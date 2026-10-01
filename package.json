@@ -1,0 +1,31 @@
+{
+  "name": "bymoffice",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Word and Excel viewer/editor engine, embeddable from a CDN",
+  "type": "module",
+  "main": "dist/bymoffice.esm.js",
+  "module": "dist/bymoffice.esm.js",
+  "types": "dist/types/index.d.ts",
+  "unpkg": "dist/bymoffice.min.js",
+  "jsdelivr": "dist/bymoffice.min.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "corpus": "tsx scripts/corpus.ts",
+    "corpus:baseline": "tsx scripts/corpus.ts --local",
+    "verify": "pnpm typecheck && pnpm test && pnpm e2e && pnpm corpus:baseline && BYM_NO_NATIVE=1 pnpm corpus:baseline",
+    "demo": "pnpm build && E2E_PORT=4318 node e2e/server.mjs",
+    "e2e": "pnpm build && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office test arayüzü</title>
+    <style>
+      :root {
+        --bg: #f6f7f9; --panel: #fff; --text: #1c2330; --muted: #667085; --line: #dfe3ea;
+        --accent: #1f6feb; --ok: #137a3f; --ok-bg: #e3f5ea; --bad: #b42318; --bad-bg: #fde8e6; --warn: #8a5a00; --warn-bg: #fdf1d6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #12151b; --panel: #1b2029; --text: #e6e9ef; --muted: #98a2b3; --line: #2e3542;
+          --accent: #6ea8fe; --ok: #6fd69a; --ok-bg: #173524; --bad: #ff9a8f; --bad-bg: #3d1c19; --warn: #f2c66d; --warn-bg: #3a2d10;
+        }
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+      main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+      h1 { font-size: 22px; margin: 0 0 4px; }
+      h2 { font-size: 15px; margin: 0 0 10px; }
+      p { margin: 0 0 12px; }
+      .muted { color: var(--muted); font-size: 13px; }
+      section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-top: 16px; }
+      #drop { border: 2px dashed var(--line); border-radius: 10px; padding: 22px 16px; text-align: center; }
+      #drop.over { border-color: var(--accent); }
+      .row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-top: 12px; }
+      button { font: inherit; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      label { display: inline-flex; gap: 6px; align-items: center; }
+      .scroll { overflow-x: auto; }
+      table { border-collapse: collapse; width: 100%; }
+      td, th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); font-size: 13px; vertical-align: top; }
+      th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+      td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      tbody tr, #parts tr { cursor: pointer; }
+      tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+      .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+      .ok { color: var(--ok); background: var(--ok-bg); }
+      .bad { color: var(--bad); background: var(--bad-bg); }
+      .warn { color: var(--warn); background: var(--warn-bg); }
+      #status { font-weight: 600; overflow-wrap: anywhere; }
+      #summary { font-size: 13px; color: var(--muted); }
+      pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 420px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>BYM Office test arayüzü</h1>
+      <p class="muted">
+        Sürüm durumu: kapsayıcı katmanı (dosyayı aç, parçalarını oku, kayıpsız yeniden kaydet). Tablo ve belge
+        görüntüleme henüz yok; eklendikçe bu sayfaya gelecek. Dosyalar yalnız tarayıcınızda işlenir, hiçbir yere gönderilmez.
+      </p>
+
+      <section>
+        <div id="drop">
+          <p><strong>Dosyaları buraya sürükleyin</strong> ya da seçin (docx, xlsx, doc, xls; birden çok olabilir).</p>
+          <input type="file" id="file" multiple />
+        </div>
+        <div class="row">
+          <button id="sample">Örnek xlsx üret ve aç</button>
+          <button id="clear">Listeyi temizle</button>
+          <label title="Eski iOS/Android WebView'lerde olduğu gibi tarayıcının yerleşik sıkıştırmasını kapatır; motorun kendi inflate/deflate kodu kullanılır.">
+            <input type="checkbox" id="legacy" /> Eski cihaz kipi (yerleşik sıkıştırma kapalı)
+          </label>
+        </div>
+        <div class="row"><span id="summary"></span></div>
+      </section>
+
+      <section>
+        <h2>Dosyalar</h2>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th>Ad</th><th>Biçim</th><th>Boyut (bayt)</th><th>Açılış (ms)</th><th>Kaydet → yeniden aç</th></tr>
+            </thead>
+            <tbody id="files"></tbody>
+          </table>
+        </div>
+        <p class="muted" id="empty" style="margin-top: 10px">Henüz dosya yok.</p>
+      </section>
+
+      <section>
+        <h2>Seçili dosya</h2>
+        <div id="status">—</div>
+        <div id="detail" class="muted"></div>
+        <div class="row">
+          <button id="save" class="primary" disabled>Yeniden kaydet ve indir</button>
+        </div>
+        <div class="scroll" style="margin-top: 12px"><table id="parts"></table></div>
+      </section>
+
+      <section>
+        <h2 id="viewer-title">İçerik</h2>
+        <pre id="viewer">Bir parçaya ya da akışa tıklayın.</pre>
+      </section>
+    </main>
+
+    <script src="../dist/bymoffice.min.js"></script>
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const status = $('status');
+      const detail = $('detail');
+      const parts = $('parts');
+      const filesBody = $('files');
+      const saveButton = $('save');
+      const viewer = $('viewer');
+      const viewerTitle = $('viewer-title');
+
+      const TEXT_LIMIT = 200000;
+      const HEX_LIMIT = 4096;
+
+      /** One record per dropped file: { name, bytes, file?, error?, unsupported?, ms, check } */
+      let records = [];
+      let selected = null;
+
+      // File content only ever reaches the page through textContent.
+      const el = (tag, text, className) => {
+        const node = document.createElement(tag);
+        if (text !== undefined) node.textContent = text;
+        if (className) node.className = className;
+        return node;
+      };
+      const row = (cells, tag = 'td') => {
+        const tr = document.createElement('tr');
+        for (const cell of cells) tr.appendChild(cell instanceof Node ? cell : el(tag, cell));
+        return tr;
+      };
+      const number = (n) => n.toLocaleString('tr-TR');
+      const sameBytes = (a, b) => {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+        return true;
+      };
+
+      // "Old device" mode hides the built-in streams so the engine uses its own codec.
+      const nativeStreams = { c: globalThis.CompressionStream, d: globalThis.DecompressionStream };
+      $('legacy').addEventListener('change', (event) => {
+        globalThis.CompressionStream = event.target.checked ? undefined : nativeStreams.c;
+        globalThis.DecompressionStream = event.target.checked ? undefined : nativeStreams.d;
+      });
+
+      /** Saves, reopens and compares every part with the original. */
+      async function verify(file, bytes) {
+        if (!file.package) {
+          const saved = await file.save();
+          return sameBytes(saved, bytes)
+            ? { level: 'warn', text: 'özgün baytlar (ikili yazıcı henüz yok)' }
+            : { level: 'bad', text: 'kaydedilen baytlar farklı' };
+        }
+        const saved = await file.save();
+        const again = await BymOffice.open(saved);
+        const before = file.package.partNames();
+        const after = again.package.partNames();
+        if (before.join('\n') !== after.join('\n')) return { level: 'bad', text: 'parça listesi değişti' };
+        for (const part of before) {
+          if (!sameBytes(await file.package.readPart(part), await again.package.readPart(part))) {
+            return { level: 'bad', text: `içerik değişti: ${part}` };
+          }
+        }
+        return { level: 'ok', text: `${before.length} parça aynı` };
+      }
+
+      async function process(name, bytes) {
+        const record = { name, bytes, ms: 0, check: null };
+        const started = performance.now();
+        try {
+          record.file = await BymOffice.open(bytes);
+          record.ms = performance.now() - started;
+          record.check = await verify(record.file, bytes);
+        } catch (error) {
+          record.ms = performance.now() - started;
+          record.file = undefined;
+          record.error = error && error.message ? error.message : String(error);
+          record.unsupported = error instanceof BymOffice.UnsupportedFileError;
+        }
+        records.push(record);
+        return record;
+      }
+
+      function renderFiles() {
+        filesBody.replaceChildren();
+        for (const record of records) {
+          const result = record.file
+            ? el('span', record.check.text, `badge ${record.check.level}`)
+            : el('span', record.unsupported ? 'desteklenmiyor' : 'hata', `badge ${record.unsupported ? 'warn' : 'bad'}`);
+          const tr = row([
+            record.name,
+            record.file ? `${record.file.format} (${record.file.container})` : '—',
+            el('td', number(record.bytes.length), 'num'),
+            el('td', record.ms.toFixed(1), 'num'),
+            (() => {
+              const td = el('td');
+              td.appendChild(result);
+              return td;
+            })(),
+          ]);
+          if (record === selected) tr.className = 'selected';
+          tr.addEventListener('click', () => select(record));
+          filesBody.appendChild(tr);
+        }
+        $('empty').hidden = records.length > 0;
+        const opened = records.filter((r) => r.file);
+        const lossless = opened.filter((r) => r.check.level !== 'bad').length;
+        $('summary').textContent = records.length
+          ? `${records.length} dosya: ${opened.length} açıldı (${lossless} kayıpsız), ` +
+            `${records.filter((r) => r.unsupported).length} desteklenmiyor, ` +
+            `${records.filter((r) => r.error && !r.unsupported).length} hata`
+          : '';
+      }
+
+      function showBytes(title, bytes, asText) {
+        viewerTitle.textContent = `İçerik: ${title} (${number(bytes.length)} bayt)`;
+        if (asText) {
+          const text = new TextDecoder().decode(bytes.subarray(0, TEXT_LIMIT));
+          viewer.textContent = bytes.length > TEXT_LIMIT ? `${text}\n… (ilk ${number(TEXT_LIMIT)} bayt gösterildi)` : text;
+          return;
+        }
+        const lines = [];
+        const shown = bytes.subarray(0, HEX_LIMIT);
+        for (let i = 0; i < shown.length; i += 16) {
+          const chunk = shown.subarray(i, i + 16);
+          const hex = Array.from(chunk, (b) => b.toString(16).padStart(2, '0')).join(' ');
+          const ascii = Array.from(chunk, (b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('');
+          lines.push(`${i.toString(16).padStart(8, '0')}  ${hex.padEnd(47)}  ${ascii}`);
+        }
+        if (bytes.length > HEX_LIMIT) lines.push(`… (ilk ${number(HEX_LIMIT)} bayt gösterildi)`);
+        viewer.textContent = lines.join('\n') || '(boş)';
+      }
+
+      function select(record) {
+        selected = record;
+        parts.replaceChildren();
+        saveButton.disabled = true;
+        detail.textContent = '';
+        viewerTitle.textContent = 'İçerik';
+        viewer.textContent = 'Bir parçaya ya da akışa tıklayın.';
+        renderFiles();
+        if (!record) {
+          status.textContent = '—';
+          return;
+        }
+        if (!record.file) {
+          status.textContent = `Açılamadı: ${record.error}`;
+          return;
+        }
+
+        const file = record.file;
+        status.textContent = `Biçim: ${file.format} (${file.container})`;
+        detail.textContent = `${record.name} · ${number(record.bytes.length)} bayt · ${record.ms.toFixed(1)} ms · ${record.check.text}`;
+        const open = async (tr, title, read, asText) => {
+          for (const other of parts.querySelectorAll('tr.selected')) other.className = '';
+          tr.className = 'selected';
+          try {
+            showBytes(title, await read(), asText);
+          } catch (error) {
+            viewerTitle.textContent = `İçerik: ${title}`;
+            viewer.textContent = `Okunamadı: ${error.message}`;
+          }
+        };
+        if (file.package) {
+          parts.appendChild(row(['Parça', 'İçerik türü', 'Boyut (bayt)'], 'th'));
+          for (const part of file.package.partNames()) {
+            const type = file.package.contentTypeOf(part);
+            const entry = file.package.zip.entry(part.slice(1));
+            const tr = row([part, type ?? '—', el('td', entry ? number(entry.uncompressedSize) : '—', 'num')]);
+            const asText = /xml/i.test(type ?? '') || /\.(xml|rels|vml|txt)$/i.test(part);
+            tr.addEventListener('click', () => open(tr, part, () => file.package.readPart(part), asText));
+            parts.appendChild(tr);
+          }
+        } else {
+          parts.appendChild(row(['Akış', 'Boyut (bayt)'], 'th'));
+          for (const entry of file.cfb.entries) {
+            const isStream = entry.type === 'stream';
+            const tr = row([entry.path, isStream ? String(entry.size) : '(klasör)']);
+            if (isStream) tr.addEventListener('click', () => open(tr, entry.path, async () => file.cfb.stream(entry.path), false));
+            parts.appendChild(tr);
+          }
+        }
+        saveButton.disabled = false;
+      }
+
+      async function handle(list) {
+        let last = null;
+        for (const item of list) {
+          status.textContent = `Açılıyor: ${item.name}`;
+          const bytes = item.data ?? new Uint8Array(await item.arrayBuffer());
+          last = await process(item.name, bytes);
+          renderFiles();
+        }
+        if (last) select(last);
+      }
+
+      $('file').addEventListener('change', async (event) => {
+        const list = Array.from(event.target.files);
+        await handle(list);
+        event.target.value = '';
+      });
+
+      const drop = $('drop');
+      for (const type of ['dragenter', 'dragover']) {
+        drop.addEventListener(type, (event) => {
+          event.preventDefault();
+          drop.classList.add('over');
+        });
+      }
+      drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+      drop.addEventListener('drop', (event) => {
+        event.preventDefault();
+        drop.classList.remove('over');
+        handle(Array.from(event.dataTransfer.files));
+      });
+
+      $('clear').addEventListener('click', () => {
+        records = [];
+        select(null);
+      });
+
+      // A small synthetic workbook, built in the page with the engine's own ZIP writer.
+      $('sample').addEventListener('click', async () => {
+        const utf8 = (text) => new TextEncoder().encode(text);
+        const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        const rows = Array.from(
+          { length: 200 },
+          (_, i) => `<row r="${i + 1}"><c r="A${i + 1}"><v>${i + 1}</v></c><c r="B${i + 1}" t="inlineStr"><is><t>Satır ${i + 1} — ğüşiöç</t></is></c></row>`,
+        ).join('');
+        const zip = new BymOffice.ZipArchive();
+        zip.set(
+          '[Content_Types].xml',
+          utf8(
+            `${head}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+              '<Default Extension="xml" ContentType="application/xml"/>' +
+              '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+              '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' +
+              '</Types>',
+          ),
+        );
+        zip.set(
+          '_rels/.rels',
+          utf8(
+            `${head}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+              '</Relationships>',
+          ),
+        );
+        zip.set(
+          'xl/workbook.xml',
+          utf8(
+            `${head}<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+              '<sheets><sheet name="Sayfa1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+          ),
+        );
+        zip.set(
+          'xl/_rels/workbook.xml.rels',
+          utf8(
+            `${head}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+              '</Relationships>',
+          ),
+        );
+        zip.set(
+          'xl/worksheets/sheet1.xml',
+          utf8(`${head}<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows}</sheetData></worksheet>`),
+        );
+        await handle([{ name: 'ornek.xlsx', data: await zip.write() }]);
+      });
+
+      saveButton.addEventListener('click', async () => {
+        if (!selected || !selected.file) return;
+        const url = URL.createObjectURL(new Blob([await selected.file.save()]));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = selected.name;
+        link.click();
+        URL.revokeObjectURL(url);
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Local only: working notes, agent definitions, corpus location, review scratch
+CLAUDE.md
+.claude/
+.corpus.local
+tmp-*/

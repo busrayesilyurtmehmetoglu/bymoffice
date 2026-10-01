@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: classic script</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <p id="state">loading</p>
+    <!-- The way a CDN user embeds the engine: one classic script, one global. -->
+    <script src="/dist/bymoffice.min.js"></script>
+    <script>
+      window.__bym = window.BymOffice;
+      window.__bymFlavour = 'script';
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>

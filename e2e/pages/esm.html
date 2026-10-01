@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: ES module</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <p id="state">loading</p>
+    <!-- The way a bundler-less ESM user imports the engine; no global is involved. -->
+    <script type="module">
+      import * as BymOfficeModule from '/dist/bymoffice.esm.js';
+      window.__bym = BymOfficeModule;
+      window.__bymFlavour = 'esm';
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>
