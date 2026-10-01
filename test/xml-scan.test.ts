@@ -157,6 +157,14 @@ test('xml-scan: a repeated attribute reads as its last value, as in parseXml', (
   assert.equal(parseXml(xml).root.attrs.get('k'), '2');
 });
 
+test('xml-scan: attrCount is the number of attributes of the current open tag', () => {
+  const sc = new XmlScanner('<a><b/><c r="A1" s = \'2\'\n t="s"/><d k="1" k="2">x</d><e x:y="&amp;"></e></a>');
+  const counts: number[] = [];
+  while (sc.next()) if (sc.kind === 'open') counts.push(sc.attrCount, sc.attrs().length);
+  // A repeated attribute counts each time it is written, as in attrs().
+  assert.deepEqual(counts, [0, 0, 0, 0, 3, 3, 2, 2, 1, 1]);
+});
+
 test('xml-scan: attribute names are matched whole', () => {
   const sc = new XmlScanner('<c rr="1" r="A1" xr="3" s = "7"/>');
   sc.next();

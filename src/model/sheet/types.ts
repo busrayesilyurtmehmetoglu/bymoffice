@@ -164,6 +164,17 @@ export interface Cell {
   formula?: CellFormula;
   /** Rich text runs, when the text has mixed formatting. Shared between cells that use the same string. */
   runs?: RichRun[];
+  /**
+   * Index of the shared string this cell was read from. Only cells that come
+   * from the file have it; the writer uses it to put the cell back exactly as
+   * it was, phonetic text included.
+   */
+  si?: number;
+  /** Cell metadata index (dynamic array formulas) and value metadata index (rich values), kept to be written back. */
+  cm?: number;
+  vm?: number;
+  /** The cell shows phonetic text. */
+  ph?: boolean;
 }
 
 export interface Row {
@@ -177,6 +188,11 @@ export interface Row {
   collapsed: boolean;
   /** Sparse, indexed by column. */
   cells: Cell[];
+  /**
+   * Attributes of <row> the model has no field for (thickTop, ph, x14ac:dyDescent, ...),
+   * kept to be written back. "spans" is not kept: it is a hint that is stale after any edit.
+   */
+  attrs?: [name: string, value: string][];
 }
 
 /** Properties shared by a run of columns, as in <col min max>. */
@@ -264,6 +280,25 @@ export interface Sheet {
   tabColor?: Color;
   /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */
   modified?: boolean;
+  /**
+   * Rows in which a cell was changed since the sheet was read (indexes as they
+   * were when the change happened). While there are no structural edits, every
+   * other row is written back byte for byte from the original part.
+   */
+  changedRows?: Set<number>;
+  /** Column widths, visibility or formats were changed; the writer regenerates <cols>. */
+  columnsModified?: boolean;
+  /** Cells were merged or unmerged; the writer regenerates <mergeCells>. */
+  mergesModified?: boolean;
+  /** Links changed without the sheet's own cells moving; the writer regenerates <hyperlinks>. */
+  hyperlinksModified?: boolean;
+  /**
+   * Kinds of content anchored to cells but stored outside the sheet part
+   * ("drawing", "comments", "table", "pivotTable", ...). Their positions are
+   * not adjusted yet, so rows and columns cannot be inserted or deleted in a
+   * sheet that has any.
+   */
+  anchored?: string[];
   /**
    * Rows and columns inserted or deleted since the sheet was read, in order.
    * The writer replays them on the parts of the sheet the model does not hold

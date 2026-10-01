@@ -47,6 +47,11 @@ export class XmlScanner {
   local = '';
   /** Set on open tokens. A self-closing element produces no separate close token. */
   selfClosing = false;
+  /**
+   * Number of attributes of the current open tag. Lets a consumer that knows
+   * how many of them it has found skip the lookups for rare ones.
+   */
+  attrCount = 0;
   /** Decoded text of a text token (CDATA included). */
   text = '';
 
@@ -173,6 +178,7 @@ export class XmlScanner {
       const attrStart = j;
 
       let selfClosing = false;
+      let attrCount = 0;
       for (;;) {
         while (j < n && isSpace(s.charCodeAt(j))) j++;
         if (j >= n) this.fail('unterminated start tag', i);
@@ -198,6 +204,7 @@ export class XmlScanner {
         const quote = s.charCodeAt(k);
         if (quote !== 34 && quote !== 39) this.fail(`attribute "${s.slice(j, nameEnd)}" value is not quoted`, k);
         j = this.find(quote === 34 ? '"' : "'", k + 1) + 1;
+        attrCount++;
       }
 
       if (depth === 0) {
@@ -213,6 +220,7 @@ export class XmlScanner {
       this.name = name;
       this.local = local;
       this.selfClosing = selfClosing;
+      this.attrCount = attrCount;
       this.tagStart = i;
       this.attrStart = attrStart;
       this.pos = j;

@@ -266,6 +266,16 @@ function parseCell(sc: XmlScanner, cells: Cell[], rowIndex: number, prevCol: num
   const styleAttr = sc.attr('s');
   const style = styleAttr === undefined ? 0 : Math.max(parseUint(styleAttr), 0);
   const type = sc.attr('t');
+  // Metadata indexes and the phonetic flag are rare; they are only looked for in a tag that has more
+  // attributes than the ones found so far, and only added to the cells that have them.
+  let cm = -1;
+  let vm = -1;
+  let ph = false;
+  if (sc.attrCount > (ref === undefined ? 0 : 1) + (styleAttr === undefined ? 0 : 1) + (type === undefined ? 0 : 1)) {
+    cm = parseUint(sc.attr('cm'));
+    vm = parseUint(sc.attr('vm'));
+    ph = parseBool(sc.attr('ph'), false);
+  }
 
   let v: string | undefined;
   let formula: CellFormula | undefined;
@@ -303,6 +313,7 @@ function parseCell(sc: XmlScanner, cells: Cell[], rowIndex: number, prevCol: num
       const item = shared[index];
       cell = { kind: 'string', value: item.text, style };
       if (item.runs) cell.runs = item.runs;
+      cell.si = index;
     }
   } else if (type === 'b') {
     if (v === undefined || v === '') cell = { kind: 'blank', value: null, style };
@@ -323,6 +334,9 @@ function parseCell(sc: XmlScanner, cells: Cell[], rowIndex: number, prevCol: num
     cell = { kind: 'string', value: v === undefined ? '' : decodeXstring(v), style };
   }
   if (formula) cell.formula = formula;
+  if (cm >= 0) cell.cm = cm;
+  if (vm >= 0) cell.vm = vm;
+  if (ph) cell.ph = true;
 
   // A repeated cell replaces the earlier one.
   cells[col] = cell;
@@ -346,9 +360,14 @@ function parseRowCells(sc: XmlScanner, row: Row, rowIndex: number, shared: Share
   }
 }
 
+/** Most distinct attribute lists kept for sharing between rows; a sheet normally has one or two. */
+const MAX_SHARED_ROW_ATTRS = 256;
+
 function parseSheetData(sc: XmlScanner, shared: SharedString[], sheet: Sheet, state: { prevRow: number }): void {
   if (sc.selfClosing) return;
   const rows = sheet.rows;
+  // Nearly every row of a file carries the same extra attributes (x14ac:dyDescent); equal lists are one object.
+  const attrLists = new Map<string, [string, string][]>();
   while (sc.next()) {
     if (sc.kind === 'close') break;
     if (sc.kind !== 'open') continue;
@@ -357,7 +376,51 @@ function parseSheetData(sc: XmlScanner, shared: SharedString[], sheet: Sheet, st
       continue;
     }
 
-    const r = sc.attr('r');
+    let r: string | undefined;
+    let ht: string | undefined;
+    let s: string | undefined;
+    let customFormat = false;
+    let customHeight = false;
+    let hidden = false;
+    let collapsed = false;
+    let outlineLevel = 0;
+    let extra: [string, string][] | undefined;
+    for (const pair of sc.attrs()) {
+      const value = pair[1];
+      switch (pair[0]) {
+        case 'r':
+          r = value;
+          break;
+        case 'spans':
+          // A hint for readers; not kept, it is stale after any edit.
+          break;
+        case 's':
+          s = value;
+          break;
+        case 'customFormat':
+          customFormat = parseBool(value, false);
+          break;
+        case 'ht':
+          ht = value;
+          break;
+        case 'customHeight':
+          customHeight = parseBool(value, false);
+          break;
+        case 'hidden':
+          hidden = parseBool(value, false);
+          break;
+        case 'outlineLevel':
+          outlineLevel = Math.max(parseUint(value), 0);
+          break;
+        case 'collapsed':
+          collapsed = parseBool(value, false);
+          break;
+        default:
+          if (extra) extra.push(pair);
+          else extra = [pair];
+      }
+    }
+
     let rowIndex: number;
     if (r === undefined) rowIndex = state.prevRow + 1;
     else {
@@ -370,18 +433,32 @@ function parseSheetData(sc: XmlScanner, shared: SharedString[], sheet: Sheet, st
     // A repeated row adds to the earlier one; its own properties replace the earlier ones.
     let row = rows.get(rowIndex);
     if (!row) {
-      row = { customHeight: false, hidden: false, outlineLevel: 0, collapsed: false, cells: [] };
+      row = { customHeight, hidden, outlineLevel, collapsed, cells: [] };
       rows.set(rowIndex, row);
+    } else {
+      row.customHeight = customHeight;
+      row.hidden = hidden;
+      row.outlineLevel = outlineLevel;
+      row.collapsed = collapsed;
+      delete row.attrs;
     }
-    const height = parseFinite(sc.attr('ht'));
+    const height = parseFinite(ht);
     if (height !== undefined && height >= 0) row.height = height;
-    row.customHeight = parseBool(sc.attr('customHeight'), false);
-    row.hidden = parseBool(sc.attr('hidden'), false);
-    row.outlineLevel = Math.max(parseUint(sc.attr('outlineLevel')), 0);
-    row.collapsed = parseBool(sc.attr('collapsed'), false);
-    if (parseBool(sc.attr('customFormat'), false)) {
-      const style = parseUint(sc.attr('s'));
+    if (customFormat) {
+      const style = parseUint(s);
       if (style >= 0) row.style = style;
+    } else if (s !== undefined) {
+      // Without customFormat the index is not the row's format; it is kept only to be written back.
+      if (extra) extra.unshift(['s', s]);
+      else extra = [['s', s]];
+    }
+    if (extra) {
+      let key = '';
+      for (let i = 0; i < extra.length; i++) key += extra[i][0] + '\u0000' + extra[i][1] + '\u0000';
+      const known = attrLists.get(key);
+      if (known) extra = known;
+      else if (attrLists.size < MAX_SHARED_ROW_ATTRS) attrLists.set(key, extra);
+      row.attrs = extra;
     }
 
     if (!sc.selfClosing) parseRowCells(sc, row, rowIndex, shared, sheet);

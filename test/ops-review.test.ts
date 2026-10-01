@@ -340,3 +340,41 @@ test('commands: pasting refuses text it could only paste part of, and skips cell
     ['a', 'b', undefined, 'd', 'e', undefined, undefined, 'h'],
   );
 });
+
+test('ops: formatting the cell that holds a shared formula keeps the group shared', async () => {
+  const wb = await workbook();
+  const sheet = wb.sheets[0];
+  const master = getCell(sheet, 0, 1)!;
+  applyOp(wb, { type: 'setCells', sheet: 0, cells: [{ row: 0, col: 1, cell: { ...master, style: 2 } }] });
+  assert.deepEqual([f(sheet, 0, 1)?.type, f(sheet, 1, 1), f(sheet, 3, 1)], ['shared', { text: '', type: 'shared', si: 0 }, { text: '', type: 'shared', si: 0 }]);
+  // Only the row of the changed cell is marked for rewriting.
+  assert.deepEqual([...(sheet.changedRows || [])], [0]);
+});
+
+test('ops: links in other sheets follow the cells they point at, and come back on undo', async () => {
+  const wb = await workbook();
+  const other = wb.sheets[1];
+  other.hyperlinks = [
+    { range: { top: 0, left: 0, bottom: 0, right: 0 }, location: 'Veri!A3' },
+    { range: { top: 1, left: 0, bottom: 1, right: 0 }, location: "'Özet'!B2" },
+    { range: { top: 2, left: 0, bottom: 2, right: 0 }, target: 'https://example.com/' },
+  ];
+  const before = picture(wb);
+  const linksBefore = other.hyperlinks;
+  const undo = applyOp(wb, { type: 'insert', sheet: 0, axis: 'row', at: 1, count: 2 });
+  assert.deepEqual(other.hyperlinks.map((link) => link.location), ['Veri!A5', "'Özet'!B2", undefined]);
+  assert.equal(other.hyperlinksModified, true);
+  assert.equal(linksBefore[0].location, 'Veri!A3', 'the list held for undo is not changed in place');
+  const redo = applyOp(wb, undo);
+  assert.equal(picture(wb), before);
+  applyOp(wb, redo);
+  assert.equal(other.hyperlinks[0].location, 'Veri!A5');
+});
+
+test('review: a typed formula that cannot be read is refused', async () => {
+  const wb = await workbook();
+  for (const text of ['=1+', '=SUM(A1;A2)', '=A1*1,5']) {
+    assert.throws(() => setCellInput(wb, 0, 20, 0, text), /The formula cannot be read/);
+  }
+  assert.equal(setCellInput(wb, 0, 20, 0, '=SUM(A1,A2)*2').length, 1);
+});

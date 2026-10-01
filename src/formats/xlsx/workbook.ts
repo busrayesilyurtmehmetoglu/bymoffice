@@ -53,6 +53,13 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   const sharedStrings = stringsPart && pkg.hasPart(stringsPart) ? parseSharedStrings(await pkg.readPart(stringsPart)) : [];
   const styles = parseStyles(await optionalXml(pkg, rels, '/styles'), await optionalXml(pkg, rels, '/theme'));
 
+  // A chart or a pivot table reads cells of some sheet from a part that says nothing about which.
+  // While a workbook has any, rows and columns stay where they are in all of its sheets.
+  const global: string[] = [];
+  const allParts = pkg.partNames().map((part) => part.toLowerCase());
+  if (allParts.some((part) => part.startsWith('/xl/charts/'))) global.push('chart');
+  if (allParts.some((part) => part.startsWith('/xl/pivottables/') || part.startsWith('/xl/pivotcache/'))) global.push('pivotTable');
+
   const sheets: Sheet[] = [];
   const seenParts = new Set<string>();
   const sheetsElement = child(root, 'sheets');
@@ -76,12 +83,34 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     // A chart sheet holds a drawing, not cells; it stays in the package as it is.
     if (kind !== 'chartsheet') {
       parseWorksheet(await pkg.readPart(rel.part), sharedStrings, sheet);
+      const sheetRels = await pkg.relationships(rel.part);
       if (sheet.hyperlinks.some((link) => link.rId !== undefined)) {
-        const targets = new Map((await pkg.relationships(rel.part)).map((r) => [r.id, r.target]));
+        const targets = new Map(sheetRels.map((r) => [r.id, r.target]));
         for (const link of sheet.hyperlinks) {
           if (link.rId !== undefined) link.target = targets.get(link.rId);
         }
       }
+      // Everything related to the sheet except links and printer settings is placed by cell position.
+      const anchored = new Set<string>();
+      for (const r of sheetRels) {
+        const type = r.type.slice(r.type.lastIndexOf('/') + 1);
+        if (type !== 'hyperlink' && type !== 'printerSettings') anchored.add(type);
+        // A drawing may hold charts, whose series refer to cells of this sheet from yet another part.
+        if (type === 'drawing' && r.part && pkg.hasPart(r.part)) {
+          for (const inner of await pkg.relationships(r.part)) {
+            const innerType = inner.type.slice(inner.type.lastIndexOf('/') + 1);
+            if (innerType !== 'image' && innerType !== 'hyperlink') anchored.add(innerType);
+          }
+        }
+        // Comment boxes are moved by the writer; form controls in the same part are not.
+        if (type === 'vmlDrawing' && r.part && pkg.hasPart(r.part)) {
+          const vml = new TextDecoder().decode(await pkg.readPart(r.part));
+          const kinds = vml.match(/ObjectType\s*=\s*"[^"]*"/g) || [];
+          if (kinds.some((kind) => !/"Note"$/.test(kind))) anchored.add('formControl');
+        }
+      }
+      for (const kind of global) anchored.add(kind);
+      if (anchored.size > 0) sheet.anchored = [...anchored].sort();
     }
     sheets.push(sheet);
   }

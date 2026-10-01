@@ -119,3 +119,11 @@ test('workbook(): xls and documents report that the model is not available', asy
   const xls = await open(minimalCfb(new Uint8Array(9 * 512), new Uint8Array(10)));
   await assert.rejects(xls.workbook(), UnsupportedFileError);
 });
+
+test('xlsx: a file whose model cannot be read is still saved as it was', async () => {
+  const bytes = await buildXlsx({ sheets: [{ name: 'S', xml: worksheetXml('<sheetData><row r="1"><c r="A1"><v>abc</v></c></row></sheetData>') }] });
+  const file = await open(bytes);
+  await assert.rejects(file.workbook(), /is not a number/);
+  assert.deepEqual(await file.save(), bytes);
+  await assert.rejects(file.workbook(), /is not a number/);
+});

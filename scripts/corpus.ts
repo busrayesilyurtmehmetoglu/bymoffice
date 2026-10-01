@@ -11,7 +11,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { OpcPackage, UnsupportedFileError, open, parseXml, serializeXml, type OfficeFile } from '../src/index';
+import { OpcPackage, UnsupportedFileError, applyOp, open, parseXml, serializeXml, type OfficeFile, type Workbook } from '../src/index';
 
 const EXTENSIONS = /\.(docx|docm|dotx|xlsx|xlsm|xltx|doc|xls)$/i;
 const SKIP_DIRS = new Set(['node_modules', 'vendor', '.git']);
@@ -27,6 +27,87 @@ function* walk(dir: string): Generator<string> {
 
 let sheets = 0;
 let cells = 0;
+let documents = 0;
+let docBlocks = 0;
+let edited = 0;
+let restructured = 0;
+
+/** What a workbook holds, as plain data that survives a save: used to compare a model with its reopened copy. */
+function picture(workbook: Workbook): string {
+  return JSON.stringify({
+    names: workbook.definedNames,
+    sheets: workbook.sheets.map((sheet) => ({
+      name: sheet.name,
+      state: sheet.state,
+      merges: sheet.merges,
+      links: sheet.hyperlinks.map((link) => [link.range, link.target, link.location, link.tooltip, link.display]),
+      columns: sheet.columns,
+      rows: [...sheet.rows.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([index, row]) => [
+          index,
+          row.height,
+          row.hidden,
+          row.style,
+          row.attrs,
+          row.cells
+            .map((cell, col) => [col, cell.kind, cell.value, cell.style, cell.formula && { ...cell.formula, attrs: cell.formula.attrs && [...cell.formula.attrs] }, cell.runs, cell.cm, cell.vm])
+            // A blank cell without a format or a formula says nothing; the writer leaves it out.
+            .filter((entry) => !(entry[1] === 'blank' && entry[3] === 0 && !entry[4])),
+        ])
+        // Likewise a row with neither cells nor properties.
+        .filter((entry) => (entry[5] as unknown[]).length > 0 || entry[1] !== undefined || entry[2] || entry[3] !== undefined || entry[4] !== undefined),
+    })),
+  });
+}
+
+/** Edits a real workbook the way a user would and checks that the saved file reads back as the edited model. */
+async function checkEditing(original: Uint8Array): Promise<void> {
+  const file = await open(original);
+  const workbook = await file.workbook();
+  const index = workbook.sheets.findIndex((sheet) => sheet.kind === 'worksheet');
+  if (index < 0) return;
+  const sheet = workbook.sheets[index];
+
+  // A new cell below the data, and the first number in the sheet changed.
+  const changes = [{ row: sheet.rowCount + 2, col: 0, cell: { kind: 'number' as const, value: 12345.678, style: 0 } }];
+  outer: for (const [rowIndex, row] of sheet.rows) {
+    for (let col = 0; col < row.cells.length; col++) {
+      const cell = row.cells[col];
+      if (cell && cell.kind === 'number' && !cell.formula) {
+        changes.push({ row: rowIndex, col, cell: { ...cell, value: (cell.value as number) + 1 } });
+        break outer;
+      }
+    }
+  }
+  applyOp(workbook, { type: 'setCells', sheet: index, cells: changes });
+  const saved = await file.save();
+  const reopened = await open(saved);
+  if (picture(await reopened.workbook()) !== picture(workbook)) throw new Error('edited workbook reads back differently');
+
+  // Parts the edit has no business with keep their bytes.
+  const reference = await OpcPackage.open(original);
+  const touched = new Set([sheet.part.toLowerCase(), '/xl/workbook.xml', '/xl/_rels/workbook.xml.rels', '/xl/calcchain.xml']);
+  for (const part of reference.partNames()) {
+    if (touched.has(part.toLowerCase())) continue;
+    if (!reopened.package!.hasPart(part)) throw new Error(`part lost after an edit: ${part}`);
+    if (!isDeepStrictEqual(await reopened.package!.readPart(part), await reference.readPart(part))) throw new Error(`untouched part changed after an edit: ${part}`);
+  }
+  edited++;
+
+  // Rows inserted and deleted, where the sheet allows it (tables and pivot tables do not yet).
+  try {
+    applyOp(workbook, { type: 'insert', sheet: index, axis: 'row', at: 1, count: 2 });
+    applyOp(workbook, { type: 'delete', sheet: index, axis: 'col', at: 1, count: 1 });
+  } catch (error) {
+    // Array formulas and full sheets refuse structural edits; that is not a failure of the writer.
+    if (error instanceof RangeError) return;
+    throw error;
+  }
+  const again = await open(await file.save());
+  if (picture(await again.workbook()) !== picture(workbook)) throw new Error('restructured workbook reads back differently');
+  restructured++;
+}
 
 async function checkOoxml(file: OfficeFile, original: Uint8Array): Promise<void> {
   const pkg = file.package!;
@@ -57,6 +138,15 @@ async function checkOoxml(file: OfficeFile, original: Uint8Array): Promise<void>
       cells += [...sheet.rows.values()].reduce((sum, row) => sum + row.cells.filter(() => true).length, 0);
     }
     sheets += workbook.sheets.length;
+    if (!isDeepStrictEqual(await file.save(), savedBytes)) throw new Error('saved bytes changed after reading the model');
+    await checkEditing(original);
+  }
+
+  // Documents must read into the model; reading must not disturb the package.
+  if (file.format === 'docx' && file.document) {
+    const model = await file.document();
+    documents++;
+    docBlocks += model.body.blocks.length;
     if (!isDeepStrictEqual(await file.save(), savedBytes)) throw new Error('saved bytes changed after reading the model');
   }
 
@@ -130,7 +220,8 @@ for (const root of roots) {
 
 const total = Object.values(passed).reduce((sum, n) => sum + n, 0);
 console.log(`passed: ${total}`, passed);
-console.log(`xlsx model: ${sheets} sheets, ${cells} cells`);
+console.log(`docx model: ${documents} documents, ${docBlocks} blocks`);
+console.log(`xlsx model: ${sheets} sheets, ${cells} cells; edited and saved: ${edited}; restructured and saved: ${restructured}`);
 console.log(`not a Word/Excel file: ${unsupported}`);
 console.log(`failed: ${failures.length}`);
 for (const failure of failures.slice(0, 40)) console.log(`  ${failure}`);

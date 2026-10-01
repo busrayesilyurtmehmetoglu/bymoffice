@@ -131,6 +131,29 @@ export class OpcPackage {
     }
   }
 
+  /**
+   * Removes a part, its own relationships part and its content type override.
+   * Relationships that point to the part are the caller's to remove.
+   */
+  deletePart(part: string): boolean {
+    const name = this.entryName(part);
+    if (name === undefined) return false;
+    this.zip.delete(name);
+    const slash = part.lastIndexOf('/');
+    const rels = this.entryName(`${part.slice(0, slash)}/_rels/${part.slice(slash + 1)}.rels`);
+    if (rels !== undefined) this.zip.delete(rels);
+    const lower = part.toLowerCase();
+    const root = this.types.root;
+    const kept = root.children.filter(
+      (node) => !(node.type === 'element' && node.name.replace(/^.*:/, '') === 'Override' && (node.attrs.get('PartName') || '').toLowerCase() === lower),
+    );
+    if (kept.length !== root.children.length) {
+      root.children = kept;
+      this.typesDirty = true;
+    }
+    return true;
+  }
+
   async save(): Promise<Uint8Array> {
     if (this.typesDirty) {
       this.zip.set(CONTENT_TYPES, encoder.encode(serializeXml(this.types)));

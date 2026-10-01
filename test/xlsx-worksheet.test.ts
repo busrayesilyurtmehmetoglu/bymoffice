@@ -307,6 +307,59 @@ test('worksheet: row properties', () => {
   assert.deepEqual(getCell(sheet, 5, 2), { kind: 'blank', value: null, style: 2 });
 });
 
+test('worksheet: shared string index, cell metadata and the phonetic flag are kept for the writer', () => {
+  const shared: SharedString[] = [{ text: 'bir' }, { text: 'iki' }];
+  const sheet = read(
+    data(
+      '<row r="1"><c r="A1" t="s"><v>1</v></c><c r="B1" t="s"><v> 0 </v></c><c r="C1" cm="3" vm="12" ph="1"><v>5</v></c>' +
+        '<c r="D1" ph="0" cm="x" vm="-1"><v>6</v></c><c r="E1" ph="true"/><c r="F1" t="inlineStr"><is><t>iç</t></is></c><c r="G1" t="s"/></row>',
+    ),
+    shared,
+  );
+  assert.deepEqual(getCell(sheet, 0, 0), { kind: 'string', value: 'iki', style: 0, si: 1 });
+  assert.deepEqual(getCell(sheet, 0, 1), { kind: 'string', value: 'bir', style: 0, si: 0 });
+  assert.deepEqual(getCell(sheet, 0, 2), { kind: 'number', value: 5, style: 0, cm: 3, vm: 12, ph: true });
+  // Absent, false or malformed: the cell has no such member at all.
+  assert.deepEqual(Object.keys(getCell(sheet, 0, 3)!), ['kind', 'value', 'style']);
+  assert.deepEqual(getCell(sheet, 0, 4), { kind: 'blank', value: null, style: 0, ph: true });
+  assert.deepEqual(Object.keys(getCell(sheet, 0, 5)!), ['kind', 'value', 'style']);
+  assert.deepEqual(Object.keys(getCell(sheet, 0, 6)!), ['kind', 'value', 'style']);
+});
+
+test('worksheet: row attributes the model has no field for are kept in order and shared between rows', () => {
+  const sheet = read(
+    data(
+      '<row r="1" spans="1:3" x14ac:dyDescent="0.25"><c r="A1"><v>1</v></c></row>' +
+        '<row r="2" spans="1:3" ht="20" customHeight="1" x14ac:dyDescent="0.25"/>' +
+        '<row r="3" thickTop="1" s="4" customFormat="1" thickBot="1" hidden="1" ph="1" outlineLevel="1" collapsed="1" x14ac:dyDescent="0.3" bilinmeyen="a&amp;b"/>' +
+        '<row r="4" spans="1:3" s="2"/>' +
+        '<row r="5" x14ac:dyDescent="0.25" thickTop="1"/>' +
+        '<row r="6" thickTop="1" x14ac:dyDescent="0.25"/>' +
+        '<row r="7" thickTop="1" x14ac:dyDescent="0.25"/>',
+    ),
+  );
+  assert.deepEqual(sheet.rows.get(0)!.attrs, [['x14ac:dyDescent', '0.25']]);
+  // The same list is one object, however many rows have it.
+  assert.equal(sheet.rows.get(1)!.attrs, sheet.rows.get(0)!.attrs);
+  assert.equal(sheet.rows.get(6)!.attrs, sheet.rows.get(5)!.attrs);
+  assert.notEqual(sheet.rows.get(4)!.attrs, sheet.rows.get(5)!.attrs);
+  assert.deepEqual(sheet.rows.get(4)!.attrs, [['x14ac:dyDescent', '0.25'], ['thickTop', '1']]);
+  assert.deepEqual(sheet.rows.get(2)!.attrs, [['thickTop', '1'], ['thickBot', '1'], ['ph', '1'], ['x14ac:dyDescent', '0.3'], ['bilinmeyen', 'a&b']]);
+  const r3 = sheet.rows.get(2)!;
+  assert.deepEqual([r3.style, r3.hidden, r3.outlineLevel, r3.collapsed], [4, true, 1, true]);
+  // A format index without customFormat is not the row's format; it is kept among the attributes to be written back.
+  assert.deepEqual(sheet.rows.get(3)!.attrs, [['s', '2']]);
+  assert.equal(sheet.rows.get(3)!.style, undefined);
+  assert.equal(sheet.rows.get(2)!.attrs!.some(([name]) => name === 's'), false);
+  assert.equal(sheet.rows.get(1)!.height, 20);
+
+  // A repeated row takes the attributes of its last occurrence.
+  const twice = read(data('<row r="1" thickTop="1"><c r="A1"><v>1</v></c></row><row r="1"><c r="B1"><v>2</v></c></row><row r="2"/><row r="2" thickBot="1"/>'));
+  assert.equal('attrs' in twice.rows.get(0)!, false);
+  assert.deepEqual(twice.rows.get(1)!.attrs, [['thickBot', '1']]);
+  assert.equal(twice.rows.get(0)!.cells.length, 2);
+});
+
 test('worksheet: every cell type', () => {
   const shared: SharedString[] = [{ text: 'Çıkış limanı' }, { text: 'kalın düz', runs: [{ text: 'kalın', font: { bold: true, italic: false, strike: false, underline: 'none' } }, { text: ' düz' }] }];
   const sheet = read(
@@ -336,7 +389,7 @@ test('worksheet: every cell type', () => {
   const at = (col: number) => getCell(sheet, 0, col);
   assert.deepEqual(at(0), { kind: 'number', value: 42, style: 0 });
   assert.deepEqual(at(1), { kind: 'number', value: -0.0015, style: 3 });
-  assert.deepEqual(at(2), { kind: 'string', value: 'Çıkış limanı', style: 0 });
+  assert.deepEqual(at(2), { kind: 'string', value: 'Çıkış limanı', style: 0, si: 0 });
   assert.equal('runs' in at(2)!, false);
   assert.equal(at(3)!.value, 'kalın düz');
   assert.equal(at(3)!.style, 1);
@@ -508,7 +561,7 @@ test('worksheet: unknown elements are skipped wherever they appear', () => {
       '<extLst><ext uri="{x}"><x14:sheetData xmlns:x14="urn:x14"><x14:row r="50"><x14:c r="A50"><x14:v>1</x14:v></x14:c></x14:row></x14:sheetData></ext></extLst>',
   );
   assert.equal(sheet.rows.size, 1);
-  assert.deepEqual(getCell(sheet, 0, 0), { kind: 'number', value: 5, style: 0 });
+  assert.deepEqual(getCell(sheet, 0, 0), { kind: 'number', value: 5, style: 0, cm: 1, vm: 2 });
   assert.equal(sheet.rowCount, 1);
   assert.equal(sheet.colCount, 1);
 });
@@ -621,7 +674,7 @@ test('worksheet: 100,000 rows x 10 columns read in reasonable time', () => {
   for (const row of [1, 2, 777, 50000, rowCount]) {
     const r = row - 1;
     assert.deepEqual(getCell(sheet, r, 0), { kind: 'number', value: row, style: 1 });
-    assert.deepEqual(getCell(sheet, r, 1), { kind: 'string', value: `Liman ${row % 1000} İskenderun`, style: 0 });
+    assert.deepEqual(getCell(sheet, r, 1), { kind: 'string', value: `Liman ${row % 1000} İskenderun`, style: 0, si: row % 1000 });
     assert.deepEqual(getCell(sheet, r, 2), { kind: 'number', value: row * 1.25, style: 2 });
     assert.deepEqual(getCell(sheet, r, 3), {
       kind: 'number',

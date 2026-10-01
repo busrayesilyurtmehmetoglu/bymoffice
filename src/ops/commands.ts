@@ -2,6 +2,7 @@
 // a range, copying and pasting. These functions only build operations; the
 // caller applies them through a History so that each is one undo step.
 
+import { parseFormula } from '../calc/parse';
 import { shiftFormula } from '../calc/refs';
 import { MAX_PASTE_CELLS, parseTsvLimited, toHtmlTable, toTsv } from '../edit/clipboard';
 import { cellEditText, parseCellInput } from '../edit/input';
@@ -40,7 +41,7 @@ function inheritedStyle(sheet: Sheet, row: number, col: number): number {
 }
 
 /** An emptied cell: gone when the position would look the same without it, otherwise blank with its format. */
-function emptied(sheet: Sheet, row: number, col: number, style: number): Cell | undefined {
+export function emptied(sheet: Sheet, row: number, col: number, style: number): Cell | undefined {
   return style === inheritedStyle(sheet, row, col) ? undefined : { kind: 'blank', value: null, style };
 }
 
@@ -72,6 +73,15 @@ export function setCellInput(workbook: Workbook, sheetIndex: number, row: number
   const sheet = workbook.sheets[sheetIndex];
   const cell = cellFromInput(workbook, sheet, row, col, text, options);
   if (cell === undefined && getCell(sheet, row, col) === undefined) return [];
+  // A formula that cannot be read is refused, as Excel refuses it: stored, it would calculate to
+  // nothing here and make a file that Excel has to repair.
+  if (cell && cell.formula) {
+    try {
+      parseFormula(cell.formula.text);
+    } catch (error) {
+      throw new RangeError('The formula cannot be read');
+    }
+  }
   return [{ type: 'setCells', sheet: sheetIndex, cells: [{ row, col, cell }] }];
 }
 

@@ -51,6 +51,19 @@ export type Op =
       /** Used extent to restore; set on the inverse of an operation that grew the sheet. */
       extent?: { rowCount: number; colCount: number };
     }
+  | {
+      /** Replaces the column settings (widths, visibility, formats) of a sheet. */
+      type: 'setColumns';
+      sheet: number;
+      columns: ColumnRange[];
+    }
+  | {
+      /** Changes properties of rows; a property given as undefined is removed. */
+      type: 'setRows';
+      sheet: number;
+      rows: { row: number; props: RowProps }[];
+    }
+  | { type: 'setMerges'; sheet: number; merges: CellRange[] }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | {
@@ -60,10 +73,15 @@ export type Op =
       snapshot: SheetSnapshot;
       /** Cells of other sheets whose formulas referred to the sheet. */
       others: { sheet: number; cells: CellChange[] }[];
+      /** Links of other sheets that pointed into the sheet. */
+      otherLinks?: { sheet: number; hyperlinks: Hyperlink[] }[];
       definedNames: DefinedName[];
       /** Roughly how many rows this operation keeps alive for undo; History uses it to bound memory. */
       weight?: number;
     };
+
+/** The row properties an operation may set. */
+export type RowProps = Partial<Pick<Row, 'height' | 'customHeight' | 'hidden' | 'style'>>;
 
 const sheetAt = (workbook: Workbook, index: number): Sheet => {
   const sheet = workbook.sheets[index];
@@ -74,7 +92,7 @@ const sheetAt = (workbook: Workbook, index: number): Sheet => {
 const newRow = (cells: Cell[] = []): Row => ({ customHeight: false, hidden: false, outlineLevel: 0, collapsed: false, cells });
 
 const isPlainRow = (row: Row) =>
-  row.height === undefined && !row.customHeight && !row.hidden && row.style === undefined && row.outlineLevel === 0 && !row.collapsed;
+  row.height === undefined && !row.customHeight && !row.hidden && row.style === undefined && row.outlineLevel === 0 && !row.collapsed && row.attrs === undefined;
 
 function checkCell(row: number, col: number): void {
   if (!(row >= 0 && row < MAX_ROWS && col >= 0 && col < MAX_COLS) || Math.floor(row) !== row || Math.floor(col) !== col) {
@@ -111,6 +129,7 @@ function setCells(sheet: Sheet, changes: CellChange[]): CellChange[] {
       if (isPlainRow(row) && !row.cells.some(() => true)) sheet.rows.delete(change.row);
     }
     undo.push({ row: change.row, col: change.col, cell: previous });
+    (sheet.changedRows || (sheet.changedRows = new Set())).add(change.row);
     if (change.cell) {
       if (change.row >= sheet.rowCount) sheet.rowCount = change.row + 1;
       if (change.col >= sheet.colCount) sheet.colCount = change.col + 1;
@@ -129,7 +148,9 @@ function withDependants(sheet: Sheet, changes: CellChange[]): CellChange[] {
   for (const change of changes) {
     const row = sheet.rows.get(change.row);
     const formula = row && row.cells[change.col] ? row.cells[change.col].formula : undefined;
-    if (formula && formula.type === 'shared' && formula.text !== '' && formula.si !== undefined && row && row.cells[change.col] !== change.cell) {
+    // A change that leaves the formula itself alone (a new format, say) keeps the group as it is.
+    const kept = change.cell !== undefined && change.cell.formula === formula;
+    if (formula && formula.type === 'shared' && formula.text !== '' && formula.si !== undefined && !kept) {
       if (!groups) groups = new Set();
       groups.add(formula.si);
     }
@@ -296,6 +317,9 @@ function checkArrayFormulas(sheet: Sheet, edit: SheetStructuralEdit): void {
   }
 }
 
+/** Kinds of anchored parts whose positions the writer adjusts after a structural edit. */
+const MOVABLE_PARTS = new Set(['drawing', 'comments', 'vmlDrawing', 'image']);
+
 /** Inserts or deletes rows or columns and fixes up everything that refers to them. */
 function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit): Op {
   const sheet = sheetAt(workbook, index);
@@ -311,6 +335,10 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
     if (axis === 'row') for (const key of sheet.rows.keys()) if (key >= used) used = key + 1;
     if (used + count > limit && used > at) throw new RangeError(`Cannot insert ${count} ${axis}(s): cells would be pushed off the sheet`);
   }
+  // Content placed by cell position but stored in other parts has to move with the cells. The writer
+  // moves pictures and comments; for anything else the edit is refused rather than leave it behind.
+  const stuck = (sheet.anchored || []).filter((part) => !MOVABLE_PARTS.has(part));
+  if (stuck.length > 0) throw new RangeError(`Cannot ${kind} ${axis}s in a sheet with ${stuck.join(', ')}: not supported yet`);
   checkArrayFormulas(sheet, edit);
 
   const snapshot = snapshotOf(sheet);
@@ -352,7 +380,10 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   const hyperlinks: Hyperlink[] = [];
   for (const link of sheet.hyperlinks) {
     const range = moveRange(link.range);
-    if (range) hyperlinks.push({ ...link, range });
+    if (!range) continue;
+    // A link into this workbook names a cell that may have moved as well.
+    const location = link.location === undefined ? undefined : adjustFormula(link.location, sheet.name, refEdit);
+    hyperlinks.push(location === link.location ? { ...link, range } : { ...link, range, location });
   }
   sheet.hyperlinks = hyperlinks;
   if (sheet.dimension) sheet.dimension = moveRange(sheet.dimension);
@@ -361,6 +392,7 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
 
   // Formulas elsewhere that point into this sheet, and names defined on it.
   const others: { sheet: number; cells: CellChange[] }[] = [];
+  const otherLinks: { sheet: number; hyperlinks: Hyperlink[] }[] = [];
   workbook.sheets.forEach((other, otherIndex) => {
     if (other === sheet) return;
     const changes: CellChange[] = [];
@@ -375,6 +407,21 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
       others.push({ sheet: otherIndex, cells: setCells(other, changes) });
       other.modified = true;
     }
+    // Links elsewhere that point at a cell of this sheet follow it.
+    let links: Hyperlink[] | undefined;
+    other.hyperlinks.forEach((link, i) => {
+      if (link.location === undefined) return;
+      const location = adjustFormula(link.location, other.name, refEdit);
+      if (location === link.location) return;
+      if (!links) links = other.hyperlinks.slice();
+      links[i] = { ...link, location };
+    });
+    if (links) {
+      otherLinks.push({ sheet: otherIndex, hyperlinks: other.hyperlinks });
+      other.hyperlinks = links;
+      other.hyperlinksModified = true;
+      other.modified = true;
+    }
   });
   const definedNames = workbook.definedNames;
   workbook.definedNames = definedNames.map((name) => {
@@ -383,7 +430,25 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
     return value === name.value ? name : { ...name, value };
   });
 
-  return { type: 'restore', sheet: index, snapshot, others, definedNames, weight };
+  return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, weight };
+}
+
+/** Column settings sorted, clipped to the sheet and free of overlaps (an earlier range wins). */
+function normalizeColumns(columns: ColumnRange[]): ColumnRange[] {
+  const sorted = columns
+    .map((range) => ({ ...range, min: Math.max(Math.floor(range.min), 0), max: Math.min(Math.floor(range.max), MAX_COLS - 1) }))
+    .filter((range) => range.min <= range.max)
+    .sort((a, b) => a.min - b.min);
+  const out: ColumnRange[] = [];
+  for (const range of sorted) {
+    const last = out[out.length - 1];
+    if (last && range.min <= last.max) {
+      if (range.max <= last.max) continue;
+      range.min = last.max + 1;
+    }
+    out.push(range);
+  }
+  return out;
 }
 
 /** Applies an operation to the workbook and returns the operation that undoes it. */
@@ -401,6 +466,45 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       const grew = sheet.rowCount !== extent.rowCount || sheet.colCount !== extent.colCount;
       return { type: 'setCells', sheet: op.sheet, cells: undo, ...(grew ? { extent } : {}) };
     }
+    case 'setColumns': {
+      const sheet = sheetAt(workbook, op.sheet);
+      const previous = sheet.columns;
+      sheet.columns = normalizeColumns(op.columns);
+      sheet.columnsModified = true;
+      sheet.modified = true;
+      return { type: 'setColumns', sheet: op.sheet, columns: previous };
+    }
+    case 'setRows': {
+      const sheet = sheetAt(workbook, op.sheet);
+      for (const change of op.rows) checkCell(change.row, 0);
+      const undo: { row: number; props: RowProps }[] = [];
+      for (const change of op.rows) {
+        const current = sheet.rows.get(change.row);
+        const before: RowProps = {};
+        const next: Row = current ? { ...current } : newRow();
+        for (const key of Object.keys(change.props) as (keyof RowProps)[]) {
+          (before as Record<string, unknown>)[key] = current ? current[key] : key === 'height' || key === 'style' ? undefined : false;
+          const value = change.props[key];
+          if (value === undefined && (key === 'height' || key === 'style')) delete next[key];
+          else (next as unknown as Record<string, unknown>)[key] = value === undefined ? false : value;
+        }
+        // A row brought back to having nothing of its own is not kept.
+        if (isPlainRow(next) && !next.cells.some(() => true)) sheet.rows.delete(change.row);
+        else sheet.rows.set(change.row, next);
+        (sheet.changedRows || (sheet.changedRows = new Set())).add(change.row);
+        undo.push({ row: change.row, props: before });
+      }
+      sheet.modified = true;
+      return { type: 'setRows', sheet: op.sheet, rows: undo.reverse() };
+    }
+    case 'setMerges': {
+      const sheet = sheetAt(workbook, op.sheet);
+      const previous = sheet.merges;
+      sheet.merges = op.merges.map((range) => ({ ...range }));
+      sheet.mergesModified = true;
+      sheet.modified = true;
+      return { type: 'setMerges', sheet: op.sheet, merges: previous };
+    }
     case 'insert':
     case 'delete':
       return structural(workbook, op.sheet, { kind: op.type, axis: op.axis, at: op.at, count: op.count });
@@ -410,9 +514,17 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       restoreSnapshot(sheet, op.snapshot);
       sheet.modified = true;
       const others = op.others.map((other) => ({ sheet: other.sheet, cells: setCells(sheetAt(workbook, other.sheet), other.cells) }));
+      const otherLinks = (op.otherLinks || []).map((other) => {
+        const target = sheetAt(workbook, other.sheet);
+        const previous = target.hyperlinks;
+        target.hyperlinks = other.hyperlinks;
+        target.hyperlinksModified = true;
+        target.modified = true;
+        return { sheet: other.sheet, hyperlinks: previous };
+      });
       const definedNames = workbook.definedNames;
       workbook.definedNames = op.definedNames;
-      return { type: 'restore', sheet: op.sheet, snapshot, others, definedNames, weight: op.weight };
+      return { type: 'restore', sheet: op.sheet, snapshot, others, otherLinks, definedNames, weight: op.weight };
     }
   }
 }
@@ -454,8 +566,8 @@ export class History<M = undefined> {
    * Applies operations as one undoable step. If one of them throws, the ones
    * already applied are undone and the error is passed on.
    */
-  apply(ops: Op[], before: M, after: M): void {
-    if (ops.length === 0) return;
+  apply(ops: Op[], before: M, after: M): Op[] {
+    if (ops.length === 0) return [];
     const inverse = this.run(ops);
     this.undoStack.push({ ops: inverse, before, after });
     this.weight += weightOf(inverse);
@@ -464,6 +576,7 @@ export class History<M = undefined> {
       this.weight -= weightOf((this.undoStack.shift() as { ops: Op[] }).ops);
     }
     this.redoStack = [];
+    return inverse;
   }
 
   /** Undoes the last step and returns what was passed as `before` for it. */
@@ -506,7 +619,7 @@ function sameRecord(a: object | undefined, b: object | undefined): boolean {
   return true;
 }
 
-const sameFormat = (a: CellFormat, b: CellFormat) =>
+export const sameFormat = (a: CellFormat, b: CellFormat) =>
   a.numFmtId === b.numFmtId &&
   a.fontId === b.fontId &&
   a.fillId === b.fillId &&
@@ -517,7 +630,7 @@ const sameFormat = (a: CellFormat, b: CellFormat) =>
   sameRecord(a.protection, b.protection);
 
 /** Excel's limit on cell formats in one workbook. */
-const MAX_CELL_FORMATS = 65430;
+export const MAX_CELL_FORMATS = 65430;
 
 /** First id a file may use for its own number formats. */
 const FIRST_CUSTOM_FORMAT = 164;
