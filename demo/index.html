@@ -41,7 +41,7 @@
       .ok { color: var(--ok); background: var(--ok-bg); }
       .bad { color: var(--bad); background: var(--bad-bg); }
       .warn { color: var(--warn); background: var(--warn-bg); }
-      #grid { height: 480px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+      #grid { height: 560px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #status { font-weight: 600; overflow-wrap: anywhere; }
       #summary { font-size: 13px; color: var(--muted); }
       pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 420px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -102,23 +102,15 @@
           </label>
           <label><input type="checkbox" id="readonly" /> Salt okunur</label>
         </div>
-        <div class="row" id="edit-tools" style="margin: 0 0 10px">
-          <button id="undo" disabled>Geri al</button>
-          <button id="redo" disabled>Yinele</button>
-          <button id="row-insert">Satır ekle</button>
-          <button id="row-delete">Satır sil</button>
-          <button id="col-insert">Sütun ekle</button>
-          <button id="col-delete">Sütun sil</button>
-          <span class="muted" id="edit-state"></span>
-        </div>
+        <div class="row" style="margin: 0 0 10px"><span class="muted" id="edit-state"></span></div>
         <div id="grid"></div>
         <p class="muted" id="cell-info" style="margin: 10px 0 0"></p>
         <p class="muted">
-          Fare ya da dokunma ile seçin ve kaydırın; ok tuşları, Shift+ok, Ctrl+ok, PageUp/PageDown, Home, Ctrl+Home/End çalışır.
-          Düzenlemek için hücreye yazmaya başlayın, F2'ye basın ya da çift tıklayın; Enter yazar, Esc vazgeçer, Delete temizler.
-          Ctrl+Z / Ctrl+Y geri alır ve yineler; Ctrl+C / X / V kopyalar, keser, yapıştırır; satır ya da sütun başlığına sağ tıklayınca ekle-sil menüsü açılır.
+          Üstteki araç çubuğuyla biçimlendirin (kalın, renk, dolgu, kenarlık, hizalama, birleştirme, sayı biçimi); formül çubuğundan ya da hücrenin içinden düzenleyin.
+          Hücreye yazmaya başlayın, F2'ye basın ya da çift tıklayın; Enter yazar, Esc vazgeçer, Delete temizler. Ctrl+Z / Ctrl+Y geri alır ve yineler; Ctrl+C / X / V kopyalar, keser, yapıştırır.
+          Sağ tık menüsü kes/kopyala/yapıştır ve satır-sütun ekle-sil sunar; sütun ya da satır başlığının kenarını sürükleyerek boyutlandırın, çift tıklayarak içeriğe sığdırın.
         </p>
-        <p class="muted"><strong>Not:</strong> düzenlemeler şimdilik yalnız ekrandadır; "Yeniden kaydet ve indir" özgün dosyayı verir. Değişiklikleri dosyaya yazma sıradaki görevdir.</p>
+        <p class="muted"><strong>Kaydetme:</strong> "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; değiştirmediğiniz her şey özgün baytlarıyla kalır. İndirilen dosyayı Excel'de açıp denetleyebilirsiniz. Formüller burada hesaplanmaz; Excel dosyayı açarken yeniden hesaplar.</p>
       </section>
 
       <section>
@@ -259,29 +251,12 @@
         viewer.textContent = lines.join('\n') || '(boş)';
       }
 
+      let editor = null;
       let view = null;
       let changes = 0;
 
       function refreshTools() {
-        const editable = !!view && !$('readonly').checked;
-        $('undo').disabled = !editable || !view.history.canUndo;
-        $('redo').disabled = !editable || !view.history.canRedo;
-        for (const id of ['row-insert', 'row-delete', 'col-insert', 'col-delete']) $(id).disabled = !editable;
         $('edit-state').textContent = !view ? '' : $('readonly').checked ? 'Salt okunur.' : changes === 0 ? 'Değişiklik yok.' : `${changes} değişiklik adımı (geri al/yinele dahil).`;
-      }
-
-      // Structural commands act on the rows or columns the selection covers.
-      function structural(action) {
-        if (!view) return;
-        const { range } = view.selection;
-        try {
-          if (action === 'row-insert') view.insertRows(range.top, range.bottom - range.top + 1);
-          else if (action === 'row-delete') view.deleteRows(range.top, range.bottom - range.top + 1);
-          else if (action === 'col-insert') view.insertColumns(range.left, range.right - range.left + 1);
-          else view.deleteColumns(range.left, range.right - range.left + 1);
-        } catch (error) {
-          $('edit-state').textContent = `Yapılamadı: ${error.message}`;
-        }
       }
 
       function describeSheet(workbook, index) {
@@ -307,7 +282,8 @@
 
       async function showPreview(record) {
         const section = $('preview-section');
-        if (view) view.destroy();
+        if (editor) editor.destroy();
+        editor = null;
         view = null;
         section.hidden = true;
         $('preview-note').textContent = '';
@@ -323,7 +299,7 @@
             $('preview-note').textContent = `${describeSheet(workbook, index)} Model ${ms.toFixed(1)} ms'de okundu.`;
           };
           changes = 0;
-          view = new BymOffice.WorkbookView($('grid'), workbook, {
+          editor = new BymOffice.SpreadsheetEditor($('grid'), workbook, {
             locale: $('locale').value,
             readOnly: $('readonly').checked,
             onChange: () => {
@@ -337,7 +313,9 @@
               describeSelection(workbook, view.selection, index);
             },
           });
+          view = editor.view;
           window.__view = view;
+          window.__editor = editor;
           refreshTools();
           note(view.activeSheet);
           describeSelection(workbook, view.selection, view.activeSheet);
@@ -432,16 +410,13 @@
 
       $('locale').addEventListener('change', () => {
         if (!view) return;
-        view.setLocale($('locale').value);
+        editor.setLocale($('locale').value);
         describeSelection(view.workbook, view.selection, view.activeSheet);
       });
 
-      $('undo').addEventListener('click', () => view && view.undo());
-      $('redo').addEventListener('click', () => view && view.redo());
-      for (const id of ['row-insert', 'row-delete', 'col-insert', 'col-delete']) $(id).addEventListener('click', () => structural(id));
       // Switching read-only keeps the view, and with it what can be undone.
       $('readonly').addEventListener('change', () => {
-        if (view) view.setReadOnly($('readonly').checked);
+        if (editor) editor.setReadOnly($('readonly').checked);
         refreshTools();
       });
 
@@ -502,6 +477,8 @@
 
       saveButton.addEventListener('click', async () => {
         if (!selected || !selected.file) return;
+        // A cell still being edited is written first, as leaving it would do.
+        if (view && view.isEditing) view.commitEditing();
         const url = URL.createObjectURL(new Blob([await selected.file.save()]));
         const link = document.createElement('a');
         link.href = url;

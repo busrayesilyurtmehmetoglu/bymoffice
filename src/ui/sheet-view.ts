@@ -7,13 +7,24 @@
 // renderGrid(). Nothing in this module touches the DOM at import time, so it
 // can be imported where there is no document.
 
-import { createLayout, hitTest, maxScroll, rangeRect, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
-import { createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
+import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
+import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
 import { MAX_COLS, MAX_ROWS, cellName, getCell, parseCellRef, rangeName, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
-import { resolveCellStyle, resolveColor } from '../model/sheet/color';
+import { getUiStrings, type UiStrings } from './strings';
+import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
 import { clearRange, copyRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
+import {
+  formatAt,
+  formatRange,
+  mergeRange,
+  setColumnWidth as columnWidthOps,
+  setRowHeight as rowHeightOps,
+  unmergeRange,
+  type StylePatch,
+} from '../ops/format';
+import { CalcEngine } from '../calc/engine';
 import { History, type Op } from '../ops/ops';
 import { DEFAULT_GRID_THEME, renderGrid, type GridSelection } from '../render/grid';
 import { cssFont } from '../render/text';
@@ -31,8 +42,24 @@ export interface WorkbookViewOptions {
   onSheetChange?(sheetIndex: number): void;
   /** No editing: no cell editor, no paste, cut, delete, undo or structural commands. Copy still works. Default false. */
   readOnly?: boolean;
+  /** Recalculate formulas after every change. Default true. */
+  calculate?: boolean;
   /** Called after every change to the workbook, including undo and redo. */
   onChange?(change: { sheets: number[] }): void;
+  /**
+   * Called with every message the view has for the user, in the language of
+   * the view: what an action was refused for ('error'), or a hint ('info').
+   * The same text goes to the view's live region for assistive technology.
+   */
+  onNotice?(notice: { message: string; kind: 'error' | 'info' }): void;
+  /** Called when cell editing starts, on every change of the text being edited, and when it ends. */
+  onEditingChange?(state: { editing: boolean; text: string }): void;
+  /**
+   * An element around the view (an editor shell with a formula bar, say).
+   * While the focus is inside it, an open edit is not written just because
+   * the focus left the cell editor.
+   */
+  focusScope?: HTMLElement;
 }
 
 /**
@@ -45,9 +72,20 @@ export interface HistoryMark {
   range: CellRange;
   /** Indexes of the sheets the step may have changed. */
   sheets: number[];
-  /** Rows or columns were inserted or deleted, so sizes and positions changed too. */
+  /** Rows, columns or merged cells changed (inserted, deleted, resized, hidden), so sizes and positions changed too. */
   structural: boolean;
+  /**
+   * The cells the step wrote, for recalculating what depends on them; missing
+   * when rows or columns moved or too many cells changed, which recalculates everything.
+   */
+  cells?: { sheet: number; row: number; col: number }[];
 }
+
+/** Longest a recalculation holds the page before it leaves the rest for the next turn. */
+const CALC_SLICE_MS = 250;
+
+/** Above this many written cells a step recalculates every formula instead of tracking what depends on them. */
+const MAX_RECALC_CELLS = 100000;
 
 /** The cell being edited. */
 interface Edit {
@@ -101,9 +139,18 @@ interface MergeIndex {
   maxBottom: number[];
 }
 
+/** A column or row whose size is being dragged. */
+interface Resize {
+  axis: 'row' | 'col';
+  index: number;
+  /** Canvas coordinate of the edge the column or row starts at. */
+  origin: number;
+}
+
 interface Drag {
   pointerId: number;
-  mode: 'cell' | 'row' | 'col' | 'all';
+  mode: 'cell' | 'row' | 'col' | 'all' | 'resize';
+  resize?: Resize;
   /** Last pointer position on the canvas. */
   x: number;
   y: number;
@@ -121,6 +168,8 @@ interface Touch {
   moved: boolean;
   /** The touch opened the menu (a long press), so lifting the finger is not a tap. */
   consumed: boolean;
+  /** The touch began on a border between headers: it resizes once it moves, and is a tap on the header if it does not. */
+  resize?: Resize;
 }
 
 /**
@@ -145,31 +194,47 @@ const MAX_EXTEND_STEPS = 4096;
 
 /** How long a touch has to rest on a header to open its menu, and how close in time and place two taps make a double tap. */
 const LONG_PRESS_MS = 550;
+/** How near a border between two headers the pointer has to be to resize, for a mouse and for a finger. */
+const RESIZE_REACH_MOUSE = 4;
+const RESIZE_REACH_TOUCH = 10;
+/** Largest sizes a file can state: 255 characters and 409.5 points. */
+const MAX_COLUMN_PIXELS = 1785;
+const MAX_ROW_PIXELS = 546;
+/** Rows looked at to fit a column to its content. */
+const AUTO_FIT_ROWS = 2000;
+/** Space the grid leaves around the text of a cell, both sides together. */
+const CELL_TEXT_MARGIN = 8;
 const DOUBLE_TAP_MS = 500;
 
-const LABEL = 'Spreadsheet';
-const INPUT_LABEL = 'Cell editor';
-const ACTION_FAILED = 'The action could not be completed';
-const SHEET_LABEL = 'Sheet';
-const CHART_SHEET_NOTE = 'This sheet is a chart sheet. Charts are not shown yet.';
-const OTHER_SHEET_NOTE = 'This kind of sheet is not shown yet.';
+/** Language of the view's own words: the tag given as `locale`, else the browser's. */
+function resolveStrings(locale: string | FormatLocale | undefined): UiStrings {
+  return getUiStrings(typeof locale === 'string' ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
+}
 
 // Cosmetic rules only; everything the layout depends on is set inline so the
 // view still works where a style element is not allowed.
 const STYLE_TEXT =
   '.bym-view{font:12px/1.2 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;color:#202124;background:#fff}' +
-  '.bym-focus-ring .bym-scroller,.bym-tab:focus{outline:2px solid #1a73e8;outline-offset:-2px}' +
+  '.bym-focus-ring .bym-scroller,.bym-tab:focus{outline:2px solid #1a7f45;outline-offset:-2px}' +
   '.bym-tab:focus:not(:focus-visible){outline:none}' +
-  '.bym-input{color:#000;background:#fff}' +
+  '.bym-input{color:#000;background:#fff;box-shadow:none}' +
   '.bym-menu{min-width:160px;padding:4px 0;background:#fff;border:1px solid #dadce0;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.25)}' +
-  '.bym-menu-item{-webkit-appearance:none;appearance:none;margin:0;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;' +
+  // Sizes are stated in full: a page rule for every button or textarea must not reach into the view.
+  '.bym-menu-item{-webkit-appearance:none;appearance:none;display:block;float:none;box-sizing:border-box;width:auto;height:auto;min-width:0;min-height:0;' +
+  'max-width:none;max-height:none;margin:0;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;line-height:1.2;' +
   'text-align:left;padding:8px 16px;white-space:nowrap;cursor:pointer}' +
   '.bym-menu-item:hover,.bym-menu-item:focus{background:#e8eaed;outline:none}' +
+  '.bym-menu-item:disabled{color:#9aa0a6;background:transparent;cursor:default}' +
+  '.bym-menu-separator{height:1px;margin:4px 0;background:#dadce0}' +
+  '.bym-resize-guide{background:#1a7f45}' +
   '.bym-tabs{background:#f1f3f4;border-top:1px solid #dadce0}' +
-  '.bym-tab{-webkit-appearance:none;appearance:none;flex:none;margin:0;border:0;border-right:1px solid #dadce0;border-radius:0;' +
-  'background:transparent;color:#444746;font:inherit;padding:0 14px;min-height:32px;white-space:nowrap;cursor:pointer}' +
+  '.bym-tab{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;width:auto;height:auto;min-width:0;' +
+  'max-width:none;max-height:none;margin:0;border:0;border-right:1px solid #dadce0;border-radius:0;' +
+  'background:transparent;color:#444746;font:inherit;line-height:1.2;padding:0 14px;min-height:32px;white-space:nowrap;cursor:pointer}' +
+  // A finger needs more to hit than a mouse pointer.
+  '@media (pointer:coarse){.bym-tab{min-height:40px}}' +
   '.bym-tab:hover{background:#e8eaed}' +
-  '.bym-tab[aria-selected="true"]{background:#fff;color:#0b57d0;font-weight:600}' +
+  '.bym-tab[aria-selected="true"]{background:#fff;color:#1a7f45;font-weight:600}' +
   '.bym-note{color:#5f6368;font-size:14px}';
 
 /** One style element per document or shadow root, shared by the views in it. */
@@ -313,11 +378,25 @@ function resolveLocale(locale: string | FormatLocale | undefined): FormatLocale 
   return getLocale(locale !== undefined ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
 }
 
+/**
+ * Column width in pixels -> the width in characters a file stores for it: the
+ * inverse of columnWidthToPixels(), in the 1/256 steps files use.
+ */
+function pixelsToColumnWidth(pixels: number): number {
+  if (!(pixels > 0)) return 0;
+  const digit = DEFAULT_DIGIT_WIDTH;
+  // Aimed at the middle of the pixel, so that rounding to 1/256 cannot leave it.
+  return Math.max(Math.round(((pixels + 0.5) * 256) / digit - Math.floor(128 / digit)), 0) / 256;
+}
+
 export class WorkbookView {
   readonly workbook: Workbook;
   /** Undo and redo. Each step carries the sheet and selection to go back to. */
   readonly history: History<HistoryMark>;
   private locale: FormatLocale;
+  private engine: CalcEngine | undefined;
+  private calcTimer: ReturnType<typeof setTimeout> | undefined;
+  private strings: UiStrings;
   private locked: boolean;
 
   private readonly container: HTMLElement;
@@ -369,6 +448,10 @@ export class WorkbookView {
   /** Names the last copy on the clipboard, so that a paste can tell this view's own cells from any other text. */
   private copyId = '';
   private committing = false;
+  /** Set by the copy and cut handlers, so that the menu can tell whether execCommand reached them. */
+  private clipboardHandled = false;
+  private guide: HTMLDivElement | undefined;
+  private measureCanvas: CanvasRenderingContext2D | null | undefined;
   /** The last pointer was a finger: editing has to ask for the on-screen keyboard. */
   private touchInput = false;
   private keyboardShown = false;
@@ -385,6 +468,7 @@ export class WorkbookView {
     this.workbook = workbook;
     this.options = options;
     this.locale = resolveLocale(options.locale);
+    this.strings = resolveStrings(options.locale);
     this.locked = options.readOnly === true;
     this.history = new History<HistoryMark>(workbook);
     this.sheetIndex = this.initialSheet();
@@ -393,7 +477,7 @@ export class WorkbookView {
     const root = document.createElement('div');
     root.className = 'bym-view';
     root.setAttribute('role', 'group');
-    root.setAttribute('aria-label', LABEL);
+    root.setAttribute('aria-label', this.strings.spreadsheet);
     // The scroll mapping assumes offsets that grow to the right, whatever the page direction is.
     root.style.cssText = 'position:relative;display:flex;flex-direction:column;width:100%;height:100%;box-sizing:border-box;overflow:hidden;direction:ltr';
 
@@ -406,7 +490,9 @@ export class WorkbookView {
 
     const canvas = document.createElement('canvas');
     canvas.className = 'bym-canvas';
-    canvas.style.cssText = 'display:block;position:-webkit-sticky;top:0;left:0';
+    canvas.style.cssText =
+      'display:block;position:-webkit-sticky;top:0;left:0;float:none;box-sizing:content-box;margin:0;padding:0;border:0;' +
+      'min-width:0;min-height:0;max-width:none;max-height:none';
     canvas.style.position = 'sticky';
 
     const spacer = document.createElement('div');
@@ -430,7 +516,7 @@ export class WorkbookView {
 
     const input = document.createElement('textarea');
     input.className = 'bym-input';
-    input.setAttribute('aria-label', INPUT_LABEL);
+    input.setAttribute('aria-label', this.strings.cellEditor);
     // No on-screen keyboard until a cell is edited.
     input.setAttribute('inputmode', 'none');
     input.setAttribute('autocomplete', 'off');
@@ -441,8 +527,9 @@ export class WorkbookView {
     input.rows = 1;
     input.readOnly = this.locked;
     input.style.cssText =
-      'position:absolute;z-index:2;left:0;top:0;width:1px;height:1px;margin:0;padding:0;border:0;outline:none;resize:none;overflow:hidden;' +
-      'box-sizing:border-box;opacity:0;pointer-events:none;white-space:pre;line-height:1.2;border-radius:0';
+      'position:absolute;z-index:2;left:0;top:0;display:block;float:none;width:1px;height:1px;min-width:0;min-height:0;max-width:none;max-height:none;' +
+      'margin:0;padding:0;border:0;outline:none;resize:none;overflow:hidden;-webkit-appearance:none;appearance:none;' +
+      'box-sizing:border-box;opacity:0;pointer-events:none;white-space:pre;font:12px/1.2 sans-serif;border-radius:0';
 
     this.root = root;
     this.input = input;
@@ -480,6 +567,10 @@ export class WorkbookView {
     canvas.style.touchAction = 'manipulation';
     tabs.addEventListener('click', this.onTabClick);
     root.addEventListener('mousedown', this.onRootMouseDown);
+    root.addEventListener('focusout', this.onFocusOut);
+    if (options.focusScope) options.focusScope.addEventListener('focusout', this.onFocusOut);
+    // Not passive: a finger on the border between two headers resizes instead of scrolling.
+    canvas.addEventListener('touchstart', this.onTouchStart, { passive: false });
     scroller.addEventListener('focus', this.onScrollerFocus);
     if (this.pointerEvents) {
       canvas.addEventListener('pointerdown', this.onPointerDown);
@@ -564,9 +655,14 @@ export class WorkbookView {
     return { scrollX: state.scrollX, scrollY: state.scrollY, width: this.width, height: this.height, devicePixelRatio: this.dpr };
   }
 
-  /** Changes the language of number and date formats and redraws. */
+  /** Changes the language of number and date formats, and of the view's own labels, and redraws. */
   setLocale(locale: string | FormatLocale): void {
     this.locale = resolveLocale(locale);
+    // The view's own words follow a language tag; a locale object only changes formats.
+    if (typeof locale === 'string') this.strings = resolveStrings(locale);
+    this.root.setAttribute('aria-label', this.strings.spreadsheet);
+    this.input.setAttribute('aria-label', this.strings.cellEditor);
+    this.showSheet();
     this.render();
     this.announce();
   }
@@ -585,6 +681,7 @@ export class WorkbookView {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.calcTimer !== undefined) clearTimeout(this.calcTimer);
     this.endDrag();
     this.endTouch();
     this.edit = undefined;
@@ -609,6 +706,9 @@ export class WorkbookView {
     this.scroller.removeEventListener('scroll', this.onScroll);
     this.tabs.removeEventListener('click', this.onTabClick);
     this.root.removeEventListener('mousedown', this.onRootMouseDown);
+    this.root.removeEventListener('focusout', this.onFocusOut);
+    if (this.options.focusScope) this.options.focusScope.removeEventListener('focusout', this.onFocusOut);
+    this.canvas.removeEventListener('touchstart', this.onTouchStart);
     this.scroller.removeEventListener('focus', this.onScrollerFocus);
     const canvas = this.canvas;
     canvas.removeEventListener('pointerdown', this.onPointerDown);
@@ -703,9 +803,9 @@ export class WorkbookView {
       else if (right > this.tabs.scrollLeft + this.tabs.clientWidth) this.tabs.scrollLeft = right - this.tabs.clientWidth;
     }
 
-    this.scroller.setAttribute('aria-label', `${SHEET_LABEL} ${state.sheet.name}`);
+    this.scroller.setAttribute('aria-label', this.strings.sheet(state.sheet.name));
     const kind = state.sheet.kind;
-    this.note.textContent = kind === 'worksheet' ? '' : kind === 'chartsheet' ? CHART_SHEET_NOTE : OTHER_SHEET_NOTE;
+    this.note.textContent = kind === 'worksheet' ? '' : kind === 'chartsheet' ? this.strings.chartSheetNote : this.strings.otherSheetNote;
     this.note.style.display = kind === 'worksheet' ? 'none' : 'block';
 
     this.growExtent(state.scrollX, state.scrollY);
@@ -1012,7 +1112,7 @@ export class WorkbookView {
     if (value !== '') text += ` ${value}`;
     const merge = mergeIn(this.merges(), active.row, active.col);
     const single = range.top === range.bottom && range.left === range.right;
-    if (!single && !(merge && sameRange(merge, range))) text += `, ${rangeName(range)} selected`;
+    if (!single && !(merge && sameRange(merge, range))) text += `, ${this.strings.selected(rangeName(range))}`;
     this.live.textContent = text;
     this.syncInput();
   }
@@ -1021,6 +1121,13 @@ export class WorkbookView {
 
   private onKeyDown = (event: KeyboardEvent): void => {
     if (this.destroyed || event.defaultPrevented) return;
+    if (event.key === 'Escape' && this.drag && this.drag.resize) {
+      // Gives up a resize that is being dragged: nothing changes.
+      this.endDrag();
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (this.edit) {
       this.onEditKey(event);
       return;
@@ -1099,6 +1206,21 @@ export class WorkbookView {
         break;
       case 'F2':
         this.startEditing();
+        break;
+      case 'b':
+      case 'B':
+      case 'i':
+      case 'I':
+      case 'u':
+      case 'U':
+        if (!ctrl || shift || this.locked) handled = false;
+        else {
+          // Switches on what the active cell shows.
+          const font = this.selectionFormat.font;
+          const key = event.key.toLowerCase();
+          const patch: StylePatch = key === 'b' ? { bold: !font.bold } : key === 'i' ? { italic: !font.italic } : { underline: font.underline === 'none' ? 'single' : 'none' };
+          this.attempt(() => this.format(patch));
+        }
         break;
       case 'z':
       case 'Z':
@@ -1264,6 +1386,127 @@ export class WorkbookView {
       // Only fails on an element that is not rendered; the caret position is cosmetic.
     }
     this.placeInput();
+    this.emitEditing();
+  }
+
+  /** While editing: the text in the editor. Otherwise: the edit text of the active cell. */
+  get editText(): string {
+    if (this.edit) return this.input.value;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return '';
+    return editTextAt(this.workbook, state.sheet, state.active.row, state.active.col, { locale: this.locale });
+  }
+
+  /** Replaces the text being edited; starts editing the active cell when nothing is being edited. Does not move focus. */
+  setEditText(text: string): void {
+    if (this.destroyed || this.locked) return;
+    if (!this.edit) {
+      if (this.state().sheet.kind !== 'worksheet') return;
+      this.closeMenu();
+      this.beginEdit();
+    }
+    this.input.value = String(text);
+    this.placeInput();
+    this.emitEditing();
+  }
+
+  /**
+   * Gives keyboard focus to the grid. The focus ring is for people who arrive
+   * with the keyboard; code that hands the focus back after a click on a
+   * toolbar leaves it off, which is the default.
+   */
+  focus(options?: { ring?: boolean }): void {
+    if (this.destroyed) return;
+    const ring = options !== undefined && options.ring === true;
+    this.focusInput(!ring);
+    if (ring) this.root.classList.add('bym-focus-ring');
+  }
+
+  /**
+   * What an error of the operations layer says, in the language of the view.
+   * Errors it does not know give the general "could not be completed".
+   */
+  localizeError(error: unknown): string {
+    const strings = this.strings;
+    const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+    let match: RegExpExecArray | null;
+    if (message === 'Too many cells to format at once') return strings.tooManyCells;
+    if ((match = /^Too many rows to (format|resize|change) at once$/.exec(message))) return strings.tooManyRows(match[1] as 'format' | 'resize' | 'change');
+    if (message === 'Whole rows or columns cannot be merged') return strings.cannotMergeWhole;
+    if ((match = /^Cannot insert (\d+) (row|col)\(s\): cells would be pushed off the sheet$/.exec(message))) return strings.insertPushesOff(Number(match[1]), match[2]);
+    if ((match = /^Cannot (insert|delete) (row|col)s through the array formula in (.+)$/.exec(message))) {
+      return strings.arrayFormulaBlocks(match[1] as 'insert' | 'delete', match[2], match[3]);
+    }
+    if ((match = /^Cannot (insert|delete) (row|col)s in a sheet with (.+): not supported yet$/.exec(message))) {
+      return strings.notSupportedWith(match[1] as 'insert' | 'delete', match[2], match[3]);
+    }
+    if ((match = /^Cannot paste more than (\d+) cells at once$/.exec(message))) return strings.pasteTooLarge(match[1]);
+    if (message === 'The workbook has too many cell formats') return strings.tooManyFormats;
+    if (message === 'The formula cannot be read') return strings.badFormula;
+    if (message === 'The range is too large to copy') return strings.copyTooLarge;
+    return strings.actionFailed;
+  }
+
+  /** Says something to the user: in the live region, and to the host page if it listens. */
+  private notify(message: string, kind: 'error' | 'info'): void {
+    this.live.textContent = message;
+    if (this.options.onNotice) this.options.onNotice({ message, kind });
+  }
+
+  private emitEditing(): void {
+    if (this.options.onEditingChange) this.options.onEditingChange({ editing: this.edit !== undefined, text: this.editText });
+  }
+
+  /** Applies a style patch to the selection as one undo step. No-op when read-only. */
+  format(patch: StylePatch): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    this.applyOps(formatRange(this.workbook, this.sheetIndex, this.state().range, patch));
+  }
+
+  /** Merges the selection into one cell, or splits the merges it touches. */
+  merge(): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    const range = { ...this.state().range };
+    this.applyOps(mergeRange(this.workbook, this.sheetIndex, range), { active: { row: range.top, col: range.left }, range });
+  }
+
+  unmerge(): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    this.applyOps(unmergeRange(this.workbook, this.sheetIndex, this.state().range));
+  }
+
+  /** The format of the active cell (font, fill, border, alignment, numFmt), for a toolbar to reflect. */
+  get selectionFormat(): ResolvedCellStyle {
+    const state = this.state();
+    return formatAt(this.workbook, state.sheet, state.active.row, state.active.col);
+  }
+
+  /** Whether the active cell is part of a merged range. */
+  get selectionMerged(): boolean {
+    const active = this.state().active;
+    return mergeIn(this.merges(), active.row, active.col) !== undefined;
+  }
+
+  /** Width in characters / height in points; undefined restores the default. One undo step. */
+  setColumnWidth(first: number, last: number, width: number | undefined): void {
+    if (this.destroyed || this.locked) return;
+    const a = toIndex(first, MAX_COLS);
+    const b = toIndex(last, MAX_COLS);
+    if (width !== undefined && (typeof width !== 'number' || Number.isNaN(width))) throw new RangeError('Invalid column width');
+    this.commitEditing();
+    this.applyOps(columnWidthOps(this.workbook, this.sheetIndex, Math.min(a, b), Math.max(a, b), width));
+  }
+
+  setRowHeight(first: number, last: number, height: number | undefined): void {
+    if (this.destroyed || this.locked) return;
+    const a = toIndex(first, MAX_ROWS);
+    const b = toIndex(last, MAX_ROWS);
+    if (height !== undefined && (typeof height !== 'number' || Number.isNaN(height))) throw new RangeError('Invalid row height');
+    this.commitEditing();
+    this.applyOps(rowHeightOps(this.sheetIndex, Math.min(a, b), Math.max(a, b), height));
   }
 
   /** Writes the editor's text to the cell and closes the editor. Returns whether a cell was being edited. */
@@ -1294,7 +1537,7 @@ export class WorkbookView {
       this.commitEditing();
       return true;
     } catch (error) {
-      this.live.textContent = error instanceof Error && error.message ? error.message : ACTION_FAILED;
+      this.notify(this.localizeError(error), 'error');
       return false;
     }
   }
@@ -1418,7 +1661,7 @@ export class WorkbookView {
           ? { active: { row: at, col: state.active.col }, range: { top: at, bottom: at + count - 1, left: 0, right: MAX_COLS - 1 } }
           : { active: { row: state.active.row, col: at }, range: { top: 0, bottom: MAX_ROWS - 1, left: at, right: at + count - 1 } };
     }
-    this.applyOps([{ type: kind, sheet: this.sheetIndex, axis, at, count }], after, true);
+    this.applyOps([{ type: kind, sheet: this.sheetIndex, axis, at, count }], after);
   }
 
   /** Ctrl with plus or minus on whole rows or columns. Returns false when the selection is neither. */
@@ -1434,9 +1677,56 @@ export class WorkbookView {
     return true;
   }
 
-  private mark(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): HistoryMark {
+  private mark(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }, cells?: HistoryMark['cells']): HistoryMark {
     const from = selection || this.state();
-    return { sheet: this.sheetIndex, active: { ...from.active }, range: { ...from.range }, sheets, structural };
+    return { sheet: this.sheetIndex, active: { ...from.active }, range: { ...from.range }, sheets, structural, cells };
+  }
+
+  /**
+   * Recalculates the formulas that depend on what a step changed. Without a
+   * list of cells (rows or columns moved) every formula is calculated again.
+   * A failure here must never get in the way of editing: the cells then keep
+   * the values they had.
+   */
+  private recalculate(cells: HistoryMark['cells']): number[] {
+    if (this.options.calculate === false) return [];
+    try {
+      if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      if (!cells) this.engine.invalidate();
+      const changed = cells ? this.engine.recalculate(cells) : this.engine.recalculate();
+      if (this.engine.incomplete) this.continueCalculation();
+      return changed.map((entry) => entry.sheet);
+    } catch (error) {
+      this.engine = undefined;
+      return [];
+    }
+  }
+
+  /**
+   * A calculation that ran out of its time leaves the rest for later, so that the
+   * page keeps answering; the rest is calculated in further turns, each drawn as it ends.
+   */
+  private continueCalculation(): void {
+    if (this.calcTimer !== undefined) return;
+    this.calcTimer = setTimeout(() => {
+      this.calcTimer = undefined;
+      const engine = this.engine;
+      if (this.destroyed || !engine || !engine.incomplete) return;
+      let sheets: number[] = [];
+      try {
+        sheets = engine.recalculate([]).map((entry) => entry.sheet);
+        if (engine.incomplete) this.continueCalculation();
+      } catch (error) {
+        this.engine = undefined;
+      }
+      this.schedule();
+      if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
+    }, 0);
+  }
+
+  /** Adds the sheets a recalculation wrote to the ones a step reports as changed. */
+  private addSheets(sheets: number[], more: number[]): void {
+    for (let i = 0; i < more.length; i++) if (sheets.indexOf(more[i]) < 0) sheets.push(more[i]);
   }
 
   /**
@@ -1444,13 +1734,39 @@ export class WorkbookView {
    * up to date. Returns false when there was nothing to apply. An operation
    * that throws leaves the workbook and the view as they were.
    */
-  private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }, structural = false): boolean {
+  private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }): boolean {
     if (ops.length === 0) return false;
     const sheets: number[] = [];
-    for (let i = 0; i < ops.length; i++) if (sheets.indexOf(ops[i].sheet) < 0) sheets.push(ops[i].sheet);
+    // Anything but a change of cells can change sizes, hidden runs or merged cells of its sheet.
+    let structural = false;
+    let moves = false;
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
+      if (op.type !== 'setCells') structural = true;
+      if (op.type === 'insert' || op.type === 'delete') moves = true;
+    }
     // Rows and columns that move take the formulas of every other sheet with them.
-    if (structural) for (let i = 0; i < this.workbook.sheets.length; i++) if (sheets.indexOf(i) < 0) sheets.push(i);
-    this.history.apply(ops, this.mark(sheets, structural), this.mark(sheets, structural, after));
+    if (moves) for (let i = 0; i < this.workbook.sheets.length; i++) if (sheets.indexOf(i) < 0) sheets.push(i);
+    const before = this.mark(sheets, structural);
+    const done = this.mark(sheets, structural, after);
+    const inverse = this.history.apply(ops, before, done);
+    // The cells written, so that what depends on them can be calculated again after the step and after
+    // undoing it. They are read from the inverse: it also names the cells an operation changed on its
+    // own, such as the dependants of a shared formula whose master was overwritten.
+    let cells: HistoryMark['cells'] = moves ? undefined : [];
+    for (let i = 0; cells && i < inverse.length; i++) {
+      const op = inverse[i];
+      if (op.type !== 'setCells') {
+        if (op.type === 'restore') cells = undefined;
+        continue;
+      }
+      if (cells.length + op.cells.length > MAX_RECALC_CELLS) cells = undefined;
+      else for (let k = 0; k < op.cells.length; k++) cells.push({ sheet: op.sheet, row: op.cells[k].row, col: op.cells[k].col });
+    }
+    before.cells = cells;
+    done.cells = cells;
+    this.addSheets(sheets, this.recalculate(cells));
     this.afterChange(sheets, structural, after);
     return true;
   }
@@ -1466,7 +1782,9 @@ export class WorkbookView {
     if (!step) return false;
     const meta = step.meta;
     if (meta.sheet !== this.sheetIndex && meta.sheet >= 0 && meta.sheet < this.workbook.sheets.length) this.setActiveSheet(meta.sheet);
-    this.afterChange(meta.sheets, meta.structural, meta);
+    const sheets = meta.sheets.slice();
+    this.addSheets(sheets, this.recalculate(meta.cells));
+    this.afterChange(sheets, meta.structural, meta);
     return true;
   }
 
@@ -1501,7 +1819,7 @@ export class WorkbookView {
     try {
       run();
     } catch (error) {
-      this.live.textContent = error instanceof Error && error.message ? error.message : ACTION_FAILED;
+      this.notify(this.localizeError(error), 'error');
     }
   }
 
@@ -1533,6 +1851,7 @@ export class WorkbookView {
       if (this.hasFocus()) this.refocus();
     }
     this.syncInput();
+    this.emitEditing();
   }
 
   /** On a touch device the on-screen keyboard has to be asked for. */
@@ -1659,6 +1978,7 @@ export class WorkbookView {
       this.beginEdit();
     }
     this.placeInput();
+    this.emitEditing();
   };
 
   private onCompositionStart = (): void => {
@@ -1666,6 +1986,7 @@ export class WorkbookView {
     // An input method composes in place; the editor has to be there from its first key.
     this.selectIdleText();
     this.beginEdit(this.input.value);
+    this.emitEditing();
   };
 
   private onFocus = (): void => {
@@ -1679,7 +2000,19 @@ export class WorkbookView {
     // The scrolling element can take the focus (a click on its scroll bar in some browsers); it hands it straight back.
     if (event.relatedTarget === this.scroller) return;
     this.root.classList.remove('bym-focus-ring');
-    // Leaving the editor any other way than Escape keeps what was typed.
+  };
+
+  /**
+   * The focus left an element of the view or of the focus scope. If it went
+   * outside both (or nowhere), an open edit is written: leaving the editor any
+   * other way than Escape keeps what was typed. Inside them - a formula bar, a
+   * toolbar button, a sheet tab - the edit goes on.
+   */
+  private onFocusOut = (event: FocusEvent): void => {
+    if (this.destroyed || this.refocusing || !this.edit) return;
+    const to = event.relatedTarget as Node | null;
+    const scope = this.options.focusScope;
+    if (to && (this.root.contains(to) || (scope !== undefined && scope.contains(to)))) return;
     this.tryCommit();
   };
 
@@ -1707,6 +2040,7 @@ export class WorkbookView {
           const input = this.input;
           input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end');
           this.placeInput();
+          this.emitEditing();
         } else {
           if (this.tryCommit() && !event.ctrlKey && !event.metaKey) this.moveBy(shift ? -1 : 1, 0, false, false);
         }
@@ -1739,6 +2073,7 @@ export class WorkbookView {
     const data = event.clipboardData;
     if (this.destroyed || this.edit || !data) return;
     event.preventDefault();
+    this.clipboardHandled = true;
     this.attempt(() => {
       const copied = cut ? this.cut() : this.copy();
       data.setData('text/plain', copied.text);
@@ -1767,9 +2102,10 @@ export class WorkbookView {
    * point. Returns false when the point is not on a header.
    */
   private openHeaderMenu(x: number, y: number): boolean {
-    if (this.locked || this.state().sheet.kind !== 'worksheet') return false;
+    if (this.state().sheet.kind !== 'worksheet') return false;
     const hit = hitTest(this.layout(), x, y);
-    if (hit.area !== 'rowHeader' && hit.area !== 'colHeader') return false;
+    if (hit.area === 'cell') return this.openCellMenu(x, y, hit.row, hit.col);
+    if (this.locked || (hit.area !== 'rowHeader' && hit.area !== 'colHeader')) return false;
     this.closeMenu();
     if (!this.tryCommit()) return false;
     const rows = hit.area === 'rowHeader';
@@ -1785,12 +2121,17 @@ export class WorkbookView {
     const first = rows ? range.top : range.left;
     const count = (rows ? range.bottom : range.right) - first + 1;
     const axis = rows ? 'row' : 'col';
-    const noun = rows ? (count === 1 ? 'row' : `${count} rows`) : count === 1 ? 'column' : `${count} columns`;
+    const strings = this.strings;
     const items: MenuItem[] = [
-      { label: `Insert ${noun} ${rows ? 'above' : 'left'}`, action: () => this.attempt(() => this.structural('insert', axis, first, count)) },
-      { label: `Insert ${noun} ${rows ? 'below' : 'right'}`, action: () => this.attempt(() => this.structural('insert', axis, first + count, count)) },
-      { label: `Delete ${noun}`, action: () => this.attempt(() => this.structural('delete', axis, first, count)) },
+      { label: rows ? strings.insertRowsAbove(count) : strings.insertColumnsLeft(count), action: () => this.attempt(() => this.structural('insert', axis, first, count)) },
+      { label: rows ? strings.insertRowsBelow(count) : strings.insertColumnsRight(count), action: () => this.attempt(() => this.structural('insert', axis, first + count, count)) },
+      { label: rows ? strings.deleteRows(count) : strings.deleteColumns(count), action: () => this.attempt(() => this.structural('delete', axis, first, count)) },
     ];
+    this.showMenu(items, x, y);
+    return true;
+  }
+
+  private showMenu(items: MenuItem[], x: number, y: number): void {
     this.menu = new ContextMenu(
       this.root,
       items,
@@ -1804,8 +2145,224 @@ export class WorkbookView {
       // Opened under a finger that is still down.
       this.touch !== undefined,
     );
+  }
+
+  /** The menu of a cell: clipboard, clearing, and rows and columns of the selection. */
+  private openCellMenu(x: number, y: number, row: number, col: number): boolean {
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    let range = this.state().range;
+    // A cell outside the selection is selected first, as a click would.
+    if (row < range.top || row > range.bottom || col < range.left || col > range.right) {
+      this.collapseTo({ row, col }, false);
+      range = this.state().range;
+    }
+    const strings = this.strings;
+    const canCopy = typeof document.execCommand === 'function' || (navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function');
+    const items: MenuItem[] = [];
+    if (!this.locked) items.push({ label: strings.cut, disabled: !canCopy, action: () => this.menuCopy(true) });
+    items.push({ label: strings.copy, disabled: !canCopy, action: () => this.menuCopy(false) });
+    if (!this.locked) {
+      items.push({ label: strings.paste, action: () => this.menuPaste() });
+      items.push({ label: strings.clearContents, action: () => this.attempt(() => this.clearSelection()) });
+      // Whole columns have no rows to speak of, and whole rows no columns.
+      const rows = fullHeight(range) ? 0 : range.bottom - range.top + 1;
+      const cols = fullWidth(range) ? 0 : range.right - range.left + 1;
+      if (rows > 0 || cols > 0) items.push({ label: '', separator: true });
+      if (rows > 0) items.push({ label: strings.insertRowsAbove(rows), action: () => this.attempt(() => this.structural('insert', 'row', range.top, rows)) });
+      if (cols > 0) items.push({ label: strings.insertColumnsLeft(cols), action: () => this.attempt(() => this.structural('insert', 'col', range.left, cols)) });
+      if (rows > 0) items.push({ label: strings.deleteRows(rows), action: () => this.attempt(() => this.structural('delete', 'row', range.top, rows)) });
+      if (cols > 0) items.push({ label: strings.deleteColumns(cols), action: () => this.attempt(() => this.structural('delete', 'col', range.left, cols)) });
+    }
+    this.showMenu(items, x, y);
     return true;
   }
+
+  /**
+   * Copy or cut from the menu. The clipboard can only be written from a copy
+   * or cut event, so one is asked for: with the input focused it arrives at the
+   * same handlers Ctrl+C and Ctrl+X reach. Where that is not possible the text
+   * alone is written through the asynchronous clipboard.
+   */
+  private menuCopy(cut: boolean): void {
+    this.focusInput(true);
+    this.selectIdleText();
+    this.clipboardHandled = false;
+    try {
+      document.execCommand(cut ? 'cut' : 'copy');
+    } catch {
+      // Not available; the fallback below takes over.
+    }
+    if (this.clipboardHandled) return;
+    this.attempt(() => {
+      const copied = cut ? this.cut() : this.copy();
+      const clipboard = navigator.clipboard;
+      if (clipboard && typeof clipboard.writeText === 'function') {
+        clipboard.writeText(copied.text).then(undefined, () => {
+          if (!this.destroyed) this.notify(this.strings.actionFailed, 'error');
+        });
+      } else this.notify(this.strings.actionFailed, 'error');
+    });
+  }
+
+  /** Paste from the menu: only the asynchronous clipboard can be read without a paste event, and only as text. */
+  private menuPaste(): void {
+    const unavailable = () => {
+      if (!this.destroyed) this.notify(this.strings.pasteWithKeyboard, 'info');
+    };
+    const clipboard = navigator.clipboard;
+    if (!clipboard || typeof clipboard.readText !== 'function') {
+      unavailable();
+      return;
+    }
+    try {
+      clipboard.readText().then((text) => {
+        if (!this.destroyed) this.attempt(() => this.paste(text));
+      }, unavailable);
+    } catch {
+      unavailable();
+    }
+  }
+
+  // ---------------------------------------------------------------- resize
+
+  /** The column or row whose border in the headers a canvas point is on, if any. */
+  private resizeAt(x: number, y: number, reach: number): Resize | undefined {
+    if (this.locked) return undefined;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return undefined;
+    const layout = this.layout(state);
+    const { headerWidth, headerHeight, rows, cols } = layout.metrics;
+    const overColumns = y >= 0 && y < headerHeight && x >= headerWidth;
+    const overRows = x >= 0 && x < headerWidth && y >= headerHeight;
+    if (overColumns === overRows) return undefined;
+    const hit = hitTest(layout, x, y);
+    if (hit.area !== 'colHeader' && hit.area !== 'rowHeader') return undefined;
+    const axis = hit.area === 'colHeader' ? 'col' : 'row';
+    const metrics = axis === 'col' ? cols : rows;
+    const index = hit.area === 'colHeader' ? hit.col : hit.row;
+    const at = axis === 'col' ? x : y;
+    const start = axis === 'col' ? colX(layout, index) : rowY(layout, index);
+    const size = metrics.size(index);
+    // The far edge is this column's own border; the near edge belongs to the one before, which may be hidden:
+    // dragging from there is how a hidden column or row is shown again.
+    // Never more than a third of the header from either side: the middle stays a place to press the header itself.
+    const near = Math.min(reach, Math.floor(size / 3));
+    if (at >= start + size - near) return { axis, index, origin: start };
+    if (at <= start + near && index > 0) return { axis, index: index - 1, origin: start - metrics.size(index - 1) };
+    return undefined;
+  }
+
+  private showGuide(resize: Resize, position: number): void {
+    let guide = this.guide;
+    if (!guide) {
+      guide = document.createElement('div');
+      guide.className = 'bym-resize-guide';
+      guide.style.cssText = 'position:absolute;z-index:2;pointer-events:none';
+      this.root.appendChild(guide);
+      this.guide = guide;
+    }
+    const at = Math.max(position, resize.origin);
+    const style = guide.style;
+    if (resize.axis === 'col') {
+      style.left = `${at}px`;
+      style.top = '0';
+      style.width = '1px';
+      style.height = `${this.height}px`;
+    } else {
+      style.left = '0';
+      style.top = `${at}px`;
+      style.width = `${this.width}px`;
+      style.height = '1px';
+    }
+  }
+
+  private hideGuide(): void {
+    if (this.guide && this.guide.parentNode) this.guide.parentNode.removeChild(this.guide);
+    this.guide = undefined;
+  }
+
+  /** The columns or rows a resize of one of them applies to: all selected whole ones when it is among them. */
+  private resizeSpan(resize: Resize): { first: number; last: number } {
+    const range = this.state().range;
+    if (resize.axis === 'col' && fullHeight(range) && !fullWidth(range) && resize.index >= range.left && resize.index <= range.right) {
+      return { first: range.left, last: range.right };
+    }
+    if (resize.axis === 'row' && fullWidth(range) && !fullHeight(range) && resize.index >= range.top && resize.index <= range.bottom) {
+      return { first: range.top, last: range.bottom };
+    }
+    return { first: resize.index, last: resize.index };
+  }
+
+  /** Applies the size a drag ended at, in pixels; 0 hides. */
+  private applyResize(resize: Resize, pixels: number): void {
+    const span = this.resizeSpan(resize);
+    this.attempt(() => {
+      if (resize.axis === 'col') this.setColumnWidth(span.first, span.last, pixelsToColumnWidth(Math.min(pixels, MAX_COLUMN_PIXELS)));
+      else this.setRowHeight(span.first, span.last, (Math.min(pixels, MAX_ROW_PIXELS) * 72) / 96);
+    });
+  }
+
+  /** A double click on a border: the column takes the width of its content, the row its default height. */
+  private autoFit(resize: Resize): void {
+    this.attempt(() => {
+      if (resize.axis === 'row') {
+        const span = this.resizeSpan(resize);
+        this.setRowHeight(span.first, span.last, undefined);
+        return;
+      }
+      const pixels = this.contentWidth(resize.index);
+      this.setColumnWidth(resize.index, resize.index, pixels === undefined ? undefined : pixelsToColumnWidth(pixels));
+    });
+  }
+
+  /** Width in pixels that shows the widest text of a column, from a sample of its rows; undefined for an empty column. */
+  private contentWidth(col: number): number | undefined {
+    if (this.measureCanvas === undefined) this.measureCanvas = document.createElement('canvas').getContext('2d');
+    const context = this.measureCanvas;
+    if (!context) return undefined;
+    const state = this.state();
+    const merges = this.merges();
+    const fonts = new Map<number, string>();
+    let widest = 0;
+    let seen = 0;
+    let current = '';
+    const rows = state.sheet.rows;
+    const iterator = rows.entries();
+    for (let entry = iterator.next(); !entry.done && seen < AUTO_FIT_ROWS; entry = iterator.next()) {
+      const row = entry.value[1];
+      const cell = row.cells[col];
+      if (!cell || row.hidden) continue;
+      seen++;
+      // A cell merged across columns does not ask its first column to hold all of it.
+      const merge = mergeIn(merges, entry.value[0], col);
+      if (merge && merge.right > merge.left) continue;
+      const text = cellDisplayText(this.workbook, cell, this.locale);
+      if (text === '') continue;
+      let font = fonts.get(cell.style);
+      if (font === undefined) {
+        font = cssFont(resolveCellStyle(this.workbook.styles, cell.style).font);
+        fonts.set(cell.style, font);
+      }
+      if (font !== current) {
+        context.font = font;
+        current = font;
+      }
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length; i++) widest = Math.max(widest, context.measureText(lines[i]).width);
+    }
+    return widest > 0 ? Math.min(Math.ceil(widest) + CELL_TEXT_MARGIN, MAX_COLUMN_PIXELS) : undefined;
+  }
+
+  private onTouchStart = (event: TouchEvent): void => {
+    if (this.destroyed || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    const rect = this.canvas.getBoundingClientRect();
+    const x = (touch.clientX - rect.left) * (rect.width > 0 ? this.width / rect.width : 1);
+    const y = (touch.clientY - rect.top) * (rect.height > 0 ? this.height / rect.height : 1);
+    // Keeps the browser from scrolling with a finger that is resizing.
+    if (this.resizeAt(x, y, RESIZE_REACH_TOUCH) && event.cancelable) event.preventDefault();
+  };
 
   private onContextMenu = (event: MouseEvent): void => {
     if (this.destroyed) return;
@@ -1839,7 +2396,9 @@ export class WorkbookView {
   private onDoubleClick = (event: MouseEvent): void => {
     if (this.destroyed) return;
     const point = this.canvasPoint(event);
-    if (hitTest(this.layout(), point.x, point.y).area === 'cell') this.startEditing();
+    const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
+    if (resize) this.autoFit(resize);
+    else if (hitTest(this.layout(), point.x, point.y).area === 'cell') this.startEditing();
   };
 
   // --------------------------------------------------------------- pointer
@@ -1930,7 +2489,8 @@ export class WorkbookView {
       this.readScroll();
       this.endTouch();
       this.touchInput = true;
-      this.touch = { pointerId, x: point.x, y: point.y, domX: this.domX, domY: this.domY, moved: false, consumed: false };
+      const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_TOUCH);
+      this.touch = { pointerId, x: point.x, y: point.y, domX: this.domX, domY: this.domY, moved: false, consumed: false, resize };
       this.longPressTimer = window.setTimeout(this.onLongPress, LONG_PRESS_MS);
       return;
     }
@@ -1942,8 +2502,23 @@ export class WorkbookView {
     this.focusInput(true);
     this.endDrag();
     this.readScroll();
+    // A press on the border between two headers resizes; it neither selects nor starts a selection drag.
+    const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
+    if (resize) {
+      this.beginResize(pointerId, point, resize);
+      return;
+    }
     const mode = this.press(point.x, point.y, event.shiftKey);
     this.drag = { pointerId, mode, x: point.x, y: point.y, originX: point.x, originY: point.y, moved: false };
+    this.capturePointer(pointerId);
+  };
+
+  private beginResize(pointerId: number, point: { x: number; y: number }, resize: Resize): void {
+    this.drag = { pointerId, mode: 'resize', resize, x: point.x, y: point.y, originX: point.x, originY: point.y, moved: false };
+    this.capturePointer(pointerId);
+  }
+
+  private capturePointer(pointerId: number): void {
     if (this.pointerEvents) {
       try {
         this.canvas.setPointerCapture(pointerId);
@@ -1954,7 +2529,7 @@ export class WorkbookView {
       window.addEventListener('mousemove', this.onPointerMove);
       window.addEventListener('mouseup', this.onPointerUp);
     }
-  };
+  }
 
   private onPointerMove = (event: MouseEvent): void => {
     const pointer = event as PointerEvent;
@@ -1962,6 +2537,22 @@ export class WorkbookView {
     const point = this.canvasPoint(event);
     const touch = this.touch;
     if (touch && touch.pointerId === pointerId) {
+      const resize = touch.resize;
+      if (resize && !touch.consumed && (Math.abs(point.x - touch.x) > DRAG_SLOP || Math.abs(point.y - touch.y) > DRAG_SLOP)) {
+        // The finger on a border has started to move: from here on it resizes.
+        this.endTouch();
+        if (!this.tryCommit()) return;
+        this.endDrag();
+        this.beginResize(pointerId, { x: touch.x, y: touch.y }, resize);
+        const drag = this.drag as Drag | undefined;
+        if (drag) {
+          drag.x = point.x;
+          drag.y = point.y;
+          drag.moved = true;
+          this.showGuide(resize, resize.axis === 'col' ? point.x : point.y);
+        }
+        return;
+      }
       if (Math.abs(point.x - touch.x) > TAP_SLOP || Math.abs(point.y - touch.y) > TAP_SLOP) {
         touch.moved = true;
         this.clearLongPress();
@@ -1969,12 +2560,25 @@ export class WorkbookView {
       return;
     }
     const drag = this.drag;
-    if (!drag || drag.pointerId !== pointerId) return;
+    if (!drag) {
+      // Hovering: the cursor says where a press would resize.
+      if (pointer.pointerType !== 'touch') {
+        const over = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
+        const cursor = over ? (over.axis === 'col' ? 'col-resize' : 'row-resize') : '';
+        if (this.canvas.style.cursor !== cursor) this.canvas.style.cursor = cursor;
+      }
+      return;
+    }
+    if (drag.pointerId !== pointerId) return;
     drag.x = point.x;
     drag.y = point.y;
     if (!drag.moved) {
       if (Math.abs(point.x - drag.originX) <= DRAG_SLOP && Math.abs(point.y - drag.originY) <= DRAG_SLOP) return;
       drag.moved = true;
+    }
+    if (drag.resize) {
+      this.showGuide(drag.resize, drag.resize.axis === 'col' ? point.x : point.y);
+      return;
     }
     this.readScroll();
     this.dragTo(drag);
@@ -2014,6 +2618,13 @@ export class WorkbookView {
     const drag = this.drag;
     if (!drag || drag.pointerId !== pointerId) return;
     this.endDrag();
+    if (drag.resize) {
+      if (drag.moved) {
+        const point = this.canvasPoint(event);
+        this.applyResize(drag.resize, Math.max(Math.round((drag.resize.axis === 'col' ? point.x : point.y) - drag.resize.origin), 0));
+      }
+      return;
+    }
     // A click on a cell that is cut off by the edge brings it into view; with Shift that is the clicked cell, not the active one.
     if (!drag.moved && drag.mode === 'cell') this.reveal(this.state().focus, this.state().range);
   };
@@ -2027,6 +2638,7 @@ export class WorkbookView {
   private endDrag(): void {
     const drag = this.drag;
     this.drag = undefined;
+    this.hideGuide();
     if (this.autoScrollFrame) cancelAnimationFrame(this.autoScrollFrame);
     this.autoScrollFrame = 0;
     window.removeEventListener('mousemove', this.onPointerMove);

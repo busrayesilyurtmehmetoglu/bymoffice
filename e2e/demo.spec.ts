@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { XLSX_PARTS, XLS_STREAMS, readPartsInNode, textFile, xls, xlsx } from './fixtures/files';
+import { formatAt, getCell, open as openInNode } from '../src/index';
 import { sampleWorkbook } from '../test/fixtures';
 import { expect, expectResponsive, test } from './helpers';
 
@@ -165,10 +166,20 @@ test.describe('demo page', () => {
     await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
     await expect(page.locator('#preview-section')).toBeHidden();
   });
-  test('cells can be edited, undone and restructured from the test page', async ({ page }) => {
+  test('the editor shell is shown: cells can be edited, formatted, undone and restructured', async ({ page }) => {
     await page.locator('#file').setInputFiles(upload('model.xlsx', await sampleWorkbook()));
     await expect(page.locator('#edit-state')).toHaveText('Değişiklik yok.');
-    await expect(page.locator('#undo')).toBeDisabled();
+    // Toolbar, formula bar and status bar surround the grid; their labels follow the page language.
+    await expect(page.locator('#grid .bym-editor [role="toolbar"]')).toBeVisible();
+    await expect(page.locator('#grid .bym-editor [role="toolbar"]')).toHaveAttribute('aria-label', /.+/);
+    const value = (row: number, col: number) =>
+      page.evaluate(([r, c]) => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], r, c)?.value, [row, col]);
+    const bold = (row: number, col: number) =>
+      page.evaluate(([r, c]) => {
+        const api = (window as any).BymOffice;
+        const view = (window as any).__view;
+        return api.formatAt(view.workbook, view.workbook.sheets[0], r, c).font.bold;
+      }, [row, col]);
 
     await page.evaluate(() => {
       const view = (window as any).__view;
@@ -177,31 +188,63 @@ test.describe('demo page', () => {
     });
     await expect(page.locator('#cell-info')).toHaveText('Seçim: B2 · B2 = 99,50 ₺ (ham değer: 99.5)');
     await expect(page.locator('#edit-state')).toHaveText('1 değişiklik adımı (geri al/yinele dahil).');
-    await expect(page.locator('#undo')).toBeEnabled();
 
-    // A row inserted above moves the cell down; the selection stays on the inserted row.
-    await page.locator('#row-insert').click();
-    await expect(page.locator('#cell-info')).toHaveText('Seçim: A2:XFD2 · B2 = ');
-    await expect(page.locator('#preview-note')).toContainText('Veri: worksheet');
-    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 2, 1).value)).toBe(99.5);
+    // Formatting through the grid's command, as the toolbar button does.
+    expect(await bold(1, 1)).toBe(false);
+    await page.evaluate(() => (window as any).__view.format({ bold: true }));
+    expect(await bold(1, 1)).toBe(true);
 
-    await page.locator('#undo').click();
-    await page.locator('#undo').click();
-    await expect(page.locator('#undo')).toBeDisabled();
-    await expect(page.locator('#redo')).toBeEnabled();
-    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 1, 1).value)).toBe(12.5);
+    // A row inserted above moves the cell down.
+    await page.evaluate(() => (window as any).__view.insertRows(1, 1));
+    expect(await value(2, 1)).toBe(99.5);
 
-    await page.locator('#redo').click();
+    await page.evaluate(() => {
+      const view = (window as any).__view;
+      view.undo();
+      view.undo();
+      view.undo();
+    });
+    expect(await value(1, 1)).toBe(12.5);
+    expect(await page.evaluate(() => (window as any).__view.history.canUndo)).toBe(false);
+    await page.evaluate(() => (window as any).__view.redo());
+    expect(await value(1, 1)).toBe(99.5);
+
     // Read-only stops editing but keeps the history.
     await page.locator('#readonly').check();
     await expect(page.locator('#edit-state')).toHaveText('Salt okunur.');
-    await expect(page.locator('#row-insert')).toBeDisabled();
-    await expect(page.locator('#undo')).toBeDisabled();
     await page.evaluate(() => (window as any).__view.setCellInput(1, 1, '1'));
-    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 1, 1).value)).toBe(99.5);
+    expect(await value(1, 1)).toBe(99.5);
     await page.locator('#readonly').uncheck();
     await expect(page.locator('#edit-state')).toHaveText(/değişiklik adımı/);
-    await page.locator('#undo').click();
-    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 1, 1).value)).toBe(12.5);
+    await page.evaluate(() => (window as any).__view.undo());
+    expect(await value(1, 1)).toBe(12.5);
+  });
+
+  test('"save" downloads a file that holds the edits', async ({ page }) => {
+    const input = await sampleWorkbook();
+    await page.locator('#file').setInputFiles(upload('model.xlsx', input));
+    await expect(page.locator('#save')).toBeEnabled();
+    // The editor is built after the model has been read, a moment after the file is listed.
+    await expect(page.locator('#grid .bym-editor')).toBeVisible();
+    await page.evaluate(() => {
+      const view = (window as any).__view;
+      view.setCellInput(1, 1, '77');
+      view.setCellInput(20, 0, 'yeni satır ğüşiöç');
+      view.select({ top: 0, left: 0, bottom: 0, right: 1 });
+      view.format({ italic: true });
+    });
+
+    const downloadPromise = page.waitForEvent('download', { timeout: 10_000 });
+    await page.locator('#save').click();
+    const download = await downloadPromise;
+    const saved = new Uint8Array(await readFile(await download.path()));
+    const reopened = await (await openInNode(saved)).workbook();
+    const sheet = reopened.sheets[0];
+    expect(getCell(sheet, 1, 1)?.value).toBe(77);
+    expect(getCell(sheet, 20, 0)?.value).toBe('yeni satır ğüşiöç');
+    expect(formatAt(reopened, sheet, 0, 0).font.italic).toBe(true);
+    // What was not touched is still there, formats included.
+    expect(getCell(sheet, 2, 0)?.value).toBe('Kalın şeker');
+    expect(formatAt(reopened, sheet, 0, 0).font.bold).toBe(true);
   });
 });

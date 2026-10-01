@@ -46,6 +46,31 @@ test.describe('BymOffice.mount', () => {
     await page.evaluate(() => (window as any).__mounted.destroy());
   });
 
+  test('the view speaks the language of its locale', async ({ page, isMobile }) => {
+    const bytes = Array.from(await sampleWorkbook());
+    await page.evaluate(async (input) => {
+      const mounted = await (window as any).BymOffice.mount(document.getElementById('editor'), { file: new Uint8Array(input), locale: 'tr' });
+      (window as any).__mounted = mounted;
+      mounted.view.select({ top: 0, left: 0, bottom: 1, right: 1 });
+    }, bytes);
+    await expect(page.locator('#editor .bym-view')).toHaveAttribute('aria-label', 'Hesap tablosu');
+    await expect(page.locator('#editor .bym-input')).toHaveAttribute('aria-label', 'Hücre düzenleyici');
+    await expect(page.locator('#editor .bym-scroller')).toHaveAttribute('aria-label', 'Sayfa Veri');
+    await expect(page.locator('#editor [aria-live]')).toHaveText('A1 Ürün, A1:B2 seçili');
+
+    if (!isMobile) {
+      // Header of row 5: the header strip is 72 px wide; rows 1-2 are 32 and 20 px, row 3 is hidden.
+      await page.mouse.click(30, 22 + 32 + 20 + 20 + 10, { button: 'right' });
+      await expect(page.locator('#editor .bym-menu button')).toHaveText(['Üste satır ekle', 'Alta satır ekle', 'Satırı sil']);
+      await page.keyboard.press('Escape');
+    }
+
+    await page.evaluate(() => (window as any).__mounted.view.setLocale('en'));
+    await expect(page.locator('#editor .bym-view')).toHaveAttribute('aria-label', 'Spreadsheet');
+    await expect(page.locator('#editor .bym-scroller')).toHaveAttribute('aria-label', 'Sheet Veri');
+    await page.evaluate(() => (window as any).__mounted.destroy());
+  });
+
   test('loads the file from a URL', async ({ page, pageProblems }) => {
     const bytes = Buffer.from(await sampleWorkbook());
     await page.route('**/files/sample.xlsx', (route) => route.fulfill({ body: bytes, contentType: 'application/octet-stream' }));

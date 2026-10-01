@@ -36,19 +36,43 @@
     <button id="before" type="button">before</button>
     <div id="host"></div>
     <button id="after" type="button">after</button>
+    <!-- Stands for an editor shell around the view: a formula bar that edits the active cell. -->
+    <div id="shell"><input id="bar" type="text" aria-label="bar" /></div>
     <p id="state">loading</p>
     <script src="/dist/bymoffice.min.js"></script>
     <script>
       if (location.search.indexOf('offset') >= 0) document.body.className = 'offset';
       window.__events = [];
+      window.__editing = [];
       // Opens a workbook from bytes and shows it in #host. Resolves once the view exists.
       window.__mountView = async function (bytes, options) {
         if (window.__view) window.__view.destroy();
         window.__events.length = 0;
+        window.__editing.length = 0;
+        // A selector stands for the element, which cannot be passed in from a test.
+        if (options && typeof options.focusScope === 'string') {
+          options = Object.assign({}, options, { focusScope: document.querySelector(options.focusScope) });
+        }
+        // "shadow": the view is built inside a shadow root (open or closed) of the host.
+        let container = document.getElementById('host');
+        if (window.__shadowHost) window.__shadowHost.remove();
+        window.__shadow = null;
+        if (options && options.shadow) {
+          const shadowHost = document.createElement('div');
+          shadowHost.id = 'shadow-host';
+          shadowHost.style.cssText = 'width:100%;height:100%';
+          container.appendChild(shadowHost);
+          window.__shadowHost = shadowHost;
+          window.__shadow = shadowHost.attachShadow({ mode: options.shadow });
+          container = document.createElement('div');
+          container.style.cssText = 'width:100%;height:100%';
+          window.__shadow.appendChild(container);
+        }
+        window.__notices = [];
         const file = await BymOffice.open(new Uint8Array(bytes));
         const workbook = await file.workbook();
         window.__view = new BymOffice.WorkbookView(
-          document.getElementById('host'),
+          container,
           workbook,
           Object.assign({}, options, {
             onSelectionChange: function (selection, sheet) {
@@ -56,6 +80,12 @@
             },
             onSheetChange: function (sheet) {
               window.__events.push({ type: 'sheet', sheet: sheet });
+            },
+            onEditingChange: function (state) {
+              window.__editing.push({ editing: state.editing, text: state.text });
+            },
+            onNotice: function (notice) {
+              window.__notices.push({ message: notice.message, kind: notice.kind });
             },
             onChange: function (change) {
               window.__events.push({ type: 'change', sheets: change.sheets });

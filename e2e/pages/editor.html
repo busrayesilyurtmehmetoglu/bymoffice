@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: spreadsheet editor</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      /* Fixed size on desktop; narrower screens get the full width. */
+      #host,
+      #host2 {
+        width: 900px;
+        max-width: 100%;
+        height: 560px;
+      }
+      #host2 {
+        height: 300px;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="before" type="button">before</button>
+    <div id="host"></div>
+    <button id="after" type="button">after</button>
+    <div id="host2"></div>
+    <p id="state">loading</p>
+    <script src="/dist/bymoffice.min.js"></script>
+    <script>
+      window.__events = [];
+      // Opens a workbook from bytes and shows the editor in #host (or the element named by `into`).
+      // "shadow-open" and "shadow-closed" put it into a shadow root instead, the way a web component
+      // would hold it; the root is kept in window.__shadowRoot, the only way into a closed one.
+      // The host page's own callbacks are recorded, to show that the shell still calls them.
+      window.__mountEditor = async function (bytes, options, into) {
+        const second = into === 'host2';
+        const key = second ? '__editor2' : '__editor';
+        if (window[key]) window[key].destroy();
+        if (!second) window.__events.length = 0;
+        let container = document.getElementById(second ? 'host2' : 'host');
+        if (into === 'shadow-open' || into === 'shadow-closed') {
+          document.getElementById('host').style.display = 'none';
+          document.getElementById('host2').style.display = 'none';
+          const old = document.getElementById('shadowhost');
+          if (old) old.remove();
+          const shadowHost = document.createElement('div');
+          shadowHost.id = 'shadowhost';
+          document.body.insertBefore(shadowHost, document.getElementById('after'));
+          window.__shadowRoot = shadowHost.attachShadow({ mode: into === 'shadow-open' ? 'open' : 'closed' });
+          container = document.createElement('div');
+          container.id = 'inner';
+          container.style.cssText = 'width:600px;max-width:100%;height:400px';
+          window.__shadowRoot.appendChild(container);
+        }
+        const file = await BymOffice.open(new Uint8Array(bytes));
+        const workbook = await file.workbook();
+        const record = second
+          ? {}
+          : {
+              onSelectionChange: function (selection, sheet) {
+                window.__events.push({ type: 'selection', range: BymOffice.rangeName(selection.range), sheet: sheet });
+              },
+              onSheetChange: function (sheet) {
+                window.__events.push({ type: 'sheet', sheet: sheet });
+              },
+              onChange: function (change) {
+                window.__events.push({ type: 'change', sheets: change.sheets });
+              },
+              onNotice: function (notice) {
+                window.__events.push({ type: 'notice', message: notice.message, kind: notice.kind });
+              },
+              onEditingChange: function (state) {
+                window.__events.push({ type: 'editing', editing: state.editing, text: state.text });
+              },
+            };
+        window[key] = new BymOffice.SpreadsheetEditor(container, workbook, Object.assign({}, options, record));
+        if (!second) window.__file = file;
+        return true;
+      };
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>
