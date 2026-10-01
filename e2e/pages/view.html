@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: workbook view</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      /* Fixed size on desktop; narrower screens get the full width. */
+      #host {
+        width: 800px;
+        max-width: 100%;
+        height: 500px;
+      }
+      /* "?offset": the host sits away from the corner of a page that scrolls both ways. */
+      body.offset {
+        height: 3000px;
+      }
+      /* Only wide screens also scroll sideways; a phone would zoom out to fit the width. */
+      @media (min-width: 900px) {
+        body.offset {
+          width: 2400px;
+        }
+      }
+      body.offset #host {
+        margin: 53px 37px;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="before" type="button">before</button>
+    <div id="host"></div>
+    <button id="after" type="button">after</button>
+    <p id="state">loading</p>
+    <script src="/dist/bymoffice.min.js"></script>
+    <script>
+      if (location.search.indexOf('offset') >= 0) document.body.className = 'offset';
+      window.__events = [];
+      // Opens a workbook from bytes and shows it in #host. Resolves once the view exists.
+      window.__mountView = async function (bytes, options) {
+        if (window.__view) window.__view.destroy();
+        window.__events.length = 0;
+        const file = await BymOffice.open(new Uint8Array(bytes));
+        const workbook = await file.workbook();
+        window.__view = new BymOffice.WorkbookView(
+          document.getElementById('host'),
+          workbook,
+          Object.assign({}, options, {
+            onSelectionChange: function (selection, sheet) {
+              window.__events.push({ type: 'selection', selection: selection, sheet: sheet });
+            },
+            onSheetChange: function (sheet) {
+              window.__events.push({ type: 'sheet', sheet: sheet });
+            },
+          }),
+        );
+        return true;
+      };
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>

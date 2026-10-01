@@ -113,28 +113,46 @@ test.describe('demo page', () => {
     await expect(page.locator('#status')).toHaveText('—');
     await expect(page.locator('#save')).toBeDisabled();
   });
-  test('xlsx cells are previewed per sheet with basic styles', async ({ page }) => {
+  test('xlsx opens in the grid view with sheet tabs and a selection read-out', async ({ page }) => {
     await page.locator('#file').setInputFiles(upload('model.xlsx', await sampleWorkbook()));
 
     await expect(page.locator('#preview-section')).toBeVisible();
-    await expect(page.locator('#tabs button')).toHaveText(['Veri', 'Gizli', 'Grafik']);
-    // The workbook opens on its active sheet, which is empty here.
-    await expect(page.locator('#tabs button.active')).toHaveText('Gizli');
-    await expect(page.locator('#preview tr')).toHaveCount(0);
-
-    await page.locator('#tabs button', { hasText: 'Veri' }).click();
+    // Hidden sheets get no tab; the workbook's active sheet is hidden, so the first visible one shows.
+    await expect(page.locator('#grid .bym-tabs button')).toHaveText(['Veri', 'Grafik']);
+    await expect(page.locator('#grid .bym-tabs button[aria-selected="true"]')).toHaveText('Veri');
     await expect(page.locator('#preview-note')).toContainText('Veri: worksheet, 4 satır × 3 sütun');
     await expect(page.locator('#preview-note')).toContainText('dondurulmuş 1 satır / 1 sütun');
-    await expect(page.locator('#preview tr').first().locator('th')).toHaveText(['', 'A', 'B', 'C']);
-    await expect(page.locator('#preview tr').nth(1).locator('td')).toHaveText(['Ürün', 'Fiyat', '']);
-    await expect(page.locator('#preview tr').nth(2).locator('td')).toHaveText([' Çay ', '12.5', 'true'], { useInnerText: false });
-    await expect(page.locator('#preview tr').nth(3).locator('td')).toHaveText(['Kalın şeker', '7', '#DIV/0!']);
-    await expect(page.locator('#preview tr').nth(4).locator('td').nth(1)).toHaveAttribute('title', '=SUM(B2:B3)');
+    // The file's active cell is B3.
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: B3 · B3 = 7');
 
-    const header = page.locator('#preview tr').nth(1).locator('td').first();
-    await expect(header).toHaveCSS('background-color', 'rgb(255, 255, 0)');
-    await expect(header).toHaveCSS('color', 'rgb(68, 114, 196)');
-    await expect(header).toHaveCSS('font-weight', '700');
+    // Programmatic selection goes through the same read-out as a click would.
+    await page.evaluate(() => (window as any).__view.select({ top: 3, left: 1, bottom: 3, right: 1 }));
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: B4 · B4 = 19.5 · formül: =SUM(B2:B3)');
+
+    const canvas = page.locator('#grid canvas');
+    const box = await canvas.boundingBox();
+    expect(box && box.width > 200 && box.height > 200).toBe(true);
+    const painted = await canvas.evaluate((element) => {
+      const c = element as HTMLCanvasElement;
+      const data = c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data;
+      const colours = new Set<number>();
+      for (let i = 0; i < data.length; i += 4 * 97) colours.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
+      return colours.size;
+    });
+    expect(painted).toBeGreaterThan(3);
+
+    await page.locator('#grid .bym-tabs button', { hasText: 'Grafik' }).click();
+    await expect(page.locator('#preview-note')).toContainText('Grafik: chartsheet');
+  });
+
+  test('switching files replaces the grid view instead of stacking them', async ({ page }) => {
+    await page.locator('#file').setInputFiles(upload('a.xlsx', await sampleWorkbook()));
+    await expect(page.locator('#grid .bym-view')).toHaveCount(1);
+    await page.locator('#file').setInputFiles(upload('b.xlsx', await xlsx()));
+    await expect(page.locator('#grid .bym-tabs button')).toHaveText(['Sayfa1']);
+    await expect(page.locator('#grid .bym-view')).toHaveCount(1);
+    await page.locator('#clear').click();
+    await expect(page.locator('#grid .bym-view')).toHaveCount(0);
   });
 
   test('no cell preview for files without a spreadsheet model', async ({ page }) => {

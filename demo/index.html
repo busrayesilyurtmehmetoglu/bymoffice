@@ -41,12 +41,7 @@
       .ok { color: var(--ok); background: var(--ok-bg); }
       .bad { color: var(--bad); background: var(--bad-bg); }
       .warn { color: var(--warn); background: var(--warn-bg); }
-      .grid { max-height: 460px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
-      #preview { width: auto; }
-      #preview td, #preview th { border: 1px solid var(--line); padding: 2px 6px; white-space: pre; max-width: 260px; overflow: hidden; text-overflow: ellipsis; cursor: default; }
-      #preview th { position: sticky; top: 0; background: var(--panel); text-align: center; font-weight: 500; }
-      #preview th.rowhead { left: 0; position: sticky; }
-      #tabs button.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+      #grid { height: 480px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #status { font-weight: 600; overflow-wrap: anywhere; }
       #summary { font-size: 13px; color: var(--muted); }
       pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 420px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -99,10 +94,11 @@
       </section>
 
       <section id="preview-section" hidden>
-        <h2>Hücre önizlemesi</h2>
+        <h2>Tablo görünümü</h2>
         <p class="muted" id="preview-note"></p>
-        <div class="row" id="tabs" style="margin: 0 0 10px"></div>
-        <div class="scroll grid"><table id="preview"></table></div>
+        <div id="grid"></div>
+        <p class="muted" id="cell-info" style="margin: 10px 0 0"></p>
+        <p class="muted">Fare ya da dokunma ile seçin ve kaydırın; ok tuşları, Shift+ok, Ctrl+ok, PageUp/PageDown, Home, Ctrl+Home/End çalışır.</p>
       </section>
 
       <section>
@@ -122,8 +118,6 @@
       const viewer = $('viewer');
       const viewerTitle = $('viewer-title');
 
-      const PREVIEW_ROWS = 200;
-      const PREVIEW_COLS = 50;
       const TEXT_LIMIT = 200000;
       const HEX_LIMIT = 4096;
 
@@ -245,57 +239,34 @@
         viewer.textContent = lines.join('\n') || '(boş)';
       }
 
-      // Values are shown as stored; number formats and the real grid arrive with later tasks.
-      function showSheet(workbook, index) {
+      let view = null;
+
+      function describeSheet(workbook, index) {
         const sheet = workbook.sheets[index];
-        const table = $('preview');
-        table.replaceChildren();
-        Array.from($('tabs').children).forEach((button, i) => button.classList.toggle('active', i === index));
-        const rowCount = Math.min(sheet.rowCount, PREVIEW_ROWS);
-        const colCount = Math.min(sheet.colCount, PREVIEW_COLS);
         const cells = Array.from(sheet.rows.values()).reduce((sum, r) => sum + r.cells.filter(() => true).length, 0);
-        $('preview-note').textContent =
+        return (
           `${sheet.name}: ${sheet.kind}, ${number(sheet.rowCount)} satır × ${number(sheet.colCount)} sütun, ${number(cells)} hücre` +
           `${sheet.state === 'visible' ? '' : ', gizli'}, ${sheet.merges.length} birleştirme` +
-          `${sheet.view.frozenRows || sheet.view.frozenCols ? `, dondurulmuş ${sheet.view.frozenRows} satır / ${sheet.view.frozenCols} sütun` : ''}` +
-          `${sheet.rowCount > rowCount || sheet.colCount > colCount ? ` — ilk ${rowCount} satır × ${colCount} sütun gösteriliyor` : ''}` +
-          '. Değerler ham haliyle gösterilir (sayı biçimleri henüz uygulanmıyor).';
-        if (rowCount === 0) return;
-        const head = row(['', ...Array.from({ length: colCount }, (_, c) => BymOffice.columnName(c))], 'th');
-        table.appendChild(head);
-        for (let r = 0; r < rowCount; r++) {
-          const tr = document.createElement('tr');
-          tr.appendChild(el('th', String(r + 1), 'rowhead'));
-          for (let c = 0; c < colCount; c++) {
-            const cell = BymOffice.getCell(sheet, r, c);
-            const td = el('td', cell && cell.value !== null ? String(cell.value) : '');
-            if (cell) {
-              const style = BymOffice.resolveCellStyle(workbook.styles, cell.style);
-              if (style.font.bold) td.style.fontWeight = '700';
-              if (style.font.italic) td.style.fontStyle = 'italic';
-              const color = BymOffice.resolveColor(style.font.color, workbook.styles);
-              const fill = style.fill.type === 'pattern' && style.fill.pattern === 'solid' ? BymOffice.resolveColor(style.fill.fg, workbook.styles) : undefined;
-              if (fill) {
-                td.style.backgroundColor = fill;
-                td.style.color = color ?? '#000000';
-              } else if (color && color !== '#000000') td.style.color = color;
-              if (cell.kind === 'number') td.style.textAlign = 'right';
-              if (style.alignment.horizontal === 'center' || style.alignment.horizontal === 'right' || style.alignment.horizontal === 'left') {
-                td.style.textAlign = style.alignment.horizontal;
-              }
-              if (cell.formula) td.title = `=${cell.formula.text}`;
-            }
-            tr.appendChild(td);
-          }
-          table.appendChild(tr);
-        }
+          `${sheet.view.frozenRows || sheet.view.frozenCols ? `, dondurulmuş ${sheet.view.frozenRows} satır / ${sheet.view.frozenCols} sütun` : ''}.`
+        );
+      }
+
+      function describeSelection(workbook, selection, index) {
+        const sheet = workbook.sheets[index];
+        const { row, col } = selection.active;
+        const cell = BymOffice.getCell(sheet, row, col);
+        const range = BymOffice.rangeName(selection.range);
+        const formula = cell && cell.formula && cell.formula.text ? ` · formül: =${cell.formula.text}` : '';
+        $('cell-info').textContent = `Seçim: ${range} · ${BymOffice.cellName(row, col)} = ${cell ? BymOffice.cellText(cell) : ''}${formula}`;
       }
 
       async function showPreview(record) {
         const section = $('preview-section');
+        if (view) view.destroy();
+        view = null;
         section.hidden = true;
-        $('tabs').replaceChildren();
-        $('preview').replaceChildren();
+        $('preview-note').textContent = '';
+        $('cell-info').textContent = '';
         if (!record || !record.file || record.file.format !== 'xlsx') return;
         section.hidden = false;
         try {
@@ -303,13 +274,19 @@
           const workbook = await record.file.workbook();
           const ms = performance.now() - started;
           if (selected !== record) return;
-          workbook.sheets.forEach((sheet, i) => {
-            const button = el('button', sheet.name);
-            button.addEventListener('click', () => showSheet(workbook, i));
-            $('tabs').appendChild(button);
+          const note = (index) => {
+            $('preview-note').textContent = `${describeSheet(workbook, index)} Model ${ms.toFixed(1)} ms'de okundu. Sayı biçimleri henüz uygulanmıyor.`;
+          };
+          view = new BymOffice.WorkbookView($('grid'), workbook, {
+            onSelectionChange: (selection, index) => describeSelection(workbook, selection, index),
+            onSheetChange: (index) => {
+              note(index);
+              describeSelection(workbook, view.selection, index);
+            },
           });
-          showSheet(workbook, workbook.activeSheet);
-          $('preview-note').textContent += ` Model ${ms.toFixed(1)} ms'de okundu.`;
+          window.__view = view;
+          note(view.activeSheet);
+          describeSelection(workbook, view.selection, view.activeSheet);
         } catch (error) {
           $('preview-note').textContent = `Model okunamadı: ${error.message}`;
         }

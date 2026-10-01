@@ -1,6 +1,7 @@
 import { CfbFile } from './cfb';
 import { readXlsx } from './formats/xlsx/workbook';
 import type { Workbook } from './model/sheet/types';
+import { WorkbookView, type WorkbookViewOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
 
 export { CfbFile, type CfbEntry } from './cfb';
@@ -10,6 +11,10 @@ export * from './xml';
 export * from './model/sheet/types';
 export * from './model/sheet/color';
 export { readXlsx } from './formats/xlsx/workbook';
+export { DEFAULT_GRID_THEME, renderGrid, type GridScene, type GridSelection, type GridTheme } from './render/grid';
+export { cellText, formatGeneral } from './render/cell-text';
+export { WorkbookView, type WorkbookViewOptions } from './ui/sheet-view';
+export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls';
 
@@ -82,4 +87,34 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
   }
 
   throw new UnsupportedFileError('Not a Word or Excel file');
+}
+
+export interface MountOptions extends WorkbookViewOptions {
+  /** The file itself, or a URL to fetch it from. The format is detected from the content. */
+  file: Uint8Array | ArrayBuffer | Blob | string;
+}
+
+export interface MountedView {
+  file: OfficeFile;
+  workbook: Workbook;
+  view: WorkbookView;
+  /** Removes the view from the container. */
+  destroy(): void;
+}
+
+/**
+ * Opens a spreadsheet and shows it inside `container`, which must have a size.
+ * Only xlsx can be shown so far; other formats reject with UnsupportedFileError.
+ */
+export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
+  let input = options.file;
+  if (typeof input === 'string') {
+    const response = await fetch(input);
+    if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
+    input = await response.arrayBuffer();
+  }
+  const file = await open(input);
+  const workbook = await file.workbook();
+  const view = new WorkbookView(container, workbook, options);
+  return { file, workbook, view, destroy: () => view.destroy() };
 }

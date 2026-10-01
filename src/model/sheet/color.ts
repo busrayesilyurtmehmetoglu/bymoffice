@@ -159,8 +159,11 @@ export interface ResolvedCellStyle {
  * the first format, and a table that lacks the entry falls back to its first
  * entry and then to the defaults, so this never throws on a damaged style sheet.
  */
+let fallbackStyles: StyleSheet | undefined;
+
 export function resolveCellStyle(styles: StyleSheet, index: number): ResolvedCellStyle {
-  const defaults = emptyStyleSheet();
+  // Only reached for a style sheet with empty tables; built once, never handed out for writing.
+  const defaults = fallbackStyles || (fallbackStyles = emptyStyleSheet());
   const xf = styles.cellXfs[index] ?? styles.cellXfs[0] ?? defaults.cellXfs[0];
   return {
     font: styles.fonts[xf.fontId] ?? styles.fonts[0] ?? defaults.fonts[0],

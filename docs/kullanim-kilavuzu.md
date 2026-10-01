@@ -3,7 +3,7 @@
 Bu kılavuz, BYM Office'i kendi uygulamasına ekleyecek geliştiriciler içindir. Her kod değişikliğinde güncellenir;
 burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılmamış olanlar "Henüz olmayanlar" başlığında açıkça listelenir.
 
-**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — kapsayıcı katmanı ve xlsx okuma modeli.
+**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — kapsayıcı katmanı, xlsx okuma modeli ve salt okunur tablo görünümü.
 
 ## 1. Bu sürüm ne yapar
 
@@ -11,6 +11,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - docx/xlsx içindeki her parçayı (XML, görsel, bilinmeyen ikili parça) okur.
 - Bir parçayı değiştirip dosyayı yeniden kaydeder; dokunulmayan parçalar özgün sıkıştırılmış baytlarıyla, **bayt bayt aynı** kalır.
 - xlsx dosyasını **tablo modeline** okur: sayfalar, hücre değerleri ve türleri, formül metinleri, stiller, birleştirilmiş hücreler, sütun genişlikleri, satır yükseklikleri, dondurulmuş bölmeler, gizli satır/sütun/sayfa, köprüler, adlandırılmış aralıklar.
+- xlsx dosyasını sayfada **gösterir** (`BymOffice.mount()`): Canvas üzerinde yalnız görünen alan çizilir; kaydırma, hücre/aralık seçimi, klavye ile gezinme, dokunmatik kullanım, dondurulmuş bölmeler, sayfa sekmeleri.
 - doc/xls içindeki akışları (stream) okur.
 - Tarayıcıda ve Node'da aynı kodla, çalışma zamanı bağımlılığı olmadan çalışır.
 
@@ -18,7 +19,10 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 
 | Özellik | Durum |
 |---|---|
-| Tablo/belge görüntüleme ve düzenleme arayüzü (`BymOffice.mount()`) | Yok (Aşama 1 ve sonrası) |
+| Hücre düzenleme, geri al/yinele, kopyala/yapıştır | Yok (görev 1.4); görünüm salt okunurdur |
+| Belge (docx/doc) ve xls görüntüleme | Yok; `mount()` `UnsupportedFileError` ile reddeder |
+| Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
+| `onSave`, `readOnly`, `locale` seçenekleri; arayüz metinlerinin Türkçesi | Yok (görev 1.6); sabit metinler şimdilik İngilizce |
 | Sayı biçimlerinin uygulanması (tarih, para, yüzde olarak gösterim) | Yok (görev 1.3); model ham değeri ve biçim kodunu verir |
 | Formül hesaplama | Yok (Aşama 2); dosyadaki son hesaplanmış değer ve formül metni okunur |
 | Modeli değiştirip xlsx olarak yazma | Yok (görev 1.4–1.5); model şimdilik salt okunurdur |
@@ -96,6 +100,65 @@ await writeFile('copy.xlsx', await file.save());
 ```
 
 ## 4. API
+
+### `mount(container, options): Promise<MountedView>`
+
+Bir xlsx dosyasını açar ve `container` içinde gösterir. Kapsayıcının bir boyutu olmalıdır (ör. `height: 600px`); görünüm onu doldurur ve boyutu değişince kendini uyarlar.
+
+```html
+<div id="editor" style="height: 600px"></div>
+<script src="dist/bymoffice.min.js"></script>
+<script>
+  (async () => {
+    const mounted = await BymOffice.mount(document.getElementById('editor'), {
+      file: '/files/report.xlsx',           // URL, Blob/File, ArrayBuffer ya da Uint8Array
+      onSelectionChange: (selection, sheetIndex) => {
+        console.log(BymOffice.rangeName(selection.range), selection.active);
+      },
+      onSheetChange: (sheetIndex) => console.log('sayfa', sheetIndex),
+    });
+    // mounted.file, mounted.workbook, mounted.view
+    // mounted.destroy();  // görünümü kaldırır
+  })();
+</script>
+```
+
+| Seçenek | İş |
+|---|---|
+| `file` | Dosyanın kendisi ya da getirileceği adres. Adres verilirse `fetch` ile alınır; sunucu hata dönerse `Could not load the file: HTTP 404` gibi bir hata fırlatılır |
+| `sheet` | İlk gösterilecek sayfanın dizini. Verilmezse dosyanın etkin sayfası; o gizliyse ilk görünür sayfa |
+| `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
+| `onSheetChange(sheetIndex)` | Gösterilen sayfa değişince çağrılır |
+
+xlsx dışındaki dosyalarda `UnsupportedFileError` ile reddeder ve kapsayıcıya bir şey eklemez.
+
+`mounted.view` bir `WorkbookView`'dir (modeli zaten elinizde tutuyorsanız `new BymOffice.WorkbookView(container, workbook, options)` ile doğrudan da kurabilirsiniz):
+
+| Üye | İş |
+|---|---|
+| `activeSheet`, `setActiveSheet(index)` | Gösterilen sayfa; gizli sayfa da programla gösterilebilir |
+| `selection` | `{ active: { row, col }, range: { top, left, bottom, right } }` (0 tabanlı; kopya döner) |
+| `select(range, active?)` | Seçimi değiştirir ve görünür alana getirir; sınır dışı değerler sayfa sınırına çekilir |
+| `scrollTo(row, col)` | Hücreyi görünür alana getirir |
+| `getViewState()` | `{ scrollX, scrollY, width, height, devicePixelRatio }` |
+| `render()` | Hemen yeniden çizer (normalde gerekmez) |
+| `destroy()` | Tüm DOM'u ve dinleyicileri kaldırır |
+
+Kullanıcı etkileşimi:
+
+- **Fare:** tıkla (seç), sürükle (aralık; kenarda kendiliğinden kayar), Shift+tık, satır/sütun başlığı (tüm satır/sütun), köşe (tümü). Birleştirilmiş hücre bütün olarak seçilir.
+- **Dokunma:** dokun (seç), sürükle (kaydır; atalet tarayıcınındır).
+- **Klavye** (önce görünüme tıklayın ya da Tab ile odaklanın): oklar, Shift+oklar, Ctrl/Cmd+oklar (veri bloğunun kenarı), Home, Ctrl+Home, Ctrl+End, PageUp/PageDown, Enter/Shift+Enter, Ctrl+A; sayfa değiştirmek için Alt+PageDown/PageUp (Ctrl+PageDown/PageUp da çalışır, ama bazı tarayıcılar onu kendine ayırır). Tab ve Shift+Tab hücre değiştirmez: odağı ızgaradan sayfadaki sonraki/önceki öğeye taşır, böylece klavye kullanıcıları görünümde hapsolmaz. Sayfa sekmeleri Tab ile odaklanıp Enter ya da Boşluk ile seçilir.
+
+Bilinmesi gerekenler:
+
+- Sayılar şimdilik Excel'in "Genel" biçimiyle gösterilir; tarih, para ve yüzde biçimleri görev 1.3'te gelecek (ör. tarih hücresi seri numarası olarak görünür).
+- Çizimde hücrenin kendi fontu kullanılır; cihazda yoksa `Carlito`, `Calibri`, `Arial` sırasıyla yedeğe düşülür. Font farkı metin genişliklerini biraz değiştirebilir.
+- Sütun genişlikleri ve satır yükseklikleri Excel'in piksel yuvarlamasıyla hesaplanır (varsayılan sütun 64 px, satır 20 px).
+- Sayfa her zaman 1.048.576 satır × 16.384 sütundur; kaydırma alanı kullanılan alanla başlar ve sona yaklaşıldıkça büyür.
+- Erişilebilirlik: kaydırılan bölüm `role="grid"` ile odak alır, sekmeler `role="tab"` düğmeleridir; etkin hücrenin adresi ve metni ekran okuyucular için bir canlı bölgede duyurulur. Ekran okuyucuyla henüz denenmedi.
+- CSS ile ölçeklenmiş (`transform: scale(...)`) bir kapsayıcıda da tıklamalar doğru hücreye gider.
+- Görünüm kendi stillerini sayfaya tek bir `<style data-bymoffice>` öğesiyle ekler; sınıf adları `bym-` ile başlar. Dosyadan gelen hiçbir metin HTML olarak basılmaz.
 
 ### `open(input): Promise<OfficeFile>`
 
@@ -181,6 +244,7 @@ Bilinmesi gerekenler:
 - Sayılar XML'deki ondalık yazımla okunur; `0x1F`, `NaN`, `INF` gibi değerler içeren dosya bozuk sayılır.
 - Bozuk sayfa verisi `Error` ile reddedilir (iletisi `Invalid XML …` ya da `Invalid xlsx …`/`Invalid worksheet …` ile başlar).
 - Başarım: 100.000 satır × 5 sütunluk sayfa güncel tarayıcılarda bir saniyenin altında okunur (her değişiklikte Playwright ile ölçülür).
+- Görünüm için ek yardımcılar da dışa açıktır: `cellText(cell)` (ekranda görünen metin), `createSheetMetrics(sheet)`, `createLayout(...)`, `cellRect(...)`, `hitTest(...)`, `renderGrid(ctx, scene)`. Bunlar kendi tuvalinize çizmek ya da test yazmak içindir; arayüzleri ilk kararlı sürüme dek değişebilir.
 
 ### `OpcPackage` (docx/xlsx)
 
@@ -255,7 +319,7 @@ Sayfada yapabilecekleriniz:
 - Bir ya da birden çok dosyayı sürükleyip bırakmak ya da seçmek.
 - Her dosya için biçimi, boyutu, açılış süresini ve "kaydet → yeniden aç" sonucunu görmek (yeşil: tüm parçalar aynı; sarı: desteklenmiyor ya da ikili biçim; kırmızı: hata ya da içerik değişti).
 - Parçaya ya da akışa tıklayıp içeriğini görmek (XML metin olarak, diğerleri onaltılık döküm).
-- xlsx dosyalarında **hücre önizlemesi**: sayfa sekmeleri, ilk 200 satır × 50 sütun, kalın/italik, yazı ve dolgu rengi, hizalama; formüllü hücrenin üzerine gelince formül görünür. Değerler ham haliyle gösterilir (sayı biçimleri henüz uygulanmıyor).
+- xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler); altında seçili aralık, etkin hücrenin değeri ve formülü yazar. Sayı biçimleri henüz uygulanmıyor.
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
