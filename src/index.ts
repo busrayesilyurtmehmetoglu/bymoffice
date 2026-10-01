@@ -1,10 +1,15 @@
 import { CfbFile } from './cfb';
+import { readXlsx } from './formats/xlsx/workbook';
+import type { Workbook } from './model/sheet/types';
 import { OpcPackage } from './opc';
 
 export { CfbFile, type CfbEntry } from './cfb';
 export { OpcPackage, type Relationship } from './opc';
 export { ZipArchive, type ZipEntry } from './zip';
 export * from './xml';
+export * from './model/sheet/types';
+export * from './model/sheet/color';
+export { readXlsx } from './formats/xlsx/workbook';
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls';
 
@@ -16,6 +21,12 @@ export interface OfficeFile {
   package?: OpcPackage;
   /** Present for doc/xls. */
   cfb?: CfbFile;
+  /**
+   * The spreadsheet model: sheets, cells, styles. Read on first use and then
+   * kept. Rejects with UnsupportedFileError for documents and, until the BIFF
+   * reader exists, for xls.
+   */
+  workbook(): Promise<Workbook>;
   save(): Promise<Uint8Array>;
 }
 
@@ -23,6 +34,9 @@ export interface OfficeFile {
 export class UnsupportedFileError extends Error {
   override name = 'UnsupportedFileError';
 }
+
+const notASpreadsheet = (): Promise<Workbook> =>
+  Promise.reject(new UnsupportedFileError('This file is a document, not a spreadsheet'));
 
 /**
  * Opens a Word or Excel file. The format is detected from the content, never
@@ -39,8 +53,13 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
     const main = await pkg.mainPart();
     const contentType = (main && pkg.contentTypeOf(main)) || '';
     const base = { container: 'ooxml' as const, package: pkg, save: () => pkg.save() };
-    if (/wordprocessingml|ms-word/.test(contentType)) return { format: 'docx', kind: 'document', ...base };
-    if (/spreadsheetml|ms-excel/.test(contentType)) return { format: 'xlsx', kind: 'spreadsheet', ...base };
+    if (/wordprocessingml|ms-word/.test(contentType)) {
+      return { format: 'docx', kind: 'document', ...base, workbook: notASpreadsheet };
+    }
+    if (/spreadsheetml|ms-excel/.test(contentType)) {
+      let workbook: Promise<Workbook> | undefined;
+      return { format: 'xlsx', kind: 'spreadsheet', ...base, workbook: () => (workbook ??= readXlsx(pkg)) };
+    }
     throw new UnsupportedFileError(`Unsupported OOXML document type: ${contentType || 'unknown'}`);
   }
 
@@ -48,8 +67,11 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
     const cfb = CfbFile.read(bytes);
     // No binary writer yet, and nothing can be modified, so saving returns the original bytes.
     const base = { container: 'cfb' as const, cfb, save: async () => bytes };
-    if (cfb.has('WordDocument')) return { format: 'doc', kind: 'document', ...base };
-    if (cfb.has('Workbook') || cfb.has('Book')) return { format: 'xls', kind: 'spreadsheet', ...base };
+    if (cfb.has('WordDocument')) return { format: 'doc', kind: 'document', ...base, workbook: notASpreadsheet };
+    if (cfb.has('Workbook') || cfb.has('Book')) {
+      const workbook = () => Promise.reject(new UnsupportedFileError('Reading xls cell data is not supported yet'));
+      return { format: 'xls', kind: 'spreadsheet', ...base, workbook };
+    }
     if (cfb.has('EncryptedPackage')) throw new UnsupportedFileError('Password-protected files are not supported yet');
     throw new UnsupportedFileError('Compound file is not a Word or Excel document');
   }

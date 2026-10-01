@@ -3,13 +3,14 @@
 Bu kılavuz, BYM Office'i kendi uygulamasına ekleyecek geliştiriciler içindir. Her kod değişikliğinde güncellenir;
 burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılmamış olanlar "Henüz olmayanlar" başlığında açıkça listelenir.
 
-**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — kapsayıcı katmanı.
+**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — kapsayıcı katmanı ve xlsx okuma modeli.
 
 ## 1. Bu sürüm ne yapar
 
 - docx, xlsx, doc ve xls dosyalarını **içeriğinden** tanır (dosya adına bakmaz).
 - docx/xlsx içindeki her parçayı (XML, görsel, bilinmeyen ikili parça) okur.
 - Bir parçayı değiştirip dosyayı yeniden kaydeder; dokunulmayan parçalar özgün sıkıştırılmış baytlarıyla, **bayt bayt aynı** kalır.
+- xlsx dosyasını **tablo modeline** okur: sayfalar, hücre değerleri ve türleri, formül metinleri, stiller, birleştirilmiş hücreler, sütun genişlikleri, satır yükseklikleri, dondurulmuş bölmeler, gizli satır/sütun/sayfa, köprüler, adlandırılmış aralıklar.
 - doc/xls içindeki akışları (stream) okur.
 - Tarayıcıda ve Node'da aynı kodla, çalışma zamanı bağımlılığı olmadan çalışır.
 
@@ -18,7 +19,11 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Özellik | Durum |
 |---|---|
 | Tablo/belge görüntüleme ve düzenleme arayüzü (`BymOffice.mount()`) | Yok (Aşama 1 ve sonrası) |
-| Hücre değerleri, stiller, formüller için model | Yok (görev 1.1'den itibaren) |
+| Sayı biçimlerinin uygulanması (tarih, para, yüzde olarak gösterim) | Yok (görev 1.3); model ham değeri ve biçim kodunu verir |
+| Formül hesaplama | Yok (Aşama 2); dosyadaki son hesaplanmış değer ve formül metni okunur |
+| Modeli değiştirip xlsx olarak yazma | Yok (görev 1.4–1.5); model şimdilik salt okunurdur |
+| xls ve docx/doc için model | Yok; `workbook()` `UnsupportedFileError` ile reddeder |
+| Koşullu biçim, veri doğrulama, grafik, görsel | Modelde yok; dosyada korunur |
 | doc/xls yazma | Yok; `save()` özgün baytları döndürür |
 | RTF, parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
 | npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
@@ -103,6 +108,7 @@ interface OfficeFile {
   container: 'ooxml' | 'cfb';
   package?: OpcPackage; // docx/xlsx
   cfb?: CfbFile;        // doc/xls
+  workbook(): Promise<Workbook>; // tablo modeli; şimdilik yalnız xlsx
   save(): Promise<Uint8Array>;
 }
 ```
@@ -111,6 +117,70 @@ Hatalar:
 
 - `UnsupportedFileError`: girdi Word/Excel dosyası değil ya da henüz desteklenmeyen bir tür (RTF, parola korumalı).
 - `Error`: dosya bozuk (iletisi `Corrupt ZIP archive: …`, `Corrupt ZIP entry …` vb. ile başlar).
+
+### Tablo modeli: `file.workbook()`
+
+İlk çağrıda dosyayı okur, sonraki çağrılarda aynı nesneyi döndürür. Modeli okumak dosyayı değiştirmez; `save()` yine özgün baytları verir.
+Satır ve sütun numaraları modelde **0 tabanlıdır** (`A1` → satır 0, sütun 0).
+
+```js
+const file = await BymOffice.open(bytes);
+const workbook = await file.workbook();
+
+for (const sheet of workbook.sheets) {
+  console.log(sheet.name, sheet.state, sheet.rowCount, sheet.colCount);
+}
+
+const sheet = workbook.sheets[workbook.activeSheet];
+const cell = BymOffice.getCell(sheet, 0, 0);     // A1; hücre yoksa undefined
+cell.kind;      // 'blank' | 'number' | 'string' | 'boolean' | 'error' | 'date'
+cell.value;     // number | string | boolean | null
+cell.formula;   // { text: 'SUM(B2:B3)', type: 'normal' } ya da undefined
+cell.runs;      // zengin metin parçaları (varsa)
+
+const style = BymOffice.resolveCellStyle(workbook.styles, cell.style);
+style.font.bold;                                          // boolean
+style.numFmt;                                             // ör. '#,##0.00'
+BymOffice.resolveColor(style.font.color, workbook.styles); // '#RRGGBB' ya da undefined
+```
+
+`Workbook`:
+
+| Alan | İçerik |
+|---|---|
+| `sheets: Sheet[]` | Sayfalar, dosyadaki sırayla |
+| `styles: StyleSheet` | Font, dolgu, kenarlık, hücre biçimi tabloları ve tema renkleri |
+| `sharedStrings` | Paylaşılan metin tablosu |
+| `definedNames` | Adlandırılmış aralıklar (`name`, `value`, `localSheet`, `hidden`) |
+| `date1904` | Tarihler 1904 sistemine göre mi |
+| `activeSheet` | Açılışta gösterilen sayfanın dizini |
+
+`Sheet`:
+
+| Alan | İçerik |
+|---|---|
+| `name`, `sheetId`, `state`, `kind`, `part` | Ad, kimlik, `'visible' \| 'hidden' \| 'veryHidden'`, `'worksheet' \| 'chartsheet' \| …`, kaynak parça |
+| `rows: Map<number, Row>` | Seyrek satırlar; `Row`: `cells` (sütuna göre seyrek dizi), `height` (punto), `hidden`, `style`, `outlineLevel` |
+| `columns: ColumnRange[]` | Sütun aralıkları: `min`, `max`, `width` (karakter), `hidden`, `style` |
+| `merges: CellRange[]` | Birleştirilmiş alanlar (`top`, `left`, `bottom`, `right`; uçlar dahil) |
+| `hyperlinks` | `range`, `target` (dış adres) ya da `location` (kitap içi), `tooltip` |
+| `rowCount`, `colCount` | Hücre içeren son satır/sütun + 1 |
+| `dimension` | Dosyanın bildirdiği kullanılan alan (eksik ya da yanlış olabilir) |
+| `defaultRowHeight`, `defaultColWidth` | Varsayılan ölçüler |
+| `view` | `frozenRows`, `frozenCols`, `topLeftCell` (kaydırılan alanın ilk hücresi), `firstVisibleCell` (görünümün sol üst hücresi; dondurulan alan buradan başlar), `showGridLines`, `zoomScale`, `rightToLeft`, `activeCell`, … |
+| `tabColor` | Sekme rengi |
+
+Yardımcılar: `getCell(sheet, row, col)`, `columnName(col)`, `cellName(row, col)`, `parseCellRef('B7')`, `parseRange('A1:C3')`, `rangeName(range)`, `resolveCellStyle(styles, index)`, `resolveColor(color, styles)`, `formatCodeOf(styles, numFmtId)`.
+
+Bilinmesi gerekenler:
+
+- Tarihler Excel'de olduğu gibi **sayı** olarak gelir; tarih olduğunu `style.numFmt` biçim kodu belirtir. Biçim motoru (görev 1.3) gelene dek dönüştürme sizdedir.
+- Formüller hesaplanmaz; `cell.value` dosyaya en son kaydedilen sonuçtur.
+- Grafik sayfaları (`kind: 'chartsheet'`) listede görünür ama hücre içermez.
+- `activeSheet` gizli bir sayfayı gösterebilir (dosya öyle kaydedilmişse); kullanıcıya göstermeden önce `state` alanına bakın.
+- Sayılar XML'deki ondalık yazımla okunur; `0x1F`, `NaN`, `INF` gibi değerler içeren dosya bozuk sayılır.
+- Bozuk sayfa verisi `Error` ile reddedilir (iletisi `Invalid XML …` ya da `Invalid xlsx …`/`Invalid worksheet …` ile başlar).
+- Başarım: 100.000 satır × 5 sütunluk sayfa güncel tarayıcılarda bir saniyenin altında okunur (her değişiklikte Playwright ile ölçülür).
 
 ### `OpcPackage` (docx/xlsx)
 
@@ -185,6 +255,7 @@ Sayfada yapabilecekleriniz:
 - Bir ya da birden çok dosyayı sürükleyip bırakmak ya da seçmek.
 - Her dosya için biçimi, boyutu, açılış süresini ve "kaydet → yeniden aç" sonucunu görmek (yeşil: tüm parçalar aynı; sarı: desteklenmiyor ya da ikili biçim; kırmızı: hata ya da içerik değişti).
 - Parçaya ya da akışa tıklayıp içeriğini görmek (XML metin olarak, diğerleri onaltılık döküm).
+- xlsx dosyalarında **hücre önizlemesi**: sayfa sekmeleri, ilk 200 satır × 50 sütun, kalın/italik, yazı ve dolgu rengi, hizalama; formüllü hücrenin üzerine gelince formül görünür. Değerler ham haliyle gösterilir (sayı biçimleri henüz uygulanmıyor).
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.

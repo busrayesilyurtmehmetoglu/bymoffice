@@ -39,7 +39,7 @@ Yalnız değiştirilen parçalar yeniden üretilir. Her yeni özellik `pnpm corp
 ## Durum
 
 - [x] Aşama 0: ZIP, XML, OPC (docx/xlsx kapsayıcısı), CFB okuyucu (doc/xls kapsayıcısı), biçim algılama, gidiş-dönüş denetimi
-- [ ] Aşama 1: xlsx tablo modeli, Canvas ızgara, hücre düzenleme
+- [ ] Aşama 1: xlsx tablo modeli (okuma tamam), Canvas ızgara, hücre düzenleme
 - [ ] Aşama 2: formül motoru, biçimler
 - [ ] Aşama 3: docx belge modeli, sayfa düzeni motoru
 - [ ] Aşama 4: Word düzenleme

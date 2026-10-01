@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { XLSX_PARTS, XLS_STREAMS, readPartsInNode, textFile, xls, xlsx } from './fixtures/files';
+import { sampleWorkbook } from '../test/fixtures';
 import { expect, expectResponsive, test } from './helpers';
 
 const upload = (name: string, bytes: Uint8Array) => ({
@@ -111,5 +112,34 @@ test.describe('demo page', () => {
     await expect(page.locator('#files tr')).toHaveCount(0);
     await expect(page.locator('#status')).toHaveText('—');
     await expect(page.locator('#save')).toBeDisabled();
+  });
+  test('xlsx cells are previewed per sheet with basic styles', async ({ page }) => {
+    await page.locator('#file').setInputFiles(upload('model.xlsx', await sampleWorkbook()));
+
+    await expect(page.locator('#preview-section')).toBeVisible();
+    await expect(page.locator('#tabs button')).toHaveText(['Veri', 'Gizli', 'Grafik']);
+    // The workbook opens on its active sheet, which is empty here.
+    await expect(page.locator('#tabs button.active')).toHaveText('Gizli');
+    await expect(page.locator('#preview tr')).toHaveCount(0);
+
+    await page.locator('#tabs button', { hasText: 'Veri' }).click();
+    await expect(page.locator('#preview-note')).toContainText('Veri: worksheet, 4 satır × 3 sütun');
+    await expect(page.locator('#preview-note')).toContainText('dondurulmuş 1 satır / 1 sütun');
+    await expect(page.locator('#preview tr').first().locator('th')).toHaveText(['', 'A', 'B', 'C']);
+    await expect(page.locator('#preview tr').nth(1).locator('td')).toHaveText(['Ürün', 'Fiyat', '']);
+    await expect(page.locator('#preview tr').nth(2).locator('td')).toHaveText([' Çay ', '12.5', 'true'], { useInnerText: false });
+    await expect(page.locator('#preview tr').nth(3).locator('td')).toHaveText(['Kalın şeker', '7', '#DIV/0!']);
+    await expect(page.locator('#preview tr').nth(4).locator('td').nth(1)).toHaveAttribute('title', '=SUM(B2:B3)');
+
+    const header = page.locator('#preview tr').nth(1).locator('td').first();
+    await expect(header).toHaveCSS('background-color', 'rgb(255, 255, 0)');
+    await expect(header).toHaveCSS('color', 'rgb(68, 114, 196)');
+    await expect(header).toHaveCSS('font-weight', '700');
+  });
+
+  test('no cell preview for files without a spreadsheet model', async ({ page }) => {
+    await page.locator('#file').setInputFiles(upload('sample.xls', xls()));
+    await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
+    await expect(page.locator('#preview-section')).toBeHidden();
   });
 });

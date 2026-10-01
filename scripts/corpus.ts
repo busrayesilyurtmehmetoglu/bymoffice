@@ -25,6 +25,9 @@ function* walk(dir: string): Generator<string> {
   }
 }
 
+let sheets = 0;
+let cells = 0;
+
 async function checkOoxml(file: OfficeFile, original: Uint8Array): Promise<void> {
   const pkg = file.package!;
   const parts = pkg.partNames();
@@ -37,13 +40,24 @@ async function checkOoxml(file: OfficeFile, original: Uint8Array): Promise<void>
   }
 
   // Plain save: same parts, same order, same bytes.
-  const saved = await OpcPackage.open(await file.save());
+  const savedBytes = await file.save();
+  const saved = await OpcPackage.open(savedBytes);
   if (!isDeepStrictEqual(saved.partNames(), parts)) throw new Error('part list changed after save');
   const reference = await OpcPackage.open(original);
   for (const part of parts) {
     if (!isDeepStrictEqual(await saved.readPart(part), await reference.readPart(part))) {
       throw new Error(`content changed after save: ${part}`);
     }
+  }
+
+  // Spreadsheets must read into the model; reading must not disturb the package.
+  if (file.format === 'xlsx') {
+    const workbook = await file.workbook();
+    for (const sheet of workbook.sheets) {
+      cells += [...sheet.rows.values()].reduce((sum, row) => sum + row.cells.filter(() => true).length, 0);
+    }
+    sheets += workbook.sheets.length;
+    if (!isDeepStrictEqual(await file.save(), savedBytes)) throw new Error('saved bytes changed after reading the model');
   }
 
   // Rewriting the main part through the XML layer must keep its meaning.
@@ -116,6 +130,7 @@ for (const root of roots) {
 
 const total = Object.values(passed).reduce((sum, n) => sum + n, 0);
 console.log(`passed: ${total}`, passed);
+console.log(`xlsx model: ${sheets} sheets, ${cells} cells`);
 console.log(`not a Word/Excel file: ${unsupported}`);
 console.log(`failed: ${failures.length}`);
 for (const failure of failures.slice(0, 40)) console.log(`  ${failure}`);

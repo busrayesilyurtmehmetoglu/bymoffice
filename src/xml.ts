@@ -47,7 +47,8 @@ function decodeEntities(text: string): string {
     if (ref[0] === '#') {
       return String.fromCodePoint(ref[1] === 'x' ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10));
     }
-    const value = NAMED_ENTITIES[ref];
+    // Own properties only: "&constructor;" must not find Object.prototype members.
+    const value = Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, ref) ? NAMED_ENTITIES[ref] : undefined;
     if (value === undefined) throw new Error(`Unknown XML entity: ${match}`);
     return value;
   });
