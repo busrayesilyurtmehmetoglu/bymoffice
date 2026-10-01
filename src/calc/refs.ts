@@ -464,24 +464,24 @@ function adjustRef(ref: Ref, edit: AxisEdit): string | undefined {
   return formatRef(rows ? { ...ref, r1: first, r2: second } : { ...ref, c1: first, c2: second });
 }
 
-/** Decides per reference whether it points at the edited sheet, then adjusts it. */
-function editTransform(ownSheetName: string, edit: StructuralEdit): Transform {
+/** Tells per reference whether it points at the edited sheet. `ownSheetName` is the sheet of the formula. */
+function sheetMatcher(ownSheetName: string, edit: StructuralEdit): (sheets: string[] | undefined, external: boolean) => boolean {
   const edited = foldSheetName(edit.sheetName);
   const ownMatches = foldSheetName(ownSheetName) === edited;
-  return (ref, sheets, external) => {
+  return (sheets, external) => {
     // Rows and columns of another workbook did not move.
-    if (external) return undefined;
-    if (!sheets) {
-      if (!ownMatches) return undefined;
-    } else {
-      // A 3D reference is adjusted when the edited sheet is one of its two ends; the sheets
-      // between them are not known here.
-      let found = false;
-      for (let k = 0; k < sheets.length; k++) if (foldSheetName(sheets[k]) === edited) found = true;
-      if (!found) return undefined;
-    }
-    return adjustRef(ref, edit);
+    if (external) return false;
+    if (!sheets) return ownMatches;
+    // A 3D reference is adjusted when the edited sheet is one of its two ends; the sheets
+    // between them are not known here.
+    for (let k = 0; k < sheets.length; k++) if (foldSheetName(sheets[k]) === edited) return true;
+    return false;
   };
+}
+
+function editTransform(ownSheetName: string, edit: StructuralEdit): Transform {
+  const onEditedSheet = sheetMatcher(ownSheetName, edit);
+  return (ref, sheets, external) => (onEditedSheet(sheets, external) ? adjustRef(ref, edit) : undefined);
 }
 
 /**
@@ -492,6 +492,76 @@ export function adjustFormula(text: string, formulaSheetName: string, edit: Stru
   if (typeof text !== 'string') return toText(text);
   if (!isEffective(edit)) return text;
   return rewrite(text, editTransform(formulaSheetName, edit));
+}
+
+/**
+ * One axis of a reference in an anchored formula: the two ends a and b, each either anchored
+ * with "$" (it follows `edit`, when the edit is about this axis of its sheet) or relative (it
+ * moves by `delta` with the anchor cell). Undefined when the result is #REF!.
+ */
+function adjustAnchoredAxis(a: number, b: number, absA: boolean, absB: boolean, delta: number, limit: number, edit: AxisEdit | undefined): [number, number] | undefined {
+  if (absA && absB) {
+    // Fully anchored: a span, with the growing and shrinking of adjustFormula.
+    if (!edit) return [a, b];
+    const span = adjustSpan(Math.min(a, b), Math.max(a, b), limit, edit);
+    if (!span) return undefined;
+    return a <= b ? span : [span[1], span[0]];
+  }
+  if (!absA) a += delta;
+  else if (edit) {
+    const moved = adjustSpan(a, a, limit, edit);
+    if (!moved) return undefined;
+    a = moved[0];
+  }
+  if (!absB) b += delta;
+  else if (edit) {
+    const moved = adjustSpan(b, b, limit, edit);
+    if (!moved) return undefined;
+    b = moved[0];
+  }
+  if (a < 0 || b < 0 || a >= limit || b >= limit) return undefined;
+  return [a, b];
+}
+
+/**
+ * Adjusts a formula that is written relative to an anchor cell (conditional formats, data
+ * validations) after a structural edit. Parts of a reference anchored with "$" follow the
+ * edit as in adjustFormula; relative parts keep their distance from the anchor, which moved
+ * from `before` to `after`.
+ */
+export function adjustAnchoredFormula(
+  text: string,
+  formulaSheetName: string,
+  edit: StructuralEdit,
+  before: { row: number; col: number },
+  after: { row: number; col: number },
+): string {
+  if (typeof text !== 'string') return toText(text);
+  const dRow = before && after ? toInt(after.row - before.row) : 0;
+  const dCol = before && after ? toInt(after.col - before.col) : 0;
+  const effective = isEffective(edit);
+  if (!effective && dRow === 0 && dCol === 0) return text;
+  const onEditedSheet = effective ? sheetMatcher(formulaSheetName, edit) : () => false;
+  return rewrite(text, (ref, sheets, external) => {
+    // Relative parts move with the anchor whatever sheet they point at; anchored parts only
+    // follow an edit of their own sheet.
+    const edited = onEditedSheet(sheets, external);
+    let { r1, c1, r2, c2 } = ref;
+    if (ref.kind !== K_COL) {
+      const rows = adjustAnchoredAxis(r1, r2, ref.absR1, ref.absR2, dRow, MAX_ROWS, edited && edit.axis === 'row' ? edit : undefined);
+      if (!rows) return REF_ERROR;
+      r1 = rows[0];
+      r2 = rows[1];
+    }
+    if (ref.kind !== K_ROW) {
+      const cols = adjustAnchoredAxis(c1, c2, ref.absC1, ref.absC2, dCol, MAX_COLS, edited && edit.axis === 'col' ? edit : undefined);
+      if (!cols) return REF_ERROR;
+      c1 = cols[0];
+      c2 = cols[1];
+    }
+    if (r1 === ref.r1 && c1 === ref.c1 && r2 === ref.r2 && c2 === ref.c2) return undefined;
+    return formatRef({ ...ref, r1, c1, r2, c2 });
+  });
 }
 
 /** The same adjustment for a plain range (merged cells, hyperlinks); undefined when all of it was deleted. */

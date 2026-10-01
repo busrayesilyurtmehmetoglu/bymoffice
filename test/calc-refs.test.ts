@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from '../src/calc/refs';
+import { adjustAnchoredFormula, adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from '../src/calc/refs';
 import { MAX_COLS, MAX_ROWS } from '../src/model/sheet/types';
 
 const SHEET = 'Sheet1';
@@ -539,10 +539,10 @@ function random(seed: number): () => number {
   };
 }
 
-function randomFormula(rnd: () => number, lowerCase: boolean): string {
+function randomFormula(rnd: () => number, lowerCase: boolean, dollars = 0.3): string {
   const pick = <T>(list: T[]): T => list[Math.floor(rnd() * list.length)];
   const int = (max: number) => Math.floor(rnd() * max);
-  const dollar = () => (rnd() < 0.3 ? '$' : '');
+  const dollar = () => (rnd() < dollars ? '$' : '');
   const letters = () => {
     const name = pick(['A', 'B', 'C', 'Z', 'AA', 'AZ', 'BC']);
     return lowerCase && rnd() < 0.3 ? name.toLowerCase() : name;
@@ -620,6 +620,183 @@ test('refs property: an insertion followed by the same deletion is undone', () =
   assert.equal(adjustFormula(deleted, SHEET, edit('insert', 'row', 1, 1)), 'A1:A3+#REF!');
   const shrunk = adjustFormula('A1:A2', SHEET, edit('delete', 'row', 1, 1));
   assert.equal(adjustFormula(shrunk, SHEET, edit('insert', 'row', 1, 1)), 'A1:A1');
+});
+
+// ---------------------------------------------------------------------------
+// adjustAnchoredFormula
+
+/** Rows of [input, expected] for one edit and one move of the anchor cell. */
+function checkAnchored(e: StructuralEdit, before: [number, number], after: [number, number], cases: [string, string][], formulaSheet = SHEET): void {
+  const b = { row: before[0], col: before[1] };
+  const a = { row: after[0], col: after[1] };
+  for (const [input, expected] of cases) {
+    assert.equal(adjustAnchoredFormula(input, formulaSheet, e, b, a), expected, `${e.kind} ${e.axis} ${e.at}+${e.count}, anchor ${before} -> ${after}: ${JSON.stringify(input)}`);
+  }
+}
+
+test('refs anchored: deleting rows', () => {
+  // sqref A5:A10, row 5 deleted: the rule still starts at A5 (the anchor is inside the deleted rows).
+  checkAnchored(edit('delete', 'row', 4, 1), [4, 0], [4, 0], [
+    ['A5>B5', 'A5>B5'],
+    ['A7', 'A7'],
+    ['$A$7', '$A$6'],
+    ['A$7', 'A$6'],
+    ['$A7', '$A7'],
+    ['$A$5', '#REF!'],
+    ['A$5', '#REF!'],
+    ['$A$4', '$A$4'],
+    ['AND(A5>$B$7,"A5"<>a5)', 'AND(A5>$B$6,"A5"<>a5)'],
+    ['$A$1:$A$10', '$A$1:$A$9'],
+    ['$A$5:$A$5', '#REF!'],
+    ['SUM($A$5:A5)', 'SUM(#REF!)'],
+    ['SUM($A$1:A5)', 'SUM($A$1:A5)'],
+    ['SUM($A$6:A5)', 'SUM($A$5:A5)'],
+    ['$5:$5', '#REF!'],
+    ['$3:$9', '$3:$8'],
+    ['5:9', '5:9'],
+    ['$A:$C', '$A:$C'],
+  ]);
+  // Anchor below the deleted rows: sqref A5:A10 -> A3:A8 after rows 1-2 go.
+  checkAnchored(edit('delete', 'row', 0, 2), [4, 0], [2, 0], [
+    ['A5>B5', 'A3>B3'],
+    ['$A$7', '$A$5'],
+    ['$A$2', '#REF!'],
+    ['A1', '#REF!'], // two rows above the sheet
+    ['A2:A5', '#REF!'],
+    ['$A$3:A5', '$A$1:A3'],
+    ['A$9+$A9', 'A$7+$A7'],
+  ]);
+  // Anchor above the deleted rows: it stays.
+  checkAnchored(edit('delete', 'row', 20, 2), [4, 0], [4, 0], [
+    ['A5>B5', 'A5>B5'],
+    ['A30', 'A30'],
+    ['$A$30', '$A$28'],
+    ['$A$21', '#REF!'],
+    ['$A$5:$A$30', '$A$5:$A$28'],
+  ]);
+});
+
+test('refs anchored: inserting rows', () => {
+  // Three rows inserted before row 3: sqref A5:A10 -> A8:A13.
+  checkAnchored(edit('insert', 'row', 2, 3), [4, 0], [7, 0], [
+    ['A5>B5', 'A8>B8'],
+    ['$C$1', '$C$1'],
+    ['$C$3', '$C$6'],
+    ['A$3', 'A$6'],
+    ['$A5', '$A8'],
+    ['a5', 'A8'],
+    ['$A$1:$A$10', '$A$1:$A$13'],
+    ['$A$3:$A$10', '$A$6:$A$13'],
+    ['$A$1:A5', '$A$1:A8'],
+    ['$A$3:A5', '$A$6:A8'],
+    ['A1:A2', 'A4:A5'],
+    ['$1:$3', '$1:$6'],
+    ['1:3', '4:6'],
+    ['A:A', 'A:A'],
+    [`A${MAX_ROWS - 2}`, '#REF!'],
+    [`$A$${MAX_ROWS}`, '#REF!'],
+  ]);
+  // Inserted inside the rule: the anchor stays, anchored targets below move.
+  checkAnchored(edit('insert', 'row', 6, 1), [4, 0], [4, 0], [
+    ['A5>B5', 'A5>B5'],
+    ['A9', 'A9'],
+    ['$A$9', '$A$10'],
+    ['$A$5:$A$10', '$A$5:$A$11'],
+  ]);
+});
+
+test('refs anchored: columns', () => {
+  // Two columns inserted before B: sqref C1:C9 -> E1:E9.
+  checkAnchored(edit('insert', 'col', 1, 2), [0, 2], [0, 4], [
+    ['C1>$B1', 'E1>$D1'],
+    ['$A1', '$A1'],
+    ['C$1', 'E$1'],
+    ['$B$1:$C$5', '$D$1:$E$5'],
+    ['$A1:$C1', '$A1:$E1'],
+    ['$A1:C1', '$A1:E1'],
+    ['B:B', 'D:D'],
+    ['$B:$B', '$D:$D'],
+    ['$A:$B', '$A:$D'],
+    ['1:1', '1:1'],
+    ['$1:$1', '$1:$1'],
+    ['XFC1', '#REF!'],
+  ]);
+  // Column C deleted out of sqref B1:C5: the anchor stays on B.
+  checkAnchored(edit('delete', 'col', 2, 1), [0, 1], [0, 1], [
+    ['B1>C1', 'B1>C1'],
+    ['$C1', '#REF!'],
+    ['$D1', '$C1'],
+    ['$B1', '$B1'],
+    ['$B$1:$D$1', '$B$1:$C$1'],
+    ['$C:$C', '#REF!'],
+    ['C:C', 'C:C'],
+  ]);
+  // Column A deleted: sqref B1:C5 -> A1:B5.
+  checkAnchored(edit('delete', 'col', 0, 1), [0, 1], [0, 0], [
+    ['B1>C1', 'A1>B1'],
+    ['A1', '#REF!'],
+    ['$A1', '#REF!'],
+    ['$B1', '$A1'],
+    ['B$1:$D$9', 'A$1:$C$9'],
+  ]);
+});
+
+test('refs anchored: other sheets and other workbooks', () => {
+  const e = edit('insert', 'row', 2, 3);
+  // Relative parts follow the anchor whatever they point at; anchored parts follow the edit of their own sheet only.
+  checkAnchored(e, [4, 0], [7, 0], [
+    ['Sheet2!A5', 'Sheet2!A8'],
+    ['Sheet2!$A$5', 'Sheet2!$A$5'],
+    ['Sheet2!$A5:$B$9', 'Sheet2!$A8:$B$9'],
+    ['Sheet1!$A$5+sheet1!A5', 'Sheet1!$A$8+sheet1!A8'],
+    ["'Veri Sayfası'!A5>Özet!$B$5", "'Veri Sayfası'!A8>Özet!$B$5"],
+    ['[1]Sheet1!A5+[1]Sheet1!$A$5', '[1]Sheet1!A8+[1]Sheet1!$A$5'],
+    ['Sheet1:Sheet3!$A$5', 'Sheet1:Sheet3!$A$8'],
+    ['Sheet2:Sheet3!$A$5', 'Sheet2:Sheet3!$A$5'],
+    ['Sheet1!$A$1:Sheet1!$A$5', 'Sheet1!$A$1:Sheet1!$A$8'],
+    ['Tablo1[A5]+LOG10(A5)+TAX2024+"A5"', 'Tablo1[A5]+LOG10(A8)+TAX2027+"A5"'],
+  ]);
+  // A formula on another sheet than the edited one: bare references are not about the edit.
+  checkAnchored(
+    e,
+    [4, 0],
+    [7, 0],
+    [['A5+$A$5+Sheet1!$A$5', 'A8+$A$5+Sheet1!$A$8']],
+    'Sheet2',
+  );
+});
+
+test('refs anchored: nothing to do', () => {
+  const formula = 'and(a5>b5, Sheet2!c$1="x")';
+  const anchor = { row: 4, col: 0 };
+  // No anchored part on the edited sheet and an anchor that stayed: identical.
+  assert.equal(adjustAnchoredFormula(formula, SHEET, edit('delete', 'row', 4, 1), anchor, anchor), formula);
+  assert.equal(adjustAnchoredFormula('A5>B5', SHEET, edit('delete', 'row', 0, 100), anchor, anchor), 'A5>B5');
+  // An edit that moves nothing still lets the anchor move.
+  assert.equal(adjustAnchoredFormula('A5>$B$5', SHEET, edit('insert', 'row', 0, 0), anchor, { row: 5, col: 1 }), 'B6>$B$5');
+  assert.equal(adjustAnchoredFormula('A5>$B$5', SHEET, edit('insert', 'row', 0, 0), anchor, anchor), 'A5>$B$5');
+  const bad = (value: unknown) => value as string;
+  assert.equal(adjustAnchoredFormula(bad(null), SHEET, edit('insert', 'row', 0, 1), anchor, anchor), '');
+  assert.equal(adjustAnchoredFormula('A5+$A$5', SHEET, edit('insert', 'row', 0, 1), bad(null) as unknown as typeof anchor, anchor), 'A5+$A$6');
+  assert.equal(adjustAnchoredFormula('A5', SHEET, bad(undefined) as unknown as StructuralEdit, anchor, anchor), 'A5');
+});
+
+test('refs property: anchored formulas agree with adjustFormula and shiftFormula', () => {
+  const rnd = random(5);
+  for (let k = 0; k < 2000; k++) {
+    const axis = rnd() < 0.5 ? 'row' : 'col';
+    const e = edit(rnd() < 0.5 ? 'insert' : 'delete', axis, Math.floor(rnd() * (axis === 'row' ? 210 : 60)), 1 + Math.floor(rnd() * 5));
+    const before = { row: Math.floor(rnd() * 20), col: Math.floor(rnd() * 20) };
+    const after = { row: Math.floor(rnd() * 20), col: Math.floor(rnd() * 20) };
+    // Every part anchored: the anchor cell does not matter.
+    const anchored = randomFormula(rnd, true, 1);
+    assert.equal(adjustAnchoredFormula(anchored, SHEET, e, before, after), adjustFormula(anchored, SHEET, e), anchored);
+    // No part anchored: the edit does not matter, only the move of the anchor.
+    const relative = randomFormula(rnd, true, 0);
+    assert.equal(adjustAnchoredFormula(relative, SHEET, e, before, after), shiftFormula(relative, after.row - before.row, after.col - before.col), relative);
+    // An anchor that stayed and no anchored part: identical.
+    assert.equal(adjustAnchoredFormula(relative, SHEET, e, before, before), relative);
+  }
 });
 
 // ---------------------------------------------------------------------------
