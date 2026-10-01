@@ -123,11 +123,16 @@ test.describe('demo page', () => {
     await expect(page.locator('#preview-note')).toContainText('Veri: worksheet, 4 satır × 3 sütun');
     await expect(page.locator('#preview-note')).toContainText('dondurulmuş 1 satır / 1 sütun');
     // The file's active cell is B3.
-    await expect(page.locator('#cell-info')).toHaveText('Seçim: B3 · B3 = 7');
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: B3 · B3 = 7,00 ₺ (ham değer: 7)');
 
     // Programmatic selection goes through the same read-out as a click would.
     await page.evaluate(() => (window as any).__view.select({ top: 3, left: 1, bottom: 3, right: 1 }));
-    await expect(page.locator('#cell-info')).toHaveText('Seçim: B4 · B4 = 19.5 · formül: =SUM(B2:B3)');
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: B4 · B4 = 19,50 ₺ (ham değer: 19.5) · formül: =SUM(B2:B3)');
+
+    // The number format follows the chosen language.
+    await page.locator('#locale').selectOption('en');
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: B4 · B4 = 19.50 ₺ (ham değer: 19.5) · formül: =SUM(B2:B3)');
+    await page.locator('#locale').selectOption('tr');
 
     const canvas = page.locator('#grid canvas');
     const box = await canvas.boundingBox();

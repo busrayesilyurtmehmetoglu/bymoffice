@@ -96,6 +96,11 @@
       <section id="preview-section" hidden>
         <h2>Tablo görünümü</h2>
         <p class="muted" id="preview-note"></p>
+        <div class="row" style="margin: 0 0 10px">
+          <label>Sayı ve tarih biçimi dili
+            <select id="locale"><option value="tr">Türkçe (1.234,50 · 15.03.2024)</option><option value="en">English (1,234.50 · 3/15/2024)</option></select>
+          </label>
+        </div>
         <div id="grid"></div>
         <p class="muted" id="cell-info" style="margin: 10px 0 0"></p>
         <p class="muted">Fare ya da dokunma ile seçin ve kaydırın; ok tuşları, Shift+ok, Ctrl+ok, PageUp/PageDown, Home, Ctrl+Home/End çalışır.</p>
@@ -257,7 +262,9 @@
         const cell = BymOffice.getCell(sheet, row, col);
         const range = BymOffice.rangeName(selection.range);
         const formula = cell && cell.formula && cell.formula.text ? ` · formül: =${cell.formula.text}` : '';
-        $('cell-info').textContent = `Seçim: ${range} · ${BymOffice.cellName(row, col)} = ${cell ? BymOffice.cellText(cell) : ''}${formula}`;
+        const shown = BymOffice.cellDisplayText(workbook, cell, BymOffice.getLocale($('locale').value));
+        const raw = cell && cell.kind === 'number' && BymOffice.cellText(cell) !== shown ? ` (ham değer: ${BymOffice.cellText(cell)})` : '';
+        $('cell-info').textContent = `Seçim: ${range} · ${BymOffice.cellName(row, col)} = ${shown}${raw}${formula}`;
       }
 
       async function showPreview(record) {
@@ -275,9 +282,10 @@
           const ms = performance.now() - started;
           if (selected !== record) return;
           const note = (index) => {
-            $('preview-note').textContent = `${describeSheet(workbook, index)} Model ${ms.toFixed(1)} ms'de okundu. Sayı biçimleri henüz uygulanmıyor.`;
+            $('preview-note').textContent = `${describeSheet(workbook, index)} Model ${ms.toFixed(1)} ms'de okundu.`;
           };
           view = new BymOffice.WorkbookView($('grid'), workbook, {
+            locale: $('locale').value,
             onSelectionChange: (selection, index) => describeSelection(workbook, selection, index),
             onSheetChange: (index) => {
               note(index);
@@ -374,6 +382,12 @@
         event.preventDefault();
         drop.classList.remove('over');
         handle(Array.from(event.dataTransfer.files));
+      });
+
+      $('locale').addEventListener('change', () => {
+        if (!view) return;
+        view.setLocale($('locale').value);
+        describeSelection(view.workbook, view.selection, view.activeSheet);
       });
 
       $('clear').addEventListener('click', () => {

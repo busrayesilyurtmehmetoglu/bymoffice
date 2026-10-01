@@ -152,6 +152,8 @@ export interface ResolvedCellStyle {
   border: Border;
   alignment: Alignment;
   numFmt: string;
+  /** Id of the number format; ids below 164 that the file does not redefine are built-in formats. */
+  numFmtId: number;
 }
 
 /**
@@ -171,5 +173,6 @@ export function resolveCellStyle(styles: StyleSheet, index: number): ResolvedCel
     border: styles.borders[xf.borderId] ?? styles.borders[0] ?? defaults.borders[0],
     alignment: xf.alignment ?? {},
     numFmt: formatCodeOf(styles, xf.numFmtId),
+    numFmtId: xf.numFmtId,
   };
 }

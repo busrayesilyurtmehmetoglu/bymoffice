@@ -13,7 +13,9 @@ import type { AxisMetrics } from '../layout/sheet-metrics';
 import { resolveCellStyle, resolveColor } from '../model/sheet/color';
 import { columnName, MAX_COLS, MAX_ROWS } from '../model/sheet/types';
 import type { BorderEdge, Cell, CellRange, Fill, Font, Row, Sheet, StyleSheet, Workbook } from '../model/sheet/types';
-import { cellText } from './cell-text';
+import { builtinFormatId, formatCell } from '../format/cell-format';
+import type { FormatLocale } from '../format/locale';
+import type { FormatOptions } from '../format/number-format';
 import { cssFont, FONT_FALLBACK, fontPixels, TextPainter, wrapLines } from './text';
 
 export interface GridTheme {
@@ -53,6 +55,8 @@ export interface GridScene {
   layout: GridLayout;
   selection?: GridSelection;
   theme?: GridTheme;
+  /** Decimal separators, month names and date order for number formats; en-US when missing. */
+  locale?: FormatLocale;
   /** Canvas backing store pixels per CSS pixel. */
   devicePixelRatio: number;
 }
@@ -149,6 +153,9 @@ interface DrawStyle {
   top: EdgeStyle | undefined;
   bottom: EdgeStyle | undefined;
   hasBorder: boolean;
+  /** Number format code, and the options to apply it with. */
+  numFmt: string;
+  format: FormatOptions;
 }
 
 /** A piece of cell text with one font; a plain cell has one, rich text has one per run. */
@@ -194,6 +201,9 @@ interface Frame {
   merges: CellRange[];
   styleCache: Map<number, DrawStyle>;
   textStyleCache: Map<Font, TextStyle>;
+  format: FormatOptions;
+  /** Text styles recoloured by a number format section such as [Red], keyed by font and colour. */
+  colorStyleCache: Map<string, TextStyle>;
 }
 
 /** Draws the whole scene. The canvas backing store is layout.width*dpr by layout.height*dpr. */
@@ -224,6 +234,8 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     merges: visibleMerges(sheet, panes),
     styleCache: new Map(),
     textStyleCache: new Map(),
+    format: { locale: scene.locale, date1904: scene.workbook.date1904 === true },
+    colorStyleCache: new Map(),
   };
 
   const views: PaneView[] = [];
@@ -438,6 +450,8 @@ function drawStyle(frame: Frame, index: number): DrawStyle {
     top,
     bottom,
     hasBorder: !!(left || right || top || bottom),
+    numFmt: resolved.numFmt,
+    format: { locale: frame.format.locale, date1904: frame.format.date1904, builtinId: builtinFormatId(frame.styles, resolved.numFmtId) },
   };
   frame.styleCache.set(index, style);
   return style;
@@ -748,8 +762,21 @@ function cellSegments(frame: Frame, cell: Cell, style: DrawStyle, wrap: boolean)
     }
     return segments;
   }
-  const text = prepareText(cellText(cell), limit, wrap);
-  if (text.length > 0) segments.push({ text, style: style.text });
+  const formatted = formatCell(cell, style.numFmt, style.format);
+  // A value its format cannot show (a negative date) is drawn like a number that does not fit.
+  const text = formatted.overflow ? '#'.repeat(MAX_HASHES) : prepareText(formatted.text, limit, wrap);
+  if (text.length === 0) return segments;
+  let shown = style.text;
+  if (formatted.color && formatted.color !== shown.color) {
+    const key = shown.font + formatted.color + shown.underline + shown.strike;
+    let coloured = frame.colorStyleCache.get(key);
+    if (!coloured) {
+      coloured = { font: shown.font, px: shown.px, color: formatted.color, underline: shown.underline, strike: shown.strike };
+      frame.colorStyleCache.set(key, coloured);
+    }
+    shown = coloured;
+  }
+  segments.push({ text, style: shown });
   return segments;
 }
 

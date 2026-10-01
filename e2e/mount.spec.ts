@@ -27,6 +27,25 @@ test.describe('BymOffice.mount', () => {
     await expect(page.locator('#editor')).toBeEmpty();
   });
 
+  test('the locale option and setLocale change what cells show', async ({ page }) => {
+    const bytes = Array.from(await sampleWorkbook());
+    await page.evaluate(async (input) => {
+      const mounted = await (window as any).BymOffice.mount(document.getElementById('editor'), { file: new Uint8Array(input), locale: 'tr' });
+      (window as any).__mounted = mounted;
+      mounted.view.select({ top: 1, left: 1, bottom: 1, right: 1 });
+    }, bytes);
+    const live = page.locator('#editor [aria-live]');
+    await expect(live).toHaveText('B2 12,50 ₺');
+
+    await page.evaluate(() => (window as any).__mounted.view.setLocale('en'));
+    await expect(live).toHaveText('B2 12.50 ₺');
+
+    // An incomplete locale object falls back to en-US for what it leaves out.
+    await page.evaluate(() => (window as any).__mounted.view.setLocale({ decimal: ';' }));
+    await expect(live).toHaveText('B2 12;50 ₺');
+    await page.evaluate(() => (window as any).__mounted.destroy());
+  });
+
   test('loads the file from a URL', async ({ page, pageProblems }) => {
     const bytes = Buffer.from(await sampleWorkbook());
     await page.route('**/files/sample.xlsx', (route) => route.fulfill({ body: bytes, contentType: 'application/octet-stream' }));

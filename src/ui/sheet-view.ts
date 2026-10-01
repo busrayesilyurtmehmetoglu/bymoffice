@@ -11,10 +11,16 @@ import { createLayout, hitTest, maxScroll, scrollAreaSize, scrollToReveal, type 
 import { createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
 import { resolveColor } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, cellName, getCell, parseCellRef, rangeName, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
-import { cellText } from '../render/cell-text';
+import { cellDisplayText } from '../format/cell-format';
+import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { renderGrid, type GridSelection } from '../render/grid';
 
 export interface WorkbookViewOptions {
+  /**
+   * Language for number and date formats: a tag such as "tr" or "en-US", or a
+   * complete FormatLocale. Defaults to the browser's language.
+   */
+  locale?: string | FormatLocale;
   /** Sheet shown first; defaults to workbook.activeSheet, or the first visible sheet when that one is hidden. */
   sheet?: number;
   onSelectionChange?(selection: GridSelection, sheetIndex: number): void;
@@ -250,8 +256,15 @@ function fromNative(offset: number, limit: number, range: number): number {
   return clamp(Math.round((offset * limit) / range), 0, limit);
 }
 
+function resolveLocale(locale: string | FormatLocale | undefined): FormatLocale {
+  // A locale object from the host page may be incomplete; missing parts fall back to en-US.
+  if (typeof locale === 'object' && locale !== null) return normalizeLocale(locale);
+  return getLocale(locale !== undefined ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
+}
+
 export class WorkbookView {
   readonly workbook: Workbook;
+  private locale: FormatLocale;
 
   private readonly container: HTMLElement;
   private readonly options: WorkbookViewOptions;
@@ -295,6 +308,7 @@ export class WorkbookView {
     this.container = container;
     this.workbook = workbook;
     this.options = options;
+    this.locale = resolveLocale(options.locale);
     this.sheetIndex = this.initialSheet();
     this.pointerEvents = 'PointerEvent' in window;
 
@@ -431,6 +445,13 @@ export class WorkbookView {
     if (!this.destroyed) this.readScroll();
     const state = this.state();
     return { scrollX: state.scrollX, scrollY: state.scrollY, width: this.width, height: this.height, devicePixelRatio: this.dpr };
+  }
+
+  /** Changes the language of number and date formats and redraws. */
+  setLocale(locale: string | FormatLocale): void {
+    this.locale = resolveLocale(locale);
+    this.render();
+    this.announce();
   }
 
   /** Forces a synchronous redraw. */
@@ -802,6 +823,7 @@ export class WorkbookView {
       sheet: state.sheet,
       layout: this.layout(state),
       selection: { active: state.active, range: state.range },
+      locale: this.locale,
       devicePixelRatio: this.dpr,
     });
   }
@@ -849,7 +871,7 @@ export class WorkbookView {
     const state = this.state();
     const { active, range } = state;
     let text = cellName(active.row, active.col);
-    const value = cellText(getCell(state.sheet, active.row, active.col));
+    const value = cellDisplayText(this.workbook, getCell(state.sheet, active.row, active.col), this.locale);
     if (value !== '') text += ` ${value}`;
     const merge = mergeIn(this.merges(), active.row, active.col);
     const single = range.top === range.bottom && range.left === range.right;

@@ -7,6 +7,7 @@ import type { Alignment, Border, Cell, CellRange, Fill, Font, Row, Sheet, StyleS
 import { DEFAULT_GRID_THEME, renderGrid } from '../src/render/grid';
 import type { GridSelection } from '../src/render/grid';
 import { clearTextMeasureCache, FONT_FALLBACK } from '../src/render/text';
+import { LOCALE_TR, type FormatLocale } from '../src/format/locale';
 
 // Default geometry: columns are 64 px wide, rows 20 px high, the row header is
 // 72 px wide and the column header 22 px high. So A1 is at (72, 22).
@@ -222,6 +223,8 @@ interface DrawOptions {
   scrollY?: number;
   selection?: GridSelection;
   dpr?: number;
+  locale?: FormatLocale;
+  date1904?: boolean;
 }
 
 function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
@@ -230,7 +233,7 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     styles: options.styles || emptyStyleSheet(),
     sharedStrings: [],
     definedNames: [],
-    date1904: false,
+    date1904: options.date1904 === true,
     activeSheet: 0,
   };
   const layout = createLayout(createSheetMetrics(sheet), sheet.view, {
@@ -245,6 +248,7 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     sheet,
     layout,
     selection: options.selection,
+    locale: options.locale,
     devicePixelRatio: options.dpr === undefined ? 1 : options.dpr,
   });
   assert.equal(ctx.saves, ctx.restores, 'save() and restore() are balanced');
@@ -935,4 +939,52 @@ test('grid: a damaged model does not throw', () => {
   assert.ok(ctx.cellTexts.length >= 1);
   for (const call of ctx.texts) assert.match(call.fill, /^#[0-9A-Fa-f]{6}$/);
   for (const call of ctx.strokes) assert.match(call.style, /^#[0-9A-Fa-f]{6}$/);
+});
+
+test('grid: number formats decide the text, its colour and the date system', () => {
+  const styles = emptyStyleSheet();
+  const format = (code: string) => {
+    const id = 200 + styles.numFmts.size;
+    styles.numFmts.set(id, code);
+    return styles.cellXfs.push({ numFmtId: id, fontId: 0, fillId: 0, borderId: 0, quotePrefix: false }) - 1;
+  };
+  const money = format('#,##0.00;[Red]-#,##0.00');
+  const date = format('yyyy-mm-dd');
+  const percent = format('0%');
+  const sheet = newSheet();
+  // 140 px: wide enough for every text below.
+  sheet.columns = [{ min: 0, max: 0, width: 20, customWidth: true, hidden: false, outlineLevel: 0, collapsed: false }];
+  put(sheet, 0, 0, 1234.5, money);
+  put(sheet, 1, 0, -1234.5, money);
+  put(sheet, 2, 0, 45000, date);
+  put(sheet, 3, 0, -1, date);
+  put(sheet, 4, 0, 0.256, percent);
+  put(sheet, 5, 0, true);
+
+  const en = draw(sheet, { styles });
+  assert.equal(en.textCall('1,234.50').fill, DEFAULT_GRID_THEME.defaultText);
+  assert.equal(en.textCall('-1,234.50').fill, '#FF0000');
+  assert.ok(en.textCall('2023-03-15'));
+  assert.ok(en.textCall('26%'));
+  assert.ok(en.textCall('TRUE'));
+  // A negative date has no text: it fills the cell with "#", right aligned like a number.
+  const hashes = en.cellTexts.filter((call) => /^#+$/.test(call.text));
+  assert.equal(hashes.length, 1);
+  assert.equal(hashes[0].text.length, Math.floor((140 - 6) / CHAR));
+  assert.equal(hashes[0].y, en.textCall('2023-03-15').y + RH);
+
+  // Two format colours in the same font are two text styles, not one.
+  const blue = format('[Blue]0.0;[Red]-0.0');
+  put(sheet, 6, 0, 7, blue);
+  put(sheet, 7, 0, -7, blue);
+  const colours = draw(sheet, { styles });
+  assert.deepEqual([colours.textCall('7.0').fill, colours.textCall('-7.0').fill, colours.textCall('-1,234.50').fill], ['#0000FF', '#FF0000', '#FF0000']);
+
+  const tr = draw(sheet, { styles, locale: LOCALE_TR });
+  assert.ok(tr.textCall('1.234,50'));
+  assert.equal(tr.textCall('-1.234,50').fill, '#FF0000');
+  assert.ok(tr.textCall('DOĞRU'));
+
+  // The same serial in the 1904 date system is four years and a day later.
+  assert.ok(draw(sheet, { styles, date1904: true }).textCall('2027-03-16'));
 });

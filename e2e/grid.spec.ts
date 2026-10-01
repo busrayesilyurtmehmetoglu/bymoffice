@@ -229,7 +229,7 @@ test.describe('opening', () => {
     await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'false');
 
     expect(await selection(page)).toEqual({ active: 'B3', range: 'B3' });
-    await expect(page.locator('.bym-view [aria-live]')).toHaveText('B3 7');
+    await expect(page.locator('.bym-view [aria-live]')).toHaveText('B3 7.00 ₺');
     expect(await events(page)).toEqual([]);
   });
 

@@ -13,6 +13,9 @@ export * from './model/sheet/color';
 export { readXlsx } from './formats/xlsx/workbook';
 export { DEFAULT_GRID_THEME, renderGrid, type GridScene, type GridSelection, type GridTheme } from './render/grid';
 export { cellText, formatGeneral } from './render/cell-text';
+export { cellDisplayText, formatCell, isoToSerial } from './format/cell-format';
+export { LOCALE_EN, LOCALE_TR, getLocale, normalizeLocale, type FormatLocale } from './format/locale';
+export { formatValue, isDateFormat, serialToDate, type FormatOptions, type FormattedValue } from './format/number-format';
 export { WorkbookView, type WorkbookViewOptions } from './ui/sheet-view';
 export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 
