@@ -165,4 +165,43 @@ test.describe('demo page', () => {
     await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
     await expect(page.locator('#preview-section')).toBeHidden();
   });
+  test('cells can be edited, undone and restructured from the test page', async ({ page }) => {
+    await page.locator('#file').setInputFiles(upload('model.xlsx', await sampleWorkbook()));
+    await expect(page.locator('#edit-state')).toHaveText('Değişiklik yok.');
+    await expect(page.locator('#undo')).toBeDisabled();
+
+    await page.evaluate(() => {
+      const view = (window as any).__view;
+      view.select({ top: 1, left: 1, bottom: 1, right: 1 });
+      view.setCellInput(1, 1, '99,5');
+    });
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: B2 · B2 = 99,50 ₺ (ham değer: 99.5)');
+    await expect(page.locator('#edit-state')).toHaveText('1 değişiklik adımı (geri al/yinele dahil).');
+    await expect(page.locator('#undo')).toBeEnabled();
+
+    // A row inserted above moves the cell down; the selection stays on the inserted row.
+    await page.locator('#row-insert').click();
+    await expect(page.locator('#cell-info')).toHaveText('Seçim: A2:XFD2 · B2 = ');
+    await expect(page.locator('#preview-note')).toContainText('Veri: worksheet');
+    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 2, 1).value)).toBe(99.5);
+
+    await page.locator('#undo').click();
+    await page.locator('#undo').click();
+    await expect(page.locator('#undo')).toBeDisabled();
+    await expect(page.locator('#redo')).toBeEnabled();
+    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 1, 1).value)).toBe(12.5);
+
+    await page.locator('#redo').click();
+    // Read-only stops editing but keeps the history.
+    await page.locator('#readonly').check();
+    await expect(page.locator('#edit-state')).toHaveText('Salt okunur.');
+    await expect(page.locator('#row-insert')).toBeDisabled();
+    await expect(page.locator('#undo')).toBeDisabled();
+    await page.evaluate(() => (window as any).__view.setCellInput(1, 1, '1'));
+    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 1, 1).value)).toBe(99.5);
+    await page.locator('#readonly').uncheck();
+    await expect(page.locator('#edit-state')).toHaveText(/değişiklik adımı/);
+    await page.locator('#undo').click();
+    expect(await page.evaluate(() => (window as any).BymOffice.getCell((window as any).__view.workbook.sheets[0], 1, 1).value)).toBe(12.5);
+  });
 });

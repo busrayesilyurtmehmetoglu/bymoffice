@@ -11,12 +11,17 @@ export * from './xml';
 export * from './model/sheet/types';
 export * from './model/sheet/color';
 export { readXlsx } from './formats/xlsx/workbook';
+export { History, applyOp, ensureCellFormat, ensureNumberFormat, type CellChange, type Op } from './ops/ops';
+export { clearRange, copyRange, editTextAt, pasteAt, setCellInput, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
+export { parseCellInput, cellEditText, type ParsedInput, type InputOptions } from './edit/input';
+export { parseTsv, toTsv } from './edit/clipboard';
+export { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from './calc/refs';
 export { DEFAULT_GRID_THEME, renderGrid, type GridScene, type GridSelection, type GridTheme } from './render/grid';
 export { cellText, formatGeneral } from './render/cell-text';
 export { cellDisplayText, formatCell, isoToSerial } from './format/cell-format';
 export { LOCALE_EN, LOCALE_TR, getLocale, normalizeLocale, type FormatLocale } from './format/locale';
 export { formatValue, isDateFormat, serialToDate, type FormatOptions, type FormattedValue } from './format/number-format';
-export { WorkbookView, type WorkbookViewOptions } from './ui/sheet-view';
+export { WorkbookView, type HistoryMark, type WorkbookViewOptions } from './ui/sheet-view';
 export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls';

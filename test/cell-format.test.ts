@@ -6,6 +6,8 @@ import { sampleWorkbook } from './fixtures';
 test('cell format: value kinds', () => {
   assert.deepEqual(formatCell(undefined, '0.00'), { text: '' });
   assert.deepEqual(formatCell({ kind: 'blank', value: null, style: 0 }, '0.00'), { text: '' });
+  // A formula without a result shows its text until it can be calculated.
+  assert.equal(formatCell({ kind: 'blank', value: null, style: 0, formula: { text: 'A1*2', type: 'normal' } }, '0.00').text, '=A1*2');
   assert.equal(formatCell({ kind: 'number', value: 1234.5, style: 0 }, '#,##0.00').text, '1,234.50');
   assert.equal(formatCell({ kind: 'number', value: 1234.5, style: 0 }, '#,##0.00', { locale: LOCALE_TR }).text, '1.234,50');
   assert.equal(formatCell({ kind: 'string', value: 'metin', style: 0 }, '0.00').text, 'metin');

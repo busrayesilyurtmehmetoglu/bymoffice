@@ -1,0 +1,549 @@
+// Every change to a workbook is an operation. Applying one returns the
+// operation that undoes it, which is all undo and redo need; later the same
+// operations are what collaborative editing will send over the wire.
+//
+// Cells and rows are treated as immutable here: a change puts a new object in
+// place instead of altering the old one. That is what lets a structural
+// operation keep the previous state for undo by reference, without copying it.
+
+import { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from '../calc/refs';
+import {
+  MAX_COLS,
+  MAX_ROWS,
+  parseRange,
+  type Cell,
+  type CellFormat,
+  type CellRange,
+  type ColumnRange,
+  type DefinedName,
+  type Hyperlink,
+  type Row,
+  type Sheet,
+  type SheetStructuralEdit,
+  type StyleSheet,
+  type Workbook,
+} from '../model/sheet/types';
+
+export interface CellChange {
+  row: number;
+  col: number;
+  /** The new cell; undefined removes the cell. */
+  cell: Cell | undefined;
+}
+
+/** Everything a structural operation can alter, held by reference. */
+export interface SheetSnapshot {
+  rows: Map<number, Row>;
+  columns: ColumnRange[];
+  merges: CellRange[];
+  hyperlinks: Hyperlink[];
+  dimension: CellRange | undefined;
+  rowCount: number;
+  colCount: number;
+  structuralEdits: SheetStructuralEdit[] | undefined;
+}
+
+export type Op =
+  | {
+      type: 'setCells';
+      sheet: number;
+      cells: CellChange[];
+      /** Used extent to restore; set on the inverse of an operation that grew the sheet. */
+      extent?: { rowCount: number; colCount: number };
+    }
+  | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
+  | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
+  | {
+      /** Puts a sheet back the way a snapshot recorded it; the inverse of a structural operation. */
+      type: 'restore';
+      sheet: number;
+      snapshot: SheetSnapshot;
+      /** Cells of other sheets whose formulas referred to the sheet. */
+      others: { sheet: number; cells: CellChange[] }[];
+      definedNames: DefinedName[];
+      /** Roughly how many rows this operation keeps alive for undo; History uses it to bound memory. */
+      weight?: number;
+    };
+
+const sheetAt = (workbook: Workbook, index: number): Sheet => {
+  const sheet = workbook.sheets[index];
+  if (!sheet) throw new RangeError(`No sheet at index ${index}`);
+  return sheet;
+};
+
+const newRow = (cells: Cell[] = []): Row => ({ customHeight: false, hidden: false, outlineLevel: 0, collapsed: false, cells });
+
+const isPlainRow = (row: Row) =>
+  row.height === undefined && !row.customHeight && !row.hidden && row.style === undefined && row.outlineLevel === 0 && !row.collapsed;
+
+function checkCell(row: number, col: number): void {
+  if (!(row >= 0 && row < MAX_ROWS && col >= 0 && col < MAX_COLS) || Math.floor(row) !== row || Math.floor(col) !== col) {
+    throw new RangeError(`Cell (${row}, ${col}) is outside the sheet`);
+  }
+}
+
+/** Applies cell changes and returns the changes that undo them, in reverse order. */
+function setCells(sheet: Sheet, changes: CellChange[]): CellChange[] {
+  // Everything is checked before anything is changed: an operation applies as a whole or not at all.
+  for (const change of changes) checkCell(change.row, change.col);
+  const all = withDependants(sheet, changes);
+  const undo: CellChange[] = [];
+  // Rows are copied once per operation, on their first change.
+  const copied = new Set<number>();
+  for (const change of all) {
+    let row = sheet.rows.get(change.row);
+    const previous = row ? row.cells[change.col] : undefined;
+    if (previous === change.cell) continue;
+    if (!row) {
+      if (!change.cell) continue;
+      row = newRow();
+      sheet.rows.set(change.row, row);
+      copied.add(change.row);
+    } else if (!copied.has(change.row)) {
+      row = { ...row, cells: row.cells.slice() };
+      sheet.rows.set(change.row, row);
+      copied.add(change.row);
+    }
+    if (change.cell) row.cells[change.col] = change.cell;
+    else {
+      delete row.cells[change.col];
+      // A row left with neither cells nor properties of its own is not a row any more.
+      if (isPlainRow(row) && !row.cells.some(() => true)) sheet.rows.delete(change.row);
+    }
+    undo.push({ row: change.row, col: change.col, cell: previous });
+    if (change.cell) {
+      if (change.row >= sheet.rowCount) sheet.rowCount = change.row + 1;
+      if (change.col >= sheet.colCount) sheet.colCount = change.col + 1;
+    }
+  }
+  return undo.reverse();
+}
+
+/**
+ * A shared formula keeps its text in one cell only. Before that cell is
+ * overwritten, the cells that depend on it get the formula written out, or
+ * they would be left pointing at nothing.
+ */
+function withDependants(sheet: Sheet, changes: CellChange[]): CellChange[] {
+  let groups: Set<number> | undefined;
+  for (const change of changes) {
+    const row = sheet.rows.get(change.row);
+    const formula = row && row.cells[change.col] ? row.cells[change.col].formula : undefined;
+    if (formula && formula.type === 'shared' && formula.text !== '' && formula.si !== undefined && row && row.cells[change.col] !== change.cell) {
+      if (!groups) groups = new Set();
+      groups.add(formula.si);
+    }
+  }
+  if (!groups) return changes;
+  const masters = sharedMasters(sheet);
+  const targeted = new Set(changes.map((change) => change.row * MAX_COLS + change.col));
+  const extra: CellChange[] = [];
+  for (const [index, row] of sheet.rows) {
+    row.cells.forEach((cell, col) => {
+      const formula = cell.formula;
+      if (!formula || formula.type !== 'shared' || formula.si === undefined || !groups!.has(formula.si)) return;
+      if (targeted.has(index * MAX_COLS + col)) return;
+      extra.push({ row: index, col, cell: explicitFormula(cell, index, col, masters) });
+    });
+  }
+  return extra.concat(changes);
+}
+
+function snapshotOf(sheet: Sheet): SheetSnapshot {
+  return {
+    rows: sheet.rows,
+    columns: sheet.columns,
+    merges: sheet.merges,
+    hyperlinks: sheet.hyperlinks,
+    dimension: sheet.dimension,
+    rowCount: sheet.rowCount,
+    colCount: sheet.colCount,
+    structuralEdits: sheet.structuralEdits,
+  };
+}
+
+function restoreSnapshot(sheet: Sheet, snapshot: SheetSnapshot): void {
+  sheet.rows = snapshot.rows;
+  sheet.columns = snapshot.columns;
+  sheet.merges = snapshot.merges;
+  sheet.hyperlinks = snapshot.hyperlinks;
+  sheet.dimension = snapshot.dimension;
+  sheet.rowCount = snapshot.rowCount;
+  sheet.colCount = snapshot.colCount;
+  sheet.structuralEdits = snapshot.structuralEdits;
+}
+
+export type SharedMasters = Map<number, { text: string; row: number; col: number }>;
+
+/** The cells that hold the text of each shared formula group of a sheet. */
+export function sharedMasters(sheet: Sheet): SharedMasters {
+  const masters: SharedMasters = new Map();
+  for (const [index, row] of sheet.rows) {
+    row.cells.forEach((cell, col) => {
+      const formula = cell.formula;
+      if (formula && formula.type === 'shared' && formula.text !== '' && formula.si !== undefined && !masters.has(formula.si)) {
+        masters.set(formula.si, { text: formula.text, row: index, col });
+      }
+    });
+  }
+  return masters;
+}
+
+/** A shared formula written out for the cell it applies to. */
+export function explicitFormula(cell: Cell, row: number, col: number, masters: SharedMasters): Cell {
+  const formula = cell.formula;
+  if (!formula || formula.type !== 'shared') return cell;
+  let text = formula.text;
+  if (text === '' && formula.si !== undefined) {
+    const master = masters.get(formula.si);
+    // A dependant without its master cannot be rebuilt; it keeps its last value and loses the formula.
+    if (!master) return { kind: cell.kind, value: cell.value, style: cell.style, ...(cell.runs ? { runs: cell.runs } : {}) };
+    text = shiftFormula(master.text, row - master.row, col - master.col);
+  }
+  return { ...cell, formula: { text, type: 'normal', ...(formula.attrs ? { attrs: formula.attrs } : {}) } };
+}
+
+/**
+ * Rewrites the formulas of a sheet for a structural edit and returns the rows
+ * with the changes applied, leaving the sheet's own rows untouched. Shared
+ * formulas are written out: the group no longer describes its cells once
+ * rows or columns move through it.
+ */
+function adjustSheetFormulas(sheet: Sheet, edit: StructuralEdit, unshareAll: boolean): Map<number, Row> {
+  const masters = sharedMasters(sheet);
+  let shared = masters.size > 0;
+  if (!shared && unshareAll) {
+    // Dependants whose master is gone still have to lose their formula.
+    for (const row of sheet.rows.values()) {
+      if (row.cells.some((cell) => cell.formula !== undefined && cell.formula.type === 'shared')) {
+        shared = true;
+        break;
+      }
+    }
+  }
+  // In a sheet whose cells stay where they are, only the groups whose text changes are written out.
+  let affected: Set<number> | undefined;
+  if (!unshareAll) {
+    // A group is affected when the formula of any of its cells changes, not only that of the master:
+    // the dependants refer to other rows than the master does.
+    const groups = new Set<number>();
+    for (const [index, row] of sheet.rows) {
+      row.cells.forEach((cell, col) => {
+        const formula = cell.formula;
+        if (!formula || formula.type !== 'shared' || formula.si === undefined || groups.has(formula.si)) return;
+        const explicit = explicitFormula(cell, index, col, masters).formula;
+        if (explicit && adjustFormula(explicit.text, sheet.name, edit) !== explicit.text) groups.add(formula.si);
+      });
+    }
+    affected = groups;
+    shared = groups.size > 0;
+  }
+
+  const changed = new Map<number, Row>();
+  for (const [index, row] of sheet.rows) {
+    let cells: Cell[] | undefined;
+    row.cells.forEach((cell, col) => {
+      if (!cell.formula) return;
+      const group = cell.formula.type === 'shared' ? cell.formula.si : undefined;
+      let next = shared && (!affected || (group !== undefined && affected.has(group))) ? explicitFormula(cell, index, col, masters) : cell;
+      const formula = next.formula;
+      if (formula) {
+        // A dependant that keeps pointing at its group has no text of its own to adjust.
+        const text = formula.text === '' ? '' : adjustFormula(formula.text, sheet.name, edit);
+        const ref = formula.ref === undefined ? undefined : adjustReferenceText(formula.ref, sheet.name, edit);
+        if (text !== formula.text || ref !== formula.ref) {
+          next = { ...next, formula: { ...formula, text, ...(ref === undefined || ref === '' ? {} : { ref }) } };
+          if (ref === '' && next.formula) delete next.formula.ref;
+        }
+      }
+      if (next !== cell) {
+        if (!cells) cells = row.cells.slice();
+        cells[col] = next;
+      }
+    });
+    if (cells) changed.set(index, { ...row, cells });
+  }
+  return changed;
+}
+
+function shiftColumns(columns: ColumnRange[], edit: SheetStructuralEdit): ColumnRange[] {
+  const out: ColumnRange[] = [];
+  for (const range of columns) {
+    const moved = adjustRange({ top: 0, bottom: 0, left: range.min, right: range.max }, edit);
+    if (moved) out.push({ ...range, min: moved.left, max: Math.min(moved.right, MAX_COLS - 1) });
+  }
+  return out;
+}
+
+/**
+ * An array formula covers its range as one unit. Like Excel, an edit that
+ * would cut through such a range is refused; moving or removing all of it is fine.
+ */
+function checkArrayFormulas(sheet: Sheet, edit: SheetStructuralEdit): void {
+  const end = edit.at + edit.count - 1;
+  for (const row of sheet.rows.values()) {
+    row.cells.forEach((cell) => {
+      const formula = cell.formula;
+      if (!formula || formula.type !== 'array' || formula.ref === undefined) return;
+      const range = parseRange(formula.ref);
+      if (!range) return;
+      const first = edit.axis === 'row' ? range.top : range.left;
+      const last = edit.axis === 'row' ? range.bottom : range.right;
+      if (first === last && edit.kind === 'insert') return;
+      const cuts = edit.kind === 'insert' ? edit.at > first && edit.at <= last : edit.at <= last && end >= first && !(edit.at <= first && end >= last);
+      if (cuts) throw new RangeError(`Cannot ${edit.kind} ${edit.axis}s through the array formula in ${formula.ref}`);
+    });
+  }
+}
+
+/** Inserts or deletes rows or columns and fixes up everything that refers to them. */
+function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit): Op {
+  const sheet = sheetAt(workbook, index);
+  const { kind, axis, at, count } = edit;
+  const limit = axis === 'row' ? MAX_ROWS : MAX_COLS;
+  if (!(at >= 0 && count > 0 && at + count <= limit) || Math.floor(at) !== at || Math.floor(count) !== count) {
+    throw new RangeError(`Cannot ${kind} ${count} ${axis}(s) at ${at}`);
+  }
+  if (kind === 'insert') {
+    // Excel refuses an insert that would push cells off the sheet rather than lose them.
+    // Rows count even without cells: a height or a format is content too.
+    let used = axis === 'row' ? sheet.rowCount : sheet.colCount;
+    if (axis === 'row') for (const key of sheet.rows.keys()) if (key >= used) used = key + 1;
+    if (used + count > limit && used > at) throw new RangeError(`Cannot insert ${count} ${axis}(s): cells would be pushed off the sheet`);
+  }
+  checkArrayFormulas(sheet, edit);
+
+  const snapshot = snapshotOf(sheet);
+  const refEdit: StructuralEdit = { ...edit, sheetName: sheet.name };
+  const adjusted = adjustSheetFormulas(sheet, refEdit, true);
+  let weight = adjusted.size + (axis === 'col' ? sheet.rows.size : 0);
+
+  const rows = new Map<number, Row>();
+  if (axis === 'row') {
+    for (const [i, original] of sheet.rows) {
+      const row = adjusted.get(i) || original;
+      if (i < at) rows.set(i, row);
+      else if (kind === 'insert') rows.set(i + count, row);
+      else if (i >= at + count) rows.set(i - count, row);
+    }
+    sheet.rowCount = kind === 'insert' ? (sheet.rowCount > at ? sheet.rowCount + count : sheet.rowCount) : sheet.rowCount <= at ? sheet.rowCount : Math.max(sheet.rowCount - count, at);
+  } else {
+    for (const [i, original] of sheet.rows) {
+      const row = adjusted.get(i) || original;
+      if (row.cells.length <= at) {
+        rows.set(i, row);
+        continue;
+      }
+      const cells: Cell[] = [];
+      row.cells.forEach((cell, col) => {
+        if (col < at) cells[col] = cell;
+        else if (kind === 'insert') cells[col + count] = cell;
+        else if (col >= at + count) cells[col - count] = cell;
+      });
+      rows.set(i, { ...row, cells });
+    }
+    sheet.colCount = kind === 'insert' ? (sheet.colCount > at ? sheet.colCount + count : sheet.colCount) : sheet.colCount <= at ? sheet.colCount : Math.max(sheet.colCount - count, at);
+    sheet.columns = shiftColumns(sheet.columns, edit);
+  }
+  sheet.rows = rows;
+
+  const moveRange = (range: CellRange) => adjustRange(range, edit);
+  sheet.merges = sheet.merges.map(moveRange).filter((range): range is CellRange => !!range && (range.bottom > range.top || range.right > range.left));
+  const hyperlinks: Hyperlink[] = [];
+  for (const link of sheet.hyperlinks) {
+    const range = moveRange(link.range);
+    if (range) hyperlinks.push({ ...link, range });
+  }
+  sheet.hyperlinks = hyperlinks;
+  if (sheet.dimension) sheet.dimension = moveRange(sheet.dimension);
+  sheet.structuralEdits = (sheet.structuralEdits || []).concat([{ kind, axis, at, count }]);
+  sheet.modified = true;
+
+  // Formulas elsewhere that point into this sheet, and names defined on it.
+  const others: { sheet: number; cells: CellChange[] }[] = [];
+  workbook.sheets.forEach((other, otherIndex) => {
+    if (other === sheet) return;
+    const changes: CellChange[] = [];
+    for (const [rowIndex, row] of adjustSheetFormulas(other, refEdit, false)) {
+      const previous = other.rows.get(rowIndex);
+      row.cells.forEach((cell, col) => {
+        if (!previous || previous.cells[col] !== cell) changes.push({ row: rowIndex, col, cell });
+      });
+    }
+    weight += changes.length;
+    if (changes.length > 0) {
+      others.push({ sheet: otherIndex, cells: setCells(other, changes) });
+      other.modified = true;
+    }
+  });
+  const definedNames = workbook.definedNames;
+  workbook.definedNames = definedNames.map((name) => {
+    const home = name.localSheet !== undefined && workbook.sheets[name.localSheet] ? workbook.sheets[name.localSheet].name : '';
+    const value = adjustFormula(name.value, home, refEdit);
+    return value === name.value ? name : { ...name, value };
+  });
+
+  return { type: 'restore', sheet: index, snapshot, others, definedNames, weight };
+}
+
+/** Applies an operation to the workbook and returns the operation that undoes it. */
+export function applyOp(workbook: Workbook, op: Op): Op {
+  switch (op.type) {
+    case 'setCells': {
+      const sheet = sheetAt(workbook, op.sheet);
+      const extent = { rowCount: sheet.rowCount, colCount: sheet.colCount };
+      const undo = setCells(sheet, op.cells);
+      if (op.extent) {
+        sheet.rowCount = op.extent.rowCount;
+        sheet.colCount = op.extent.colCount;
+      }
+      sheet.modified = true;
+      const grew = sheet.rowCount !== extent.rowCount || sheet.colCount !== extent.colCount;
+      return { type: 'setCells', sheet: op.sheet, cells: undo, ...(grew ? { extent } : {}) };
+    }
+    case 'insert':
+    case 'delete':
+      return structural(workbook, op.sheet, { kind: op.type, axis: op.axis, at: op.at, count: op.count });
+    case 'restore': {
+      const sheet = sheetAt(workbook, op.sheet);
+      const snapshot = snapshotOf(sheet);
+      restoreSnapshot(sheet, op.snapshot);
+      sheet.modified = true;
+      const others = op.others.map((other) => ({ sheet: other.sheet, cells: setCells(sheetAt(workbook, other.sheet), other.cells) }));
+      const definedNames = workbook.definedNames;
+      workbook.definedNames = op.definedNames;
+      return { type: 'restore', sheet: op.sheet, snapshot, others, definedNames, weight: op.weight };
+    }
+  }
+}
+
+/**
+ * A structural step keeps the rows it replaced. A sheet of 100,000 formula
+ * rows costs about 40 MB per step, so steps are dropped by what they hold as
+ * well as by their number.
+ */
+const MAX_UNDO_WEIGHT = 300000;
+
+function weightOf(ops: Op[]): number {
+  let weight = 0;
+  for (const op of ops) weight += op.type === 'restore' ? op.weight || 0 : op.type === 'setCells' ? op.cells.length / 16 : 0;
+  return weight;
+}
+
+/** Undo and redo over applyOp(). `M` is whatever the caller wants back with each step (a selection, say). */
+export class History<M = undefined> {
+  private undoStack: { ops: Op[]; before: M; after: M }[] = [];
+  private redoStack: { ops: Op[]; before: M; after: M }[] = [];
+  /** Rows kept alive by the steps on the undo stack; see MAX_UNDO_WEIGHT. */
+  private weight = 0;
+
+  constructor(
+    readonly workbook: Workbook,
+    private readonly limit = 200,
+  ) {}
+
+  get canUndo(): boolean {
+    return this.undoStack.length > 0;
+  }
+
+  get canRedo(): boolean {
+    return this.redoStack.length > 0;
+  }
+
+  /**
+   * Applies operations as one undoable step. If one of them throws, the ones
+   * already applied are undone and the error is passed on.
+   */
+  apply(ops: Op[], before: M, after: M): void {
+    if (ops.length === 0) return;
+    const inverse = this.run(ops);
+    this.undoStack.push({ ops: inverse, before, after });
+    this.weight += weightOf(inverse);
+    // The oldest steps go when there are too many of them or they hold too much; the newest always stays.
+    while (this.undoStack.length > 1 && (this.undoStack.length > this.limit || this.weight > MAX_UNDO_WEIGHT)) {
+      this.weight -= weightOf((this.undoStack.shift() as { ops: Op[] }).ops);
+    }
+    this.redoStack = [];
+  }
+
+  /** Undoes the last step and returns what was passed as `before` for it. */
+  undo(): { meta: M } | undefined {
+    const step = this.undoStack.pop();
+    if (!step) return undefined;
+    this.weight -= weightOf(step.ops);
+    this.redoStack.push({ ops: this.run(step.ops), before: step.before, after: step.after });
+    return { meta: step.before };
+  }
+
+  redo(): { meta: M } | undefined {
+    const step = this.redoStack.pop();
+    if (!step) return undefined;
+    const inverse = this.run(step.ops);
+    this.weight += weightOf(inverse);
+    this.undoStack.push({ ops: inverse, before: step.before, after: step.after });
+    return { meta: step.after };
+  }
+
+  /** Applies operations in order and returns their inverses, last first. */
+  private run(ops: Op[]): Op[] {
+    const inverse: Op[] = [];
+    try {
+      for (const op of ops) inverse.push(applyOp(this.workbook, op));
+    } catch (error) {
+      for (let i = inverse.length - 1; i >= 0; i--) applyOp(this.workbook, inverse[i]);
+      throw error;
+    }
+    return inverse.reverse();
+  }
+}
+
+/** Compares two flat records field by field; undefined and a missing record are the same. */
+function sameRecord(a: object | undefined, b: object | undefined): boolean {
+  const left = (a || {}) as Record<string, unknown>;
+  const right = (b || {}) as Record<string, unknown>;
+  for (const key of Object.keys(left)) if (left[key] !== right[key]) return false;
+  for (const key of Object.keys(right)) if (left[key] !== right[key]) return false;
+  return true;
+}
+
+const sameFormat = (a: CellFormat, b: CellFormat) =>
+  a.numFmtId === b.numFmtId &&
+  a.fontId === b.fontId &&
+  a.fillId === b.fillId &&
+  a.borderId === b.borderId &&
+  a.xfId === b.xfId &&
+  a.quotePrefix === b.quotePrefix &&
+  sameRecord(a.alignment, b.alignment) &&
+  sameRecord(a.protection, b.protection);
+
+/** Excel's limit on cell formats in one workbook. */
+const MAX_CELL_FORMATS = 65430;
+
+/** First id a file may use for its own number formats. */
+const FIRST_CUSTOM_FORMAT = 164;
+
+/** Id of a number format code in the style sheet, adding it when it is not there yet. */
+export function ensureNumberFormat(styles: StyleSheet, code: string): number {
+  if (/^general$/i.test(code)) return 0;
+  let highest = FIRST_CUSTOM_FORMAT - 1;
+  for (const [id, existing] of styles.numFmts) {
+    if (existing === code) return id;
+    if (id > highest) highest = id;
+  }
+  styles.numFmts.set(highest + 1, code);
+  styles.modified = true;
+  return highest + 1;
+}
+
+/** Index of the cell format that is `base` with another number format, adding it when it is not there yet. */
+export function ensureCellFormat(styles: StyleSheet, base: number, numFmtId: number): number {
+  const source = styles.cellXfs[base] || styles.cellXfs[0];
+  if (!source) throw new Error('The style sheet has no cell formats');
+  if (source.numFmtId === numFmtId) return styles.cellXfs[base] ? base : 0;
+  const wanted: CellFormat = { ...source, numFmtId };
+  const found = styles.cellXfs.findIndex((format) => sameFormat(format, wanted));
+  if (found >= 0) return found;
+  if (styles.cellXfs.length >= MAX_CELL_FORMATS) throw new RangeError('The workbook has too many cell formats');
+  styles.modified = true;
+  return styles.cellXfs.push(wanted) - 1;
+}

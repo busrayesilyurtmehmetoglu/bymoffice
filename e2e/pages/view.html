@@ -57,6 +57,9 @@
             onSheetChange: function (sheet) {
               window.__events.push({ type: 'sheet', sheet: sheet });
             },
+            onChange: function (change) {
+              window.__events.push({ type: 'change', sheets: change.sheets });
+            },
           }),
         );
         return true;

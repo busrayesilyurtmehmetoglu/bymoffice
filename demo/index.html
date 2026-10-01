@@ -100,10 +100,25 @@
           <label>Sayı ve tarih biçimi dili
             <select id="locale"><option value="tr">Türkçe (1.234,50 · 15.03.2024)</option><option value="en">English (1,234.50 · 3/15/2024)</option></select>
           </label>
+          <label><input type="checkbox" id="readonly" /> Salt okunur</label>
+        </div>
+        <div class="row" id="edit-tools" style="margin: 0 0 10px">
+          <button id="undo" disabled>Geri al</button>
+          <button id="redo" disabled>Yinele</button>
+          <button id="row-insert">Satır ekle</button>
+          <button id="row-delete">Satır sil</button>
+          <button id="col-insert">Sütun ekle</button>
+          <button id="col-delete">Sütun sil</button>
+          <span class="muted" id="edit-state"></span>
         </div>
         <div id="grid"></div>
         <p class="muted" id="cell-info" style="margin: 10px 0 0"></p>
-        <p class="muted">Fare ya da dokunma ile seçin ve kaydırın; ok tuşları, Shift+ok, Ctrl+ok, PageUp/PageDown, Home, Ctrl+Home/End çalışır.</p>
+        <p class="muted">
+          Fare ya da dokunma ile seçin ve kaydırın; ok tuşları, Shift+ok, Ctrl+ok, PageUp/PageDown, Home, Ctrl+Home/End çalışır.
+          Düzenlemek için hücreye yazmaya başlayın, F2'ye basın ya da çift tıklayın; Enter yazar, Esc vazgeçer, Delete temizler.
+          Ctrl+Z / Ctrl+Y geri alır ve yineler; Ctrl+C / X / V kopyalar, keser, yapıştırır; satır ya da sütun başlığına sağ tıklayınca ekle-sil menüsü açılır.
+        </p>
+        <p class="muted"><strong>Not:</strong> düzenlemeler şimdilik yalnız ekrandadır; "Yeniden kaydet ve indir" özgün dosyayı verir. Değişiklikleri dosyaya yazma sıradaki görevdir.</p>
       </section>
 
       <section>
@@ -245,6 +260,29 @@
       }
 
       let view = null;
+      let changes = 0;
+
+      function refreshTools() {
+        const editable = !!view && !$('readonly').checked;
+        $('undo').disabled = !editable || !view.history.canUndo;
+        $('redo').disabled = !editable || !view.history.canRedo;
+        for (const id of ['row-insert', 'row-delete', 'col-insert', 'col-delete']) $(id).disabled = !editable;
+        $('edit-state').textContent = !view ? '' : $('readonly').checked ? 'Salt okunur.' : changes === 0 ? 'Değişiklik yok.' : `${changes} değişiklik adımı (geri al/yinele dahil).`;
+      }
+
+      // Structural commands act on the rows or columns the selection covers.
+      function structural(action) {
+        if (!view) return;
+        const { range } = view.selection;
+        try {
+          if (action === 'row-insert') view.insertRows(range.top, range.bottom - range.top + 1);
+          else if (action === 'row-delete') view.deleteRows(range.top, range.bottom - range.top + 1);
+          else if (action === 'col-insert') view.insertColumns(range.left, range.right - range.left + 1);
+          else view.deleteColumns(range.left, range.right - range.left + 1);
+        } catch (error) {
+          $('edit-state').textContent = `Yapılamadı: ${error.message}`;
+        }
+      }
 
       function describeSheet(workbook, index) {
         const sheet = workbook.sheets[index];
@@ -284,8 +322,15 @@
           const note = (index) => {
             $('preview-note').textContent = `${describeSheet(workbook, index)} Model ${ms.toFixed(1)} ms'de okundu.`;
           };
+          changes = 0;
           view = new BymOffice.WorkbookView($('grid'), workbook, {
             locale: $('locale').value,
+            readOnly: $('readonly').checked,
+            onChange: () => {
+              changes++;
+              refreshTools();
+              describeSelection(workbook, view.selection, view.activeSheet);
+            },
             onSelectionChange: (selection, index) => describeSelection(workbook, selection, index),
             onSheetChange: (index) => {
               note(index);
@@ -293,6 +338,7 @@
             },
           });
           window.__view = view;
+          refreshTools();
           note(view.activeSheet);
           describeSelection(workbook, view.selection, view.activeSheet);
         } catch (error) {
@@ -388,6 +434,15 @@
         if (!view) return;
         view.setLocale($('locale').value);
         describeSelection(view.workbook, view.selection, view.activeSheet);
+      });
+
+      $('undo').addEventListener('click', () => view && view.undo());
+      $('redo').addEventListener('click', () => view && view.redo());
+      for (const id of ['row-insert', 'row-delete', 'col-insert', 'col-delete']) $(id).addEventListener('click', () => structural(id));
+      // Switching read-only keeps the view, and with it what can be undone.
+      $('readonly').addEventListener('change', () => {
+        if (view) view.setReadOnly($('readonly').checked);
+        refreshTools();
       });
 
       $('clear').addEventListener('click', () => {

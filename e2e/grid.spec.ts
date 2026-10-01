@@ -174,8 +174,8 @@ const select = (page: Page, range: { top: number; left: number; bottom: number; 
   page.evaluate((range) => (window as any).__view.select(range), range);
 
 async function focusGrid(page: Page): Promise<void> {
-  await page.locator('.bym-scroller').focus();
-  await expect(page.locator('.bym-scroller')).toBeFocused();
+  await page.locator('.bym-input').focus();
+  await expect(page.locator('.bym-input')).toBeFocused();
 }
 
 /** Resolves when the native scroll position has not moved for several frames (smooth scrolling has ended). */
@@ -237,13 +237,17 @@ test.describe('opening', () => {
     await mount(page, await sampleWorkbook());
 
     const root = page.locator('#host > .bym-view');
-    // The view is a group; the cells are the grid and take the focus; the tabs are a tab list.
+    // The view is a group; the cells are the grid; one input element takes the focus; the tabs are a tab list.
     await expect(root).toHaveAttribute('role', 'group');
     await expect(root).toHaveAttribute('aria-label', /\S/);
     await expect(root).not.toHaveAttribute('tabindex', /.*/);
     const grid = page.locator('.bym-view > .bym-scroller');
     await expect(grid).toHaveAttribute('role', 'grid');
-    await expect(grid).toHaveAttribute('tabindex', '0');
+    await expect(grid).toHaveAttribute('tabindex', '-1');
+    const input = page.locator('.bym-view > textarea.bym-input');
+    await expect(input).toHaveCount(1);
+    await expect(input).toHaveAttribute('aria-label', /\S/);
+    await expect(input).toHaveAttribute('inputmode', 'none');
     await expect(grid).toHaveAttribute('aria-label', /Veri/);
     await expect(page.locator('.bym-view [role="grid"]')).toHaveCount(1);
     await expect(page.locator('.bym-view > .bym-tabs')).toHaveAttribute('role', 'tablist');
@@ -285,7 +289,7 @@ test.describe('opening', () => {
     await expect(page.locator('.bym-tabs button').nth(0)).toHaveAttribute('aria-selected', 'false');
     expect(await events(page)).toEqual([{ type: 'sheet', sheet: 2 }]);
     // Tabs hand the focus back to the grid so that the keyboard keeps working.
-    await expect(page.locator('.bym-scroller')).toBeFocused();
+    await expect(page.locator('.bym-input')).toBeFocused();
 
     await page.locator('.bym-tabs button', { hasText: 'Veri' }).click();
     await expect(note).toBeHidden();
@@ -324,7 +328,7 @@ test.describe('mouse', () => {
 
     await clickCell(page, 1, 1);
     expect(await selection(page)).toEqual({ active: 'B2', range: 'B2' });
-    await expect(page.locator('.bym-scroller')).toBeFocused();
+    await expect(page.locator('.bym-input')).toBeFocused();
     await expect(page.locator('.bym-view [aria-live]')).toHaveText('B2 12.5');
     expect(await events(page)).toEqual([
       { type: 'selection', sheet: 0, selection: { active: { row: 1, col: 1 }, range: { top: 1, left: 1, bottom: 1, right: 1 } } },
@@ -805,7 +809,7 @@ test.describe('keyboard', () => {
     expect(await selection(page)).toEqual({ active: 'B1', range: 'B1' });
     await page.keyboard.press('Shift+Enter');
     expect(await selection(page)).toEqual({ active: 'B1', range: 'B1' });
-    await expect(page.locator('.bym-scroller')).toBeFocused();
+    await expect(page.locator('.bym-input')).toBeFocused();
   });
 
   test('Ctrl+PageDown and Ctrl+PageUp switch between visible sheets; Ctrl+A selects everything', async ({ page }) => {
@@ -1054,7 +1058,10 @@ test.describe('destroy', () => {
 
       // Put the old elements back and poke them: nothing may still be listening.
       host.appendChild(root);
-      scroller.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+      const input = root.querySelector('.bym-input') as HTMLTextAreaElement;
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+      input.value = 'typed';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
       const box = canvas.getBoundingClientRect();
       for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup']) {
         const init = { bubbles: true, cancelable: true, clientX: box.left + 200, clientY: box.top + 200, button: 0 };
@@ -1578,10 +1585,10 @@ test.describe('keyboard: focus, extending and edge cases', () => {
     await focusGrid(page);
     // What the grid does with the key, whatever the browser's own tab order rules are.
     const prevented = await page.evaluate(() => {
-      const scroller = document.querySelector('.bym-scroller')!;
+      const input = document.querySelector('.bym-input')!;
       return [false, true].map((shiftKey) => {
         const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true });
-        scroller.dispatchEvent(event);
+        input.dispatchEvent(event);
         return event.defaultPrevented;
       });
     });
@@ -1591,7 +1598,7 @@ test.describe('keyboard: focus, extending and edge cases', () => {
     await page.keyboard.press('Tab');
     expect(await selection(page)).toEqual({ active: 'A1', range: 'A1' });
     expect(await events(page)).toEqual([]);
-    await expect(page.locator('.bym-scroller')).not.toBeFocused();
+    await expect(page.locator('.bym-input')).not.toBeFocused();
   });
 
   test('the focus can leave the grid with the keyboard and the tabs work with it', async ({ page, browserName }) => {
@@ -1684,9 +1691,9 @@ test.describe('keyboard: focus, extending and edge cases', () => {
     const press = (key: string, ctrlKey = false) =>
       page.evaluate(
         ([key, ctrlKey]) => {
-          const scroller = document.querySelector('.bym-scroller')!;
+          const input = document.querySelector('.bym-input')!;
           const started = performance.now();
-          scroller.dispatchEvent(new KeyboardEvent('keydown', { key: key as string, ctrlKey: ctrlKey as boolean, bubbles: true, cancelable: true }));
+          input.dispatchEvent(new KeyboardEvent('keydown', { key: key as string, ctrlKey: ctrlKey as boolean, bubbles: true, cancelable: true }));
           return performance.now() - started;
         },
         [key, ctrlKey],

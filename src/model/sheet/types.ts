@@ -121,6 +121,8 @@ export interface StyleSheet {
   indexedColors?: string[];
   /** Theme colours as "RRGGBB", in the order theme indexes refer to them. */
   themeColors: string[];
+  /** Set once a format was added after the styles were read. */
+  modified?: boolean;
 }
 
 export interface RichRun {
@@ -260,6 +262,21 @@ export interface Sheet {
   baseColWidth?: number;
   view: SheetView;
   tabColor?: Color;
+  /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */
+  modified?: boolean;
+  /**
+   * Rows and columns inserted or deleted since the sheet was read, in order.
+   * The writer replays them on the parts of the sheet the model does not hold
+   * (conditional formats, validations, ...), so that their ranges follow.
+   */
+  structuralEdits?: SheetStructuralEdit[];
+}
+
+export interface SheetStructuralEdit {
+  kind: 'insert' | 'delete';
+  axis: 'row' | 'col';
+  at: number;
+  count: number;
 }
 
 export interface DefinedName {

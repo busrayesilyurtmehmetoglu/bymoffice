@@ -23,6 +23,8 @@ export interface FormatLocale {
   longTime?: string;
   /** Format code of the system short time (the time part of built-in format 22). Default "h:mm". */
   shortTime?: string;
+  /** Order of day, month and year in typed dates such as "3/4/2024". Default "mdy". */
+  dateOrder?: 'dmy' | 'mdy' | 'ymd';
 }
 
 export const LOCALE_EN: FormatLocale = {
@@ -45,6 +47,7 @@ export const LOCALE_EN: FormatLocale = {
   longDate: 'dddd, mmmm d, yyyy',
   longTime: 'h:mm:ss AM/PM',
   shortTime: 'h:mm',
+  dateOrder: 'mdy',
 };
 
 export const LOCALE_TR: FormatLocale = {
@@ -67,6 +70,7 @@ export const LOCALE_TR: FormatLocale = {
   longDate: 'd mmmm yyyy dddd',
   longTime: 'hh:mm:ss',
   shortTime: 'hh:mm',
+  dateOrder: 'dmy',
 };
 
 /** Locale for a BCP 47 tag: "tr", "tr-TR", "tr_TR" give Turkish; everything else English. */
@@ -116,6 +120,8 @@ export function normalizeLocale(locale: Partial<FormatLocale> | undefined | null
       ? (source[field] as string[]).slice()
       : fallback[field];
   }
+  const order = source.dateOrder;
+  result.dateOrder = order === 'dmy' || order === 'mdy' || order === 'ymd' ? order : fallback.dateOrder;
   const complete = result as unknown as FormatLocale;
   normalized.set(locale, complete);
   return complete;

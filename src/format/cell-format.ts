@@ -42,7 +42,9 @@ export function isoToSerial(text: string, date1904 = false): number | undefined 
  * or text that is not a date they keep their text.
  */
 export function formatCell(cell: Cell | undefined, code: string, options?: FormatOptions): FormattedValue {
-  if (!cell || cell.value === null) return EMPTY;
+  if (!cell) return EMPTY;
+  // A formula that has no result yet (typed in, not calculated) shows as its own text.
+  if (cell.value === null) return cell.formula && cell.formula.text !== '' ? { text: `=${cell.formula.text}` } : EMPTY;
   if (cell.kind === 'error') return { text: String(cell.value) };
   if (cell.kind === 'date') {
     const text = String(cell.value);
@@ -63,7 +65,7 @@ export function builtinFormatId(styles: StyleSheet, numFmtId: number): number | 
 
 /** The text a cell shows in the grid, with the workbook's styles and date system. */
 export function cellDisplayText(workbook: Workbook, cell: Cell | undefined, locale?: FormatLocale): string {
-  if (!cell || cell.value === null) return '';
+  if (!cell) return '';
   const style = resolveCellStyle(workbook.styles, cell.style);
   const options = { locale, date1904: workbook.date1904, builtinId: builtinFormatId(workbook.styles, style.numFmtId) };
   return formatCell(cell, style.numFmt, options).text;

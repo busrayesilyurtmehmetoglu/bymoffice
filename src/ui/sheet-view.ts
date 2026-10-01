@@ -7,13 +7,17 @@
 // renderGrid(). Nothing in this module touches the DOM at import time, so it
 // can be imported where there is no document.
 
-import { createLayout, hitTest, maxScroll, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
+import { createLayout, hitTest, maxScroll, rangeRect, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { resolveColor } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, cellName, getCell, parseCellRef, rangeName, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
-import { renderGrid, type GridSelection } from '../render/grid';
+import { resolveCellStyle, resolveColor } from '../model/sheet/color';
+import { clearRange, copyRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
+import { History, type Op } from '../ops/ops';
+import { DEFAULT_GRID_THEME, renderGrid, type GridSelection } from '../render/grid';
+import { cssFont } from '../render/text';
+import { ContextMenu, type MenuItem } from './context-menu';
 
 export interface WorkbookViewOptions {
   /**
@@ -25,6 +29,40 @@ export interface WorkbookViewOptions {
   sheet?: number;
   onSelectionChange?(selection: GridSelection, sheetIndex: number): void;
   onSheetChange?(sheetIndex: number): void;
+  /** No editing: no cell editor, no paste, cut, delete, undo or structural commands. Copy still works. Default false. */
+  readOnly?: boolean;
+  /** Called after every change to the workbook, including undo and redo. */
+  onChange?(change: { sheets: number[] }): void;
+}
+
+/**
+ * What the view stores with every undo step: the sheet shown and its
+ * selection, which undo and redo bring back, and the sheets the step touches.
+ */
+export interface HistoryMark {
+  sheet: number;
+  active: { row: number; col: number };
+  range: CellRange;
+  /** Indexes of the sheets the step may have changed. */
+  sheets: number[];
+  /** Rows or columns were inserted or deleted, so sizes and positions changed too. */
+  structural: boolean;
+}
+
+/** The cell being edited. */
+interface Edit {
+  sheet: number;
+  row: number;
+  col: number;
+  /** The text the cell had for editing when the edit began; committing the same text changes nothing. */
+  original: string;
+  /**
+   * The edit began (through an input method) with the idle text still in the
+   * input. If that is all there is when it ends, nothing was entered.
+   */
+  idle: string | undefined;
+  font: string;
+  wrap: boolean;
 }
 
 interface CellPos {
@@ -81,6 +119,8 @@ interface Touch {
   domX: number;
   domY: number;
   moved: boolean;
+  /** The touch opened the menu (a long press), so lifting the finger is not a tap. */
+  consumed: boolean;
 }
 
 /**
@@ -103,7 +143,13 @@ const AUTO_SCROLL_MAX = 48;
 /** Upper bound for the steps one Shift+arrow takes to get out of a merged range. */
 const MAX_EXTEND_STEPS = 4096;
 
+/** How long a touch has to rest on a header to open its menu, and how close in time and place two taps make a double tap. */
+const LONG_PRESS_MS = 550;
+const DOUBLE_TAP_MS = 500;
+
 const LABEL = 'Spreadsheet';
+const INPUT_LABEL = 'Cell editor';
+const ACTION_FAILED = 'The action could not be completed';
 const SHEET_LABEL = 'Sheet';
 const CHART_SHEET_NOTE = 'This sheet is a chart sheet. Charts are not shown yet.';
 const OTHER_SHEET_NOTE = 'This kind of sheet is not shown yet.';
@@ -112,8 +158,13 @@ const OTHER_SHEET_NOTE = 'This kind of sheet is not shown yet.';
 // view still works where a style element is not allowed.
 const STYLE_TEXT =
   '.bym-view{font:12px/1.2 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;color:#202124;background:#fff}' +
-  '.bym-scroller:focus,.bym-tab:focus{outline:2px solid #1a73e8;outline-offset:-2px}' +
-  '.bym-scroller:focus:not(:focus-visible),.bym-tab:focus:not(:focus-visible){outline:none}' +
+  '.bym-focus-ring .bym-scroller,.bym-tab:focus{outline:2px solid #1a73e8;outline-offset:-2px}' +
+  '.bym-tab:focus:not(:focus-visible){outline:none}' +
+  '.bym-input{color:#000;background:#fff}' +
+  '.bym-menu{min-width:160px;padding:4px 0;background:#fff;border:1px solid #dadce0;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.25)}' +
+  '.bym-menu-item{-webkit-appearance:none;appearance:none;margin:0;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;' +
+  'text-align:left;padding:8px 16px;white-space:nowrap;cursor:pointer}' +
+  '.bym-menu-item:hover,.bym-menu-item:focus{background:#e8eaed;outline:none}' +
   '.bym-tabs{background:#f1f3f4;border-top:1px solid #dadce0}' +
   '.bym-tab{-webkit-appearance:none;appearance:none;flex:none;margin:0;border:0;border-right:1px solid #dadce0;border-radius:0;' +
   'background:transparent;color:#444746;font:inherit;padding:0 14px;min-height:32px;white-space:nowrap;cursor:pointer}' +
@@ -264,7 +315,10 @@ function resolveLocale(locale: string | FormatLocale | undefined): FormatLocale 
 
 export class WorkbookView {
   readonly workbook: Workbook;
+  /** Undo and redo. Each step carries the sheet and selection to go back to. */
+  readonly history: History<HistoryMark>;
   private locale: FormatLocale;
+  private locked: boolean;
 
   private readonly container: HTMLElement;
   private readonly options: WorkbookViewOptions;
@@ -275,6 +329,12 @@ export class WorkbookView {
   private readonly tabs: HTMLDivElement;
   private readonly note: HTMLDivElement;
   private readonly live: HTMLDivElement;
+  /**
+   * The one element that takes the keyboard focus and all text input. While no
+   * cell is edited it is a transparent pixel over the active cell (so that an
+   * input method opens its window there); while one is, it is the editor.
+   */
+  private readonly input: HTMLTextAreaElement;
   private readonly styleHost: Node;
   private readonly pointerEvents: boolean;
 
@@ -299,6 +359,22 @@ export class WorkbookView {
   private autoScrollFrame = 0;
   private drag: Drag | undefined;
   private touch: Touch | undefined;
+  private edit: Edit | undefined;
+  private menu: ContextMenu | undefined;
+  /** What copy() last put on the clipboard; pasting the same text back pastes these cells. */
+  private copied: CopiedRange | undefined;
+  private longPressTimer = 0;
+  /** The cell the last tap selected, for telling a double tap: the second tap has to select the same cell. */
+  private lastTap: { time: number; sheet: number; row: number; col: number } | undefined;
+  /** Names the last copy on the clipboard, so that a paste can tell this view's own cells from any other text. */
+  private copyId = '';
+  private committing = false;
+  /** The last pointer was a finger: editing has to ask for the on-screen keyboard. */
+  private touchInput = false;
+  private keyboardShown = false;
+  /** Set around focus calls of the view's own, which must not count as the user arriving or leaving. */
+  private quietFocus = false;
+  private refocusing = false;
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
@@ -309,6 +385,8 @@ export class WorkbookView {
     this.workbook = workbook;
     this.options = options;
     this.locale = resolveLocale(options.locale);
+    this.locked = options.readOnly === true;
+    this.history = new History<HistoryMark>(workbook);
     this.sheetIndex = this.initialSheet();
     this.pointerEvents = 'PointerEvent' in window;
 
@@ -321,8 +399,8 @@ export class WorkbookView {
 
     const scroller = document.createElement('div');
     scroller.className = 'bym-scroller';
-    // The cells are the grid and take the keyboard focus; Tab leaves them like any other control.
-    scroller.tabIndex = 0;
+    // The focus lives in the input element; some browsers would make a scrolling element a Tab stop of its own.
+    scroller.tabIndex = -1;
     scroller.setAttribute('role', 'grid');
     scroller.style.cssText = 'position:relative;flex:1 1 0;min-height:0;overflow:auto;overscroll-behavior:contain';
 
@@ -350,7 +428,24 @@ export class WorkbookView {
     live.setAttribute('aria-atomic', 'true');
     live.style.cssText = 'position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0';
 
+    const input = document.createElement('textarea');
+    input.className = 'bym-input';
+    input.setAttribute('aria-label', INPUT_LABEL);
+    // No on-screen keyboard until a cell is edited.
+    input.setAttribute('inputmode', 'none');
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('wrap', 'off');
+    input.spellcheck = false;
+    input.rows = 1;
+    input.readOnly = this.locked;
+    input.style.cssText =
+      'position:absolute;z-index:2;left:0;top:0;width:1px;height:1px;margin:0;padding:0;border:0;outline:none;resize:none;overflow:hidden;' +
+      'box-sizing:border-box;opacity:0;pointer-events:none;white-space:pre;line-height:1.2;border-radius:0';
+
     this.root = root;
+    this.input = input;
     this.scroller = scroller;
     this.canvas = canvas;
     this.spacer = spacer;
@@ -362,6 +457,7 @@ export class WorkbookView {
     scroller.appendChild(canvas);
     scroller.appendChild(spacer);
     root.appendChild(scroller);
+    root.appendChild(input);
     root.appendChild(note);
     root.appendChild(tabs);
     root.appendChild(live);
@@ -370,14 +466,29 @@ export class WorkbookView {
     container.appendChild(root);
 
     scroller.addEventListener('scroll', this.onScroll, { passive: true });
-    scroller.addEventListener('keydown', this.onKeyDown);
+    input.addEventListener('keydown', this.onKeyDown);
+    input.addEventListener('input', this.onInput);
+    input.addEventListener('compositionstart', this.onCompositionStart);
+    input.addEventListener('focus', this.onFocus);
+    input.addEventListener('blur', this.onBlur);
+    input.addEventListener('copy', this.onCopy);
+    input.addEventListener('cut', this.onCut);
+    input.addEventListener('paste', this.onPaste);
+    canvas.addEventListener('dblclick', this.onDoubleClick);
+    canvas.addEventListener('contextmenu', this.onContextMenu);
+    // Panning and pinching stay with the browser; its double-tap zoom would swallow the double tap that edits.
+    canvas.style.touchAction = 'manipulation';
     tabs.addEventListener('click', this.onTabClick);
+    root.addEventListener('mousedown', this.onRootMouseDown);
+    scroller.addEventListener('focus', this.onScrollerFocus);
     if (this.pointerEvents) {
       canvas.addEventListener('pointerdown', this.onPointerDown);
       canvas.addEventListener('pointermove', this.onPointerMove);
       canvas.addEventListener('pointerup', this.onPointerUp);
       canvas.addEventListener('pointercancel', this.onPointerCancel);
       canvas.addEventListener('lostpointercapture', this.onPointerCancel);
+      // After a tap the browser also sends mouse events; their default would take the focus away from the input.
+      canvas.addEventListener('mousedown', this.onMouseDown);
     } else {
       // Browsers without pointer events: a tap arrives as the mouse events the browser makes up for it.
       canvas.addEventListener('mousedown', this.onPointerDown);
@@ -404,8 +515,12 @@ export class WorkbookView {
       throw new RangeError(`No sheet with index ${index}`);
     }
     if (this.destroyed || index === this.sheetIndex) return;
+    // What is being typed belongs to the sheet that is being left.
+    if (this.edit) this.commitEditing();
+    this.closeMenu();
     this.endDrag();
-    this.touch = undefined;
+    this.endTouch();
+    this.lastTap = undefined;
     this.sheetIndex = index;
     this.showSheet();
     this.schedule();
@@ -420,6 +535,8 @@ export class WorkbookView {
   /** Selects a range and scrolls its active cell (the top-left one unless given) into view. */
   select(range: CellRange, active?: { row: number; col: number }): void {
     if (this.destroyed) return;
+    // Like a click on another cell: what is being typed is written first.
+    if (this.edit) this.commitEditing();
     const a = { row: toIndex(range.top, MAX_ROWS), col: toIndex(range.left, MAX_COLS) };
     const b = { row: toIndex(range.bottom, MAX_ROWS), col: toIndex(range.right, MAX_COLS) };
     // The same rule as for clicks and keys: a merged cell is selected whole, with its top-left cell active.
@@ -469,7 +586,20 @@ export class WorkbookView {
     if (this.destroyed) return;
     this.destroyed = true;
     this.endDrag();
-    this.touch = undefined;
+    this.endTouch();
+    this.edit = undefined;
+    this.closeMenu();
+    const input = this.input;
+    input.removeEventListener('keydown', this.onKeyDown);
+    input.removeEventListener('input', this.onInput);
+    input.removeEventListener('compositionstart', this.onCompositionStart);
+    input.removeEventListener('focus', this.onFocus);
+    input.removeEventListener('blur', this.onBlur);
+    input.removeEventListener('copy', this.onCopy);
+    input.removeEventListener('cut', this.onCut);
+    input.removeEventListener('paste', this.onPaste);
+    this.canvas.removeEventListener('dblclick', this.onDoubleClick);
+    this.canvas.removeEventListener('contextmenu', this.onContextMenu);
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     if (this.resizeObserver) this.resizeObserver.disconnect();
@@ -477,8 +607,9 @@ export class WorkbookView {
     this.unwatchPixelRatio();
     window.removeEventListener('resize', this.onResize);
     this.scroller.removeEventListener('scroll', this.onScroll);
-    this.scroller.removeEventListener('keydown', this.onKeyDown);
     this.tabs.removeEventListener('click', this.onTabClick);
+    this.root.removeEventListener('mousedown', this.onRootMouseDown);
+    this.scroller.removeEventListener('focus', this.onScrollerFocus);
     const canvas = this.canvas;
     canvas.removeEventListener('pointerdown', this.onPointerDown);
     canvas.removeEventListener('pointermove', this.onPointerMove);
@@ -486,6 +617,7 @@ export class WorkbookView {
     canvas.removeEventListener('pointercancel', this.onPointerCancel);
     canvas.removeEventListener('lostpointercapture', this.onPointerCancel);
     canvas.removeEventListener('mousedown', this.onPointerDown);
+    canvas.removeEventListener('mousedown', this.onMouseDown);
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);
     // Give the backing store back right away; some browsers keep it until collection otherwise.
@@ -606,7 +738,7 @@ export class WorkbookView {
     const sheets = this.workbook.sheets;
     for (let i = this.sheetIndex + step; i >= 0 && i < sheets.length; i += step) {
       if (sheets[i].state === 'visible') {
-        this.setActiveSheet(i);
+        this.attempt(() => this.setActiveSheet(i));
         return;
       }
     }
@@ -618,8 +750,8 @@ export class WorkbookView {
     if (!node || node === this.tabs) return;
     const index = Number(node.getAttribute('data-sheet'));
     // A pointer click hands the keyboard back to the cells; a tab chosen with the keyboard keeps the focus.
-    if (event.detail > 0) this.scroller.focus({ preventScroll: true });
-    this.setActiveSheet(index);
+    if (event.detail > 0) this.focusInput(true);
+    this.attempt(() => this.setActiveSheet(index));
   };
 
   // ------------------------------------------------------- size and scroll
@@ -759,11 +891,14 @@ export class WorkbookView {
         changed = true;
       }
     }
+    // What was tapped a moment ago is somewhere else now.
+    if (changed) this.lastTap = undefined;
     return changed;
   }
 
   private onScroll = (): void => {
     if (this.destroyed || !this.readScroll()) return;
+    this.closeMenu();
     const state = this.state();
     if (this.growExtent(state.scrollX, state.scrollY)) this.commitScroll();
     this.schedule();
@@ -826,6 +961,8 @@ export class WorkbookView {
       locale: this.locale,
       devicePixelRatio: this.dpr,
     });
+    // The input follows its cell through every scroll and resize.
+    this.placeInput();
   }
 
   // ------------------------------------------------------------- selection
@@ -877,21 +1014,31 @@ export class WorkbookView {
     const single = range.top === range.bottom && range.left === range.right;
     if (!single && !(merge && sameRange(merge, range))) text += `, ${rangeName(range)} selected`;
     this.live.textContent = text;
+    this.syncInput();
   }
 
   // -------------------------------------------------------------- keyboard
 
   private onKeyDown = (event: KeyboardEvent): void => {
-    if (this.destroyed || event.defaultPrevented || event.isComposing) return;
-    if (event.target !== this.scroller) return;
+    if (this.destroyed || event.defaultPrevented) return;
+    if (this.edit) {
+      this.onEditKey(event);
+      return;
+    }
+    // 229: the key went to an input method, also where isComposing is not reported.
+    if (event.isComposing || event.keyCode === 229) return;
+    // Whatever is typed next replaces the idle text, and copy needs a selection in some browsers.
+    this.selectIdleText();
     const ctrl = event.ctrlKey || event.metaKey;
     const shift = event.shiftKey;
     if (event.altKey) {
       // Browsers keep Ctrl+PageUp/PageDown for their own tabs; Alt does the same here.
-      if (ctrl || shift || (event.key !== 'PageUp' && event.key !== 'PageDown')) return;
-      this.stepSheet(event.key === 'PageDown' ? 1 : -1);
-      event.preventDefault();
-      return;
+      if (event.key !== 'Delete' && event.key !== 'Backspace') {
+        if (ctrl || shift || (event.key !== 'PageUp' && event.key !== 'PageDown')) return;
+        this.stepSheet(event.key === 'PageDown' ? 1 : -1);
+        event.preventDefault();
+        return;
+      }
     }
     const state = this.state();
     const { rows, cols } = state.metrics;
@@ -942,6 +1089,35 @@ export class WorkbookView {
       case 'A':
         if (ctrl && !shift) this.selectAll();
         else handled = false;
+        break;
+      case 'Delete':
+      case 'Backspace':
+        // With Ctrl, Alt or Cmd the browser would delete a word of the idle text; here every variant clears
+        // the selection. Shift+Delete is "cut" on Windows: left alone, it arrives as a cut event or does nothing.
+        if (shift) handled = false;
+        else if (!this.locked) this.attempt(() => this.clearSelection());
+        break;
+      case 'F2':
+        this.startEditing();
+        break;
+      case 'z':
+      case 'Z':
+        if (!ctrl) handled = false;
+        else if (shift) this.redo();
+        else this.undo();
+        break;
+      case 'y':
+      case 'Y':
+        if (ctrl && !shift) this.redo();
+        else handled = false;
+        break;
+      case '+':
+      case '=':
+        handled = ctrl && this.structuralKey('insert');
+        break;
+      case '-':
+      case '_':
+        handled = ctrl && this.structuralKey('delete');
         break;
       default:
         handled = false;
@@ -1017,7 +1193,8 @@ export class WorkbookView {
     const filled = (index: number) => {
       if (index < 0 || index >= used) return false;
       const cell = vertical ? getCell(sheet, index, line) : getCell(sheet, line, index);
-      return cell !== undefined && cell.value !== null && cell.value !== '';
+      // A formula typed in but not calculated yet has no value and still fills its cell.
+      return cell !== undefined && ((cell.value !== null && cell.value !== '') || cell.formula !== undefined);
     };
 
     let next = stepVisible(axis, from, step);
@@ -1058,6 +1235,612 @@ export class WorkbookView {
     this.scrollToOffsets(state.scrollX, state.scrollY + direction * area.height);
     this.moveTo({ row, col: from.col }, extend);
   }
+
+  // --------------------------------------------------------------- editing
+
+  get isEditing(): boolean {
+    return this.edit !== undefined;
+  }
+
+  /**
+   * Opens the editor on the active cell. Without an argument it holds the
+   * cell's content as the user would type it; with one, that text instead.
+   */
+  startEditing(initialText?: string): void {
+    if (this.destroyed || this.locked || this.edit) return;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return;
+    this.closeMenu();
+    this.beginEdit();
+    const edit = this.edit as Edit | undefined;
+    if (!edit) return;
+    const text = initialText !== undefined ? String(initialText) : edit.original;
+    this.input.value = text;
+    this.focusInput(true);
+    this.showKeyboard();
+    try {
+      this.input.setSelectionRange(text.length, text.length);
+    } catch {
+      // Only fails on an element that is not rendered; the caret position is cosmetic.
+    }
+    this.placeInput();
+  }
+
+  /** Writes the editor's text to the cell and closes the editor. Returns whether a cell was being edited. */
+  commitEditing(): boolean {
+    const edit = this.edit;
+    if (!edit) return false;
+    if (this.committing) return false;
+    const text = this.input.value;
+    // Text that was only looked at, or the idle text an abandoned composition left behind, is not a change.
+    const unchanged = text === edit.original || (edit.idle !== undefined && text === edit.idle);
+    if (!unchanged) {
+      // The editor stays open until the cell is written: if that fails, what was typed is still there.
+      this.committing = true;
+      try {
+        this.applyOps(setCellInput(this.workbook, edit.sheet, edit.row, edit.col, text, { locale: this.locale }));
+      } finally {
+        this.committing = false;
+      }
+    }
+    this.endEdit();
+    return true;
+  }
+
+  /** commitEditing() for keys, pointers and focus changes: a failure is announced and reported as false. */
+  private tryCommit(): boolean {
+    if (!this.edit) return true;
+    try {
+      this.commitEditing();
+      return true;
+    } catch (error) {
+      this.live.textContent = error instanceof Error && error.message ? error.message : ACTION_FAILED;
+      return false;
+    }
+  }
+
+  get readOnly(): boolean {
+    return this.locked;
+  }
+
+  /** Turns editing off or on. Turning it off writes an open edit first; the undo history is kept either way. */
+  setReadOnly(readOnly: boolean): void {
+    const next = readOnly === true;
+    if (this.destroyed || next === this.locked) return;
+    if (next) {
+      this.commitEditing();
+      this.closeMenu();
+    }
+    this.locked = next;
+    this.input.readOnly = next;
+  }
+
+  /** Closes the editor and leaves the cell as it was. */
+  cancelEditing(): void {
+    if (this.edit) this.endEdit();
+  }
+
+  /** Sets a cell from text, read the way typed input is: one undo step. */
+  setCellInput(row: number, col: number, text: string): void {
+    if (this.destroyed || this.locked) return;
+    const r = toIndex(row, MAX_ROWS);
+    const c = toIndex(col, MAX_COLS);
+    this.commitEditing();
+    this.applyOps(setCellInput(this.workbook, this.sheetIndex, r, c, String(text), { locale: this.locale }));
+  }
+
+  /** Empties the selected cells and keeps their formatting, like the Delete key. */
+  clearSelection(): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    this.applyOps(clearRange(this.workbook, this.sheetIndex, this.state().range));
+  }
+
+  /**
+   * Undoes the last change and returns whether there was one. While a cell is
+   * edited it only abandons the edit (and returns true): as in Excel, the
+   * steps before it are out of reach until the edit is over.
+   */
+  undo(): boolean {
+    return this.travel(false);
+  }
+
+  redo(): boolean {
+    return this.travel(true);
+  }
+
+  /** Copies the selection: returns what belongs on the clipboard and remembers the cells for a later paste. */
+  copy(): CopiedRange {
+    const plain = copyRange(this.workbook, this.sheetIndex, this.state().range, { locale: this.locale });
+    // The same text can come back from anywhere (another program, another view, another cell that shows the
+    // same); only HTML that carries this mark is this copy.
+    this.copyId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const copied = { ...plain, html: plain.html.replace('<table>', `<table data-bym-copy="${this.copyId}">`) };
+    this.copied = copied;
+    return copied;
+  }
+
+  /** Copies the selection and empties it, as one undo step. Read-only views only copy. */
+  cut(): CopiedRange {
+    if (!this.destroyed && !this.locked) this.commitEditing();
+    const copied = this.copy();
+    if (!this.destroyed && !this.locked) {
+      this.applyOps(clearRange(this.workbook, this.sheetIndex, this.state().range));
+    }
+    return copied;
+  }
+
+  /**
+   * Pastes clipboard text at the selection and selects what was written.
+   * `html` is the clipboard's text/html, if any: when it is what the last
+   * copy() of this view produced, the copied cells themselves are pasted, with
+   * their formats and with formulas moved along. Without it, or with any other
+   * HTML, the text is read field by field as if typed.
+   */
+  paste(text: string, html?: string): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    const value = String(text);
+    if (value === '') return;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return;
+    const own = html !== undefined && this.copied !== undefined && this.copyId !== '' && String(html).indexOf(`data-bym-copy="${this.copyId}"`) >= 0;
+    const result = pasteAt(this.workbook, this.sheetIndex, state.range, value, own ? this.copied : undefined, { locale: this.locale });
+    const after = { active: { row: result.range.top, col: result.range.left }, range: result.range };
+    if (!this.applyOps(result.ops, after)) this.restoreSelection(after);
+  }
+
+  insertRows(at: number, count: number): void {
+    this.structural('insert', 'row', at, count);
+  }
+
+  deleteRows(at: number, count: number): void {
+    this.structural('delete', 'row', at, count);
+  }
+
+  insertColumns(at: number, count: number): void {
+    this.structural('insert', 'col', at, count);
+  }
+
+  deleteColumns(at: number, count: number): void {
+    this.structural('delete', 'col', at, count);
+  }
+
+  private structural(kind: 'insert' | 'delete', axis: 'row' | 'col', at: number, count: number): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    const state = this.state();
+    // The new rows or columns end up selected; after a delete the selection stays where it is.
+    let after: { active: CellPos; range: CellRange } | undefined;
+    if (kind === 'insert') {
+      after =
+        axis === 'row'
+          ? { active: { row: at, col: state.active.col }, range: { top: at, bottom: at + count - 1, left: 0, right: MAX_COLS - 1 } }
+          : { active: { row: state.active.row, col: at }, range: { top: 0, bottom: MAX_ROWS - 1, left: at, right: at + count - 1 } };
+    }
+    this.applyOps([{ type: kind, sheet: this.sheetIndex, axis, at, count }], after, true);
+  }
+
+  /** Ctrl with plus or minus on whole rows or columns. Returns false when the selection is neither. */
+  private structuralKey(kind: 'insert' | 'delete'): boolean {
+    if (this.locked) return false;
+    const range = this.state().range;
+    const rows = fullWidth(range) && !fullHeight(range);
+    const cols = fullHeight(range) && !fullWidth(range);
+    if (!rows && !cols) return false;
+    const at = rows ? range.top : range.left;
+    const count = (rows ? range.bottom : range.right) - at + 1;
+    this.attempt(() => this.structural(kind, rows ? 'row' : 'col', at, count));
+    return true;
+  }
+
+  private mark(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): HistoryMark {
+    const from = selection || this.state();
+    return { sheet: this.sheetIndex, active: { ...from.active }, range: { ...from.range }, sheets, structural };
+  }
+
+  /**
+   * Applies operations to the shown sheet as one undo step and brings the view
+   * up to date. Returns false when there was nothing to apply. An operation
+   * that throws leaves the workbook and the view as they were.
+   */
+  private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }, structural = false): boolean {
+    if (ops.length === 0) return false;
+    const sheets: number[] = [];
+    for (let i = 0; i < ops.length; i++) if (sheets.indexOf(ops[i].sheet) < 0) sheets.push(ops[i].sheet);
+    // Rows and columns that move take the formulas of every other sheet with them.
+    if (structural) for (let i = 0; i < this.workbook.sheets.length; i++) if (sheets.indexOf(i) < 0) sheets.push(i);
+    this.history.apply(ops, this.mark(sheets, structural), this.mark(sheets, structural, after));
+    this.afterChange(sheets, structural, after);
+    return true;
+  }
+
+  private travel(redo: boolean): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (this.edit) {
+      this.cancelEditing();
+      return true;
+    }
+    this.closeMenu();
+    const step = redo ? this.history.redo() : this.history.undo();
+    if (!step) return false;
+    const meta = step.meta;
+    if (meta.sheet !== this.sheetIndex && meta.sheet >= 0 && meta.sheet < this.workbook.sheets.length) this.setActiveSheet(meta.sheet);
+    this.afterChange(meta.sheets, meta.structural, meta);
+    return true;
+  }
+
+  /** Everything that has to follow a change of the model. */
+  private afterChange(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): void {
+    if (structural) {
+      this.lastTap = undefined;
+      // Row heights, column widths and hidden runs moved; the merged ranges are indexed again on their own.
+      for (let i = 0; i < sheets.length; i++) {
+        const state = this.states[sheets[i]];
+        if (state) state.metrics = createSheetMetrics(state.sheet);
+      }
+    }
+    if (selection) this.restoreSelection(selection);
+    const state = this.state();
+    this.growExtent(state.scrollX, state.scrollY);
+    this.commitScroll();
+    this.announce();
+    this.schedule();
+    if (this.options.onChange) this.options.onChange({ sheets: sheets.slice() });
+  }
+
+  private restoreSelection(selection: { active: CellPos; range: CellRange }): void {
+    const range = selection.range;
+    const active = { row: clamp(selection.active.row, range.top, range.bottom), col: clamp(selection.active.col, range.left, range.right) };
+    const focus = { row: active.row === range.top ? range.bottom : range.top, col: active.col === range.left ? range.right : range.left };
+    this.setSelection(active, range, focus, active);
+  }
+
+  /** Runs a command from a key, the clipboard or the menu; a failure is announced instead of thrown. */
+  private attempt(run: () => void): void {
+    try {
+      run();
+    } catch (error) {
+      this.live.textContent = error instanceof Error && error.message ? error.message : ACTION_FAILED;
+    }
+  }
+
+  private beginEdit(idle?: string): void {
+    const state = this.state();
+    const { row, col } = state.active;
+    const style = resolveCellStyle(this.workbook.styles, styleAt(state.sheet, row, col));
+    this.edit = {
+      sheet: this.sheetIndex,
+      row,
+      col,
+      // As the input will hold it: a text field turns every kind of line break into "\n".
+      original: editTextAt(this.workbook, state.sheet, row, col, { locale: this.locale }).replace(/\r\n?/g, '\n'),
+      idle,
+      font: cssFont(style.font),
+      wrap: style.alignment.wrapText === true,
+    };
+    this.input.setAttribute('inputmode', 'text');
+    this.reveal(state.active);
+    this.placeInput();
+  }
+
+  private endEdit(): void {
+    this.edit = undefined;
+    this.input.setAttribute('inputmode', 'none');
+    if (this.keyboardShown) {
+      this.keyboardShown = false;
+      // The keyboard only follows inputmode when the focus arrives.
+      if (this.hasFocus()) this.refocus();
+    }
+    this.syncInput();
+  }
+
+  /** On a touch device the on-screen keyboard has to be asked for. */
+  private showKeyboard(): void {
+    if (!this.touchInput) return;
+    this.keyboardShown = true;
+    this.refocus();
+  }
+
+  private refocus(): void {
+    this.refocusing = true;
+    this.quietFocus = true;
+    this.input.blur();
+    this.input.focus({ preventScroll: true });
+    this.quietFocus = false;
+    this.refocusing = false;
+  }
+
+  private hasFocus(): boolean {
+    const root = this.input.getRootNode() as Document | ShadowRoot;
+    return root.activeElement === this.input;
+  }
+
+  /** Gives the input the focus without the focus ring that keyboard users get. */
+  private focusInput(quiet: boolean): void {
+    if (quiet) this.root.classList.remove('bym-focus-ring');
+    if (this.hasFocus()) return;
+    this.quietFocus = quiet;
+    this.input.focus({ preventScroll: true });
+    this.quietFocus = false;
+  }
+
+  private selectIdleText(): void {
+    if (this.edit) return;
+    const input = this.input;
+    if (input.selectionStart === 0 && input.selectionEnd === input.value.length) return;
+    try {
+      input.setSelectionRange(0, input.value.length);
+    } catch {
+      // Not rendered; nothing to select in.
+    }
+  }
+
+  /**
+   * While no cell is edited the input holds the active cell's text, selected:
+   * typing replaces it, an input method sees it, and browsers that only fire
+   * copy and cut for a selection have one. An empty cell gets a space.
+   */
+  private syncInput(): void {
+    if (this.edit) return;
+    const state = this.state();
+    const text = state.sheet.kind === 'worksheet' ? editTextAt(this.workbook, state.sheet, state.active.row, state.active.col, { locale: this.locale }) : '';
+    const value = text === '' ? ' ' : text;
+    if (this.input.value !== value) this.input.value = value;
+    if (this.hasFocus()) this.selectIdleText();
+    this.placeInput();
+  }
+
+  /** Puts the input where its cell is: a hidden pixel while idle, the editor box while editing. */
+  private placeInput(): void {
+    const style = this.input.style;
+    const state = this.state();
+    const layout = this.layout(state);
+    const edit = this.edit;
+    const cell = edit || state.active;
+    const merge = mergeIn(this.merges(), cell.row, cell.col);
+    const rect = rangeRect(layout, merge || { top: cell.row, left: cell.col, bottom: cell.row, right: cell.col });
+    const paneLeft = layout.metrics.headerWidth + (cell.col < layout.frozenCols ? 0 : layout.frozenWidth);
+    const paneTop = layout.metrics.headerHeight + (cell.row < layout.frozenRows ? 0 : layout.frozenHeight);
+    const inView = rect.width > 0 && rect.height > 0 && rect.x >= paneLeft && rect.y >= paneTop && rect.x < this.width && rect.y < this.height;
+    if (!edit || !inView) {
+      // Out of sight but still inside the view, so the browser never scrolls anything to show it. An editor
+      // whose cell is scrolled away waits here with its text.
+      style.left = `${clamp(rect.x, 0, Math.max(this.width - 1, 0))}px`;
+      style.top = `${clamp(rect.y, 0, Math.max(this.height - 1, 0))}px`;
+      style.width = '1px';
+      style.height = '1px';
+      style.opacity = '0';
+      style.pointerEvents = 'none';
+      style.border = '0';
+      style.padding = '0';
+      return;
+    }
+    // One pixel up and left: the box covers the grid lines around the cell, like the selection border does.
+    const left = Math.max(rect.x - 1, 0);
+    const top = Math.max(rect.y - 1, 0);
+    const maxWidth = Math.max(this.width - left, 1);
+    const maxHeight = Math.max(this.height - top, 1);
+    const minWidth = Math.min(rect.width + 1, maxWidth);
+    const minHeight = Math.min(rect.height + 1, maxHeight);
+    style.opacity = '1';
+    style.pointerEvents = 'auto';
+    style.border = `2px solid ${DEFAULT_GRID_THEME.selectionBorder}`;
+    style.padding = '0 2px';
+    style.font = edit.font;
+    style.lineHeight = '1.2';
+    style.whiteSpace = edit.wrap ? 'pre-wrap' : 'pre';
+    style.left = `${left}px`;
+    style.top = `${top}px`;
+    style.width = `${minWidth}px`;
+    style.height = `${minHeight}px`;
+    // Grow with the text: to the right until the edge of the view, then down.
+    const border = 4;
+    if (!edit.wrap) {
+      const wanted = this.input.scrollWidth + border + 2;
+      if (wanted > minWidth) style.width = `${Math.min(wanted, maxWidth)}px`;
+    }
+    const wantedHeight = this.input.scrollHeight + border;
+    if (wantedHeight > minHeight) style.height = `${Math.min(wantedHeight, maxHeight)}px`;
+  }
+
+  private onInput = (event: Event): void => {
+    if (this.destroyed) return;
+    if (!this.edit) {
+      // Typed over the idle text: that starts an edit which already holds what was typed. Only input that
+      // adds something does; a deletion of the idle text (a key combination the view does not know) does not.
+      const type = (event as InputEvent).inputType;
+      const adds = type ? type.indexOf('insert') === 0 || (event as InputEvent).isComposing === true : this.input.value !== '';
+      if (!adds || this.locked || this.state().sheet.kind !== 'worksheet') {
+        this.syncInput();
+        return;
+      }
+      this.closeMenu();
+      this.beginEdit();
+    }
+    this.placeInput();
+  };
+
+  private onCompositionStart = (): void => {
+    if (this.destroyed || this.edit || this.locked || this.state().sheet.kind !== 'worksheet') return;
+    // An input method composes in place; the editor has to be there from its first key.
+    this.selectIdleText();
+    this.beginEdit(this.input.value);
+  };
+
+  private onFocus = (): void => {
+    if (this.destroyed) return;
+    if (!this.quietFocus) this.root.classList.add('bym-focus-ring');
+    this.selectIdleText();
+  };
+
+  private onBlur = (event: FocusEvent): void => {
+    if (this.destroyed || this.refocusing) return;
+    // The scrolling element can take the focus (a click on its scroll bar in some browsers); it hands it straight back.
+    if (event.relatedTarget === this.scroller) return;
+    this.root.classList.remove('bym-focus-ring');
+    // Leaving the editor any other way than Escape keeps what was typed.
+    this.tryCommit();
+  };
+
+  private onScrollerFocus = (): void => {
+    if (!this.destroyed) this.focusInput(true);
+  };
+
+  /** A press on an empty part of the view (the tab strip beside the tabs, say) must not take the focus from the input. */
+  private onRootMouseDown = (event: MouseEvent): void => {
+    const target = event.target as Element | null;
+    if (this.destroyed || !target || target === this.input || this.scroller.contains(target)) return;
+    if (typeof target.closest === 'function' && target.closest('button, .bym-menu')) return;
+    event.preventDefault();
+    this.focusInput(true);
+  };
+
+  private onEditKey(event: KeyboardEvent): void {
+    // Enter that confirms an input method's candidate is not Enter for the cell.
+    if (event.isComposing || event.keyCode === 229) return;
+    const shift = event.shiftKey;
+    switch (event.key) {
+      case 'Enter':
+        event.preventDefault();
+        if (event.altKey) {
+          const input = this.input;
+          input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end');
+          this.placeInput();
+        } else {
+          if (this.tryCommit() && !event.ctrlKey && !event.metaKey) this.moveBy(shift ? -1 : 1, 0, false, false);
+        }
+        break;
+      case 'Tab':
+        event.preventDefault();
+        if (this.tryCommit()) this.moveBy(0, shift ? -1 : 1, false, false);
+        break;
+      case 'Escape':
+        event.preventDefault();
+        // The host page must not also act on it (close a dialog, say).
+        event.stopPropagation();
+        this.cancelEditing();
+        break;
+      default:
+      // Every other key is the editor's own: arrows move the caret, not the selection.
+    }
+  }
+
+  private onCopy = (event: ClipboardEvent): void => {
+    this.onClipboard(event, false);
+  };
+
+  private onCut = (event: ClipboardEvent): void => {
+    this.onClipboard(event, true);
+  };
+
+  private onClipboard(event: ClipboardEvent, cut: boolean): void {
+    // While a cell is edited the clipboard works on the editor's text, as in any text field.
+    const data = event.clipboardData;
+    if (this.destroyed || this.edit || !data) return;
+    event.preventDefault();
+    this.attempt(() => {
+      const copied = cut ? this.cut() : this.copy();
+      data.setData('text/plain', copied.text);
+      data.setData('text/html', copied.html);
+    });
+  }
+
+  private onPaste = (event: ClipboardEvent): void => {
+    if (this.destroyed || this.edit) return;
+    event.preventDefault();
+    const data = event.clipboardData;
+    if (!data) return;
+    const text = data.getData('text/plain');
+    const html = data.getData('text/html');
+    this.attempt(() => this.paste(text, html));
+  };
+
+  // ------------------------------------------------------------------ menu
+
+  private closeMenu(): void {
+    if (this.menu) this.menu.close();
+  }
+
+  /**
+   * Opens the insert and delete menu for the row or column header at a canvas
+   * point. Returns false when the point is not on a header.
+   */
+  private openHeaderMenu(x: number, y: number): boolean {
+    if (this.locked || this.state().sheet.kind !== 'worksheet') return false;
+    const hit = hitTest(this.layout(), x, y);
+    if (hit.area !== 'rowHeader' && hit.area !== 'colHeader') return false;
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    const rows = hit.area === 'rowHeader';
+    const index = hit.area === 'rowHeader' ? hit.row : hit.col;
+    // A header outside the selected rows or columns is selected first, as a click would.
+    let range = this.state().range;
+    const whole = rows ? fullWidth(range) && !fullHeight(range) : fullHeight(range) && !fullWidth(range);
+    const inside = whole && (rows ? index >= range.top && index <= range.bottom : index >= range.left && index <= range.right);
+    if (!inside) {
+      this.press(x, y, false);
+      range = this.state().range;
+    }
+    const first = rows ? range.top : range.left;
+    const count = (rows ? range.bottom : range.right) - first + 1;
+    const axis = rows ? 'row' : 'col';
+    const noun = rows ? (count === 1 ? 'row' : `${count} rows`) : count === 1 ? 'column' : `${count} columns`;
+    const items: MenuItem[] = [
+      { label: `Insert ${noun} ${rows ? 'above' : 'left'}`, action: () => this.attempt(() => this.structural('insert', axis, first, count)) },
+      { label: `Insert ${noun} ${rows ? 'below' : 'right'}`, action: () => this.attempt(() => this.structural('insert', axis, first + count, count)) },
+      { label: `Delete ${noun}`, action: () => this.attempt(() => this.structural('delete', axis, first, count)) },
+    ];
+    this.menu = new ContextMenu(
+      this.root,
+      items,
+      x,
+      y,
+      () => {
+        this.menu = undefined;
+        // Back to the cells, unless the view is going away.
+        if (!this.destroyed) this.focusInput(true);
+      },
+      // Opened under a finger that is still down.
+      this.touch !== undefined,
+    );
+    return true;
+  }
+
+  private onContextMenu = (event: MouseEvent): void => {
+    if (this.destroyed) return;
+    const point = this.canvasPoint(event);
+    if (this.openHeaderMenu(point.x, point.y)) {
+      event.preventDefault();
+      // On a touch screen this is the long press; lifting the finger must not count as a tap.
+      if (this.touch) this.touch.consumed = true;
+    }
+  };
+
+  private onLongPress = (): void => {
+    this.longPressTimer = 0;
+    const touch = this.touch;
+    if (this.destroyed || !touch || touch.moved || touch.consumed || this.menu) return;
+    this.readScroll();
+    if (touch.domX !== this.domX || touch.domY !== this.domY) return;
+    if (this.openHeaderMenu(touch.x, touch.y)) touch.consumed = true;
+  };
+
+  private clearLongPress(): void {
+    if (this.longPressTimer) window.clearTimeout(this.longPressTimer);
+    this.longPressTimer = 0;
+  }
+
+  private endTouch(): void {
+    this.clearLongPress();
+    this.touch = undefined;
+  }
+
+  private onDoubleClick = (event: MouseEvent): void => {
+    if (this.destroyed) return;
+    const point = this.canvasPoint(event);
+    if (hitTest(this.layout(), point.x, point.y).area === 'cell') this.startEditing();
+  };
 
   // --------------------------------------------------------------- pointer
 
@@ -1132,6 +1915,10 @@ export class WorkbookView {
     }
   }
 
+  private onMouseDown = (event: MouseEvent): void => {
+    event.preventDefault();
+  };
+
   private onPointerDown = (event: MouseEvent): void => {
     if (this.destroyed) return;
     const pointer = event as PointerEvent;
@@ -1141,13 +1928,18 @@ export class WorkbookView {
     if (pointer.pointerType === 'touch') {
       // A touch that moves is a native scroll; only a tap selects (see onPointerUp).
       this.readScroll();
-      this.touch = { pointerId, x: point.x, y: point.y, domX: this.domX, domY: this.domY, moved: false };
+      this.endTouch();
+      this.touchInput = true;
+      this.touch = { pointerId, x: point.x, y: point.y, domX: this.domX, domY: this.domY, moved: false, consumed: false };
+      this.longPressTimer = window.setTimeout(this.onLongPress, LONG_PRESS_MS);
       return;
     }
     if (event.button !== 0) return;
     // Keeps the browser from starting a text selection or an image drag.
     event.preventDefault();
-    this.scroller.focus({ preventScroll: true });
+    this.touchInput = false;
+    if (!this.tryCommit()) return;
+    this.focusInput(true);
     this.endDrag();
     this.readScroll();
     const mode = this.press(point.x, point.y, event.shiftKey);
@@ -1170,7 +1962,10 @@ export class WorkbookView {
     const point = this.canvasPoint(event);
     const touch = this.touch;
     if (touch && touch.pointerId === pointerId) {
-      if (Math.abs(point.x - touch.x) > TAP_SLOP || Math.abs(point.y - touch.y) > TAP_SLOP) touch.moved = true;
+      if (Math.abs(point.x - touch.x) > TAP_SLOP || Math.abs(point.y - touch.y) > TAP_SLOP) {
+        touch.moved = true;
+        this.clearLongPress();
+      }
       return;
     }
     const drag = this.drag;
@@ -1191,13 +1986,29 @@ export class WorkbookView {
     const pointerId = pointer.pointerId === undefined ? 0 : pointer.pointerId;
     const touch = this.touch;
     if (touch && touch.pointerId === pointerId) {
-      this.touch = undefined;
+      this.endTouch();
       this.readScroll();
       const point = this.canvasPoint(event);
       const still = Math.abs(point.x - touch.x) <= TAP_SLOP && Math.abs(point.y - touch.y) <= TAP_SLOP;
-      if (touch.moved || !still || touch.domX !== this.domX || touch.domY !== this.domY) return;
-      this.scroller.focus({ preventScroll: true });
-      this.press(point.x, point.y, false);
+      if (touch.consumed || touch.moved || !still || touch.domX !== this.domX || touch.domY !== this.domY) return;
+      if (!this.tryCommit()) return;
+      this.focusInput(true);
+      const mode = this.press(point.x, point.y, false);
+      // A second tap that selects the same cell (or the same merged cell) edits it; two quick taps on neighbours do not.
+      const last = this.lastTap;
+      const active = this.state().active;
+      this.lastTap = mode === 'cell' ? { time: event.timeStamp, sheet: this.sheetIndex, row: active.row, col: active.col } : undefined;
+      if (
+        mode === 'cell' &&
+        last &&
+        event.timeStamp - last.time < DOUBLE_TAP_MS &&
+        last.sheet === this.sheetIndex &&
+        last.row === active.row &&
+        last.col === active.col
+      ) {
+        this.lastTap = undefined;
+        this.startEditing();
+      }
       return;
     }
     const drag = this.drag;
@@ -1209,7 +2020,7 @@ export class WorkbookView {
 
   private onPointerCancel = (event: Event): void => {
     const pointerId = (event as PointerEvent).pointerId;
-    if (this.touch && this.touch.pointerId === pointerId) this.touch = undefined;
+    if (this.touch && this.touch.pointerId === pointerId) this.endTouch();
     if (this.drag && this.drag.pointerId === pointerId) this.endDrag();
   };
 

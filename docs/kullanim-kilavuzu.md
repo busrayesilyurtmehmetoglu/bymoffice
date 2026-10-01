@@ -3,7 +3,7 @@
 Bu kılavuz, BYM Office'i kendi uygulamasına ekleyecek geliştiriciler içindir. Her kod değişikliğinde güncellenir;
 burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılmamış olanlar "Henüz olmayanlar" başlığında açıkça listelenir.
 
-**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — kapsayıcı katmanı, xlsx okuma modeli, salt okunur tablo görünümü ve sayı biçimleri.
+**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — kapsayıcı katmanı, xlsx okuma modeli, tablo görünümü, sayı biçimleri ve ekranda hücre düzenleme.
 
 ## 1. Bu sürüm ne yapar
 
@@ -13,6 +13,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - xlsx dosyasını **tablo modeline** okur: sayfalar, hücre değerleri ve türleri, formül metinleri, stiller, birleştirilmiş hücreler, sütun genişlikleri, satır yükseklikleri, dondurulmuş bölmeler, gizli satır/sütun/sayfa, köprüler, adlandırılmış aralıklar.
 - xlsx dosyasını sayfada **gösterir** (`BymOffice.mount()`): Canvas üzerinde yalnız görünen alan çizilir; kaydırma, hücre/aralık seçimi, klavye ile gezinme, dokunmatik kullanım, dondurulmuş bölmeler, sayfa sekmeleri.
 - Hücreleri **Excel sayı biçimleriyle** gösterir: tarih, saat, para, yüzde, bilimsel, kesir ve özel biçim kodları; Türkçe ve İngilizce yerel ayar (`1.234,50 ₺` / `15.03.2024` ↔ `1,234.50` / `3/15/2024`).
+- Hücreleri **düzenler** (şimdilik yalnız ekranda): yazarak giriş, geri al/yinele, kopyala/kes/yapıştır, satır ve sütun ekle-sil. Formül metinleri, birleştirilmiş hücreler ve adlandırılmış aralıklar ekleme-silmeyle birlikte kayar.
 - doc/xls içindeki akışları (stream) okur.
 - Tarayıcıda ve Node'da aynı kodla, çalışma zamanı bağımlılığı olmadan çalışır.
 
@@ -20,13 +21,13 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 
 | Özellik | Durum |
 |---|---|
-| Hücre düzenleme, geri al/yinele, kopyala/yapıştır | Yok (görev 1.4); görünüm salt okunurdur |
+| **Düzenlemeleri dosyaya yazma** | Yok (görev 1.5). `save()` hâlâ özgün dosyayı verir; ekranda yaptığınız değişiklikler kaydedilmez |
+| Formül hesaplama | Yok (Aşama 2). Yazılan ya da yapıştırılan formül hücrede `=metin` olarak görünür; var olan formüllerin sonuçları, baktıkları hücreler değişse de eski değerinde kalır |
+| Biçimlendirme (kalın, renk, kenarlık), sütun genişliği/satır yüksekliği değiştirme, birleştirme, sayfa ekleme-silme | Yok (Aşama 2) |
 | Belge (docx/doc) ve xls görüntüleme | Yok; `mount()` `UnsupportedFileError` ile reddeder |
 | Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
-| `onSave`, `readOnly` seçenekleri; arayüz metinlerinin Türkçesi | Yok (görev 1.6); sabit metinler şimdilik İngilizce |
+| `onSave` seçeneği; arayüz metinlerinin Türkçesi | Yok (görev 1.6); menü ve ekran okuyucu metinleri şimdilik İngilizce |
 | Sayı biçimlerinde: Türkçe ve İngilizce dışındaki diller, `*` ile doldurma, `_` boşluğunun gerçek genişliği, Hicri/Japon takvimleri, `[DBNum]` | Yok; `*` hiçbir şey yazmaz, `_x` tek boşluk olur |
-| Formül hesaplama | Yok (Aşama 2); dosyadaki son hesaplanmış değer ve formül metni okunur |
-| Modeli değiştirip xlsx olarak yazma | Yok (görev 1.4–1.5); model şimdilik salt okunurdur |
 | xls ve docx/doc için model | Yok; `workbook()` `UnsupportedFileError` ile reddeder |
 | Koşullu biçim, veri doğrulama, grafik, görsel | Modelde yok; dosyada korunur |
 | doc/xls yazma | Yok; `save()` özgün baytları döndürür |
@@ -129,6 +130,8 @@ Bir xlsx dosyasını açar ve `container` içinde gösterir. Kapsayıcının bir
 | `file` | Dosyanın kendisi ya da getirileceği adres. Adres verilirse `fetch` ile alınır; sunucu hata dönerse `Could not load the file: HTTP 404` gibi bir hata fırlatılır |
 | `locale` | Sayı ve tarih biçimlerinin dili: `'tr'`, `'en'` gibi bir etiket ya da tam bir `FormatLocale` nesnesi. Verilmezse tarayıcının dili (`navigator.language`); Türkçe dışındaki her dil İngilizce (en-US) kurallarıyla gösterilir |
 | `sheet` | İlk gösterilecek sayfanın dizini. Verilmezse dosyanın etkin sayfası; o gizliyse ilk görünür sayfa |
+| `readOnly` | `true` ise düzenleme kapalıdır (editör, yapıştırma, kesme, silme, geri al, satır/sütun komutları çalışmaz); kopyalama çalışır. Varsayılan `false` |
+| `onChange({ sheets })` | Çalışma kitabı her değiştiğinde çağrılır (geri al ve yinele dahil); `sheets` etkilenmiş olabilecek sayfa dizinleridir |
 | `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
 | `onSheetChange(sheetIndex)` | Gösterilen sayfa değişince çağrılır |
 
@@ -143,6 +146,13 @@ xlsx dışındaki dosyalarda `UnsupportedFileError` ile reddeder ve kapsayıcıy
 | `select(range, active?)` | Seçimi değiştirir ve görünür alana getirir; sınır dışı değerler sayfa sınırına çekilir |
 | `scrollTo(row, col)` | Hücreyi görünür alana getirir |
 | `setLocale(locale)` | Sayı ve tarih biçimlerinin dilini değiştirir ve yeniden çizer |
+| `setCellInput(row, col, text)` | Hücreye, kullanıcı yazmış gibi metin girer (tek geri alma adımı) |
+| `startEditing(text?)`, `commitEditing()`, `cancelEditing()`, `isEditing` | Hücre editörünü programla açar, yazar, kapatır |
+| `clearSelection()` | Seçili aralığın içeriğini siler, biçimi korur |
+| `undo()`, `redo()`, `history.canUndo`, `history.canRedo` | Geri al ve yinele; seçim ve sayfa da geri döner |
+| `copy()`, `cut()`, `paste(text, html?)` | Pano işlemlerinin çekirdeği; `copy()` `{ text, html, … }` döndürür. `paste`'e yalnız metin verilirse dışarıdan gelmiş sayılır; kendi kopyanızı biçim ve formülleriyle yapıştırmak için `copy()`'nin `html`'ini de verin |
+| `readOnly`, `setReadOnly(readOnly)` | Salt okunur kipini görünümü yeniden kurmadan değiştirir; geri alma geçmişi korunur |
+| `insertRows(at, count)`, `deleteRows(at, count)`, `insertColumns(at, count)`, `deleteColumns(at, count)` | Satır ve sütun ekler ya da siler (0 tabanlı). Yapılamazsa `RangeError` fırlatır |
 | `getViewState()` | `{ scrollX, scrollY, width, height, devicePixelRatio }` |
 | `render()` | Hemen yeniden çizer (normalde gerekmez) |
 | `destroy()` | Tüm DOM'u ve dinleyicileri kaldırır |
@@ -151,6 +161,8 @@ Kullanıcı etkileşimi:
 
 - **Fare:** tıkla (seç), sürükle (aralık; kenarda kendiliğinden kayar), Shift+tık, satır/sütun başlığı (tüm satır/sütun), köşe (tümü). Birleştirilmiş hücre bütün olarak seçilir.
 - **Dokunma:** dokun (seç), sürükle (kaydır; atalet tarayıcınındır).
+- **Düzenleme:** hücreye yazmaya başlayın (içerik değişir), F2'ye basın ya da çift tıklayın/çift dokunun (mevcut içerik düzenlenir). Enter yazar ve aşağı iner, Shift+Enter yukarı çıkar, Tab sağa, Shift+Tab sola gider, Esc vazgeçer, Alt+Enter satır sonu ekler. Delete ya da Backspace seçili aralığı temizler. Ctrl/Cmd+Z geri alır, Ctrl+Y ya da Ctrl/Cmd+Shift+Z yineler. Ctrl/Cmd+C, X, V kopyalar, keser, yapıştırır.
+- **Satır ve sütun:** satır ya da sütun başlığına sağ tıklayın (dokunmatikte uzun basın); açılan menüden ekleyin ya da silin. Tam satır ya da sütun seçiliyken Ctrl/Cmd+`+` ekler, Ctrl/Cmd+`-` siler.
 - **Klavye** (önce görünüme tıklayın ya da Tab ile odaklanın): oklar, Shift+oklar, Ctrl/Cmd+oklar (veri bloğunun kenarı), Home, Ctrl+Home, Ctrl+End, PageUp/PageDown, Enter/Shift+Enter, Ctrl+A; sayfa değiştirmek için Alt+PageDown/PageUp (Ctrl+PageDown/PageUp da çalışır, ama bazı tarayıcılar onu kendine ayırır). Tab ve Shift+Tab hücre değiştirmez: odağı ızgaradan sayfadaki sonraki/önceki öğeye taşır, böylece klavye kullanıcıları görünümde hapsolmaz. Sayfa sekmeleri Tab ile odaklanıp Enter ya da Boşluk ile seçilir.
 
 Bilinmesi gerekenler:
@@ -159,9 +171,40 @@ Bilinmesi gerekenler:
 - Çizimde hücrenin kendi fontu kullanılır; cihazda yoksa `Carlito`, `Calibri`, `Arial` sırasıyla yedeğe düşülür. Font farkı metin genişliklerini biraz değiştirebilir.
 - Sütun genişlikleri ve satır yükseklikleri Excel'in piksel yuvarlamasıyla hesaplanır (varsayılan sütun 64 px, satır 20 px).
 - Sayfa her zaman 1.048.576 satır × 16.384 sütundur; kaydırma alanı kullanılan alanla başlar ve sona yaklaşıldıkça büyür.
-- Erişilebilirlik: kaydırılan bölüm `role="grid"` ile odak alır, sekmeler `role="tab"` düğmeleridir; etkin hücrenin adresi ve metni ekran okuyucular için bir canlı bölgede duyurulur. Ekran okuyucuyla henüz denenmedi.
+- Erişilebilirlik: klavye odağı görünümdeki gizli bir metin alanındadır (`aria-label="Cell editor"`); kaydırılan bölüm `role="grid"` taşır, sekmeler `role="tab"` düğmeleridir; etkin hücrenin adresi ve metni ekran okuyucular için bir canlı bölgede duyurulur. Ekran okuyucuyla henüz denenmedi.
 - CSS ile ölçeklenmiş (`transform: scale(...)`) bir kapsayıcıda da tıklamalar doğru hücreye gider.
 - Görünüm kendi stillerini sayfaya tek bir `<style data-bymoffice>` öğesiyle ekler; sınıf adları `bym-` ile başlar. Dosyadan gelen hiçbir metin HTML olarak basılmaz.
+
+### Düzenleme: yazılan metin nasıl yorumlanır
+
+Yazılan metin Excel'deki gibi yorumlanır; kurallar seçili dile (`locale`) göre değişir:
+
+| Yazılan (TR) | Sonuç |
+|---|---|
+| `12,5` · `1.234,56` · `-5` · `(5)` | Sayı |
+| `15%` · `%15` | Yüzde (0,15); hücre "Genel" biçimdeyse yüzde biçimi alır |
+| `15.03.2024` · `15/3/24` · `2024-03-15` · `15 Mart 2024` | Tarih (seri numarası); hücre "Genel" biçimdeyse tarih biçimi alır |
+| `13:45` · `13:45:30` · `1:30 ÖS` | Saat |
+| `12,50 ₺` · `$1,234.50` | Para; sayı ve para biçimi |
+| `DOĞRU` · `YANLIŞ` · `TRUE` · `FALSE` | Mantıksal değer |
+| `=A1*2` | Formül (henüz hesaplanmaz; `=A1*2` olarak görünür) |
+| `'0123` | Baştaki `'` ile her şey metin olur: `0123` |
+| diğer her şey | Metin |
+
+Bilinmesi gerekenler:
+
+- **Metin biçimli hücreler** (`@`): yazılan her şey olduğu gibi metin saklanır; `0123` sıfırını korur, `=A1` formül olmaz.
+- **Uzun numaralar korunur:** sayıya tam sığmayan rakam dizileri (ör. 20 haneli bir numara, IBAN) Excel'in aksine yuvarlanmaz, metin olarak saklanır. Baştaki sıfırlar ise Excel'deki gibi düşer (`0123` → 123); korumak için hücreyi Metin biçimli yapın ya da başına `'` koyun.
+- Hücrenin zaten bir sayı biçimi varsa yazılan tarih ya da yüzde o biçimi değiştirmez.
+- İçeriği değiştirmeden editörden çıkmak (F2, sonra Enter) hücreyi değiştirmez ve geri alma adımı üretmez.
+- **Satır/sütun ekle-sil:** formüllerdeki başvurular (diğer sayfalardakiler dahil), birleştirilmiş hücreler, köprüler, sütun genişlikleri ve adlandırılmış aralıklar birlikte kayar; silinen hücreye bakan başvuru `#REF!` olur. Bir dizi formülünü ortasından kesen ya da dolu hücreleri sayfanın dışına iten işlem Excel'deki gibi reddedilir.
+- **Geri alma** en çok 200 adım tutar; büyük sayfalarda satır/sütun ekleme gibi ağır adımlar belleği korumak için daha erken düşebilir.
+- **Düzenlerken geri al** yalnız açık düzenlemeyi iptal eder; önceki adımı geri almak için önce editörden çıkın.
+- Bir milyon hücreden büyük yapıştırma, yarısı yazılıp kalmasın diye tümüyle reddedilir. Birleştirilmiş bir alanın altında kalan hücrelere yapıştırma yapılmaz.
+- **Kesme** kopyalayıp temizler; Excel'deki gibi "taşıma" değildir (kesilen hücrelere bakan formüller yeni yeri izlemez).
+- Kendi kopyaladığınız aralığı yapıştırdığınızda biçimler ve formüller birlikte gelir, formül başvuruları yeni yere göre kayar. Başka bir programdan gelen metin hücre hücre yazılmış gibi yorumlanır.
+
+Aynı işlemler arayüz olmadan da kullanılabilir (ör. Node'da): `setCellInput(workbook, sheetIndex, row, col, text, { locale })`, `clearRange`, `copyRange`, `pasteAt` işlem listesi (`Op[]`) üretir; `new History(workbook).apply(ops, before, after)` uygular, `undo()`/`redo()` geri alır. Satır eklemek için doğrudan `{ type: 'insert', sheet, axis: 'row', at, count }` işlemi verilir. Yardımcılar: `parseCellInput(text, options)`, `cellEditText(cell, numFmt, options)`, `shiftFormula(text, dRow, dCol)`, `adjustFormula(text, sheetName, edit)`.
 
 ### `open(input): Promise<OfficeFile>`
 
@@ -359,7 +402,7 @@ Sayfada yapabilecekleriniz:
 - Bir ya da birden çok dosyayı sürükleyip bırakmak ya da seçmek.
 - Her dosya için biçimi, boyutu, açılış süresini ve "kaydet → yeniden aç" sonucunu görmek (yeşil: tüm parçalar aynı; sarı: desteklenmiyor ya da ikili biçim; kırmızı: hata ya da içerik değişti).
 - Parçaya ya da akışa tıklayıp içeriğini görmek (XML metin olarak, diğerleri onaltılık döküm).
-- xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler); altında seçili aralık, etkin hücrenin görünen değeri, ham değeri ve formülü yazar. "Sayı ve tarih biçimi dili" seçimiyle Türkçe ve İngilizce gösterim arasında geçilir.
+- xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler) ve **hücre düzenleme** (yazma, geri al/yinele, kopyala/yapıştır, satır/sütun ekle-sil; üstteki düğmeler ve "Salt okunur" seçimi); altında seçili aralık, etkin hücrenin görünen değeri, ham değeri ve formülü yazar. Düzenlemeler henüz dosyaya yazılmaz: "Yeniden kaydet ve indir" özgün dosyayı verir. "Sayı ve tarih biçimi dili" seçimiyle Türkçe ve İngilizce gösterim arasında geçilir.
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.

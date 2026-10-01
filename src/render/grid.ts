@@ -471,7 +471,10 @@ function styleIndexAt(sheet: Sheet, row: number, col: number): number {
 }
 
 function hasContent(cell: Cell | undefined): cell is Cell {
-  return cell !== undefined && cell.value !== null && cell.value !== undefined && cell.value !== '';
+  if (cell === undefined) return false;
+  // A formula that has not been calculated yet is drawn as its text.
+  if (cell.value === null || cell.value === undefined) return cell.formula !== undefined && cell.formula.text !== '';
+  return cell.value !== '';
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +863,7 @@ function drawCellText(
   let segments = cellSegments(frame, cell, style, wrap);
   if (segments.length === 0) return;
 
-  const align = style.horizontal !== 'general' ? style.horizontal : kind === 'string' ? 'left' : numeric ? 'right' : 'center';
+  const align = style.horizontal !== 'general' ? style.horizontal : kind === 'string' || kind === 'blank' ? 'left' : numeric ? 'right' : 'center';
   const indent = align === 'center' ? 0 : style.indent * INDENT_WIDTH;
   const available = width - 2 * CELL_PADDING - indent;
 
