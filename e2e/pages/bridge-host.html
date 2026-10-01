@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: bridge page in an iframe</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      iframe {
+        display: block;
+        width: 100%;
+        height: 420px;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script>
+      // The embedding application: keeps what the editor posts and sends it messages as text.
+      // "?src=<address>" names the bridge page to embed; the tests serve this page from another origin.
+      window.__messages = [];
+      var frame = document.createElement('iframe');
+      frame.id = 'bridge';
+      frame.title = 'editor';
+      window.addEventListener('message', function (event) {
+        if (event.source !== frame.contentWindow) return;
+        window.__messages.push(event.data);
+      });
+      window.__send = function (message) {
+        frame.contentWindow.postMessage(message, '*');
+      };
+      var src = /[?&]src=([^&]*)/.exec(location.search);
+      frame.src = src ? decodeURIComponent(src[1]) : '/dist/bymoffice.webview.html';
+      document.body.appendChild(frame);
+    </script>
+  </body>
+</html>

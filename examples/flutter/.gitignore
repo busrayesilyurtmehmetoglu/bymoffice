@@ -1,0 +1,7 @@
+# Copied from the engine's dist/ before building; see README.md.
+assets/bymoffice.webview.html
+
+.dart_tool/
+.packages
+build/
+pubspec.lock

@@ -1,0 +1,22 @@
+name: bym_office_example
+description: Embedding the BYM Office spreadsheet editor in a Flutter application.
+publish_to: none
+version: 0.0.1
+
+environment:
+  sdk: ^3.4.0
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The editor page runs in the platform's WebView (Android, iOS, macOS).
+  webview_flutter: ^4.8.0
+  # Only the example application (lib/main.dart) needs this one.
+  file_picker: ^8.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    # Copy dist/bymoffice.webview.html here first; see README.md.
+    - assets/bymoffice.webview.html

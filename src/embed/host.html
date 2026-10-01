@@ -1,0 +1,180 @@
+<!doctype html>
+<!--
+  Template of dist/bymoffice.webview.html, the page applications load into a
+  WebView. scripts/build.mjs replaces the __BYM_…__ markers: the policy, the engine
+  (inlined, so the page needs no network), the version and the origins that may embed the page.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <!--
+      maximum-scale=1: the cell editor's font is the cell's (often below 16 px), and iOS zooms the
+      page into any focused field smaller than that. viewport-fit=cover makes the safe-area insets available.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <!--
+      Origins that may embed this page in an iframe and drive it with window messages, separated by
+      spaces ("https://app.example.com"). Empty: none; the page then only talks to a WebView's channel.
+    -->
+    <meta name="bymoffice-parent-origins" content="__BYM_PARENT_ORIGINS__" />
+    <title>BYM Office</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        overscroll-behavior: none;
+        -webkit-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+        background: #f1f3f4;
+        color: #444746;
+        font: 15px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
+      }
+      /* The editor and the notice share the area inside the notch, the rounded corners and the home indicator. */
+      #editor,
+      #status {
+        position: fixed;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        top: env(safe-area-inset-top, 0px);
+        right: env(safe-area-inset-right, 0px);
+        bottom: env(safe-area-inset-bottom, 0px);
+        left: env(safe-area-inset-left, 0px);
+      }
+      #status {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        box-sizing: border-box;
+        text-align: center;
+        overflow-wrap: break-word;
+        word-wrap: break-word;
+      }
+      #status[hidden] {
+        display: none;
+      }
+      #status p {
+        margin: 0 0 8px;
+        max-width: 100%;
+      }
+      @media (prefers-color-scheme: dark) {
+        html,
+        body {
+          background: #202124;
+          color: #c4c7c5;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="editor"></div>
+    <div id="status" role="status">
+      <p id="status-title"></p>
+    </div>
+    <script>__BYM_ENGINE__</script>
+    <script>
+      // Not compiled: this has to parse wherever the engine does.
+      (function () {
+        var status = document.getElementById('status');
+        var title = document.getElementById('status-title');
+        var words = {
+          tr: {
+            empty: 'Açık dosya yok',
+            loading: 'Dosya açılıyor…',
+            error: 'Dosya açılamadı',
+            unsupported: 'Bu dosya türü desteklenmiyor',
+            corrupt: 'Dosya bozuk, açılamadı',
+            'load-failed': 'Dosya yüklenemedi',
+            engine: 'Bu cihazda düzenleyici çalıştırılamıyor',
+          },
+          en: {
+            empty: 'No file is open',
+            loading: 'Opening the file…',
+            error: 'The file could not be opened',
+            unsupported: 'This type of file is not supported',
+            corrupt: 'The file is damaged and could not be opened',
+            'load-failed': 'The file could not be loaded',
+            engine: 'The editor cannot run on this device',
+          },
+        };
+        var language = 'en';
+        var shown = 'empty';
+        function setLanguage(tag) {
+          language = /^tr\b/i.test(tag || '') ? 'tr' : 'en';
+          document.documentElement.lang = language;
+        }
+        // Only the page's own words are shown: what went wrong in detail is for the application, not the user.
+        function show(state, code) {
+          shown = state === 'error' && words[language][code] ? code : state;
+          status.hidden = state === 'open';
+          title.textContent = words[language][shown] || '';
+        }
+        setLanguage(navigator.language);
+        if (!window.BymOffice) {
+          title.textContent = words[language].engine;
+          return;
+        }
+        show('empty');
+        var origins = document.querySelector('meta[name="bymoffice-parent-origins"]');
+        window.BymOffice.installBridge({
+          window: window,
+          container: document.getElementById('editor'),
+          open: window.BymOffice.open,
+          createView: function (container, workbook, options) {
+            // The full editor: toolbar, formula bar and status bar around the grid. The bridge
+            // drives the grid; these three calls are passed on so that the shell follows.
+            var editor = new window.BymOffice.SpreadsheetEditor(container, workbook, options);
+            var view = editor.view;
+            var destroyView = view.destroy.bind(view);
+            var destroyed = false;
+            view.destroy = function () {
+              if (destroyed) return destroyView();
+              destroyed = true;
+              editor.destroy();
+            };
+            var setLocale = view.setLocale.bind(view);
+            var inLocale = false;
+            view.setLocale = function (locale) {
+              if (inLocale) return setLocale(locale);
+              inLocale = true;
+              try {
+                editor.setLocale(locale);
+              } finally {
+                inLocale = false;
+              }
+            };
+            var setReadOnly = view.setReadOnly.bind(view);
+            var inReadOnly = false;
+            view.setReadOnly = function (readOnly) {
+              if (inReadOnly) return setReadOnly(readOnly);
+              inReadOnly = true;
+              try {
+                editor.setReadOnly(readOnly);
+              } finally {
+                inReadOnly = false;
+              }
+            };
+            return view;
+          },
+          version: '__BYM_VERSION__',
+          parentOrigins: origins ? origins.getAttribute('content') : '',
+          onState: show,
+          // The page speaks the language the application chose for the file.
+          onLocale: function (tag) {
+            setLanguage(tag);
+            title.textContent = words[language][shown] || '';
+          },
+        });
+      })();
+    </script>
+  </body>
+</html>

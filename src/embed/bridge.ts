@@ -1,0 +1,841 @@
+// The WebView bridge: lets a native application drive the editor with JSON
+// messages. All messages travel as strings in both directions, so that every
+// platform (Flutter, Android, iOS, Windows, React Native, an iframe) uses the
+// same contract. Nothing here touches the DOM when the module is imported;
+// the window and the container are handed in.
+import type { OfficeFile } from '../index';
+import { cellName, rangeName, type Workbook } from '../model/sheet/types';
+import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
+
+export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded';
+
+/** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
+export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
+
+export interface BridgeHost {
+  /** The element the editor is shown in. */
+  container: HTMLElement;
+  /** The engine's open(). */
+  open(bytes: Uint8Array): Promise<OfficeFile>;
+  /** Shows a workbook in the container: `new WorkbookView(container, workbook, options)`. */
+  createView(container: HTMLElement, workbook: Workbook, options: WorkbookViewOptions): WorkbookView;
+  /**
+   * Hands one message to the application. Returns false (or throws) when there
+   * is no channel to send it on yet; the message is then kept and sent later.
+   */
+  post(json: string): boolean | void;
+  /** Sent in `ready`; the package version, which is also the version of the contract. */
+  version: string;
+  /** The page's own address. A `load` with a `url` is resolved against it; without it only blob: and data: URLs load. */
+  baseUrl?: string;
+  /** False refuses every `load` with a `url` (a framed page). Default true. */
+  allowUrl?: boolean;
+  /**
+   * Fetches the file of a `load` with a `url`; must give up when the signal
+   * aborts and fail when the file is larger than `maxBytes`. Without it such
+   * a load fails with `load-failed`.
+   */
+  fetchBytes?(url: string, limits: { signal?: AbortSignal; maxBytes: number }): Promise<Uint8Array>;
+  /** How long a fetch may take. Default 30 s. */
+  fetchTimeoutMs?: number;
+  /** Largest file a fetch may return. Default 256 MB. */
+  maxFetchBytes?: number;
+  /** Characters of undelivered messages kept before `saved` messages are given up. Default 64 M. */
+  maxPendingChars?: number;
+  /** Called when what the page should show around the editor changes. `code` comes with 'error'. */
+  onState?(state: BridgeState, code?: BridgeErrorCode): void;
+  /** Called with the language tag of a successful `load` or `setLocale`. */
+  onLocale?(locale: string): void;
+  /** Runs a callback on the next frame; selection messages are sent from it. Default: a 16 ms timer. */
+  frame?(callback: () => void): void;
+  /** Runs a callback after a delay. Default: setTimeout. */
+  timer?(callback: () => void, ms: number): void;
+}
+
+export interface Bridge {
+  /**
+   * Takes one message from the application: the JSON text, or the object it
+   * stands for. Resolves when the message has been dealt with; never rejects.
+   */
+  receive(message: unknown): Promise<void>;
+  /** Announces the page with `ready`. Called by receive() too; a second call does nothing. */
+  start(): void;
+  /** Closes the file, gives up a load that is under way and stops answering. */
+  destroy(): void;
+}
+
+const ENCODE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+/** Input bytes turned into text per step: a multiple of 3, and few enough characters for one fromCharCode call. */
+const ENCODE_STEP = 3 * 4096;
+
+const SKIP = 64;
+const PAD = 65;
+const INVALID = 255;
+/** Character code -> 6-bit value, SKIP for white space, PAD for "=", INVALID for the rest. */
+const DECODE = /* @__PURE__ */ (() => {
+  const table = new Uint8Array(128).fill(INVALID);
+  for (let i = 0; i < 64; i++) table[ENCODE.charCodeAt(i)] = i;
+  // The URL-safe alphabet, which some platform encoders produce.
+  table[0x2d] = 62;
+  table[0x5f] = 63;
+  // Line breaks and blanks: several platform encoders wrap their output.
+  table[0x09] = table[0x0a] = table[0x0d] = table[0x20] = SKIP;
+  table[0x3d] = PAD;
+  return table;
+})();
+
+/** Bytes as base64 text. Works in steps, so the size of the input is only limited by memory. */
+export function base64Encode(bytes: Uint8Array): string {
+  const parts: string[] = [];
+  const codes = new Uint8Array((ENCODE_STEP / 3) * 4);
+  for (let start = 0; start < bytes.length; start += ENCODE_STEP) {
+    const end = Math.min(start + ENCODE_STEP, bytes.length);
+    let n = 0;
+    let i = start;
+    for (; i + 2 < end; i += 3) {
+      const triple = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+      codes[n++] = ENCODE.charCodeAt(triple >> 18);
+      codes[n++] = ENCODE.charCodeAt((triple >> 12) & 63);
+      codes[n++] = ENCODE.charCodeAt((triple >> 6) & 63);
+      codes[n++] = ENCODE.charCodeAt(triple & 63);
+    }
+    // Only the last step can end with one or two bytes left over.
+    if (i < end) {
+      const triple = (bytes[i] << 16) | (i + 1 < end ? bytes[i + 1] << 8 : 0);
+      codes[n++] = ENCODE.charCodeAt(triple >> 18);
+      codes[n++] = ENCODE.charCodeAt((triple >> 12) & 63);
+      codes[n++] = i + 1 < end ? ENCODE.charCodeAt((triple >> 6) & 63) : 0x3d;
+      codes[n++] = 0x3d;
+    }
+    parts.push(String.fromCharCode.apply(null, (n === codes.length ? codes : codes.subarray(0, n)) as unknown as number[]));
+  }
+  return parts.join('');
+}
+
+/**
+ * Base64 text as bytes. Accepts the standard and the URL-safe alphabet, white
+ * space between characters and missing padding; throws an Error for anything else.
+ */
+export function base64Decode(text: string): Uint8Array {
+  const length = text.length;
+  let end = length;
+  while (end > 0 && text.charCodeAt(end - 1) === 0x3d) end--;
+  // Exact when the text has no white space, which is the usual case; otherwise an upper bound.
+  const out = new Uint8Array(Math.floor((end * 3) / 4));
+  let n = 0;
+  let acc = 0;
+  let bits = 0;
+  let count = 0;
+  let pads = 0;
+  for (let i = 0; i < length; i++) {
+    const code = text.charCodeAt(i);
+    const value = code < 128 ? DECODE[code] : INVALID;
+    if (value === SKIP) continue;
+    if (value === PAD) {
+      pads++;
+      continue;
+    }
+    if (value === INVALID || pads > 0) throw new Error(`Invalid base64: unexpected character at offset ${i}`);
+    acc = ((acc << 6) | value) & 0xfff;
+    bits += 6;
+    count++;
+    if (bits >= 8) {
+      bits -= 8;
+      out[n++] = (acc >> bits) & 0xff;
+    }
+  }
+  const rest = count % 4;
+  if (rest === 1) throw new Error('Invalid base64: the text is cut short');
+  if (pads > 0 && (pads > 2 || (rest + pads) % 4 !== 0)) throw new Error('Invalid base64: wrong padding');
+  return n === out.length ? out : out.slice(0, n);
+}
+
+/**
+ * The address a `load` may fetch, resolved against the page's own address, or
+ * undefined when it may not: only blob: and data: URLs and http(s) addresses
+ * of the page's own origin, without user name or password. A page that was
+ * not loaded over http(s) (file:, an application's asset scheme) therefore
+ * gets blob: and data: only. White space, control characters and backslashes
+ * are refused outright, because URL parsers drop or rewrite them.
+ */
+export function resolveLoadUrl(url: string, base?: string): string | undefined {
+  if (url.length === 0) return undefined;
+  for (let i = 0; i < url.length; i++) {
+    const code = url.charCodeAt(i);
+    if (code <= 0x20 || code === 0x7f || code === 0x5c) return undefined;
+  }
+  let target: URL;
+  let page: URL | undefined;
+  try {
+    page = base === undefined ? undefined : new URL(base);
+    target = page ? new URL(url, page.href) : new URL(url);
+  } catch {
+    return undefined;
+  }
+  if (target.protocol === 'blob:' || target.protocol === 'data:') return target.href;
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') return undefined;
+  if (target.username !== '' || target.password !== '') return undefined;
+  if (!page || (page.protocol !== 'http:' && page.protocol !== 'https:') || page.origin !== target.origin) return undefined;
+  return target.href;
+}
+
+/** Whether a `load` may fetch this address; see resolveLoadUrl(). */
+export function isAllowedUrl(url: string, base?: string): boolean {
+  return resolveLoadUrl(url, base) !== undefined;
+}
+
+/** A message that does not follow the contract. */
+class BadMessage extends Error {}
+
+type Message = { [field: string]: unknown };
+
+function field<T>(message: Message, name: string, type: 'string' | 'boolean' | 'number', required: boolean): T | undefined {
+  const value = message[name];
+  if (value === undefined || value === null) {
+    if (required) throw new BadMessage(`"${name}" is missing`);
+    return undefined;
+  }
+  if (typeof value !== type) throw new BadMessage(`"${name}" must be a ${type}`);
+  return value as T;
+}
+
+/** The message as an object: parsed when it is text. Throws BadMessage for anything that is not a JSON object. */
+function parseMessage(input: unknown): Message {
+  let message = input;
+  if (typeof message === 'string') {
+    try {
+      message = JSON.parse(message);
+    } catch {
+      throw new BadMessage('The message is not valid JSON');
+    }
+  }
+  if (typeof message !== 'object' || message === null || Array.isArray(message)) throw new BadMessage('The message must be a JSON object');
+  return message as Message;
+}
+
+const errorText = (error: unknown) => (error instanceof Error && error.message ? error.message : String(error));
+
+/** How often and for how long a channel that is not there is looked for: every 50 ms for 10 s after the last delivery. */
+const RETRY_MS = 50;
+const MAX_RETRIES = 200;
+
+const DEFAULT_FETCH_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_FETCH_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_CHARS = 64 * 1024 * 1024;
+
+/** Messages that say how things are now: of those waiting for a channel only the newest of each kind is kept. */
+const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet';
+
+interface Outgoing {
+  type: string;
+  id: string | undefined;
+  json: string;
+  /** Sheets of a waiting `changed`, which a later one takes over. */
+  sheets?: number[];
+}
+
+/** The file that is shown. */
+interface Shown {
+  file: OfficeFile;
+  workbook: Workbook;
+  view: WorkbookView;
+  name: string | undefined;
+}
+
+/** The message handling of the bridge page, with everything it needs from the page handed in. */
+export function createBridge(host: BridgeHost): Bridge {
+  const timer = host.timer || ((callback: () => void, ms: number) => void setTimeout(callback, ms));
+  const frame = host.frame || ((callback: () => void) => timer(callback, 16));
+  const fetchTimeout = host.fetchTimeoutMs === undefined ? DEFAULT_FETCH_TIMEOUT_MS : host.fetchTimeoutMs;
+  const maxFetchBytes = host.maxFetchBytes === undefined ? DEFAULT_MAX_FETCH_BYTES : host.maxFetchBytes;
+  const maxPendingChars = host.maxPendingChars === undefined ? DEFAULT_MAX_PENDING_CHARS : host.maxPendingChars;
+
+  let shown: Shown | undefined;
+  let destroyed = false;
+  /**
+   * Counts loads and closes. A load that finds another number than its own
+   * when it comes back from waiting has been overtaken and gives up.
+   */
+  let generation = 0;
+  /** Ends the fetch that is under way, if any. */
+  let cancelFetch: ((reason: string) => void) | undefined;
+  /** Messages are handled one after the other: a `save` sent right after a `load` waits for it. */
+  let chain: Promise<void> = Promise.resolve();
+
+  const pending: Outgoing[] = [];
+  let pendingChars = 0;
+  let started = false;
+  let retrying = false;
+  let retries = 0;
+
+  let selectionDue: { sheet: number; range: string; active: string } | undefined;
+  let selectionScheduled = false;
+  let selectionSent = '';
+
+  const deliver = (json: string): boolean => {
+    try {
+      return host.post(json) !== false;
+    } catch {
+      return false;
+    }
+  };
+
+  const flush = (): boolean => {
+    while (pending.length > 0) {
+      if (!deliver(pending[0].json)) return false;
+      pendingChars -= (pending.shift() as Outgoing).json.length;
+      // A channel that works earns the full time again when it goes away.
+      retries = 0;
+    }
+    return true;
+  };
+
+  const retry = () => {
+    retrying = false;
+    if (destroyed || flush()) return;
+    if (retries++ < MAX_RETRIES) {
+      retrying = true;
+      timer(retry, RETRY_MS);
+    }
+  };
+
+  const errorMessage = (code: BridgeErrorCode, message: string, id?: string): Message => {
+    const out: Message = { type: 'error' };
+    if (id !== undefined) out.id = id;
+    out.code = code;
+    out.message = message;
+    return out;
+  };
+
+  const send = (message: Message) => {
+    if (destroyed) return;
+    const type = message.type as string;
+    if (isStatus(type)) {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (pending[i].type !== type) continue;
+        const older = pending.splice(i, 1)[0];
+        pendingChars -= older.json.length;
+        // One `changed` stands for all that were waiting: it names every sheet they named.
+        if (type === 'changed' && older.sheets) {
+          const sheets = (message.sheets as number[]).slice();
+          for (const index of older.sheets) if (sheets.indexOf(index) < 0) sheets.push(index);
+          message = { ...message, sheets: sheets.sort((a, b) => a - b) };
+        }
+      }
+    }
+    const entry: Outgoing = { type, id: message.id as string | undefined, json: JSON.stringify(message) };
+    if (type === 'changed') entry.sheets = message.sheets as number[];
+    pending.push(entry);
+    pendingChars += entry.json.length;
+    if (flush()) return;
+    // Nobody is listening. Answers are never dropped, but a saved file is big:
+    // past the limit the oldest ones become errors the application can act on.
+    for (let i = 0; i < pending.length && pendingChars > maxPendingChars; i++) {
+      if (pending[i].type !== 'saved') continue;
+      const json = JSON.stringify(errorMessage('save-failed', 'The saved file was given up: the application did not take it', pending[i].id));
+      pendingChars += json.length - pending[i].json.length;
+      pending[i] = { type: 'error', id: pending[i].id, json };
+    }
+    if (!retrying && retries < MAX_RETRIES) {
+      retrying = true;
+      timer(retry, RETRY_MS);
+    }
+  };
+
+  const fail = (code: BridgeErrorCode, message: string, id?: string) => send(errorMessage(code, message, id));
+
+  const done = (command: string, id: string | undefined) => {
+    if (id !== undefined) send({ type: 'done', id, command });
+  };
+
+  // The page's own callbacks must not be able to leave the bridge half way through a step.
+  const setState = (state: BridgeState, code?: BridgeErrorCode) => {
+    try {
+      if (host.onState) host.onState(state, code);
+    } catch {
+      // Nothing to do: what the page shows around the editor is not the bridge's state.
+    }
+  };
+
+  const setLocale = (locale: string | undefined) => {
+    try {
+      if (locale !== undefined && host.onLocale) host.onLocale(locale);
+    } catch {
+      // As above.
+    }
+  };
+
+  const closeShown = () => {
+    selectionDue = undefined;
+    selectionSent = '';
+    if (!shown) return;
+    const view = shown.view;
+    shown = undefined;
+    view.destroy();
+  };
+
+  /** Gives up whatever load is under way or waiting. */
+  const supersede = (reason: string): number => {
+    generation++;
+    if (cancelFetch) cancelFetch(reason);
+    return generation;
+  };
+
+  const flushSelection = () => {
+    selectionScheduled = false;
+    const due = selectionDue;
+    selectionDue = undefined;
+    if (!due || !shown) return;
+    const key = `${due.sheet}!${due.range}!${due.active}`;
+    if (key === selectionSent) return;
+    selectionSent = key;
+    send({ type: 'selection', sheet: due.sheet, range: due.range, active: due.active });
+  };
+
+  /** Fetches with a time limit and a way to be cancelled; the size limit is the host's and is checked again here. */
+  const fetchFile = (url: string): Promise<Uint8Array> =>
+    new Promise<Uint8Array>((resolve, reject) => {
+      const fetchBytes = host.fetchBytes;
+      if (!fetchBytes) return reject(new Error('loading from a URL is not available here'));
+      const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+      let over = false;
+      const cancel = (reason: string) => {
+        if (over) return;
+        over = true;
+        if (cancelFetch === cancel) cancelFetch = undefined;
+        // Without AbortController the request runs on, and its result is ignored.
+        if (controller) controller.abort();
+        reject(new Error(reason));
+      };
+      cancelFetch = cancel;
+      timer(() => cancel(`no answer within ${Math.round(fetchTimeout / 1000)} s`), fetchTimeout);
+      let request: Promise<Uint8Array>;
+      try {
+        request = fetchBytes(url, { signal: controller ? controller.signal : undefined, maxBytes: maxFetchBytes });
+      } catch (error) {
+        request = Promise.reject(error);
+      }
+      request.then(
+        (bytes) => {
+          if (over) return;
+          over = true;
+          if (cancelFetch === cancel) cancelFetch = undefined;
+          if (bytes.length > maxFetchBytes) reject(new Error(`the file is larger than ${maxFetchBytes} bytes`));
+          else resolve(bytes);
+        },
+        (error) => {
+          if (over) return;
+          over = true;
+          if (cancelFetch === cancel) cancelFetch = undefined;
+          reject(error);
+        },
+      );
+    });
+
+  const load = async (message: Message, id: string | undefined, mine: number) => {
+    const data = field<string>(message, 'data', 'string', false);
+    const url = field<string>(message, 'url', 'string', false);
+    const name = field<string>(message, 'name', 'string', false);
+    const locale = field<string>(message, 'locale', 'string', false);
+    const readOnly = field<boolean>(message, 'readOnly', 'boolean', false);
+    const sheet = field<number>(message, 'sheet', 'number', false);
+    if ((data === undefined) === (url === undefined)) throw new BadMessage('"load" needs either "data" or "url"');
+    if (sheet !== undefined && (!Number.isInteger(sheet) || sheet < 0)) throw new BadMessage('"sheet" must be a sheet index');
+    let address: string | undefined;
+    if (url !== undefined) {
+      if (host.allowUrl === false) throw new BadMessage('"url" is not accepted by a framed page; send the file as "data"');
+      address = resolveLoadUrl(url, host.baseUrl);
+      if (address === undefined) throw new BadMessage('"url" must be a blob: or data: URL or an address of the page\'s own origin');
+    }
+    let bytes: Uint8Array | undefined;
+    if (data !== undefined) {
+      try {
+        bytes = base64Decode(data);
+      } catch (error) {
+        throw new BadMessage(errorText(error));
+      }
+    }
+
+    // A load that was overtaken (by a later load, a close or destroy) answers its id and changes nothing.
+    const overtaken = () => {
+      if (mine === generation && !destroyed) return false;
+      if (id !== undefined) fail('load-failed', 'The load was cancelled', id);
+      return true;
+    };
+    // The file that is open stays open, and stays on screen, until the new one has been read.
+    const refuse = (code: BridgeErrorCode, text: string) => {
+      if (!shown) setState(code === 'bad-message' ? 'empty' : 'error', code === 'bad-message' ? undefined : code);
+      fail(code, text, id);
+    };
+
+    if (overtaken()) return;
+    if (!shown) setState('loading');
+    if (bytes === undefined) {
+      try {
+        bytes = await fetchFile(address as string);
+      } catch (error) {
+        if (overtaken()) return;
+        return refuse('load-failed', `Could not load the file: ${errorText(error)}`);
+      }
+      if (overtaken()) return;
+    }
+
+    let file: OfficeFile;
+    let workbook: Workbook;
+    try {
+      file = await host.open(bytes);
+      if (overtaken()) return;
+      workbook = await file.workbook();
+      if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
+    } catch (error) {
+      if (overtaken()) return;
+      return refuse(error instanceof Error && error.name === 'UnsupportedFileError' ? 'unsupported' : 'corrupt', errorText(error));
+    }
+    if (overtaken()) return;
+    if (sheet !== undefined && sheet >= workbook.sheets.length) return refuse('bad-message', `No sheet with index ${sheet}`);
+
+    let view: WorkbookView | undefined;
+    const options: WorkbookViewOptions = {
+      onChange: (change) => {
+        if (!view) return;
+        send({ type: 'changed', sheets: change.sheets, canUndo: view.history.canUndo, canRedo: view.history.canRedo });
+      },
+      // At most one selection message per frame, and only the last selection of that frame.
+      onSelectionChange: (selection, sheetIndex) => {
+        selectionDue = { sheet: sheetIndex, range: rangeName(selection.range), active: cellName(selection.active.row, selection.active.col) };
+        if (selectionScheduled) return;
+        selectionScheduled = true;
+        frame(flushSelection);
+      },
+      onSheetChange: (index) => {
+        const entry = workbook.sheets[index];
+        send({ type: 'sheet', index, name: entry ? entry.name : '' });
+      },
+    };
+    if (locale !== undefined) options.locale = locale;
+    if (readOnly !== undefined) options.readOnly = readOnly;
+    if (sheet !== undefined) options.sheet = sheet;
+
+    closeShown();
+    try {
+      view = host.createView(host.container, workbook, options);
+    } catch (error) {
+      setState('error', 'corrupt');
+      return fail('corrupt', errorText(error), id);
+    }
+    shown = { file, workbook, view, name };
+    setLocale(locale);
+    setState('open');
+
+    const out: Message = { type: 'loaded' };
+    if (id !== undefined) out.id = id;
+    out.format = file.format;
+    out.sheets = workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind }));
+    out.activeSheet = view.activeSheet;
+    send(out);
+  };
+
+  const save = async (id: string | undefined) => {
+    const current = shown;
+    if (!current) return fail('not-loaded', 'No file is open', id);
+    let data: string;
+    try {
+      // A cell that is being edited is written first, as leaving it would do.
+      if (current.view.isEditing) current.view.commitEditing();
+      data = base64Encode(await current.file.save());
+    } catch (error) {
+      return fail('save-failed', errorText(error), id);
+    }
+    const out: Message = { type: 'saved' };
+    if (id !== undefined) out.id = id;
+    out.data = data;
+    if (current.name !== undefined) out.name = current.name;
+    send(out);
+  };
+
+  /** The id of a message; it is read first so that every later complaint can carry it. */
+  const idOf = (fields: Message): string | undefined => {
+    if (typeof fields.id === 'string') return fields.id;
+    if (fields.id !== undefined && fields.id !== null) throw new BadMessage('"id" must be a string');
+    return undefined;
+  };
+
+  const handle = async (input: unknown, mine: number) => {
+    if (destroyed) return;
+    let id: string | undefined;
+    try {
+      const fields = parseMessage(input);
+      id = idOf(fields);
+      const type = fields.type;
+      if (typeof type !== 'string') throw new BadMessage('"type" is missing');
+
+      if (type === 'load') return await load(fields, id, mine);
+      if (type === 'save') return await save(id);
+      if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
+        throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
+      }
+      const readOnly = type === 'setReadOnly' ? field<boolean>(fields, 'readOnly', 'boolean', true) : undefined;
+      const locale = type === 'setLocale' ? field<string>(fields, 'locale', 'string', true) : undefined;
+      if (!shown) return fail('not-loaded', 'No file is open', id);
+      const view = shown.view;
+      if (type === 'setReadOnly') view.setReadOnly(readOnly as boolean);
+      else if (type === 'setLocale') {
+        view.setLocale(locale as string);
+        setLocale(locale);
+      } else if (type === 'undo') view.undo();
+      else view.redo();
+      done(type, id);
+    } catch (error) {
+      // Whatever went wrong, the page stays alive and the application hears about it.
+      fail('bad-message', errorText(error), id);
+    }
+  };
+
+  /** `hello` and `close` do not wait for their turn: they must work while a load hangs. */
+  const handleNow = (fields: Message, type: string) => {
+    let id: string | undefined;
+    try {
+      id = idOf(fields);
+      if (type === 'hello') return send({ type: 'ready', version: host.version });
+      supersede('the file was closed');
+      closeShown();
+      setState('empty');
+      done('close', id);
+    } catch (error) {
+      fail('bad-message', errorText(error), id);
+    }
+  };
+
+  const start = () => {
+    if (started || destroyed) return;
+    started = true;
+    send({ type: 'ready', version: host.version });
+  };
+
+  return {
+    start,
+    receive(message: unknown): Promise<void> {
+      if (destroyed) return Promise.resolve();
+      // A call proves the application is there: `ready` and anything kept get another try.
+      const announced = started;
+      start();
+      flush();
+      // A first look, only to see what must not wait; complaints are made in turn, by handle().
+      let fields: Message | undefined;
+      try {
+        fields = parseMessage(message);
+      } catch {
+        fields = undefined;
+      }
+      const type = fields && fields.type;
+      if (fields && (type === 'hello' || type === 'close')) {
+        // A `hello` that is the first thing to arrive has just been answered by start().
+        if (type === 'close' || announced) handleNow(fields, type as string);
+        return Promise.resolve();
+      }
+      // A new load overtakes the one before it, whether that one is fetching or still waiting.
+      const mine = type === 'load' ? supersede('another file was requested') : generation;
+      chain = chain.then(() => handle(fields || message, mine));
+      return chain;
+    },
+    destroy() {
+      if (destroyed) return;
+      supersede('the bridge was destroyed');
+      closeShown();
+      destroyed = true;
+      pending.length = 0;
+      pendingChars = 0;
+    },
+  };
+}
+
+export interface InstallBridgeOptions {
+  /** The page's window. */
+  window: Window;
+  container: HTMLElement;
+  open: BridgeHost['open'];
+  createView: BridgeHost['createView'];
+  version: string;
+  /**
+   * Origins that may embed the page in an iframe and drive it with window
+   * messages, separated by white space. Empty or missing: no page may.
+   * This comes from the page itself, never from its address.
+   */
+  parentOrigins?: string;
+  onState?: BridgeHost['onState'];
+  onLocale?: BridgeHost['onLocale'];
+}
+
+/** The ways an application can be listening, as they appear on a window. */
+interface ChannelWindow {
+  BymOfficeHost?: { postMessage?(json: string): void };
+  webkit?: { messageHandlers?: { bymoffice?: { postMessage?(json: string): void } } };
+  chrome?: {
+    webview?: {
+      postMessage?(json: string): void;
+      addEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
+      removeEventListener?(type: 'message', listener: (event: { data: unknown }) => void): void;
+    };
+  };
+  ReactNativeWebView?: { postMessage?(json: string): void };
+  flutter_inappwebview?: { callHandler?(name: string, json: string): unknown };
+  BymOfficeBridge?: { receive(message: unknown): void; version: string };
+}
+
+/** An origin in the form browsers report it ("https://app.example"), or '' when the text is not one. "null" never is. */
+export function normalizeOrigin(text: string): string {
+  try {
+    const url = new URL(text);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+    return url.origin === 'null' ? '' : url.origin;
+  } catch {
+    return '';
+  }
+}
+
+/** Reads a response body, giving up as soon as it is larger than allowed. */
+async function readLimited(response: Response, maxBytes: number): Promise<Uint8Array> {
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const tooLarge = () => new Error(`the file is larger than ${maxBytes} bytes`);
+  const declared = Number(response.headers.get('content-length'));
+  if (declared > maxBytes) throw tooLarge();
+  const reader = response.body && typeof response.body.getReader === 'function' ? response.body.getReader() : undefined;
+  if (!reader) {
+    const whole = new Uint8Array(await response.arrayBuffer());
+    if (whole.length > maxBytes) throw tooLarge();
+    return whole;
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const step = await reader.read();
+    if (step.done) break;
+    total += step.value.length;
+    if (total > maxBytes) {
+      void reader.cancel().catch(() => undefined);
+      throw tooLarge();
+    }
+    chunks.push(step.value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    out.set(chunks[i], offset);
+    offset += chunks[i].length;
+  }
+  return out;
+}
+
+/**
+ * Wires a bridge to a page: finds the application's channel for outgoing
+ * messages, takes incoming ones through `window.BymOfficeBridge.receive()` and
+ * `message` events, and sends `ready`. destroy() of the result undoes all of it.
+ *
+ * A framed page talks to its parent only when the parent's origin is in
+ * `parentOrigins`, and never loads from a URL.
+ */
+export function installBridge(options: InstallBridgeOptions): Bridge {
+  const win = options.window;
+  const channels = win as unknown as ChannelWindow;
+  const framed = win.parent !== win;
+
+  const allowed: string[] = [];
+  const listed = (options.parentOrigins || '').split(/\s+/);
+  for (let i = 0; i < listed.length; i++) {
+    const origin = normalizeOrigin(listed[i]);
+    if (origin && allowed.indexOf(origin) < 0) allowed.push(origin);
+  }
+  // Where messages for the parent go. Known at once when the browser tells
+  // who the parent is or only one origin is allowed; otherwise it is the
+  // origin of the first message the parent sends (a `hello`).
+  let parentOrigin = '';
+  let parentRefused = false;
+  if (framed && allowed.length > 0) {
+    const ancestors = (win.location as { ancestorOrigins?: { length: number; [index: number]: string } }).ancestorOrigins;
+    if (ancestors && ancestors.length > 0) {
+      const origin = normalizeOrigin(ancestors[0]);
+      if (allowed.indexOf(origin) >= 0) parentOrigin = origin;
+      else parentRefused = true;
+    } else if (allowed.length === 1) {
+      parentOrigin = allowed[0];
+    }
+  }
+
+  // The first channel that exists gets the message. The objects are looked up
+  // on every call because applications may inject them after the page loaded,
+  // and their methods are called in place: some of them need their `this`.
+  const post = (json: string): boolean => {
+    const own = channels.BymOfficeHost;
+    if (own && typeof own.postMessage === 'function') return own.postMessage(json), true;
+    const handlers = channels.webkit && channels.webkit.messageHandlers;
+    if (handlers && handlers.bymoffice && typeof handlers.bymoffice.postMessage === 'function') return handlers.bymoffice.postMessage(json), true;
+    // Before WebView2's own channel: on Windows this plugin runs on top of WebView2.
+    const inApp = channels.flutter_inappwebview;
+    if (inApp && typeof inApp.callHandler === 'function') return inApp.callHandler('bymoffice', json), true;
+    const webview = channels.chrome && channels.chrome.webview;
+    if (webview && typeof webview.postMessage === 'function') return webview.postMessage(json), true;
+    const native = channels.ReactNativeWebView;
+    if (native && typeof native.postMessage === 'function') return native.postMessage(json), true;
+    if (framed && parentOrigin) return win.parent.postMessage(json, parentOrigin), true;
+    return false;
+  };
+
+  const fetchBytes =
+    typeof win.fetch === 'function'
+      ? (url: string, limits: { signal?: AbortSignal; maxBytes: number }) =>
+          win.fetch(url, limits.signal ? { signal: limits.signal } : undefined).then((response) => readLimited(response, limits.maxBytes))
+      : undefined;
+
+  const bridge = createBridge({
+    container: options.container,
+    open: options.open,
+    createView: options.createView,
+    version: options.version,
+    post,
+    baseUrl: win.location.href,
+    // A framed page would fetch with its own origin's cookies for whoever embeds it.
+    allowUrl: !framed,
+    fetchBytes,
+    onState: options.onState,
+    onLocale: options.onLocale,
+    frame: typeof win.requestAnimationFrame === 'function' ? (callback) => void win.requestAnimationFrame(callback) : undefined,
+    timer: (callback, ms) => void win.setTimeout(callback, ms),
+  });
+
+  // Nothing is returned to the caller: some WebViews report an error when the
+  // evaluated script yields a value they cannot pass on, such as a promise.
+  const entry = {
+    receive(message: unknown) {
+      void bridge.receive(message);
+    },
+    version: options.version,
+  };
+  channels.BymOfficeBridge = entry;
+
+  // Only an allowed embedding page may talk to a framed editor; a top-level page takes no window messages at all.
+  const onWindowMessage = (event: MessageEvent) => {
+    if (!framed || parentRefused || event.source !== win.parent) return;
+    const origin = normalizeOrigin(event.origin);
+    if (!origin || allowed.indexOf(origin) < 0) return;
+    if (parentOrigin && origin !== parentOrigin) return;
+    parentOrigin = origin;
+    void bridge.receive(event.data);
+  };
+  win.addEventListener('message', onWindowMessage);
+  // WebView2 delivers the application's messages on its own object, not on the window.
+  const webview = channels.chrome && channels.chrome.webview;
+  const onWebViewMessage = (event: { data: unknown }) => void bridge.receive(event.data);
+  if (webview && typeof webview.addEventListener === 'function') webview.addEventListener('message', onWebViewMessage);
+
+  bridge.start();
+  return {
+    start: bridge.start,
+    receive: bridge.receive,
+    destroy() {
+      bridge.destroy();
+      win.removeEventListener('message', onWindowMessage);
+      if (webview && typeof webview.removeEventListener === 'function') webview.removeEventListener('message', onWebViewMessage);
+      if (channels.BymOfficeBridge === entry) delete channels.BymOfficeBridge;
+    },
+  };
+}
