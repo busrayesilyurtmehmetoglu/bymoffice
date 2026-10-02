@@ -30,16 +30,20 @@ export { NumberingCounters } from './formats/docx/numbering';
 export { resolveNumberRunProps, resolveParaProps, resolveRunProps } from './formats/docx/resolve';
 export { CalcEngine, type CalcEngineOptions } from './calc/engine';
 export { ConditionalFormats, type CellConditional, type ConditionalSource } from './format/conditional';
+export { DataValidations, MAX_LIST_ITEMS, ValidationError, type ValidationList, type ValidationOptions, type ValidationVerdict } from './format/validation';
 export { FormulaParseError, parseFormula } from './calc/parse';
 export { FUNCTIONS } from './calc/functions/index';
 export { calcError, isError, type CalcError, type ErrorCode, type Scalar, type Value } from './calc/values';
 export { writeXlsx } from './formats/xlsx/write';
 export { History, applyOp, ensureCellFormat, ensureNumberFormat, type CellChange, type Op } from './ops/ops';
 export { clearRange, copyRange, editTextAt, pasteAt, setCellInput, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
+export { MAX_FILTER_VALUES, clearFilter, filterSummary, filterValues, setAutoFilter, setFilterColumn, type FilterCriterion, type FilterValue, type FilterValueList } from './ops/filter';
+export { collationKey, currentRegion, sortRange, type SortKey, type SortOptions } from './ops/sort';
 export { parseCellInput, cellEditText, type ParsedInput, type InputOptions } from './edit/input';
+export { formulaFromLocal, formulaToLocal } from './edit/formula-locale';
 export { parseTsv, toTsv } from './edit/clipboard';
 export { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from './calc/refs';
-export { DEFAULT_GRID_THEME, renderGrid, type GridScene, type GridSelection, type GridTheme } from './render/grid';
+export { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridScene, type GridSelection, type GridTheme } from './render/grid';
 export { cellText, formatGeneral } from './render/cell-text';
 export { cellDisplayText, formatCell, isoToSerial } from './format/cell-format';
 export { LOCALE_EN, LOCALE_TR, getLocale, normalizeLocale, type FormatLocale } from './format/locale';
@@ -89,6 +93,14 @@ export interface OfficeFile {
 /** The input is not a Word or Excel file this engine can open. */
 export class UnsupportedFileError extends Error {
   override name = 'UnsupportedFileError';
+}
+
+/** "{\\rtf" at the start, after a byte order mark and white space some writers put before it. */
+function isRtf(bytes: Uint8Array): boolean {
+  let at = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+  const end = Math.min(bytes.length, at + 64);
+  while (at < end && (bytes[at] === 0x20 || bytes[at] === 0x09 || bytes[at] === 0x0a || bytes[at] === 0x0d)) at++;
+  return bytes[at] === 0x7b && bytes[at + 1] === 0x5c && bytes[at + 2] === 0x72 && bytes[at + 3] === 0x74 && bytes[at + 4] === 0x66;
 }
 
 const notASpreadsheet = (): Promise<Workbook> =>
@@ -166,7 +178,7 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
   }
 
   // "{\rtf": Word documents are often RTF saved with a .doc extension.
-  if (bytes[0] === 0x7b && bytes[1] === 0x5c && bytes[2] === 0x72 && bytes[3] === 0x74 && bytes[4] === 0x66) {
+  if (isRtf(bytes)) {
     let model: Promise<DocModel> | undefined;
     // Nothing writes RTF and nothing can be changed, so saving returns the original bytes.
     return {

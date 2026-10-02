@@ -39,12 +39,12 @@ Yalnız değiştirilen parçalar yeniden üretilir. Her yeni özellik `pnpm corp
 ## Durum
 
 - [x] Aşama 0: ZIP, XML, OPC (docx/xlsx kapsayıcısı), CFB okuyucu (doc/xls kapsayıcısı), biçim algılama, gidiş-dönüş denetimi
-- [ ] Aşama 1: xlsx tablo modeli (okuma tamam), Canvas ızgara, hücre düzenleme
-- [ ] Aşama 2: formül motoru, biçimler
-- [ ] Aşama 3: docx belge modeli, sayfa düzeni motoru
+- [x] Aşama 1: xlsx tablo modeli, Canvas ızgara, hücre düzenleme, kayıpsız xlsx yazma, editör arayüzü, WebView köprüsü
+- [ ] Aşama 2: formül motoru (225 fonksiyon), biçimlendirme, koşullu biçim gösterimi tamam; süzgeç, sıralama, veri doğrulama sürüyor
+- [x] Aşama 3: docx belge modeli, sayfa düzeni motoru, salt okunur belge görünümü
 - [ ] Aşama 4: Word düzenleme
-- [ ] Aşama 5: xls (BIFF8), doc (Word Binary) ve RTF okuyucuları; CFB yazıcı
-- [ ] Aşama 6: grafikler, pivot, koşullu biçim, PDF çıktısı
+- [ ] Aşama 5: xls (BIFF8), doc (Word 97–2003) ve RTF okuyucuları tamam (salt okunur); bu biçimlere yazma yok
+- [ ] Aşama 6: grafikler, pivot, PDF çıktısı
 - [ ] Aşama 7: eşzamanlı düzenleme
 
-Bilinen eksikler: parola korumalı dosyalar, RTF, doc/xls yazma.
+Bilinen eksikler: parola korumalı dosyalar; docx, doc, RTF ve xls düzenleme (salt okunur açılırlar). Ayrıntı: `docs/kullanim-kilavuzu.md`.

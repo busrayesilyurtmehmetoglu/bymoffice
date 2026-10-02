@@ -30,7 +30,8 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 |---|---|
 | Formüllerde: dinamik dizi taşması, `LET`/`LAMBDA`, tablo başvuruları (`Tablo[Sütun]`), başka dosyaya ve 3B (`Sayfa1:Sayfa3!A1`) başvurular, `;` ile argüman ayırma | Yok. Böyle bir formül içeren hücre dosyadaki son değerini korur ya da `#REF!`/`#NAME?` verir; formül metni kaydederken bozulmaz |
 | Tablo ya da form denetimi içeren sayfalarda, ve içinde grafik ya da pivot tablo bulunan çalışma kitaplarında satır/sütun ekleme-silme | Reddedilir (bu içeriklerin başvuruları henüz kaydırılmıyor; sessizce bozulmasınlar diye); hücre düzenleme ve biçimlendirme serbesttir. Resim ve yorum içeren sayfalarda serbesttir |
-| Sayfa ekleme, silme, yeniden adlandırma; yazı tipi adı seçimi; dikey hizalama düğmeleri; koşullu biçim, veri doğrulama ve süzgeç düzenleme | Yok |
+| Sayfa ekleme, silme, yeniden adlandırma; yazı tipi adı seçimi; dikey hizalama düğmeleri; koşullu biçim ve veri doğrulama KURALI ekleme/değiştirme | Yok |
+| Renge ve ikona göre süzme, tablo içi süzgeç, yorumlu ya da tablolu sayfada sıralama, `SUBTOTAL`'ın süzgeçle gizlenen satırları ayırması, uyarı türü doğrulamada onay penceresi, Türkçe hata adları (`#YOK`) | Yok. Uygulanamayan süzgeç ölçütleri dosyada korunur |
 | Koşullu biçimde: kural ekleme/değiştirme arayüzü, Excel'in özgün ikon görselleri (basit vektör ikonlar çizilir), kuraldaki yazı tipi adı/boyutu ve desenli/gradyan dolgu | Yok. `calculate: false` iken formüllü kurallar uygulanmaz |
 | Word 95 ve öncesi, parola korumalı doc | Yok; `UnsupportedFileError` |
 | RTF'te matematik, çerçeve yerleşimi, şekil dolgu/çizgileri, eski `\pn` listeleri, tablo stilleri, Uzak Doğu kod sayfaları; RTF'e yazma | Yok. RTF salt okunur açılır, `save()` özgün baytları verir |
@@ -41,9 +42,9 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | `onSave` seçeneği; arayüz metinlerinin Türkçesi | Yok (görev 1.6); menü ve ekran okuyucu metinleri şimdilik İngilizce |
 | Sayı biçimlerinde: Türkçe ve İngilizce dışındaki diller, `*` ile doldurma, `_` boşluğunun gerçek genişliği, Hicri/Japon takvimleri, `[DBNum]` | Yok; `*` hiçbir şey yazmaz, `_x` tek boşluk olur |
 | Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx için yalnız okuma modeli var (`file.document()`); düzenleme ve modelden yazma yok |
-| Koşullu biçim, veri doğrulama, grafik, görsel | Modelde yok; dosyada korunur |
 | doc/xls yazma | Yok; `save()` özgün baytları döndürür |
-| RTF, parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
+| Parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
+| Excel'de grafik, görsel, pivot tablo gösterimi | Yok; dosyada korunur |
 | npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
 | 4 GB ve üzeri arşiv yazma | Yok |
 
@@ -186,6 +187,8 @@ Kullanıcı etkileşimi:
 - **Dokunma:** dokun (seç), sürükle (kaydır; atalet tarayıcınındır).
 - **Düzenleme:** hücreye yazmaya başlayın (içerik değişir), F2'ye basın ya da çift tıklayın/çift dokunun (mevcut içerik düzenlenir). Enter yazar ve aşağı iner, Shift+Enter yukarı çıkar, Tab sağa, Shift+Tab sola gider, Esc vazgeçer, Alt+Enter satır sonu ekler. Delete ya da Backspace seçili aralığı temizler. Ctrl/Cmd+Z geri alır, Ctrl+Y ya da Ctrl/Cmd+Shift+Z yineler. Ctrl/Cmd+C, X, V kopyalar, keser, yapıştırır.
 - **Biçimlendirme:** araç çubuğu ya da Ctrl/Cmd+B, I, U.
+- **Sıralama ve süzgeç:** araç çubuğundaki A→Z, Z→A ve Süzgeç düğmeleri. Tek hücre seçiliyken çevresindeki dolu bölge alınır, ilk satır başlık sayılır. Süzgeç açıkken başlık hücrelerindeki düğme (ya da Alt+Aşağı ok) menüyü açar: sırala, ara, değerleri seç, süzgeci temizle. Durum çubuğu "N kayıttan M tanesi" gösterir. Sıralama satırları formülleri ve biçimleriyle taşır (satır yükseklikleri taşınmaz); birleşik hücre, çok hücreli dizi formülü içeren aralık ve yorumlu/tablolu sayfa sıralanmaz. Kaydederken değişmeyen süzgeç bayt bayt korunur; değişen süzgeç Excel'in beklediği biçimde yazılır. API: `view.sort(descending)`, `view.toggleFilter()`, `view.setColumnFilter(col, choice)`.
+- **Veri doğrulama:** dosyadaki kurallar uygulanır. "Dur" türündeki kurala uymayan değer yazılamaz ve kuralın iletisi gösterilir; "uyarı" ve "bilgi" türünde değer yazılır ve bildirim verilir. Liste kurallı hücrede açılır ok (Alt+Aşağı ok) değerleri gösterir; hücre seçilince giriş iletisi balonda görünür. Yapıştırma doğrulanmaz (Excel de doğrulamaz). Kural ekleme/değiştirme arayüzü yoktur.
 - **Sağ tık menüsü** (dokunmatikte uzun basma): kes, kopyala, yapıştır, içeriği temizle, satır/sütun ekle-sil. Menüden "Yapıştır" tarayıcı izni ister ve her zaman düz metin yapıştırır; biçim ve formülleriyle yapıştırmak için Ctrl/Cmd+V kullanın.
 - **Boyutlandırma:** sütun ya da satır başlığının kenarını sürükleyin (Esc vazgeçer); kenara çift tıklamak sütunu içeriğine sığdırır. Sıfıra sürüklemek gizler.
 - **Satır ve sütun:** satır ya da sütun başlığına sağ tıklayın (dokunmatikte uzun basın); açılan menüden ekleyin ya da silin. Tam satır ya da sütun seçiliyken Ctrl/Cmd+`+` ekler, Ctrl/Cmd+`-` siler.
@@ -268,8 +271,9 @@ engine.evaluateText('SUM(A1:A3)*2', { sheet: 0, row: 0, col: 0 });   // saklamad
 Editör bunu kendisi yapar: her düzenlemeden, geri al ve yineleden sonra değişen hücrelere bağlı formüller yeniden hesaplanır. Kendi kodunuzda modeli doğrudan değiştirirseniz `recalculate` çağırmak size kalır; satır/sütun eklenip silindiyse önce `engine.invalidate()`.
 
 - **Fonksiyonlar** (`BymOffice.FUNCTIONS` kayıt haritası): matematik (SUM, SUMIF(S), SUMPRODUCT, ROUND ailesi, MOD, …), istatistik (AVERAGE, COUNT ailesi, MIN/MAX, MEDIAN, STDEV, PERCENTILE, RANK, …), mantıksal (IF, IFS, IFERROR, AND, OR, SWITCH, CHOOSE), metin (CONCAT, TEXTJOIN, LEFT/MID/RIGHT, FIND/SEARCH, SUBSTITUTE, TEXT, VALUE, …), tarih (DATE, TODAY, EDATE, EOMONTH, DATEDIF, NETWORKDAYS, WORKDAY, WEEKNUM, …), arama (VLOOKUP, HLOOKUP, XLOOKUP, MATCH, INDEX, OFFSET, INDIRECT, …), bilgi (ISNUMBER, ISERROR, …), finans (PMT, FV, PV, RATE, NPV, IRR, …).
-- Formüller Excel'in İngilizce fonksiyon adlarıyla ve `,` argüman ayırıcısıyla yazılır (dosyada da böyle saklanır): `=IF(A1>5,"büyük","küçük")`. Türkçe fonksiyon adları ve `;` ayırıcı henüz desteklenmez.
-- Okunamayan formül (`=1+`, `=SUM(A1;A2)`) yazılamaz: editör açık kalır ve nedenini söyler (`onNotice`); `setCellInput` `RangeError` fırlatır.
+- Formüller dosyada ve modelde Excel'in İngilizce fonksiyon adları, `,` argüman ayırıcısı ve `.` ondalık ayırıcısıyla saklanır. **Türkçe yerel ayarda** (ve ondalık ayırıcısı virgül olan diğer yerellerde) kullanıcı Türkçe Excel'deki gibi yazar: `=EĞER(A1>5;1,5;0)`; argümanlar `;` ile, ondalıklar `,` ile. Yaklaşık 85 Türkçe fonksiyon adı (TOPLA, EĞER, DÜŞEYARA, ORTALAMA…) girişte tanınır; formül çubuğu adı İngilizce, ayırıcıları yerel gösterir (`=IF(A1>5;1,5;0)`). Dikkat: Türkçe yerelde rakamlar arasındaki virgül ondalıktır, yani `=IF(A1>5,1,0)` Türkçe Excel'deki gibi yanlış okunur; `;` kullanın. İngilizce yerelde davranış değişmez. Çeviri: `BymOffice.formulaFromLocal(text, locale)` / `formulaToLocal`.
+- Okunamayan formül (`=1+`) yazılamaz: editör açık kalır ve nedenini söyler (`onNotice`); `setCellInput` `RangeError` fırlatır. Dışarıdan yapıştırılan okunamayan formül metin olarak kalır.
+- **Formül işaretleri:** hücrenin sol üst köşesindeki üçgen, formülün burada hesaplanamadığını söyler: turuncu = dosyadaki son değer gösteriliyor (desteklenmeyen fonksiyon vb.), kırmızı = döngüsel başvuru, gri = hesap sürüyor ya da değer eski. Hücre seçilince durum çubuğu nedenini yazar.
 - Dosyadaki değerlere güvenilir: açılışta tüm kitap yeniden hesaplanmaz, yalnız değişikliklerden etkilenen formüller hesaplanır. Sonucu hiç olmayan formüller (hesaplama yapmayan kitaplıkların yazdığı dosyalar) açılışta bir kez hesaplanır (`engine.uncalculated()`).
 - Girdisi değişmediği halde bizim sonucumuz dosyadakinden farklı çıkan formülde dosyadaki değer kalır (`engine.mismatched`): Excel'in bildiği bir şeyi bilmiyoruz demektir (ör. Türkçe biçim kodlu `TEXT`). Satır/sütun eklenip silindikten sonra ise tüm sonuçlar yeniden hesaplanıp yazılır (`recalculate(undefined, { overwrite: true })`).
 - Süre bütçesini tek başına aşan formül sert sınıra (`budget.hardMilliseconds`) kadar denenir; onu da aşarsa kendisi ve ona bağlı olanlar `engine.stale` listesine girer. Koşullu biçim gibi çok sayıda küçük hesap için `engine.batch(() => …)` ve `engine.evaluateShifted(text, anchor, at)` vardır.
@@ -330,7 +334,7 @@ interface OfficeFile {
 
 Hatalar:
 
-- `UnsupportedFileError`: girdi Word/Excel dosyası değil ya da henüz desteklenmeyen bir tür (RTF, parola korumalı).
+- `UnsupportedFileError`: girdi Word/Excel dosyası değil ya da henüz desteklenmeyen bir tür (parola korumalı, Word 95 ve öncesi).
 - `Error`: dosya bozuk (iletisi `Corrupt ZIP archive: …`, `Corrupt ZIP entry …` vb. ile başlar).
 
 ### Tablo modeli: `file.workbook()`

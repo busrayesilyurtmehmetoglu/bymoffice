@@ -122,3 +122,15 @@ test('open: format is detected from content', async () => {
 
   await assert.rejects(open(utf8('just some text')), UnsupportedFileError);
 });
+
+test('open(): RTF is recognised after a byte order mark and white space', async () => {
+  const text = '{\\rtf1\\ansi Hello\\par}';
+  const plain = new TextEncoder().encode(text);
+  const marked = new Uint8Array([0xef, 0xbb, 0xbf, 0x0d, 0x0a, 0x20, ...plain]);
+  for (const bytes of [plain, marked]) {
+    const file = await open(bytes);
+    assert.equal(file.format, 'rtf');
+    assert.equal((await file.document!()).body.blocks.length, 1);
+    assert.deepEqual(await file.save(), bytes);
+  }
+});
