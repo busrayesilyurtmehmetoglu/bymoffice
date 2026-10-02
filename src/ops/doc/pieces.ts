@@ -5,8 +5,25 @@
 // object it was and joining neighbours that are formatted alike.
 
 import { isLiveField, parseFieldCode } from '../../layout/doc/symbols';
-import { EMPTY_RUN_PROPS, type AttrList, type Inline, type Paragraph, type Run, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
-import { itemLength, itemsLength, snapOffset } from './position';
+import {
+  EMPTY_RUN_PROPS,
+  type AttrList,
+  type Block,
+  type ExtraXml,
+  type Inline,
+  type MiscXml,
+  type Paragraph,
+  type RangeMark,
+  type Run,
+  type RunItem,
+  type RunProps,
+  type Table,
+  type TableRow,
+  type Wrapper,
+} from '../../model/doc/types';
+import { ATOM_ITEMS, itemLength, itemsLength, snapOffset } from './position';
+
+export const READ_ONLY = 'This part of the document cannot be edited';
 
 export interface Piece {
   /** An item of a run; `props`, `group`, `index` and `code` describe the run it is in. */
@@ -143,7 +160,8 @@ function passable(piece: Piece): boolean {
 
 /**
  * How an offset becomes a place between two pieces:
- *   "caret"  after what has no width at the offset, but not into a field or marked range;
+ *   "caret"  after what has no width at the offset, but not into a field or marked range
+ *            (and, with `beforeAtoms`, not past what shows without width: a picture, a note reference);
  *   "start"  the same, for the start of a range: inside a unit that cannot be cut it is the start of the unit;
  *   "after"  directly after the character before the offset;
  *   "before" directly before the character at the offset.
@@ -154,9 +172,10 @@ export type BoundaryMode = 'caret' | 'start' | 'after' | 'before';
  * The index of the piece an offset falls before. A text piece the offset is
  * inside of is cut in two (the list changes, the offsets of its pieces do
  * not). An offset inside a unit that cannot be cut moves to its end, or to
- * its start for "start" and "before".
+ * its start for "start" and "before". `beforeAtoms` is DocPosition.before:
+ * it matters for "caret" and "start" only.
  */
-export function boundary(pieces: Piece[], offset: number, mode: BoundaryMode): number {
+export function boundary(pieces: Piece[], offset: number, mode: BoundaryMode, beforeAtoms = false): number {
   let acc = 0;
   let k = 0;
   for (; k < pieces.length; k++) {
@@ -185,7 +204,7 @@ export function boundary(pieces: Piece[], offset: number, mode: BoundaryMode): n
     else if (mode === 'before') i = k;
     else {
       i = first;
-      while (i < k && passable(pieces[i])) i++;
+      while (i < k && passable(pieces[i]) && !(beforeAtoms && isAtom(pieces[i]))) i++;
     }
   }
   if (i > 0 && i < pieces.length && pieces[i - 1].lock !== undefined && pieces[i - 1].lock === pieces[i].lock) {
@@ -194,6 +213,18 @@ export function boundary(pieces: Piece[], offset: number, mode: BoundaryMode): n
     else while (i < pieces.length && pieces[i].lock === lock) i++;
   }
   return i;
+}
+
+/** Where a caret at a position stands among the pieces. */
+export const caretIndex = (pieces: Piece[], position: { offset: number; before?: true }): number => boundary(pieces, position.offset, 'caret', position.before === true);
+
+/** Where a range that starts at a position begins among the pieces. */
+export const startIndex = (pieces: Piece[], position: { offset: number; before?: true }): number => boundary(pieces, position.offset, 'start', position.before === true);
+
+/** Does something that shows without width stand between the piece at `index` and the next piece with width. */
+export function atomFollows(pieces: Piece[], index: number): boolean {
+  for (let i = index; i < pieces.length && pieces[i].len === 0; i++) if (isAtom(pieces[i])) return true;
+  return false;
 }
 
 /** The offset at which the piece at `index` begins. */
@@ -230,8 +261,20 @@ export function isRemovable(piece: Piece): boolean {
   return REMOVABLE.has((piece.item as RunItem).type);
 }
 
-/** Without width, and taken by a deletion as a unit of its own: a drawing, a note reference. */
-export const isAtom = (piece: Piece): boolean => piece.len === 0 && isRemovable(piece);
+/**
+ * Shows, but without width in the offsets, and so is taken by Backspace and
+ * Delete as a unit of its own: a drawing, a note reference. A soft hyphen and
+ * the hints of the last layout are not: they do not show.
+ */
+export const isAtom = (piece: Piece): boolean => piece.len === 0 && piece.item !== undefined && !piece.frozen && !piece.code && ATOM_ITEMS.has(piece.item.type);
+
+/**
+ * A hint an earlier layout or spelling check left behind (where a page broke,
+ * where a misspelt word began): stale once the text beside it changes, so
+ * Backspace and Delete drop the ones they pass.
+ */
+export const isStaleHint = (piece: Piece): boolean =>
+  !piece.frozen && (piece.item !== undefined ? !piece.code && piece.item.type === 'lastRenderedPageBreak' : (piece.inline as Inline).type === 'proofError');
 
 /** Part of the skeleton of a field: its marks and its code. */
 const isStructural = (piece: Piece): boolean => piece.item !== undefined && (piece.code || piece.item.type === 'fieldChar' || piece.item.type === 'instrText');
@@ -385,15 +428,48 @@ export function markRunProps(mark: RunProps | undefined): RunProps {
   return Object.keys(out).length ? out : EMPTY_RUN_PROPS;
 }
 
+/** Wrappers whose formatting belongs to what they hold: text typed beside them does not take it over. */
+const isContainer = (w: Wrapper): boolean => w.kind === 'hyperlink' || w.kind === 'simpleField' || w.kind === 'sdt';
+
 /**
  * Formatting text typed before the piece at `index` takes: that of the text
  * to its left (Word's rule at the border between two runs), of the text to
  * its right at the start of the paragraph, of the paragraph mark in an empty
  * paragraph.
+ *
+ * Text in a hyperlink, a content control or the result of a field hands its
+ * formatting on only to what is typed inside the same: after a link the text
+ * is formatted like the last text before the link, and like the paragraph
+ * mark when there is none (so the blue and the underline end with the link).
  */
 export function inheritedProps(pieces: Piece[], index: number, mark: RunProps | undefined): RunProps {
-  for (let i = index - 1; i >= 0; i--) if (pieces[i].item && pieces[i].len > 0 && !pieces[i].frozen) return pieces[i].props;
-  for (let i = index; i < pieces.length; i++) if (pieces[i].item && pieces[i].len > 0 && !pieces[i].frozen) return pieces[i].props;
+  const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+  const around = new Set<Wrapper>();
+  for (let w = wrap; w; w = w.parent) around.add(w);
+  let fields: { pairs: FieldPair[]; owner: number[] } | undefined;
+  /** Is the piece in a container the new text is not in. */
+  const apart = (i: number): boolean => {
+    for (let w = pieces[i].wrap; w; w = w.parent) if (isContainer(w) && !around.has(w)) return true;
+    if (!fields) fields = fieldPairs(pieces);
+    const owner = fields.owner[i];
+    if (owner < 0) return false;
+    const pair = fields.pairs[owner];
+    return !(pair.begin < index && (pair.end < 0 || index <= pair.end));
+  };
+  const text = (piece: Piece): boolean => piece.item !== undefined && piece.len > 0 && !piece.frozen;
+  let passed = false;
+  for (let i = index - 1; i >= 0; i--) {
+    if (!text(pieces[i])) continue;
+    if (!apart(i)) return pieces[i].props;
+    passed = true;
+  }
+  if (!passed) {
+    for (let i = index; i < pieces.length; i++) {
+      if (!text(pieces[i])) continue;
+      if (apart(i)) break;
+      return pieces[i].props;
+    }
+  }
   return markRunProps(mark);
 }
 
@@ -527,4 +603,108 @@ export function sameInlines(a: Inline[], b: Inline[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+// ------------------------------------------------------- what a deletion leaves
+
+const RANGE_MARK_NAMES = new Set<string>([
+  'bookmarkStart',
+  'bookmarkEnd',
+  'commentRangeStart',
+  'commentRangeEnd',
+  'moveFromRangeStart',
+  'moveFromRangeEnd',
+  'moveToRangeStart',
+  'moveToRangeEnd',
+  'permStart',
+  'permEnd',
+]);
+
+const localName = (name: string): string => name.slice(name.indexOf(':') + 1);
+
+const loosePiece = (inline: Inline): Piece => ({ inline, props: EMPTY_RUN_PROPS, group: inline, index: -1, code: false, len: 0 });
+
+/**
+ * A range mark that was kept as a child of a table or a row (a bookmark
+ * between two rows), as the mark it is. Other kept children of a table belong
+ * to its structure and go with it.
+ */
+function looseMark(extra: ExtraXml): Inline | undefined {
+  const el = extra.el;
+  const type = localName(el.name);
+  if (extra.partial || extra.index < 0 || !RANGE_MARK_NAMES.has(type)) return undefined;
+  let id: string | undefined;
+  let name: string | undefined;
+  let attrs: AttrList | undefined;
+  el.attrs.forEach((value, key) => {
+    const local = localName(key);
+    if (local === 'id' && id === undefined) id = value;
+    else if (local === 'name' && name === undefined) name = value;
+    else (attrs || (attrs = [])).push([key, value]);
+  });
+  if (id === undefined || el.children.length) return { type: 'unknown', xml: el };
+  const mark: RangeMark = { type: type as RangeMark['type'], id };
+  if (name !== undefined) mark.name = name;
+  if (attrs) mark.attrs = attrs;
+  return mark;
+}
+
+/** What blocks leave behind when they are removed: the pieces of their paragraphs, and the blocks that are not content. */
+export interface Harvest {
+  pieces: Piece[];
+  blocks: Block[];
+}
+
+function harvestLoose(extras: ExtraXml[] | undefined, misc: MiscXml[] | undefined, into: Harvest): void {
+  if (extras) {
+    for (const extra of extras) {
+      const mark = looseMark(extra);
+      if (mark) into.pieces.push(loosePiece(mark));
+    }
+  }
+  if (misc) for (const note of misc) into.pieces.push(loosePiece({ type: 'misc', node: note.node }));
+}
+
+function refuseAlternate(wrap: Wrapper | undefined): void {
+  if (wrap && chainHas(wrap, isAlternate)) throw new RangeError(READ_ONLY);
+}
+
+/** Adds what a row of a table leaves behind. */
+export function harvestRow(row: TableRow, into: Harvest, depth = 0): void {
+  refuseAlternate(row.wrap);
+  harvestLoose(row.extras, row.misc, into);
+  for (const cell of row.cells) {
+    refuseAlternate(cell.wrap);
+    harvestBlocks(cell.blocks, into, depth + 1);
+  }
+}
+
+/** Adds what a table leaves behind. */
+export function harvestTable(table: Table, into: Harvest, depth = 0): void {
+  refuseAlternate(table.wrap);
+  harvestLoose(table.extras, table.misc, into);
+  for (const row of table.rows) harvestRow(row, into, depth);
+}
+
+/**
+ * Adds what blocks leave behind when they are removed. Throws RangeError for
+ * content that is written back whole (mc:AlternateContent) and so cannot be
+ * taken apart.
+ */
+export function harvestBlocks(blocks: Block[], into: Harvest, depth = 0): void {
+  // Tables nest as deep as the reader lets them, which is far less than this.
+  if (depth > 256) throw new RangeError('The tables are nested too deep');
+  for (const block of blocks) {
+    refuseAlternate(block.wrap);
+    if (block.type === 'paragraph') {
+      const pieces = flatten(block);
+      for (let i = 0; i < pieces.length; i++) into.pieces.push(pieces[i]);
+    } else if (block.type === 'table') harvestTable(block, into, depth + 1);
+    else into.blocks.push(block);
+  }
+}
+
+/** The inlines that stay of harvested pieces once all their content is removed: marks of ranges, comment marks, kept XML, tracked deletions. */
+export function leftInlines(pieces: Piece[]): Inline[] {
+  return rebuild(removePieces(pieces, 0, pieces.length));
 }

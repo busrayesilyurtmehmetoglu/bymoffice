@@ -6,28 +6,37 @@ import { paragraphText, EMPTY_PARA_PROPS, type Block, type CellProps, type DocMo
 import { buildEdit, tableContextOf, type DocEdit, type DocEditOptions, type Draft } from './draft';
 import { inList, patchRunProps, withoutNumbering, type RunFormatPatch } from './format';
 import {
+  atomFollows,
   boundary,
+  caretIndex,
   cleanText,
   flatten,
   groupFor,
+  harvestBlocks,
+  harvestTable,
   inheritedProps,
   isAtom,
+  isStaleHint,
   itemPiece,
   offsetOf,
   paragraphWith,
   rebuild,
   removePieces,
+  startIndex,
   textPieces,
   wrapBetween,
+  type Harvest,
   type Piece,
 } from './pieces';
 import {
   asRange,
   comparePositions,
   containerBlocks,
+  hasAtomAt,
   inTextBox,
   nextCharOffset,
   nextWordOffset,
+  orderRange,
   paragraphIn,
   paragraphLength,
   previousCharOffset,
@@ -41,6 +50,12 @@ import {
 const bad = (message: string): never => {
   throw new RangeError(message);
 };
+
+/** A position as the caret a command leaves: before what has no width at its offset when the position the command was given was (`before`) and something of the kind is there now. */
+function sided(doc: DocModel, position: DocPosition, before: boolean): DocPosition {
+  if (!before) return position;
+  return hasAtomAt(resolvePosition(doc, position).paragraph, position.offset) ? { ...position, before: true } : position;
+}
 
 /** Paragraph properties without the section break: of the two halves of a paragraph only the second ends the section. */
 function withoutSection(props: ParaProps): ParaProps {
@@ -65,18 +80,31 @@ function joinedProps(first: Paragraph, last: Paragraph): ParaProps {
   return section === undefined ? base : { ...base, section };
 }
 
-/** The first paragraph of a cell, emptied: what a cleared cell holds. */
+/**
+ * What a cleared cell holds: one paragraph, formatted like the first one the
+ * cell had, with everything of the cell that is not content in it (marks of
+ * bookmarks and comments, comment references, kept XML, tracked deletions,
+ * from the tables inside the cell too), after the blocks of the cell that
+ * are not content (marks and comments between its paragraphs). Undefined
+ * when the cell is like that already.
+ */
 function clearedBlocks(cell: TableCell): Block[] | undefined {
   let first: Paragraph | undefined;
+  let paragraphs = 0;
+  let tables = 0;
   for (const block of cell.blocks) {
     if (block.type === 'paragraph') {
-      first = block;
-      break;
-    }
+      if (!first) first = block;
+      paragraphs++;
+    } else if (block.type === 'table') tables++;
   }
-  if (first && cell.blocks.length === 1 && first.children.length === 0) return undefined;
-  const paragraph: Paragraph = { type: 'paragraph', props: first ? withoutSection(first.props) : EMPTY_PARA_PROPS, children: [] };
-  return [paragraph];
+  const harvest: Harvest = { pieces: [], blocks: [] };
+  harvestBlocks(cell.blocks, harvest);
+  const left = removePieces(harvest.pieces, 0, harvest.pieces.length);
+  if (paragraphs === 1 && tables === 0 && left.length === harvest.pieces.length) return undefined;
+  const paragraph: Paragraph = { type: 'paragraph', props: first ? withoutSection(first.props) : EMPTY_PARA_PROPS, children: rebuild(left) };
+  harvest.blocks.push(paragraph);
+  return harvest.blocks;
 }
 
 /** Grid columns a cell covers, as [start, end). */
@@ -121,6 +149,105 @@ function appendPieces(target: Piece[], pieces: Piece[]): void {
   for (let i = 0; i < pieces.length; i++) target.push(pieces[i]);
 }
 
+const samePath = (a: number[] | undefined, b: number[]): boolean => a !== undefined && a.length === b.length && a.every((value, i) => value === b[i]);
+
+/** Which cells of a table a range between two of its cells takes: all of them from the first to the last in one row, a rectangle of the grid over several rows. */
+function cellsBetween(table: Table, r1: number, c1: number, r2: number, c2: number): (row: number, cell: number) => boolean {
+  if (r1 === r2) return (r, c) => r === r1 && c >= c1 && c <= c2;
+  const first = cellSpan(table.rows[r1], c1);
+  const last = cellSpan(table.rows[r2], c2);
+  const left = Math.min(first[0], last[0]);
+  const right = Math.max(first[1], last[1]);
+  return (r, c) => {
+    if (r < r1 || r > r2) return false;
+    const span = cellSpan(table.rows[r], c);
+    return span[0] < right && span[1] > left;
+  };
+}
+
+/** How far the paths of two positions agree, and the level of blocks at which they part. */
+function parting(start: DocPosition, end: DocPosition): { depth: number; level: number } {
+  let depth = 0;
+  while (depth < start.path.length && depth < end.path.length && start.path[depth] === end.path[depth]) depth++;
+  return { depth, level: depth - (depth % 3) };
+}
+
+/** Start of the first paragraph of a cell; `fallback` when the cell holds none. */
+function cellStart(doc: DocModel, story: string, cell: number[], fallback: DocPosition): DocPosition {
+  const path = paragraphIn(containerBlocks(doc, story, cell), cell, 0, 1);
+  if (!path) return fallback;
+  if (samePath(path, fallback.path) && fallback.offset === 0) return fallback;
+  return hasAtomAt(resolvePosition(doc, { story, path, offset: 0 }).paragraph, 0) ? { story, path, offset: 0, before: true } : { story, path, offset: 0 };
+}
+
+/** End of the last paragraph of a cell. */
+function cellEnd(doc: DocModel, story: string, cell: number[], fallback: DocPosition): DocPosition {
+  const blocks = containerBlocks(doc, story, cell);
+  const path = paragraphIn(blocks, cell, blocks.length - 1, -1);
+  if (!path) return fallback;
+  const offset = resolvePosition(doc, { story, path, offset: 0 }).length;
+  if (samePath(path, fallback.path) && fallback.offset === offset && fallback.before !== true) return fallback;
+  return { story, path, offset };
+}
+
+/**
+ * The range a deletion really covers. A range that crosses the border of a
+ * table takes whole cells, as a selection in Word does: where it begins in a
+ * table and ends outside of it (at that level), it covers the cell it begins
+ * in from its start; where it ends in a table it began outside of, the cell
+ * it ends in to its end; between two cells of one table, both cells whole.
+ * deleteRange and insertText over a range delete exactly this, so an editor
+ * shows this range as the selection. Over several rows of one table the
+ * cells that are emptied are those of the rectangle between the two cells
+ * (by grid column), which a range cannot say: the range returned runs from
+ * the first emptied cell of the first row to the last one of the last row.
+ *
+ * Returns the range itself when nothing changes. Throws RangeError for a
+ * range that is not one of the document.
+ */
+export function expandRangeForTables(doc: DocModel, range: DocRange): DocRange {
+  const at = asRange(range);
+  const { start, end } = orderRange(at);
+  resolvePosition(doc, start);
+  resolvePosition(doc, end);
+  if (inTextBox(start.path) || inTextBox(end.path)) return range;
+  const { depth, level } = parting(start, end);
+  if (depth === start.path.length && depth === end.path.length) return range;
+  const story = start.story;
+  let from = start;
+  let to = end;
+  if (depth % 3 !== 0) {
+    const table = containerBlocks(doc, story, start.path.slice(0, level))[start.path[level]] as Table;
+    const [r1, c1, r2, c2] = [start.path[level + 1], start.path[level + 2], end.path[level + 1], end.path[level + 2]];
+    const takes = cellsBetween(table, r1, c1, r2, c2);
+    let first = c1;
+    let last = c2;
+    if (r1 !== r2) {
+      const top = table.rows[r1].cells.length;
+      first = 0;
+      while (first < top - 1 && !takes(r1, first)) first++;
+      last = table.rows[r2].cells.length - 1;
+      while (last > 0 && !takes(r2, last)) last--;
+    }
+    const base = start.path.slice(0, level + 1);
+    from = cellStart(doc, story, base.concat([r1, first]), start);
+    to = cellEnd(doc, story, base.concat([r2, last]), end);
+  } else {
+    if (start.path.length > level + 1) from = cellStart(doc, story, start.path.slice(0, level + 3), start);
+    if (end.path.length > level + 1) to = cellEnd(doc, story, end.path.slice(0, level + 3), end);
+  }
+  if (from === start && to === end) return range;
+  return start === at.anchor ? { anchor: from, focus: to } : { anchor: to, focus: from };
+}
+
+/** What kind of content block comes next before (step -1) or after (1) a block of a list; blocks without content are passed over. */
+function neighbour(blocks: Block[], index: number, step: 1 | -1): number {
+  for (let i = index + step, tries = 0; i >= 0 && i < blocks.length && tries < 64; i += step, tries++) {
+    if (blocks[i].type === 'paragraph' || blocks[i].type === 'table') return i;
+  }
+  return -1;
+}
+
 /**
  * Removes what lies between two positions (`start` before `end`) and returns
  * where the caret is afterwards.
@@ -129,10 +256,20 @@ function appendPieces(target: Piece[], pieces: Piece[]): void {
  * what is before the range and takes what the last one has after it; the
  * paragraphs and tables in between go. Where the range ends inside a table
  * it began outside of (or the other way round), and between cells of one
- * table, the cells in the range are emptied and the table stays as it is.
- * What is not content (bookmarks, comment marks, kept XML, fields the range
- * only partly covers) is never removed; of removed paragraphs it moves into
- * the paragraph that stays.
+ * table, the cells in the range are emptied, whole (see
+ * expandRangeForTables), and the table stays as it is. A table goes when
+ * the range covers all of it: when it lies between the ends of the range, or
+ * the range begins at its very start and ends after it, or begins before it
+ * and ends at its very end (so "select all, delete" leaves no empty tables).
+ * UNSURE: Word deletes the rows a selection that leaves the table touches;
+ * here they are emptied unless the whole table is in the range.
+ *
+ * What is not content (bookmarks, comment marks and references, kept XML,
+ * tracked deletions, fields the range only partly covers) is never removed:
+ * of removed paragraphs and tables it moves into the paragraph that stays,
+ * of an emptied cell into the paragraph the cell keeps. The list of blocks
+ * always keeps a paragraph where one is needed: after a table at its end,
+ * between two tables, in a list that would be empty.
  */
 export function deleteSpan(draft: Draft, start: DocPosition, end: DocPosition): DocPosition {
   const doc = draft.doc;
@@ -141,41 +278,27 @@ export function deleteSpan(draft: Draft, start: DocPosition, end: DocPosition): 
   const b = resolvePosition(doc, end);
   if (inTextBox(start.path) || inTextBox(end.path)) bad('The content of a text box cannot be edited');
   if (comparePositions(start, end) > 0) bad('The range is the wrong way round');
+  const sideOfStart = start.before === true;
 
-  let depth = 0;
-  while (depth < start.path.length && depth < end.path.length && start.path[depth] === end.path[depth]) depth++;
+  const { depth, level } = parting(start, end);
   if (depth === start.path.length && depth === end.path.length) {
     const pieces = flatten(a.paragraph);
-    const from = boundary(pieces, start.offset, 'start');
-    const to = boundary(pieces, end.offset, 'caret');
+    const from = startIndex(pieces, start);
+    const to = caretIndex(pieces, end);
     const offset = offsetOf(pieces, from);
     if (from < to) {
       const left = removePieces(pieces, from, to);
       if (left.length !== pieces.length) draft.setParagraph(story, start.path, paragraphWith(a.paragraph, rebuild(left)));
     }
-    return { story, path: start.path.slice(), offset };
+    return sided(doc, { story, path: start.path.slice(), offset }, sideOfStart);
   }
 
-  const level = depth - (depth % 3);
   const container = start.path.slice(0, level);
   if (depth % 3 !== 0) {
-    // Two cells of one table: the cells of the rectangle between them are emptied.
+    // Two cells of one table: the cells between them are emptied.
     const blocks = containerBlocks(doc, story, container);
     const table = blocks[start.path[level]] as Table;
-    const [r1, c1, r2, c2] = [start.path[level + 1], start.path[level + 2], end.path[level + 1], end.path[level + 2]];
-    let cleared: Table;
-    if (r1 === r2) cleared = tableCleared(table, (r, c) => r === r1 && c >= c1 && c <= c2);
-    else {
-      const first = cellSpan(table.rows[r1], c1);
-      const last = cellSpan(table.rows[r2], c2);
-      const left = Math.min(first[0], last[0]);
-      const right = Math.max(first[1], last[1]);
-      cleared = tableCleared(table, (r, c) => {
-        if (r < r1 || r > r2) return false;
-        const span = cellSpan(table.rows[r], c);
-        return span[0] < right && span[1] > left;
-      });
-    }
+    const cleared = tableCleared(table, cellsBetween(table, start.path[level + 1], start.path[level + 2], end.path[level + 1], end.path[level + 2]));
     if (cleared !== table) draft.replace(story, container, start.path[level], 1, [cleared]);
     const cell = containerBlocks(doc, story, start.path.slice(0, level + 3));
     const path = paragraphIn(cell, start.path.slice(0, level + 3), 0, 1);
@@ -187,71 +310,111 @@ export function deleteSpan(draft: Draft, start: DocPosition, end: DocPosition): 
   const last = end.path[level];
   const startPara = start.path.length === level + 1 ? a.paragraph : undefined;
   const endPara = end.path.length === level + 1 ? b.paragraph : undefined;
+  const startTable = startPara ? undefined : (blocks[first] as Table);
+  const endTable = endPara ? undefined : (blocks[last] as Table);
+  // A table the range covers from its very first position, or to its very last, goes as a whole.
+  const startGoes = startTable !== undefined && start.offset === 0 && samePath(paragraphIn(blocks, container, first, 1), start.path);
+  const endGoes = endTable !== undefined && end.offset === b.length && samePath(paragraphIn(blocks, container, last, -1), end.path);
 
-  // What stays of the paragraphs in the range, in order, and the blocks without content between them.
-  const pieces: Piece[] = [];
+  // What stays of the paragraphs and tables in the range, in order, and the blocks without content between them.
+  const harvest: Harvest = { pieces: [], blocks: [] };
+  const pieces = harvest.pieces;
+  const kept = harvest.blocks;
   let from = 0;
   let caretOffset = 0;
   if (startPara) {
     appendPieces(pieces, flatten(startPara));
-    from = boundary(pieces, start.offset, 'start');
+    from = startIndex(pieces, start);
     caretOffset = offsetOf(pieces, from);
-  }
-  const kept: Block[] = [];
+  } else if (startGoes) harvestTable(startTable as Table, harvest);
   let middle: Paragraph | undefined;
+  let tableBetween = false;
   for (let i = first + 1; i < last; i++) {
     const block = blocks[i];
     if (block.type === 'paragraph') {
       appendPieces(pieces, flatten(block));
       middle = block;
-    } else if (block.type !== 'table') kept.push(block);
+    } else if (block.type === 'table') {
+      harvestTable(block, harvest);
+      tableBetween = true;
+    } else kept.push(block);
   }
+  if (endGoes) harvestTable(endTable as Table, harvest);
   let to = pieces.length;
   if (endPara) {
     const tail = flatten(endPara);
-    to += boundary(tail, end.offset, 'caret');
+    to += caretIndex(tail, end);
     appendPieces(pieces, tail);
   }
   const children = rebuild(removePieces(pieces, from, to));
 
   const out: Block[] = [];
-  const startTable = startPara ? undefined : (blocks[first] as Table);
-  const endTable = endPara ? undefined : (blocks[last] as Table);
-  let caret: DocPosition = { story, path: start.path.slice(), offset: caretOffset };
-  if (startTable) {
+  /** Index in `out` of the paragraph that takes what stays of the range. */
+  let holder = -1;
+  const startStays = startTable !== undefined && !startGoes;
+  const endStays = endTable !== undefined && !endGoes;
+  if (startStays) {
     const [r1, c1] = [start.path[level + 1], start.path[level + 2]];
-    out.push(tableCleared(startTable, (r, c) => r > r1 || (r === r1 && c >= c1)));
+    out.push(tableCleared(startTable as Table, (r, c) => r > r1 || (r === r1 && c >= c1)));
   }
   if (startPara) {
+    holder = out.length;
     out.push(paragraphWith(startPara, children, endPara ? joinedProps(startPara, endPara) : startPara.props));
     appendBlocks(out, kept);
   } else if (endPara) {
     appendBlocks(out, kept);
+    holder = out.length;
     out.push(paragraphWith(endPara, children, endPara.props));
   } else {
-    // Two tables that end up next to each other would become one: a paragraph that was between them stays, empty.
-    if (middle) out.push(paragraphWith(middle, children, withoutSection(middle.props), false));
+    // From a table to a table. A paragraph that was between them stays, empty; without one, a paragraph is
+    // made where the list would otherwise end with a table, have two tables touch, or hold nothing to stand in.
+    const before = neighbour(blocks, first, -1);
+    const after = neighbour(blocks, last, 1);
+    const tableBefore = before >= 0 && blocks[before].type === 'table';
+    const tableAfter = after >= 0 && blocks[after].type === 'table';
+    let needed: boolean;
+    if (middle || children.length > 0) needed = true;
+    else if (startStays && endStays) needed = tableBetween;
+    else if (startStays) needed = after < 0 || tableAfter;
+    else if (endStays) needed = tableBefore;
+    else needed = after < 0 ? before < 0 || tableBefore : tableBefore && tableAfter;
+    if (needed) {
+      holder = out.length;
+      out.push(middle ? paragraphWith(middle, children, withoutSection(middle.props), false) : { type: 'paragraph', props: EMPTY_PARA_PROPS, children });
+    }
     appendBlocks(out, kept);
   }
-  if (endTable) {
+  if (endStays) {
     const [r2, c2] = [end.path[level + 1], end.path[level + 2]];
-    out.push(tableCleared(endTable, (r, c) => r < r2 || (r === r2 && c <= c2)));
+    out.push(tableCleared(endTable as Table, (r, c) => r < r2 || (r === r2 && c <= c2)));
   }
   draft.replace(story, container, first, last - first + 1, out);
-  if (!startPara) {
+
+  if (startPara) return sided(doc, { story, path: start.path.slice(), offset: caretOffset }, sideOfStart);
+  if (startStays) {
     const cell = start.path.slice(0, level + 3);
     const path = paragraphIn(containerBlocks(doc, story, cell), cell, 0, 1);
-    if (path) caret = { story, path, offset: 0 };
+    return path ? { story, path, offset: 0 } : { story, path: start.path.slice(), offset: 0 };
   }
-  return caret;
+  // The table the range began in is gone: the caret goes to what took its place, or to what follows, or to what is before.
+  if (holder >= 0) return { story, path: container.concat([first + holder]), offset: 0 };
+  const now = containerBlocks(doc, story, container);
+  const next = paragraphIn(now, container, first, 1);
+  if (next) return { story, path: next, offset: 0 };
+  const previous = paragraphIn(now, container, first - 1, -1);
+  if (!previous) return bad('The story holds no paragraph');
+  return { story, path: previous, offset: resolvePosition(doc, { story, path: previous, offset: 0 }).length };
 }
 
-/** Deletes the content of a range. The selection left is a caret where the range began. */
+/**
+ * Deletes the content of a range. The selection left is a caret where the
+ * range began. A range that crosses the border of a table deletes what
+ * expandRangeForTables() returns for it.
+ */
 export function deleteRange(doc: DocModel, range: DocRange, _options?: DocEditOptions): DocEdit {
+  const at = asRange(range);
   return buildEdit(doc, (draft) => {
-    const ordered = comparePositions(range.anchor, range.focus) <= 0;
-    const start = ordered ? range.anchor : range.focus;
-    const end = ordered ? range.focus : range.anchor;
+    const { start, end } = orderRange(at);
     resolvePosition(doc, start);
     resolvePosition(doc, end);
     return samePosition(start, end) ? start : deleteSpan(draft, start, end);
@@ -267,21 +430,22 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
   if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
   const paragraph = at.paragraph;
   const pieces = flatten(paragraph);
-  const index = boundary(pieces, position.offset, 'caret');
+  const index = caretIndex(pieces, position);
   const offset = offsetOf(pieces, index);
   const inherited = inheritedProps(pieces, index, paragraph.props.markProps);
-  const props = format ? patchRunProps(inherited, format) : inherited;
+  const props = format ? patchRunProps(inherited, format, doc) : inherited;
   const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
   const group = groupFor(pieces, index, props, wrap);
   const lines = text.split('\n');
   if (lines.length > MAX_INSERTED_PARAGRAPHS) bad('The text has too many paragraphs');
   const story = position.story;
+  const side = position.before === true;
   const head = pieces.slice(0, index);
   appendPieces(head, textPieces(lines[0], props, wrap, group));
   if (lines.length === 1) {
     for (let i = index; i < pieces.length; i++) head.push(pieces[i]);
     draft.setParagraph(story, position.path, paragraphWith(paragraph, rebuild(head)));
-    return { story, path: position.path.slice(), offset: offset + lines[0].length };
+    return sided(doc, { story, path: position.path.slice(), offset: offset + lines[0].length }, side);
   }
   // Every line but the last ends a paragraph formatted like this one; the section break stays with the last.
   const inner = withoutSection(paragraph.props);
@@ -294,7 +458,7 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
   const container = position.path.slice(0, -1);
   const blockIndex = position.path[position.path.length - 1];
   draft.replace(story, container, blockIndex, 1, out);
-  return { story, path: container.concat([blockIndex + lines.length - 1]), offset: lastLine.length };
+  return sided(doc, { story, path: container.concat([blockIndex + lines.length - 1]), offset: lastLine.length }, side);
 }
 
 /**
@@ -302,37 +466,30 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
  * first). "\n" ends a paragraph, a tab character becomes a tab and a vertical
  * tab ("\v", Shift+Enter) a line break. The text takes the formatting of the
  * text to its left, at the start of a paragraph of the text to its right, in
- * an empty paragraph of the paragraph mark; `format` is laid over that (the
- * "bold is on" of a caret that has no text yet).
+ * an empty paragraph of the paragraph mark (see inheritedProps for what text
+ * beside a hyperlink takes); `format` is laid over that (the "bold is on" of
+ * a caret that has no text yet).
  */
 export function insertText(doc: DocModel, at: DocPosition | DocRange, text: string, format?: RunFormatPatch, _options?: DocEditOptions): DocEdit {
   if (typeof text !== 'string') bad('The text to insert must be a string');
   const range = asRange(at);
   const clean = cleanText(text);
+  const pending = format === null ? undefined : format;
   return buildEdit(doc, (draft) => {
-    const ordered = comparePositions(range.anchor, range.focus) <= 0;
-    const start = ordered ? range.anchor : range.focus;
-    const end = ordered ? range.focus : range.anchor;
+    const { start, end } = orderRange(range);
     resolvePosition(doc, start);
     resolvePosition(doc, end);
+    if (pending !== undefined) patchRunProps({}, pending, doc);
     const typing = samePosition(start, end);
     const caret = typing ? start : deleteSpan(draft, start, end);
     if (clean === '') return caret;
-    const after = insertAt(draft, caret, clean, format);
+    const after = insertAt(draft, caret, clean, pending);
     const selection = { anchor: after, focus: after };
     // One character typed at a caret: joins the characters typed before it into one undo step.
     if (!typing || nextCharOffset(clean, 0) !== clean.length || clean === '\n' || clean === '\t' || clean === '\v') return { selection };
     const space = clean === ' ' || clean === ' ';
     return { selection, mergeKey: 'type:' + start.story + ':' + start.path.join(','), seal: space };
   });
-}
-
-/** The nearest paragraph or table before (step -1) or after (1) a block of a list; blocks without content are passed over. */
-function neighbour(blocks: Block[], index: number, step: 1 | -1): number {
-  for (let i = index + step, tries = 0; i >= 0 && i < blocks.length && tries < 64; i += step, tries++) {
-    if (blocks[i].type === 'paragraph' || blocks[i].type === 'table') return i;
-  }
-  return -1;
 }
 
 /** Joins the paragraph at `second` of a list of blocks onto the one at `first`; what lies between them (marks, kept XML) follows the joined paragraph. */
@@ -348,12 +505,26 @@ function joinParagraphs(draft: Draft, story: string, container: number[], first:
   return { story, path: container.concat([first]), offset: paragraphLength(a) };
 }
 
-/** Removes the pieces [from, to) of a paragraph and returns the caret that leaves. */
-function removeFrom(draft: Draft, position: DocPosition, paragraph: Paragraph, pieces: Piece[], from: number, to: number): DocPosition {
+/**
+ * Removes the pieces [from, to) of a paragraph and returns the caret that
+ * leaves. The pieces of `hints` go too when anything is removed: the stale
+ * hints Backspace or Delete passed on its way to what it takes.
+ */
+function removeFrom(draft: Draft, position: DocPosition, paragraph: Paragraph, pieces: Piece[], from: number, to: number, hints: Set<Piece>): DocPosition {
   const offset = offsetOf(pieces, from);
-  const left = removePieces(pieces, from, to);
-  if (left.length !== pieces.length) draft.setParagraph(position.story, position.path, paragraphWith(paragraph, rebuild(left)));
+  let left = removePieces(pieces, from, to);
+  if (left.length !== pieces.length) {
+    if (hints.size) left = left.filter((piece) => !hints.has(piece));
+    draft.setParagraph(position.story, position.path, paragraphWith(paragraph, rebuild(left)));
+  }
   return { story: position.story, path: position.path.slice(), offset };
+}
+
+/** The stale hints among the pieces [from, to): pieces without width are never cut, so they stay the objects they are while the list changes. */
+function hintsBetween(pieces: Piece[], from: number, to: number): Set<Piece> {
+  const out = new Set<Piece>();
+  for (let q = from; q < to; q++) if (isStaleHint(pieces[q])) out.add(pieces[q]);
+  return out;
 }
 
 /** The pieces a lock holds around the piece at `index`, as [from, to). */
@@ -366,35 +537,49 @@ function lockSpan(pieces: Piece[], index: number): [number, number] {
   return [from, to];
 }
 
+const checkUnit = (unit: unknown): void => {
+  if (unit !== 'char' && unit !== 'word') bad('The unit of a deletion is "char" or "word"');
+};
+
 /**
  * Backspace. Removes the character (or the word) before the caret; a drawing,
- * a note reference or a computed field there goes as one unit. At the start
- * of a paragraph, in Word's order: an item of a list leaves the list; else
- * an indent goes (first the first line indent, then the left one); else the
- * paragraph joins the one before it. Nothing happens at the start of a table
- * cell or of the story, and after a table.
+ * a note reference or a computed field there goes as one unit. What does not
+ * show is never the unit that goes: the caret passes over it to what shows.
+ * Of what it passes, marks of bookmarks and comments and a soft hyphen stay,
+ * and the hints of the last layout and spelling check (w:lastRenderedPageBreak,
+ * w:proofErr) are dropped, being stale once the text changes. UNSURE: a soft
+ * hyphen takes no offset (paragraphText leaves it out), so no caret can stand
+ * beside it and only a range over it removes it.
+ *
+ * At the start of a paragraph, in Word's order: an item of a list leaves the
+ * list; else an indent goes (first the first line indent, then the left one);
+ * else the paragraph joins the one before it. Nothing happens at the start of
+ * a table cell or of the story, and after a table.
  */
 export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char' | 'word' = 'char', _options?: DocEditOptions): DocEdit {
+  checkUnit(unit);
   return buildEdit(doc, (draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     const paragraph = at.paragraph;
+    const side = position.before === true;
     const pieces = flatten(paragraph);
-    const index = boundary(pieces, position.offset, 'caret');
+    const index = caretIndex(pieces, position);
     let k = index - 1;
     while (k >= 0 && pieces[k].len === 0 && !isAtom(pieces[k]) && pieces[k].lock === undefined) k--;
     if (k >= 0) {
+      const hints = hintsBetween(pieces, k + 1, index);
       if (pieces[k].lock !== undefined) {
         const [from, to] = lockSpan(pieces, k);
-        return removeFrom(draft, position, paragraph, pieces, from, to);
+        return sided(doc, removeFrom(draft, position, paragraph, pieces, from, to, hints), side);
       }
-      if (isAtom(pieces[k])) return removeFrom(draft, position, paragraph, pieces, k, k + 1);
+      if (isAtom(pieces[k])) return sided(doc, removeFrom(draft, position, paragraph, pieces, k, k + 1, hints), side);
       const text = paragraphText(paragraph);
       const end = offsetOf(pieces, k + 1);
       const begin = unit === 'word' ? previousWordOffset(text, end) : previousCharOffset(text, end);
       const from = boundary(pieces, begin, 'before');
       const to = boundary(pieces, end, 'after');
-      return removeFrom(draft, position, paragraph, pieces, from, to);
+      return sided(doc, removeFrom(draft, position, paragraph, pieces, from, to, hints), side);
     }
     const where = tableContextOf(doc, position.story, position.path);
     if (inList(doc, paragraph.props, where)) {
@@ -420,54 +605,60 @@ export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char
     }
     const before = neighbour(at.blocks, at.index, -1);
     if (before < 0 || at.blocks[before].type !== 'paragraph') return position;
-    return joinParagraphs(draft, position.story, at.container, before, at.index);
+    return sided(doc, joinParagraphs(draft, position.story, at.container, before, at.index), side);
   });
 }
 
 /**
  * Delete. Removes the character (or the word) after the caret, with the same
- * units as deleteBackward; at the end of a paragraph the next paragraph joins
- * this one. Nothing happens at the end of a table cell or of the story, and
- * before a table.
+ * units as deleteBackward and the same treatment of what does not show; at
+ * the end of a paragraph the next paragraph joins this one. Nothing happens
+ * at the end of a table cell or of the story, and before a table. The caret
+ * stays at the offset it had.
  */
 export function deleteForward(doc: DocModel, position: DocPosition, unit: 'char' | 'word' = 'char', _options?: DocEditOptions): DocEdit {
+  checkUnit(unit);
   return buildEdit(doc, (draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     const paragraph = at.paragraph;
+    const side = position.before === true;
     const pieces = flatten(paragraph);
-    const index = boundary(pieces, position.offset, 'caret');
+    const index = caretIndex(pieces, position);
     let k = index;
     while (k < pieces.length && pieces[k].len === 0 && !isAtom(pieces[k]) && pieces[k].lock === undefined) k++;
     if (k < pieces.length) {
+      const hints = hintsBetween(pieces, index, k);
       if (pieces[k].lock !== undefined) {
         const [from, to] = lockSpan(pieces, k);
-        return removeFrom(draft, position, paragraph, pieces, from, to);
+        return sided(doc, removeFrom(draft, position, paragraph, pieces, from, to, hints), side);
       }
-      if (isAtom(pieces[k])) return removeFrom(draft, position, paragraph, pieces, k, k + 1);
+      if (isAtom(pieces[k])) return sided(doc, removeFrom(draft, position, paragraph, pieces, k, k + 1, hints), side);
       const text = paragraphText(paragraph);
       const begin = offsetOf(pieces, k);
       const end = unit === 'word' ? nextWordOffset(text, begin) : nextCharOffset(text, begin);
       const from = boundary(pieces, begin, 'before');
       const to = boundary(pieces, end, 'after');
-      const caret = removeFrom(draft, position, paragraph, pieces, from, to);
-      return { ...caret, offset: position.offset };
+      const caret = removeFrom(draft, position, paragraph, pieces, from, to, hints);
+      return sided(doc, { ...caret, offset: position.offset }, side);
     }
     const after = neighbour(at.blocks, at.index, 1);
     if (after < 0 || at.blocks[after].type !== 'paragraph') return position;
-    return joinParagraphs(draft, position.story, at.container, at.index, after);
+    return sided(doc, joinParagraphs(draft, position.story, at.container, at.index, after), side);
   });
 }
 
 /**
- * Enter. The paragraph is cut in two at the position; both halves are
- * formatted like it, and a section break it carries stays with the second.
- * At the end of a paragraph whose style names a style for the paragraph that
- * follows (a heading), the new paragraph takes that style. In an empty list
- * item the paragraph leaves the list instead.
+ * Enter. The paragraph is cut in two at the position; both halves keep its
+ * style and its direct formatting, and a section break it carries stays with
+ * the second. In an empty list item the paragraph leaves the list instead.
  *
- * UNSURE: whether Word keeps the direct formatting of the paragraph when it
- * switches to the following style; here the new paragraph has the style only.
+ * At the end of a paragraph whose style names a style for the paragraph that
+ * follows (a heading), the new paragraph takes that style and none of the
+ * direct paragraph formatting (alignment, indents, spacing): in Word applying
+ * the following style starts the new paragraph from the style alone. UNSURE:
+ * this is Word's behaviour as documented and observed for headings; it was
+ * not compared with Word for every kind of direct formatting (borders, tabs).
  */
 export function splitParagraph(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
   return buildEdit(doc, (draft) => {
@@ -480,9 +671,10 @@ export function splitParagraph(doc: DocModel, position: DocPosition, _options?: 
       return position;
     }
     const pieces = flatten(paragraph);
-    const index = boundary(pieces, position.offset, 'caret');
+    const index = caretIndex(pieces, position);
     let second = paragraph.props;
-    if (at.length > 0 && offsetOf(pieces, index) === at.length) {
+    // At the very end: nothing that shows goes into the new paragraph.
+    if (at.length > 0 && offsetOf(pieces, index) === at.length && !atomFollows(pieces, index)) {
       const styles = doc.styles;
       const own = paragraph.props.style !== undefined ? paragraph.props.style : styles.defaultIds.paragraph;
       const style = own === undefined ? undefined : styles.styles.get(own);
@@ -495,24 +687,31 @@ export function splitParagraph(doc: DocModel, position: DocPosition, _options?: 
     }
     const container = position.path.slice(0, -1);
     const blockIndex = position.path[position.path.length - 1];
+    // The second half is a new paragraph: it does not take the identity (w14:paraId) of the first.
     draft.replace(position.story, container, blockIndex, 1, [
       paragraphWith(paragraph, rebuild(pieces.slice(0, index)), withoutSection(paragraph.props)),
       paragraphWith(paragraph, rebuild(pieces.slice(index)), second, false),
     ]);
-    return { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 };
+    return sided(doc, { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 }, position.before === true);
   });
 }
 
 const PAGE_BREAK_ITEM: RunItem = Object.freeze({ type: 'break' as const, kind: 'page' as const });
 
-/** Ctrl+Enter. A page break goes in at the position and the paragraph ends after it: what follows starts the next page as a paragraph of its own. */
+/**
+ * Ctrl+Enter. A page break goes in at the position and the paragraph ends
+ * after it: what follows starts the next page as a paragraph of its own.
+ * Refused inside a table cell. UNSURE: Word does not put a page break into a
+ * cell; it splits the table at the row instead, which is not done here.
+ */
 export function insertPageBreak(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
   return buildEdit(doc, (draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
+    if (position.path.length > 1) bad('A page break cannot be put into a table cell');
     const paragraph = at.paragraph;
     const pieces = flatten(paragraph);
-    const index = boundary(pieces, position.offset, 'caret');
+    const index = caretIndex(pieces, position);
     const props = inheritedProps(pieces, index, paragraph.props.markProps);
     const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
     const head = pieces.slice(0, index);
@@ -523,7 +722,7 @@ export function insertPageBreak(doc: DocModel, position: DocPosition, _options?:
       paragraphWith(paragraph, rebuild(head), withoutSection(paragraph.props)),
       paragraphWith(paragraph, rebuild(pieces.slice(index)), paragraph.props, false),
     ]);
-    return { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 };
+    return sided(doc, { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 }, position.before === true);
   });
 }
 
@@ -550,7 +749,7 @@ export function placeBlock(draft: Draft, position: DocPosition, block: Block): n
   let index = at.index;
   if (position.offset > 0 && position.offset < at.length) {
     const pieces = flatten(at.paragraph);
-    const cut = boundary(pieces, position.offset, 'caret');
+    const cut = caretIndex(pieces, position);
     draft.replace(position.story, container, index, 1, [
       paragraphWith(at.paragraph, rebuild(pieces.slice(0, cut)), withoutSection(at.paragraph.props)),
       paragraphWith(at.paragraph, rebuild(pieces.slice(cut)), at.paragraph.props, false),

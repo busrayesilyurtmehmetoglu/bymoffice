@@ -9,9 +9,26 @@
 //
 // A caret at an offset stands after everything without width that sits at that
 // offset, except that it does not step over the beginning of a field or of a
-// bookmark or comment range: what is typed there stays outside of them.
+// bookmark or comment range: what is typed there stays outside of them. A
+// position with `before` set stands before what shows without width at its
+// offset instead (a picture, a note reference), so that a caret can be put on
+// either side of a picture and a range can hold a picture alone.
 
-import { findWrapper, paragraphText, type Block, type DocModel, type Note, type Paragraph, type RunItem, type Story, type StoryCollection, type Table, type Wrapper } from '../../model/doc/types';
+import { resolveRunProps, type TableContext } from '../../formats/docx/resolve';
+import {
+  findWrapper,
+  paragraphText,
+  type Block,
+  type DocModel,
+  type Note,
+  type Paragraph,
+  type RunItem,
+  type RunProps,
+  type Story,
+  type StoryCollection,
+  type Table,
+  type Wrapper,
+} from '../../model/doc/types';
 
 export interface DocPosition {
   /** "body", "header:<rId>", "footer:<rId>", "footnote:<id>", "endnote:<id>". */
@@ -20,6 +37,12 @@ export interface DocPosition {
   path: number[];
   /** Offset in paragraphText() of the paragraph, in UTF-16 code units. */
   offset: number;
+  /**
+   * The position is before what shows without width at this offset (an inline
+   * picture or drawing, a note reference) instead of after it. Where nothing
+   * of the kind sits at the offset the flag says nothing.
+   */
+  before?: true;
 }
 
 export interface DocRange {
@@ -284,6 +307,7 @@ function rootLength(path: number[]): number {
  * boxes.
  */
 export function comparePositions(a: DocPosition, b: DocPosition): number {
+  if (!a || !b || !Array.isArray(a.path) || !Array.isArray(b.path)) return bad('A position needs a path');
   if (a.story !== b.story) return bad('The positions are in different stories');
   const root = rootLength(a.path);
   if (root !== rootLength(b.path)) return bad('The positions are in different text boxes');
@@ -291,30 +315,65 @@ export function comparePositions(a: DocPosition, b: DocPosition): number {
   const shared = Math.min(a.path.length, b.path.length);
   for (let i = root; i < shared; i++) if (a.path[i] !== b.path[i]) return a.path[i] - b.path[i];
   if (a.path.length !== b.path.length) return a.path.length - b.path.length;
-  return a.offset - b.offset;
+  if (a.offset !== b.offset) return a.offset - b.offset;
+  // At one offset the position before what has no width there comes first.
+  return (a.before === true ? 0 : 1) - (b.before === true ? 0 : 1);
 }
 
-export const samePosition = (a: DocPosition, b: DocPosition): boolean =>
-  a.story === b.story && a.offset === b.offset && a.path.length === b.path.length && a.path.every((value, i) => value === b.path[i]);
+/** Do two positions name the same place: story, paragraph, offset and side. */
+export function samePosition(a: DocPosition, b: DocPosition): boolean {
+  if (!a || !b || !Array.isArray(a.path) || !Array.isArray(b.path)) return bad('A position needs a path');
+  return a.story === b.story && a.offset === b.offset && (a.before === true) === (b.before === true) && a.path.length === b.path.length && a.path.every((value, i) => value === b.path[i]);
+}
 
 /** The ends of a range in document order. Throws RangeError when they cannot form a range. */
 export function orderRange(range: DocRange): { start: DocPosition; end: DocPosition } {
+  if (!range || typeof range !== 'object') return bad('A range needs two positions');
   return comparePositions(range.anchor, range.focus) <= 0 ? { start: range.anchor, end: range.focus } : { start: range.focus, end: range.anchor };
 }
 
-export const isCollapsed = (range: DocRange): boolean => samePosition(range.anchor, range.focus);
+export function isCollapsed(range: DocRange): boolean {
+  if (!range || typeof range !== 'object') return bad('A range needs two positions');
+  return samePosition(range.anchor, range.focus);
+}
 
 export const collapsed = (position: DocPosition): DocRange => ({ anchor: position, focus: position });
 
-/** A position or a range as a range. */
-export const asRange = (at: DocPosition | DocRange): DocRange => ('anchor' in at ? at : collapsed(at));
+/** A position or a range as a range. Throws RangeError for what is neither. */
+export function asRange(at: DocPosition | DocRange): DocRange {
+  if (!at || typeof at !== 'object') return bad('A position or a range is needed');
+  if (!('anchor' in at) && !('focus' in at)) return collapsed(at);
+  const range = at as DocRange;
+  if (!range.anchor || !range.focus || typeof range.anchor !== 'object' || typeof range.focus !== 'object') return bad('A range needs two positions');
+  return range;
+}
 
 // ------------------------------------------------------------------ characters
 
 const isHigh = (code: number) => code >= 0xd800 && code <= 0xdbff;
 const isLow = (code: number) => code >= 0xdc00 && code <= 0xdfff;
 
-/** Marks that belong to the character before them: combining marks, variation selectors, the joiners. */
+/** The code point that ends at `i`. */
+function pointBefore(text: string, i: number): number {
+  const low = text.charCodeAt(i - 1);
+  if (isLow(low) && i > 1) {
+    const high = text.charCodeAt(i - 2);
+    if (isHigh(high)) return (high - 0xd800) * 0x400 + (low - 0xdc00) + 0x10000;
+  }
+  return low;
+}
+
+/** The code point that begins at `i`. */
+function pointAt(text: string, i: number): number {
+  const high = text.charCodeAt(i);
+  if (isHigh(high)) {
+    const low = text.charCodeAt(i + 1);
+    if (isLow(low)) return (high - 0xd800) * 0x400 + (low - 0xdc00) + 0x10000;
+  }
+  return high;
+}
+
+/** Marks that belong to the character before them: combining marks, variation selectors, the joiners, skin tones. */
 function isExtender(code: number): boolean {
   if (code < 0x300) return false;
   return (
@@ -323,104 +382,183 @@ function isExtender(code: number): boolean {
     (code >= 0x591 && code <= 0x5bd) ||
     (code >= 0x610 && code <= 0x61a) ||
     (code >= 0x64b && code <= 0x65f) ||
+    code === 0x670 ||
+    (code >= 0x6d6 && code <= 0x6dc) ||
+    code === 0xe31 ||
+    (code >= 0xe34 && code <= 0xe3a) ||
+    (code >= 0xe47 && code <= 0xe4e) ||
     (code >= 0x1ab0 && code <= 0x1aff) ||
     (code >= 0x1dc0 && code <= 0x1dff) ||
     code === 0x200c ||
     code === 0x200d ||
     (code >= 0x20d0 && code <= 0x20ff) ||
+    (code >= 0x3099 && code <= 0x309a) ||
     (code >= 0xfe00 && code <= 0xfe0f) ||
-    (code >= 0xfe20 && code <= 0xfe2f)
+    (code >= 0xfe20 && code <= 0xfe2f) ||
+    (code >= 0x1f3fb && code <= 0x1f3ff) ||
+    (code >= 0xe0020 && code <= 0xe007f) ||
+    (code >= 0xe0100 && code <= 0xe01ef)
   );
 }
 
+/** Regional indicators: two of them are a flag. */
+const isRegional = (code: number) => code >= 0x1f1e6 && code <= 0x1f1ff;
+
+const HANGUL_L = 1;
+const HANGUL_V = 2;
+const HANGUL_T = 3;
+const HANGUL_LV = 4;
+const HANGUL_LVT = 5;
+
+/** The part a code point plays in a Hangul syllable; 0 for everything else. */
+function hangul(code: number): number {
+  if (code < 0x1100) return 0;
+  if (code <= 0x115f || (code >= 0xa960 && code <= 0xa97c)) return HANGUL_L;
+  if ((code >= 0x1160 && code <= 0x11a7) || (code >= 0xd7b0 && code <= 0xd7c6)) return HANGUL_V;
+  if ((code >= 0x11a8 && code <= 0x11ff) || (code >= 0xd7cb && code <= 0xd7fb)) return HANGUL_T;
+  if (code >= 0xac00 && code <= 0xd7a3) return (code - 0xac00) % 28 === 0 ? HANGUL_LV : HANGUL_LVT;
+  return 0;
+}
+
 /**
- * The offset one character after `offset` in `text`: a surrogate pair and a
- * base character with its marks are one step. A practical subset of the
- * Unicode grapheme rules.
+ * May a caret stand at `offset` of `text`: is it not inside a character. A
+ * surrogate pair, a base character with its marks, what a joiner joins, a
+ * letter with its skin tone or variation selector, the two halves of a flag
+ * and the letters of a Hangul syllable are one character each. A practical
+ * subset of the Unicode grapheme rules, and the one place they are written
+ * down: stepping forward, stepping back and snapping all ask this.
  */
+export function isCharBreak(text: string, offset: number): boolean {
+  if (offset <= 0 || offset >= text.length) return true;
+  if (isLow(text.charCodeAt(offset)) && isHigh(text.charCodeAt(offset - 1))) return false;
+  const prev = pointBefore(text, offset);
+  const next = pointAt(text, offset);
+  if (prev < 0x300 && next < 0x300) return !(prev === 0x0d && next === 0x0a);
+  // A line end or another control character is always a character of its own.
+  if (prev < 0x20 || next < 0x20) return true;
+  if (isExtender(next)) return false;
+  // What a joiner joins belongs to the same character.
+  if (prev === 0x200d) return false;
+  if (isRegional(prev) && isRegional(next)) {
+    // Flags pair up from the start of the run of indicators.
+    let before = 0;
+    for (let i = offset; i >= 2 && isRegional(pointBefore(text, i)); i -= 2) before++;
+    return before % 2 === 0;
+  }
+  const left = hangul(prev);
+  if (left !== 0) {
+    const right = hangul(next);
+    if (left === HANGUL_L) return right === 0 || right === HANGUL_T;
+    if (left === HANGUL_LV || left === HANGUL_V) return !(right === HANGUL_V || right === HANGUL_T);
+    return right !== HANGUL_T;
+  }
+  return true;
+}
+
+/** Every offset of `text` a caret may stand at, in order: 0, the borders between its characters, its length. */
+export function graphemeBreaks(text: string): number[] {
+  const out: number[] = [0];
+  for (let i = 1; i < text.length; i++) if (isCharBreak(text, i)) out.push(i);
+  if (text.length > 0) out.push(text.length);
+  return out;
+}
+
+/** The offset one character after `offset` in `text` (see isCharBreak for what a character is). */
 export function nextCharOffset(text: string, offset: number): number {
   if (offset >= text.length) return text.length;
-  let at = offset + (isHigh(text.charCodeAt(offset)) && isLow(text.charCodeAt(offset + 1)) ? 2 : 1);
+  let at = Math.max(0, offset) + 1;
   // A long run of marks is one character however long it is; the loop ends with the text.
-  while (at < text.length) {
-    const code = text.charCodeAt(at);
-    if (isExtender(code)) {
-      // What a joiner joins belongs to the same character.
-      at += code === 0x200d && at + 1 < text.length ? (isHigh(text.charCodeAt(at + 1)) && isLow(text.charCodeAt(at + 2)) ? 3 : 2) : 1;
-    } else break;
-  }
-  return Math.min(at, text.length);
+  while (at < text.length && !isCharBreak(text, at)) at++;
+  return at;
 }
 
 /** The offset one character before `offset`. */
 export function previousCharOffset(text: string, offset: number): number {
-  let at = Math.min(offset, text.length);
-  while (at > 0) {
-    at -= at > 1 && isLow(text.charCodeAt(at - 1)) && isHigh(text.charCodeAt(at - 2)) ? 2 : 1;
-    if (at === 0) break;
-    const code = text.charCodeAt(at);
-    // Still on a mark, or on what a joiner before it joins: the character starts further back.
-    if (!isExtender(code) && text.charCodeAt(at - 1) !== 0x200d) break;
-  }
-  return at;
+  let at = Math.min(offset, text.length) - 1;
+  while (at > 0 && !isCharBreak(text, at)) at--;
+  return Math.max(0, at);
 }
 
 /** The nearest offset at or after `offset` that is not inside a character. */
 export function snapOffset(text: string, offset: number): number {
   if (offset <= 0) return 0;
-  if (offset >= text.length) return text.length;
-  let start = offset;
-  while (start > 0) {
-    const code = text.charCodeAt(start);
-    if ((isLow(code) && isHigh(text.charCodeAt(start - 1))) || isExtender(code) || text.charCodeAt(start - 1) === 0x200d) start--;
-    else break;
-  }
-  return start === offset ? offset : nextCharOffset(text, start);
+  let at = offset;
+  while (at < text.length && !isCharBreak(text, at)) at++;
+  return Math.min(at, text.length);
 }
 
 const SPACE = 0;
 const WORD = 1;
 const PUNCT = 2;
+/** Ideographs and kana: written without spaces, so each is a word of its own. */
+const IDEOGRAPH = 3;
 
-function charClass(code: number): number {
+function pointClass(code: number): number {
   if (code <= 0x20 || code === 0xa0 || code === 0x3000 || (code >= 0x2000 && code <= 0x200a)) return SPACE;
   if (code < 0x80) {
-    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 39 ? WORD : PUNCT;
+    return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 ? WORD : PUNCT;
   }
   // General punctuation and symbols; everything else beyond ASCII counts as a letter.
   if ((code >= 0xa1 && code <= 0xbf && code !== 0xaa && code !== 0xb5 && code !== 0xba) || (code >= 0x2010 && code <= 0x205e) || (code >= 0x3001 && code <= 0x303f)) return PUNCT;
+  if (
+    (code >= 0x3040 && code <= 0x30ff) ||
+    (code >= 0x3400 && code <= 0x4dbf) ||
+    (code >= 0x4e00 && code <= 0x9fff) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xff66 && code <= 0xff9f) ||
+    (code >= 0x20000 && code <= 0x3ffff)
+  ) {
+    return isExtender(code) ? WORD : IDEOGRAPH;
+  }
   return WORD;
+}
+
+const isApostrophe = (code: number) => code === 39 || code === 0x2019;
+
+/** The class of the character `offset` is in: of its base, whatever marks follow it. */
+function classAt(text: string, offset: number): number {
+  let start = offset;
+  while (start > 0 && !isCharBreak(text, start)) start--;
+  const code = pointAt(text, start);
+  if (!isApostrophe(code)) return pointClass(code);
+  // An apostrophe between two letters is part of the word ("don't", "İstanbul’da"); anywhere else it is a quote.
+  if (start === 0 || start + 1 >= text.length) return PUNCT;
+  const before = pointBefore(text, start);
+  const after = pointAt(text, start + 1);
+  return pointClass(before) === WORD && pointClass(after) === WORD ? WORD : PUNCT;
+}
+
+/** Does a word, a run of spaces or a run of punctuation begin at `offset` (0 < offset < length). */
+function isWordBreak(text: string, offset: number): boolean {
+  if (!isCharBreak(text, offset)) return false;
+  const kind = classAt(text, offset);
+  return kind === IDEOGRAPH || kind !== classAt(text, offset - 1);
 }
 
 /** Start of the word after `offset`: past the rest of this word and the spaces after it. */
 export function nextWordOffset(text: string, offset: number): number {
-  let at = offset;
-  if (at >= text.length) return text.length;
-  const first = charClass(text.charCodeAt(at));
-  if (first !== SPACE) while (at < text.length && charClass(text.charCodeAt(at)) === first) at++;
-  while (at < text.length && charClass(text.charCodeAt(at)) === SPACE) at++;
-  return at;
+  for (let at = Math.max(0, offset) + 1; at < text.length; at++) {
+    if (isWordBreak(text, at) && classAt(text, at) !== SPACE) return at;
+  }
+  return text.length;
 }
 
 /** Start of the word before `offset`: past the spaces before it and back to where that word begins. */
 export function previousWordOffset(text: string, offset: number): number {
-  let at = Math.min(offset, text.length);
-  while (at > 0 && charClass(text.charCodeAt(at - 1)) === SPACE) at--;
-  if (at === 0) return 0;
-  const kind = charClass(text.charCodeAt(at - 1));
-  while (at > 0 && charClass(text.charCodeAt(at - 1)) === kind) at--;
-  return at;
+  for (let at = Math.min(offset, text.length) - 1; at > 0; at--) {
+    if (isWordBreak(text, at) && classAt(text, at) !== SPACE) return at;
+  }
+  return 0;
 }
 
 /** The word around an offset as [start, end): what a double click selects. */
 export function wordAt(text: string, offset: number): [start: number, end: number] {
   if (text.length === 0) return [0, 0];
   const at = Math.min(Math.max(0, offset), text.length - 1);
-  const kind = charClass(text.charCodeAt(at));
   let start = at;
   let end = at + 1;
-  while (start > 0 && charClass(text.charCodeAt(start - 1)) === kind) start--;
-  while (end < text.length && charClass(text.charCodeAt(end)) === kind) end++;
+  while (start > 0 && !isWordBreak(text, start)) start--;
+  while (end < text.length && !isWordBreak(text, end)) end++;
   return [start, end];
 }
 
@@ -500,7 +638,80 @@ export function storyEnd(doc: DocModel, story: string): DocPosition | undefined 
   return path && { story, path, offset: resolvePosition(doc, { story, path, offset: 0 }).length };
 }
 
+/**
+ * Items of a run that show but take no offset of paragraphText(): a caret can
+ * stand before or after them (DocPosition.before), a deletion takes them as a
+ * unit of their own.
+ */
+export const ATOM_ITEMS = new Set<string>(['drawing', 'pict', 'object', 'footnoteReference', 'endnoteReference', 'separator', 'continuationSeparator', 'pageNumber', 'positionalTab']);
+
+/** Does something that shows without width (a picture, a note reference) sit at an offset of a paragraph. */
+export function hasAtomAt(paragraph: Paragraph, offset: number): boolean {
+  let at = 0;
+  for (const inline of paragraph.children) {
+    if (at > offset) return false;
+    if (inline.type === 'math') {
+      if (!notShown(inline)) at += inline.text.length;
+      continue;
+    }
+    if (inline.type !== 'run' || inline.fieldCode === true || notShown(inline)) continue;
+    const code = inline.fieldCode;
+    // Content of mc:AlternateContent is kept whole: nothing in it is a unit of its own.
+    const whole = inline.wrap !== undefined && findWrapper(inline, 'alternate') !== undefined;
+    for (let k = 0; k < inline.content.length; k++) {
+      if (code !== undefined && code[k]) continue;
+      const item = inline.content[k];
+      const length = itemLength(item);
+      if (length > 0) at += length;
+      else if (at === offset && !whole && ATOM_ITEMS.has(item.type)) return true;
+    }
+  }
+  return false;
+}
+
+/** Where a paragraph sits when its path goes through a table: what the style resolution needs. */
+export function tableContextOf(doc: DocModel, story: string, path: number[]): TableContext | undefined {
+  if (path.length < 4 || path[path.length - 4] === -1) return undefined;
+  const tablePath = path.slice(0, -3);
+  const blocks = containerBlocks(doc, story, tablePath.slice(0, -1));
+  const table = blocks[tablePath[tablePath.length - 1]];
+  if (!table || table.type !== 'table') return undefined;
+  return { table, row: path[path.length - 3], cell: path[path.length - 2] };
+}
+
+/** The stretches of a paragraph that are hidden text (w:vanish, from the run or a style), as [start, end) offsets. */
+function hiddenRanges(doc: DocModel, paragraph: Paragraph, where: TableContext | undefined): [number, number][] {
+  const out: [number, number][] = [];
+  const memo = new Map<RunProps, boolean>();
+  let at = 0;
+  for (const inline of paragraph.children) {
+    if (inline.type === 'math') {
+      if (!notShown(inline)) at += inline.text.length;
+      continue;
+    }
+    if (inline.type !== 'run' || inline.fieldCode === true || notShown(inline)) continue;
+    const length = itemsLength(inline.content, inline.fieldCode, 0);
+    if (length === 0) continue;
+    let hidden = memo.get(inline.props);
+    if (hidden === undefined) memo.set(inline.props, (hidden = resolveRunProps(doc, paragraph.props, inline.props, where).vanish === true));
+    if (hidden) {
+      const last = out.length ? out[out.length - 1] : undefined;
+      if (last && last[1] === at) last[1] = at + length;
+      else out.push([at, at + length]);
+    }
+    at += length;
+  }
+  return out;
+}
+
 export type MoveUnit = 'char' | 'word' | 'paragraphStart' | 'paragraphEnd' | 'paragraph' | 'story';
+
+const MOVE_UNITS: readonly string[] = ['char', 'word', 'paragraphStart', 'paragraphEnd', 'paragraph', 'story'];
+
+export interface MoveOptions {
+  /** Stop inside hidden text (w:vanish) too; without it a stretch of hidden text is passed in one step. */
+  includeHidden?: boolean;
+}
 
 /**
  * The position one unit before (direction -1) or after (1) a position.
@@ -508,36 +719,62 @@ export type MoveUnit = 'char' | 'word' | 'paragraphStart' | 'paragraphEnd' | 'pa
  * one; "paragraph" goes to the start of the next or previous paragraph;
  * "story" to the very start or end. At the end of the story the position
  * comes back unchanged.
+ *
+ * What shows without width (a picture, a note reference) is a step of its
+ * own for "char": first the position before it (`before: true`), then the
+ * one after it. Moving forward, and to the start of a paragraph, arrives
+ * before such a thing; moving back arrives after it. Several of them at one
+ * offset are passed together. Hidden text is passed in one step, and no
+ * position inside it is returned, unless `options.includeHidden` is set.
  */
-export function movePosition(doc: DocModel, position: DocPosition, unit: MoveUnit, direction: 1 | -1): DocPosition {
+export function movePosition(doc: DocModel, position: DocPosition, unit: MoveUnit, direction: 1 | -1, options?: MoveOptions): DocPosition {
+  if (direction !== 1 && direction !== -1) return bad('The direction of a move is 1 or -1');
+  if (MOVE_UNITS.indexOf(unit) < 0) return bad('The unit of a move is not valid');
   const at = resolvePosition(doc, position);
   const { story, path } = position;
   const here = (offset: number): DocPosition => ({ story, path: path.slice(), offset });
+  /** The position at an offset of a paragraph that is before what has no width there. */
+  const first = (to: number[], paragraph: Paragraph, offset: number): DocPosition => (hasAtomAt(paragraph, offset) ? { story, path: to, offset, before: true } : { story, path: to, offset });
+  const unchanged = (): DocPosition => (position.before === true ? first(path.slice(), at.paragraph, at.offset) : here(at.offset));
   const into = (step: 1 | -1, end: boolean): DocPosition | undefined => {
     const next = adjacentParagraph(doc, story, path, step);
     if (!next) return undefined;
-    return { story, path: next, offset: end ? resolvePosition(doc, { story, path: next, offset: 0 }).length : 0 };
+    const target = resolvePosition(doc, { story, path: next, offset: 0 });
+    return end ? { story, path: next, offset: target.length } : first(next, target.paragraph, 0);
   };
-  if (unit === 'paragraphStart') return here(0);
+  const startOf = (to: number[]): DocPosition => first(to.slice(), resolvePosition(doc, { story, path: to, offset: 0 }).paragraph, 0);
+  if (unit === 'paragraphStart') return first(path.slice(), at.paragraph, 0);
   if (unit === 'paragraphEnd') return here(at.length);
   if (unit === 'story') {
-    if (rootLength(path) === 0) return (direction === 1 ? storyEnd(doc, story) : storyStart(doc, story)) || here(at.offset);
+    if (rootLength(path) === 0) {
+      const edge = direction === 1 ? storyEnd(doc, story) : storyStart(doc, story);
+      return edge ? (direction === 1 ? edge : startOf(edge.path)) : unchanged();
+    }
     let last = path;
     // Inside a text box the walk stays in the box, which holds few paragraphs.
     for (let next = adjacentParagraph(doc, story, last, direction); next; next = adjacentParagraph(doc, story, last, direction)) last = next;
-    return { story, path: last.slice(), offset: direction === 1 ? resolvePosition(doc, { story, path: last, offset: 0 }).length : 0 };
+    return direction === 1 ? { story, path: last.slice(), offset: resolvePosition(doc, { story, path: last, offset: 0 }).length } : startOf(last);
   }
   if (unit === 'paragraph') {
-    if (direction === -1 && at.offset > 0) return here(0);
-    return into(direction, false) || here(direction === 1 ? at.length : 0);
+    if (direction === -1 && at.offset > 0) return first(path.slice(), at.paragraph, 0);
+    return into(direction, false) || (direction === 1 ? here(at.length) : first(path.slice(), at.paragraph, 0));
   }
+  const atom = unit === 'char' && hasAtomAt(at.paragraph, at.offset);
+  // Over the picture at the offset, from one side of it to the other.
+  if (atom && direction === 1 && position.before === true) return here(at.offset);
+  if (atom && direction === -1 && position.before !== true) return { ...here(at.offset), before: true };
   const text = paragraphText(at.paragraph);
+  const hidden = options && options.includeHidden ? [] : hiddenRanges(doc, at.paragraph, tableContextOf(doc, story, path));
+  const shown = (offset: number): number => {
+    for (const [from, to] of hidden) if (offset > from && offset < to) return direction === 1 ? to : from;
+    return offset;
+  };
   if (direction === 1) {
-    if (at.offset >= at.length) return into(1, false) || here(at.length);
-    return here(unit === 'word' ? nextWordOffset(text, at.offset) : nextCharOffset(text, at.offset));
+    if (at.offset >= at.length) return into(1, false) || unchanged();
+    return first(path.slice(), at.paragraph, shown(unit === 'word' ? nextWordOffset(text, at.offset) : nextCharOffset(text, at.offset)));
   }
-  if (at.offset <= 0) return into(-1, true) || here(0);
-  return here(unit === 'word' ? previousWordOffset(text, at.offset) : previousCharOffset(text, at.offset));
+  if (at.offset <= 0) return into(-1, true) || unchanged();
+  return here(shown(unit === 'word' ? previousWordOffset(text, at.offset) : previousCharOffset(text, at.offset)));
 }
 
 /**

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { DocLayout } from '../src/layout/doc/layout';
 import type { LayoutFont, TextMeasurer } from '../src/layout/doc/types';
-import { paragraphText, type Block, type DocModel, type Paragraph } from '../src/model/doc/types';
+import { paragraphText, type Block, type DocModel, type ExtraXml, type Paragraph, type RunItem, type Wrapper } from '../src/model/doc/types';
 import {
   DocHistory,
   adjacentParagraph,
@@ -235,6 +235,144 @@ export function checkInvariants(doc: DocModel, strict = true): void {
   }
 }
 
+const RANGE_MARKS = new Set<string>(['bookmarkStart', 'bookmarkEnd', 'commentRangeStart', 'commentRangeEnd', 'moveFromRangeStart', 'moveFromRangeEnd', 'moveToRangeStart', 'moveToRangeEnd', 'permStart', 'permEnd']);
+
+/**
+ * What no edit may take out of a document, counted: the marks of bookmarks,
+ * comments and moves (by kind and id, wherever they sit: in a paragraph,
+ * between blocks, between the rows of a table), references to comments, the
+ * automatic numbers of notes, kept XML, comments of the XML, and the text of
+ * tracked deletions (in characters). Content of text boxes and of alternate
+ * content is not looked into: it goes with the drawing that holds it.
+ */
+export function undeletables(doc: DocModel, stories = storyIds(doc)): Map<string, number> {
+  const out = new Map<string, number>();
+  const add = (key: string, count = 1) => out.set(key, (out.get(key) || 0) + count);
+  const loose = (extras: ExtraXml[] | undefined, misc: unknown[] | undefined) => {
+    for (const extra of extras || []) {
+      const local = extra.el.name.slice(extra.el.name.indexOf(':') + 1);
+      if (!RANGE_MARKS.has(local) || extra.partial || extra.index < 0) continue;
+      let id = '';
+      extra.el.attrs.forEach((value, name) => (name.slice(name.indexOf(':') + 1) === 'id' ? (id = value) : 0));
+      add(local + ':' + id);
+    }
+    add('misc', (misc || []).length);
+  };
+  const items = (list: RunItem[]) => {
+    for (const item of list) {
+      if (item.type === 'commentReference') add('commentReference:' + item.id);
+      else if (item.type === 'footnoteRef' || item.type === 'endnoteRef' || item.type === 'annotationRef' || item.type === 'unknown' || item.type === 'misc') add(item.type);
+      else if (item.type === 'deletedText') add('deleted', item.text.length);
+    }
+  };
+  const blocks = (list: Block[], depth: number) => {
+    if (depth > 64) return;
+    for (const block of list) {
+      if (block.type === 'paragraph') {
+        for (const inline of block.children) {
+          if (inline.type === 'run') items(inline.content);
+          else if (RANGE_MARKS.has(inline.type)) add(inline.type + ':' + (inline as { id: string }).id);
+          else if (inline.type === 'unknown' || inline.type === 'misc') add(inline.type);
+        }
+      } else if (block.type === 'table') {
+        loose(block.extras, block.misc);
+        for (const row of block.rows) {
+          loose(row.extras, row.misc);
+          for (const cell of row.cells) blocks(cell.blocks, depth + 1);
+        }
+      } else if (block.type === 'mark') add(block.mark.type + ':' + block.mark.id);
+      else if (block.type === 'unknown' || block.type === 'misc') add(block.type);
+    }
+  };
+  for (const id of stories) blocks(storyOf(doc, id).blocks, 0);
+  out.forEach((count, key) => (count === 0 ? out.delete(key) : 0));
+  return out;
+}
+
+/**
+ * undeletables() of each story as a text to compare, by the id of the story.
+ * (A note that leaves the document with its last reference takes what it
+ * holds with it, so the stories are compared one by one.)
+ */
+export function undeletablesByStory(doc: DocModel): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const id of storyIds(doc)) {
+    out.set(
+      id,
+      Array.from(undeletables(doc, [id]).entries())
+        .map(([key, count]) => key + '=' + count)
+        .sort()
+        .join(' '),
+    );
+  }
+  return out;
+}
+
+/** The id of a content control (w:sdtPr/w:id), when it states one. */
+function controlId(wrap: Wrapper): string | undefined {
+  if (wrap.kind !== 'sdt' || !wrap.pr) return undefined;
+  for (const child of wrap.pr.children) {
+    if (child.type !== 'element' || child.name.slice(child.name.indexOf(':') + 1) !== 'id') continue;
+    let value: string | undefined;
+    child.attrs.forEach((text, name) => (name.slice(name.indexOf(':') + 1) === 'val' ? (value = text) : 0));
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * Wrappers around blocks: the blocks of one wrapper follow each other, and a
+ * content control is one wrapper object, not several with the same id (which
+ * the writer would write as several controls).
+ */
+export function checkWrappers(doc: DocModel): void {
+  const walk = (list: Block[], where: string, depth: number) => {
+    if (depth > 64) return;
+    const byId = new Map<string, Wrapper>();
+    const closed = new Set<Wrapper>();
+    let open: Wrapper[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const chain: Wrapper[] = [];
+      for (let w = list[i].wrap; w; w = w.parent) chain.push(w);
+      for (const w of open) if (chain.indexOf(w) < 0) closed.add(w);
+      for (const w of chain) {
+        assert.ok(!closed.has(w), `${where}/${i}: the blocks of a wrapper do not follow each other`);
+        const id = controlId(w);
+        if (id === undefined) continue;
+        const other = byId.get(id);
+        assert.ok(other === undefined || other === w, `${where}/${i}: two wrappers for the content control ${id}`);
+        byId.set(id, w);
+      }
+      open = chain;
+      const block = list[i];
+      if (block.type === 'table') block.rows.forEach((row, r) => row.cells.forEach((cell, c) => walk(cell.blocks, `${where}/${i}/${r}/${c}`, depth + 1)));
+    }
+  };
+  for (const id of storyIds(doc)) walk(storyOf(doc, id).blocks, id, 0);
+}
+
+/**
+ * Freezes every block of the document and all it holds (paragraphs, runs,
+ * property bags, tables, rows, cells, wrappers, kept XML), so that a command
+ * that changes one of them in place throws. The lists of blocks of the body
+ * and of headers and footers stay open: operations replace blocks in them.
+ */
+export function freezeBlocks(doc: DocModel): void {
+  const freeze = (value: unknown, depth: number): void => {
+    if (value === null || typeof value !== 'object' || depth > 400) return;
+    if (ArrayBuffer.isView(value) || Object.isFrozen(value)) return;
+    Object.freeze(value);
+    if (value instanceof Map) value.forEach((item) => freeze(item, depth + 1));
+    else if (Array.isArray(value)) for (const item of value) freeze(item, depth + 1);
+    else for (const key of Object.keys(value)) freeze((value as Record<string, unknown>)[key], depth + 1);
+  };
+  for (const id of storyIds(doc)) {
+    const handle = storyOf(doc, id);
+    if (handle.note) freeze(handle.note, 0);
+    else for (const block of handle.blocks) freeze(block, 0);
+  }
+}
+
 /**
  * Lays the document out and checks that every text item with a source shows the text the model has at that place
  * (`exact`), or at least lies inside its paragraph. Returns the number of items checked.
@@ -252,7 +390,12 @@ export function checkLayout(doc: DocModel, exact = true): number {
       assert.equal(paragraph.type, 'paragraph', 'the source of a text item is a paragraph');
       const text = paragraphText(paragraph as Paragraph);
       // Capitals, small capitals and symbol fonts show other characters than the model holds; then only the place is checked.
-      if (exact) assert.equal(text.substr(source.offset, item.text.length), item.text, `text at ${source.story} ${source.path.join('.')}+${source.offset}`);
+      if (exact) {
+        let shown = item.text;
+        // A line that ends at a soft hyphen shows a hyphen the model does not hold.
+        if (shown.charAt(shown.length - 1) === '-' && text.substr(source.offset, shown.length) !== shown) shown = shown.slice(0, -1);
+        assert.equal(text.substr(source.offset, shown.length), shown, `text at ${source.story} ${source.path.join('.')}+${source.offset}`);
+      }
       else if (source.offset < 0 || source.offset + item.text.length > text.length) assert.fail(`a text item lies outside its paragraph at ${source.story} ${source.path.join('.')}+${source.offset}`);
       // Outside text boxes the source is a position the commands accept.
       if (source.path.indexOf(-1) < 0) resolvePosition(doc, source);
@@ -302,11 +445,17 @@ const DRAWING =
   '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr/>' +
   '<wps:txbx><w:txbxContent><w:p><w:r><w:t>boxed text</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:inline></w:drawing>';
 
-function randomRuns(d: Dice, notes: number[]): string {
+/** Counters of a random document: ids of comments made so far (undefined where comments cannot be, in a header) and of marks. */
+interface Marks {
+  comments?: number[];
+  next: number;
+}
+
+function randomRuns(d: Dice, notes: number[], marks: Marks = { next: 9000 }): string {
   let out = '';
   const count = d.int(5);
   for (let i = 0; i < count; i++) {
-    const kind = d.int(22);
+    const kind = d.int(26);
     const rPr = d.pick(['', '', '<w:b/>', '<w:i/>', '<w:sz w:val="32"/>', '<w:color w:val="FF0000"/>', '<w:rStyle w:val="Strong"/>', '<w:u w:val="single"/>', '<w:b/><w:i/>']);
     const text = words(d, 1 + d.int(4)) + (d.chance(0.5) ? ' ' : '');
     if (kind < 9) out += r(text, rPr);
@@ -326,17 +475,24 @@ function randomRuns(d: Dice, notes: number[]): string {
       notes.push(notes.length + 2);
       out += `${r(text)}<w:r><w:footnoteReference w:id="${notes.length + 1}"/></w:r>`;
     } else if (kind === 20) out += `<w:r>${DRAWING}</w:r>`;
+    else if (kind === 22 && marks.comments) {
+      const id = marks.next++;
+      marks.comments.push(id);
+      out += `<w:commentRangeStart w:id="${id}"/>${r(text, rPr)}<w:commentRangeEnd w:id="${id}"/><w:r><w:commentReference w:id="${id}"/></w:r>`;
+    } else if (kind === 23) out += `<!--kept-->${r(text, rPr)}<w:bookmarkStart w:id="${marks.next}" w:name="open${marks.next}"/>${r(words(d, 1))}<w:bookmarkEnd w:id="${marks.next++}"/>`;
+    else if (kind === 24) out += `<w:proofErr w:type="spellStart"/>${r(text, rPr)}<w:proofErr w:type="spellEnd"/><w:r><w:lastRenderedPageBreak/><w:t>${escape(words(d, 1))}</w:t><w:softHyphen/><w:t>x</w:t></w:r>`;
+    else if (kind === 25) out += `${r(text, rPr + '<w:vanish/>')}<w:r><w:noBreakHyphen/><w:ptab w:relativeTo="margin" w:alignment="center" w:leader="none"/></w:r>`;
     else out += `<m:oMath><m:r><m:t>x+y</m:t></m:r></m:oMath>`;
   }
   return out;
 }
 
-function randomParagraph(d: Dice, notes: number[]): string {
+function randomParagraph(d: Dice, notes: number[], marks?: Marks): string {
   const pPr = d.pick(['', '', '', '<w:pStyle w:val="Heading1"/>', '<w:jc w:val="center"/>', '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>', '<w:numPr><w:ilvl w:val="1"/><w:numId w:val="2"/></w:numPr>', '<w:ind w:left="720" w:firstLine="360"/>', '<w:pStyle w:val="ListStyle"/>', '<w:rPr><w:b/></w:rPr>']);
-  return p(randomRuns(d, notes), pPr);
+  return p(randomRuns(d, notes, marks), pPr);
 }
 
-function randomTable(d: Dice, notes: number[], depth: number): string {
+function randomTable(d: Dice, notes: number[], depth: number, marks: Marks): string {
   const columns = 1 + d.int(4);
   const rows = 1 + d.int(4);
   const merge = columns > 1 && d.chance(0.4);
@@ -350,11 +506,14 @@ function randomTable(d: Dice, notes: number[], depth: number): string {
       if (merge && row === 0 && c === 1) continue;
       if (vertical && c === columns - 1 && row < 2) tcPr += row === 0 ? '<w:vMerge w:val="restart"/>' : '<w:vMerge/>';
       let content = '';
-      if (depth < 1 && d.chance(0.1)) content += randomTable(d, notes, depth + 1);
+      if (depth < 1 && d.chance(0.1)) content += randomTable(d, notes, depth + 1, marks);
       const paragraphs = 1 + d.int(2);
-      for (let k = 0; k < paragraphs; k++) content += randomParagraph(d, notes);
+      for (let k = 0; k < paragraphs; k++) content += randomParagraph(d, notes, marks);
+      if (d.chance(0.1)) content = `<w:sdt><w:sdtPr><w:id w:val="${marks.next++}"/></w:sdtPr><w:sdtContent>${content}</w:sdtContent></w:sdt>`;
       cells += tc(content, tcPr);
     }
+    // Now and then a bookmark between the cells of the row: kept on the row, not in a paragraph.
+    if (d.chance(0.15)) cells = `<w:bookmarkStart w:id="${marks.next}" w:name="row${marks.next}"/>${cells}<w:bookmarkEnd w:id="${marks.next++}"/>`;
     out += tr(cells);
   }
   const grid: number[] = [];
@@ -362,33 +521,46 @@ function randomTable(d: Dice, notes: number[], depth: number): string {
   return tbl(out, grid);
 }
 
-/** A random document: paragraphs of all kinds of inline content, tables with merged cells, a header, footnotes. */
+/**
+ * A random document: paragraphs of all kinds of inline content, tables with
+ * merged cells, content controls around blocks (inside each other too),
+ * bookmarks and comments, a header, footnotes.
+ */
 export async function randomDoc(seed: number): Promise<DocModel> {
   const d = dice(seed);
   const notes: number[] = [];
+  const marks: Marks = { comments: [], next: 600 };
+  const control = (inner: string) => `<w:sdt><w:sdtPr><w:alias w:val="block"/><w:id w:val="${marks.next++}"/></w:sdtPr><w:sdtContent>${inner}</w:sdtContent></w:sdt>`;
   let body = '';
   const count = 3 + d.int(8);
   let lastTable = true;
   for (let i = 0; i < count; i++) {
     const kind = d.int(10);
     if (kind < 2 && !lastTable) {
-      body += randomTable(d, notes, 0);
+      body += randomTable(d, notes, 0, marks);
       lastTable = true;
       continue;
     }
     lastTable = false;
-    if (kind === 2) body += `<w:sdt><w:sdtPr><w:alias w:val="block"/></w:sdtPr><w:sdtContent>${randomParagraph(d, notes)}${randomParagraph(d, notes)}</w:sdtContent></w:sdt>`;
-    else if (kind === 3) body += `<w:bookmarkStart w:id="50${i}" w:name="between${i}"/>${randomParagraph(d, notes)}<w:bookmarkEnd w:id="50${i}"/>`;
-    else if (kind === 4) body += p(randomRuns(d, notes), '<w:sectPr><w:pgSz w:w="9000" w:h="9000"/><w:pgMar w:top="600" w:right="600" w:bottom="600" w:left="600" w:header="150" w:footer="150" w:gutter="0"/><w:type w:val="continuous"/></w:sectPr>');
-    else body += randomParagraph(d, notes);
+    if (kind === 2) {
+      // Two to four paragraphs in a control, now and then with a control (or a table) inside it.
+      let inner = randomParagraph(d, notes, marks) + randomParagraph(d, notes, marks);
+      if (d.chance(0.5)) inner += control(randomParagraph(d, notes, marks) + randomParagraph(d, notes, marks));
+      if (d.chance(0.3)) inner += randomTable(d, notes, 1, marks) + randomParagraph(d, notes, marks);
+      if (d.chance(0.5)) inner += randomParagraph(d, notes, marks);
+      body += control(inner);
+    } else if (kind === 3) body += `<w:bookmarkStart w:id="50${i}" w:name="between${i}"/>${randomParagraph(d, notes, marks)}<!--between blocks--><w:bookmarkEnd w:id="50${i}"/>`;
+    else if (kind === 4) body += p(randomRuns(d, notes, marks), '<w:sectPr><w:pgSz w:w="9000" w:h="9000"/><w:pgMar w:top="600" w:right="600" w:bottom="600" w:left="600" w:header="150" w:footer="150" w:gutter="0"/><w:type w:val="continuous"/></w:sectPr>');
+    else body += randomParagraph(d, notes, marks);
   }
-  body += p(randomRuns(d, notes));
+  body += p(randomRuns(d, notes, marks));
   body += '<w:sectPr><w:headerReference w:type="default" r:id="rIdHeader"/><w:pgSz w:w="9000" w:h="9000"/><w:pgMar w:top="900" w:right="600" w:bottom="600" w:left="600" w:header="150" w:footer="150" w:gutter="0"/></w:sectPr>';
   let footnotes = '<w:footnote w:type="separator" w:id="0"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="1"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>';
   for (const id of notes) footnotes += `<w:footnote w:id="${id}"><w:p><w:r><w:footnoteRef/></w:r>${r(' note ' + words(d, 3))}</w:p></w:footnote>`;
   return open({
     body,
     footnotes,
+    comments: (marks.comments as number[]).map((id) => `<w:comment w:id="${id}" w:author="A"><w:p><w:r><w:t>comment</w:t></w:r></w:p></w:comment>`).join(''),
     headers: { rIdHeader: p(randomRuns(d, [9, 9, 9])) + p('header end') },
     rels: [['rIdLink', 'hyperlink', 'https://example.com/', true]],
   });
@@ -402,8 +574,28 @@ export function randomPosition(doc: DocModel, d: Dice, story: string, paths = pa
   return { story, path, offset: d.int(paragraphLength(paragraphAt(doc, path, story)) + 1) };
 }
 
-/** A range of a story with ends not too far apart, so that documents do not shrink to nothing at once. */
+/** A range of a story with ends not too far apart, so that documents do not shrink to nothing at once; now and then all of a wrapper around blocks. */
 function randomRange(doc: DocModel, d: Dice, story: string, paths: number[][]): DocRange {
+  if (d.chance(0.2)) {
+    const blocks = storyOf(doc, story).blocks;
+    const wrapped: number[] = [];
+    for (let k = 0; k < blocks.length; k++) if (blocks[k].wrap && blocks[k].type === 'paragraph') wrapped.push(k);
+    if (wrapped.length) {
+      const root = (k: number) => {
+        let w = blocks[k].wrap;
+        while (w && w.parent) w = w.parent;
+        return w;
+      };
+      const k = d.pick(wrapped);
+      let first = k;
+      let last = k;
+      while (first > 0 && root(first - 1) === root(k) && blocks[first - 1].type === 'paragraph') first--;
+      while (last < blocks.length - 1 && root(last + 1) === root(k) && blocks[last + 1].type === 'paragraph') last++;
+      const a: DocPosition = { story, path: [first], offset: d.int(2) === 0 ? 0 : Math.min(1, paragraphLength(blocks[first] as Paragraph)) };
+      const b: DocPosition = { story, path: [last], offset: paragraphLength(blocks[last] as Paragraph) };
+      return d.chance(0.5) ? { anchor: a, focus: b } : { anchor: b, focus: a };
+    }
+  }
   const i = d.int(paths.length);
   const j = Math.min(paths.length - 1, i + (d.chance(0.6) ? 0 : d.int(3)));
   const at = (path: number[]): DocPosition => ({ story, path, offset: d.int(paragraphLength(paragraphAt(doc, path, story)) + 1) });
@@ -442,6 +634,10 @@ export function randomEdit(doc: DocModel, d: Dice, stories = storyIds(doc)): { n
   if (paths.length === 0) return undefined;
   const at = randomPosition(doc, d, story, paths);
   const span = randomRange(doc, d, story, paths);
+  // Now and then on the near side of what has no width at the offset.
+  if (d.chance(0.15)) at.before = true;
+  if (d.chance(0.1)) span.anchor = { ...span.anchor, before: true };
+  if (d.chance(0.1)) span.focus = { ...span.focus, before: true };
   const name = d.pick(COMMANDS);
   const inTable = at.path.length >= 4;
   let edit: DocEdit;

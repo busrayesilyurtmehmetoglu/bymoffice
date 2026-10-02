@@ -504,8 +504,8 @@ test('a simple field the engine computes is one unit too', async () => {
   assert.deepEqual(shapeAt(doc, 0), [':p.  end']);
   h.undo();
   run(h, insertText(doc, pos(0, 4), 'X'));
-  // After the field, with the formatting of the text to its left.
-  assert.deepEqual(shapeAt(doc, 0), [':p. ', ':1@simpleField', 'b:2@simpleField', 'b:X', ': end']);
+  // After the field, with the formatting of the text before the field: what is in a field does not hand its formatting on.
+  assert.deepEqual(shapeAt(doc, 0), [':p. ', ':1@simpleField', 'b:2@simpleField', ':X end']);
 });
 
 test('content of mc:AlternateContent is written back whole, so it is not edited', async () => {

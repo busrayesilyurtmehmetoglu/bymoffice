@@ -3,12 +3,14 @@
 
 import {
   EMPTY_PARA_PROPS,
+  safeHyperlinkTarget,
   type Block,
   type Border,
   type CellProps,
   type DocMedia,
   type DocModel,
   type DrawingItem,
+  type Inline,
   type Paragraph,
   type RowProps,
   type RunItem,
@@ -21,8 +23,27 @@ import {
 import type { XmlElement, XmlNode } from '../../xml';
 import { buildEdit, type DocEdit, type DocEditOptions, type Draft } from './draft';
 import { patchRunProps } from './format';
-import { boundary, flatten, groupFor, inheritedProps, itemPiece, offsetOf, paragraphWith, rebuild, textPieces, wrapBetween, type Piece } from './pieces';
-import { comparePositions, containerBlocks, inTextBox, paragraphIn, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
+import {
+  caretIndex,
+  cleanText,
+  flatten,
+  groupFor,
+  harvestBlocks,
+  harvestRow,
+  harvestTable,
+  inheritedProps,
+  itemPiece,
+  leftInlines,
+  offsetOf,
+  paragraphWith,
+  rebuild,
+  startIndex,
+  textPieces,
+  wrapBetween,
+  type Harvest,
+  type Piece,
+} from './pieces';
+import { asRange, containerBlocks, inTextBox, orderRange, paragraphIn, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
 import { placeBlock } from './text';
 
 const bad = (message: string): never => {
@@ -148,32 +169,95 @@ export function insertRow(doc: DocModel, position: DocPosition, where: 'above' |
   });
 }
 
-/** Removes a table; an empty paragraph takes its place where the list of blocks would otherwise end with a table, be empty, or have two tables touch. */
+/** What removed rows or cells leave behind (see harvestBlocks): inlines for a paragraph that stays, and blocks without content. */
+interface Leftover {
+  inlines: Inline[];
+  blocks: Block[];
+}
+
+const leftoverOf = (harvest: Harvest): Leftover => ({ inlines: leftInlines(harvest.pieces), blocks: harvest.blocks });
+
+/**
+ * A cell that takes over what removed content left behind: the inlines go to
+ * the start of its first paragraph (`atEnd`: to the end of its last one), the
+ * blocks before that paragraph. The cell itself when there is nothing.
+ */
+function cellWith(cell: TableCell, left: Leftover, atEnd: boolean): TableCell {
+  if (left.inlines.length === 0 && left.blocks.length === 0) return cell;
+  const blocks = cell.blocks.slice();
+  let index = -1;
+  for (let i = atEnd ? blocks.length - 1 : 0; i >= 0 && i < blocks.length && index < 0; i += atEnd ? -1 : 1) if (blocks[i].type === 'paragraph') index = i;
+  if (index < 0) {
+    index = blocks.length;
+    blocks.push({ type: 'paragraph', props: EMPTY_PARA_PROPS, children: left.inlines });
+  } else if (left.inlines.length) {
+    const paragraph = blocks[index] as Paragraph;
+    blocks[index] = paragraphWith(paragraph, atEnd ? paragraph.children.concat(left.inlines) : left.inlines.concat(paragraph.children));
+  }
+  if (left.blocks.length) blocks.splice(index, 0, ...left.blocks);
+  return { ...cell, blocks };
+}
+
+/** A row whose first cell (`atEnd`: last cell) takes over what removed content left behind. */
+function rowWith(row: TableRow, left: Leftover, atEnd: boolean): TableRow {
+  if (row.cells.length === 0 || (left.inlines.length === 0 && left.blocks.length === 0)) return row;
+  const cells = row.cells.slice();
+  const c = atEnd ? cells.length - 1 : 0;
+  cells[c] = cellWith(cells[c], left, atEnd);
+  return { ...row, cells };
+}
+
+/**
+ * Removes a table; an empty paragraph takes its place where the list of
+ * blocks would otherwise end with a table, be empty, or have two tables
+ * touch. What the table held that is not content (marks of bookmarks and
+ * comments, kept XML) goes into the paragraph after it, else the one before
+ * it, else into such a paragraph.
+ */
 function removeTable(draft: Draft, site: CellSite): DocPosition {
   const blocks = containerBlocks(draft.doc, site.story, site.container);
-  const near = (step: 1 | -1): Block | undefined => {
+  const near = (step: 1 | -1): number => {
     for (let i = site.index + step, tries = 0; i >= 0 && i < blocks.length && tries < 64; i += step, tries++) {
-      if (blocks[i].type === 'paragraph' || blocks[i].type === 'table') return blocks[i];
+      if (blocks[i].type === 'paragraph' || blocks[i].type === 'table') return i;
     }
-    return undefined;
+    return -1;
   };
+  const harvest: Harvest = { pieces: [], blocks: [] };
+  harvestTable(site.table, harvest);
+  const left = leftoverOf(harvest);
   const before = near(-1);
   const after = near(1);
-  const needed = after ? after.type === 'table' && before !== undefined && before.type === 'table' : !before || before.type === 'table';
-  const filler: Paragraph = { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] };
-  if (site.table.wrap) filler.wrap = site.table.wrap;
-  draft.replace(site.story, site.container, site.index, 1, needed ? [filler] : []);
+  const tableBefore = before >= 0 && blocks[before].type === 'table';
+  const tableAfter = after >= 0 && blocks[after].type === 'table';
+  let needed = after >= 0 ? tableAfter && tableBefore : before < 0 || tableBefore;
+  if (!needed && left.inlines.length) {
+    const target = after >= 0 && !tableAfter ? after : before >= 0 && !tableBefore ? before : -1;
+    if (target < 0) needed = true;
+    else {
+      const paragraph = blocks[target] as Paragraph;
+      draft.setParagraph(site.story, site.container.concat([target]), paragraphWith(paragraph, target === after ? left.inlines.concat(paragraph.children) : paragraph.children.concat(left.inlines)));
+    }
+  }
+  const out: Block[] = left.blocks.slice();
+  if (needed) {
+    const filler: Paragraph = { type: 'paragraph', props: EMPTY_PARA_PROPS, children: left.inlines };
+    if (site.table.wrap) filler.wrap = site.table.wrap;
+    out.push(filler);
+  }
+  draft.replace(site.story, site.container, site.index, 1, out);
   const now = containerBlocks(draft.doc, site.story, site.container);
   const path = paragraphIn(now, site.container, site.index, 1) || paragraphIn(now, site.container, site.index - 1, -1);
   if (!path) return bad('The story holds no paragraph');
-  const end = path[path.length - 1] < site.index;
+  const end = path[site.container.length] < site.index;
   return { story: site.story, path, offset: end ? resolvePosition(draft.doc, { story: site.story, path, offset: 0 }).length : 0 };
 }
 
 /**
  * Deletes the row a position is in; the last row takes the table with it. A
  * vertically merged cell that began in the row begins in the next row
- * afterwards.
+ * afterwards. What the row held that is not content (marks of bookmarks and
+ * comments, kept XML) moves to the start of the row after it, or to the end
+ * of the row before it.
  */
 export function deleteRow(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
   return buildEdit(doc, (draft) => {
@@ -182,6 +266,9 @@ export function deleteRow(doc: DocModel, position: DocPosition, _options?: DocEd
     if (table.rows.length <= 1) return removeTable(draft, site);
     const rows = table.rows.slice();
     const gone = rows.splice(site.row, 1)[0];
+    const harvest: Harvest = { pieces: [], blocks: [] };
+    harvestRow(gone, harvest);
+    const left = leftoverOf(harvest);
     const next = rows[site.row];
     if (next) {
       const spans = rowSpans(gone);
@@ -195,8 +282,8 @@ export function deleteRow(doc: DocModel, position: DocPosition, _options?: DocEd
           cells[k] = { ...next.cells[k], props: { ...next.cells[k].props, vMerge: 'restart' } };
         }
       }
-      if (cells) rows[site.row] = { ...next, cells };
-    }
+      rows[site.row] = rowWith(cells ? { ...next, cells } : next, left, false);
+    } else rows[site.row - 1] = rowWith(rows[site.row - 1], left, true);
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows)]);
     const row = Math.min(site.row, rows.length - 1);
     return cellStart(doc, site, row, Math.min(site.cell, rows[row].cells.length - 1));
@@ -274,7 +361,10 @@ export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' 
 /**
  * Deletes the grid columns the cell a position is in covers. Cells wholly in
  * those columns go; cells that also cover other columns become narrower. A
- * row left without cells goes, and the table with its last row.
+ * row left without cells goes, and the table with its last row. What the
+ * removed cells held that is not content (marks of bookmarks and comments,
+ * kept XML) moves into the cell after them in the row, else the one before
+ * them, and of a row that goes into the row after or before it.
  */
 export function deleteColumn(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
   return buildEdit(doc, (draft) => {
@@ -289,6 +379,8 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
     };
     const rows: TableRow[] = [];
     let caretRow = -1;
+    /** What rows that went as a whole left behind, for the next row that stays. */
+    let pending: Harvest = { pieces: [], blocks: [] };
     for (let r = 0; r < table.rows.length; r++) {
       const row = table.rows[r];
       const spans = rowSpans(row);
@@ -296,6 +388,9 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
       const after = row.props.gridAfter || 0;
       const rowEnd = spans.length ? spans[spans.length - 1][1] : before;
       const cells: TableCell[] = [];
+      const harvest: Harvest = { pieces: [], blocks: [] };
+      /** Index among the cells that stay of the first one after the removed cells. */
+      let behind = -1;
       for (let c = 0; c < row.cells.length; c++) {
         const [from, to] = spans[c];
         const cut = overlap(from, to);
@@ -304,9 +399,20 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
           const props: CellProps = { ...cellWidened(row.cells[c].props, -widthOf(from, to)), gridSpan: to - from - cut };
           if (props.gridSpan === 1) delete props.gridSpan;
           cells.push({ ...row.cells[c], props });
+        } else {
+          harvestBlocks(row.cells[c].blocks, harvest);
+          if (behind < 0) behind = cells.length;
         }
       }
-      if (cells.length === 0) continue;
+      if (cells.length === 0) {
+        harvestRow(row, pending);
+        continue;
+      }
+      if (behind >= 0) {
+        const left = leftoverOf(harvest);
+        if (behind < cells.length) cells[behind] = cellWith(cells[behind], left, false);
+        else cells[cells.length - 1] = cellWith(cells[cells.length - 1], left, true);
+      }
       const cutBefore = overlap(0, before);
       const cutAfter = overlap(rowEnd, rowEnd + after);
       let props = row.props;
@@ -316,9 +422,15 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
         if (cutAfter) props.gridAfter = after - cutAfter;
       }
       if (r === site.row) caretRow = rows.length;
-      rows.push(cells.length === row.cells.length && props === row.props && cells.every((cell, i) => cell === row.cells[i]) ? row : { ...row, props, cells });
+      let kept: TableRow = cells.length === row.cells.length && props === row.props && cells.every((cell, i) => cell === row.cells[i]) ? row : { ...row, props, cells };
+      if (pending.pieces.length || pending.blocks.length) {
+        kept = rowWith(kept, leftoverOf(pending), false);
+        pending = { pieces: [], blocks: [] };
+      }
+      rows.push(kept);
     }
     if (rows.length === 0) return removeTable(draft, site);
+    if (pending.pieces.length || pending.blocks.length) rows[rows.length - 1] = rowWith(rows[rows.length - 1], leftoverOf(pending), true);
     const grid = table.grid.slice();
     if (start < grid.length) grid.splice(start, end - start);
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows, grid, widened(table.props, -widthOf(start, end)))]);
@@ -402,18 +514,27 @@ const isRevision = (w: Wrapper) => w.kind === 'ins' || w.kind === 'del' || w.kin
 
 /**
  * Makes the text of a range a hyperlink to `target`: an address ("https://…",
- * "mailto:…"), or "#name" for a bookmark of the document. The range must lie
- * in one paragraph; a collapsed range gets the target itself as its text. A
- * link the text already has is replaced. For an address the part of the story
- * gets a relationship, which undoing removes again.
+ * "mailto:…", "tel:…"), or "#name" for a bookmark of the document. The range
+ * must lie in one paragraph; a collapsed range gets the target itself as its
+ * text. A link the text already has is replaced. For an address the part of
+ * the story gets a relationship, which undoing removes again.
+ *
+ * Only a target that is safe to follow is taken (safeHyperlinkTarget: http,
+ * https, mailto, tel, or a bookmark): a script or a file address throws
+ * RangeError, so that no document leaves the editor with one. The target is
+ * stored as that function reads it, without the space around it.
  */
-export function insertHyperlink(doc: DocModel, range: DocRange, target: string, _options?: DocEditOptions): DocEdit {
-  if (typeof target !== 'string' || target === '' || target === '#' || target.length > 2083 || /[\u0000-\u001f]/.test(target)) bad('The target of the hyperlink is not valid');
+export function insertHyperlink(doc: DocModel, range: DocRange, address: string, _options?: DocEditOptions): DocEdit {
+  let plain = typeof address === 'string' && address.length <= 2083;
+  // Control characters have no place in an address; a browser would drop some of them and read another address.
+  for (let i = 0; plain && i < address.length; i++) if (address.charCodeAt(i) < 0x20) plain = false;
+  const safe = plain ? safeHyperlinkTarget(address) : undefined;
+  if (safe === undefined || safe === '' || safe === '#') return bad('The target of the hyperlink is not valid');
+  const target: string = safe;
+  const at = asRange(range);
   return buildEdit(doc, (draft) => {
-    const ordered = comparePositions(range.anchor, range.focus) <= 0;
-    const start = ordered ? range.anchor : range.focus;
-    const end = ordered ? range.focus : range.anchor;
-    const at = resolvePosition(doc, start);
+    const { start, end } = orderRange(at);
+    const where = resolvePosition(doc, start);
     resolvePosition(doc, end);
     if (inTextBox(start.path)) bad('The content of a text box cannot be edited');
     if (start.path.length !== end.path.length || start.path.some((value, i) => value !== end.path[i])) bad('A hyperlink must lie in one paragraph');
@@ -426,17 +547,18 @@ export function insertHyperlink(doc: DocModel, range: DocRange, target: string, 
       draft.apply({ type: 'setRelationship', story, id, relationship: { id, type: (doc.strict ? REL_BASE_STRICT : REL_BASE) + '/hyperlink', target, external: true, part: null } });
       link = { kind: 'hyperlink', rId: id, target };
     }
-    const paragraph = at.paragraph;
+    const paragraph = where.paragraph;
     const pieces = flatten(paragraph);
-    const from = boundary(pieces, start.offset, start.offset === end.offset ? 'caret' : 'start');
+    const caret = start.offset === end.offset && (start.before === true) === (end.before === true);
+    const from = caret ? caretIndex(pieces, start) : startIndex(pieces, start);
     let to: number;
-    if (start.offset === end.offset) {
+    if (caret) {
       const props = inheritedProps(pieces, from, paragraph.props.markProps);
       const wrap = wrapBetween(from > 0 ? pieces[from - 1].wrap : undefined, from < pieces.length ? pieces[from].wrap : undefined);
       const added = textPieces(target.replace(/[\t\n\u000b]/g, ' '), props, wrap, {});
       pieces.splice(from, 0, ...added);
       to = from + added.length;
-    } else to = boundary(pieces, end.offset, 'caret');
+    } else to = caretIndex(pieces, end);
     const styled = doc.styles.styles.get('Hyperlink');
     const useStyle = styled !== undefined && styled.type === 'character';
     // The link goes inside the wrappers the text is in, but around tracked changes (which may only hold runs), and
@@ -496,24 +618,42 @@ export function insertHyperlink(doc: DocModel, range: DocRange, target: string, 
 
 export interface NewImage {
   bytes: Uint8Array;
-  /** Media type: "image/png", "image/jpeg", "image/gif", "image/bmp", "image/tiff", "image/x-emf", "image/x-wmf". */
+  /** Media type: "image/png", "image/jpeg", "image/gif", "image/bmp" or "image/webp". The bytes have to begin the way a file of that type does. */
   type: string;
-  /** Size as shown, in EMU (914400 to the inch, 9525 to the CSS pixel). */
+  /** Size as shown, in EMU (914400 to the inch, 9525 to the CSS pixel): whole numbers from 1 to 91440000 (100 inches). */
   width: number;
   height: number;
   /** Alternative text. */
   description?: string;
 }
 
-const IMAGE_EXTENSIONS: Record<string, string> = {
-  'image/png': 'png',
-  'image/jpeg': 'jpeg',
-  'image/gif': 'gif',
-  'image/bmp': 'bmp',
-  'image/tiff': 'tiff',
-  'image/x-emf': 'emf',
-  'image/x-wmf': 'wmf',
+export interface InsertImageOptions extends DocEditOptions {
+  /**
+   * Is a part of this name ("/word/media/image3.png") in the package already?
+   * The commands see the model, not the package: a caller that has the
+   * package says so here, and the new picture gets a name that is free.
+   */
+  taken?: (part: string) => boolean;
+}
+
+const startsWith = (bytes: Uint8Array, signature: number[], at = 0): boolean => {
+  if (bytes.length < at + signature.length) return false;
+  for (let i = 0; i < signature.length; i++) if (bytes[at + i] !== signature[i]) return false;
+  return true;
 };
+
+/** The picture formats every browser shows, with the extension of their part and how a file of the type begins. */
+const IMAGE_TYPES = new Map<string, { extension: string; is: (bytes: Uint8Array) => boolean }>([
+  ['image/png', { extension: 'png', is: (bytes) => startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) }],
+  ['image/jpeg', { extension: 'jpeg', is: (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff]) }],
+  ['image/gif', { extension: 'gif', is: (bytes) => startsWith(bytes, [0x47, 0x49, 0x46, 0x38]) && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61 }],
+  ['image/bmp', { extension: 'bmp', is: (bytes) => startsWith(bytes, [0x42, 0x4d]) && bytes.length >= 6 }],
+  ['image/webp', { extension: 'webp', is: (bytes) => startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) && startsWith(bytes, [0x57, 0x45, 0x42, 0x50], 8) }],
+]);
+
+/** Largest side of a picture, EMU: 100 inches, several times the largest page of Word. */
+const MAX_IMAGE_EMU = 91440000;
+const MAX_DESCRIPTION = 4096;
 
 const DRAWING_NS = {
   wp: 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
@@ -530,13 +670,28 @@ const DRAWING_NS_STRICT = {
 
 const el = (name: string, attrs: [string, string][], children: XmlNode[] = []): XmlElement => ({ type: 'element', name, attrs: new Map(attrs), children });
 
-/** Highest number N among the parts named /word/media/imageN.* the document knows of, and the highest drawing id. */
-function mediaNumbers(doc: DocModel): { image: number; drawing: number } {
-  let image = 0;
-  let drawing = 0;
+/** What the document has in use that a new picture must not take: names of media parts and ids of drawings. */
+interface Taken {
+  /** Highest N among the parts named ".../media/imageN.*". */
+  image: number;
+  /** Names of parts the relationships and DocModel.media refer to, in lower case. */
+  parts: Set<string>;
+  /** Highest id of a drawing or of an object in one (wp:docPr, pic:cNvPr, ...). */
+  drawing: number;
+}
+
+/**
+ * Walks every story of the document (the comments too), into text boxes and
+ * into the trees kept of drawings, legacy pictures and alternate content,
+ * for the names and ids in use.
+ */
+function takenByDocument(doc: DocModel): Taken {
+  const taken: Taken = { image: 0, parts: new Set<string>(), drawing: 0 };
   const part = (name: string | null | undefined) => {
-    const match = name ? /\/media\/image(\d{1,9})\.[^/]*$/.exec(name) : null;
-    if (match && Number(match[1]) > image) image = Number(match[1]);
+    if (!name) return;
+    taken.parts.add(name.toLowerCase());
+    const match = /\/media\/image(\d{1,9})\.[^/]*$/i.exec(name);
+    if (match && Number(match[1]) > taken.image) taken.image = Number(match[1]);
   };
   if (doc.media) doc.media.forEach((_media, name) => part(name));
   const hosts: { relationships: Map<string, { part: string | null }> }[] = [doc.body];
@@ -545,36 +700,60 @@ function mediaNumbers(doc: DocModel): { image: number; drawing: number } {
   for (const collection of [doc.footnotes, doc.endnotes, doc.comments]) if (collection) hosts.push(collection);
   for (const host of hosts) host.relationships.forEach((relationship) => part(relationship.part));
 
+  /** Every id of a docPr or cNvPr element in a kept tree, however deep. */
+  const tree = (root: XmlElement) => {
+    const stack: XmlElement[] = [root];
+    while (stack.length) {
+      const node = stack.pop() as XmlElement;
+      const local = node.name.slice(node.name.indexOf(':') + 1);
+      if (local === 'docPr' || local === 'cNvPr') {
+        const text = node.attrs.get('id');
+        const id = text !== undefined && /^\d{1,10}$/.test(text) ? Number(text) : 0;
+        if (id > taken.drawing && id < 0x7fffffff) taken.drawing = id;
+      }
+      for (const child of node.children) if (child.type === 'element') stack.push(child);
+    }
+  };
+  const wrappers = new Set<Wrapper>();
+  const wrapped = (wrap: Wrapper | undefined) => {
+    for (let w = wrap; w && !wrappers.has(w); w = w.parent) {
+      wrappers.add(w);
+      if (w.kind === 'alternate') tree(w.xml);
+    }
+  };
   const items = (list: RunItem[], depth: number) => {
     for (const item of list) {
-      if (item.type === 'alternate' && depth < 32) items(item.items, depth + 1);
-      if (item.type !== 'drawing') continue;
-      for (const frame of item.xml.children) {
-        if (frame.type !== 'element') continue;
-        for (const child of frame.children) {
-          if (child.type !== 'element' || child.name.slice(child.name.indexOf(':') + 1) !== 'docPr') continue;
-          const id = Number(child.attrs.get('id'));
-          if (id > drawing && id < 0x7fffffff) drawing = id;
-        }
-      }
-      if (item.textBoxes && depth < 32) for (const box of item.textBoxes) blocks(box, depth + 1);
+      if (item.type === 'alternate') {
+        tree(item.xml);
+        if (depth < 64) items(item.items, depth + 1);
+      } else if (item.type === 'drawing' || item.type === 'pict' || item.type === 'object') {
+        tree(item.xml);
+        if (item.textBoxes && depth < 64) for (const box of item.textBoxes) blocks(box, depth + 1);
+      } else if (item.type === 'unknown') tree(item.xml);
     }
   };
   const blocks = (list: Block[], depth: number) => {
-    if (depth > 64) return;
+    if (depth > 256) return;
     for (const block of list) {
+      wrapped(block.wrap);
       if (block.type === 'paragraph') {
-        for (const inline of block.children) if (inline.type === 'run') items(inline.content, depth);
+        for (const inline of block.children) {
+          wrapped(inline.wrap);
+          if (inline.type === 'run') items(inline.content, depth);
+          else if (inline.type === 'unknown') tree(inline.xml);
+        }
       } else if (block.type === 'table') {
         for (const row of block.rows) for (const cell of row.cells) blocks(cell.blocks, depth + 1);
-      }
+      } else if (block.type === 'unknown') tree(block.xml);
     }
   };
   blocks(doc.body.blocks, 0);
-  doc.headers.forEach((story) => blocks(story.blocks, 0));
-  doc.footers.forEach((story) => blocks(story.blocks, 0));
-  for (const collection of [doc.footnotes, doc.endnotes]) if (collection) collection.items.forEach((note) => blocks(note.blocks, 0));
-  return { image, drawing };
+  const stories = new Set<{ blocks: Block[] }>();
+  doc.headers.forEach((story) => stories.add(story));
+  doc.footers.forEach((story) => stories.add(story));
+  stories.forEach((story) => blocks(story.blocks, 0));
+  for (const collection of [doc.footnotes, doc.endnotes, doc.comments]) if (collection) collection.items.forEach((item: { blocks: Block[] }) => blocks(item.blocks, 0));
+  return taken;
 }
 
 /**
@@ -586,19 +765,43 @@ function mediaNumbers(doc: DocModel): { image: number; drawing: number } {
  * has to add every entry of DocModel.media that the package does not hold as
  * a part, with a content type for its extension. Undoing removes the entry
  * and the relationship again.
+ *
+ * N goes on from the highest number among the media parts the model knows
+ * of: those of DocModel.media and of the relationships of every story. Parts
+ * of the package that no story refers to (a picture bullet of the numbering
+ * part) are not in the model: `options.taken` lets the caller answer for the
+ * package, and a name it reports as taken is passed over.
+ *
+ * Throws RangeError for a type other than png, jpeg, gif, bmp and webp, for
+ * bytes that do not begin like a file of the type, and for a size that is
+ * not a whole number of EMU between 1 and 91440000.
  */
-export function insertImage(doc: DocModel, position: DocPosition, image: NewImage, _options?: DocEditOptions): DocEdit {
-  const extension = image && typeof image.type === 'string' ? IMAGE_EXTENSIONS[image.type] : undefined;
-  if (!image || !(image.bytes instanceof Uint8Array) || image.bytes.length === 0) bad('A picture needs its bytes');
-  if (extension === undefined) bad('The type of the picture is not supported');
-  if (!whole(image.width, 1, 0x7fffffff) || !whole(image.height, 1, 0x7fffffff)) bad('The size of the picture is not valid');
+export function insertImage(doc: DocModel, position: DocPosition, image: NewImage, options?: InsertImageOptions): DocEdit {
+  if (!image || typeof image !== 'object') bad('A picture needs its bytes');
+  if (!(image.bytes instanceof Uint8Array) || image.bytes.length === 0) bad('A picture needs its bytes');
+  const kind = typeof image.type === 'string' ? IMAGE_TYPES.get(image.type) : undefined;
+  if (!kind) return bad('The type of the picture is not supported');
+  if (!kind.is(image.bytes)) bad('The bytes of the picture are not of its type');
+  if (!whole(image.width, 1, MAX_IMAGE_EMU) || !whole(image.height, 1, MAX_IMAGE_EMU)) bad('The size of the picture is not valid');
+  if (image.description !== undefined && (typeof image.description !== 'string' || image.description.length > MAX_DESCRIPTION)) bad('The description of the picture is not valid');
+  const isTaken = options ? options.taken : undefined;
+  if (isTaken !== undefined && typeof isTaken !== 'function') bad('The check for names in use must be a function');
+  const description = image.description === undefined ? undefined : cleanText(image.description);
   return buildEdit(doc, (draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     const story = position.story;
     const host = storyOf(doc, story).host;
-    const numbers = mediaNumbers(doc);
-    const name = `/word/media/image${numbers.image + 1}.${extension}`;
+    const taken = takenByDocument(doc);
+    if (taken.drawing >= 0x7ffffffe) bad('The document has no room for another drawing');
+    let number = taken.image + 1;
+    let name = `/word/media/image${number}.${kind.extension}`;
+    // Each turn tries the next number; the caller is asked a bounded number of times.
+    for (let tries = 0; taken.parts.has(name.toLowerCase()) || (isTaken !== undefined && isTaken(name) === true); tries++) {
+      if (tries >= 10000) bad('No name is free for the picture');
+      number++;
+      name = `/word/media/image${number}.${kind.extension}`;
+    }
     const media: DocMedia = { bytes: image.bytes, type: image.type };
     draft.apply({ type: 'setMedia', name, media });
     const rId = freeRelId(host.relationships);
@@ -614,7 +817,7 @@ export function insertImage(doc: DocModel, position: DocPosition, image: NewImag
     const ns = doc.strict ? DRAWING_NS_STRICT : DRAWING_NS;
     let w = 'w';
     for (const [attr, value] of host.rootAttrs) if (attr.indexOf('xmlns:') === 0 && /wordprocessingml\/(2006\/)?main$/.test(value)) w = attr.slice(6);
-    const id = String(numbers.drawing + 1);
+    const id = String(taken.drawing + 1);
     const title = `Picture ${id}`;
     const size: [string, string][] = [
       ['cx', String(image.width)],
@@ -624,7 +827,7 @@ export function insertImage(doc: DocModel, position: DocPosition, image: NewImag
       ['id', id],
       ['name', title],
     ];
-    if (image.description !== undefined) docPr.push(['descr', String(image.description)]);
+    if (description !== undefined) docPr.push(['descr', description]);
     const xml = el(`${w}:drawing`, [], [
       el('wp:inline', [['xmlns:wp', ns.wp], ['distT', '0'], ['distB', '0'], ['distL', '0'], ['distR', '0']], [
         el('wp:extent', size),
@@ -646,11 +849,11 @@ export function insertImage(doc: DocModel, position: DocPosition, image: NewImag
     ]);
     const ref = { rId, target: name };
     const item: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'picture', width: image.width, height: image.height, name: title, images: [{ image: ref }], image: ref, xml };
-    if (image.description !== undefined) item.description = String(image.description);
+    if (description !== undefined) item.description = description;
 
     const paragraph = at.paragraph;
     const pieces = flatten(paragraph);
-    const index = boundary(pieces, position.offset, 'caret');
+    const index = caretIndex(pieces, position);
     const props = inheritedProps(pieces, index, paragraph.props.markProps);
     const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
     pieces.splice(index, 0, itemPiece(item, props, wrap, groupFor(pieces, index, props, wrap)));

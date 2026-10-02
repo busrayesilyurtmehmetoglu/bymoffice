@@ -4,10 +4,12 @@
 // back and hands out the recorded operations; the caller applies them through
 // a DocHistory. A command that throws leaves the document as it was.
 
-import type { TableContext } from '../../formats/docx/resolve';
-import type { Block, DocModel, Paragraph, Table, Wrapper } from '../../model/doc/types';
-import { applyDocOp, tableWithBlocks, type DocOp } from './ops';
-import { collapsed, containerBlocks, inTextBox, storyOf, type DocPosition, type DocRange } from './position';
+import type { Block, DocModel, Paragraph, RunItem, Story, Table, TableCell, Wrapper } from '../../model/doc/types';
+import { applyDocOp, checkSplice, splicedBlocks, type DocOp } from './ops';
+import { READ_ONLY } from './pieces';
+import { collapsed, inTextBox, storyOf, type DocPosition, type DocRange } from './position';
+
+export { tableContextOf } from './position';
 
 /** What a command returns: the operations to apply and the selection they leave. */
 export interface DocEdit {
@@ -42,13 +44,83 @@ function inAlternate(wrap: Wrapper | undefined): boolean {
   return false;
 }
 
-const READ_ONLY = 'This part of the document cannot be edited';
+/** Most blocks handed to Array.splice at once; beyond that the list is built anew. */
+const SPLICE_LIMIT = 4096;
+
+/**
+ * How many copies drafts have made of tables, rows and cells since the module
+ * was loaded. For tests: a command over a large table must copy the table
+ * once, not once per paragraph.
+ */
+export const draftCounters = { tables: 0, rows: 0, cells: 0 };
+
+/** Adds the notes the items of a run refer to, as the ids of their stories ("footnote:2"). */
+function noteRefsOfItems(items: RunItem[], out: Set<string>, depth: number): void {
+  for (const item of items) {
+    if (item.type === 'footnoteReference') out.add('footnote:' + item.id);
+    else if (item.type === 'endnoteReference') out.add('endnote:' + item.id);
+    else if (depth < 64) {
+      if (item.type === 'alternate') noteRefsOfItems(item.items, out, depth + 1);
+      else if ((item.type === 'drawing' || item.type === 'pict' || item.type === 'object') && item.textBoxes) {
+        for (const box of item.textBoxes) noteRefs(box, undefined, undefined, out, depth + 1);
+      }
+    }
+  }
+}
+
+/**
+ * Adds the notes that blocks refer to. Blocks, rows and cells in `skip` are
+ * passed over; the ones visited are added to `seen`.
+ */
+function noteRefs(blocks: Block[], skip: Set<object> | undefined, seen: Set<object> | undefined, out: Set<string>, depth = 0): void {
+  if (depth > 256) return;
+  for (const block of blocks) {
+    if (skip && skip.has(block)) continue;
+    if (seen) seen.add(block);
+    if (block.type === 'paragraph') {
+      for (const inline of block.children) if (inline.type === 'run') noteRefsOfItems(inline.content, out, depth);
+    } else if (block.type === 'table') {
+      for (const row of block.rows) {
+        if (skip && skip.has(row)) continue;
+        if (seen) seen.add(row);
+        for (const cell of row.cells) {
+          if (skip && skip.has(cell)) continue;
+          if (seen) seen.add(cell);
+          noteRefs(cell.blocks, skip, seen, out, depth + 1);
+        }
+      }
+    }
+  }
+}
 
 export class Draft {
   readonly ops: DocOp[] = [];
   private readonly inverses: DocOp[] = [];
+  /** Block-level wrappers this draft has copied (to drop their source span), by the wrapper they were. */
+  private readonly copies = new Map<Wrapper, Wrapper>();
+  /**
+   * Tables, rows and cells this draft made and put into the document. Only
+   * its own operations refer to them, so a further change inside the same
+   * table is made in them directly instead of copying the table again.
+   */
+  private readonly owned = new WeakSet<object>();
+  /** Notes a reference to which was removed: they go when nothing refers to them at the end (see finish). */
+  private readonly unreferenced = new Set<string>();
+  private readonly hasNotes: boolean;
 
-  constructor(readonly doc: DocModel) {}
+  constructor(readonly doc: DocModel) {
+    let notes = false;
+    for (const collection of [doc.footnotes, doc.endnotes]) {
+      if (!collection || notes) continue;
+      for (const note of collection.items.values()) {
+        if (note.kind === undefined) {
+          notes = true;
+          break;
+        }
+      }
+    }
+    this.hasNotes = notes;
+  }
 
   apply(op: DocOp): void {
     this.inverses.push(applyDocOp(this.doc, op));
@@ -63,40 +135,115 @@ export class Draft {
 
   /**
    * Replaces blocks of the list at `path` of a story. What goes into the
-   * story is always a replacement of blocks of the story itself: a change
-   * inside a table replaces the table by a copy.
+   * story is always a replacement of blocks of the story itself: the first
+   * change inside a table replaces the table by a copy (one operation), and
+   * the changes that follow in the same table are made in that copy, so a
+   * command over every cell of a table costs one copy of its list of rows,
+   * one of each row and cell it touches, and one operation.
    *
    * Blocks in a block-level wrapper (a content control around paragraphs)
    * have no source span of their own; the wrapper has it. When such a block
    * changes, the blocks of the wrapper all get a copy of it without the
-   * span, so that the writer does not copy the old text of the wrapper.
+   * span, so that the writer does not copy the old text of the wrapper. The
+   * draft remembers the copy: blocks that come later and still point to the
+   * wrapper as it was are bound to the same copy, so one command leaves one
+   * wrapper however many of its blocks it changes.
    */
   replace(story: string, path: number[], at: number, remove: number, insert: Block[]): void {
     if (inTextBox(path)) bad('The content of a text box cannot be edited');
-    const handle = storyOf(this.doc, story);
-    const top = handle.blocks;
-    if (path.length > 0) {
-      // Everything the path goes through must be content the writer writes from the model.
-      let blocks = top;
-      for (let i = 0; i < path.length; i += 3) {
-        const table = blocks[path[i]];
-        if (!table || table.type !== 'table') return bad('The path does not lead to a table cell');
-        const row = table.rows[path[i + 1]];
-        const cell = row && row.cells[path[i + 2]];
-        if (!cell) return bad('The path does not lead to a table cell');
-        if (inAlternate(table.wrap) || inAlternate(row.wrap) || inAlternate(cell.wrap)) bad(READ_ONLY);
-        blocks = cell.blocks;
-      }
-      for (let i = at; i < at + remove && i < blocks.length; i++) if (inAlternate(blocks[i].wrap)) bad(READ_ONLY);
-      const table = top[path[0]] as Table;
-      this.replaceTop(story, top, path[0], 1, [tableWithBlocks(table, path.slice(1), at, remove, insert)]);
+    const top = storyOf(this.doc, story).blocks;
+    if (path.length === 0) {
+      for (let i = at; i < at + remove && i < top.length; i++) if (inAlternate(top[i].wrap)) bad(READ_ONLY);
+      checkSplice(top, at, remove, insert);
+      this.trackNotes(top, at, remove, insert);
+      this.replaceTop(story, top, at, remove, insert);
       return;
     }
-    for (let i = at; i < at + remove && i < top.length; i++) if (inAlternate(top[i].wrap)) bad(READ_ONLY);
-    this.replaceTop(story, top, at, remove, insert);
+    // Everything the path goes through must be content the writer writes from the model.
+    let blocks = top;
+    for (let i = 0; i < path.length; i += 3) {
+      const table = blocks[path[i]];
+      if (!table || table.type !== 'table') return bad('The path does not lead to a table cell');
+      const row = table.rows[path[i + 1]];
+      const cell = row && row.cells[path[i + 2]];
+      if (!cell) return bad('The path does not lead to a table cell');
+      if (inAlternate(table.wrap) || inAlternate(row.wrap) || inAlternate(cell.wrap)) bad(READ_ONLY);
+      blocks = cell.blocks;
+    }
+    for (let i = at; i < at + remove && i < blocks.length; i++) if (inAlternate(blocks[i].wrap)) bad(READ_ONLY);
+    checkSplice(blocks, at, remove, insert);
+    this.trackNotes(blocks, at, remove, insert);
+
+    let table = top[path[0]] as Table;
+    if (!this.owned.has(table)) {
+      this.replaceTop(story, top, path[0], 1, [this.tableCopy(table)]);
+      // The block that went in may be another object than the copy: one bound to the copy of a wrapper.
+      table = storyOf(this.doc, story).blocks[path[0]] as Table;
+      this.owned.add(table);
+    }
+    let cell = this.ownCell(table, path[1], path[2]);
+    for (let i = 3; i < path.length; i += 3) {
+      let inner = cell.blocks[path[i]] as Table;
+      if (!this.owned.has(inner)) {
+        inner = this.tableCopy(inner);
+        cell.blocks[path[i]] = inner;
+        this.owned.add(inner);
+      }
+      cell = this.ownCell(inner, path[i + 1], path[i + 2]);
+    }
+    if (remove === 1 && insert.length === 1) cell.blocks[at] = insert[0];
+    else if (insert.length <= SPLICE_LIMIT) cell.blocks.splice(at, remove, ...insert);
+    else cell.blocks = splicedBlocks(cell.blocks, at, remove, insert);
   }
 
-  private replaceTop(story: string, top: Block[], at: number, remove: number, insert: Block[]): void {
+  /** A copy of a table with a list of rows of its own, and no source span. */
+  private tableCopy(table: Table): Table {
+    const copy: Table = { ...table, rows: table.rows.slice() };
+    delete copy.srcStart;
+    delete copy.srcEnd;
+    draftCounters.tables++;
+    return copy;
+  }
+
+  /** The cell of a table of this draft as a cell of this draft: the row and the cell are copied the first time. */
+  private ownCell(table: Table, r: number, c: number): TableCell {
+    let row = table.rows[r];
+    if (!this.owned.has(row)) {
+      row = { ...row, cells: row.cells.slice() };
+      table.rows[r] = row;
+      this.owned.add(row);
+      draftCounters.rows++;
+    }
+    let cell = row.cells[c];
+    if (!this.owned.has(cell)) {
+      cell = { ...cell, blocks: cell.blocks.slice() };
+      row.cells[c] = cell;
+      this.owned.add(cell);
+      draftCounters.cells++;
+    }
+    return cell;
+  }
+
+  /** Notes the removed blocks refer to and the inserted ones do not: candidates for removal. */
+  private trackNotes(blocks: Block[], at: number, remove: number, insert: Block[]): void {
+    if (!this.hasNotes || remove === 0) return;
+    const kept = new Set<object>();
+    const still = new Set<string>();
+    noteRefs(insert, undefined, kept, still);
+    const gone = new Set<string>();
+    noteRefs(blocks.slice(at, at + remove), kept, undefined, gone);
+    gone.forEach((ref) => (still.has(ref) ? 0 : this.unreferenced.add(ref)));
+  }
+
+  private replaceTop(story: string, top: Block[], at: number, remove: number, incoming: Block[]): void {
+    // Blocks that still point to a wrapper this draft has copied follow the copy.
+    let insert = incoming;
+    if (this.copies.size) {
+      insert = incoming.map((block) => {
+        const copy = block.wrap && this.copies.get(block.wrap);
+        return copy ? ({ ...block, wrap: copy } as Block) : block;
+      });
+    }
     // Wrappers with a source span among what goes and what comes.
     let spanned: Set<Wrapper> | undefined;
     const note = (block: Block | undefined) => {
@@ -118,7 +265,7 @@ export class Draft {
     let to = at + remove;
     while (from > 0 && inGroup(top[from - 1])) from--;
     while (to < top.length && inGroup(top[to])) to++;
-    const copies = new Map<Wrapper, Wrapper>();
+    const copies = this.copies;
     const copyOf = (wrap: Wrapper): Wrapper => {
       let copy = copies.get(wrap);
       if (!copy) {
@@ -142,6 +289,33 @@ export class Draft {
   setParagraph(story: string, path: number[], paragraph: Paragraph): void {
     this.replace(story, path.slice(0, -1), path[path.length - 1], 1, [paragraph]);
   }
+
+  /**
+   * Ends the command: a note whose last reference the command removed leaves
+   * its collection, in the same undo step, so that the writer does not write
+   * a note nothing refers to. The separators of the notes area stay.
+   */
+  finish(): void {
+    if (this.unreferenced.size === 0) return;
+    const doc = this.doc;
+    const live = new Set<string>();
+    const stories = new Set<Story>([doc.body]);
+    doc.headers.forEach((story) => stories.add(story));
+    doc.footers.forEach((story) => stories.add(story));
+    stories.forEach((story) => noteRefs(story.blocks, undefined, undefined, live));
+    for (const collection of [doc.footnotes, doc.endnotes, doc.comments]) {
+      if (collection) collection.items.forEach((item: { blocks: Block[] }) => noteRefs(item.blocks, undefined, undefined, live));
+    }
+    this.unreferenced.forEach((ref) => {
+      if (live.has(ref)) return;
+      const collection = ref.charAt(0) === 'f' ? doc.footnotes : doc.endnotes;
+      const id = ref.slice(ref.indexOf(':') + 1);
+      // An id no story id can name (storyOf) stays: such a note cannot be edited either.
+      const note = collection && /^-?\d{1,9}$/.test(id) ? collection.items.get(Number(id)) : undefined;
+      if (note && note.kind === undefined) this.apply({ type: 'removeNote', story: ref });
+    });
+    this.unreferenced.clear();
+  }
 }
 
 /** Runs a command on a draft and returns its operations; the document is as before when this returns or throws. */
@@ -149,19 +323,10 @@ export function buildEdit(doc: DocModel, command: (draft: Draft) => DocRange | D
   const draft = new Draft(doc);
   try {
     const result = command(draft);
+    draft.finish();
     if ('selection' in result) return { ...result, ops: draft.ops };
     return { ops: draft.ops, selection: 'anchor' in result ? result : collapsed(result) };
   } finally {
     draft.rollback();
   }
-}
-
-/** Where a paragraph sits when its path goes through a table: what the style resolution needs. */
-export function tableContextOf(doc: DocModel, story: string, path: number[]): TableContext | undefined {
-  if (path.length < 4 || path[path.length - 4] === -1) return undefined;
-  const tablePath = path.slice(0, -3);
-  const blocks = containerBlocks(doc, story, tablePath.slice(0, -1));
-  const table = blocks[tablePath[tablePath.length - 1]];
-  if (!table || table.type !== 'table') return undefined;
-  return { table, row: path[path.length - 3], cell: path[path.length - 2] };
 }

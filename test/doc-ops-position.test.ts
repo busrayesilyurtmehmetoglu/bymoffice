@@ -209,7 +209,7 @@ test('every offset of every paragraph of random documents names the item that ho
           if (inline.type === 'math') assert.equal(inline.text.charAt(at.char), text.charAt(offset));
           else {
             const item = (inline as Run).content[at.item];
-            const shown = item.type === 'text' ? item.text.charAt(at.char) : item.type === 'tab' ? '\t' : item.type === 'break' ? '\n' : undefined;
+            const shown = item.type === 'text' ? item.text.charAt(at.char) : item.type === 'tab' ? '\t' : item.type === 'break' ? '\n' : item.type === 'noBreakHyphen' ? String.fromCharCode(0x2011) : undefined;
             assert.equal(shown, text.charAt(offset), `${story} ${path.join('.')}+${offset}`);
           }
         }

@@ -21,6 +21,9 @@ import { buildEdit, tableContextOf, type Draft, type DocEdit } from './draft';
 import { boundary, flatten, inheritedProps, markRunProps, paragraphWith, rebuild, sameInlines, sameProps, type Piece } from './pieces';
 import { asRange, containerBlocks, inTextBox, isCollapsed, orderRange, paragraphLength, paragraphsBetween, resolvePosition, type DocPosition, type DocRange } from './position';
 
+// Patches come from the caller of the editor, who may hand over anything: every field is checked before it reaches
+// the model, where the writer would put it into the file.
+
 const bad = (message: string): never => {
   throw new RangeError(message);
 };
@@ -49,8 +52,108 @@ export interface RunFormatPatch {
   style?: string | null;
 }
 
-/** Run properties with a patch laid over them: the same object when nothing changes. */
-export function patchRunProps(props: RunProps, patch: RunFormatPatch): RunProps {
+const RUN_PATCH_KEYS = new Set<string>(['bold', 'italic', 'underline', 'strike', 'font', 'size', 'color', 'highlight', 'vertAlign', 'style']);
+
+/** ST_Underline. */
+const UNDERLINES = new Set<string>([
+  'single',
+  'words',
+  'double',
+  'thick',
+  'dotted',
+  'dottedHeavy',
+  'dash',
+  'dashedHeavy',
+  'dashLong',
+  'dashLongHeavy',
+  'dotDash',
+  'dashDotHeavy',
+  'dotDotDash',
+  'dashDotDotHeavy',
+  'wave',
+  'wavyHeavy',
+  'wavyDouble',
+  'none',
+]);
+
+/** ST_HighlightColor. */
+const HIGHLIGHTS = new Set<string>([
+  'black',
+  'blue',
+  'cyan',
+  'green',
+  'magenta',
+  'red',
+  'yellow',
+  'white',
+  'darkBlue',
+  'darkCyan',
+  'darkGreen',
+  'darkMagenta',
+  'darkRed',
+  'darkYellow',
+  'darkGray',
+  'lightGray',
+  'none',
+]);
+
+const COLOR_KEYS = new Set<string>(['rgb', 'auto', 'theme', 'tint', 'shade']);
+
+/** A patch is an object of known properties. */
+function checkPatch(patch: unknown, keys: Set<string>, what: string): void {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) bad(`A change of ${what} formatting must be an object`);
+  for (const key of Object.keys(patch as object)) if (!keys.has(key)) bad(`"${key}" is not a property of ${what} formatting that can be set`);
+}
+
+function checkFlag(value: unknown, name: string): void {
+  if (value !== undefined && value !== null && typeof value !== 'boolean') bad(`"${name}" must be true, false or null`);
+}
+
+const isWhole = (value: unknown, min: number, max: number): value is number => typeof value === 'number' && value >= min && value <= max && Math.floor(value) === value;
+
+/** A colour of a patch as a colour of the model: a copy, checked field by field. */
+function patchColor(color: unknown): DocColor {
+  if (typeof color === 'string') {
+    if (color === 'auto') return { auto: true };
+    if (/^[0-9A-Fa-f]{6}$/.test(color)) return { rgb: color.toUpperCase() };
+    return bad('The colour is not valid');
+  }
+  if (color === null || typeof color !== 'object' || Array.isArray(color)) return bad('The colour is not valid');
+  const given = color as Record<string, unknown>;
+  const out: DocColor = {};
+  for (const key of Object.keys(given)) {
+    const value = given[key];
+    if (value === undefined) continue;
+    if (!COLOR_KEYS.has(key)) return bad('The colour is not valid');
+    if (key === 'rgb') {
+      if (typeof value !== 'string' || !/^[0-9A-Fa-f]{6}$/.test(value)) return bad('The colour is not valid');
+      out.rgb = value.toUpperCase();
+    } else if (key === 'auto') {
+      if (typeof value !== 'boolean') return bad('The colour is not valid');
+      if (value) out.auto = true;
+    } else if (key === 'theme') {
+      if (typeof value !== 'string' || !/^[A-Za-z0-9]{1,32}$/.test(value)) return bad('The colour is not valid');
+      out.theme = value;
+    } else {
+      if (!isWhole(value, 0, 255)) return bad('The colour is not valid');
+      out[key as 'tint' | 'shade'] = value;
+    }
+  }
+  if (out.rgb === undefined && out.auto === undefined && out.theme === undefined) return bad('The colour is not valid');
+  return out;
+}
+
+/**
+ * Run properties with a patch laid over them: the same object when nothing
+ * changes. Every field of the patch is checked; what is not a valid value,
+ * and a property the patch cannot set, throws RangeError. With `doc`, a
+ * character style has to be one of the document.
+ */
+export function patchRunProps(props: RunProps, patch: RunFormatPatch, doc?: DocModel): RunProps {
+  checkPatch(patch, RUN_PATCH_KEYS, 'character');
+  checkFlag(patch.bold, 'bold');
+  checkFlag(patch.italic, 'italic');
+  checkFlag(patch.strike, 'strike');
   const out: RunProps = { ...props };
   const set = <K extends keyof RunProps>(key: K, value: RunProps[K] | null | undefined) => {
     if (value === undefined) return;
@@ -65,7 +168,7 @@ export function patchRunProps(props: RunProps, patch: RunFormatPatch): RunProps 
   if (patch.strike === true) delete out.doubleStrike;
   if (patch.underline !== undefined) {
     const u = patch.underline;
-    if (u !== null && typeof u !== 'boolean' && (typeof u !== 'string' || !/^[A-Za-z]{1,32}$/.test(u))) bad('The kind of underline is not valid');
+    if (u !== null && typeof u !== 'boolean' && (typeof u !== 'string' || !UNDERLINES.has(u))) bad('The kind of underline is not valid');
     set('underline', u === null ? null : { style: u === true ? 'single' : u === false ? 'none' : u });
   }
   if (patch.font !== undefined) {
@@ -79,20 +182,17 @@ export function patchRunProps(props: RunProps, patch: RunFormatPatch): RunProps 
   }
   if (patch.size !== undefined) {
     const size = patch.size;
-    if (size !== null && !(typeof size === 'number' && size >= 2 && size <= 3276 && Math.floor(size) === size)) bad('The font size is not valid');
+    // Half-points: 1 pt to 1638 pt, the sizes Word takes.
+    if (size !== null && !isWhole(size, 2, 3276)) bad('The font size is not valid');
     set('size', size);
     set('sizeCs', size);
   }
   if (patch.color !== undefined) {
-    const color = patch.color;
-    if (typeof color === 'string') {
-      if (color === 'auto') out.color = { auto: true };
-      else if (/^[0-9A-Fa-f]{6}$/.test(color)) out.color = { rgb: color.toUpperCase() };
-      else bad('The colour is not valid');
-    } else set('color', color);
+    if (patch.color === null) delete out.color;
+    else out.color = patchColor(patch.color);
   }
   if (patch.highlight !== undefined) {
-    if (patch.highlight !== null && !/^[A-Za-z]{1,32}$/.test(String(patch.highlight))) bad('The highlight colour is not valid');
+    if (patch.highlight !== null && (typeof patch.highlight !== 'string' || !HIGHLIGHTS.has(patch.highlight))) bad('The highlight colour is not valid');
     set('highlight', patch.highlight);
   }
   if (patch.vertAlign !== undefined) {
@@ -101,11 +201,19 @@ export function patchRunProps(props: RunProps, patch: RunFormatPatch): RunProps 
     set('vertAlign', v);
   }
   if (patch.style !== undefined) {
-    if (patch.style !== null && (typeof patch.style !== 'string' || patch.style === '')) bad('The style id is not valid');
+    if (patch.style !== null) checkStyle(doc, patch.style, 'character');
     set('style', patch.style);
   }
   if (sameProps(out, props)) return props;
   return Object.keys(out).length ? out : EMPTY_RUN_PROPS;
+}
+
+/** A style id of a patch: a text, and with `doc` the id of a style of the right type. */
+function checkStyle(doc: DocModel | undefined, id: unknown, type: 'character' | 'paragraph'): void {
+  if (typeof id !== 'string' || id === '' || id.length > 255) bad('The style id is not valid');
+  if (!doc) return;
+  const style = doc.styles.styles.get(id as string);
+  if (!style || style.type !== type) bad(`The document has no ${type} style with this id`);
 }
 
 /** One paragraph of a range, with the part of it the range covers. */
@@ -114,6 +222,9 @@ interface Covered {
   paragraph: Paragraph;
   from: number;
   to: number;
+  /** DocPosition.before of the ends of the range, where they are in this paragraph. */
+  fromBefore: boolean;
+  toBefore: boolean;
   /** The range goes on after the paragraph: its mark is covered too. */
   mark: boolean;
 }
@@ -128,12 +239,25 @@ function coveredParagraphs(doc: DocModel, range: DocRange): { story: string; lis
   const list: Covered[] = [];
   for (let i = 0; i < paths.length; i++) {
     const path = paths[i];
-    const blocks = containerBlocks(doc, story, path.slice(0, -1));
-    const paragraph = blocks[path[path.length - 1]] as Paragraph;
+    const paragraph = paragraphAt(doc, story, path);
     const last = i === paths.length - 1;
-    list.push({ path, paragraph, from: i === 0 ? start.offset : 0, to: last ? end.offset : paragraphLength(paragraph), mark: !last });
+    list.push({
+      path,
+      paragraph,
+      from: i === 0 ? start.offset : 0,
+      to: last ? end.offset : paragraphLength(paragraph),
+      fromBefore: i === 0 && start.before === true,
+      toBefore: last && end.before === true,
+      mark: !last,
+    });
   }
   return { story, list };
+}
+
+/** The paragraph at a path as the document has it now. */
+function paragraphAt(doc: DocModel, story: string, path: number[]): Paragraph {
+  const blocks = containerBlocks(doc, story, path.slice(0, -1));
+  return blocks[path[path.length - 1]] as Paragraph;
 }
 
 const editable = (range: DocRange): void => {
@@ -143,15 +267,35 @@ const editable = (range: DocRange): void => {
 /** May this piece take character formatting: shown content of a run, not the marks of a field. */
 const formattable = (piece: Piece): boolean => piece.item !== undefined && !piece.code && !piece.frozen && piece.item.type !== 'fieldChar';
 
+/** Applies a change to the formatting of a paragraph mark; returns the properties of the paragraph, the same object when nothing changes. */
+function withMark(props: ParaProps, next: RunProps): ParaProps {
+  const out: ParaProps = { ...props, markProps: next };
+  if (next === EMPTY_RUN_PROPS || Object.keys(next).length === 0) delete out.markProps;
+  return Object.keys(out).length ? out : EMPTY_PARA_PROPS;
+}
+
 function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, paragraph: Paragraph, where: TableContext | undefined) => RunProps): void {
   editable(range);
+  if (isCollapsed(range)) {
+    // A caret. In an empty paragraph the formatting goes onto the paragraph mark, which text typed there takes
+    // over (what Word does); in a paragraph with text there is nothing to format: the caller keeps the format
+    // for what is typed next (see insertText).
+    const at = resolvePosition(draft.doc, range.anchor);
+    if (at.length !== 0) return;
+    const paragraph = at.paragraph;
+    const mark = paragraph.props.markProps || EMPTY_RUN_PROPS;
+    const next = change(mark, paragraph, tableContextOf(draft.doc, range.anchor.story, range.anchor.path));
+    if (next !== mark) draft.setParagraph(range.anchor.story, range.anchor.path, paragraphWith(paragraph, paragraph.children, withMark(paragraph.props, next)));
+    return;
+  }
   const { story, list } = coveredParagraphs(draft.doc, range);
   for (const part of list) {
-    const paragraph = part.paragraph;
+    // As the draft has it now: an earlier step of this command may have put another object there (see Draft.replace).
+    const paragraph = paragraphAt(draft.doc, story, part.path);
     const where = tableContextOf(draft.doc, story, part.path);
     const pieces = flatten(paragraph);
-    const from = boundary(pieces, part.from, 'start');
-    const to = boundary(pieces, part.to, 'caret');
+    const from = boundary(pieces, part.from, 'start', part.fromBefore);
+    const to = boundary(pieces, part.to, 'caret', part.toBefore);
     // Runs share their properties: each bag is changed once.
     const memo = new Map<RunProps, RunProps>();
     const changed = (props: RunProps): RunProps => {
@@ -170,10 +314,7 @@ function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, pa
       // The paragraph mark is in the range: what is typed at the end of the paragraph is formatted alike.
       const mark = props.markProps || EMPTY_RUN_PROPS;
       const next = change(mark, paragraph, where);
-      if (next !== mark) {
-        props = { ...props, markProps: next };
-        if (next === EMPTY_RUN_PROPS) delete props.markProps;
-      }
+      if (next !== mark) props = withMark(props, next);
     }
     const children = rebuild(pieces);
     if (props === paragraph.props && sameInlines(children, paragraph.children)) continue;
@@ -181,13 +322,26 @@ function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, pa
   }
 }
 
-/** Sets character formatting on the text of a range. A collapsed range changes nothing: the caller keeps the format for what is typed next (see insertText). */
+/**
+ * Sets character formatting on the text of a range. At a caret (a collapsed
+ * range) in an empty paragraph the formatting is set on the paragraph mark,
+ * so that text typed there takes it; at a caret in a paragraph with text
+ * nothing changes: the caller keeps the format for what is typed next (see
+ * insertText). An end of the range with `before` set leaves out the picture
+ * at its offset, a start with it takes that picture in.
+ */
 export function setRunFormat(doc: DocModel, range: DocRange, patch: RunFormatPatch): DocEdit {
+  const at = asRange(range);
   return buildEdit(doc, (draft) => {
-    patchRunProps(EMPTY_RUN_PROPS, patch);
-    if (!isCollapsed(range)) mapRunProps(draft, range, (props) => patchRunProps(props, patch));
-    else resolvePosition(doc, range.anchor);
-    return range;
+    patchRunProps(EMPTY_RUN_PROPS, patch, doc);
+    // The change does not depend on the paragraph: each bag of properties is patched once for the whole range.
+    const memo = new Map<RunProps, RunProps>();
+    mapRunProps(draft, at, (props) => {
+      let next = memo.get(props);
+      if (!next) memo.set(props, (next = patchRunProps(props, patch, doc)));
+      return next;
+    });
+    return at;
   });
 }
 
@@ -291,12 +445,12 @@ export function rangeFormat(doc: DocModel, at: DocRange | DocPosition): RangeFor
       return values;
     };
     if (single) {
-      merge(valuesOf(inheritedProps(pieces, boundary(pieces, part.from, 'caret'), paragraph.props.markProps)), RUN_KEYS);
+      merge(valuesOf(inheritedProps(pieces, boundary(pieces, part.from, 'caret', part.fromBefore), paragraph.props.markProps)), RUN_KEYS);
       anyText = true;
       continue;
     }
-    const from = boundary(pieces, part.from, 'start');
-    const to = boundary(pieces, part.to, 'caret');
+    const from = boundary(pieces, part.from, 'start', part.fromBefore);
+    const to = boundary(pieces, part.to, 'caret', part.toBefore);
     for (let q = from; q < to; q++) {
       const piece = pieces[q];
       if (!piece.item || piece.code || piece.len === 0) continue;
@@ -318,20 +472,21 @@ export type ToggleKey = 'bold' | 'italic' | 'underline' | 'strike';
 /**
  * Turns a property on for the whole range, or off when all of the range has
  * it already. Turning off removes the property from the text; where a style
- * still turns it on, it is switched off on the text itself.
+ * still turns it on, it is switched off on the text itself. At a caret see
+ * setRunFormat.
  */
 export function toggleRunFormat(doc: DocModel, range: DocRange, key: ToggleKey): DocEdit {
   if (key !== 'bold' && key !== 'italic' && key !== 'underline' && key !== 'strike') bad('The property cannot be toggled');
-  const on = rangeFormat(doc, range)[key] === true;
-  if (!on) return setRunFormat(doc, range, { [key]: true });
+  const at = asRange(range);
+  const on = rangeFormat(doc, at)[key] === true;
+  if (!on) return setRunFormat(doc, at, { [key]: true });
   return buildEdit(doc, (draft) => {
-    if (isCollapsed(range)) return range;
-    mapRunProps(draft, range, (props, paragraph, where) => {
+    mapRunProps(draft, at, (props, paragraph, where) => {
       const removed = patchRunProps(props, { [key]: null });
       const still = runValues(doc, resolveRunProps(doc, paragraph.props, removed, where), removed)[key] === true;
       return still ? patchRunProps(props, { [key]: false }) : removed;
     });
-    return range;
+    return at;
   });
 }
 
@@ -341,8 +496,9 @@ type Nullable<T> = { [K in keyof T]?: T[K] | null };
 
 /** A change of paragraph formatting; `null` removes a property so that the style decides again. */
 export interface ParaFormatPatch {
+  /** "left", "center", "right", "both" (justified), "start", "end", "distribute", ... as in ST_Jc. */
   align?: string | null;
-  /** Laid over the indents the paragraph states; null removes all of them. */
+  /** Laid over the indents the paragraph states, twips; null removes all of them. */
   indent?: Nullable<Indent> | null;
   spacing?: Nullable<ParaSpacing> | null;
   /** Paragraph style id. */
@@ -357,36 +513,91 @@ export interface ParaFormatPatch {
   outlineLevel?: number | null;
 }
 
-const PARA_PATCH_KEYS = ['align', 'style', 'keepNext', 'keepLines', 'pageBreakBefore', 'widowControl', 'contextualSpacing', 'outlineLevel'] as const;
+const PARA_FLAGS = ['keepNext', 'keepLines', 'pageBreakBefore', 'widowControl', 'contextualSpacing'] as const;
+const PARA_PATCH_KEYS = new Set<string>(['align', 'indent', 'spacing', 'style', 'numbering', 'outlineLevel', ...PARA_FLAGS]);
 
-function patchNested<T extends object>(base: T | undefined, patch: Nullable<T> | null): T | undefined {
+/** ST_Jc. */
+const ALIGNMENTS = new Set<string>(['left', 'center', 'right', 'both', 'start', 'end', 'distribute', 'mediumKashida', 'highKashida', 'lowKashida', 'thaiDistribute', 'numTab']);
+
+/** The widest page of Word, twips: no indent or spacing is larger. */
+const MAX_PARA_TWIPS = 31680;
+
+/** Fields of an indent a patch can set, each with the least value it takes. */
+const INDENT_FIELDS: Record<string, number> = {
+  left: -MAX_PARA_TWIPS,
+  right: -MAX_PARA_TWIPS,
+  firstLine: 0,
+  hanging: 0,
+  leftChars: -MAX_PARA_TWIPS,
+  rightChars: -MAX_PARA_TWIPS,
+  firstLineChars: 0,
+  hangingChars: 0,
+};
+
+const SPACING_FIELDS: Record<string, number> = { before: 0, after: 0, line: 0, beforeLines: 0, afterLines: 0 };
+
+const own = (record: object, key: string): boolean => Object.prototype.hasOwnProperty.call(record, key);
+
+/** A group of properties with a patch laid over it; undefined when nothing is left. */
+function patchNested<T extends object>(base: T | undefined, patch: unknown, check: (key: string, value: unknown) => boolean): T | undefined {
   if (patch === null) return undefined;
+  if (typeof patch !== 'object' || Array.isArray(patch)) return bad('The paragraph format is not valid');
   const out = { ...base } as Record<string, unknown>;
-  for (const key of Object.keys(patch)) {
+  for (const key of Object.keys(patch as object)) {
     const value = (patch as Record<string, unknown>)[key];
+    if (!check(key, value)) return bad('The paragraph format is not valid');
     if (value === undefined) continue;
     if (value === null) delete out[key];
-    else if (typeof value === 'number' ? value !== value || Math.abs(value) > 1000000 : typeof value !== 'boolean' && typeof value !== 'string') bad('The paragraph format is not valid');
     else out[key] = value;
   }
   return Object.keys(out).length ? (out as T) : undefined;
 }
 
-/** Paragraph properties with a patch laid over them: the same object when nothing changes. */
-export function patchParaProps(props: ParaProps, patch: ParaFormatPatch): ParaProps {
+const indentField = (key: string, value: unknown): boolean => own(INDENT_FIELDS, key) && (value === undefined || value === null || isWhole(value, INDENT_FIELDS[key], MAX_PARA_TWIPS));
+
+function spacingField(key: string, value: unknown): boolean {
+  if (value === undefined || value === null) return own(SPACING_FIELDS, key) || key === 'lineRule' || key === 'beforeAuto' || key === 'afterAuto';
+  if (key === 'lineRule') return value === 'auto' || value === 'exact' || value === 'atLeast';
+  if (key === 'beforeAuto' || key === 'afterAuto') return typeof value === 'boolean';
+  return own(SPACING_FIELDS, key) && isWhole(value, SPACING_FIELDS[key], MAX_PARA_TWIPS);
+}
+
+/**
+ * Paragraph properties with a patch laid over them: the same object when
+ * nothing changes. Every field of the patch is checked; what is not a valid
+ * value, and a property the patch cannot set, throws RangeError. With `doc`,
+ * a style has to be a paragraph style of the document and a list one of its
+ * lists.
+ */
+export function patchParaProps(props: ParaProps, patch: ParaFormatPatch, doc?: DocModel): ParaProps {
+  checkPatch(patch, PARA_PATCH_KEYS, 'paragraph');
   const out: ParaProps = { ...props };
-  const target = out as Record<string, unknown>;
-  for (const key of PARA_PATCH_KEYS) {
+  for (const key of PARA_FLAGS) {
     const value = patch[key];
+    checkFlag(value, key);
     if (value === undefined) continue;
-    if (value === null) delete target[key];
-    else target[key] = value;
+    if (value === null) delete out[key];
+    else out[key] = value;
   }
-  if (typeof patch.align === 'string' && !/^[A-Za-z]{1,32}$/.test(patch.align)) bad('The alignment is not valid');
-  if (typeof patch.style === 'string' && patch.style === '') bad('The style id is not valid');
-  if (typeof patch.outlineLevel === 'number' && !(patch.outlineLevel >= 0 && patch.outlineLevel <= 9 && Math.floor(patch.outlineLevel) === patch.outlineLevel)) bad('The outline level is not valid');
+  if (patch.align !== undefined) {
+    if (patch.align === null) delete out.align;
+    else if (typeof patch.align !== 'string' || !ALIGNMENTS.has(patch.align)) bad('The alignment is not valid');
+    else out.align = patch.align;
+  }
+  if (patch.style !== undefined) {
+    if (patch.style === null) delete out.style;
+    else {
+      checkStyle(doc, patch.style, 'paragraph');
+      out.style = patch.style;
+    }
+  }
+  if (patch.outlineLevel !== undefined) {
+    if (patch.outlineLevel === null) delete out.outlineLevel;
+    else if (!isWhole(patch.outlineLevel, 0, 9)) bad('The outline level is not valid');
+    else out.outlineLevel = patch.outlineLevel;
+  }
   if (patch.indent !== undefined) {
-    const indent = patchNested(props.indent, patch.indent);
+    const indent = patchNested(props.indent, patch.indent, indentField);
     if (indent) {
       // A first line indent and a hanging indent replace each other.
       if (patch.indent && typeof patch.indent.firstLine === 'number' && patch.indent.hanging === undefined) delete indent.hanging;
@@ -395,17 +606,20 @@ export function patchParaProps(props: ParaProps, patch: ParaFormatPatch): ParaPr
     } else delete out.indent;
   }
   if (patch.spacing !== undefined) {
-    const spacing = patchNested(props.spacing, patch.spacing);
+    const spacing = patchNested(props.spacing, patch.spacing, spacingField);
     if (spacing) out.spacing = spacing;
     else delete out.spacing;
   }
   if (patch.numbering !== undefined) {
-    const n = patch.numbering;
+    const n = patch.numbering as unknown;
     if (n === null) delete out.numbering;
     else {
-      const whole = (value: number, max: number) => typeof value === 'number' && value >= 0 && value <= max && Math.floor(value) === value;
-      if (!whole(n.numId, 0x7fffffff) || (n.level !== undefined && !whole(n.level, 8))) bad('The numbering is not valid');
-      out.numbering = n.level === undefined ? { numId: n.numId } : { numId: n.numId, level: n.level };
+      if (typeof n !== 'object' || Array.isArray(n)) return bad('The numbering is not valid');
+      const given = n as { numId: unknown; level?: unknown };
+      for (const key of Object.keys(given)) if (key !== 'numId' && key !== 'level') return bad('The numbering is not valid');
+      if (!isWhole(given.numId, 0, 0x7fffffff) || (given.level !== undefined && !isWhole(given.level, 0, 8))) return bad('The numbering is not valid');
+      if (doc && given.numId !== 0 && !doc.numbering.nums.has(given.numId)) return bad('The document has no list with this id');
+      out.numbering = given.level === undefined ? { numId: given.numId } : { numId: given.numId, level: given.level };
     }
   }
   if (sameProps(out, props)) return props;
@@ -416,8 +630,10 @@ function mapParaProps(draft: Draft, range: DocRange, change: (props: ParaProps, 
   editable(range);
   const { story, list } = coveredParagraphs(draft.doc, range);
   for (const part of list) {
-    const next = change(part.paragraph.props, part.paragraph, tableContextOf(draft.doc, story, part.path), part.path);
-    if (next !== part.paragraph.props) draft.setParagraph(story, part.path, paragraphWith(part.paragraph, part.paragraph.children, next));
+    // As the draft has it now: an earlier step of this command may have put another object there (see Draft.replace).
+    const paragraph = paragraphAt(draft.doc, story, part.path);
+    const next = change(paragraph.props, paragraph, tableContextOf(draft.doc, story, part.path), part.path);
+    if (next !== paragraph.props) draft.setParagraph(story, part.path, paragraphWith(paragraph, paragraph.children, next));
   }
 }
 
@@ -425,8 +641,8 @@ function mapParaProps(draft: Draft, range: DocRange, change: (props: ParaProps, 
 export function setParaFormat(doc: DocModel, at: DocRange | DocPosition, patch: ParaFormatPatch): DocEdit {
   const range = asRange(at);
   return buildEdit(doc, (draft) => {
-    patchParaProps(EMPTY_PARA_PROPS, patch);
-    mapParaProps(draft, range, (props) => patchParaProps(props, patch));
+    patchParaProps(EMPTY_PARA_PROPS, patch, doc);
+    mapParaProps(draft, range, (props) => patchParaProps(props, patch, doc));
     return range;
   });
 }

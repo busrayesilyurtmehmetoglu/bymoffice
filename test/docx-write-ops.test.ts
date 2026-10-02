@@ -14,6 +14,8 @@ import { canonicalText, convertedPicture, firstDifference, schemaOrderViolations
 
 const decoder = new TextDecoder();
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 2, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+// insertImage takes only bytes that begin like a file of the type they are given as.
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46, 0]);
 
 interface Opened {
   pkg: OpcPackage;
@@ -158,7 +160,7 @@ test('a picture inserted by an edit: the part, its content type, the relationshi
   const opened = await open({ body: BODY, headers: { rIdH: '<w:p><w:r><w:t>head</w:t></w:r></w:p>' } });
   const { pkg, doc } = opened;
   opened.apply(insertImage(doc, at(0, 5), { bytes: PNG, type: 'image/png', width: 914400, height: 457200, description: 'a picture' }));
-  opened.apply(insertImage(doc, at(0, 0, 'header:rIdH'), { bytes: PNG.slice(), type: 'image/jpeg', width: 100, height: 100 }));
+  opened.apply(insertImage(doc, at(0, 0, 'header:rIdH'), { bytes: JPEG, type: 'image/jpeg', width: 100, height: 100 }));
   await writeDocx(pkg, doc);
   assert.equal(pkg.contentTypeOf('/word/media/image1.png'), 'image/png');
   assert.equal(pkg.contentTypeOf('/word/media/image2.jpeg'), 'image/jpeg');

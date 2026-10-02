@@ -4,7 +4,7 @@ export * from './position';
 export { applyDocOp, applyDocOps, type DocOp } from './ops';
 export { DocHistory } from './history';
 export { buildEdit, Draft, type DocEdit, type DocEditOptions } from './draft';
-export { deleteBackward, deleteForward, deleteRange, insertBlock, insertPageBreak, insertText, splitParagraph } from './text';
+export { deleteBackward, deleteForward, deleteRange, expandRangeForTables, insertBlock, insertPageBreak, insertText, splitParagraph } from './text';
 export {
   indentList,
   patchParaProps,
@@ -19,4 +19,4 @@ export {
   type RunFormatPatch,
   type ToggleKey,
 } from './format';
-export { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertImage, insertRow, insertTable, type NewImage } from './structure';
+export { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertImage, insertRow, insertTable, type InsertImageOptions, type NewImage } from './structure';

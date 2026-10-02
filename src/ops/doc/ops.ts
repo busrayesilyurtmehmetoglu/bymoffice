@@ -9,7 +9,7 @@
 // back by reference, source spans and all, and restores `modified`, so that
 // "edit, undo, save" writes the bytes that were read.
 
-import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, Note, NumInstance, Story, Table, TableCell, TableRow } from '../../model/doc/types';
+import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, Note, NumInstance, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
 import { storyOf, type StoryHandle } from './position';
 
 /** `modified` flag to set after an operation: true when missing, null to remove the flag. */
@@ -34,6 +34,14 @@ export type DocOp =
     }
   /** Puts a note object in the place of the one with its id: what undoes a change of the blocks of a note. */
   | { type: 'setNote'; story: string; note: Note; modified?: Flag }
+  /**
+   * Takes a note ("footnote:<id>", "endnote:<id>") out of its collection: what
+   * follows when the last reference to it is deleted, so that no note is left
+   * that nothing refers to.
+   */
+  | { type: 'removeNote'; story: string; modified?: Flag }
+  /** Puts back the whole table of notes of a kind, in its order: what undoes removeNote. */
+  | { type: 'setNotes'; kind: 'footnote' | 'endnote'; items: Map<number, Note>; modified?: Flag }
   /** Adds, replaces or (null) removes numbering definitions and instances. */
   | { type: 'setNumbering'; abstracts?: [id: number, value: AbstractNum | null][]; nums?: [id: number, value: NumInstance | null][]; modified?: Flag }
   /** Adds, replaces or (null) removes one relationship of the part a story is in. */
@@ -54,7 +62,7 @@ function setFlag(target: { modified?: boolean }, flag: Flag | undefined): Flag {
   return before;
 }
 
-function checkSplice(blocks: Block[], at: number, remove: number, insert: Block[]): void {
+export function checkSplice(blocks: Block[], at: number, remove: number, insert: Block[]): void {
   const whole = (value: number) => typeof value === 'number' && value >= 0 && Math.floor(value) === value;
   if (!whole(at) || !whole(remove) || at + remove > blocks.length) bad('The blocks to replace are outside their list');
   if (!Array.isArray(insert)) bad('The blocks to insert must be a list');
@@ -150,6 +158,24 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
       // Setting an existing key keeps the order of the notes.
       collection.items.set(handle.noteId, op.note);
       return { type: 'setNote', story: op.story, note: handle.note, modified: setFlag(collection, op.modified) };
+    }
+    case 'removeNote': {
+      const handle = storyOf(doc, op.story);
+      if (!handle.note || handle.noteId === undefined || (handle.kind !== 'footnote' && handle.kind !== 'endnote')) return bad('The story is not a note');
+      const collection = handle.host as StoryCollection<Note>;
+      const before = collection.items;
+      // A new table: the old one goes back as it is, with the note at its place among the others.
+      const next = new Map(before);
+      next.delete(handle.noteId);
+      collection.items = next;
+      return { type: 'setNotes', kind: handle.kind, items: before, modified: setFlag(collection, op.modified) };
+    }
+    case 'setNotes': {
+      const collection = op.kind === 'footnote' ? doc.footnotes : op.kind === 'endnote' ? doc.endnotes : undefined;
+      if (!collection || !(op.items instanceof Map)) return bad('The document has no such notes');
+      const before = collection.items;
+      collection.items = op.items;
+      return { type: 'setNotes', kind: op.kind, items: before, modified: setFlag(collection, op.modified) };
     }
     case 'setNumbering': {
       const numbering = doc.numbering;

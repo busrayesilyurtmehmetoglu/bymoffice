@@ -201,7 +201,8 @@ test('hyperlinks: to a bookmark, over an existing link, with a style, with a car
   assert.equal(doc.body.relationships.size, size + 1);
 });
 
-const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
 
 test('a picture: bytes in doc.media under a new part name, a relationship, and a drawing the layout shows', async () => {
   const doc = await open({ body: p('ab') + p('cd'), headers: { rIdH: p('header') }, parts: [['word/media/image4.png', PNG]], rels: [['rId3', 'image', 'media/image4.png']] });
@@ -230,7 +231,7 @@ test('a picture: bytes in doc.media under a new part name, a relationship, and a
   const image = layout.pages[0].items.find((item) => item.type === 'image');
   assert.ok(image && image.type === 'image' && image.width === 100 && image.height === 50 && image.part === '/word/media/image5.png');
   // A second picture, in the header: another part name, a relationship of the header part, another drawing id.
-  run(h, insertImage(doc, pos(0, 0, 'header:rIdH'), { bytes: PNG, type: 'image/jpeg', width: 9525, height: 9525 }));
+  run(h, insertImage(doc, pos(0, 0, 'header:rIdH'), { bytes: JPEG, type: 'image/jpeg', width: 9525, height: 9525 }));
   assert.deepEqual(Array.from(doc.media!.keys()), ['/word/media/image5.png', '/word/media/image6.jpeg']);
   const header = doc.headers.get('rIdH')!;
   assert.equal(header.relationships.size, 1);
