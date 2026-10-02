@@ -84,6 +84,8 @@ export interface HistoryMark {
    * when rows or columns moved or too many cells changed, which recalculates everything.
    */
   cells?: { sheet: number; row: number; col: number }[];
+  /** Sheets on which the step hid or showed rows (by hand, by a filter): SUBTOTAL and AGGREGATE read that. */
+  rows?: number[];
 }
 
 /** Longest a recalculation holds the page before it leaves the rest for the next turn. */
@@ -1349,6 +1351,7 @@ export class WorkbookView {
       add(engine.mismatched, 'file');
       add(engine.unsupported, 'file');
       add(engine.unparsed, 'file');
+      add(engine.cycles(), 'circular');
       add(engine.circular, 'circular');
     } catch (error) {
       // Lists that cannot be read give no marks.
@@ -2296,12 +2299,13 @@ export class WorkbookView {
    * A failure here must never get in the way of editing: the cells then keep
    * the values they had.
    */
-  private recalculate(cells: HistoryMark['cells']): number[] {
+  private recalculate(cells: HistoryMark['cells'], rows?: number[]): number[] {
     if (this.options.calculate === false) return [];
     try {
       if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
       this.marksDirty = true;
       if (!cells) this.engine.invalidate();
+      else if (rows) for (let i = 0; i < rows.length; i++) this.engine.rowsChanged(rows[i]);
       // After rows or columns moved every result may have changed for a reason the engine cannot
       // see in the cells (a deleted row makes a sum smaller), so the values of the file give way.
       const changed = cells ? this.engine.recalculate(cells) : this.engine.recalculate(undefined, { overwrite: true });
@@ -2353,11 +2357,13 @@ export class WorkbookView {
     // Anything but a change of cells can change sizes, hidden runs or merged cells of its sheet.
     let structural = false;
     let moves = false;
+    let rows: number[] | undefined;
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
       if (op.type !== 'setCells') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
+      if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }
     // Rows and columns that move take the formulas of every other sheet with them.
     if (moves) for (let i = 0; i < this.workbook.sheets.length; i++) if (sheets.indexOf(i) < 0) sheets.push(i);
@@ -2379,7 +2385,9 @@ export class WorkbookView {
     }
     before.cells = cells;
     done.cells = cells;
-    this.addSheets(sheets, this.recalculate(cells));
+    before.rows = rows;
+    done.rows = rows;
+    this.addSheets(sheets, this.recalculate(cells, rows));
     this.afterChange(sheets, structural, after);
     return true;
   }
@@ -2396,7 +2404,7 @@ export class WorkbookView {
     const meta = step.meta;
     if (meta.sheet !== this.sheetIndex && meta.sheet >= 0 && meta.sheet < this.workbook.sheets.length) this.setActiveSheet(meta.sheet);
     const sheets = meta.sheets.slice();
-    this.addSheets(sheets, this.recalculate(meta.cells));
+    this.addSheets(sheets, this.recalculate(meta.cells, meta.rows));
     this.afterChange(sheets, meta.structural, meta);
     return true;
   }

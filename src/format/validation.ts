@@ -495,24 +495,17 @@ export class DataValidations {
       }
       return 'done';
     }
-    // Any other formula (OFFSET, INDIRECT, ...): the engine is asked for its values one by one.
+    // Any other formula (OFFSET, INDIRECT, ...): the engine gives all of its values at once.
     const engine = this.engine();
     if (!engine) return 'unknown';
-    const anchor = { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol };
-    const at = { row, col };
-    return engine.batch(() => {
-      const count = engine.evaluateShifted(`ROWS(${source.text})*COLUMNS(${source.text})`, anchor, at);
-      if (typeof count !== 'number' || !(count >= 1)) return 'unknown';
-      const single = engine.evaluateShifted(`ROWS(${source.text})`, anchor, at) === 1;
-      const last = Math.min(Math.floor(count), MAX_LIST_ITEMS);
-      for (let i = 1; i <= last; i++) {
-        const value = engine.evaluateShifted(single ? `INDEX(${source.text},1,${i})` : `INDEX(${source.text},${i})`, anchor, at);
-        if (value === null || value === '' || typeof value === 'object') continue;
-        const plain = value as Plain;
-        if (visit(plain, () => (typeof plain === 'string' ? plain : formatValue(plain, 'General', { locale }).text))) return 'done';
-      }
-      return count > last ? 'cut' : 'done';
-    });
+    const found = engine.evaluateRange(source.text, { sheet: this.sheetIndex(), row, col }, { anchor: { row: entry.anchorRow, col: entry.anchorCol }, maxCells: MAX_SOURCE_CELLS });
+    if (!('values' in found) || found.values.length === 0) return 'unknown';
+    for (const value of found.values) {
+      if (value === null || value === '' || typeof value === 'object') continue;
+      const plain = value as Plain;
+      if (visit(plain, () => (typeof plain === 'string' ? plain : formatValue(plain, 'General', { locale }).text))) return 'done';
+    }
+    return found.truncated ? 'cut' : 'done';
   }
 
   private inList(entry: Entry, value: Plain, typed: string, row: number, col: number): boolean | undefined {

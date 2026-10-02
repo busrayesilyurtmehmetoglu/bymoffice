@@ -263,22 +263,56 @@ function nestedSubtotals(context: CalcContext): ((sheet: number, row: number, co
   };
 }
 
+// Which hidden rows are left out.
+const HIDDEN_NONE = 0;
+/** Rows a filter hides. */
+const HIDDEN_FILTERED = 1;
+/** Every hidden row. */
+const HIDDEN_ALL = 2;
+
+/**
+ * The test for the cells SUBTOTAL and AGGREGATE leave out: those of hidden rows, and those
+ * that hold a subtotal of their own when `nested` is set. Undefined when nothing is left out.
+ */
+function skippedCells(context: CalcContext, hidden: number, nested: boolean): NumberRules['skipCell'] {
+  const subtotals = nested ? nestedSubtotals(context) : undefined;
+  const asked = hidden === HIDDEN_ALL ? context.rowHidden : hidden === HIDDEN_FILTERED ? context.rowFiltered : undefined;
+  if (asked === undefined) return subtotals;
+  // Cells arrive row by row: the answer for a row is asked once.
+  let lastSheet = -1;
+  let lastRow = -1;
+  let lastHidden = false;
+  return (sheet, row, col) => {
+    if (row !== lastRow || sheet !== lastSheet) {
+      lastSheet = sheet;
+      lastRow = row;
+      lastHidden = asked.call(context, sheet, row) === true;
+    }
+    return lastHidden || (subtotals !== undefined && subtotals(sheet, row, col));
+  };
+}
+
 // Both ranges of function numbers leave out the cells of the ranges that hold a SUBTOTAL
 // (or AGGREGATE) formula of their own, so that subtotals can be stacked without counting
-// anything twice. Function numbers 101 to 111 also leave out rows hidden by hand, and both
-// ranges rows hidden by a filter; the context does not tell which rows are hidden, so
-// those are included.
+// anything twice, and the rows a filter hides. Function numbers 101 to 111 also leave out
+// rows hidden by hand. Hidden columns are never left out.
 const subtotal: CalcFunction = (args, context) => {
   const code = scalarNumber(first(args[0], context), context);
   if (typeof code !== 'number') return code;
   let kind = Math.floor(code);
-  if (kind >= 101 && kind <= 111) kind -= 100;
+  let hidden = HIDDEN_FILTERED;
+  if (kind >= 101 && kind <= 111) {
+    kind -= 100;
+    hidden = HIDDEN_ALL;
+  }
   if (!(kind >= 1 && kind <= 11)) return ERROR_VALUE;
-  return aggregate(kind, args.slice(1), context, { skipCell: nestedSubtotals(context) });
+  return aggregate(kind, args.slice(1), context, { skipCell: skippedCells(context, hidden, true) });
 };
 
 // Options 0 to 7 choose what to leave out: nested SUBTOTAL and AGGREGATE results (0 to 3),
-// hidden rows (1, 3, 5, 7; not known here), errors (2, 3, 6, 7).
+// hidden rows, however they were hidden (1, 3, 5, 7), errors (2, 3, 6, 7).
+// UNSURE: whether Excel leaves out rows hidden by a filter with the options that do not name
+// hidden rows (0, 2, 4, 6), as SUBTOTAL 1 to 11 does; here they are counted.
 const aggregateFunction: CalcFunction = (args, context) => {
   const code = scalarNumber(first(args[0], context), context);
   if (typeof code !== 'number') return code;
@@ -289,7 +323,7 @@ const aggregateFunction: CalcFunction = (args, context) => {
   if (!(kind >= 1 && kind <= 19) || !(choice >= 0 && choice <= 7)) return ERROR_VALUE;
   const rules: NumberRules = {};
   if (choice === 2 || choice === 3 || choice === 6 || choice === 7) rules.skipErrors = true;
-  if (choice <= 3) rules.skipCell = nestedSubtotals(context);
+  rules.skipCell = skippedCells(context, choice % 2 === 1 ? HIDDEN_ALL : HIDDEN_NONE, choice <= 3);
   if (kind <= 13) return aggregate(kind, args.slice(2), context, rules);
   if (args.length !== 4) return ERROR_VALUE;
   const k = scalarNumber(first(args[3], context), context);

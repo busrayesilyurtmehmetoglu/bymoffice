@@ -415,6 +415,13 @@ export interface CalcContext {
    * Throws to give the calculation up when the budget is used up; functions let that pass.
    */
   tick?(units: number): void;
+  /** Whether a row is hidden, by hand or by a filter. Without it no row counts as hidden. */
+  rowHidden?(sheet: number, row: number): boolean;
+  /**
+   * Whether a row is hidden and lies among the data rows of a filter that has a criterion:
+   * such rows are left out by every SUBTOTAL, rows hidden otherwise only by SUBTOTAL 101 to 111.
+   */
+  rowFiltered?(sheet: number, row: number): boolean;
 }
 
 /** Largest array a reference is read into. */

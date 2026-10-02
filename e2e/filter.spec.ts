@@ -608,3 +608,36 @@ test.describe('read-only', () => {
     expect(await page.evaluate(() => (window as any).__editor.view.openFilterMenu(1))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// SUBTOTAL follows what the filter hides.
+
+test.describe('filter and calculation', () => {
+  test('SUBTOTAL leaves out the rows a filter hides, and comes back with undo', async ({ page }) => {
+    let data = `<row r="1">${str('A1', 'Kind')}${str('B1', 'Amount')}</row>`;
+    const rows: [string, number][] = [['x', 1], ['y', 2], ['x', 4], ['y', 8], ['x', 16]];
+    rows.forEach(([kind, amount], i) => (data += `<row r="${i + 2}">${str(`A${i + 2}`, kind)}${num(`B${i + 2}`, amount)}</row>`));
+    data +=
+      '<row r="8"><c r="A8"><f>SUBTOTAL(9,B2:B6)</f><v>31</v></c><c r="B8"><f>SUBTOTAL(109,B2:B6)</f><v>31</v></c><c r="C8"><f>SUM(B2:B6)</f><v>31</v></c></row>';
+    await mount(page, await buildXlsx({ sheets: [{ name: 'S', xml: worksheetXml(`<sheetData>${data}</sheetData>`) }] }));
+    const totals = () =>
+      page.evaluate(() => {
+        const api = (window as any).BymOffice;
+        const sheet = (window as any).__editor.view.workbook.sheets[0];
+        return [0, 1, 2].map((col) => api.getCell(sheet, 7, col).value);
+      });
+    await select(page, 'A1');
+    await page.evaluate(() => {
+      const view = (window as any).__editor.view;
+      view.toggleFilter();
+      view.setColumnFilter(0, { values: ['x'] });
+    });
+    expect(await totals()).toEqual([21, 21, 31]);
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(await totals()).toEqual([31, 31, 31]);
+    await page.evaluate(() => (window as any).__editor.view.redo());
+    expect(await totals()).toEqual([21, 21, 31]);
+    await page.evaluate(() => (window as any).__editor.view.setColumnFilter(0, undefined));
+    expect(await totals()).toEqual([31, 31, 31]);
+  });
+});

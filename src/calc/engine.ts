@@ -20,6 +20,10 @@
 // Everything that can take long is done in slices: reading the formulas into the graph,
 // finding the circular references, calculating. A call that runs out of budget returns with
 // `incomplete` set and the next call goes on where it stopped.
+//
+// Two things a formula can depend on are not cells: whether rows are hidden (SUBTOTAL,
+// AGGREGATE) and what the defined names stand for. The formulas that use them are noted
+// when the graph is built, and rowsChanged() and namesChanged() name them as changed.
 
 import { isoToSerial } from '../format/cell-format';
 import { MAX_COLS, MAX_ROWS, parseRange, type Cell, type CellFormula, type CellRange, type Row, type Sheet, type Workbook } from '../model/sheet/types';
@@ -28,7 +32,7 @@ import { EvaluationAbort, evaluate, evaluationDepth, isBuiltinForm, refRange, to
 import { FUNCTIONS } from './functions/index';
 import { parseFormula, type Node } from './parse';
 import { shiftFormula } from './refs';
-import { ERROR_NUM, ERROR_VALUE, arrayAt, calcError, isArray, isError, isRef, parseErrorCode, refToArray, type ArrayValue, type CalcContext, type FunctionSpec, type Scalar, type Value } from './values';
+import { ERROR_NUM, ERROR_VALUE, arrayAt, calcError, isArray, isError, isRef, parseErrorCode, refToArray, type ArrayValue, type CalcContext, type CalcError, type FunctionSpec, type Scalar, type Value } from './values';
 
 /** How much one recalculate() call may cost before it stops with part of the formulas left for the next call. */
 export interface CalcBudget {
@@ -86,6 +90,30 @@ export interface CellAddress {
   col: number;
 }
 
+/** What evaluateRange() gives: every value of a reference or an array. */
+export interface RangeValues {
+  /** Size of the whole result; a reference is cut to the used part of its sheet. */
+  rows: number;
+  cols: number;
+  /** Row by row, null for an empty cell; rows * cols values unless `truncated`. */
+  values: Scalar[];
+  /** The result has more cells than were asked for: `values` holds the first ones only. */
+  truncated: boolean;
+  /** Where the values are, when the formula gave a reference: the sheet and the cells (as cut). */
+  sheet?: number;
+  range?: CellRange;
+}
+
+export interface EvaluateRangeOptions {
+  /** Most values to give; 1,000,000 when omitted, 5,000,000 at most. */
+  maxCells?: number;
+  /**
+   * The cell the formula was written for, when that is not the cell it is calculated for:
+   * relative references move by the distance between the two (see evaluateShifted).
+   */
+  anchor?: { row: number; col: number };
+}
+
 // State of a formula within one recalculation.
 const FRESH = 0;
 const ACTIVE = 1;
@@ -120,6 +148,10 @@ interface FormulaRec {
   arrayMode: boolean;
   /** One of its references names its own cell. */
   selfRef: boolean;
+  /** Calls SUBTOTAL or AGGREGATE, itself or through a name: what it is worth depends on which rows are hidden. */
+  rowAware: boolean;
+  /** The defined names it uses, itself or through other names, in upper case; also those the workbook lacks. */
+  names?: string[];
   /** Could not be calculated within the hard budget; left alone until something it reads changes. */
   costly: boolean;
   /** Cells an array formula fills, when there is more than one. */
@@ -299,6 +331,9 @@ const DIRECT_ROWS = 32;
 /** Calculated whenever anything changed. */
 const VOLATILE = new Set(['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY', 'OFFSET', 'INDIRECT']);
 
+/** They leave hidden rows out: their value changes when rows are hidden or shown. */
+const ROW_AWARE = new Set(['SUBTOTAL', 'AGGREGATE']);
+
 /** Their value changes although no cell did. */
 const TIMED = new Set(['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY']);
 
@@ -311,6 +346,10 @@ const UNSUPPORTED_FORMS = new Set(['LET', 'LAMBDA']);
 /** What CELL can tell: the first three only ask where the cell is. */
 const CELL_WHERE = new Set(['row', 'col', 'address']);
 const CELL_INFO = new Set(['row', 'col', 'address', 'contents']);
+
+/** Values evaluateRange() gives when no limit is asked for, and the most it ever gives. */
+const DEFAULT_RANGE_VALUES = 1000000;
+const MAX_RANGE_VALUES = 5000000;
 
 const DEFAULT_MILLISECONDS = 5000;
 const MIN_HARD_MILLISECONDS = 2000;
@@ -468,6 +507,18 @@ export class CalcEngine {
   private sheetByName = new Map<string, number>();
   private names = new Map<string, { global?: NameEntry; local?: Map<number, NameEntry> }>();
   private volatiles = new Set<FormulaRec>();
+  /** Formulas whose value depends on which rows are hidden. */
+  private rowAware = new Set<FormulaRec>();
+  /** Formulas that name their own cell. */
+  private selfRefs = new Set<FormulaRec>();
+  /** Formulas that use defined names. */
+  private named = new Set<FormulaRec>();
+  /** The names used by formulas listed in `unsupported`, by the key of the cell there. */
+  private unsupportedNames = new Map<string, string[]>();
+  /** Names met by supports(), for the formula being read. */
+  private metNames: string[] = [];
+  /** Sheets whose hidden rows changed since the formulas that care were last marked. */
+  private rowSheets = new Set<number>();
   private unparsedCells = new Map<string, CellAddress>();
   private unsupportedCells = new Map<string, CellAddress>();
   private costlyCells = new Map<string, CellAddress>();
@@ -578,6 +629,8 @@ export class CalcEngine {
         return value;
       },
       tick: (units) => engine.spend(units),
+      rowHidden: (sheet, row) => engine.rowHidden(sheet, row, false),
+      rowFiltered: (sheet, row) => engine.rowHidden(sheet, row, true),
     };
     this.evalOptions = {
       resolveName: (name, sheet) => engine.resolveName(name, sheet),
@@ -730,9 +783,11 @@ export class CalcEngine {
     const pending = this.first !== undefined || this.cursor < this.dirty.length;
     // Marking every formula takes a while in a large workbook: not at the end of a call that built the graph.
     if (all && this.outOfTime()) return [];
+    // Rows were hidden or shown: a change for the formulas that leave hidden rows out.
+    const rowReaders = this.rowReaders();
     // A call that only goes on with what was left takes it up where the last one stopped: what is
     // done stays done, and what functions keep for a recalculation is still good.
-    if (all || changes || !pending) this.begin(all, changes, pending);
+    if (all || changes || rowReaders.length > 0 || !pending) this.begin(all, changes, pending, rowReaders);
     this.calculateAll();
     this.flush();
     // Formulas that turned out to have been changed behind the engine's back are read again for next time.
@@ -753,7 +808,7 @@ export class CalcEngine {
   }
 
   /** Starts a recalculation: marks what has to be calculated. */
-  private begin(all: boolean, changes: boolean, pending: boolean): void {
+  private begin(all: boolean, changes: boolean, pending: boolean, rowReaders: FormulaRec[]): void {
     // What the last call left over comes first. Its dependents were marked when it was: the ones
     // that are done did not read it.
     const carried: FormulaRec[] = [];
@@ -802,6 +857,8 @@ export class CalcEngine {
       if (rec) this.mark(rec, cell.replaced);
       else this.collect(sh, cell.row, cell.col, cell.row, cell.col, true);
     }
+    // Which rows are hidden is something these formulas read: their results replace the values of the file.
+    for (const rec of rowReaders) if (!rec.gone) this.mark(rec, true);
     if (changes || !all) {
       this.volatiles.forEach((rec) => {
         // A formula that reads cells it chooses while calculating may read one that changed.
@@ -832,6 +889,10 @@ export class CalcEngine {
     this.sheetByName = new Map();
     this.names = new Map();
     this.volatiles = new Set();
+    this.rowAware = new Set();
+    this.selfRefs = new Set();
+    this.named = new Set();
+    this.unsupportedNames = new Map();
     this.unparsedCells = new Map();
     this.unsupportedCells = new Map();
     this.costlyCells = new Map();
@@ -905,6 +966,18 @@ export class CalcEngine {
   }
 
   private preview(node: Node, sheetOf: CellAddress, at: { row: number; col: number }, rowShift: number, colShift: number): Scalar {
+    const context = this.context;
+    const value = this.previewed<Scalar>(sheetOf, at, rowShift, colShift, ERROR_VALUE, () => toCellValue(evaluate(node, context, this.functions, this.evalOptions), context));
+    if (typeof value === 'number' && !isFinite(value)) return ERROR_NUM;
+    return value === null || value === undefined ? 0 : value;
+  }
+
+  /**
+   * Runs `run` as a preview for the cell `at` of the sheet of `sheetOf`: no formula is
+   * calculated, every cell answers from the model. `failed` is the answer when `run` throws
+   * (out of budget, among other things).
+   */
+  private previewed<T>(sheetOf: CellAddress, at: { row: number; col: number }, rowShift: number, colShift: number, failed: T, run: () => T): T {
     this.prepare();
     if (!this.batchOpen) {
       this.nowValue = undefined;
@@ -913,8 +986,7 @@ export class CalcEngine {
       for (const sh of this.sheets) sh.rowKeys = undefined;
       this.batchOpen = this.batching;
     }
-    // No formula is calculated for a preview: every cell answers from the model. What a
-    // recalculation in progress keeps is left alone.
+    // What a recalculation in progress keeps is left alone.
     const memos = this.memos;
     this.memos = this.previewMemos;
     this.previewing = true;
@@ -925,20 +997,191 @@ export class CalcEngine {
     this.evalOptions.rowShift = rowShift;
     this.evalOptions.colShift = colShift;
     this.evalOptions.arrayFormula = false;
-    let value: Scalar;
+    let value: T;
     try {
-      value = toCellValue(evaluate(node, context, this.functions, this.evalOptions), context);
+      value = run();
     } catch (error) {
-      // Out of budget, among other things.
-      value = ERROR_VALUE;
+      value = failed;
     }
     this.previewing = false;
     this.memos = memos;
     this.evalOptions.rowShift = 0;
     this.evalOptions.colShift = 0;
     if (!this.batchOpen) this.previewMemos = new Map();
+    return value;
+  }
+
+  /**
+   * Every value of what a formula text gives in a cell, in one call: the cells of a reference
+   * (a range, a range of another sheet, a defined name, OFFSET, INDIRECT ...), the elements
+   * of an array, or the one value of anything else. Like evaluateText() nothing is stored and
+   * other formulas answer with the values the model holds; inside batch() it shares the budget
+   * and what is kept with the other calls.
+   *
+   * A reference is cut to the used part of its sheet. No more than `maxCells` values are
+   * given: a larger result comes with `truncated` set and its first values, row by row.
+   * Never throws: a text that is not a formula and a formula that cannot be calculated within
+   * the budget give #VALUE!, a formula whose value is an error gives that error. An error
+   * inside a reference or an array is one of the values.
+   */
+  evaluateRange(formula: string, at: CellAddress, options?: EvaluateRangeOptions): RangeValues | CalcError {
+    let node: Node;
+    try {
+      if (typeof formula !== 'string') return ERROR_VALUE;
+      node = parseFormula(formula);
+    } catch (error) {
+      return ERROR_VALUE;
+    }
+    const asked = options ? Number(options.maxCells) : NaN;
+    const limit = asked >= 1 ? Math.min(Math.floor(asked), MAX_RANGE_VALUES) : asked === asked ? 1 : DEFAULT_RANGE_VALUES;
+    const row = at && isIndex(at.row, MAX_ROWS) ? at.row : 0;
+    const col = at && isIndex(at.col, MAX_COLS) ? at.col : 0;
+    const anchor = options ? options.anchor : undefined;
+    const fromRow = anchor && isIndex(anchor.row, MAX_ROWS) ? anchor.row : row;
+    const fromCol = anchor && isIndex(anchor.col, MAX_COLS) ? anchor.col : col;
+    const context = this.context;
+    return this.previewed<RangeValues | CalcError>(at, { row, col }, anchor ? row - fromRow : 0, anchor ? col - fromCol : 0, ERROR_VALUE, () =>
+      this.valuesOf(evaluate(node, context, this.functions, this.evalOptions), limit),
+    );
+  }
+
+  /** The values of what a formula gave, `limit` at most. */
+  private valuesOf(value: Value, limit: number): RangeValues | CalcError {
+    if (isRef(value)) {
+      const range = value.range;
+      const sh = this.sheets[value.sheet];
+      if (!sh || !range || !isIndex(range.top, MAX_ROWS) || !isIndex(range.left, MAX_COLS) || !isIndex(range.bottom, MAX_ROWS) || !isIndex(range.right, MAX_COLS)) return calcError('#REF!');
+      if (range.bottom < range.top || range.right < range.left) return calcError('#REF!');
+      // Cut to what is in use, as a reference read as an array is; at least its first cell stays.
+      const bottom = Math.min(range.bottom, Math.max((sh.model.rowCount || 0) - 1, range.top));
+      const right = Math.min(range.right, Math.max((sh.model.colCount || 0) - 1, range.left));
+      const rows = bottom - range.top + 1;
+      const cols = right - range.left + 1;
+      const total = rows * cols;
+      const count = Math.min(total, limit);
+      const values: Scalar[] = new Array(count).fill(null);
+      const top = range.top;
+      const left = range.left;
+      this.forEachCell(value.sheet, { top, left, bottom: top + Math.ceil(count / cols) - 1, right }, (cell, r, c) => {
+        const k = (r - top) * cols + (c - left);
+        if (k >= 0 && k < count) values[k] = cell;
+      });
+      return { rows, cols, values, truncated: count < total, sheet: value.sheet, range: { top, left, bottom, right } };
+    }
+    if (isArray(value)) {
+      const total = value.data.length;
+      const count = Math.min(total, limit);
+      const values: Scalar[] = new Array(count);
+      for (let k = 0; k < count; k++) {
+        const item = value.data[k];
+        values[k] = item === undefined ? null : item;
+      }
+      this.spend(count);
+      return { rows: value.rows, cols: value.cols, values, truncated: count < total };
+    }
+    if (isError(value)) return value;
     if (typeof value === 'number' && !isFinite(value)) return ERROR_NUM;
-    return value === null || value === undefined ? 0 : value;
+    return { rows: 1, cols: 1, values: [value === undefined ? null : value], truncated: false };
+  }
+
+  /**
+   * Call after rows of a sheet were hidden or shown (by hand, by a filter); without a sheet,
+   * for every sheet. The formulas that leave hidden rows out (SUBTOTAL, AGGREGATE) and read
+   * that sheet are calculated by the next recalculate() call, and what they give replaces the
+   * values of the file: which rows are hidden is something they read. Costs nothing by itself.
+   */
+  rowsChanged(sheet?: number): void {
+    const count = (this.workbook.sheets || []).length;
+    if (sheet === undefined) for (let s = 0; s < count; s++) this.rowSheets.add(s);
+    else if (isIndex(sheet, count)) this.rowSheets.add(sheet);
+  }
+
+  /** The formulas rowsChanged() was called for; the graph has to be complete. */
+  private rowReaders(): FormulaRec[] {
+    const sheets = this.rowSheets;
+    const out: FormulaRec[] = [];
+    if (sheets.size === 0) return out;
+    this.rowAware.forEach((rec) => {
+      // A formula that chooses its cells while calculating may read any sheet.
+      let reads = rec.volatile;
+      for (let k = 0; !reads && k < rec.precedents.length; k++) reads = !rec.precedents[k].shapeOnly && sheets.has(rec.precedents[k].sheet);
+      if (reads) out.push(rec);
+    });
+    sheets.clear();
+    return out;
+  }
+
+  /**
+   * Whether the dependency graph is complete and the search for circular references in it
+   * done: cycles() answers only then. recalculate() works on both, in slices when the
+   * workbook is large (see `incomplete`).
+   */
+  get graphReady(): boolean {
+    return this.built && this.search === undefined && !this.searchAll && this.seeds.length === 0 && this.wantCells.length === 0;
+  }
+
+  /**
+   * Every formula cell that is part of a circular reference made of the references the
+   * formulas name, whether or not it was calculated yet (`circular` lists what recalculations
+   * met, which includes circles through OFFSET and INDIRECT). Empty while `graphReady` is
+   * false: a list of some of them would look like the whole.
+   */
+  cycles(): CellAddress[] {
+    const out: CellAddress[] = [];
+    if (!this.graphReady) return out;
+    const seen = new Set<FormulaRec>();
+    const add = (rec: FormulaRec) => {
+      if (rec.gone || !rec.circular || seen.has(rec)) return;
+      seen.add(rec);
+      out.push({ sheet: rec.sheet, row: rec.row, col: rec.col });
+    };
+    this.selfRefs.forEach(add);
+    this.groups.forEach((members) => members.forEach(add));
+    return out;
+  }
+
+  /**
+   * Call after workbook.definedNames changed (a name added, removed or given another
+   * formula), instead of invalidate(): the names are read again, and the formulas that use a
+   * name that is no longer what it was, directly or through other names, are read into the
+   * graph again and calculated by the next recalculate() call, as formulas that changed.
+   * Formulas that use no such name are left alone. Sheets, rows and columns must not have
+   * changed.
+   */
+  namesChanged(): void {
+    if (!this.prepared) return;
+    if (!this.built) {
+      // The formulas read so far were read with the old names: reading starts over. Nothing was calculated yet.
+      const wantAll = this.wantAll;
+      const wantOverwrite = this.wantOverwrite;
+      const wantCells = this.wantCells;
+      const incomplete = this.incomplete;
+      this.invalidate();
+      this.wantAll = wantAll;
+      this.wantOverwrite = wantOverwrite;
+      this.wantCells = wantCells;
+      this.incomplete = incomplete;
+      return;
+    }
+    const changed = this.readNames(this.names);
+    if (changed.size === 0) return;
+    this.previewMemos = new Map();
+    const uses = (names: string[] | undefined): boolean => {
+      for (let k = 0; names && k < names.length; k++) if (changed.has(names[k])) return true;
+      return false;
+    };
+    const again: CellAddress[] = [];
+    this.named.forEach((rec) => {
+      if (uses(rec.names)) again.push({ sheet: rec.sheet, row: rec.row, col: rec.col });
+    });
+    this.unsupportedNames.forEach((names, key) => {
+      const cell = this.unsupportedCells.get(key);
+      if (cell && uses(names)) again.push(cell);
+    });
+    for (const cell of again) {
+      this.reread(this.sheets[cell.sheet], cell.row, cell.col);
+      this.ready.push({ sheet: cell.sheet, row: cell.row, col: cell.col, replaced: true });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1057,6 +1300,20 @@ export class CalcEngine {
       if (master) return shiftFormula(master.text, row - master.row, col - master.col);
     }
     return '';
+  }
+
+  /** Whether a row is hidden; with `filtered`, only when a filter with a criterion has it among its data rows. */
+  private rowHidden(sheet: number, row: number, filtered: boolean): boolean {
+    const sh = this.sheets[sheet];
+    const modelRow = sh ? sh.model.rows.get(row) : undefined;
+    if (!modelRow || modelRow.hidden !== true) return false;
+    if (!filtered) return true;
+    // The model has one flag for both ways of hiding. In a filtered list Excel leaves out
+    // every hidden row, so a hidden row under the header of a filter in use counts as filtered.
+    const filter = sh.model.autoFilter;
+    if (!filter || !filter.range || !(row > filter.range.top && row <= filter.range.bottom) || !Array.isArray(filter.columns)) return false;
+    for (const column of filter.columns) if (column && column.kind !== 'none') return true;
+    return false;
   }
 
   private cellValue(sheet: number, row: number, col: number): Scalar {
@@ -1587,20 +1844,39 @@ export class CalcEngine {
       const key = foldName(sh.model.name);
       if (!this.sheetByName.has(key)) this.sheetByName.set(key, sh.index);
     });
-    this.names = new Map();
-    for (const name of workbook.definedNames || []) {
+    this.readNames(undefined);
+  }
+
+  /**
+   * Reads the defined names of the workbook. With the names as they were, gives the names
+   * (in upper case) that are not what they were, in any scope; what was parsed of the others is kept.
+   */
+  private readNames(before: Map<string, { global?: NameEntry; local?: Map<number, NameEntry> }> | undefined): Set<string> {
+    const names = new Map<string, { global?: NameEntry; local?: Map<number, NameEntry> }>();
+    const changed = new Set<string>();
+    for (const name of this.workbook.definedNames || []) {
       if (!name || typeof name.name !== 'string' || typeof name.value !== 'string') continue;
       const key = name.name.toUpperCase();
-      let found = this.names.get(key);
-      if (!found) this.names.set(key, (found = {}));
-      const entry: NameEntry = { text: name.value };
-      if (name.localSheet === undefined) {
-        if (!found.global) found.global = entry;
-      } else {
-        if (!found.local) found.local = new Map();
-        if (!found.local.has(name.localSheet)) found.local.set(name.localSheet, entry);
-      }
+      let found = names.get(key);
+      if (!found) names.set(key, (found = {}));
+      const old = before ? before.get(key) : undefined;
+      const local = name.localSheet === undefined ? undefined : name.localSheet;
+      if (local === undefined ? found.global !== undefined : found.local !== undefined && found.local.has(local)) continue;
+      const was = old ? (local === undefined ? old.global : old.local ? old.local.get(local) : undefined) : undefined;
+      const entry: NameEntry = was && was.text === name.value ? was : { text: name.value };
+      if (entry !== was) changed.add(key);
+      if (local === undefined) found.global = entry;
+      else (found.local || (found.local = new Map())).set(local, entry);
     }
+    if (before) {
+      // Names, or scopes of a name, that are no longer there.
+      before.forEach((old, key) => {
+        const found = names.get(key);
+        if (!found || (old.global !== undefined && found.global === undefined) || (old.local ? old.local.size : 0) !== (found.local ? found.local.size : 0)) changed.add(key);
+      });
+    }
+    this.names = names;
+    return changed;
   }
 
   /**
@@ -1665,9 +1941,14 @@ export class CalcEngine {
     // What cannot be calculated here keeps the value the file has for it. Without such a value
     // (a formula just typed in, an error the engine wrote itself) it is calculated anyway, so
     // that the cell shows the error.
-    if (hasValue(cell) && !this.own.has(cell) && !this.supports(node, sh.index)) {
-      this.unsupportedCells.set(`${sh.index}:${row}:${col}`, { sheet: sh.index, row, col });
-      return;
+    if (hasValue(cell) && !this.own.has(cell)) {
+      this.metNames = [];
+      if (!this.supports(node, sh.index)) {
+        this.unsupportedCells.set(`${sh.index}:${row}:${col}`, { sheet: sh.index, row, col });
+        // A name it lacks may be defined later (see namesChanged()).
+        if (this.metNames.length > 0) this.unsupportedNames.set(`${sh.index}:${row}:${col}`, this.metNames);
+        return;
+      }
     }
     const rec: FormulaRec = {
       sheet: sh.index,
@@ -1684,6 +1965,7 @@ export class CalcEngine {
       // Excel marks the cell of a dynamic array formula with cell metadata.
       arrayMode: formula.type === 'array' || cell.cm !== undefined,
       selfRef: false,
+      rowAware: false,
       costly: false,
       precedents: [],
       epoch: 0,
@@ -1720,6 +2002,9 @@ export class CalcEngine {
     this.findPrecedents(rec);
     rec.circular = rec.selfRef;
     if (rec.volatile) this.volatiles.add(rec);
+    if (rec.rowAware) this.rowAware.add(rec);
+    if (rec.selfRef) this.selfRefs.add(rec);
+    if (rec.names) this.named.add(rec);
     sh.recs.set(keyOf(row, col), rec);
     this.graphChanged(sh);
     // While the graph is being built every formula is looked at for circular references in the end.
@@ -1744,6 +2029,7 @@ export class CalcEngine {
           if (node.sheet !== undefined && this.sheetIndex(node.sheet) === undefined) return false;
           break;
         case 'name': {
+          this.metNames.push(node.name.toUpperCase());
           const home = node.sheet === undefined ? sheet : this.sheetIndex(node.sheet);
           if (home === undefined) return false;
           const key = `${home}!${node.name.toUpperCase()}`;
@@ -1820,13 +2106,22 @@ export class CalcEngine {
     const cell = modelRow ? modelRow.cells[col] : undefined;
     const formula = cell ? cell.formula : undefined;
     if (rec && rec.formula === formula) return;
+    this.reread(sh, row, col);
+  }
+
+  /** Reads the formula of a cell into the graph again, whatever was known about the cell. */
+  private reread(sh: SheetState, row: number, col: number): void {
+    const rec = sh.recs.get(keyOf(row, col));
+    const modelRow = sh.model.rows.get(row);
+    const cell = modelRow ? modelRow.cells[col] : undefined;
     const name = `${sh.index}:${row}:${col}`;
     this.unparsedCells.delete(name);
     this.unsupportedCells.delete(name);
+    this.unsupportedNames.delete(name);
     this.mismatchedCells.delete(name);
     if (this.costlyCells.delete(name)) this.staleCells = undefined;
     if (rec) this.removeFormula(sh, rec);
-    if (cell && formula) this.addFormula(sh, row, col, cell, {});
+    if (cell && cell.formula) this.addFormula(sh, row, col, cell, {});
   }
 
   /** The formulas of a sheet changed: what was worked out from them is worked out again. */
@@ -1845,6 +2140,9 @@ export class CalcEngine {
     sh.recs.delete(keyOf(rec.row, rec.col));
     sh.spills.delete(rec);
     this.volatiles.delete(rec);
+    this.rowAware.delete(rec);
+    this.selfRefs.delete(rec);
+    this.named.delete(rec);
     // Whoever still holds the record (the list of dirty formulas) must not write it.
     rec.gone = true;
     this.graphChanged(sh);
@@ -1928,6 +2226,7 @@ export class CalcEngine {
           break;
         }
         case 'name': {
+          (rec.names || (rec.names = [])).push(node.name.toUpperCase());
           const sheet = node.sheet === undefined ? rec.sheet : this.sheetIndex(node.sheet);
           if (sheet === undefined) break;
           const key = `${sheet}!${node.name.toUpperCase()}:${shapeOnly ? 1 : 0}`;
@@ -1945,6 +2244,7 @@ export class CalcEngine {
         case 'call': {
           if (VOLATILE.has(node.name)) rec.volatile = true;
           if (TIMED.has(node.name)) rec.timed = true;
+          if (ROW_AWARE.has(node.name)) rec.rowAware = true;
           const asksWhere = SHAPE_ONLY.has(node.name);
           // CELL("row", A1) asks where A1 is; CELL("contents", A1) reads it.
           const info = node.name === 'CELL' ? node.args[0] : undefined;
