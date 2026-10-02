@@ -1,4 +1,6 @@
+import { simpleDoc } from '../test/doc-binary-fixtures';
 import { minimalCfb, sampleWorkbook } from '../test/fixtures';
+import { cat, number, workbookStream, xlsFile } from '../test/xls-fixtures';
 import { expect, test } from './helpers';
 
 // The embedding entry point as a host page would use it.
@@ -97,6 +99,43 @@ test.describe('BymOffice.mount', () => {
     await expect(page.locator('#editor')).toBeEmpty();
   });
 
+  test('an xls file is shown read-only and a doc file as a document', async ({ page }) => {
+    const sheet = cat(number(0, 0, 41), number(1, 0, 1.5));
+    const xlsBytes = Array.from(xlsFile(workbookStream({ sheets: [{ name: 'Old', records: sheet }] })));
+    const docBytes = Array.from(simpleDoc('First paragraph\rSecond paragraph\r').build());
+    const outcome = await page.evaluate(
+      async ([xls, doc]) => {
+        const api = (window as any).BymOffice;
+        const host = document.getElementById('editor')!;
+        const first = await api.mount(host, { file: new Uint8Array(xls) });
+        const sheetView = first.view;
+        const before = sheetView.workbook.sheets[0].rows.get(0).cells[0].value;
+        sheetView.setCellInput(0, 0, '7');
+        const result = {
+          xlsKind: first.kind,
+          format: first.file.format,
+          sheet: sheetView.workbook.sheets[0].name,
+          before,
+          after: sheetView.workbook.sheets[0].rows.get(0).cells[0].value,
+          readOnly: sheetView.readOnly,
+          docKind: '',
+          pages: 0,
+          text: '',
+        };
+        first.destroy();
+        const second = await api.mount(host, { file: new Uint8Array(doc) });
+        result.docKind = second.kind;
+        result.pages = second.view.pageCount;
+        result.text = api.paragraphText(second.document.body.blocks[0]);
+        second.destroy();
+        return result;
+      },
+      [xlsBytes, docBytes],
+    );
+    expect(outcome).toEqual({ xlsKind: 'spreadsheet', format: 'xls', sheet: 'Old', before: 41, after: 41, readOnly: true, docKind: 'document', pages: 1, text: 'First paragraph' });
+    await expect(page.locator('#editor')).toBeEmpty();
+  });
+
   test('rejects files it cannot show and leaves the container empty', async ({ page }) => {
     const xls = Array.from(minimalCfb(new Uint8Array(9 * 512), new Uint8Array(10)));
     const outcome = await page.evaluate(async (input) => {
@@ -108,7 +147,8 @@ test.describe('BymOffice.mount', () => {
       }
       return names;
     }, xls);
-    expect(outcome).toEqual(['UnsupportedFileError', 'UnsupportedFileError']);
+    // The compound file names a workbook stream that is not one: damaged, not unsupported.
+    expect(outcome).toEqual(['Error', 'UnsupportedFileError']);
     await expect(page.locator('#editor')).toBeEmpty();
   });
 });

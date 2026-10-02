@@ -1,6 +1,9 @@
 import { CfbFile } from './cfb';
+import { readDoc } from './formats/doc/document';
 import { readDocx } from './formats/docx/document';
+import { documentPictures } from './model/doc/pictures';
 import type { DocModel } from './model/doc/types';
+import { readXls } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
 import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
@@ -16,7 +19,10 @@ export * from './xml';
 export * from './model/sheet/types';
 export * from './model/sheet/color';
 export { readXlsx } from './formats/xlsx/workbook';
+export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
 export { readDocx } from './formats/docx/document';
+export { readDoc } from './formats/doc/document';
+export { documentPictures } from './model/doc/pictures';
 export { inFieldCode, paragraphText, rawOf, safeHyperlinkTarget, type DocModel } from './model/doc/types';
 export { NumberingCounters } from './formats/docx/numbering';
 export { resolveNumberRunProps, resolveParaProps, resolveRunProps } from './formats/docx/resolve';
@@ -126,9 +132,31 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
     const cfb = CfbFile.read(bytes);
     // No binary writer yet, and nothing can be modified, so saving returns the original bytes.
     const base = { container: 'cfb' as const, cfb, save: async () => bytes };
-    if (cfb.has('WordDocument')) return { format: 'doc', kind: 'document', ...base, workbook: notASpreadsheet };
+    if (cfb.has('WordDocument')) {
+      let model: Promise<DocModel> | undefined;
+      const document = () =>
+        (model ??= Promise.resolve().then(() => {
+          try {
+            return readDoc(cfb);
+          } catch (error) {
+            if (error instanceof Error && error.name === 'UnsupportedFileError') throw new UnsupportedFileError(error.message);
+            throw error;
+          }
+        }));
+      return { format: 'doc', kind: 'document', ...base, workbook: notASpreadsheet, document };
+    }
     if (cfb.has('Workbook') || cfb.has('Book')) {
-      const workbook = () => Promise.reject(new UnsupportedFileError('Reading xls cell data is not supported yet'));
+      let model: Promise<Workbook> | undefined;
+      // Read on first use. What the reader cannot open (encrypted, older than BIFF5) is reported as unsupported.
+      const workbook = () =>
+        (model ??= Promise.resolve().then(() => {
+          try {
+            return readXls(cfb);
+          } catch (error) {
+            if (error instanceof Error && error.name === 'UnsupportedFileError') throw new UnsupportedFileError(error.message);
+            throw error;
+          }
+        }));
       return { format: 'xls', kind: 'spreadsheet', ...base, workbook };
     }
     if (cfb.has('EncryptedPackage')) throw new UnsupportedFileError('Password-protected files are not supported yet');
@@ -221,7 +249,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     if (!file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
     const model = await file.document();
     const view = new DocumentView(container, model, {
-      package: file.package,
+      package: documentPictures(model, file.package),
       locale: options.locale,
       zoom: options.zoom,
       toolbar: options.toolbar,
@@ -239,7 +267,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   }
 
   const workbook = await file.workbook();
-  const editor = new SpreadsheetEditor(container, workbook, options);
+  // An xls file cannot be written yet: it is shown read-only, so that no edit is lost on saving.
+  const editor = new SpreadsheetEditor(container, workbook, file.format === 'xls' ? { ...options, readOnly: true } : options);
   const view = editor.view;
   save = async () => {
     if (view.isEditing) view.commitEditing();

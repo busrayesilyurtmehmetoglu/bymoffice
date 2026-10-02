@@ -15,6 +15,8 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - Hücreleri **Excel sayı biçimleriyle** gösterir: tarih, saat, para, yüzde, bilimsel, kesir ve özel biçim kodları; Türkçe ve İngilizce yerel ayar (`1.234,50 ₺` / `15.03.2024` ↔ `1,234.50` / `3/15/2024`).
 - Hücreleri **düzenler ve dosyaya kaydeder**: yazarak giriş, geri al/yinele, kopyala/kes/yapıştır, satır ve sütun ekle-sil. Formül metinleri, birleştirilmiş hücreler ve adlandırılmış aralıklar ekleme-silmeyle birlikte kayar.
 - **Editör arayüzü** sunar: araç çubuğu (geri al/yinele, yazı boyutu, kalın/italik/altı çizili/üstü çizili, yazı ve dolgu rengi, kenarlık, hizalama, metni kaydır, birleştir, sayı biçimi, satır/sütun), formül çubuğu ve ad kutusu, durum çubuğu (toplam/ortalama/sayı), sağ tık menüsü, sürükleyerek sütun/satır boyutlandırma. Türkçe ve İngilizce.
+- **Eski Word dosyalarını (doc, Word 97–2003) salt okunur açar ve gösterir**: metin, karakter ve paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe hücreler), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, yer imleri, satır içi ve kayan resimler, metin kutuları. `file.document()` docx ile aynı `DocModel`'i verir; resimler pakette değil `model.media` içindedir (`BymOffice.documentPictures(model, file.package)` ikisini tek arayüzle sunar).
+- **Eski Excel dosyalarını (xls, Excel 97–2003) salt okunur açar**: hücreler, stiller, birleştirmeler, sütun/satır ölçüleri, dondurulmuş bölmeler, köprüler, tanımlı adlar, formül metinleri ve dosyadaki sonuçları. `mount()` xls'i her zaman salt okunur kurar. Ayrıntı için `BymOffice.readXlsWithReport(file.cfb)` okunmayan kayıtları ve çevrilemeyen formülleri sayar. Excel 5/95 dosyaları da okunur ama gerçek dosyayla sınanmamıştır.
 - **Koşullu biçimleri gösterir**: hücre kuralları, formüllü kurallar, renk ölçekleri, veri çubukları, ikon kümeleri, ilk/son N, ortalama üstü/altı, yinelenen/benzersiz, metin ve tarih kuralları. Hücre düzenlenince ve geri alınınca güncellenir; kaydederken kurallar dosyada aynen korunur.
 - **Formülleri hesaplar**: 225 Excel fonksiyonu; bir hücre değişince yalnız ona bağlı formüller yeniden hesaplanır.
 - **WebView köprüsü** ile mobil ve masaüstü uygulamalara gömülür (ayrıntı: [webview-koprusu.md](webview-koprusu.md)).
@@ -29,12 +31,14 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Tablo ya da form denetimi içeren sayfalarda, ve içinde grafik ya da pivot tablo bulunan çalışma kitaplarında satır/sütun ekleme-silme | Reddedilir (bu içeriklerin başvuruları henüz kaydırılmıyor; sessizce bozulmasınlar diye); hücre düzenleme ve biçimlendirme serbesttir. Resim ve yorum içeren sayfalarda serbesttir |
 | Sayfa ekleme, silme, yeniden adlandırma; yazı tipi adı seçimi; dikey hizalama düğmeleri; koşullu biçim, veri doğrulama ve süzgeç düzenleme | Yok |
 | Koşullu biçimde: kural ekleme/değiştirme arayüzü, Excel'in özgün ikon görselleri (basit vektör ikonlar çizilir), kuraldaki yazı tipi adı/boyutu ve desenli/gradyan dolgu | Yok. `calculate: false` iken formüllü kurallar uygulanmaz |
-| doc, xls ve RTF görüntüleme | Yok; `mount()` `UnsupportedFileError` ile reddeder |
+| RTF, Word 95 ve öncesi, parola korumalı doc | Yok; `UnsupportedFileError` |
+| doc düzenleme ve kaydetme; doc'ta EMF/WMF görseller, resim madde imleri, eski otomatik numaralar, yorum aralıkları | Yok. doc salt okunur açılır, `save()` özgün baytları verir |
+| xls düzenleme ve kaydetme, xls → xlsx dönüştürme; xls'te yorumlar, koşullu biçim, veri doğrulama, grafik/görsel; parola korumalı xls; Excel 4 ve öncesi | Yok. xls salt okunur açılır, `save()` özgün baytları verir |
 | docx düzenleme, belge içi bağlantılar, arama, dokunmatikte metin seçimi, sağdan sola yazı, heceleme, grafik/şekil ve vektör görsel (EMF/WMF/SVG) çizimi, belgeye gömülü fontlar | Yok. Çizilemeyen nesnelerin yerinde yer tutucu görünür |
 | Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
 | `onSave` seçeneği; arayüz metinlerinin Türkçesi | Yok (görev 1.6); menü ve ekran okuyucu metinleri şimdilik İngilizce |
 | Sayı biçimlerinde: Türkçe ve İngilizce dışındaki diller, `*` ile doldurma, `_` boşluğunun gerçek genişliği, Hicri/Japon takvimleri, `[DBNum]` | Yok; `*` hiçbir şey yazmaz, `_x` tek boşluk olur |
-| xls ve doc için model | Yok; `workbook()` `UnsupportedFileError` ile reddeder. docx için yalnız okuma modeli var (`file.document()`); düzenleme ve modelden yazma yok |
+| RTF için model | Yok. doc `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx için yalnız okuma modeli var (`file.document()`); düzenleme ve modelden yazma yok |
 | Koşullu biçim, veri doğrulama, grafik, görsel | Modelde yok; dosyada korunur |
 | doc/xls yazma | Yok; `save()` özgün baytları döndürür |
 | RTF, parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |

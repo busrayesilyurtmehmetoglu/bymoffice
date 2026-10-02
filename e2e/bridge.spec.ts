@@ -264,7 +264,8 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
         [{ type: 'load', id: 'c7', url: 'javascript:alert(1)' }, 'bad-message'],
         [{ type: 'load', id: 'c8', data: base64(await truncatedXlsx()) }, 'corrupt'],
         [{ type: 'load', id: 'c9', data: base64(textFile()) }, 'unsupported'],
-        [{ type: 'load', id: 'c10', data: base64(xls()) }, 'unsupported'],
+        // A compound file whose "Workbook" stream is not a workbook: an xls that cannot be read.
+        [{ type: 'load', id: 'c10', data: base64(xls()) }, 'corrupt'],
         [{ type: 'load', id: 'c11', data: '' }, 'unsupported'],
         [{ type: 'load', id: 'c12', data: base64(await smallWorkbook()), sheet: 5 }, 'bad-message'],
         [{ type: 'setReadOnly', id: 'c13' }, 'bad-message'],

@@ -3,6 +3,7 @@
 // platform (Flutter, Android, iOS, Windows, React Native, an iframe) uses the
 // same contract. Nothing here touches the DOM when the module is imported;
 // the window and the container are handed in.
+import { documentPictures } from '../model/doc/pictures';
 import type { OfficeFile } from '../index';
 import type { DocModel } from '../model/doc/types';
 import { cellName, rangeName, type Workbook } from '../model/sheet/types';
@@ -515,7 +516,7 @@ export function createBridge(host: BridgeHost): Bridge {
     if (doc) {
       // A document is shown read-only: `readOnly` and `sheet` mean nothing for it, and it never sends `changed`.
       const documentOptions: DocumentViewOptions = {
-        package: file.package,
+        package: documentPictures(doc as DocModel, file.package),
         // The page must not be replaced by what a link points to: the application decides what to do with it.
         onLinkClick: (target) => {
           send({ type: 'link', url: target });
@@ -567,6 +568,7 @@ export function createBridge(host: BridgeHost): Bridge {
     };
     if (locale !== undefined) options.locale = locale;
     if (readOnly !== undefined) options.readOnly = readOnly;
+    if (file.format === 'xls') options.readOnly = true;
     if (sheet !== undefined) options.sheet = sheet;
 
     closeShown();
@@ -637,7 +639,10 @@ export function createBridge(host: BridgeHost): Bridge {
           if (shown.pages && shown.pages.setLocale) shown.pages.setLocale(locale as string);
           setLocale(locale);
         }
-      } else if (type === 'setReadOnly') view.setReadOnly(readOnly as boolean);
+      } else if (type === 'setReadOnly') {
+        // An xls file cannot be written yet, so it stays read-only whatever is asked.
+        view.setReadOnly(shown.file.format === 'xls' ? true : (readOnly as boolean));
+      }
       else if (type === 'setLocale') {
         view.setLocale(locale as string);
         setLocale(locale);

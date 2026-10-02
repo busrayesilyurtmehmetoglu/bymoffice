@@ -397,6 +397,7 @@ export class WorkbookView {
   private locale: FormatLocale;
   private engine: CalcEngine | undefined;
   private calcTimer: ReturnType<typeof setTimeout> | undefined;
+  private missingTimer: ReturnType<typeof setTimeout> | undefined;
   /** Conditional formats of the sheets that have any, made when a sheet is first drawn. */
   private conditional = new Map<Sheet, ConditionalFormats>();
   private strings: UiStrings;
@@ -686,6 +687,7 @@ export class WorkbookView {
     if (this.destroyed) return;
     this.destroyed = true;
     if (this.calcTimer !== undefined) clearTimeout(this.calcTimer);
+    if (this.missingTimer !== undefined) clearTimeout(this.missingTimer);
     this.endDrag();
     this.endTouch();
     this.edit = undefined;
@@ -1091,11 +1093,12 @@ export class WorkbookView {
    */
   private calculateMissing(): void {
     if (this.options.calculate === false) return;
-    this.calcTimer = setTimeout(() => {
-      this.calcTimer = undefined;
-      if (this.destroyed || this.engine) return;
+    this.missingTimer = setTimeout(() => {
+      this.missingTimer = undefined;
+      if (this.destroyed) return;
       try {
-        const engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+        // A conditional format or an early edit may have made the engine already.
+        const engine = this.engine || new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
         const missing = engine.uncalculated();
         if (missing.length === 0) return;
         this.engine = engine;

@@ -8,6 +8,8 @@
 // in: where a team keeps its real documents is nobody else's business. Without
 // the file the run is skipped, so the full test run works on any machine.
 
+import { readDoc } from '../src/formats/doc/document';
+import { readXls } from '../src/formats/xls/workbook';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -27,6 +29,11 @@ function* walk(dir: string): Generator<string> {
 
 let sheets = 0;
 let cells = 0;
+let docFiles = 0;
+let docBlocksBinary = 0;
+let xlsBooks = 0;
+let xlsSheets = 0;
+let xlsCells = 0;
 let documents = 0;
 let docBlocks = 0;
 let edited = 0;
@@ -165,6 +172,19 @@ function checkCfb(file: OfficeFile): void {
     const size = file.cfb!.stream(entry.path).length;
     if (size !== entry.size) throw new Error(`stream ${entry.path}: read ${size} of ${entry.size} bytes`);
   }
+  // Old documents must read into the model.
+  if (file.format === 'doc') {
+    const model = readDoc(file.cfb!);
+    docFiles++;
+    docBlocksBinary += model.body.blocks.length;
+  }
+  // Old spreadsheets must read into the model.
+  if (file.format === 'xls') {
+    const workbook = readXls(file.cfb!);
+    xlsBooks++;
+    xlsSheets += workbook.sheets.length;
+    for (const sheet of workbook.sheets) for (const row of sheet.rows.values()) xlsCells += row.cells.filter(() => true).length;
+  }
 }
 
 // BYM_NO_NATIVE=1 hides the built-in compression streams, so the whole corpus
@@ -220,6 +240,8 @@ for (const root of roots) {
 
 const total = Object.values(passed).reduce((sum, n) => sum + n, 0);
 console.log(`passed: ${total}`, passed);
+console.log(`doc model: ${docFiles} documents, ${docBlocksBinary} blocks`);
+console.log(`xls model: ${xlsBooks} workbooks, ${xlsSheets} sheets, ${xlsCells} cells`);
 console.log(`docx model: ${documents} documents, ${docBlocks} blocks`);
 console.log(`xlsx model: ${sheets} sheets, ${cells} cells; edited and saved: ${edited}; restructured and saved: ${restructured}`);
 console.log(`not a Word/Excel file: ${unsupported}`);
