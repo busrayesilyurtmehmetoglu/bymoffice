@@ -380,6 +380,11 @@ export interface FilterMenuOptions {
   note?: string;
   /** The column has a criterion that can be removed. */
   canClear: boolean;
+  /**
+   * The checked values only say which rows are shown now, not what the criterion asks (a
+   * colour, an icon): "Apply" without a change keeps the criterion instead of replacing it.
+   */
+  unchangedKeeps?: boolean;
   openedByTouch?: boolean;
   onSort(descending: boolean): void;
   /** The values to show and whether empty cells are shown; undefined removes the criterion. */
@@ -413,6 +418,8 @@ export class FilterMenu extends Panel {
   private readonly empty: HTMLDivElement;
   private readonly checked: boolean[];
   private blanksChecked: boolean;
+  /** What was checked when the menu opened. */
+  private readonly checkedAtFirst: boolean[];
   /** Folded texts of the values, for the search. */
   private readonly folded: string[];
   /** What the list shows: indexes of values, ROW_ALL first and ROW_BLANKS last. */
@@ -424,6 +431,7 @@ export class FilterMenu extends Panel {
     const strings = options.strings;
     const coarse = coarsePointer();
     this.checked = options.values.map((value) => value.checked);
+    this.checkedAtFirst = this.checked.slice();
     this.blanksChecked = options.blanksChecked;
     this.folded = options.values.map((value) => fold(value.text));
 
@@ -605,7 +613,16 @@ export class FilterMenu extends Panel {
     const choice = this.choice();
     if (choice === null) return;
     this.close();
+    // Nothing was chosen: a criterion that cannot be shown as values stays what it is.
+    if (this.options.unchangedKeeps && !this.changed()) return;
     this.options.onApply(choice);
+  }
+
+  /** Whether what is checked, or searched for, differs from what the menu opened with. */
+  private changed(): boolean {
+    if (this.search.value.trim() !== '' || this.blanksChecked !== this.options.blanksChecked) return true;
+    for (let i = 0; i < this.checked.length; i++) if (this.checked[i] !== this.checkedAtFirst[i]) return true;
+    return false;
   }
 
   private onSearch = (): void => {

@@ -15,7 +15,7 @@ import { resolveCellStyle } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, type AutoFilter, type Cell, type CellRange, type FilterColumn, type FilterCondition, type FilterDateGroup, type Sheet, type Workbook } from '../model/sheet/types';
 import type { EditOptions } from './commands';
 import type { Op } from './ops';
-import { SORT_BLANK, SORT_TEXT, collationKey, sortValueOf } from './sort';
+import { SORT_BLANK, SORT_TEXT, collationKey, foldCase, sortValueOf } from './sort';
 
 /** Most distinct values the list of a column offers. */
 export const MAX_FILTER_VALUES = 10000;
@@ -43,11 +43,11 @@ export interface FilterValueList {
   blanksChecked: boolean;
   /** There were more distinct values than the list holds. */
   truncated: boolean;
-}
-
-/** Case folding that also holds for Turkish: "I", "İ", "ı" and "i" are one letter. */
-function fold(text: string): string {
-  return text.replace(/[İIı]/g, 'i').toLowerCase();
+  /**
+   * The criterion of the column is one this engine cannot apply (a colour, an icon): which
+   * values are checked only says which rows are shown now, and choosing values replaces it.
+   */
+  opaque: boolean;
 }
 
 const isBlank = (cell: Cell | undefined) => !cell || cell.value === null || cell.value === undefined || cell.value === '' || cell.kind === 'blank';
@@ -128,6 +128,8 @@ interface Scope {
   workbook: Workbook;
   sheet: Sheet;
   locale: FormatLocale | undefined;
+  /** Text without regard to case, the way the locale pairs its letters. */
+  fold(text: string): string;
   reader: TextReader;
   /** The same cells read in English, for values a file states that way. */
   english: TextReader;
@@ -152,7 +154,7 @@ function matchesDateGroup(group: FilterDateGroup, serial: number, date1904: bool
 }
 
 function conditionMatcher(scope: Scope, condition: FilterCondition): Matcher {
-  const { reader, locale } = scope;
+  const { reader, english, locale, fold } = scope;
   const date1904 = scope.workbook.date1904 === true;
   const operator = condition.operator;
   const value = String(condition.value).slice(0, MAX_CONDITION_TEXT);
@@ -163,6 +165,10 @@ function conditionMatcher(scope: Scope, condition: FilterCondition): Matcher {
     if (value === ' ' || value === '') return (cell) => isBlank(cell) !== negate;
     const pattern = fold(value);
     const wild = hasWildcard(value);
+    const matches = (shown: string) => {
+      const text = fold(shown);
+      return wild ? wildcardMatch(text.length > MAX_MATCH_TEXT ? text.slice(0, MAX_MATCH_TEXT) : text, pattern) : text === pattern;
+    };
     return (cell) => {
       let same: boolean;
       if (isBlank(cell)) same = false;
@@ -170,8 +176,9 @@ function conditionMatcher(scope: Scope, condition: FilterCondition): Matcher {
         const held = numberOf(cell, date1904);
         if (number !== undefined && !wild && held !== undefined && held === number) same = true;
         else {
-          const text = fold(reader.text(cell as Cell));
-          same = wild ? wildcardMatch(text.length > MAX_MATCH_TEXT ? text.slice(0, MAX_MATCH_TEXT) : text, pattern) : text === pattern;
+          same = matches(reader.text(cell as Cell));
+          // A file states TRUE and FALSE in English whatever the language its author saw them in.
+          if (!same && (cell as Cell).kind === 'boolean' && english !== reader) same = matches(english.text(cell as Cell));
         }
       }
       return same !== negate;
@@ -214,19 +221,21 @@ function matcherOf(scope: Scope, column: FilterColumn, col: number): Matcher | n
       return undefined;
     case 'values': {
       const wanted = new Set<string>();
+      const { reader, english, fold } = scope;
       for (const value of column.values || []) wanted.add(fold(String(value)));
       const blank = column.blank === true;
       const groups = column.dateGroups || [];
-      const { reader, english } = scope;
+      // UNSURE: whether a file states numbers (and TRUE and FALSE) the way its author's locale shows them or in English.
+      const inEnglish = (held: Cell) => english !== reader && wanted.size > 0 && wanted.has(fold(english.text(held)));
       return (cell) => {
         if (isBlank(cell)) return blank;
         const held = cell as Cell;
         if (wanted.has(fold(reader.text(held)))) return true;
+        if (held.kind === 'boolean') return inEnglish(held);
         const number = numberOf(held, date1904);
         if (number === undefined) return false;
         for (let i = 0; i < groups.length; i++) if (matchesDateGroup(groups[i], number, date1904)) return true;
-        // UNSURE: whether a file states numbers the way its author's locale shows them or in English.
-        return scope.locale !== undefined && scope.locale !== LOCALE_EN && wanted.size > 0 && wanted.has(fold(english.text(held)));
+        return inEnglish(held);
       };
     }
     case 'custom': {
@@ -290,7 +299,10 @@ interface Evaluation {
 }
 
 function scopeOf(workbook: Workbook, sheet: Sheet, rows: { top: number; bottom: number }, locale: FormatLocale | undefined): Scope {
-  return { workbook, sheet, locale, reader: new TextReader(workbook, locale), english: new TextReader(workbook, LOCALE_EN), top: rows.top, bottom: rows.bottom };
+  const reader = new TextReader(workbook, locale);
+  // In English (and without a locale, which reads as English) there is one way to show a cell.
+  const english = locale === undefined || locale === LOCALE_EN ? reader : new TextReader(workbook, LOCALE_EN);
+  return { workbook, sheet, locale, fold: (text) => foldCase(text, locale), reader, english, top: rows.top, bottom: rows.bottom };
 }
 
 /** Which rows pass the criteria of a filter; `skip` leaves the criterion of one column out. */
@@ -434,7 +446,7 @@ export function clearFilter(workbook: Workbook, sheetIndex: number, options: Edi
 export function filterValues(workbook: Workbook, sheetIndex: number, colId: number, options: EditOptions = {}): FilterValueList {
   const sheet = sheetOf(workbook, sheetIndex);
   const filter = sheet.autoFilter;
-  const list: FilterValueList = { items: [], blanks: false, blanksChecked: false, truncated: false };
+  const list: FilterValueList = { items: [], blanks: false, blanksChecked: false, truncated: false, opaque: false };
   if (!filter) return list;
   const col = filter.range.left + colId;
   const others = evaluate(workbook, sheet, filter, options.locale, colId);
@@ -442,6 +454,7 @@ export function filterValues(workbook: Workbook, sheetIndex: number, colId: numb
   const scope = scopeOf(workbook, sheet, others, options.locale);
   const own = filter.columns.find((column) => column.colId === colId);
   const test = own ? matcherOf(scope, own, col) : undefined;
+  list.opaque = test === null;
   const date1904 = workbook.date1904 === true;
 
   const found = new Map<string, { text: string; checked: boolean; rank: number; number: number; key: string }>();
@@ -457,7 +470,7 @@ export function filterValues(workbook: Workbook, sheetIndex: number, colId: numb
       continue;
     }
     const text = scope.reader.text(cell as Cell);
-    const id = fold(text);
+    const id = scope.fold(text);
     const known = found.get(id);
     if (known) {
       if (checked) known.checked = true;
@@ -474,6 +487,84 @@ export function filterValues(workbook: Workbook, sheetIndex: number, colId: numb
   entries.sort((a, b) => a.rank - b.rank || (a.number < b.number ? -1 : a.number > b.number ? 1 : 0) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0) || (a.text < b.text ? -1 : a.text > b.text ? 1 : 0));
   list.items = entries.map((entry) => ({ text: entry.text, checked: entry.checked }));
   return list;
+}
+
+/**
+ * The rows of a span that the filter of the sheet hides: hidden rows under the header of a
+ * filter that has a criterion. As in Excel, what is done to a selection (clearing, copying,
+ * formatting, deleting rows) leaves these rows out, while rows hidden by hand stay part of
+ * it. The model has one flag for both ways of hiding, so in a filtered list every hidden row
+ * counts as filtered. Sorted; empty for a sheet without a filter in use.
+ */
+export function rowsHiddenByFilter(sheet: Sheet, top: number, bottom: number): number[] {
+  const out: number[] = [];
+  const filter = sheet.autoFilter;
+  if (!filter || !filter.columns.some(isFilterActive)) return out;
+  const first = Math.max(top, filter.range.top + 1);
+  const last = Math.min(bottom, filter.range.bottom);
+  if (first > last) return out;
+  if (last - first < sheet.rows.size) {
+    for (let r = first; r <= last; r++) {
+      const row = sheet.rows.get(r);
+      if (row && row.hidden) out.push(r);
+    }
+    return out;
+  }
+  for (const [index, row] of sheet.rows) if (row.hidden && index >= first && index <= last) out.push(index);
+  return out.sort((a, b) => a - b);
+}
+
+/** The runs of rows of a span that are left when some rows (sorted) are taken out of it. */
+export function rowRunsWithout(top: number, bottom: number, without: number[]): { top: number; bottom: number }[] {
+  const runs: { top: number; bottom: number }[] = [];
+  let next = top;
+  for (let i = 0; i < without.length; i++) {
+    const row = without[i];
+    if (row < next || row > bottom) continue;
+    if (row > next) runs.push({ top: next, bottom: row - 1 });
+    next = row + 1;
+  }
+  if (next <= bottom) runs.push({ top: next, bottom });
+  return runs;
+}
+
+/**
+ * Deletes rows as Excel does in a filtered list: the rows of the span that the filter hides
+ * stay. What is left to delete may be several runs of rows; they are deleted from the last
+ * one up, and applied together they are one undo step. Without filtered rows in the span
+ * this is the one "delete" operation.
+ */
+export function deleteRows(workbook: Workbook, sheetIndex: number, at: number, count: number): Op[] {
+  const sheet = sheetOf(workbook, sheetIndex);
+  const kept = count > 0 ? rowsHiddenByFilter(sheet, at, at + count - 1) : [];
+  if (kept.length === 0) return [{ type: 'delete', sheet: sheetIndex, axis: 'row', at, count }];
+  const ops: Op[] = [];
+  const runs = rowRunsWithout(at, at + count - 1, kept);
+  for (let i = runs.length - 1; i >= 0; i--) ops.push({ type: 'delete', sheet: sheetIndex, axis: 'row', at: runs[i].top, count: runs[i].bottom - runs[i].top + 1 });
+  return ops;
+}
+
+/**
+ * Deletes columns. A criterion of the filter on one of them goes with its column, so the
+ * rows are first shown and hidden by the criteria that stay: rows that only the deleted
+ * column's criterion hid come back. Applied together the operations are one undo step.
+ */
+export function deleteColumns(workbook: Workbook, sheetIndex: number, at: number, count: number, options: EditOptions = {}): Op[] {
+  const sheet = sheetOf(workbook, sheetIndex);
+  const ops: Op[] = [];
+  const current = sheet.autoFilter;
+  if (current && count > 0) {
+    const gone = (column: FilterColumn) => {
+      const col = current.range.left + column.colId;
+      return col >= at && col < at + count;
+    };
+    if (current.columns.some((column) => gone(column) && isFilterActive(column))) {
+      const columns = current.columns.filter((column) => !gone(column));
+      ops.push(...applyColumns(workbook, sheetIndex, sheet, current, { ...current, columns }, options.locale));
+    }
+  }
+  ops.push({ type: 'delete', sheet: sheetIndex, axis: 'col', at, count });
+  return ops;
 }
 
 /** Whether the filter asks anything of a column, for the look of its button. */

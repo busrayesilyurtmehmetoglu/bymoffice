@@ -64,13 +64,136 @@ test('formula locale: numbers that have no Turkish spelling of their own are wri
   assert.equal(formulaToLocal('1.E3', TR), '1E3');
 });
 
-test('formula locale: a formula typed the English way is understood, except where a comma stands between digits', () => {
-  assert.equal(formulaFromLocal('SUM(A1,B1)', TR), 'SUM(A1,B1)');
-  assert.equal(formulaFromLocal('ROUND(A1,2)', TR), 'ROUND(A1,2)');
-  assert.equal(formulaFromLocal('A1*1.5', TR), 'A1*1.5');
-  assert.equal(formulaFromLocal('IF(A1>1, 2, 3)', TR), 'IF(A1>1, 2, 3)');
-  // As in the Turkish Excel: this is the one number 1,5.
+test('formula locale: a comma is the decimal comma or nothing - a formula typed the English way is refused, never read as another one', () => {
+  // Each of these would otherwise turn into a different formula without a word: "5,1" is a number.
+  const english = [
+    'IF(C2>5,1,0)',
+    'VLOOKUP(20,C2:C7,1,0)',
+    'DATE(2024,1,5)',
+    'MID(A1,2,3)',
+    'ROUND(A1,2)',
+    'SUM(A1,B1)',
+    'SUM(A1,5)',
+    'IF(A1>1, 2, 3)',
+    'SUM(1,2,3)',
+    'SUM(2,A1)',
+    '{1, 2}',
+    'SUM((A1:A2,C1:C2))',
+    '1,',
+    ',1',
+    'A1,',
+  ];
+  for (const typed of english) {
+    assert.throws(() => formulaFromLocal(typed, TR), /^RangeError: The formula cannot be read$/, typed);
+    // The same text is a formula as it stands where the comma separates arguments.
+    assert.equal(formulaFromLocal(typed, LOCALE_EN), typed);
+  }
+  // As in the Turkish Excel: between two digits the comma is the decimal comma, so this is the one number 1,5.
   assert.equal(formulaFromLocal('SUM(1,5)', TR), 'SUM(1.5)');
+  assert.equal(formulaFromLocal('SUM(1,5;2,25)', TR), 'SUM(1.5,2.25)');
+  assert.equal(formulaFromLocal('{1,5;2\\3;4}', TR), '{1.5,2;3,4}');
+  // A point in a number is left to the parser, as before.
+  assert.equal(formulaFromLocal('A1*1.5', TR), 'A1*1.5');
+  // Commas inside text, sheet names and brackets are not the formula's.
+  assert.equal(formulaFromLocal('"a,b"&\'x, y\'!A1&T[[#This Row],[a, b]]', TR), '"a,b"&\'x, y\'!A1&T[[#This Row],[a, b]]');
+  // Any locale with a decimal comma does the same.
+  const german = { ...LOCALE_EN, decimal: ',', group: '.' };
+  assert.throws(() => formulaFromLocal('ROUND(A1,2)', german), /The formula cannot be read/);
+});
+
+test('formula locale: what is typed with a stray comma is refused by the commands, and pasted from elsewhere it stays text', () => {
+  const wb = workbook();
+  const sheet = wb.sheets[0];
+  for (const typed of ['=IF(C2>5,1,0)', '=VLOOKUP(20,C2:C7,1,0)', '=DATE(2024,1,5)', '=MID(A1,2,3)', '=ROUND(A1,2)']) {
+    assert.throws(() => setCellInput(wb, 0, 0, 0, typed, { locale: TR }), /^RangeError: The formula cannot be read$/, typed);
+    assert.equal(parseCellInput(typed, { locale: TR }).invalid, true, typed);
+    // The same text in English is the formula it says.
+    assert.equal(setCellInput(wb, 0, 0, 0, typed, { locale: LOCALE_EN }).length, 1);
+  }
+  assert.equal(getCell(sheet, 0, 0), undefined);
+  assert.equal(parseCellInput('=ROUND(A1;2)', { locale: TR }).invalid, undefined);
+  const result = pasteAt(wb, 0, { top: 0, left: 0, bottom: 0, right: 0 }, '=IF(C2>5,1,0)\t=IF(C2>5;1;0)', undefined, { locale: TR });
+  for (const op of result.ops) applyOp(wb, op);
+  assert.deepEqual(getCell(sheet, 0, 0), { kind: 'string', value: '=IF(C2>5,1,0)', style: 0 });
+  assert.equal(getCell(sheet, 0, 1)!.formula!.text, 'IF(C2>5,1,0)');
+  // A copy made here carries the stored formula and is not read again.
+  const copied = copyRange(wb, 0, { top: 0, left: 1, bottom: 0, right: 1 }, { locale: TR });
+  const pasted = pasteAt(wb, 0, { top: 1, left: 1, bottom: 1, right: 1 }, copied.text, copied, { locale: TR });
+  for (const op of pasted.ops) applyOp(wb, op);
+  assert.equal(getCell(sheet, 1, 1)!.formula!.text, 'IF(C3>5,1,0)');
+});
+
+test('formula locale: DOĞRU and YANLIŞ are constants only where a constant can stand', () => {
+  assert.equal(formulaFromLocal('EĞER(A1;DOĞRU;YANLIŞ)', TR), 'IF(A1,TRUE,FALSE)');
+  assert.equal(formulaFromLocal('doğru+yanlış', TR), 'TRUE+FALSE');
+  assert.equal(formulaFromLocal('DOĞRU()', TR), 'TRUE()');
+  // The name of a sheet, of a run of sheets, and a name of a sheet's own.
+  assert.equal(formulaFromLocal('DOĞRU!A1+1', TR), 'DOĞRU!A1+1');
+  assert.equal(formulaFromLocal('TOPLA(DOĞRU:YANLIŞ!A1)', TR), 'SUM(DOĞRU:YANLIŞ!A1)');
+  assert.equal(formulaFromLocal('Sayfa1!DOĞRU*2', TR), 'Sayfa1!DOĞRU*2');
+  assert.equal(formulaFromLocal("'DOĞRU'!A1&YANLIŞ", TR), "'DOĞRU'!A1&FALSE");
+  // A range of two cells is not a run of sheets.
+  assert.equal(formulaFromLocal('EĞER(DOĞRU;A1:B2;0)', TR), 'IF(TRUE,A1:B2,0)');
+  // A defined name of the workbook, however it is cased.
+  const isName = (name: string) => name === 'DOĞRU' || name === 'doğru';
+  assert.equal(formulaFromLocal('DOĞRU*2+YANLIŞ', TR, { isName }), 'DOĞRU*2+FALSE');
+  assert.equal(formulaFromLocal('doğru*2', TR, { isName }), 'doğru*2');
+  // Function names were always read only where they are called.
+  assert.equal(formulaFromLocal('TOPLA!A1+EĞER+TOPLA(EĞER!B1:B3)', TR), 'TOPLA!A1+EĞER+SUM(EĞER!B1:B3)');
+  // What is shown never turns English words into Turkish ones.
+  assert.equal(formulaToLocal('TRUE!A1+TRUE', TR), 'TRUE!A1+TRUE');
+
+  // Through the commands: a sheet and a defined name called DOĞRU keep their formulas.
+  const wb = workbook();
+  wb.sheets.push(createSheet({ name: 'DOĞRU', sheetId: 2, state: 'visible', kind: 'worksheet', part: '/xl/worksheets/sheet2.xml' }));
+  for (const op of setCellInput(wb, 0, 0, 0, '=DOĞRU!A1+1', { locale: TR })) applyOp(wb, op);
+  assert.equal(getCell(wb.sheets[0], 0, 0)!.formula!.text, 'DOĞRU!A1+1');
+  for (const op of setCellInput(wb, 0, 1, 0, '=EĞER(DOĞRU;1;2)', { locale: TR })) applyOp(wb, op);
+  assert.equal(getCell(wb.sheets[0], 1, 0)!.formula!.text, 'IF(TRUE,1,2)');
+  wb.definedNames = [{ name: 'Doğru', value: 'Data!$B$1' }];
+  for (const op of setCellInput(wb, 0, 2, 0, '=EĞER(doğru>1;1;YANLIŞ)', { locale: TR })) applyOp(wb, op);
+  assert.equal(getCell(wb.sheets[0], 2, 0)!.formula!.text, 'IF(doğru>1,1,FALSE)');
+});
+
+test('formula locale: quotes doubled inside text, and error constants, come through both ways', () => {
+  assert.equal(formulaFromLocal('BİRLEŞTİR("x""y;";"a,b";1,5)', TR), 'CONCATENATE("x""y;","a,b",1.5)');
+  assert.equal(formulaToLocal('CONCATENATE("x""y,",1.5,"""")', TR), 'CONCATENATE("x""y,";1,5;"""")');
+  assert.equal(formulaFromLocal('"a"";"&"b";1', TR), '"a"";"&"b",1');
+  assert.equal(formulaFromLocal("'It''s; 1,5'!A1;2", TR), "'It''s; 1,5'!A1,2");
+  for (const [stored, typed] of [
+    ['IF(A1=#DIV/0!,#N/A,1.5)', 'IF(A1=#DIV/0!;#N/A;1,5)'],
+    ['IFERROR(#VALUE!,#REF!)+#NAME?+#NUM!+#NULL!', 'IFERROR(#VALUE!;#REF!)+#NAME?+#NUM!+#NULL!'],
+    ['SUM(#N/A,0.5,#DIV/0!,2)', 'SUM(#N/A;0,5;#DIV/0!;2)'],
+  ]) {
+    assert.equal(formulaToLocal(stored, TR), typed, stored);
+    assert.equal(formulaFromLocal(typed, TR), stored, typed);
+  }
+});
+
+test('formula locale: Turkish error constants are read when typed; what is shown stays English', () => {
+  const pairs: [string, string][] = [
+    ['#YOK', '#N/A'],
+    ['#DEĞER!', '#VALUE!'],
+    ['#BAŞV!', '#REF!'],
+    ['#SAYI/0!', '#DIV/0!'],
+    ['#AD?', '#NAME?'],
+    ['#SAYI!', '#NUM!'],
+    ['#BOŞ!', '#NULL!'],
+  ];
+  for (const [typed, stored] of pairs) {
+    assert.deepEqual(parseCellInput(typed, { locale: TR }), { kind: 'error', value: stored }, typed);
+    assert.deepEqual(parseCellInput(stored, { locale: TR }), { kind: 'error', value: stored }, stored);
+    // In English the Turkish word is text.
+    assert.equal(parseCellInput(typed, { locale: LOCALE_EN }).kind, 'string', typed);
+    assert.equal(formulaFromLocal(`EĞERHATA(A1;${typed})`, TR), `IFERROR(A1,${stored})`, typed);
+  }
+  assert.deepEqual(parseCellInput('#değer!', { locale: TR }), { kind: 'error', value: '#VALUE!' });
+  assert.deepEqual(parseCellInput('#sayı/0!', { locale: TR }), { kind: 'error', value: '#DIV/0!' });
+  assert.deepEqual(parseCellInput(' #yok ', { locale: TR }), { kind: 'error', value: '#N/A' });
+  assert.equal(parseCellInput('#YOKTUR', { locale: TR }).kind, 'string');
+  assert.equal(formulaFromLocal('EĞER(A1=#SAYI/0!;#yok;1,5)', TR), 'IF(A1=#DIV/0!,#N/A,1.5)');
+  assert.equal(formulaToLocal('IF(A1=#DIV/0!,#N/A,1.5)', TR), 'IF(A1=#DIV/0!;#N/A;1,5)');
+  assert.equal(cellEditText({ kind: 'error', value: '#N/A', style: 0 }, 'General', { locale: TR }), '#N/A');
 });
 
 test('formula locale: Turkish function names are read, whatever their case; shown formulas keep the English names', () => {
@@ -119,9 +242,15 @@ test('formula locale: very long and odd text comes back as it is, quickly', () =
   const started = Date.now();
   assert.equal(formulaFromLocal(big, TR).length, big.length);
   assert.ok(Date.now() - started < 1000);
-  for (const odd of ['', '(', '"', "'", '[', '{', '}}}', '#', '1,', ',1', ';;', '\\', '{\\', '$', '1E', '1,5E+']) {
+  for (const odd of ['', '(', '"', "'", '[', '{', '}}}', '#', ';;', '\\', '{\\', '$', '1E', '1,5E+', '"a,', "'a,", '[a,']) {
     assert.equal(typeof formulaFromLocal(odd, TR), 'string');
     assert.equal(typeof formulaToLocal(odd, TR), 'string');
+  }
+  // Nothing but a RangeError ever comes out of text that makes no sense.
+  for (const odd of ['1,', ',1', ',', ',,,', '{,}', '#,', 'DOĞRU,']) {
+    assert.throws(() => formulaFromLocal(odd, TR), RangeError);
+    assert.equal(typeof formulaToLocal(odd, TR), 'string');
+    assert.equal(parseCellInput(`=${odd}`, { locale: TR }).invalid, true);
   }
   assert.equal(formulaFromLocal(undefined as unknown as string, TR), undefined);
 });

@@ -254,12 +254,13 @@ test('filter: the value list of a column - distinct, sorted, checked, with blank
     blanks: true,
     blanksChecked: true,
     truncated: false,
+    opaque: false,
   });
   run(history, setFilterColumn(workbook, 0, 1, values(['red'])));
   assert.deepEqual(filterValues(workbook, 0, 1).items, [{ text: 'purple', checked: false }, { text: 'red', checked: true }, { text: 'yellow', checked: false }]);
   assert.equal(filterValues(workbook, 0, 1).blanksChecked, false);
   // Another column only offers what the first one lets through.
-  assert.deepEqual(filterValues(workbook, 0, 0), { items: [{ text: 'Apple', checked: true }, { text: 'Cherry', checked: true }], blanks: false, blanksChecked: false, truncated: false });
+  assert.deepEqual(filterValues(workbook, 0, 0), { items: [{ text: 'Apple', checked: true }, { text: 'Cherry', checked: true }], blanks: false, blanksChecked: false, truncated: false, opaque: false });
   assert.deepEqual(filterValues(workbook, 0, 2).items.map((item) => item.text), ['5', '10']);
   // A criterion of another kind: checked is what it shows.
   run(history, setFilterColumn(workbook, 0, 1, undefined));

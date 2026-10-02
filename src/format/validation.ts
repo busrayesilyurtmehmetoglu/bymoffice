@@ -7,14 +7,19 @@
 // conditional formats do it (see ConditionalFormats).
 //
 // Formulas are calculated by the engine the caller provides. A rule that needs
-// one and cannot get it (no engine, a formula the engine cannot read) is not
-// applied: the value is let through rather than refused for no reason.
+// one and cannot get it (no engine, a formula the engine cannot read or does
+// not know how to calculate) is not applied: the value is let through rather
+// than refused for no reason. A formula that is calculated and gives an error
+// is another matter: like Excel, a rule takes that for a "no".
 
-import type { CalcEngine } from '../calc/engine';
+import type { CalcEngine, CellAddress } from '../calc/engine';
 import { parseFormula, type Node } from '../calc/parse';
 import { adjustAnchoredFormula, adjustRange, type StructuralEdit } from '../calc/refs';
-import { MAX_COLS, MAX_ROWS, type Cell, type CellRange, type DataValidation, type Sheet, type Workbook } from '../model/sheet/types';
+import { isError, type Scalar } from '../calc/values';
+import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
 import { resolveCellStyle } from '../model/sheet/color';
+import { applyOp, type Op } from '../ops/ops';
+import { foldCase } from '../ops/sort';
 import { builtinFormatId, formatCell, isoToSerial } from './cell-format';
 import type { FormatLocale } from './locale';
 import { formatValue } from './number-format';
@@ -73,15 +78,51 @@ interface Entry {
 /** Where the values of a list come from. */
 type Source =
   | { kind: 'constant'; items: string[] }
-  | { kind: 'cells'; sheet: Sheet; range: CellRange }
+  /** `named`: the rule states a defined name, not the cells themselves. */
+  | { kind: 'cells'; sheet: Sheet; range: CellRange; named?: boolean }
   | { kind: 'formula'; text: string };
 
 type Plain = number | string | boolean;
 
 const OK: ValidationVerdict = { ok: true };
 
-function fold(text: string): string {
-  return text.replace(/[İIı]/g, 'i').toLowerCase();
+/** What a limit is worth when its formula gives an error: no value is within it. */
+const NO_LIMIT = 'error';
+
+/**
+ * Whether a formula uses what the engine cannot calculate, however it is written: a
+ * reference into another workbook, or across sheets (3D). The engine answers those with
+ * #REF!, which would read as a formula that was calculated and failed.
+ */
+const beyondEngine = new WeakMap<Node, boolean>();
+
+function isBeyondEngine(root: Node): boolean {
+  const known = beyondEngine.get(root);
+  if (known !== undefined) return known;
+  let found = false;
+  // The parser bounds the size of a tree; the walk keeps its own stack all the same.
+  const stack: Node[] = [root];
+  while (stack.length > 0 && !found) {
+    const node = stack.pop() as Node;
+    switch (node.type) {
+      case 'ref':
+        found = node.external === true || node.sheetEnd !== undefined;
+        break;
+      case 'call':
+        for (const arg of node.args) if (arg) stack.push(arg);
+        break;
+      case 'unary':
+        stack.push(node.operand);
+        break;
+      case 'binary':
+        stack.push(node.left, node.right);
+        break;
+      default:
+      // Constants and names hold nothing more.
+    }
+  }
+  beyondEngine.set(root, found);
+  return found;
 }
 
 /** A number as files write it; undefined for any other text. */
@@ -237,13 +278,15 @@ export class DataValidations {
   /**
    * Whether a cell may hold what is about to be written into it. `cell` is the cell the
    * typed text turns into (undefined: the cell is emptied) and `typed` the text itself.
-   * A custom rule reads the cell through its formula, so it needs the new cell in place:
-   * `tryOut` runs a function while it is, and puts the old cell back.
+   * A custom rule reads the cell through its formula, and maybe formulas that read the cell,
+   * so it needs the new cell in place and those calculated: `tryOut` runs a function while
+   * they are, and puts everything back (see tryOps()). When it answers undefined the value
+   * could not be tried, and the rule is not applied.
    *
    * A formula is not checked (UNSURE: Excel checks its result), and neither is a cell
    * whose rule says nothing happens on a wrong value. Never throws.
    */
-  check(row: number, col: number, cell: Cell | undefined, typed: string, tryOut?: <T>(run: () => T) => T): ValidationVerdict {
+  check(row: number, col: number, cell: Cell | undefined, typed: string, tryOut?: <T>(run: () => T) => T | undefined): ValidationVerdict {
     try {
       const entry = this.entryAt(row, col);
       if (!entry) return OK;
@@ -365,32 +408,56 @@ export class DataValidations {
     return entries;
   }
 
-  /** The number a limit of a rule stands for at a cell; undefined when it cannot be worked out. */
-  private limit(text: string | undefined, entry: Entry, row: number, col: number): number | undefined {
+  /**
+   * What the formula of a rule gives at a cell; undefined when it cannot be calculated: there
+   * is no engine, the text is not a formula, it uses what the engine does not know (a function
+   * it lacks, LET, a name that is not defined: #NAME?) or cannot reach (another workbook).
+   * Any other error is a result like any other.
+   */
+  private calculate(formula: string, entry: Entry, row: number, col: number): Scalar | undefined {
+    const engine = this.engine();
+    if (!engine) return undefined;
+    let node: Node;
+    try {
+      node = parseFormula(formula);
+    } catch (error) {
+      return undefined;
+    }
+    if (isBeyondEngine(node)) return undefined;
+    const value = engine.evaluateShifted(formula, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+    return isError(value) && value.error === '#NAME?' ? undefined : value;
+  }
+
+  /**
+   * The number a limit of a rule stands for at a cell; undefined when it cannot be worked
+   * out (the rule is then not applied), NO_LIMIT when its formula gives an error.
+   */
+  private limit(text: string | undefined, entry: Entry, row: number, col: number): number | typeof NO_LIMIT | undefined {
     if (text === undefined || text.trim() === '') return undefined;
     const constant = plainNumber(text);
     if (constant !== undefined) return constant;
-    const engine = this.engine();
-    if (!engine) return undefined;
-    const value = engine.evaluateShifted(text, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+    const value = this.calculate(text, entry, row, col);
+    if (isError(value)) return NO_LIMIT;
     return typeof value === 'number' ? value : typeof value === 'boolean' ? (value ? 1 : 0) : undefined;
   }
 
   private inLimits(entry: Entry, value: number, row: number, col: number): boolean | undefined {
     const a = this.limit(entry.formula1, entry, row, col);
-    if (a === undefined) return undefined;
     const operator = entry.rule.operator || 'between';
     const two = operator === 'between' || operator === 'notBetween';
     const b = two ? this.limit(entry.formula2, entry, row, col) : undefined;
-    if (two && b === undefined) return undefined;
+    // A limit that cannot be worked out lifts the rule, whatever the other limit is.
+    if (a === undefined || (two && b === undefined)) return undefined;
+    // UNSURE: Excel says of such a rule that it "currently evaluates to an error"; like a custom
+    // formula that gives an error, it is taken to refuse what is typed.
+    if (a === NO_LIMIT || b === NO_LIMIT) return false;
     return compare(value, operator, a, b);
   }
 
   /** What a custom formula says of the cell: any number but 0, or TRUE, lets the value pass. */
   private truth(formula: string, entry: Entry, row: number, col: number): boolean | undefined {
-    const engine = this.engine();
-    if (!engine) return undefined;
-    const value = engine.evaluateShifted(formula, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+    const value = this.calculate(formula, entry, row, col);
+    if (value === undefined) return undefined;
     if (typeof value === 'boolean') return value;
     if (typeof value === 'number') return value !== 0;
     // Text or an error: the formula does not say yes.
@@ -454,7 +521,7 @@ export class DataValidations {
       if (found.localSheet !== undefined && this.workbook.sheets[found.localSheet]) home = this.workbook.sheets[found.localSheet];
       // A name stands for the same cells wherever it is used.
       const cells = this.cellsOf(node, home, undefined, row, col);
-      if (cells) return { kind: 'cells', ...cells };
+      if (cells) return { kind: 'cells', ...cells, named: true };
     }
     return node.type === 'name' || node.type === 'ref' ? undefined : { kind: 'formula', text: formula };
   }
@@ -523,12 +590,181 @@ export class DataValidations {
       });
       return known === 'unknown' ? undefined : found;
     }
-    const folded = typeof value === 'string' ? fold(value) : undefined;
+    const locale = this.options.locale;
+    const folded = typeof value === 'string' ? foldCase(value, locale) : undefined;
+    let filled = 0;
     const known = this.eachSource(entry, row, col, (item) => {
-      found = typeof item === 'string' ? folded !== undefined && fold(item) === folded : item === value;
+      filled++;
+      found = typeof item === 'string' ? folded !== undefined && foldCase(item, locale) === folded : item === value;
       return found;
     });
+    if (found) return true;
     // A source that could not be read to its end may hold the value further down.
-    return found ? true : known === 'done' ? false : undefined;
+    if (known !== 'done') return undefined;
+    // UNSURE: a list given by a defined name that has empty cells in it lets every value through
+    // where the rule ignores blanks; Excel is described to do that for names, not for cells
+    // written into the rule.
+    if (source.kind === 'cells' && source.named && entry.rule.allowBlank) {
+      const { top, left, bottom, right } = source.range;
+      if (filled < (bottom - top + 1) * (right - left + 1)) return true;
+    }
+    return false;
+  }
+}
+
+/** Most calls a trial gives the engine to finish a calculation that runs out of its budget. */
+const MAX_TRIAL_SLICES = 16;
+
+/**
+ * Remembers the rows the sheets had when it was made, so that they can be put back: the
+ * very same objects, whatever replaced them in between. Rows are never changed in place,
+ * only replaced through the map of their sheet (by operations and by the engine alike), so
+ * it is enough to watch the maps; watching costs by the rows that change, not by the rows
+ * there are.
+ */
+class RowJournal {
+  private readonly watched: { rows: Map<number, Row>; was: Map<number, Row | undefined> }[] = [];
+
+  constructor(sheets: Sheet[]) {
+    for (const sheet of sheets) {
+      const rows = sheet.rows;
+      const was = new Map<number, Row | undefined>();
+      const note = (key: number) => {
+        if (!was.has(key)) was.set(key, Map.prototype.get.call(rows, key) as Row | undefined);
+      };
+      rows.set = function (key: number, value: Row) {
+        note(key);
+        return Map.prototype.set.call(this, key, value) as Map<number, Row>;
+      };
+      rows.delete = function (key: number) {
+        note(key);
+        return Map.prototype.delete.call(this, key);
+      };
+      rows.clear = function () {
+        Map.prototype.forEach.call(this, (_row: Row, key: number) => note(key));
+        Map.prototype.clear.call(this);
+      };
+      this.watched.push({ rows, was });
+    }
+  }
+
+  /** Puts back every row that was replaced, added or removed since the journal was made or last rolled back. */
+  rollback(): void {
+    for (const { rows, was } of this.watched) {
+      was.forEach((row, key) => {
+        if (row === undefined) Map.prototype.delete.call(rows, key);
+        else Map.prototype.set.call(rows, key, row);
+      });
+      was.clear();
+    }
+  }
+
+  /** Stops watching; the maps are plain maps again. */
+  close(): void {
+    for (const { rows } of this.watched) {
+      const own = rows as unknown as { set?: unknown; delete?: unknown; clear?: unknown };
+      delete own.set;
+      delete own.delete;
+      delete own.clear;
+    }
+    this.watched.length = 0;
+  }
+}
+
+const addressKey = (cell: CellAddress) => `${cell.sheet}:${cell.row}:${cell.col}`;
+
+/** Recalculates until the engine is done; false when it is not done after MAX_TRIAL_SLICES calls. */
+function settle(engine: CalcEngine, changed: CellAddress[]): boolean {
+  engine.recalculate(changed);
+  for (let i = 1; engine.incomplete && i < MAX_TRIAL_SLICES; i++) engine.recalculate([]);
+  return !engine.incomplete;
+}
+
+/**
+ * Runs `run` as if operations had been applied: the cells are written and every formula
+ * that depends on them, on any sheet, is calculated, so that a rule that reads such a formula
+ * judges the value that is being typed and not the one before it. Afterwards everything is
+ * taken back: the sheets hold the very rows they held (cells, values of the file, `modified`,
+ * `changedRows`, used extent), and the engine lists as differing from the file what it
+ * listed before. Nothing is drawn or reported in between: this runs within one call.
+ *
+ * Only changes of cells can be tried. Answers undefined, without calling `run`, when the
+ * engine could not finish calculating within its budget several times over: there is then
+ * nothing to judge the value by. The same when the engine is still in the middle of a
+ * calculation (`incomplete`): what that calculation writes is real and must not be taken
+ * back with the trial, so the caller finishes it first. Without an engine the cells are put
+ * in place and taken back, and nothing is calculated.
+ *
+ * UNSURE: a formula that was over the engine's budget before and is calculated during the
+ * trial is no longer listed as stale afterwards, although its cell has its old value again.
+ */
+export function tryOps<T>(workbook: Workbook, engine: CalcEngine | undefined, ops: Op[], run: () => T): T | undefined {
+  const sheets = workbook.sheets || [];
+  for (const op of ops) if (op.type !== 'setCells' || !sheets[op.sheet]) return run();
+  if (engine && engine.incomplete) return undefined;
+  const saved = sheets.map((sheet) => ({ modified: sheet.modified, changedRows: sheet.changedRows, rowCount: sheet.rowCount, colCount: sheet.colCount }));
+  // What the trial marks as changed must not end up in the sets the writer reads.
+  for (const sheet of sheets) if (sheet.changedRows) sheet.changedRows = new Set(sheet.changedRows);
+  const mismatched = engine ? engine.mismatched : [];
+  const circular = engine ? engine.circular.slice() : [];
+  const journal = new RowJournal(sheets);
+  const changed: CellAddress[] = [];
+  // A formula that is replaced or put in place changes the graph of the engine, which then has to be told again.
+  let formulas = false;
+  try {
+    const inverse: Op[] = [];
+    try {
+      for (const op of ops) {
+        if (op.type !== 'setCells') continue;
+        const undo = applyOp(workbook, op);
+        inverse.push(undo);
+        if (undo.type !== 'setCells') continue;
+        // The inverse also names the cells the operation changed on its own (dependants of a shared formula).
+        for (const change of undo.cells) {
+          changed.push({ sheet: op.sheet, row: change.row, col: change.col });
+          const now = getCell(sheets[op.sheet], change.row, change.col);
+          if ((change.cell && change.cell.formula) || (now && now.formula)) formulas = true;
+        }
+      }
+      if (engine && !settle(engine, changed)) return undefined;
+      return run();
+    } finally {
+      for (let i = inverse.length - 1; i >= 0; i--) applyOp(workbook, inverse[i]);
+      journal.rollback();
+    }
+  } finally {
+    try {
+      if (engine) {
+        // The engine reads values from the cells, which are back; what it keeps beside them is brought back here.
+        if (formulas || engine.incomplete) {
+          settle(engine, changed);
+          journal.rollback();
+        }
+        // A formula whose value of the file stood although the engine calculates another one was
+        // calculated during the trial as one that changed. Named again, with nothing changed, it
+        // is found to differ again; a circle met only while calculating is met again the same way.
+        const still = new Set(engine.mismatched.map(addressKey));
+        const lost = mismatched.filter((cell) => !still.has(addressKey(cell)));
+        const circles = new Set(engine.circular.map(addressKey));
+        for (const cell of circular) if (!circles.has(addressKey(cell))) lost.push(cell);
+        if (lost.length > 0) {
+          settle(engine, lost);
+          journal.rollback();
+        }
+      }
+    } catch (error) {
+      // The engine never throws; if it did, the cells are still put back below.
+      journal.rollback();
+    }
+    journal.close();
+    sheets.forEach((sheet, index) => {
+      const was = saved[index];
+      if (was.modified === undefined) delete sheet.modified;
+      else sheet.modified = was.modified;
+      if (was.changedRows) sheet.changedRows = was.changedRows;
+      else delete sheet.changedRows;
+      sheet.rowCount = was.rowCount;
+      sheet.colCount = was.colCount;
+    });
   }
 }

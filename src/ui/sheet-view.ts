@@ -26,10 +26,21 @@ import {
 } from '../ops/format';
 import { CalcEngine } from '../calc/engine';
 import { ConditionalFormats } from '../format/conditional';
-import { DataValidations, MAX_LIST_ITEMS, ValidationError } from '../format/validation';
-import { MAX_FILTER_VALUES, filterSummary, filterValues, isFilterActive, setAutoFilter, setFilterColumn } from '../ops/filter';
-import { History, applyOp, type Op } from '../ops/ops';
-import { currentRegion, sortRange } from '../ops/sort';
+import { DataValidations, MAX_LIST_ITEMS, ValidationError, tryOps } from '../format/validation';
+import {
+  MAX_FILTER_VALUES,
+  deleteColumns as deleteColumnOps,
+  deleteRows as deleteRowOps,
+  filterSummary,
+  filterValues,
+  isFilterActive,
+  rowRunsWithout,
+  rowsHiddenByFilter,
+  setAutoFilter,
+  setFilterColumn,
+} from '../ops/filter';
+import { History, markStyles, resetStyles, type Op } from '../ops/ops';
+import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { cssFont } from '../render/text';
 import { ContextMenu, type MenuItem } from './context-menu';
@@ -90,6 +101,9 @@ export interface HistoryMark {
 
 /** Longest a recalculation holds the page before it leaves the rest for the next turn. */
 const CALC_SLICE_MS = 250;
+
+/** Most turns a calculation is given at once when something has to wait for its end. */
+const MAX_FINISH_SLICES = 8;
 
 /** Above this many written cells a step recalculates every formula instead of tracking what depends on them. */
 const MAX_RECALC_CELLS = 100000;
@@ -1254,7 +1268,7 @@ export class WorkbookView {
       if (op.type !== 'setCells' || op.sheet !== sheetIndex) continue;
       for (const change of op.cells) if (change.row === row && change.col === col) cell = change.cell;
     }
-    const verdict = rules.check(row, col, cell, text, (run) => this.withCandidate(sheet, ops, run));
+    const verdict = rules.check(row, col, cell, text, (run) => this.tryOut(ops, run));
     if (verdict.ok) return undefined;
     const message = verdict.message || this.strings.validationFailed;
     const display = verdict.title ? `${verdict.title}: ${message}` : message;
@@ -1263,23 +1277,22 @@ export class WorkbookView {
   }
 
   /**
-   * Runs `run` with operations applied to the workbook and takes them back afterwards, as if
-   * nothing had happened: the formula of a custom rule reads the cell it is asked about.
+   * Runs `run` as if operations had been applied and everything that depends on them
+   * calculated, and takes it all back afterwards: the formula of a custom rule reads the cell
+   * it is asked about, and often formulas that read that cell. Nothing of it is drawn or
+   * reported; undefined when the value could not be tried (see tryOps()).
    */
-  private withCandidate<T>(sheet: Sheet, ops: Op[], run: () => T): T {
-    const modified = sheet.modified;
-    const changedRows = sheet.changedRows;
-    if (changedRows) sheet.changedRows = new Set(changedRows);
-    const inverse: Op[] = [];
+  private tryOut<T>(ops: Op[], run: () => T): T | undefined {
+    const engine = this.conditionalEngine();
+    // A calculation that is still going on is finished first: what it writes is real, and
+    // would otherwise be taken back with the trial.
+    if (engine && engine.incomplete) this.finishCalculation(engine);
     try {
-      for (const op of ops) inverse.push(applyOp(this.workbook, op));
-      return run();
+      return tryOps(this.workbook, engine, ops, run);
     } finally {
-      for (let i = inverse.length - 1; i >= 0; i--) applyOp(this.workbook, inverse[i]);
-      if (modified) sheet.modified = modified;
-      else delete sheet.modified;
-      if (changedRows) sheet.changedRows = changedRows;
-      else delete sheet.changedRows;
+      this.marksDirty = true;
+      // A calculation the trial could not finish goes on in the background.
+      if (engine && engine.incomplete) this.continueCalculation();
     }
   }
 
@@ -1532,8 +1545,8 @@ export class WorkbookView {
 
   /**
    * Sorts by the column of the active cell: inside the filter its rows, with one cell
-   * selected the block of cells around it (its first row is taken to be a header and
-   * stays), otherwise exactly the selection.
+   * selected the block of cells around it (its first row stays when it looks like a
+   * header, see hasHeaderRow()), otherwise exactly the selection.
    */
   sort(descending: boolean): void {
     if (this.destroyed || this.locked) return;
@@ -1551,7 +1564,7 @@ export class WorkbookView {
       header = true;
     } else if (this.singleCell()) {
       range = currentRegion(sheet, active.row, active.col);
-      header = range.bottom > range.top;
+      header = hasHeaderRow(this.workbook, sheet, range);
     } else {
       range = state.range;
       header = false;
@@ -1605,13 +1618,22 @@ export class WorkbookView {
       blanksChecked: list.blanksChecked,
       note: list.truncated ? strings.tooManyValues(MAX_FILTER_VALUES) : undefined,
       canClear: isFilterActive(model.columns.find((column) => column.colId === colId)),
+      unchangedKeeps: list.opaque,
       openedByTouch: touch,
       onSort: (descending) =>
         this.attempt(() => {
           const current = this.state().sheet.autoFilter;
           if (current) this.applyOps(sortRange(this.workbook, this.sheetIndex, current.range, [{ col, descending }], { locale: this.locale, header: true }));
         }),
-      onApply: (choice) => this.attempt(() => this.setColumnFilter(col, choice)),
+      onApply: (choice) =>
+        this.attempt(() => {
+          this.setColumnFilter(col, choice);
+          // Choosing values takes the place of a criterion that could not be shown as values: say so.
+          if (list.opaque && choice) {
+            const summary = filterSummary(this.state().sheet);
+            this.notify(summary ? `${strings.filterReplaced} ${strings.recordsShown(summary.shown, summary.total)}` : strings.filterReplaced, 'info');
+          }
+        }),
       onClose: () => this.panelClosed(),
     });
     this.placeTip();
@@ -2058,11 +2080,27 @@ export class WorkbookView {
     if (this.options.onEditingChange) this.options.onEditingChange({ editing: this.edit !== undefined, text: this.editText });
   }
 
-  /** Applies a style patch to the selection as one undo step. No-op when read-only. */
+  /**
+   * Applies a style patch to the selection as one undo step. No-op when read-only.
+   * Rows that the filter hides are left out, as in Excel; with whole columns selected the
+   * format is that of the columns, which those rows share.
+   */
   format(patch: StylePatch): void {
     if (this.destroyed || this.locked) return;
     this.commitEditing();
-    this.applyOps(formatRange(this.workbook, this.sheetIndex, this.state().range, patch));
+    const state = this.state();
+    const range = state.range;
+    const filtered = fullHeight(range) ? [] : rowsHiddenByFilter(state.sheet, range.top, range.bottom);
+    if (filtered.length === 0) {
+      this.applyOps(formatRange(this.workbook, this.sheetIndex, range, patch));
+      return;
+    }
+    const ops: Op[] = [];
+    for (const run of rowRunsWithout(range.top, range.bottom, filtered)) {
+      const part = formatRange(this.workbook, this.sheetIndex, { top: run.top, left: range.left, bottom: run.bottom, right: range.right }, patch);
+      for (let i = 0; i < part.length; i++) ops.push(part[i]);
+    }
+    this.applyOps(ops);
   }
 
   /** Merges the selection into one cell, or splits the merges it touches. */
@@ -2123,9 +2161,18 @@ export class WorkbookView {
       this.committing = true;
       let warning: string | undefined;
       try {
-        const ops = setCellInput(this.workbook, edit.sheet, edit.row, edit.col, text, { locale: this.locale });
-        // A value the cell's data validation refuses is not written, and the editor stays open with it.
-        warning = this.validateInput(edit.sheet, edit.row, edit.col, text, ops);
+        // Reading the text may add a format for it (a date, a percentage) before it is known to be written.
+        const styles = markStyles(this.workbook.styles);
+        let ops: Op[];
+        try {
+          ops = setCellInput(this.workbook, edit.sheet, edit.row, edit.col, text, { locale: this.locale });
+          // A value the cell's data validation refuses is not written, and the editor stays open with it.
+          warning = this.validateInput(edit.sheet, edit.row, edit.col, text, ops);
+        } catch (error) {
+          // What is refused leaves nothing behind: saved, the file is byte for byte what it was.
+          resetStyles(this.workbook.styles, styles);
+          throw error;
+        }
         this.applyOps(ops);
       } finally {
         this.committing = false;
@@ -2272,7 +2319,14 @@ export class WorkbookView {
           ? { active: { row: at, col: state.active.col }, range: { top: at, bottom: at + count - 1, left: 0, right: MAX_COLS - 1 } }
           : { active: { row: state.active.row, col: at }, range: { top: 0, bottom: MAX_ROWS - 1, left: at, right: at + count - 1 } };
     }
-    this.applyOps([{ type: kind, sheet: this.sheetIndex, axis, at, count }], after);
+    // Deleting leaves out rows the filter hides, and takes the criterion of a deleted column with it.
+    const ops: Op[] =
+      kind === 'insert'
+        ? [{ type: kind, sheet: this.sheetIndex, axis, at, count }]
+        : axis === 'row'
+          ? deleteRowOps(this.workbook, this.sheetIndex, at, count)
+          : deleteColumnOps(this.workbook, this.sheetIndex, at, count, { locale: this.locale });
+    this.applyOps(ops, after);
   }
 
   /** Ctrl with plus or minus on whole rows or columns. Returns false when the selection is neither. */
@@ -2305,7 +2359,11 @@ export class WorkbookView {
       if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
       this.marksDirty = true;
       if (!cells) this.engine.invalidate();
-      else if (rows) for (let i = 0; i < rows.length; i++) this.engine.rowsChanged(rows[i]);
+      else if (rows) {
+        for (let i = 0; i < rows.length; i++) this.engine.rowsChanged(rows[i]);
+        // A filter that is switched on or off defines or removes the name of its range.
+        this.engine.namesChanged();
+      }
       // After rows or columns moved every result may have changed for a reason the engine cannot
       // see in the cells (a deleted row makes a sum smaller), so the values of the file give way.
       const changed = cells ? this.engine.recalculate(cells) : this.engine.recalculate(undefined, { overwrite: true });
@@ -2339,6 +2397,23 @@ export class WorkbookView {
       this.schedule();
       if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
     }, 0);
+  }
+
+  /**
+   * Goes on with a calculation that ran out of its time, here and now, for a few turns: for
+   * what cannot wait for the next turn of the page. What is still left then goes on as before.
+   */
+  private finishCalculation(engine: CalcEngine): void {
+    const sheets: number[] = [];
+    try {
+      for (let i = 0; engine.incomplete && i < MAX_FINISH_SLICES; i++) this.addSheets(sheets, engine.recalculate([]).map((entry) => entry.sheet));
+    } catch (error) {
+      this.engine = undefined;
+    }
+    this.marksDirty = true;
+    this.conditional.forEach((formats) => formats.invalidate());
+    this.schedule();
+    if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
   }
 
   /** Adds the sheets a recalculation wrote to the ones a step reports as changed. */

@@ -377,10 +377,20 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   const adjusted = adjustSheetFormulas(sheet, refEdit, true);
   let weight = adjusted.size + (axis === 'col' ? sheet.rows.size : 0);
 
+  // A filter that loses its header row, or all of its range, is gone, as in Excel; the rows it hid are shown.
+  const filter = sheet.autoFilter ? shiftAutoFilter(sheet.autoFilter, edit) : undefined;
+  const dropped = sheet.autoFilter && !filter ? sheet.autoFilter.range : undefined;
+  const shown = (i: number, row: Row): Row | undefined => {
+    if (!dropped || !row.hidden || i <= dropped.top || i > dropped.bottom) return row;
+    const next: Row = { ...row, hidden: false };
+    return isPlainRow(next) && !next.cells.some(() => true) ? undefined : next;
+  };
+
   const rows = new Map<number, Row>();
   if (axis === 'row') {
     for (const [i, original] of sheet.rows) {
-      const row = adjusted.get(i) || original;
+      const row = shown(i, adjusted.get(i) || original);
+      if (!row) continue;
       if (i < at) rows.set(i, row);
       else if (kind === 'insert') rows.set(i + count, row);
       else if (i >= at + count) rows.set(i - count, row);
@@ -388,7 +398,8 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
     sheet.rowCount = kind === 'insert' ? (sheet.rowCount > at ? sheet.rowCount + count : sheet.rowCount) : sheet.rowCount <= at ? sheet.rowCount : Math.max(sheet.rowCount - count, at);
   } else {
     for (const [i, original] of sheet.rows) {
-      const row = adjusted.get(i) || original;
+      const row = shown(i, adjusted.get(i) || original);
+      if (!row) continue;
       if (row.cells.length <= at) {
         rows.set(i, row);
         continue;
@@ -418,10 +429,10 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   }
   sheet.hyperlinks = hyperlinks;
   if (sheet.dimension) sheet.dimension = moveRange(sheet.dimension);
-  if (sheet.autoFilter) {
-    const filter = shiftAutoFilter(sheet.autoFilter, edit);
-    if (filter) sheet.autoFilter = filter;
-    else delete sheet.autoFilter;
+  if (filter) sheet.autoFilter = filter;
+  else if (dropped) {
+    delete sheet.autoFilter;
+    sheet.autoFilterModified = true;
   }
   sheet.structuralEdits = (sheet.structuralEdits || []).concat([{ kind, axis, at, count }]);
   sheet.modified = true;
@@ -465,16 +476,23 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
     const value = adjustFormula(name.value, home, refEdit);
     return value === name.value ? name : { ...name, value };
   });
+  // The name that went with the filter would be left naming cells that are gone.
+  if (dropped) syncFilterName(workbook, index);
 
   return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, weight };
 }
 
 /**
  * A filter after rows or columns moved: its range follows, and its criteria stay with their
- * columns (a criterion on a deleted column goes with it). Undefined when the range is gone.
+ * columns (a criterion on a deleted column goes with it; the command that deletes the column
+ * shows the rows only that criterion hid, see deleteColumns() in filter.ts). Undefined when
+ * the range is gone, or its header row is: a filter cannot do without its header, and the
+ * row under it must not silently become one.
  * The writer does the same to the source element of a filter that was not changed otherwise.
  */
 function shiftAutoFilter(filter: AutoFilter, edit: SheetStructuralEdit): AutoFilter | undefined {
+  const header = filter.range.top;
+  if (edit.kind === 'delete' && edit.axis === 'row' && edit.at <= header && edit.at + edit.count > header) return undefined;
   const range = adjustRange(filter.range, edit);
   if (!range) return undefined;
   const next: AutoFilter = { ...filter, range };
@@ -563,6 +581,59 @@ function setRowsHidden(sheet: Sheet, rows: number[] | undefined, hidden: boolean
 const SORT_BLOCKERS = ['comments', 'pivotTable', 'table'];
 
 const intersects = (a: CellRange, b: CellRange) => a.top <= b.bottom && a.bottom >= b.top && a.left <= b.right && a.right >= b.left;
+
+/** The cells a reference names after "!": a cell, a range, whole columns or whole rows. */
+const QUALIFIED_CELLS = /^(?:\$?[A-Za-z]{1,3}\$?\d{1,7}(?::\$?[A-Za-z]{1,3}\$?\d{1,7})?|\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}|\$?\d{1,7}:\$?\d{1,7})(?![A-Za-z0-9_.])/;
+/** Longest text QUALIFIED_CELLS can match, and one character more for what must not follow. */
+const QUALIFIED_LENGTH = 24;
+
+/**
+ * Moves the relative references of a formula by rows, as shiftFormula() does, but leaves
+ * references that name a sheet ("Other!A1", "'My data'!A1:B2", also the formula's own sheet
+ * by name) as they are. That is what Excel does to the formulas of rows a sort moves: what a
+ * row reads beside itself goes along, what it reads by sheet name stays put.
+ *
+ * The text is cut at the cells of every reference with a sheet name; the pieces between
+ * them are shifted one by one. Text in quotes and in brackets is never cut.
+ */
+export function shiftUnqualified(text: string, dRow: number): string {
+  if (dRow === 0 || text.indexOf('!') < 0) return shiftFormula(text, dRow, 0);
+  const n = text.length;
+  let out = '';
+  let start = 0;
+  let i = 0;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c === 34 || c === 39) {
+      // A string, or a sheet name in apostrophes: a doubled quote stays inside.
+      let j = i + 1;
+      for (; j < n; j++) {
+        if (text.charCodeAt(j) !== c) continue;
+        if (text.charCodeAt(j + 1) === c) j++;
+        else break;
+      }
+      i = j + 1;
+    } else if (c === 91) {
+      // A workbook index or a table reference, brackets inside it included.
+      let depth = 0;
+      let j = i;
+      for (; j < n; j++) {
+        const d = text.charCodeAt(j);
+        if (d === 91) depth++;
+        else if (d === 93 && --depth === 0) break;
+      }
+      i = j + 1;
+    } else if (c === 33) {
+      const cells = QUALIFIED_CELLS.exec(text.substr(i + 1, QUALIFIED_LENGTH));
+      if (cells) {
+        out += shiftFormula(text.slice(start, i + 1), dRow, 0) + cells[0];
+        i += 1 + cells[0].length;
+        start = i;
+      } else i++;
+    } else i++;
+  }
+  return start === 0 ? shiftFormula(text, dRow, 0) : out + shiftFormula(text.slice(start), dRow, 0);
+}
 
 /** Moves the cells of rows within a range (see the operation "sortRange"). */
 function sortRows(workbook: Workbook, index: number, range: CellRange, order: number[]): Op {
@@ -661,7 +732,8 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
       const formula = cell.formula;
       if (formula) {
         // As when a cell is copied: what it refers to relative to itself is still that far from it.
-        const text = shiftFormula(formula.text, i - from, 0);
+        // What it refers to by sheet name stays where it is.
+        const text = shiftUnqualified(formula.text, i - from);
         const single = formula.type === 'array' && formula.ref !== undefined;
         if (text !== formula.text || single) cell = { ...cell, formula: { ...formula, text, ...(single ? { ref: cellName(at, range.left + k) } : {}) } };
       }
@@ -907,6 +979,40 @@ export const sameFormat = (a: CellFormat, b: CellFormat) =>
   a.quotePrefix === b.quotePrefix &&
   sameRecord(a.alignment, b.alignment) &&
   sameRecord(a.protection, b.protection);
+
+/** How much of a style sheet there was at some moment (see markStyles()). */
+export interface StylesMark {
+  numFmts: number;
+  fonts: number;
+  fills: number;
+  borders: number;
+  cellXfs: number;
+  modified: boolean | undefined;
+}
+
+/**
+ * Notes how far the tables of a style sheet reach. Formats are only ever added at the end
+ * (reading typed text may add a date format before anything is known to be written), so
+ * resetStyles() can take back whatever was added since, as if it had never been asked for.
+ */
+export function markStyles(styles: StyleSheet): StylesMark {
+  return { numFmts: styles.numFmts.size, fonts: styles.fonts.length, fills: styles.fills.length, borders: styles.borders.length, cellXfs: styles.cellXfs.length, modified: styles.modified };
+}
+
+/** Removes the formats added since markStyles(); nothing may refer to them any more. */
+export function resetStyles(styles: StyleSheet, mark: StylesMark): void {
+  if (styles.numFmts.size > mark.numFmts) {
+    // A map keeps its keys in the order they were added.
+    const added = Array.from(styles.numFmts.keys()).slice(mark.numFmts);
+    for (const id of added) styles.numFmts.delete(id);
+  }
+  if (styles.fonts.length > mark.fonts) styles.fonts.length = mark.fonts;
+  if (styles.fills.length > mark.fills) styles.fills.length = mark.fills;
+  if (styles.borders.length > mark.borders) styles.borders.length = mark.borders;
+  if (styles.cellXfs.length > mark.cellXfs) styles.cellXfs.length = mark.cellXfs;
+  if (mark.modified === undefined) delete styles.modified;
+  else styles.modified = mark.modified;
+}
 
 /** Excel's limit on cell formats in one workbook. */
 export const MAX_CELL_FORMATS = 65430;

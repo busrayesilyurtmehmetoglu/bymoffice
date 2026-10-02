@@ -8,13 +8,15 @@
 import { LOCALE_EN, LOCALE_TR, normalizeLocale, type FormatLocale } from '../format/locale';
 import { isDateFormat, serialToDate } from '../format/number-format';
 import type { Cell } from '../model/sheet/types';
-import { formulaFromLocal, formulaToLocal } from './formula-locale';
+import { formulaFromLocal, formulaToLocal, localErrorCode } from './formula-locale';
 
 export interface InputOptions {
   locale?: FormatLocale;
   date1904?: boolean;
   /** The current date, for typed dates without a year ("15.03"). Default: now. */
   today?: Date;
+  /** Whether the workbook has a defined name of this spelling, for words of a formula that are names in it and constants elsewhere. */
+  isName?(name: string): boolean;
 }
 
 export interface ParsedInput {
@@ -22,6 +24,11 @@ export interface ParsedInput {
   value: number | string | boolean | null;
   /** Formula text without the leading "=", when the input is a formula. */
   formula?: string;
+  /**
+   * The input is a formula that is not written the way the locale writes formulas (a comma
+   * that is not a decimal comma): `formula` is the text as typed, and must not be stored.
+   */
+  invalid?: boolean;
   /**
    * Number format the input implies ("0%", a date or time code, currency), as a built-in
    * format id where one exists (9, 10, 14, 20, 21, 22, 4 ...) or a format code otherwise.
@@ -570,7 +577,12 @@ export function parseCellInput(text: string, options?: InputOptions): ParsedInpu
   if (first === '=') {
     if (text.length === 1) return { kind: 'string', value: text };
     // Typed the way the locale writes formulas (";" between arguments, "1,5"); stored the one way files have them.
-    return { kind: 'blank', value: null, formula: formulaFromLocal(text.substring(1), resolveLocale(options)) };
+    const typed = text.substring(1);
+    try {
+      return { kind: 'blank', value: null, formula: formulaFromLocal(typed, resolveLocale(options), options) };
+    } catch (error) {
+      return { kind: 'blank', value: null, formula: typed, invalid: true };
+    }
   }
   // A leading apostrophe means "text, exactly as typed".
   if (first === "'") return stringResult(text.substring(1));
@@ -584,7 +596,10 @@ export function parseCellInput(text: string, options?: InputOptions): ParsedInpu
   if (folded === 'false' || folded === fold(locale.falseText)) return { kind: 'boolean', value: false };
   if (first === '#' || body.charAt(0) === '#') {
     const index = ERRORS.indexOf(body.toUpperCase());
-    return index >= 0 ? { kind: 'error', value: ERRORS[index] } : stringResult(text);
+    if (index >= 0) return { kind: 'error', value: ERRORS[index] };
+    // The locale's own name of an error ("#YOK"); what is stored and shown is the English one.
+    const local = localErrorCode(body, locale);
+    return local !== undefined ? { kind: 'error', value: local } : stringResult(text);
   }
   const result =
     tryPlainNumber(body, locale) ||

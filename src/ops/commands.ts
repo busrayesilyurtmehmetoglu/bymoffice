@@ -10,6 +10,7 @@ import { builtinFormatId, formatCell } from '../format/cell-format';
 import type { FormatLocale } from '../format/locale';
 import { resolveCellStyle } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
+import { rowRunsWithout, rowsHiddenByFilter } from './filter';
 import { ensureCellFormat, ensureNumberFormat, explicitFormula, sharedMasters, type CellChange, type Op, type SharedMasters } from './ops';
 
 export interface EditOptions {
@@ -50,14 +51,32 @@ const isTextFormat = (code: string) => code === '@';
 /** Longest text a cell holds. */
 const MAX_CELL_TEXT = 32767;
 
-/** The cell that typed text turns into at a position, or undefined when the position ends up empty. */
+/** Whether the workbook has a defined name of this spelling, whatever its case. */
+function hasDefinedName(workbook: Workbook, word: string): boolean {
+  const names = workbook.definedNames;
+  if (!names || names.length === 0) return false;
+  const wanted = word.toLowerCase();
+  const upper = word.toUpperCase();
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i].name;
+    if (name.length === word.length && (name === word || name.toLowerCase() === wanted || name.toUpperCase() === upper)) return true;
+  }
+  return false;
+}
+
+/**
+ * The cell that typed text turns into at a position, or undefined when the position ends up empty.
+ * Throws RangeError("The formula cannot be read") for a formula that is not written the way the
+ * locale writes formulas.
+ */
 export function cellFromInput(workbook: Workbook, sheet: Sheet, row: number, col: number, text: string, options: EditOptions = {}): Cell | undefined {
   let style = styleAt(sheet, row, col);
   if (text === '') return emptied(sheet, row, col, style);
   const format = resolveCellStyle(workbook.styles, style).numFmt;
   // In a cell formatted as Text, what is typed is the text: "0123" keeps its zero and "=A1" is not a formula.
   if (isTextFormat(format)) return { kind: 'string', value: text.length > MAX_CELL_TEXT ? text.slice(0, MAX_CELL_TEXT) : text, style };
-  const parsed = parseCellInput(text, { locale: options.locale, date1904: workbook.date1904 });
+  const parsed = parseCellInput(text, { locale: options.locale, date1904: workbook.date1904, isName: (name) => hasDefinedName(workbook, name) });
+  if (parsed.invalid) throw new RangeError('The formula cannot be read');
   if (parsed.kind === 'blank' && parsed.formula === undefined) return emptied(sheet, row, col, style);
   // Typing "15.03.2024" or "12%" into a cell without a format of its own gives it one.
   const implied = parsed.numFmtId !== undefined ? parsed.numFmtId : parsed.numFmt !== undefined ? ensureNumberFormat(workbook.styles, parsed.numFmt) : undefined;
@@ -111,13 +130,18 @@ function usedPart(sheet: Sheet, range: CellRange): CellRange {
   return { top: range.top, left: range.left, bottom: Math.min(range.bottom, sheet.rowCount - 1), right: Math.min(range.right, sheet.colCount - 1) };
 }
 
-/** Removes the contents of a range and keeps its formatting. */
+/**
+ * Removes the contents of a range and keeps its formatting. Rows that the filter of the
+ * sheet hides are left as they are, as in Excel; rows hidden by hand are emptied.
+ */
 export function clearRange(workbook: Workbook, sheetIndex: number, range: CellRange): Op[] {
   const sheet = workbook.sheets[sheetIndex];
   const used = usedPart(sheet, range);
+  const filtered = rowsHiddenByFilter(sheet, used.top, used.bottom);
+  const kept = filtered.length > 0 ? new Set(filtered) : undefined;
   const cells: CellChange[] = [];
   for (const [rowIndex, row] of sheet.rows) {
-    if (rowIndex < used.top || rowIndex > used.bottom) continue;
+    if (rowIndex < used.top || rowIndex > used.bottom || (kept && kept.has(rowIndex))) continue;
     row.cells.forEach((cell, col) => {
       if (col < used.left || col > used.right) return;
       if (cell.kind === 'blank' && !cell.formula) return;
@@ -132,9 +156,16 @@ export interface CopiedRange {
   text: string;
   html: string;
   sheet: number;
+  /** The range that was selected. */
   range: CellRange;
   /** Rows of the range; a missing entry is an empty cell. */
   cells: (Cell | undefined)[][];
+  /**
+   * The sheet rows the rows of `cells` came from, when rows of the range were left out
+   * (rows that a filter hides are not copied): the copy is one block, and a pasted formula
+   * moves by the distance from the row it really came from.
+   */
+  rows?: number[];
 }
 
 /** Largest selection that a smaller copied block is repeated over. */
@@ -153,7 +184,13 @@ export function copyRange(workbook: Workbook, sheetIndex: number, range: CellRan
   const grid: string[][] = [];
   const formatCache = new Map<number, { code: string; builtinId: number | undefined }>();
   let masters: SharedMasters | undefined;
-  for (let r = range.top; r <= bottom; r++) {
+  // As in Excel, a copy out of a filtered list takes the rows that are shown.
+  const filtered = rowsHiddenByFilter(sheet, range.top, bottom);
+  const rows: number[] = [];
+  for (const run of filtered.length > 0 ? rowRunsWithout(range.top, bottom, filtered) : [{ top: range.top, bottom }]) {
+    for (let r = run.top; r <= run.bottom; r++) rows.push(r);
+  }
+  for (const r of rows) {
     const rowCells: (Cell | undefined)[] = [];
     const rowText: string[] = [];
     for (let c = range.left; c <= right; c++) {
@@ -179,7 +216,9 @@ export function copyRange(workbook: Workbook, sheetIndex: number, range: CellRan
     cells.push(rowCells);
     grid.push(rowText);
   }
-  return { text: toTsv(grid), html: toHtmlTable(grid), sheet: sheetIndex, range: { top: range.top, left: range.left, bottom, right }, cells };
+  const copied: CopiedRange = { text: toTsv(grid), html: toHtmlTable(grid), sheet: sheetIndex, range: { top: range.top, left: range.left, bottom, right }, cells };
+  if (filtered.length > 0) copied.rows = rows;
+  return copied;
 }
 
 export interface PasteResult {
@@ -235,12 +274,19 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
       // A row of pasted text that is shorter than the others leaves the cells beyond its end alone.
       if (item === undefined && !internal) continue;
       if (typeof item === 'string') {
-        cell = cellFromInput(workbook, sheet, r, c, item, options);
         // Pasted text that looks like a formula and cannot be read as one stays the text it is.
-        if (cell && cell.formula && !readable(cell.formula.text)) cell = { kind: 'string', value: item.length > MAX_CELL_TEXT ? item.slice(0, MAX_CELL_TEXT) : item, style: cell.style };
+        const asText = (style: number): Cell => ({ kind: 'string', value: item.length > MAX_CELL_TEXT ? item.slice(0, MAX_CELL_TEXT) : item, style });
+        try {
+          cell = cellFromInput(workbook, sheet, r, c, item, options);
+          if (cell && cell.formula && !readable(cell.formula.text)) cell = asText(cell.style);
+        } catch (error) {
+          // Not written the way the locale writes formulas.
+          cell = asText(styleAt(sheet, r, c));
+        }
       }
       else if (item && copied) {
-        const fromRow = copied.range.top + ((r - selection.top) % height);
+        const offset = (r - selection.top) % height;
+        const fromRow = copied.rows ? copied.rows[offset] : copied.range.top + offset;
         const fromCol = copied.range.left + ((c - selection.left) % width);
         cell = item.formula
           ? {

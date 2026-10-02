@@ -949,6 +949,14 @@ export interface Story {
   /** What the part has before its root element (the XML declaration, comments) and, if anything, after it. */
   prolog?: string;
   epilog?: string;
+  /**
+   * The story was edited. An edit never changes a block in place: it puts a
+   * new block object, without a source span, where the old one was. So the
+   * writer copies every block that still has its span from `source` and
+   * writes the others from the model; a story that is not modified is not
+   * written at all.
+   */
+  modified?: boolean;
 }
 
 export interface Body extends Story {

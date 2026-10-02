@@ -52,6 +52,8 @@ export interface UiStrings {
   tooManyValues(max: number): string;
   /** What a filter with criteria shows: "12 of 340 records shown". */
   recordsShown(shown: number, total: number): string;
+  /** Said when choosing values took the place of a criterion that cannot be shown as values (a colour, an icon). */
+  filterReplaced: string;
   nothingToFilter: string;
   cannotSortMerged: string;
   cannotSortArray(ref: string): string;
@@ -133,6 +135,7 @@ export const STRINGS_EN: UiStrings = {
   valueList: 'Values',
   tooManyValues: (max) => `Only the first ${max} values are listed`,
   recordsShown: (shown, total) => `${shown} of ${total} records shown`,
+  filterReplaced: 'The colour or icon filter of this column was replaced by the chosen values.',
   nothingToFilter: 'There is no data to filter here',
   cannotSortMerged: 'A range with merged cells cannot be sorted',
   cannotSortArray: (ref) => `The array formula in ${ref} cannot be sorted through`,
@@ -209,6 +212,7 @@ export const STRINGS_TR: UiStrings = {
   valueList: 'Değerler',
   tooManyValues: (max) => `Yalnız ilk ${max} değer listeleniyor`,
   recordsShown: (shown, total) => `${total} kayıttan ${shown} tanesi gösteriliyor`,
+  filterReplaced: 'Bu sütunun renk ya da simge süzgecinin yerini seçilen değerler aldı.',
   nothingToFilter: 'Burada süzülecek veri yok',
   cannotSortMerged: 'Birleştirilmiş hücre içeren aralık sıralanamaz',
   cannotSortArray: (ref) => `${ref} aralığındaki dizi formülü bölünerek sıralanamaz`,

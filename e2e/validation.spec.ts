@@ -316,6 +316,106 @@ test.describe('data validation', () => {
   });
 });
 
+/**
+ * "Dep": A2 may hold what keeps A3 (= A2 * 2) at 100 or less; B2 has a rule whose formula
+ * uses a function the engine does not have; C2 takes whole numbers 1 to 10; D2 a rule whose
+ * formula gives an error.
+ */
+const dependentWorkbook = once(() =>
+  buildXlsx({
+    sheets: [
+      {
+        name: 'Dep',
+        xml: worksheetXml(
+          `<sheetData><row r="1">${str('A1', 'Half')}${str('B1', 'Free')}${str('C1', 'Whole')}${str('D1', 'Never')}</row>` +
+            `<row r="2">${num('A2', 1)}</row><row r="3">${formula('A3', 'A2*2', 2)}</row></sheetData>` +
+            '<dataValidations count="4">' +
+            dv('type="custom" showErrorMessage="1" error="Twice this must not pass 100" sqref="A2"', '<formula1>$A$3&lt;=100</formula1>') +
+            dv('type="custom" showErrorMessage="1" sqref="B2"', '<formula1>NOSUCHFUNCTION(B2)</formula1>') +
+            dv('type="whole" showErrorMessage="1" sqref="C2"', '<formula1>1</formula1><formula2>10</formula2>') +
+            dv('type="custom" showErrorMessage="1" sqref="D2"', '<formula1>1/0</formula1>') +
+            '</dataValidations>',
+        ),
+      },
+    ],
+  }),
+);
+
+test.describe('a value that is tried out', () => {
+  const changes = (page: Page) => page.evaluate(() => (window as any).__events.filter((event: any) => event.type === 'change').length);
+
+  test('a custom rule judges the formulas that depend on what is typed, and a refused value does not lock the cell', async ({ page }) => {
+    await mount(page, await dependentWorkbook());
+    // 60 would make A3 120.
+    await typeIn(page, 'A2', '60');
+    expect(await editing(page)).toBe(true);
+    await expect(message(page)).toHaveText('Twice this must not pass 100');
+    expect((await cell(page, 'A2')).value).toBe(1);
+    expect((await cell(page, 'A3')).value).toBe(2);
+    // Nothing of the attempt was reported or kept.
+    expect(await changes(page)).toBe(0);
+    expect(await page.evaluate(() => (window as any).__editor.view.history.canUndo)).toBe(false);
+    await page.keyboard.press('Escape');
+    // 10 is fine, whatever was refused before it.
+    await typeIn(page, 'A2', '10');
+    expect(await editing(page)).toBe(false);
+    expect((await cell(page, 'A2')).value).toBe(10);
+    expect((await cell(page, 'A3')).value).toBe(20);
+    expect(await changes(page)).toBe(1);
+    await typeIn(page, 'A2', '51');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    await typeIn(page, 'A2', '50');
+    expect(await editing(page)).toBe(false);
+    expect((await cell(page, 'A3')).value).toBe(100);
+    // Two steps were written, and only those.
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect((await cell(page, 'A3')).value).toBe(2);
+    expect(await page.evaluate(() => (window as any).__editor.view.history.canUndo)).toBe(false);
+  });
+
+  test('a rule the engine cannot calculate is not applied; one whose formula gives an error refuses', async ({ page }) => {
+    await mount(page, await dependentWorkbook());
+    await typeIn(page, 'B2', 'anything');
+    expect(await editing(page)).toBe(false);
+    expect((await cell(page, 'B2')).value).toBe('anything');
+    await typeIn(page, 'D2', '5');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    expect((await cell(page, 'D2')).value).toBe(null);
+  });
+
+  test('refused values leave the file byte for byte what it was', async ({ page }) => {
+    const bytes = await dependentWorkbook();
+    await mount(page, bytes);
+    const state = () =>
+      page.evaluate(async () => {
+        const workbook = (window as any).__editor.view.workbook;
+        return {
+          formats: workbook.styles.cellXfs.length,
+          numFmts: workbook.styles.numFmts.size,
+          stylesModified: workbook.styles.modified,
+          modified: workbook.sheets[0].modified,
+          saved: Array.from((await (window as any).__file.save()) as Uint8Array),
+        };
+      });
+    const before = await state();
+    expect(before.saved).toEqual(Array.from(bytes));
+    // A date asks for a date format before the rule refuses it; a tried value recalculates A3.
+    await typeIn(page, 'C2', '2/1/2024');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    await typeIn(page, 'A2', '60');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    await typeIn(page, 'C2', '50%');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    expect(await state()).toEqual(before);
+  });
+});
+
 test.describe('formulas typed the Turkish way', () => {
   test('";" between arguments, "," in numbers and Turkish function names are stored the way files have them', async ({ page }) => {
     await mount(page, await checkWorkbook(), { locale: 'tr' });
@@ -335,9 +435,34 @@ test.describe('formulas typed the Turkish way', () => {
 
     await typeIn(page, 'D13', '=EĞER(A2>3,5;"büyük; evet";YUVARLA(A3/3;2))');
     expect(await cell(page, 'D13')).toEqual({ value: 1.33, formula: 'IF(A2>3.5,"büyük; evet",ROUND(A3/3,2))' });
-    // A formula typed the English way still works there.
-    await typeIn(page, 'D14', '=SUM(A2,A3)');
+    // English function names are fine; the separators are those of the locale.
+    await typeIn(page, 'D14', '=SUM(A2;A3)');
     expect(await cell(page, 'D14')).toEqual({ value: 7, formula: 'SUM(A2,A3)' });
+  });
+
+  test('a comma that is not a decimal comma is refused: a formula typed the English way never turns into another one', async ({ page }) => {
+    await mount(page, await checkWorkbook(), { locale: 'tr' });
+    const hint = 'Bu formül okunamadı. Argümanları noktalı virgülle (;) ayırın, ondalıkları virgülle yazın; tanınmayan fonksiyonlarda İngilizce adı kullanın.';
+    // "5,1" would be read as the number 5.1, and the formula as IF(A2>5.1,0).
+    for (const typed of ['=IF(A2>5,1,0)', '=ROUND(A2,2)', '=SUM(A2,A3)', '=DATE(2024,1,5)']) {
+      await typeIn(page, 'D14', typed);
+      expect(await editing(page), typed).toBe(true);
+      await expect(message(page)).toHaveText(hint);
+      expect(await page.evaluate(() => (window as any).__editor.view.editText)).toBe(typed);
+      await page.keyboard.press('Escape');
+      expect(await cell(page, 'D14')).toEqual({ value: null, formula: null });
+    }
+    expect(await page.evaluate(() => (window as any).__editor.view.history.canUndo)).toBe(false);
+    // Written with ";" the same formula is taken, and "1,5" between digits is a number.
+    await typeIn(page, 'D14', '=IF(A2>5;1;0)+1,5');
+    expect(await cell(page, 'D14')).toEqual({ value: 1.5, formula: 'IF(A2>5,1,0)+1.5' });
+    // Pasted from elsewhere, what cannot be read stays the text it is.
+    await select(page, 'D15');
+    await page.evaluate(() => (window as any).__editor.view.paste('=IF(A2>5,1,0)'));
+    expect(await cell(page, 'D15')).toEqual({ value: '=IF(A2>5,1,0)', formula: null });
+    // Turkish names of the error values are read; what is shown is the value of the file.
+    await typeIn(page, 'D16', '#YOK');
+    expect((await cell(page, 'D16')).value).toBe('#N/A');
   });
 
   test('a formula that cannot be read is refused with a hint about the separators', async ({ page }) => {

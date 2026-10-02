@@ -641,3 +641,223 @@ test.describe('filter and calculation', () => {
     expect(await totals()).toEqual([31, 31, 31]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// What is done to a selection leaves the rows a filter hides alone; rows and
+// columns that are deleted take the filter along in a way that stays whole.
+
+test.describe('a selection inside a filtered list', () => {
+  /** The list with its filter on and only the yellow fruit shown: rows 2 (Lemon) and 7 (Banana). */
+  async function yellowOnly(page: Page): Promise<void> {
+    await mount(page, await listWorkbook());
+    await filterOn(page);
+    await page.evaluate(() => (window as any).__editor.view.setColumnFilter(1, { values: ['yellow'] }));
+    expect((await filterInfo(page)).hidden).toEqual([3, 4, 5, 6, 8]);
+  }
+
+  test('Delete empties the cells that are shown and leaves the filtered ones', async ({ page }) => {
+    await yellowOnly(page);
+    await select(page, 'C2:C8');
+    await page.evaluate(() => (window as any).__editor.view.focus());
+    await page.keyboard.press('Delete');
+    expect(await columnValues(page, 2, 1, 8)).toEqual(['Amount', null, 10, 30, 5, 15, null, 20]);
+    // One step back brings the two cells back.
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(await columnValues(page, 2, 1, 8)).toEqual(['Amount', 40, 10, 30, 5, 15, 25, 20]);
+  });
+
+  test('a copy takes the shown rows and pastes as one block; a cut empties only what it took', async ({ page }) => {
+    await yellowOnly(page);
+    await select(page, 'A2:C8');
+    const text = await page.evaluate(() => {
+      const view = (window as any).__editor.view;
+      const api = (window as any).BymOffice;
+      const copied = view.copy();
+      view.select(api.parseRange('A12'));
+      view.paste(copied.text, copied.html);
+      return copied.text;
+    });
+    expect(text).toBe('Lemon\tyellow\t40\nBanana\tyellow\t25');
+    expect(await columnValues(page, 0, 12, 14)).toEqual(['Lemon', 'Banana', null]);
+    expect(await columnValues(page, 2, 12, 14)).toEqual([40, 25, null]);
+    // Formulas of the copied rows move from the rows they came from.
+    await select(page, 'C2:D8');
+    await page.evaluate(() => {
+      const view = (window as any).__editor.view;
+      const api = (window as any).BymOffice;
+      const copied = view.copy();
+      view.select(api.parseRange('C16'));
+      view.paste(copied.text, copied.html);
+    });
+    expect(await columnValues(page, 3, 16, 18)).toEqual(['=C16*2', '=C17*2', null]);
+    await select(page, 'A2:A8');
+    await page.evaluate(() => (window as any).__editor.view.cut());
+    expect(await columnValues(page, 0, 1, 8)).toEqual(['Name', null, 'Apple', 'Plum', 'Cherry', 'Mystery', null, 'Fig']);
+  });
+
+  test('a format goes to the shown cells only', async ({ page }) => {
+    await yellowOnly(page);
+    await select(page, 'A2:B8');
+    await page.evaluate(() => (window as any).__editor.view.format({ bold: true }));
+    const bold = await page.evaluate(() => {
+      const view = (window as any).__editor.view;
+      const api = (window as any).BymOffice;
+      return ['A2', 'A3', 'A6', 'A7', 'B7', 'A8', 'A1'].map((ref) => {
+        view.select(api.parseRange(ref));
+        return view.selectionFormat.font.bold === true;
+      });
+    });
+    expect(bold).toEqual([true, false, false, true, true, false, false]);
+    // One undo step for the whole selection.
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(
+      await page.evaluate(() => {
+        const view = (window as any).__editor.view;
+        view.select((window as any).BymOffice.parseRange('A7'));
+        return view.selectionFormat.font.bold === true;
+      }),
+    ).toBe(false);
+  });
+
+  test('deleting selected rows deletes the shown ones, as one undo step', async ({ page }) => {
+    await yellowOnly(page);
+    // Rows 2 to 7: Lemon and Banana are shown, the four between them are filtered out.
+    await page.evaluate(() => (window as any).__editor.view.deleteRows(1, 6));
+    expect(await columnValues(page, 0, 1, 7)).toEqual(['Name', 'Apple', 'Plum', 'Cherry', 'Mystery', 'Fig', null]);
+    expect(await filterInfo(page)).toMatchObject({ range: 'A1:D6', hidden: [2, 3, 4, 5, 6] });
+    await expect(message(page)).toHaveText('0 of 5 records shown');
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(await columnValues(page, 0, 1, 8)).toEqual(['Name', 'Lemon', 'Apple', 'Plum', 'Cherry', 'Mystery', 'Banana', 'Fig']);
+    expect(await filterInfo(page)).toMatchObject({ range: 'A1:D8', hidden: [3, 4, 5, 6, 8] });
+    // The step before it is the criterion: the delete was one step.
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect((await filterInfo(page)).hidden).toEqual([]);
+  });
+
+  test('deleting the column of the criterion shows the rows it hid; the filter stays usable', async ({ page, hasTouch }) => {
+    const press = presser(hasTouch);
+    await yellowOnly(page);
+    await page.evaluate(() => (window as any).__editor.view.deleteColumns(1, 1));
+    expect(await filterInfo(page)).toEqual({ range: 'A1:C8', columns: [], sort: null, hidden: [] });
+    expect(await columnValues(page, 1, 1, 3)).toEqual(['Amount', 40, 10]);
+    expect(await facePixel(page, 1)).toEqual(WHITE);
+    // The menu of what is now column B works on.
+    await openMenu(page, hasTouch, 1);
+    await press(listRow(page, '(Select all)'));
+    await press(menu(page).getByRole('option', { name: '10', exact: true }));
+    await press(menu(page).locator('[data-action="apply"]'));
+    expect((await filterInfo(page)).hidden).toEqual([2, 4, 5, 6, 7, 8]);
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    // One step back from the delete: the column, its criterion and the hidden rows.
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(await filterInfo(page)).toEqual({ range: 'A1:D8', columns: [{ colId: 1, kind: 'values', values: ['yellow'] }], sort: null, hidden: [3, 4, 5, 6, 8] });
+    expect(await columnValues(page, 1, 1, 2)).toEqual(['Colour', 'yellow']);
+  });
+
+  test('deleting the header row removes the filter and shows every row', async ({ page }) => {
+    await yellowOnly(page);
+    await page.evaluate(() => (window as any).__editor.view.deleteRows(0, 1));
+    expect(await filterInfo(page)).toEqual({ range: null, columns: [], sort: null, hidden: [] });
+    await expect(command(page, 'filter')).toHaveAttribute('aria-pressed', 'false');
+    expect(await columnValues(page, 0, 1, 2)).toEqual(['Lemon', 'Apple']);
+    expect(await page.evaluate(() => (window as any).__editor.view.workbook.definedNames.length)).toBe(0);
+    // No button is drawn where the header was.
+    expect(await borderPixel(page, 0)).toEqual(WHITE);
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(await filterInfo(page)).toEqual({ range: 'A1:D8', columns: [{ colId: 1, kind: 'values', values: ['yellow'] }], sort: null, hidden: [3, 4, 5, 6, 8] });
+    expect(await borderPixel(page, 0)).toEqual(BORDER);
+    // What is written is a file without a filter.
+    await page.evaluate(() => (window as any).__editor.view.redo());
+    const reopened = await page.evaluate(async () => {
+      const api = (window as any).BymOffice;
+      const workbook = await (await api.open(await (window as any).__file.save())).workbook();
+      const sheet = workbook.sheets[0];
+      let hidden = 0;
+      sheet.rows.forEach((row: any) => (hidden += row.hidden ? 1 : 0));
+      return { filter: sheet.autoFilter === undefined, hidden, names: workbook.definedNames.length, first: api.getCell(sheet, 0, 0).value };
+    });
+    expect(reopened).toEqual({ filter: true, hidden: 0, names: 0, first: 'Lemon' });
+  });
+});
+
+test.describe('sorting a block without a header', () => {
+  const plain = once(() =>
+    buildXlsx({
+      sheets: [
+        {
+          name: 'Plain',
+          xml: worksheetXml(
+            `<sheetData><row r="1">${num('A1', 3)}${str('C1', 'Item')}${str('D1', 'Qty')}</row><row r="2">${num('A2', 1)}${str('C2', 'b')}${num('D2', 2)}</row>` +
+              `<row r="3">${num('A3', 2)}${str('C3', 'a')}${num('D3', 1)}</row></sheetData>`,
+          ),
+        },
+      ],
+    }),
+  );
+
+  test('numbers under a number are sorted from the first row; a title above numbers stays', async ({ page, hasTouch }) => {
+    const press = presser(hasTouch);
+    await mount(page, await plain());
+    await select(page, 'A2');
+    await press(command(page, 'sortAscending'));
+    expect(await columnValues(page, 0, 1, 3)).toEqual([1, 2, 3]);
+    await press(command(page, 'sortDescending'));
+    expect(await columnValues(page, 0, 1, 3)).toEqual([3, 2, 1]);
+    // The block beside it has titles: "Qty" is text above numbers.
+    await select(page, 'C3');
+    await press(command(page, 'sortAscending'));
+    expect(await columnValues(page, 2, 1, 3)).toEqual(['Item', 'a', 'b']);
+    expect(await columnValues(page, 3, 1, 3)).toEqual(['Qty', 1, 2]);
+    // Switching the filter on always takes the first row for the header.
+    await select(page, 'A2');
+    await page.evaluate(() => (window as any).__editor.view.toggleFilter());
+    expect((await filterInfo(page)).range).toBe('A1:A3');
+  });
+});
+
+test.describe('a criterion that cannot be shown as values', () => {
+  const coloured = once(() =>
+    buildXlsx({
+      sheets: [
+        {
+          name: 'Colours',
+          xml: worksheetXml(
+            `<sheetData><row r="1">${str('A1', 'Name')}${str('B1', 'Kind')}</row><row r="2">${str('A2', 'kiwi')}${str('B2', 'x')}</row>` +
+              `<row r="3" hidden="1">${str('A3', 'plum')}${str('B3', 'y')}</row><row r="4">${str('A4', 'fig')}${str('B4', 'x')}</row></sheetData>` +
+              '<autoFilter ref="A1:B4"><filterColumn colId="0"><colorFilter dxfId="0"/></filterColumn></autoFilter>',
+          ),
+        },
+      ],
+    }),
+  );
+
+  test('Apply without a change keeps it; choosing values replaces it and says so', async ({ page, hasTouch }) => {
+    const press = presser(hasTouch);
+    await mount(page, await coloured());
+    await settled(page);
+    expect(await filterInfo(page)).toMatchObject({ range: 'A1:B4', columns: [{ colId: 0, kind: 'color' }], hidden: [3] });
+    await openMenu(page, hasTouch, 0);
+    // What is shown is checked, what the colour hides is not.
+    await expect(listRow(page, 'plum')).toHaveAttribute('aria-selected', 'false');
+    await press(menu(page).locator('[data-action="apply"]'));
+    await expect(menu(page)).toHaveCount(0);
+    expect(await filterInfo(page)).toMatchObject({ columns: [{ colId: 0, kind: 'color' }], hidden: [3] });
+    expect(await page.evaluate(() => (window as any).__editor.view.history.canUndo)).toBe(false);
+    expect(await page.evaluate(() => (window as any).__editor.view.workbook.sheets[0].modified)).toBe(undefined);
+    // Checked and unchecked again is no change either.
+    await openMenu(page, hasTouch, 0);
+    await press(listRow(page, 'plum'));
+    await press(listRow(page, 'plum'));
+    await press(menu(page).locator('[data-action="apply"]'));
+    expect(await page.evaluate(() => (window as any).__editor.view.history.canUndo)).toBe(false);
+    // A choice replaces the colour, and the user is told.
+    await openMenu(page, hasTouch, 0);
+    await press(listRow(page, 'plum'));
+    await press(listRow(page, 'kiwi'));
+    await press(menu(page).locator('[data-action="apply"]'));
+    expect(await filterInfo(page)).toMatchObject({ columns: [{ colId: 0, kind: 'values', values: ['fig', 'plum'] }], hidden: [2] });
+    await expect(message(page)).toHaveText('The colour or icon filter of this column was replaced by the chosen values. 2 of 3 records shown');
+    await page.evaluate(() => (window as any).__editor.view.undo());
+    expect(await filterInfo(page)).toMatchObject({ columns: [{ colId: 0, kind: 'color' }], hidden: [3] });
+  });
+});

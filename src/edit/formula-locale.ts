@@ -9,7 +9,11 @@
 // is never touched.
 //
 // Nothing here parses a formula or decides whether it is one: text that makes
-// no sense comes out as it went in, and the parser has the last word.
+// no sense comes out as it went in, and the parser has the last word. There is
+// one exception. Where the decimal separator is a comma, a comma that does not
+// stand between two digits means nothing, as in Excel, and such text is refused
+// here: handed on, "IF(A1>5,1,0)" typed the English way would be read as another
+// formula ("5,1" is a number), and the parser would have nothing to object to.
 
 import type { FormatLocale } from '../format/locale';
 
@@ -121,6 +125,23 @@ const TURKISH_FUNCTIONS: [string, string][] = [
   ['TAMİŞGÜNÜ', 'NETWORKDAYS'],
 ];
 
+/**
+ * Turkish names of the error constants, with the constants files store. Read when typed, in
+ * a cell or in a formula; what is shown always has the English ones.
+ *
+ * UNSURE: taken from memory of the Turkish user interface, like the function names.
+ * The longer of two names that begin alike comes first.
+ */
+const TURKISH_ERRORS: [string, string][] = [
+  ['#SAYI/0!', '#DIV/0!'],
+  ['#SAYI!', '#NUM!'],
+  ['#DEĞER!', '#VALUE!'],
+  ['#BAŞV!', '#REF!'],
+  ['#BOŞ!', '#NULL!'],
+  ['#YOK', '#N/A'],
+  ['#AD?', '#NAME?'],
+];
+
 /** Upper case that treats the four Turkish "i" letters as one, so that "indis", "INDIS" and "İNDİS" are the same name. */
 function nameKey(text: string): string {
   return text.replace(/[iıİ]/g, 'I').toUpperCase();
@@ -160,6 +181,46 @@ function usesComma(locale: FormatLocale | undefined): locale is FormatLocale {
 
 function isTurkish(locale: FormatLocale): boolean {
   return locale.trueText === 'DOĞRU';
+}
+
+/** The Turkish error constant at `i`: how long it is, and the constant that is stored for it. */
+function turkishErrorAt(s: string, i: number): { length: number; stored: string } | undefined {
+  for (let k = 0; k < TURKISH_ERRORS.length; k++) {
+    const local = TURKISH_ERRORS[k][0];
+    if (s.length - i >= local.length && nameKey(s.substr(i, local.length)) === nameKey(local)) return { length: local.length, stored: TURKISH_ERRORS[k][1] };
+  }
+  return undefined;
+}
+
+/**
+ * The error constant that text typed into a cell stands for in the locale ("#YOK" is #N/A
+ * in Turkish); undefined when the text is not the locale's own name of one.
+ */
+export function localErrorCode(text: string, locale?: FormatLocale): string | undefined {
+  if (typeof text !== 'string' || text.length > 16 || !locale || !isTurkish(locale)) return undefined;
+  const found = turkishErrorAt(text, 0);
+  return found && found.length === text.length ? found.stored : undefined;
+}
+
+export interface FormulaLocaleOptions {
+  /**
+   * Whether the workbook has a defined name of this spelling. A name called DOĞRU (or
+   * YANLIŞ) is then that name where it is typed, and not the constant.
+   */
+  isName?(name: string): boolean;
+}
+
+/** What a pass over the text met that the caller has to know of. */
+interface Findings {
+  /** A comma that is neither inside a number nor a separator of the notation. */
+  strayComma: boolean;
+}
+
+/** Offset just past the word that starts at `i`. */
+function wordEnd(s: string, i: number): number {
+  let j = i;
+  while (j < s.length && isWordChar(s.charCodeAt(j))) j++;
+  return j;
 }
 
 /** End of the quoted run that starts at `i` (a doubled quote stays inside); the length of the text when it never ends. */
@@ -207,9 +268,10 @@ function exponentAt(s: string, i: number): number {
 
 /**
  * One pass over the text. `toLocal` says which way: stored -> typed, or typed -> stored.
- * `names` (typed -> stored only) also turns Turkish function names into the stored ones.
+ * `names` (typed -> stored only) also turns Turkish function names, TRUE and FALSE and
+ * error constants into the stored ones.
  */
-function translate(text: string, toLocal: boolean, names: boolean): string {
+function translate(text: string, toLocal: boolean, names: boolean, findings: Findings, options?: FormulaLocaleOptions): string {
   const n = text.length;
   let out = '';
   let i = 0;
@@ -226,9 +288,15 @@ function translate(text: string, toLocal: boolean, names: boolean): string {
       out += text.slice(i, end);
       i = end;
     } else if (c === 35) {
-      const length = errorAt(text, i) || 1;
-      out += text.substr(i, length);
-      i += length;
+      const local = names ? turkishErrorAt(text, i) : undefined;
+      if (local) {
+        out += local.stored;
+        i += local.length;
+      } else {
+        const length = errorAt(text, i) || 1;
+        out += text.substr(i, length);
+        i += length;
+      }
     } else if (c === 123) {
       braces++;
       out += '{';
@@ -269,12 +337,26 @@ function translate(text: string, toLocal: boolean, names: boolean): string {
       let word = text.slice(i, j);
       if (names) {
         const stored = turkishName(word);
-        // A function where it is called; TRUE and FALSE also where they stand as values.
-        if (stored !== undefined && (text.charCodeAt(j) === 40 || stored === 'TRUE' || stored === 'FALSE')) word = stored;
+        if (stored !== undefined) {
+          const next = text.charCodeAt(j);
+          // A function where it is called, and nowhere else: a sheet or a defined name may be called the same.
+          if (next === 40) word = stored;
+          else if (stored === 'TRUE' || stored === 'FALSE') {
+            // TRUE and FALSE also where they stand as values. Not where the word names a sheet
+            // ("DOĞRU!A1", "DOĞRU:YANLIŞ!A1"), a name of a sheet ("Sayfa1!DOĞRU") or a defined name.
+            const sheet = next === 33 || (next === 58 && text.charCodeAt(wordEnd(text, j + 1)) === 33 && wordEnd(text, j + 1) > j + 1);
+            const scoped = out.charCodeAt(out.length - 1) === 33;
+            const defined = options !== undefined && typeof options.isName === 'function' && options.isName(word) === true;
+            if (!sheet && !scoped && !defined) word = stored;
+          }
+        }
       }
       out += word;
       i = j;
     } else if (c === 44) {
+      // Stored: the separator of arguments. Typed: a comma is the decimal comma, and that was read
+      // with its number; any other comma has no meaning.
+      if (!toLocal) findings.strayComma = true;
       out += toLocal ? ';' : ',';
       i++;
     } else if (c === 59) {
@@ -296,17 +378,25 @@ function translate(text: string, toLocal: boolean, names: boolean): string {
  */
 export function formulaToLocal(text: string, locale?: FormatLocale): string {
   if (typeof text !== 'string' || text.length > MAX_LENGTH || !usesComma(locale)) return text;
-  return translate(text, true, false);
+  return translate(text, true, false, { strayComma: false });
 }
 
 /**
  * A formula typed in the locale (without "=") the way it is stored. Where the decimal
- * separator is a comma: ";" separates arguments, a comma between two digits is a
- * decimal comma, any other comma is taken as the separator it is in a stored formula
- * (so a formula typed the English way is understood as long as it has no number list
- * like "1,5"). In Turkish, the Turkish names of common functions are understood too.
+ * separator is a comma: ";" separates arguments (and the areas of a union, and the columns
+ * of an array constant, whose rows "\" separates), and a comma between two digits is the
+ * decimal comma. In Turkish, the Turkish names of common functions, of TRUE and FALSE and
+ * of the error constants are understood too.
+ *
+ * Throws RangeError("The formula cannot be read") for a comma anywhere else, as Excel refuses
+ * it: "IF(A1>5,1,0)" typed the English way is not taken for "IF(A1>5.1,0)", and
+ * "ROUND(A1,2)" is not understood either, so that the English notation does not work in one
+ * formula and silently mean something else in the next. Unchanged for every other locale.
  */
-export function formulaFromLocal(text: string, locale?: FormatLocale): string {
+export function formulaFromLocal(text: string, locale?: FormatLocale, options?: FormulaLocaleOptions): string {
   if (typeof text !== 'string' || text.length > MAX_LENGTH || !usesComma(locale)) return text;
-  return translate(text, false, isTurkish(locale));
+  const findings: Findings = { strayComma: false };
+  const stored = translate(text, false, isTurkish(locale), findings, options);
+  if (findings.strayComma) throw new RangeError('The formula cannot be read');
+  return stored;
 }
