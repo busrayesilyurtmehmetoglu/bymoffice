@@ -8,6 +8,7 @@ import { DEFAULT_GRID_THEME, renderGrid } from '../src/render/grid';
 import type { GridSelection } from '../src/render/grid';
 import { clearTextMeasureCache, FONT_FALLBACK } from '../src/render/text';
 import { LOCALE_TR, type FormatLocale } from '../src/format/locale';
+import { ConditionalFormats, type CellConditional, type ConditionalSource } from '../src/format/conditional';
 
 // Default geometry: columns are 64 px wide, rows 20 px high, the row header is
 // 72 px wide and the column header 22 px high. So A1 is at (72, 22).
@@ -61,9 +62,25 @@ interface StrokeRectCall extends Box {
   lineWidth: number;
 }
 
+/** A path that was filled: its corners (lines) and circles (arcs: centre, radius, start and end angle). */
+interface PathCall {
+  fill: string;
+  points: number[][];
+  arcs: number[][];
+}
+
+/** What createLinearGradient() hands out; it stands in for a fill style. */
+class FakeGradient {
+  stops: [number, string][] = [];
+  constructor(readonly line: number[]) {}
+  addColorStop(offset: number, color: string): void {
+    this.stops.push([offset, color]);
+  }
+}
+
 /** A stand-in for CanvasRenderingContext2D that records what is drawn. Each character is half the font size wide. */
 class FakeContext {
-  fillStyle = '#000000';
+  fillStyle: string | FakeGradient = '#000000';
   strokeStyle = '#000000';
   lineWidth = 1;
   globalAlpha = 1;
@@ -74,6 +91,9 @@ class FakeContext {
   rects: RectCall[] = [];
   strokes: StrokeCall[] = [];
   strokeRects: StrokeRectCall[] = [];
+  /** Paths filled with fill(), and rectangles filled with a gradient. */
+  paths: PathCall[] = [];
+  gradientRects: (Box & { gradient: FakeGradient })[] = [];
   /** Every value assigned to `font`. */
   fonts: string[] = [];
   measured: string[] = [];
@@ -83,9 +103,11 @@ class FakeContext {
   private currentFont = '10px sans-serif';
   private dash: number[] = [];
   private clips: Box[] = [];
-  private stack: { clips: Box[]; font: string; fill: string }[] = [];
+  private stack: { clips: Box[]; font: string; fill: string | FakeGradient }[] = [];
   private pathRect: Box | undefined;
   private pathLines: number[][] = [];
+  private pathPoints: number[][] = [];
+  private pathArcs: number[][] = [];
   private pen: number[] = [0, 0];
 
   get font(): string {
@@ -114,6 +136,19 @@ class FakeContext {
   beginPath(): void {
     this.pathRect = undefined;
     this.pathLines = [];
+    this.pathPoints = [];
+    this.pathArcs = [];
+  }
+  closePath(): void {}
+  arc(x: number, y: number, radius: number, start: number, end: number): void {
+    this.pathArcs.push([x, y, radius, start, end]);
+  }
+  fill(): void {
+    assert.equal(typeof this.fillStyle, 'string', 'fill() with a gradient');
+    this.paths.push({ fill: this.fillStyle as string, points: this.pathPoints.slice(), arcs: this.pathArcs.slice() });
+  }
+  createLinearGradient(x0: number, y0: number, x1: number, y1: number): FakeGradient {
+    return new FakeGradient([x0, y0, x1, y1]);
   }
   rect(x: number, y: number, width: number, height: number): void {
     this.pathRect = { x, y, width, height };
@@ -124,10 +159,12 @@ class FakeContext {
   }
   moveTo(x: number, y: number): void {
     this.pen = [x, y];
+    this.pathPoints.push([x, y]);
   }
   lineTo(x: number, y: number): void {
     this.pathLines.push([this.pen[0], this.pen[1], x, y]);
     this.pen = [x, y];
+    this.pathPoints.push([x, y]);
   }
   stroke(): void {
     this.strokes.push({
@@ -143,13 +180,15 @@ class FakeContext {
     this.dash = dash.slice();
   }
   fillRect(x: number, y: number, width: number, height: number): void {
-    this.rects.push({ x, y, width, height, fill: this.fillStyle, clips: this.clips });
+    if (typeof this.fillStyle !== 'string') this.gradientRects.push({ x, y, width, height, gradient: this.fillStyle });
+    else this.rects.push({ x, y, width, height, fill: this.fillStyle, clips: this.clips });
   }
   strokeRect(x: number, y: number, width: number, height: number): void {
     this.strokeRects.push({ x, y, width, height, style: this.strokeStyle, lineWidth: this.lineWidth });
   }
   fillText(text: string, x: number, y: number): void {
-    this.texts.push({ text, x, y, font: this.currentFont, fill: this.fillStyle, align: this.textAlign, clips: this.clips });
+    assert.equal(typeof this.fillStyle, 'string', 'text drawn with a gradient');
+    this.texts.push({ text, x, y, font: this.currentFont, fill: this.fillStyle as string, align: this.textAlign, clips: this.clips });
   }
   measureText(text: string): { width: number } {
     this.measured.push(text);
@@ -225,6 +264,8 @@ interface DrawOptions {
   dpr?: number;
   locale?: FormatLocale;
   date1904?: boolean;
+  /** Conditional formats; `true` for the ones the sheet itself holds. */
+  conditional?: ConditionalSource | true;
 }
 
 function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
@@ -250,6 +291,7 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     selection: options.selection,
     locale: options.locale,
     devicePixelRatio: options.dpr === undefined ? 1 : options.dpr,
+    conditional: options.conditional === true ? new ConditionalFormats(workbook, sheet) : options.conditional,
   });
   assert.equal(ctx.saves, ctx.restores, 'save() and restore() are balanced');
   return ctx;
@@ -987,4 +1029,260 @@ test('grid: number formats decide the text, its colour and the date system', () 
 
   // The same serial in the 1904 date system is four years and a day later.
   assert.ok(draw(sheet, { styles, date1904: true }).textCall('2027-03-16'));
+});
+
+// --- conditional formats -----------------------------------------------------
+
+/** A source that answers from a table of cells: "row,col" -> what the cell gets. */
+function fixedConditional(cells: Record<string, CellConditional>): ConditionalSource & { asked: string[]; frames: number } {
+  const source = {
+    asked: [] as string[],
+    frames: 0,
+    begin() {
+      source.frames++;
+    },
+    resolve(row: number, col: number) {
+      source.asked.push(`${row},${col}`);
+      return cells[`${row},${col}`];
+    },
+  };
+  return source;
+}
+
+test('grid: a conditional format replaces the fill and goes on top of font, border and number format', () => {
+  const styles = emptyStyleSheet();
+  const yellow = xf(styles, { fill: solid('FFFF00'), font: baseFont({ italic: true, color: { rgb: '00FF00' } }), border: { bottom: { style: 'thin', color: { rgb: '0000FF' } } } });
+  const sheet = newSheet();
+  put(sheet, 0, 0, 'plain', yellow);
+  put(sheet, 1, 0, 'styled', yellow);
+  put(sheet, 2, 0, 12.5, yellow);
+  put(sheet, 3, 0, 'nofill', yellow);
+  const format = { fill: '#FF0000', bold: true, color: '#123456', strike: true, underline: 'double' as const, top: { style: 'medium', color: { rgb: 'AA00AA' } } };
+  const source = fixedConditional({
+    '1,0': { style: format },
+    '2,0': { style: { numFmt: { id: 164, code: '0.00"!"' }, italic: false } },
+    '3,0': { style: { fill: null } },
+    // An empty cell inside a range is filled as well.
+    '1,2': { style: format },
+    // Colours that are not "#RRGGBB" never reach the canvas.
+    '5,0': { style: { fill: 'red; drop', color: 'url(x)' }, fill: 'javascript:1' },
+  });
+  put(sheet, 5, 0, 'unsafe');
+  const ctx = draw(sheet, { styles, conditional: source });
+  assert.equal(source.frames, 1);
+
+  // Row 1 keeps its own format.
+  assert.equal(ctx.fills('#FFFF00').filter((call) => call.y === HY - 1).length, 1);
+  assert.equal(ctx.textCall('plain').fill, '#00FF00');
+  assert.match(ctx.textCall('plain').font, /^italic /);
+
+  // Row 2: red instead of yellow, bold added to the italic of the cell, the colour replaced.
+  assert.deepEqual(ctx.fills('#FF0000').map((call) => [call.x, call.y, call.width, call.height]), [
+    [HX - 1, HY + RH - 1, CW + 1, RH + 1],
+    [HX + 2 * CW - 1, HY + RH - 1, CW + 1, RH + 1],
+  ]);
+  assert.equal(ctx.fills('#FFFF00').filter((call) => call.y === HY + RH - 1).length, 0);
+  const styled = ctx.textCall('styled');
+  assert.equal(styled.fill, '#123456');
+  assert.match(styled.font, /italic/);
+  assert.match(styled.font, /bold/);
+  // Strike-through and a double underline: three thin rectangles in the text colour under and through the text.
+  assert.equal(ctx.fills('#123456').filter((call) => call.x === styled.x && call.height <= 2).length, 3);
+  // The border of the format on top of the cell's own: medium purple above, the thin blue one below stays.
+  assert.ok(ctx.strokesOf('#AA00AA').some((call) => call.width === 2 && call.lines.some((l) => l[1] === HY + RH && l[3] === HY + RH)));
+  assert.ok(ctx.strokesOf('#0000FF').length > 0);
+
+  // Row 3: the number format of the rule, the italic of the cell switched off.
+  const number = ctx.textCall('12.50!');
+  assert.doesNotMatch(number.font, /italic/);
+  // Row 4: "no fill" takes the cell's fill away.
+  assert.equal(ctx.fills('#FFFF00').filter((call) => call.y === HY + 3 * RH - 1).length, 0);
+  assert.ok(ctx.textCall('nofill'));
+
+  assert.equal(ctx.textCall('unsafe').fill, DEFAULT_GRID_THEME.defaultText);
+  for (const call of ctx.rects) assert.match(call.fill, /^(#[0-9A-Fa-f]{6}|rgba\(.*\))$/);
+
+  // Without a source nothing is asked and nothing changes.
+  const without = draw(sheet, { styles });
+  assert.equal(without.fills('#FF0000').length, 0);
+  assert.equal(without.textCall('styled').fill, '#00FF00');
+});
+
+test('grid: colour scale fills, data bars and icons', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 5);
+  put(sheet, 1, 0, 7);
+  put(sheet, 2, 0, -3);
+  put(sheet, 3, 0, 9);
+  put(sheet, 4, 0, 11);
+  put(sheet, 5, 0, 13);
+  const styles = emptyStyleSheet();
+  const source = fixedConditional({
+    '0,0': { fill: '#ABCDEF', style: { fill: '#FF0000' } },
+    '1,0': { bar: { from: 0, to: 0.5, color: '#00B050', gradient: false, negative: false, rightToLeft: false, border: '#005500' } },
+    '2,0': { bar: { from: 0.25, to: 0.5, color: '#FF0000', gradient: true, negative: true, rightToLeft: false, axis: 0.5, axisColor: '#333333' } },
+    '3,0': { bar: { from: 0, to: 0.5, color: '#00B050', gradient: false, negative: false, rightToLeft: true }, hideValue: true },
+    '4,0': { icon: { set: '3TrafficLights1', index: 2 } },
+    '5,0': { icon: { set: '3Arrows', index: 0 }, hideValue: true },
+  });
+  const ctx = draw(sheet, { styles, conditional: source });
+
+  // The colour of the scale wins over the fill of a format.
+  assert.equal(ctx.fills('#ABCDEF').length, 1);
+  assert.equal(ctx.fills('#FF0000').length, 0);
+
+  // A bar leaves two pixels to every side of the cell (the last pixel of a cell is its grid line): 59 x 15 to fill.
+  const room = CW - 5;
+  assert.deepEqual(
+    ctx.fills('#00B050').map((call) => [call.x, call.y, call.width, call.height]),
+    [
+      [HX + 2, HY + RH + 2, Math.round(room / 2), RH - 5],
+      // Right to left: the same bar from the other side.
+      [HX + 2 + Math.round(room / 2), HY + 3 * RH + 2, room - Math.round(room / 2), RH - 5],
+    ],
+  );
+  assert.deepEqual(ctx.strokeRects.filter((call) => call.style === '#005500').map((call) => [call.x, call.y, call.width, call.height]), [[HX + 2.5, HY + RH + 2.5, Math.round(room / 2) - 1, RH - 6]]);
+  // The bar is drawn before the text of its cell.
+  assert.ok(ctx.textCall('7'));
+
+  // A negative gradient bar: solid at the axis, faded at its far end; the axis is a dashed line over the whole cell.
+  assert.equal(ctx.gradientRects.length, 1);
+  const negative = ctx.gradientRects[0];
+  assert.deepEqual([negative.x, negative.y, negative.width, negative.height], [HX + 2 + Math.round(room * 0.25), HY + 2 * RH + 2, Math.round(room * 0.5) - Math.round(room * 0.25), RH - 5]);
+  assert.deepEqual(negative.gradient.stops, [
+    [1, '#FF0000'],
+    [0, '#FFD9D9'],
+  ]);
+  const axis = ctx.strokesOf('#333333');
+  assert.equal(axis.length, 1);
+  assert.deepEqual(axis[0].dash, [1, 1]);
+  assert.deepEqual(axis[0].lines, [[HX + 2 + Math.round(room / 2) + 0.5, HY + 2 * RH, HX + 2 + Math.round(room / 2) + 0.5, HY + 3 * RH - 1]]);
+  assert.ok(ctx.textCall('-3'));
+
+  // No value shown: the bar is there, the text is not.
+  assert.equal(ctx.cellTexts.filter((call) => call.text === '9').length, 0);
+
+  // An icon is a circle at the left of the cell; the number stays at the right.
+  const circles = ctx.paths.filter((path) => path.arcs.length === 1 && path.fill === '#68A490');
+  assert.equal(circles.length, 1);
+  const size = Math.floor(PX * 1.05);
+  assert.deepEqual(circles[0].arcs[0].slice(0, 3), [HX + 3 + size / 2, HY + 5 * RH - 2 - size + size / 2, size * 0.44]);
+  assert.equal(ctx.textCall('11').x, Math.round(HX + CW - 3 - 2 * CHAR));
+  // Icon only: an arrow (seven corners) in red, no text.
+  const arrowsDrawn = ctx.paths.filter((path) => path.points.length === 7 && path.fill === '#D65532');
+  assert.equal(arrowsDrawn.length, 1);
+  assert.ok(arrowsDrawn[0].points.every(([x, y]) => x >= HX + 3 && x <= HX + 3 + size && y >= HY + 5 * RH && y <= HY + 6 * RH));
+  assert.equal(ctx.cellTexts.filter((call) => call.text === '13').length, 0);
+});
+
+test('grid: an icon pushes left-aligned text in and narrows the room of a number', () => {
+  const styles = emptyStyleSheet();
+  const left = xf(styles, { alignment: { horizontal: 'left' } });
+  const centred = xf(styles, { alignment: { horizontal: 'center', vertical: 'top' } });
+  const sheet = newSheet();
+  put(sheet, 0, 0, 42, left);
+  put(sheet, 1, 0, 12345678);
+  put(sheet, 2, 0, 5, centred);
+  const size = Math.floor(PX * 1.05);
+  const ctx = draw(sheet, {
+    styles,
+    conditional: fixedConditional({
+      '0,0': { icon: { set: '5Rating', index: 2 } },
+      '1,0': { icon: { set: '3Flags', index: 0 } },
+      '2,0': { icon: { set: '3Signs', index: 0 }, hideValue: true },
+      // A set or a position that does not exist draws nothing and moves nothing.
+      '3,0': { icon: { set: 'constructor', index: 0 } },
+    }),
+  });
+  assert.equal(ctx.textCall('42').x, HX + size + 3 + 3);
+  // Eight digits are 58.7 px; they fit a 64 px cell but not what the icon leaves of it.
+  assert.equal(ctx.cellTexts.filter((call) => call.text === '12345678').length, 0);
+  assert.equal(ctx.cellTexts.filter((call) => /^#+$/.test(call.text)).length, 1);
+  // Rating: four bars, two of them in the colour of the set.
+  assert.equal(ctx.fills('#4472C4').length, 2);
+  assert.equal(ctx.fills('#C8C8C8').length, 2);
+  // The icon without a value follows the alignment of its cell: centred, at the top.
+  // UNSURE: with "general" alignment such an icon is put at the left; Excel is believed to do the same.
+  const diamond = ctx.paths.filter((path) => path.points.length === 4 && path.fill === '#D65532');
+  assert.equal(diamond.length, 1);
+  assert.deepEqual(diamond[0].points[0], [Math.round(HX + (CW - size) / 2) + size * 0.5, HY + 2 * RH + 1 + size * 0.04]);
+});
+
+test('grid: every icon of every set can be drawn', () => {
+  const sets = ['3Arrows', '3ArrowsGray', '3Flags', '3TrafficLights1', '3TrafficLights2', '3Signs', '3Symbols', '3Symbols2', '3Stars', '3Triangles', '4Arrows', '4ArrowsGray', '4RedToBlack', '4Rating', '4TrafficLights', '5Arrows', '5ArrowsGray', '5Rating', '5Quarters', '5Boxes'];
+  const sheet = newSheet();
+  const cells: Record<string, CellConditional> = {};
+  sets.forEach((set, r) => {
+    for (let i = 0; i < Number(set[0]); i++) {
+      put(sheet, r, i, i);
+      cells[`${r},${i}`] = { icon: { set, index: i }, hideValue: true };
+    }
+  });
+  const ctx = draw(sheet, { conditional: fixedConditional(cells) });
+  assert.equal(ctx.cellTexts.length, 0);
+  // Each of the 74 icons leaves something on the canvas, inside its own cell.
+  for (let r = 0; r < sets.length; r++) {
+    for (let i = 0; i < Number(sets[r][0]); i++) {
+      const inCell = (x: number, y: number) => x >= HX + i * CW && x <= HX + (i + 1) * CW && y >= HY + r * RH && y <= HY + (r + 1) * RH;
+      const drawn =
+        ctx.paths.some((path) => path.points.some(([x, y]) => inCell(x, y)) || path.arcs.some(([x, y]) => inCell(x, y))) ||
+        ctx.rects.some((rect) => rect.width < 20 && rect.height < 20 && inCell(rect.x, rect.y)) ||
+        ctx.strokes.some((stroke) => stroke.lines.length > 0 && stroke.lines.every((l) => inCell(l[0], l[1]) && inCell(l[2], l[3])));
+      assert.ok(drawn, `${sets[r]} icon ${i}`);
+    }
+  }
+  // Nothing but "#RRGGBB" and the theme's own colours was used.
+  for (const path of ctx.paths) assert.match(path.fill, /^#[0-9A-F]{6}$/);
+});
+
+test('grid: a merged area is formatted as its top-left cell', () => {
+  const sheet = newSheet();
+  put(sheet, 1, 1, 8);
+  put(sheet, 2, 2, 'hidden by the merge');
+  sheet.merges = [range(1, 1, 2, 3)];
+  const source = fixedConditional({
+    '1,1': { style: { fill: '#FF0000', bold: true }, bar: { from: 0, to: 1, color: '#00B050', gradient: false, negative: false, rightToLeft: false } },
+    // What the other cells of the area would get does not count.
+    '2,2': { style: { fill: '#0000FF' } },
+  });
+  const ctx = draw(sheet, { conditional: source });
+  assert.deepEqual(ctx.fills('#FF0000').map((call) => [call.x, call.y, call.width, call.height]), [[HX + CW - 1, HY + RH - 1, 3 * CW + 1, 2 * RH + 1]]);
+  assert.equal(ctx.fills('#0000FF').length, 0);
+  assert.deepEqual(ctx.fills('#00B050').map((call) => [call.x, call.y, call.width, call.height]), [[HX + CW + 2, HY + RH + 2, 3 * CW - 5, 2 * RH - 5]]);
+  assert.match(ctx.textCall('8').font, /bold/);
+  assert.ok(!source.asked.includes('2,2'));
+});
+
+test('grid: the rules of a sheet reach the canvas through ConditionalFormats', () => {
+  const styles = emptyStyleSheet();
+  styles.dxfFormats = [{ fill: { type: 'pattern', pattern: 'solid', bg: { rgb: 'FFFFC7CE' } }, font: { color: { rgb: 'FF9C0006' } } }];
+  const sheet = newSheet();
+  for (let r = 0; r < 5; r++) put(sheet, r, 0, r * 10);
+  const base = { stopIfTrue: false, percent: false, bottom: false, aboveAverage: true, equalAverage: false };
+  sheet.conditionalFormats = [
+    { ranges: [range(0, 0, 4, 0)], rules: [{ ...base, type: 'cellIs', priority: 1, operator: 'greaterThan', formulas: ['25'], dxfId: 0 }] },
+    { ranges: [range(0, 0, 4, 0)], rules: [{ ...base, type: 'colorScale', priority: 2, formulas: [], colorScale: { values: [{ type: 'min', gte: true }, { type: 'max', gte: true }], colors: [{ rgb: 'FF000000' }, { rgb: 'FFFFFFFF' }] } }] },
+  ];
+  const ctx = draw(sheet, { styles, conditional: true });
+  // 30 and 40 take the pink of the format; the cells before them the colour of the scale.
+  assert.deepEqual(ctx.fills('#FFC7CE').map((call) => call.y), [HY + 3 * RH - 1, HY + 4 * RH - 1]);
+  assert.equal(ctx.textCall('40').fill, '#9C0006');
+  assert.equal(ctx.textCall('10').fill, DEFAULT_GRID_THEME.defaultText);
+  assert.equal(ctx.fills('#000000').filter((call) => call.y === HY - 1).length, 1);
+  assert.equal(ctx.fills('#404040').length, 1);
+  assert.equal(ctx.fills('#808080').length, 1);
+});
+
+test('grid: a sheet without conditional formats is drawn without asking for any', () => {
+  const sheet = newSheet();
+  for (let r = 0; r < 30; r++) for (let c = 0; c < 12; c++) put(sheet, r, c, r * c);
+  const before = draw(sheet);
+  const source = fixedConditional({});
+  const after = draw(sheet, { conditional: source });
+  // A source that has nothing to say changes nothing on the canvas.
+  assert.deepEqual(after.texts, before.texts);
+  assert.deepEqual(after.rects, before.rects);
+  assert.equal(after.paths.length, 0);
+  // A source that throws at construction time or is not a source at all is ignored.
+  assert.doesNotThrow(() => draw(sheet, { conditional: {} as ConditionalSource }));
 });

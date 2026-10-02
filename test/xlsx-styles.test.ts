@@ -386,3 +386,25 @@ test('theme + styles: tinted theme fill resolves to the colour Excel shows', () 
     assert.ok(Math.abs(parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16) - expected[i]) <= 1, hex);
   }
 });
+
+test('styles: differential formats are also read into what the engine draws with', () => {
+  const styles = parseStyles(parseXml(FULL_STYLES), parseXml(THEME));
+  assert.equal(styles.dxfFormats!.length, styles.dxfs.length);
+  const read = parseStyles(
+    sheetXml(
+      '<dxfs count="3">' +
+        '<dxf><font><b/><i val="0"/><color theme="1"/></font><fill><patternFill><bgColor rgb="ffffc7ce"/></patternFill></fill></dxf>' +
+        '<dxf><numFmt numFmtId="14" formatCode="m/d/yyyy"/><border><left style="thin"><color auto="1"/></left><top style="hair"/></border></dxf>' +
+        '<dxf><font/><fill/><border/></dxf>' +
+        '</dxfs>',
+    ),
+    undefined,
+  );
+  assert.deepEqual(read.dxfFormats, [
+    { font: { bold: true, italic: false, color: { theme: 1 } }, fill: { type: 'pattern', pattern: 'solid', bg: { rgb: 'FFFFC7CE' } } },
+    { numFmt: { id: 14, code: 'm/d/yyyy' }, border: { left: { style: 'thin', color: { auto: true } }, top: { style: 'hair' } } },
+    { font: {}, fill: { type: 'pattern', pattern: 'none' }, border: {} },
+  ]);
+  // A style sheet without differential formats has no list.
+  assert.equal(parseStyles(sheetXml('<dxfs count="0"/>'), undefined).dxfFormats, undefined);
+});

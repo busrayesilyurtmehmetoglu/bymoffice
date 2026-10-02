@@ -117,12 +117,128 @@ export interface StyleSheet {
   cellStyles: NamedCellStyle[];
   /** Differential formats (conditional formatting, tables); kept as read. */
   dxfs: XmlElement[];
+  /** The same records as far as the engine draws with them; index for index with `dxfs`. */
+  dxfFormats?: DifferentialFormat[];
   /** Custom indexed palette ("RRGGBB") when the file overrides the default one. */
   indexedColors?: string[];
   /** Theme colours as "RRGGBB", in the order theme indexes refer to them. */
   themeColors: string[];
   /** Set once a format was added after the styles were read. */
   modified?: boolean;
+}
+
+/**
+ * A differential format (<dxf>): only what it states is applied on top of the
+ * format of a cell. A view for reading; the record itself stays in the package.
+ */
+export interface DifferentialFormat {
+  font?: {
+    bold?: boolean;
+    italic?: boolean;
+    strike?: boolean;
+    underline?: Underline;
+    color?: Color;
+  };
+  /**
+   * As the file states it, with one difference from a cell fill: a <patternFill>
+   * without a patternType is a solid fill, and the colour of a solid fill is `bg`
+   * (see differentialFillColor()).
+   */
+  fill?: Fill;
+  border?: {
+    left?: BorderEdge;
+    right?: BorderEdge;
+    top?: BorderEdge;
+    bottom?: BorderEdge;
+  };
+  numFmt?: { id: number; code: string };
+}
+
+/** A threshold of a colour scale, a data bar or an icon set (<cfvo>). */
+export interface ConditionalValue {
+  /** "min", "max", "num", "percent", "percentile", "formula"; "autoMin" and "autoMax" in the 2010 extension. */
+  type: string;
+  /** A number or a formula (without "="), as written. */
+  value?: string;
+  /** Icon sets: the threshold itself belongs to the icon above it. Default true. */
+  gte: boolean;
+}
+
+export interface ConditionalColorScale {
+  values: ConditionalValue[];
+  colors: Color[];
+}
+
+export interface ConditionalDataBar {
+  min: ConditionalValue;
+  max: ConditionalValue;
+  color?: Color;
+  showValue: boolean;
+  /** Shortest and longest bar, in percent of the cell width. */
+  minLength: number;
+  maxLength: number;
+  /** The rest comes from the 2010 extension (<x14:dataBar>); `extended` says that one was found. */
+  extended: boolean;
+  gradient: boolean;
+  borderColor?: Color;
+  negativeFillColor?: Color;
+  negativeBorderColor?: Color;
+  negativeFillSameAsPositive: boolean;
+  negativeBorderSameAsPositive: boolean;
+  axisColor?: Color;
+  axisPosition: 'automatic' | 'middle' | 'none';
+  direction: 'context' | 'leftToRight' | 'rightToLeft';
+}
+
+export interface ConditionalIconSet {
+  /** "3Arrows", "4Rating", "5Quarters", ...; "3TrafficLights1" when the file names none. */
+  set: string;
+  values: ConditionalValue[];
+  showValue: boolean;
+  reverse: boolean;
+  /** Icons chosen one by one (2010 extension), lowest first; a set of "NoIcons" shows nothing. */
+  custom?: { set: string; id: number }[];
+}
+
+/** One <cfRule>. Attributes that only some rule types use are present when the file states them. */
+export interface ConditionalRule {
+  /** "cellIs", "expression", "colorScale", "dataBar", "iconSet", "top10", ... as in ST_CfType; unknown types are kept and never match. */
+  type: string;
+  /** Lower numbers are applied first; Infinity when the file states none. */
+  priority: number;
+  stopIfTrue: boolean;
+  /** Index into StyleSheet.dxfFormats. */
+  dxfId?: number;
+  /** A format stated in the rule itself (rules of the 2010 extension). */
+  dxf?: DifferentialFormat;
+  /** cellIs: "between", "notBetween", "equal", "notEqual", "greaterThan", "lessThan", "greaterThanOrEqual", "lessThanOrEqual". */
+  operator?: string;
+  /** Formula texts without "=", written for the top-left cell of the first range. */
+  formulas: string[];
+  /** containsText, notContainsText, beginsWith, endsWith. */
+  text?: string;
+  timePeriod?: string;
+  /** top10. */
+  rank?: number;
+  percent: boolean;
+  bottom: boolean;
+  /** aboveAverage: false means "below average". */
+  aboveAverage: boolean;
+  equalAverage: boolean;
+  stdDev?: number;
+  colorScale?: ConditionalColorScale;
+  dataBar?: ConditionalDataBar;
+  iconSet?: ConditionalIconSet;
+  /** Id that ties a rule to its counterpart in the 2010 extension list. */
+  extId?: string;
+  /** The rule exists only in the 2010 extension list. */
+  extended?: boolean;
+}
+
+/** One <conditionalFormatting>: rules and the cells they apply to. A view for reading; the writer copies the source element. */
+export interface ConditionalFormat {
+  ranges: CellRange[];
+  rules: ConditionalRule[];
 }
 
 export interface RichRun {
@@ -278,6 +394,11 @@ export interface Sheet {
   baseColWidth?: number;
   view: SheetView;
   tabColor?: Color;
+  /**
+   * Conditional formats as the file has them. They are not changed by edits: rows and
+   * columns inserted or deleted since (structuralEdits) are applied where they are evaluated.
+   */
+  conditionalFormats?: ConditionalFormat[];
   /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */
   modified?: boolean;
   /**

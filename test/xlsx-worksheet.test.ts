@@ -691,3 +691,47 @@ test('worksheet: 100,000 rows x 10 columns read in reasonable time', () => {
   }
   assert.ok(elapsed < 10000, `took ${elapsed} ms`);
 });
+
+test('worksheet: conditional formats are read beside everything else, from both lists', () => {
+  const sheet = read(
+    data('<row r="1"><c r="A1"><v>1</v></c></row>') +
+      '<conditionalFormatting sqref="A1:B2"><cfRule type="cellIs" dxfId="3" priority="2" operator="lessThan"><formula>A$1 &amp; "&lt;"</formula></cfRule></conditionalFormatting>' +
+      '<dataValidations count="1"><dataValidation type="list" sqref="C1"><formula1>"a,b"</formula1></dataValidation></dataValidations>' +
+      '<hyperlinks><hyperlink ref="A1" location="Sayfa1!B2"/></hyperlinks>' +
+      '<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">' +
+      '<x14:conditionalFormattings><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">' +
+      '<x14:cfRule type="containsText" priority="1" operator="containsText" id="{00000000-000E-0000-0000-000001000000}"><xm:f>NOT(ISERROR(SEARCH("x",D1)))</xm:f><xm:f>"x"</xm:f>' +
+      '<x14:dxf><font><color rgb="FF9C0006"/></font></x14:dxf></x14:cfRule><xm:sqref>D1:D9</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext>' +
+      '<ext uri="{other}"><x14:something xmlns:x14="urn:x"/></ext></extLst>',
+  );
+  // What was read before is still read.
+  assert.deepEqual(getCell(sheet, 0, 0), { kind: 'number', value: 1, style: 0 });
+  assert.equal(sheet.hyperlinks.length, 1);
+  assert.deepEqual(sheet.conditionalFormats, [
+    {
+      ranges: [{ top: 0, left: 0, bottom: 1, right: 1 }],
+      rules: [{ type: 'cellIs', priority: 2, stopIfTrue: false, dxfId: 3, operator: 'lessThan', formulas: ['A$1 & "<"'], percent: false, bottom: false, aboveAverage: true, equalAverage: false }],
+    },
+    {
+      ranges: [{ top: 0, left: 3, bottom: 8, right: 3 }],
+      rules: [
+        {
+          type: 'containsText',
+          priority: 1,
+          stopIfTrue: false,
+          operator: 'containsText',
+          formulas: ['NOT(ISERROR(SEARCH("x",D1)))', '"x"'],
+          percent: false,
+          bottom: false,
+          aboveAverage: true,
+          equalAverage: false,
+          extended: true,
+          extId: '{00000000-000E-0000-0000-000001000000}',
+          dxf: { font: { color: { rgb: 'FF9C0006' } } },
+        },
+      ],
+    },
+  ]);
+  // Broken XML inside a rule is still an error of the part, as anywhere else in it.
+  assert.throws(() => read('<sheetData/><conditionalFormatting sqref="A1"><cfRule type="cellIs"></conditionalFormatting>'), /Invalid XML/);
+});

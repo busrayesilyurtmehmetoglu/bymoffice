@@ -12,15 +12,24 @@ import {
   parseRange,
   type Cell,
   type CellFormula,
+  type CellRange,
   type ColumnRange,
+  type ConditionalColorScale,
+  type ConditionalDataBar,
+  type ConditionalFormat,
+  type ConditionalIconSet,
+  type ConditionalRule,
+  type ConditionalValue,
   type Hyperlink,
   type Row,
   type SharedString,
   type Sheet,
   type SheetView,
 } from '../../model/sheet/types';
+import { childElements, localName, parseXml, type XmlElement } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { decodeXstring, parseColor, parseStringItem } from './shared-strings';
+import { parseColor as parseColorElement, parseDifferentialFormat } from './styles';
 
 const ROOT_NAMES = ['worksheet', 'chartsheet', 'dialogsheet', 'macrosheet'];
 
@@ -501,6 +510,272 @@ function parseHyperlinks(sc: XmlScanner, sheet: Sheet): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Conditional formats
+//
+// The elements are small, so each one is read as a tree. Nothing here is written
+// back: the writer copies the source elements.
+
+const firstElement = (parent: XmlElement, local: string): XmlElement | undefined => childElements(parent, local)[0];
+
+function elementText(el: XmlElement): string {
+  let text = '';
+  for (const node of el.children) if (node.type === 'text') text += node.value;
+  return text;
+}
+
+/** One reference of an sqref list: "A1", "A1:B2", and the whole-column and whole-row forms "A:C" and "1:5". */
+function parseSqrefItem(ref: string): CellRange | undefined {
+  const range = parseRange(ref);
+  if (range) return range;
+  const cols = /^\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})$/.exec(ref);
+  if (cols) {
+    const a = parseCellRef(cols[1] + '1');
+    const b = parseCellRef(cols[2] + '1');
+    if (a && b) return { top: 0, left: Math.min(a.col, b.col), bottom: MAX_ROWS - 1, right: Math.max(a.col, b.col) };
+  }
+  const rows = /^\$?(\d{1,7}):\$?(\d{1,7})$/.exec(ref);
+  if (rows) {
+    const a = Number(rows[1]);
+    const b = Number(rows[2]);
+    if (a >= 1 && b >= 1 && a <= MAX_ROWS && b <= MAX_ROWS) return { top: Math.min(a, b) - 1, left: 0, bottom: Math.max(a, b) - 1, right: MAX_COLS - 1 };
+  }
+  return undefined;
+}
+
+/** The ranges of an sqref list; references that are not ranges inside the sheet are left out. */
+function parseSqref(text: string | undefined): CellRange[] {
+  const ranges: CellRange[] = [];
+  if (!text) return ranges;
+  const items = text.trim().split(/\s+/);
+  for (let i = 0; i < items.length; i++) {
+    const range = items[i] ? parseSqrefItem(items[i]) : undefined;
+    if (range) ranges.push(range);
+  }
+  return ranges;
+}
+
+const flagAttr = (el: XmlElement, name: string, fallback: boolean) => parseBool(el.attrs.get(name), fallback);
+
+/** A <cfvo>: its value is the "val" attribute, or an <xm:f> child in the extension list. */
+function parseConditionalValue(el: XmlElement): ConditionalValue {
+  const value: ConditionalValue = { type: el.attrs.get('type') || 'num', gte: flagAttr(el, 'gte', true) };
+  const formula = firstElement(el, 'f');
+  const val = formula ? elementText(formula) : el.attrs.get('val');
+  if (val !== undefined) value.value = val;
+  return value;
+}
+
+const conditionalValues = (el: XmlElement) => childElements(el, 'cfvo').map(parseConditionalValue);
+
+function parseColorScale(el: XmlElement): ConditionalColorScale {
+  const colors: ConditionalColorScale['colors'] = [];
+  for (const child of childElements(el, 'color')) colors.push(parseColorElement(child) || {});
+  return { values: conditionalValues(el), colors };
+}
+
+const percentAttr = (el: XmlElement, name: string, fallback: number): number => {
+  const value = parseFinite(el.attrs.get(name));
+  return value !== undefined && value >= 0 && value <= 100 ? value : fallback;
+};
+
+/** Reads the properties only <x14:dataBar> states into `bar`. */
+function readDataBarExtension(el: XmlElement, bar: ConditionalDataBar): void {
+  bar.extended = true;
+  bar.minLength = percentAttr(el, 'minLength', 0);
+  bar.maxLength = percentAttr(el, 'maxLength', 100);
+  bar.gradient = flagAttr(el, 'gradient', true);
+  bar.negativeFillSameAsPositive = flagAttr(el, 'negativeBarColorSameAsPositive', false);
+  bar.negativeBorderSameAsPositive = flagAttr(el, 'negativeBarBorderColorSameAsPositive', true);
+  const axis = el.attrs.get('axisPosition');
+  bar.axisPosition = axis === 'middle' || axis === 'none' ? axis : 'automatic';
+  const direction = el.attrs.get('direction');
+  bar.direction = direction === 'leftToRight' || direction === 'rightToLeft' ? direction : 'context';
+  const values = conditionalValues(el);
+  if (values[0]) bar.min = values[0];
+  if (values[1]) bar.max = values[1];
+  const fill = parseColorElement(firstElement(el, 'fillColor'));
+  if (fill) bar.color = fill;
+  // The border colour only counts when the bar is said to have a border.
+  const border = flagAttr(el, 'border', false) ? parseColorElement(firstElement(el, 'borderColor')) : undefined;
+  if (border) bar.borderColor = border;
+  const negativeFill = parseColorElement(firstElement(el, 'negativeFillColor'));
+  if (negativeFill) bar.negativeFillColor = negativeFill;
+  const negativeBorder = parseColorElement(firstElement(el, 'negativeBorderColor'));
+  if (negativeBorder) bar.negativeBorderColor = negativeBorder;
+  const axisColor = parseColorElement(firstElement(el, 'axisColor'));
+  if (axisColor) bar.axisColor = axisColor;
+}
+
+function parseDataBar(el: XmlElement, extension: boolean): ConditionalDataBar {
+  const values = conditionalValues(el);
+  const bar: ConditionalDataBar = {
+    min: values[0] || { type: 'min', gte: true },
+    max: values[1] || { type: 'max', gte: true },
+    showValue: flagAttr(el, 'showValue', true),
+    minLength: percentAttr(el, 'minLength', 10),
+    maxLength: percentAttr(el, 'maxLength', 90),
+    extended: false,
+    gradient: true,
+    negativeFillSameAsPositive: false,
+    negativeBorderSameAsPositive: true,
+    axisPosition: 'automatic',
+    direction: 'context',
+  };
+  const color = parseColorElement(firstElement(el, 'color'));
+  if (color) bar.color = color;
+  if (extension) readDataBarExtension(el, bar);
+  return bar;
+}
+
+function parseIconSet(el: XmlElement): ConditionalIconSet {
+  const icons: ConditionalIconSet = {
+    set: el.attrs.get('iconSet') || '3TrafficLights1',
+    values: conditionalValues(el),
+    showValue: flagAttr(el, 'showValue', true),
+    reverse: flagAttr(el, 'reverse', false),
+  };
+  const custom = childElements(el, 'cfIcon');
+  if (custom.length > 0) {
+    icons.custom = custom.map((icon) => ({ set: icon.attrs.get('iconSet') || '', id: Math.max(parseUint(icon.attrs.get('iconId')), 0) }));
+  }
+  return icons;
+}
+
+/** Reads a <cfRule>; `extension` is set for an <x14:cfRule>. The element of a data bar is handed back for linking. */
+function parseConditionalRule(el: XmlElement, extension: boolean): ConditionalRule {
+  const priority = parseUint(el.attrs.get('priority'));
+  const rule: ConditionalRule = {
+    type: el.attrs.get('type') || '',
+    priority: priority >= 0 ? priority : Infinity,
+    stopIfTrue: flagAttr(el, 'stopIfTrue', false),
+    formulas: [],
+    percent: flagAttr(el, 'percent', false),
+    bottom: flagAttr(el, 'bottom', false),
+    aboveAverage: flagAttr(el, 'aboveAverage', true),
+    equalAverage: flagAttr(el, 'equalAverage', false),
+  };
+  const dxfId = parseUint(el.attrs.get('dxfId'));
+  if (dxfId >= 0) rule.dxfId = dxfId;
+  const operator = el.attrs.get('operator');
+  if (operator !== undefined) rule.operator = operator;
+  const text = el.attrs.get('text');
+  if (text !== undefined) rule.text = text;
+  const timePeriod = el.attrs.get('timePeriod');
+  if (timePeriod !== undefined) rule.timePeriod = timePeriod;
+  const rank = parseUint(el.attrs.get('rank'));
+  if (rank >= 0) rule.rank = rank;
+  const stdDev = parseUint(el.attrs.get('stdDev'));
+  if (stdDev >= 0) rule.stdDev = stdDev;
+  if (extension) {
+    rule.extended = true;
+    const id = el.attrs.get('id');
+    if (id !== undefined) rule.extId = id;
+  }
+
+  for (const child of el.children) {
+    if (child.type !== 'element') continue;
+    switch (localName(child.name)) {
+      // <formula> in the main namespace, <xm:f> in the extension list. Taken literally, as cell formulas are.
+      case 'formula':
+      case 'f':
+        rule.formulas.push(elementText(child));
+        break;
+      case 'colorScale':
+        rule.colorScale = parseColorScale(child);
+        break;
+      case 'dataBar':
+        rule.dataBar = parseDataBar(child, extension);
+        break;
+      case 'iconSet':
+        rule.iconSet = parseIconSet(child);
+        break;
+      case 'dxf':
+        rule.dxf = parseDifferentialFormat(child);
+        break;
+      case 'extLst':
+        // <ext><x14:id>{...}</x14:id></ext> names the rule's counterpart in the extension list.
+        for (const ext of childElements(child, 'ext')) {
+          const id = firstElement(ext, 'id');
+          if (id) rule.extId = elementText(id).trim();
+        }
+        break;
+    }
+  }
+  return rule;
+}
+
+/** With a <conditionalFormatting> open tag current (either namespace): reads it and consumes the element. */
+function parseConditionalFormatting(sc: XmlScanner, extension: boolean): ConditionalFormat {
+  const el = parseXml(sc.readRaw()).root;
+  // The range is an attribute in the main namespace and an <xm:sqref> child in the extension list.
+  const sqref = firstElement(el, 'sqref');
+  const format: ConditionalFormat = { ranges: parseSqref(sqref ? elementText(sqref) : el.attrs.get('sqref')), rules: [] };
+  for (const child of childElements(el, 'cfRule')) format.rules.push(parseConditionalRule(child, extension));
+  return format;
+}
+
+/**
+ * With an open tag current: calls `visit` at the open tag of every child element and
+ * consumes the element. `visit` has to consume the child it is called for (skip() does).
+ */
+function eachChild(sc: XmlScanner, visit: () => void): void {
+  if (sc.selfClosing) return;
+  while (sc.next()) {
+    if (sc.kind === 'close') return;
+    if (sc.kind === 'open') visit();
+  }
+}
+
+/** With the worksheet's <extLst> open tag current: reads the conditional formats of the 2010 extension. */
+function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[]): void {
+  eachChild(sc, () => {
+    if (sc.local !== 'ext') return sc.skip();
+    eachChild(sc, () => {
+      if (sc.local !== 'conditionalFormattings') return sc.skip();
+      eachChild(sc, () => {
+        if (sc.local === 'conditionalFormatting') extended.push(parseConditionalFormatting(sc, true));
+        else sc.skip();
+      });
+    });
+  });
+}
+
+/**
+ * Joins the rules of the extension list with the ones in the main part. A data bar is
+ * written twice: once as Excel 2007 reads it and once with what later versions added,
+ * tied by an id. Rules that exist only in the extension list are added as they are.
+ */
+function linkConditionalFormats(main: ConditionalFormat[], extended: ConditionalFormat[]): ConditionalFormat[] {
+  if (extended.length === 0) return main;
+  const byId = new Map<string, ConditionalRule>();
+  for (const format of main) {
+    for (const rule of format.rules) if (rule.extId !== undefined && !byId.has(rule.extId)) byId.set(rule.extId, rule);
+  }
+  const out = main.slice();
+  for (const format of extended) {
+    const own: ConditionalRule[] = [];
+    for (const rule of format.rules) {
+      const base = rule.extId === undefined ? undefined : byId.get(rule.extId);
+      if (!base) {
+        own.push(rule);
+        continue;
+      }
+      if (base.dataBar && rule.dataBar) {
+        // The colour of the bar is stated by the main rule; the extension only repeats it sometimes.
+        const color = base.dataBar.color || rule.dataBar.color;
+        const showValue = base.dataBar.showValue && rule.dataBar.showValue;
+        base.dataBar = { ...rule.dataBar, showValue };
+        if (color) base.dataBar.color = color;
+      } else if (base.iconSet && rule.iconSet) {
+        base.iconSet = rule.iconSet;
+      }
+    }
+    if (own.length > 0 && format.ranges.length > 0) out.push({ ranges: format.ranges, rules: own });
+  }
+  return out;
+}
+
 /** Moves to the root element and checks its local name. */
 function openRoot(sc: XmlScanner): void {
   while (sc.next()) {
@@ -518,6 +793,8 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
 
   const rowState = { prevRow: -1 };
   const colState = { count: 0 };
+  const conditional: ConditionalFormat[] = [];
+  const extended: ConditionalFormat[] = [];
   if (!sc.selfClosing) {
     while (sc.next()) {
       if (sc.kind === 'close') break;
@@ -558,12 +835,20 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
         case 'hyperlinks':
           parseHyperlinks(sc, sheet);
           break;
+        case 'conditionalFormatting':
+          conditional.push(parseConditionalFormatting(sc, false));
+          break;
+        case 'extLst':
+          parseSheetExtensions(sc, extended);
+          break;
         default:
-          // Conditional formats, validations, drawings, ...: kept in the source part.
+          // Validations, drawings, ...: kept in the source part.
           sc.skip();
       }
     }
   }
+  const formats = linkConditionalFormats(conditional, extended).filter((format) => format.ranges.length > 0 && format.rules.length > 0);
+  if (formats.length > 0) sheet.conditionalFormats = formats;
   // Anything after the root is still checked for well-formedness.
   while (sc.next());
 }

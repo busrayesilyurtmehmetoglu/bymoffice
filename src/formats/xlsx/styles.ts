@@ -14,6 +14,7 @@ import type {
   BorderEdge,
   CellFormat,
   Color,
+  DifferentialFormat,
   Fill,
   Font,
   NamedCellStyle,
@@ -269,6 +270,68 @@ function parseProtection(el: XmlElement): Protection {
   return protection;
 }
 
+/**
+ * Reads a <dxf> (also an <x14:dxf> of a worksheet's extension list). Only what the
+ * element states ends up in the result: a font without <b> says nothing about bold.
+ */
+export function parseDifferentialFormat(el: XmlElement): DifferentialFormat {
+  const format: DifferentialFormat = {};
+  const fontEl = firstChild(el, 'font');
+  if (fontEl) {
+    const font: NonNullable<DifferentialFormat['font']> = {};
+    for (const child of fontEl.children) {
+      if (child.type !== 'element') continue;
+      switch (localName(child.name)) {
+        case 'b':
+          font.bold = boolElement(child);
+          break;
+        case 'i':
+          font.italic = boolElement(child);
+          break;
+        case 'strike':
+          font.strike = boolElement(child);
+          break;
+        case 'u': {
+          const val = child.attrs.get('val');
+          font.underline = val !== undefined && UNDERLINES.includes(val) ? (val as Underline) : 'single';
+          break;
+        }
+        case 'color': {
+          const color = parseColor(child);
+          if (color) font.color = color;
+          break;
+        }
+      }
+    }
+    format.font = font;
+  }
+  const fillEl = firstChild(el, 'fill');
+  if (fillEl) {
+    const fill = parseFill(fillEl);
+    // In a differential format a pattern fill that names no pattern is solid.
+    const pattern = firstChild(fillEl, 'patternFill');
+    if (fill.type === 'pattern' && pattern && !pattern.attrs.get('patternType')) fill.pattern = 'solid';
+    format.fill = fill;
+  }
+  const borderEl = firstChild(el, 'border');
+  if (borderEl) {
+    const border = parseBorder(borderEl);
+    const edges: NonNullable<DifferentialFormat['border']> = {};
+    if (border.left) edges.left = border.left;
+    if (border.right) edges.right = border.right;
+    if (border.top) edges.top = border.top;
+    if (border.bottom) edges.bottom = border.bottom;
+    format.border = edges;
+  }
+  const numFmt = firstChild(el, 'numFmt');
+  if (numFmt) {
+    const id = intAttr(numFmt, 'numFmtId');
+    const code = numFmt.attrs.get('formatCode');
+    if (code !== undefined) format.numFmt = { id: id === undefined ? -1 : id, code };
+  }
+  return format;
+}
+
 interface TableSizes {
   fonts: number;
   fills: number;
@@ -358,6 +421,7 @@ export function parseStyles(styles: XmlDocument | undefined, theme: XmlDocument 
   });
 
   sheet.dxfs = records(firstChild(root, 'dxfs'), 'dxf');
+  if (sheet.dxfs.length > 0) sheet.dxfFormats = sheet.dxfs.map(parseDifferentialFormat);
 
   const palette = records(firstChild(firstChild(root, 'colors'), 'indexedColors'), 'rgbColor');
   if (palette.length) {

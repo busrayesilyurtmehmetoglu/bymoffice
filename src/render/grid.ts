@@ -14,6 +14,7 @@ import { resolveCellStyle, resolveColor } from '../model/sheet/color';
 import { columnName, MAX_COLS, MAX_ROWS } from '../model/sheet/types';
 import type { BorderEdge, Cell, CellRange, Fill, Font, Row, Sheet, StyleSheet, Workbook } from '../model/sheet/types';
 import { builtinFormatId, formatCell } from '../format/cell-format';
+import { iconGlyph, type CellConditional, type CellDataBar, type ConditionalSource, type ConditionalStyle, type IconGlyph } from '../format/conditional';
 import type { FormatLocale } from '../format/locale';
 import type { FormatOptions } from '../format/number-format';
 import { cssFont, FONT_FALLBACK, fontPixels, TextPainter, wrapLines } from './text';
@@ -59,6 +60,8 @@ export interface GridScene {
   locale?: FormatLocale;
   /** Canvas backing store pixels per CSS pixel. */
   devicePixelRatio: number;
+  /** Conditional formats of the sheet; nothing is asked of it for a sheet that has none. */
+  conditional?: ConditionalSource;
 }
 
 /** Space between a cell edge and its text, in pixels. */
@@ -80,6 +83,19 @@ const HEADER_FONT = '12px ' + FONT_FALLBACK;
 /** Headers narrower or lower than this get no label. */
 const MIN_COL_LABEL_WIDTH = 12;
 const MIN_ROW_LABEL_HEIGHT = 8;
+/** Space between the edge of a cell and its data bar, and between an icon and the text after it. */
+const BAR_INSET = 2;
+const ICON_GAP = 3;
+const MIN_ICON = 6;
+const MAX_ICON = 32;
+/** How far the end of a gradient data bar is faded towards white. */
+const BAR_FADE = 0.85;
+const AXIS_DASH = [1, 1];
+/** Parts of an icon that are "off": the empty bars of a rating, the outline of a quarter circle. */
+const ICON_OFF = '#C8C8C8';
+const ICON_DARK = '#505050';
+const ICON_LIGHT = '#FFFFFF';
+const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/;
 
 interface LineStyle {
   name: string;
@@ -186,6 +202,8 @@ interface PaneView {
   cols: VisibleAxis;
   rows: VisibleAxis;
   merges: PaneMerge[];
+  /** What conditional formats give the visible cells, by visible position; only present when a cell has something. */
+  conditional?: (CellConditional | undefined)[];
 }
 
 /** State of one renderGrid() call. */
@@ -204,6 +222,9 @@ interface Frame {
   format: FormatOptions;
   /** Text styles recoloured by a number format section such as [Red], keyed by font and colour. */
   colorStyleCache: Map<string, TextStyle>;
+  conditional: ConditionalSource | undefined;
+  /** Cell formats with a conditional format on top, by the conditional format and the index of the cell format. */
+  conditionalStyles: Map<ConditionalStyle, Map<number, DrawStyle>>;
 }
 
 /** Draws the whole scene. The canvas backing store is layout.width*dpr by layout.height*dpr. */
@@ -236,7 +257,10 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     textStyleCache: new Map(),
     format: { locale: scene.locale, date1904: scene.workbook.date1904 === true },
     colorStyleCache: new Map(),
+    conditional: scene.conditional && typeof scene.conditional.resolve === 'function' ? scene.conditional : undefined,
+    conditionalStyles: new Map(),
   };
+  if (frame.conditional && frame.conditional.begin) frame.conditional.begin();
 
   const views: PaneView[] = [];
   for (const pane of panes) {
@@ -457,6 +481,52 @@ function drawStyle(frame: Frame, index: number): DrawStyle {
   return style;
 }
 
+/** A colour handed in from outside the model: only "#RRGGBB" reaches the canvas. */
+function safeColor(color: string | null | undefined): string | undefined {
+  return typeof color === 'string' && HEX_COLOR.test(color) ? color : undefined;
+}
+
+/** The format of a cell with what its conditional formats state on top. */
+function conditionalStyle(frame: Frame, index: number, format: ConditionalStyle): DrawStyle {
+  let byIndex = frame.conditionalStyles.get(format);
+  if (!byIndex) {
+    byIndex = new Map();
+    frame.conditionalStyles.set(format, byIndex);
+  }
+  let style = byIndex.get(index);
+  if (style) return style;
+  const base = drawStyle(frame, index);
+  style = { ...base };
+  if (format.fill !== undefined) style.fill = safeColor(format.fill);
+
+  const color = safeColor(format.color);
+  if (format.bold !== undefined || format.italic !== undefined || format.strike !== undefined || format.underline !== undefined || color) {
+    const font = resolveCellStyle(frame.styles, index).font;
+    const changed: Font = { ...font };
+    if (format.bold !== undefined) changed.bold = format.bold === true;
+    if (format.italic !== undefined) changed.italic = format.italic === true;
+    if (format.strike !== undefined) changed.strike = format.strike === true;
+    if (format.underline !== undefined) changed.underline = format.underline;
+    const text = textStyle(frame, changed);
+    style.text = color ? { ...text, color } : text;
+  }
+
+  if (format.left || format.right || format.top || format.bottom) {
+    style.left = edgeStyle(format.left, frame.styles) || base.left;
+    style.right = edgeStyle(format.right, frame.styles) || base.right;
+    style.top = edgeStyle(format.top, frame.styles) || base.top;
+    style.bottom = edgeStyle(format.bottom, frame.styles) || base.bottom;
+    style.hasBorder = !!(style.left || style.right || style.top || style.bottom);
+  }
+  if (format.numFmt && typeof format.numFmt.code === 'string') {
+    const id = format.numFmt.id;
+    style.numFmt = format.numFmt.code;
+    style.format = { locale: frame.format.locale, date1904: frame.format.date1904, builtinId: id >= 0 ? builtinFormatId(frame.styles, id) : undefined };
+  }
+  byIndex.set(index, style);
+  return style;
+}
+
 /** Style index of a cell: its own, else the row's, else the column's. */
 function styleIndexAt(sheet: Sheet, row: number, col: number): number {
   const rowData = sheet.rows.get(row);
@@ -522,6 +592,8 @@ function drawPane(frame: Frame, view: PaneView): void {
   const textRows: number[] = [];
   const textCols: number[] = [];
 
+  const conditional = frame.conditional;
+  let found: (CellConditional | undefined)[] | undefined;
   let lastIndex = -1;
   let lastStyle: DrawStyle | undefined;
   for (let ri = 0; ri < rowCount; ri++) {
@@ -536,14 +608,34 @@ function drawPane(frame: Frame, view: PaneView): void {
         lastStyle = drawStyle(frame, index);
         lastIndex = index;
       }
-      const style = lastStyle;
+      let style = lastStyle;
       const mark = marks ? marks[ri * colCount + ci] : 0;
+      let fill = style.fill;
+      if (conditional) {
+        // Every cell of a merged area is formatted as its top-left cell is.
+        const cond = mark === 0 ? conditional.resolve(r, c) : conditional.resolve(merges[mark - 1].range.top, merges[mark - 1].range.left);
+        if (cond) {
+          if (cond.style) {
+            style = conditionalStyle(frame, index, cond.style);
+            fill = style.fill;
+          }
+          if (cond.fill !== undefined) fill = safeColor(cond.fill) || fill;
+          if (mark === 0) {
+            if (!found) found = view.conditional = new Array<CellConditional | undefined>(rowCount * colCount);
+            found[ri * colCount + ci] = cond;
+          }
+        }
+      }
 
       if (mark === 0) {
-        if (style.fill) {
+        if (fill) {
           // One pixel further up and left: a filled cell hides the grid lines on all its sides.
-          frame.painter.setFill(style.fill);
+          frame.painter.setFill(fill);
           ctx.fillRect(cols.pos[ci] - 1, rows.pos[ri] - 1, cols.size[ci] + 1, rows.size[ri] + 1);
+        }
+        if (found) {
+          const cond = found[ri * colCount + ci];
+          if (cond && cond.bar) drawDataBar(frame, cond.bar, cols.pos[ci], rows.pos[ri], cols.size[ci], rows.size[ri]);
         }
         if (hasContent(cell)) {
           textRows.push(ri);
@@ -576,14 +668,18 @@ function drawPane(frame: Frame, view: PaneView): void {
   // Merged areas: the fill of the top-left cell, or the background to take the grid lines out.
   for (let i = 0; i < merges.length; i++) {
     const merge = merges[i];
-    const style = drawStyle(frame, styleIndexAt(sheet, merge.range.top, merge.range.left));
-    if (style.fill) {
-      frame.painter.setFill(style.fill);
+    const index = styleIndexAt(sheet, merge.range.top, merge.range.left);
+    const cond = conditional ? conditional.resolve(merge.range.top, merge.range.left) : undefined;
+    const style = cond && cond.style ? conditionalStyle(frame, index, cond.style) : drawStyle(frame, index);
+    const fill = (cond && safeColor(cond.fill)) || style.fill;
+    if (fill) {
+      frame.painter.setFill(fill);
       ctx.fillRect(merge.x - 1, merge.y - 1, merge.width + 1, merge.height + 1);
     } else if (showGridLines) {
       frame.painter.setFill(theme.background);
       ctx.fillRect(merge.x, merge.y, merge.width - 1, merge.height - 1);
     }
+    if (cond && cond.bar) drawDataBar(frame, cond.bar, merge.x, merge.y, merge.width, merge.height);
   }
 
   if (hEdges && vEdges) strokeEdges(ctx, view, hEdges, vEdges);
@@ -689,7 +785,9 @@ function drawPaneText(frame: Frame, view: PaneView, textRows: number[], textCols
     const ci = textCols[i];
     const row = sheet.rows.get(rows.index[ri]) as Row;
     const cell = row.cells[cols.index[ci]];
-    drawCellText(frame, view, cell, drawStyle(frame, cell.style), cols.pos[ci], rows.pos[ri], cols.size[ci], rows.size[ri], row, rows.index[ri], cols.index[ci]);
+    const cond = view.conditional ? view.conditional[ri * cols.index.length + ci] : undefined;
+    const style = cond && cond.style ? conditionalStyle(frame, cell.style, cond.style) : drawStyle(frame, cell.style);
+    drawCellText(frame, view, cell, style, cols.pos[ci], rows.pos[ri], cols.size[ci], rows.size[ri], row, rows.index[ri], cols.index[ci], false, cond);
   }
 
   // A merged area shows the top-left cell, which may itself be out of view.
@@ -698,7 +796,9 @@ function drawPaneText(frame: Frame, view: PaneView, textRows: number[], textCols
     const row = sheet.rows.get(merge.range.top);
     const cell = row ? row.cells[merge.range.left] : undefined;
     if (!hasContent(cell)) continue;
-    drawCellText(frame, view, cell, drawStyle(frame, cell.style), merge.x, merge.y, merge.width, merge.height, undefined, merge.range.top, merge.range.left);
+    const cond = frame.conditional ? frame.conditional.resolve(merge.range.top, merge.range.left) : undefined;
+    const style = cond && cond.style ? conditionalStyle(frame, cell.style, cond.style) : drawStyle(frame, cell.style);
+    drawCellText(frame, view, cell, style, merge.x, merge.y, merge.width, merge.height, undefined, merge.range.top, merge.range.left, false, cond);
   }
 
   // Text of cells just outside the pane can overflow into it.
@@ -728,13 +828,15 @@ function drawPaneText(frame: Frame, view: PaneView, textRows: number[], textCols
 function drawOutsideCell(frame: Frame, view: PaneView, row: Row, r: number, c: number, ri: number): void {
   const cell = row.cells[c];
   if (cell.kind !== 'string') return;
-  const style = drawStyle(frame, cell.style);
+  // A conditional format can make the text bold, and with that wider.
+  const cond = frame.conditional ? frame.conditional.resolve(r, c) : undefined;
+  const style = cond && cond.style ? conditionalStyle(frame, cell.style, cond.style) : drawStyle(frame, cell.style);
   if (style.wrap) return;
   const metrics = frame.layout.metrics;
   const width = metrics.cols.size(c);
   if (!(width > 0) || mergeIndexAt(view.merges, r, c) !== 0) return;
   const x = Math.round(view.cols.origin + metrics.cols.offset(c));
-  drawCellText(frame, view, cell, style, x, view.rows.pos[ri], width, view.rows.size[ri], row, r, c, true);
+  drawCellText(frame, view, cell, style, x, view.rows.pos[ri], width, view.rows.size[ri], row, r, c, true, cond);
 }
 
 /** Cuts the text to the length that is measured and takes line breaks out of text that does not wrap. */
@@ -854,11 +956,32 @@ function drawCellText(
   r: number,
   c: number,
   outside = false,
+  cond?: CellConditional,
 ): void {
   const { ctx, painter } = frame;
   const kind = cell.kind;
   const numeric = kind === 'number' || kind === 'date';
   const wrap = style.wrap && kind === 'string';
+  if (cond && (cond.icon || cond.hideValue)) {
+    const icon = cond.icon ? iconGlyph(cond.icon) : undefined;
+    // The icon is as high as a line of the cell's text, and never larger than the cell.
+    const size = Math.floor(Math.min(Math.max(style.text.px * 1.05, MIN_ICON), MAX_ICON, height - 3, width - 2 * CELL_PADDING));
+    const shown = icon !== undefined && size >= MIN_ICON && !outside;
+    const top = style.vertical === 'top' ? y + 1 : style.vertical === 'center' ? y + (height - size) / 2 : y + height - 2 - size;
+    if (cond.hideValue) {
+      // Without its value an icon goes where the alignment of the cell puts it.
+      const left = style.horizontal === 'center' ? x + (width - size) / 2 : style.horizontal === 'right' ? x + width - CELL_PADDING - size : x + CELL_PADDING;
+      if (shown) drawIcon(frame, icon as IconGlyph, Math.round(left), Math.round(top), size);
+      return;
+    }
+    if (shown) {
+      drawIcon(frame, icon as IconGlyph, x + CELL_PADDING, Math.round(top), size);
+      // The text gets what is left of the cell.
+      x += size + ICON_GAP;
+      width -= size + ICON_GAP;
+      if (width <= 2 * CELL_PADDING) return;
+    }
+  }
   if (cell.value === 0 && frame.sheet.view.showZeros === false) return;
   let segments = cellSegments(frame, cell, style, wrap);
   if (segments.length === 0) return;
@@ -969,6 +1092,227 @@ function drawCellText(
   if (clip) {
     ctx.restore();
     painter.invalidate();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data bars and icons
+
+/** "#RRGGBB" moved towards white by `share` (0..1). */
+function fade(color: string, share: number): string {
+  let out = '#';
+  for (let i = 1; i < 7; i += 2) {
+    const channel = parseInt(color.slice(i, i + 2), 16);
+    const value = Math.round(channel + (255 - channel) * share);
+    out += (value < 16 ? '0' : '') + value.toString(16).toUpperCase();
+  }
+  return out;
+}
+
+/** Draws a data bar into the cell at (x, y, width, height): above the fill, below the text. */
+function drawDataBar(frame: Frame, bar: CellDataBar, x: number, y: number, width: number, height: number): void {
+  const { ctx, painter } = frame;
+  const color = safeColor(bar.color);
+  // The last pixel of a cell is its grid line.
+  const left = x + BAR_INSET;
+  const top = y + BAR_INSET;
+  const room = width - 1 - 2 * BAR_INSET;
+  const barHeight = height - 1 - 2 * BAR_INSET;
+  if (!color || !(room > 0) || !(barHeight > 0)) return;
+  const unit = (value: number) => (value > 0 ? (value < 1 ? value : 1) : 0);
+  const mirrored = bar.rightToLeft === true;
+  let from = unit(bar.from);
+  let to = unit(bar.to);
+  if (mirrored) {
+    const swap = from;
+    from = 1 - to;
+    to = 1 - swap;
+  }
+  const x0 = Math.round(left + from * room);
+  const x1 = Math.round(left + to * room);
+  if (x1 > x0) {
+    if (bar.gradient && typeof ctx.createLinearGradient === 'function') {
+      // The bar is solid where it starts (at the axis for a negative one) and fades towards its end.
+      const startsRight = (bar.negative === true) !== mirrored;
+      const gradient = ctx.createLinearGradient(x0, 0, x1, 0);
+      gradient.addColorStop(startsRight ? 1 : 0, color);
+      gradient.addColorStop(startsRight ? 0 : 1, fade(color, BAR_FADE));
+      ctx.fillStyle = gradient;
+      painter.invalidate();
+    } else painter.setFill(color);
+    ctx.fillRect(x0, top, x1 - x0, barHeight);
+    const border = safeColor(bar.border);
+    if (border && x1 - x0 > 1 && barHeight > 1) {
+      ctx.strokeStyle = border;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0 + 0.5, top + 0.5, x1 - x0 - 1, barHeight - 1);
+    }
+  }
+  if (typeof bar.axis === 'number' && bar.axis === bar.axis) {
+    const axis = unit(mirrored ? 1 - bar.axis : bar.axis);
+    const at = Math.round(left + axis * room) + 0.5;
+    ctx.strokeStyle = safeColor(bar.axisColor) || '#000000';
+    ctx.lineWidth = 1;
+    ctx.setLineDash(AXIS_DASH);
+    ctx.beginPath();
+    ctx.moveTo(at, y);
+    ctx.lineTo(at, y + height - 1);
+    ctx.stroke();
+    ctx.setLineDash(NO_DASH);
+  }
+}
+
+/** Fills the polygon whose corners are given as fractions of a box of `size` pixels at (x, y). */
+function fillPolygon(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, points: number[]): void {
+  ctx.beginPath();
+  ctx.moveTo(x + points[0] * size, y + points[1] * size);
+  for (let i = 2; i < points.length; i += 2) ctx.lineTo(x + points[i] * size, y + points[i + 1] * size);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/** Strokes a line through the points, given as fractions of the box. */
+function strokeLine(ctx: CanvasRenderingContext2D, x: number, y: number, size: number, points: number[], color: string, lineWidth: number): void {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.beginPath();
+  ctx.moveTo(x + points[0] * size, y + points[1] * size);
+  for (let i = 2; i < points.length; i += 2) ctx.lineTo(x + points[i] * size, y + points[i + 1] * size);
+  ctx.stroke();
+  ctx.lineWidth = 1;
+}
+
+function fillCircle(ctx: CanvasRenderingContext2D, cx: number, cy: number, radius: number): void {
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+/** An arrow pointing up, as fractions of its box measured from the centre. */
+const ARROW = [0, -0.46, 0.42, -0.02, 0.15, -0.02, 0.15, 0.46, -0.15, 0.46, -0.15, -0.02, -0.42, -0.02];
+const STAR: number[] = [];
+for (let i = 0; i < 10; i++) {
+  const radius = i % 2 === 0 ? 0.48 : 0.2;
+  const angle = (Math.PI * i) / 5 - Math.PI / 2;
+  STAR.push(0.5 + radius * Math.cos(angle), 0.52 + radius * Math.sin(angle));
+}
+/** The left half of the star: the corners at or left of the middle, closed along the middle. */
+const STAR_HALF = [STAR[0], STAR[1], 0.5, STAR[11], STAR[12], STAR[13], STAR[14], STAR[15], STAR[16], STAR[17], STAR[18], STAR[19]];
+const CHECK = [0.2, 0.55, 0.42, 0.76, 0.8, 0.26];
+
+/** A check mark, a cross or an exclamation mark, drawn into the box at (x, y). */
+function drawSymbol(frame: Frame, shape: string, color: string, x: number, y: number, size: number): void {
+  const { ctx, painter } = frame;
+  const weight = Math.max(size * 0.16, 1.5);
+  if (shape === 'check') strokeLine(ctx, x, y, size, CHECK, color, weight);
+  else if (shape === 'cross') {
+    strokeLine(ctx, x, y, size, [0.24, 0.24, 0.76, 0.76], color, weight);
+    strokeLine(ctx, x, y, size, [0.76, 0.24, 0.24, 0.76], color, weight);
+  } else {
+    painter.setFill(color);
+    ctx.fillRect(x + size * 0.42, y + size * 0.16, size * 0.16, size * 0.42);
+    ctx.fillRect(x + size * 0.42, y + size * 0.68, size * 0.16, size * 0.16);
+  }
+}
+
+/** Draws one icon of an icon set into a square of `size` pixels at (x, y). Vector shapes only. */
+function drawIcon(frame: Frame, icon: IconGlyph, x: number, y: number, size: number): void {
+  const { ctx, painter } = frame;
+  const color = safeColor(icon.color) || ICON_DARK;
+  const cx = x + size / 2;
+  const cy = y + size / 2;
+  const level = icon.level;
+  painter.setFill(color);
+  switch (icon.shape) {
+    case 'arrow': {
+      const angle = (level * Math.PI) / 180;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const points: number[] = [];
+      for (let i = 0; i < ARROW.length; i += 2) points.push(0.5 + ARROW[i] * cos - ARROW[i + 1] * sin, 0.5 + ARROW[i] * sin + ARROW[i + 1] * cos);
+      fillPolygon(ctx, x, y, size, points);
+      break;
+    }
+    case 'circle':
+      fillCircle(ctx, cx, cy, size * 0.44);
+      break;
+    case 'rimCircle':
+      painter.setFill(ICON_DARK);
+      ctx.fillRect(x + size * 0.04, y + size * 0.04, size * 0.92, size * 0.92);
+      painter.setFill(color);
+      fillCircle(ctx, cx, cy, size * 0.34);
+      break;
+    case 'flag':
+      fillPolygon(ctx, x, y, size, [0.26, 0.08, 0.9, 0.3, 0.26, 0.54]);
+      painter.setFill(ICON_DARK);
+      ctx.fillRect(x + size * 0.16, y + size * 0.06, Math.max(size * 0.1, 1), size * 0.88);
+      break;
+    case 'diamond':
+      fillPolygon(ctx, x, y, size, [0.5, 0.04, 0.96, 0.5, 0.5, 0.96, 0.04, 0.5]);
+      break;
+    case 'triangle':
+      fillPolygon(ctx, x, y, size, [0.5, 0.1, 0.96, 0.88, 0.04, 0.88]);
+      break;
+    case 'triangleDown':
+      fillPolygon(ctx, x, y, size, [0.04, 0.12, 0.96, 0.12, 0.5, 0.9]);
+      break;
+    case 'dash':
+      ctx.fillRect(x + size * 0.08, y + size * 0.4, size * 0.84, size * 0.2);
+      break;
+    case 'check':
+    case 'cross':
+    case 'exclamation':
+      drawSymbol(frame, icon.shape, color, x, y, size);
+      break;
+    case 'checkCircle':
+    case 'crossCircle':
+    case 'exclamationCircle':
+      fillCircle(ctx, cx, cy, size * 0.48);
+      drawSymbol(frame, icon.shape.slice(0, -6), ICON_LIGHT, x + size * 0.14, y + size * 0.14, size * 0.72);
+      break;
+    case 'bars':
+      for (let i = 0; i < 4; i++) {
+        const barHeight = size * (0.3 + 0.2 * i);
+        painter.setFill(i < level ? color : ICON_OFF);
+        ctx.fillRect(x + size * (0.06 + 0.23 * i), y + size * 0.94 - barHeight, size * 0.18, barHeight);
+      }
+      break;
+    case 'boxes':
+      for (let i = 0; i < 4; i++) {
+        // Filled from the bottom row up, left before right.
+        const order = [2, 3, 0, 1][i];
+        painter.setFill(order < level ? color : ICON_OFF);
+        ctx.fillRect(x + size * (0.08 + 0.46 * (i % 2)), y + size * (0.08 + 0.46 * (i >> 1)), size * 0.38, size * 0.38);
+      }
+      break;
+    case 'pie': {
+      const radius = size * 0.44;
+      painter.setFill(ICON_LIGHT);
+      fillCircle(ctx, cx, cy, radius);
+      if (level > 0) {
+        painter.setFill(color);
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + (Math.min(level, 4) * Math.PI) / 2);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.stroke();
+      break;
+    }
+    case 'star':
+      painter.setFill(level >= 2 ? color : ICON_LIGHT);
+      fillPolygon(ctx, x, y, size, STAR);
+      if (level === 1) {
+        painter.setFill(color);
+        fillPolygon(ctx, x, y, size, STAR_HALF);
+      }
+      strokeLine(ctx, x, y, size, STAR.concat([STAR[0], STAR[1]]), color, 1);
+      break;
   }
 }
 
