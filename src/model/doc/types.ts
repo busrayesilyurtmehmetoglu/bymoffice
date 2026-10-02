@@ -1126,6 +1126,13 @@ export interface FontInfo {
   embedded?: Map<string, string>;
 }
 
+/** A picture that is held in the model itself, for formats without a package to read it from (doc). */
+export interface DocMedia {
+  bytes: Uint8Array;
+  /** Media type: "image/png", "image/jpeg", "image/bmp", "image/x-emf", "image/x-wmf", "image/tiff", "image/pict". */
+  type: string;
+}
+
 export interface DocModel {
   body: Body;
   styles: DocStyles;
@@ -1140,6 +1147,12 @@ export interface DocModel {
   footnotes?: StoryCollection<Note>;
   endnotes?: StoryCollection<Note>;
   comments?: StoryCollection<Comment>;
+  /**
+   * Pictures by the part name image references give as their target
+   * (ImageRef.target). Only set by readers of formats that are not packages:
+   * a docx file keeps its pictures in the package.
+   */
+  media?: Map<string, DocMedia>;
   /** The document uses the strict (ISO/IEC 29500) namespaces. */
   strict: boolean;
   /** Things the reader got past: missing parts, relationships without a target, ... */
