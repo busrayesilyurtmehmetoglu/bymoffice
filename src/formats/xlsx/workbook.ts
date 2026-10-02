@@ -6,6 +6,8 @@
 import type { OpcPackage, Relationship } from '../../opc';
 import { createSheet, type DefinedName, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
 import { childElements, localName, type XmlDocument, type XmlElement } from '../../xml';
+import { parsePersons, readSheetComments } from './comments';
+import { readSheetDrawings } from './drawings';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
 import { parseWorksheet } from './worksheet';
@@ -60,6 +62,19 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   if (allParts.some((part) => part.startsWith('/xl/charts/'))) global.push('chart');
   if (allParts.some((part) => part.startsWith('/xl/pivottables/') || part.startsWith('/xl/pivotcache/'))) global.push('pivotTable');
 
+  // The people of threaded comments are kept once for the workbook.
+  let persons = new Map<string, string>();
+  const personsPart = rels.find((rel) => rel.type.endsWith('/person'))?.part;
+  if (personsPart && pkg.hasPart(personsPart)) {
+    try {
+      persons = parsePersons((await pkg.readXml(personsPart)).root);
+    } catch (error) {
+      // Comments are then shown without the names of who wrote them.
+    }
+  }
+  /** Parts of the pictures the drawings show: the only ones the view may ask for. */
+  const mediaParts = new Set<string>();
+
   const sheets: Sheet[] = [];
   const seenParts = new Set<string>();
   const sheetsElement = child(root, 'sheets');
@@ -111,6 +126,13 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
       }
       for (const kind of global) anchored.add(kind);
       if (anchored.size > 0) sheet.anchored = [...anchored].sort();
+      // What is shown of them; the parts themselves are written back as they are.
+      const warnings: string[] = [];
+      const drawings = await readSheetDrawings(pkg, sheetRels, styles.themeColors, mediaParts, warnings);
+      if (drawings) sheet.drawings = drawings;
+      const comments = await readSheetComments(pkg, sheetRels, persons, warnings);
+      if (comments) sheet.comments = comments;
+      if (warnings.length > 0) sheet.warnings = warnings;
     }
     sheets.push(sheet);
   }
@@ -133,7 +155,7 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   const view = views && child(views, 'workbookView');
   const activeAttr = view?.attrs.get('activeTab') ?? '';
   const activeTab = /^\d{1,6}$/.test(activeAttr) ? Number(activeAttr) : 0;
-  return {
+  const workbook: Workbook = {
     sheets,
     styles,
     sharedStrings,
@@ -141,4 +163,11 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     date1904: isTrue(properties?.attrs.get('date1904')),
     activeSheet: activeTab < sheets.length ? activeTab : 0,
   };
+  if (mediaParts.size > 0) {
+    // Read from the package when a picture is first shown, and only what a drawing of this workbook shows.
+    workbook.media = {
+      readPart: (part: string) => (mediaParts.has(part) ? pkg.readPart(part) : Promise.reject(new Error(`Not a picture of this workbook: ${part}`))),
+    };
+  }
+  return workbook;
 }

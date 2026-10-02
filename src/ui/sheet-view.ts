@@ -9,7 +9,7 @@
 
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { getUiStrings, type UiStrings } from './strings';
@@ -42,6 +42,8 @@ import {
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
 import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
+import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
+import { SheetDrawings } from '../render/sheet-drawings';
 import { cssFont } from '../render/text';
 import { ContextMenu, type MenuItem } from './context-menu';
 import { FilterMenu, ListMenu } from './filter-menu';
@@ -296,6 +298,12 @@ const STYLE_TEXT =
   '.bym-tip{max-width:240px;padding:6px 8px;background:#fffbe6;border:1px solid #e0d9a8;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.2);color:#202124;' +
   'font:12px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;white-space:pre-wrap;overflow-wrap:break-word}' +
   '.bym-tip-title{font-weight:600}' +
+  // The comment of a cell, beside it.
+  '.bym-comment{padding:6px 8px;background:#ffffe1;border:1px solid #b8b28a;border-radius:2px;box-shadow:0 1px 4px rgba(0,0,0,.25);color:#202124;' +
+  'font:12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;letter-spacing:normal;text-transform:none;text-align:left;' +
+  'white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain}' +
+  '.bym-comment-author{font-weight:700}' +
+  '.bym-comment-reply{margin-top:6px;padding-top:6px;border-top:1px solid #d8d2a8}' +
   '.bym-tabs{background:#f1f3f4;border-top:1px solid #dadce0}' +
   '.bym-tab{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;width:auto;height:auto;min-width:0;' +
   'max-width:none;max-height:none;margin:0;border:0;border-right:1px solid #dadce0;border-radius:0;' +
@@ -333,6 +341,16 @@ function releaseStyle(host: Node): void {
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+const coarsePointer = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia('(pointer:coarse)').matches;
+
+/** Largest size of the box that shows a comment beside its cell, in pixels; longer text scrolls. */
+const COMMENT_MAX_WIDTH = 280;
+const COMMENT_MAX_HEIGHT = 240;
+/** Runs of a comment that keep their own weight in the box; the rest follows as plain text of the last one. */
+const MAX_COMMENT_SPANS = 256;
+/** Characters of a comment said after the cell it belongs to. */
+const MAX_SPOKEN_COMMENT = 500;
 
 /** A count read from the file, made safe to use as one. */
 const count = (value: number) => (Number.isFinite(value) && value > 0 ? Math.floor(value) : 0);
@@ -522,6 +540,20 @@ export class WorkbookView {
   private cellInfo: CellInfo | undefined;
   /** The message of the active cell's data validation, shown beside the cell. */
   private tip: HTMLDivElement | undefined;
+  /** Pictures, shapes and comments of the sheets that have any, made when a sheet is first drawn. */
+  private drawings = new Map<Sheet, SheetDrawings>();
+  /** Decoded pictures of the workbook; made when a sheet with a picture is first drawn. */
+  private images: ImageStore | undefined;
+  /** The comment of a cell, shown beside it while the cell is pointed at or active. */
+  private commentBox: HTMLDivElement | undefined;
+  /** The cell whose comment the box shows now. */
+  private commentShown: { sheet: number; row: number; col: number; comment: SheetComment } | undefined;
+  /** The cell the mouse pointer is over, while it carries a comment. */
+  private hoverComment: CellPos | undefined;
+  /** Sheets about which it was said that some of their drawings or comments are not shown. */
+  private warned = new WeakSet<Sheet>();
+  /** The comment of this cell was put away with Escape; it stays away until another cell is active. */
+  private commentDismissed: { sheet: number; row: number; col: number } | undefined;
   /**
    * Formula cells the engine has something to say about, per sheet, by row * MAX_COLS + column:
    * "file" (not calculated here, the value of the file is shown), "circular", "stale".
@@ -669,9 +701,12 @@ export class WorkbookView {
       canvas.addEventListener('lostpointercapture', this.onPointerCancel);
       // After a tap the browser also sends mouse events; their default would take the focus away from the input.
       canvas.addEventListener('mousedown', this.onMouseDown);
+      canvas.addEventListener('pointerleave', this.onPointerLeave);
     } else {
       // Browsers without pointer events: a tap arrives as the mouse events the browser makes up for it.
       canvas.addEventListener('mousedown', this.onPointerDown);
+      canvas.addEventListener('mousemove', this.onHoverMove);
+      canvas.addEventListener('mouseleave', this.onPointerLeave);
     }
     window.addEventListener('resize', this.onResize);
     if (typeof ResizeObserver === 'function') {
@@ -702,6 +737,7 @@ export class WorkbookView {
     this.endDrag();
     this.endTouch();
     this.lastTap = undefined;
+    this.hoverComment = undefined;
     this.sheetIndex = index;
     this.showSheet();
     this.schedule();
@@ -745,12 +781,26 @@ export class WorkbookView {
     return { scrollX: state.scrollX, scrollY: state.scrollY, width: this.width, height: this.height, devicePixelRatio: this.dpr };
   }
 
+  /**
+   * What the shown sheet has floating above its cells (for tests and embedding): the number of
+   * objects, the bytes of decoded pictures held right now, and the most the view ever holds.
+   */
+  getDrawingState(): { objects: number; imageBytes: number; imageBudget: number } {
+    const layer = this.destroyed ? undefined : this.drawingsOf(this.state().sheet);
+    return {
+      objects: layer ? layer.rects(this.state().metrics).length : 0,
+      imageBytes: this.images ? this.images.bytes : 0,
+      imageBudget: this.images ? this.images.budget : 0,
+    };
+  }
+
   /** Changes the language of number and date formats, and of the view's own labels, and redraws. */
   setLocale(locale: string | FormatLocale): void {
     this.locale = resolveLocale(locale);
     this.validation.forEach((rules) => rules.setLocale(this.locale));
     // The view's own words follow a language tag; a locale object only changes formats.
     if (typeof locale === 'string') this.strings = resolveStrings(locale);
+    this.drawings.forEach((layer) => layer.setLabels(this.drawingLabels()));
     this.root.setAttribute('aria-label', this.strings.spreadsheet);
     this.input.setAttribute('aria-label', this.strings.cellEditor);
     this.showSheet();
@@ -811,6 +861,16 @@ export class WorkbookView {
     canvas.removeEventListener('lostpointercapture', this.onPointerCancel);
     canvas.removeEventListener('mousedown', this.onPointerDown);
     canvas.removeEventListener('mousedown', this.onMouseDown);
+    canvas.removeEventListener('pointerleave', this.onPointerLeave);
+    canvas.removeEventListener('mouseleave', this.onPointerLeave);
+    if (!this.pointerEvents) canvas.removeEventListener('mousemove', this.onHoverMove);
+    if (this.commentBox) this.commentBox.removeEventListener('mouseleave', this.onCommentLeave);
+    this.commentBox = undefined;
+    this.commentShown = undefined;
+    // Decoded pictures are given back at once.
+    if (this.images) this.images.destroy();
+    this.images = undefined;
+    this.drawings.clear();
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);
     // Give the backing store back right away; some browsers keep it until collection otherwise.
@@ -904,6 +964,11 @@ export class WorkbookView {
     this.growExtent(state.scrollX, state.scrollY);
     this.commitScroll();
     this.announce();
+    // Said once for a sheet: something of its drawings or comments could not be read and is missing from what is shown.
+    if (state.sheet.warnings && state.sheet.warnings.length > 0 && !this.warned.has(state.sheet)) {
+      this.warned.add(state.sheet);
+      this.notifyLater(this.strings.drawingsNotShown);
+    }
   }
 
   private buildTabs(): void {
@@ -1147,6 +1212,9 @@ export class WorkbookView {
     if (!context) return;
     const state = this.state();
     const conditional = this.conditionalOf(state.sheet);
+    const floating = this.drawingsOf(state.sheet);
+    // A picture asked for in this frame is never dropped to make room for another.
+    if (this.images) this.images.pass++;
     renderGrid(context, {
       workbook: this.workbook,
       sheet: state.sheet,
@@ -1158,13 +1226,194 @@ export class WorkbookView {
       filter: this.gridFilter(state.sheet),
       dropdown: this.activeInfo().list ? state.active : undefined,
       cellMark: this.markLookup(),
+      drawings: floating,
+      // Asked for every visible cell: only for a sheet that has comments.
+      comments: floating && state.sheet.comments && state.sheet.comments.length > 0 ? floating : undefined,
     });
     // Rules whose formulas took too long are finished in the next frames.
     if (conditional && conditional.pending) this.schedule();
     // The input follows its cell through every scroll and resize.
     this.placeInput();
     this.placeTip();
+    this.placeComment();
   }
+
+  // -------------------------------------------------- drawings and comments
+
+  /** What floats above the cells of a sheet; undefined for a sheet without drawings and comments, which then costs nothing to draw. */
+  private drawingsOf(sheet: Sheet): SheetDrawings | undefined {
+    if (sheet.kind !== 'worksheet' || SheetDrawings.isEmpty(sheet)) return undefined;
+    let found = this.drawings.get(sheet);
+    if (!found) {
+      const media = this.workbook.media;
+      if (!this.images && media && typeof media.readPart === 'function') {
+        // Pictures are read from the file and decoded when they first come into view.
+        this.images = new ImageStore(media, coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => this.schedule());
+      }
+      found = new SheetDrawings(sheet, { images: this.images, labels: this.drawingLabels() });
+      this.drawings.set(sheet, found);
+    }
+    return found;
+  }
+
+  private drawingLabels(): { chart: string; diagram: string; object: string; picture: string } {
+    const name = this.strings.placeholder;
+    return { chart: name('chart'), diagram: name('diagram'), object: name('object'), picture: name('picture') };
+  }
+
+  /** The comment of a cell (of the merged range it belongs to), with the cell that carries it. */
+  private commentOf(row: number, col: number): { row: number; col: number; comment: SheetComment } | undefined {
+    const state = this.state();
+    const layer = this.drawingsOf(state.sheet);
+    if (!layer) return undefined;
+    const merge = mergeIn(this.merges(), row, col);
+    const at = merge ? { row: merge.top, col: merge.left } : { row, col };
+    const comment = layer.commentAt(at.row, at.col);
+    return comment ? { row: at.row, col: at.col, comment } : undefined;
+  }
+
+  /** What a comment says, as one line for assistive technology. */
+  private commentText(comment: SheetComment): string {
+    let text = comment.text;
+    if (comment.author !== undefined && comment.author !== '' && text.indexOf(comment.author) !== 0) text = `${comment.author}: ${text}`;
+    for (const reply of comment.replies || []) text += ` ${reply.author !== undefined && reply.author !== '' ? `${reply.author}: ` : ''}${reply.text}`;
+    text = text.replace(/\s+/g, ' ').trim();
+    return text.length > MAX_SPOKEN_COMMENT ? `${text.slice(0, MAX_SPOKEN_COMMENT)}\u2026` : text;
+  }
+
+  /** Fills the box with a comment. Everything from the file goes in as text, never as markup. */
+  private fillComment(box: HTMLDivElement, comment: SheetComment): void {
+    while (box.firstChild) box.removeChild(box.firstChild);
+    const line = (className: string, text: string, parent: HTMLElement = box): HTMLElement => {
+      const el = document.createElement(className === 'bym-comment-reply' ? 'div' : 'span');
+      if (className !== '') el.className = className;
+      el.textContent = text;
+      parent.appendChild(el);
+      return el;
+    };
+    const message = (author: string | undefined, text: string, runs: SheetComment['runs'], parent: HTMLElement) => {
+      // A legacy note usually starts with the name of who wrote it; it is not said twice.
+      if (author !== undefined && author !== '' && text.indexOf(author) !== 0) line('bym-comment-author', `${author}:\n`, parent);
+      if (runs && runs.length > 0) {
+        let rest = '';
+        for (let i = 0; i < runs.length; i++) {
+          const font = runs[i].font;
+          // Bold runs stay bold; beyond the limit the text goes on as one plain piece.
+          if (i < MAX_COMMENT_SPANS) line(font && font.bold ? 'bym-comment-author' : '', runs[i].text, parent);
+          else rest += runs[i].text;
+        }
+        if (rest !== '') line('', rest, parent);
+      } else line('', text, parent);
+    };
+    message(comment.author, comment.text, comment.threaded ? undefined : comment.runs, box);
+    for (const reply of comment.replies || []) message(reply.author, reply.text, undefined, line('bym-comment-reply', ''));
+  }
+
+  /** Puts the comment of the cell the pointer is over, or else of the active cell, beside that cell; takes the box away when there is none. */
+  private placeComment(): void {
+    const state = this.state();
+    // A sheet without comments costs nothing here.
+    if (!this.commentShown && !(state.sheet.comments && state.sheet.comments.length > 0)) return;
+    let target: { row: number; col: number; comment: SheetComment } | undefined;
+    // Not in the way of an editor, a menu or a list.
+    if (!this.edit && !this.panel && !this.menu && !this.drag) {
+      const hover = this.hoverComment;
+      if (hover) target = this.commentOf(hover.row, hover.col);
+      if (!target) {
+        const dismissed = this.commentDismissed;
+        const active = this.commentOf(state.active.row, state.active.col);
+        if (active && !(dismissed && dismissed.sheet === this.sheetIndex && dismissed.row === active.row && dismissed.col === active.col)) target = active;
+      }
+      // A box that is always shown is drawn on the sheet already.
+      if (target && target.comment.visible) target = undefined;
+    }
+    let rect: { x: number; y: number; width: number; height: number } | undefined;
+    if (target) {
+      const layout = this.layout(state);
+      const merge = mergeIn(this.merges(), target.row, target.col);
+      rect = rangeRect(layout, merge || { top: target.row, left: target.col, bottom: target.row, right: target.col });
+      const paneLeft = layout.metrics.headerWidth + (target.col < layout.frozenCols ? 0 : layout.frozenWidth);
+      const paneTop = layout.metrics.headerHeight + (target.row < layout.frozenRows ? 0 : layout.frozenHeight);
+      const inView = rect.width > 0 && rect.height > 0 && rect.x + rect.width > paneLeft && rect.y + rect.height > paneTop && rect.x < this.width && rect.y < this.height;
+      if (!inView) rect = undefined;
+    }
+    if (!target || !rect) {
+      if (this.commentBox && this.commentBox.parentNode) this.commentBox.parentNode.removeChild(this.commentBox);
+      this.commentShown = undefined;
+      return;
+    }
+    let box = this.commentBox;
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'bym-comment';
+      box.setAttribute('role', 'note');
+      box.addEventListener('mouseleave', this.onCommentLeave);
+      this.commentBox = box;
+    }
+    if (!box.parentNode) {
+      box.style.cssText = 'position:absolute;z-index:1;left:0;top:0;box-sizing:border-box;pointer-events:none';
+      this.root.appendChild(box);
+    }
+    const shown = this.commentShown;
+    if (!shown || shown.comment !== target.comment) {
+      this.fillComment(box, target.comment);
+      box.setAttribute('aria-label', this.strings.comment);
+      box.scrollTop = 0;
+    }
+    this.commentShown = { sheet: this.sheetIndex, row: target.row, col: target.col, comment: target.comment };
+    // Inside the view whatever the text is: long words break, long text scrolls.
+    box.style.maxWidth = `${Math.max(Math.min(COMMENT_MAX_WIDTH, this.width - 8), 0)}px`;
+    box.style.maxHeight = `${Math.max(Math.min(COMMENT_MAX_HEIGHT, this.height - 8), 0)}px`;
+    const width = box.offsetWidth;
+    const height = box.offsetHeight;
+    // Text that does not fit can be scrolled; a box that shows everything never takes a press from the cells under it.
+    box.style.pointerEvents = box.scrollHeight > box.clientHeight + 1 ? 'auto' : 'none';
+    // To the right of the cell as Excel has it; to its left when there is no room; else wherever it fits.
+    const right = rect.x + rect.width + 8;
+    const leftSide = rect.x - width - 8;
+    const left = right + width <= this.width - 4 ? right : leftSide >= 4 ? leftSide : clamp(right, 4, Math.max(this.width - width - 4, 4));
+    const top = clamp(rect.y - 4, 4, Math.max(this.height - height - 4, 4));
+    box.style.left = `${Math.round(left)}px`;
+    box.style.top = `${Math.round(top)}px`;
+  }
+
+  /** Notes the cell under the mouse pointer when it carries a comment; the box follows in the next frame. */
+  private hoverAt(x: number, y: number): void {
+    let next: CellPos | undefined;
+    const state = this.state();
+    if (this.drawingsOf(state.sheet)) {
+      const hit = hitTest(this.layout(state), x, y);
+      if (hit.area === 'cell') {
+        const found = this.commentOf(hit.row, hit.col);
+        if (found) next = { row: found.row, col: found.col };
+      }
+    }
+    const before = this.hoverComment;
+    if ((before === undefined) === (next === undefined) && (!before || !next || (before.row === next.row && before.col === next.col))) return;
+    this.hoverComment = next;
+    this.schedule();
+  }
+
+  private onHoverMove = (event: MouseEvent): void => {
+    if (this.destroyed || this.drag || this.touch) return;
+    const point = this.canvasPoint(event);
+    this.hoverAt(point.x, point.y);
+  };
+
+  private onPointerLeave = (event: MouseEvent): void => {
+    if (!this.hoverComment) return;
+    // Onto the box of the comment itself (to scroll it): it stays.
+    const to = event.relatedTarget as Node | null;
+    if (to && this.commentBox && this.commentBox.contains(to)) return;
+    this.hoverComment = undefined;
+    this.schedule();
+  };
+
+  private onCommentLeave = (event: MouseEvent): void => {
+    if (!this.hoverComment || event.relatedTarget === this.canvas) return;
+    this.hoverComment = undefined;
+    this.schedule();
+  };
 
   // ------------------------------------------------- validation and marks
 
@@ -1668,6 +1917,7 @@ export class WorkbookView {
     const changed = !sameCell(active, state.active) || !sameRange(range, state.range);
     // A list that belongs to another cell has nothing to choose for this one.
     if (changed && this.panel) this.panel.close();
+    if (!sameCell(active, state.active)) this.commentDismissed = undefined;
     state.active = { row: active.row, col: active.col };
     state.range = { ...range };
     state.focus = { row: focus.row, col: focus.col };
@@ -1712,6 +1962,8 @@ export class WorkbookView {
     if (prompt) text += `. ${prompt.title}${prompt.title !== '' && prompt.text !== '' ? ': ' : ''}${prompt.text}`;
     const note = this.formulaNote(active.row, active.col);
     if (note !== '') text += `. ${note}`;
+    const comment = this.commentOf(active.row, active.col);
+    if (comment) text += `. ${this.strings.comment}: ${this.commentText(comment.comment)}`;
     this.live.textContent = text;
     this.syncInput();
   }
@@ -1733,6 +1985,15 @@ export class WorkbookView {
     }
     // 229: the key went to an input method, also where isComposing is not reported.
     if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Escape' && this.commentShown && !this.hoverComment) {
+      // Puts the comment of the active cell away; it comes back when the cell is entered again.
+      const shown = this.commentShown;
+      this.commentDismissed = { sheet: shown.sheet, row: shown.row, col: shown.col };
+      this.schedule();
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     // Whatever is typed next replaces the idle text, and copy needs a selection in some browsers.
     this.selectIdleText();
     const ctrl = event.ctrlKey || event.metaKey;
@@ -2491,6 +2752,9 @@ export class WorkbookView {
     this.cellInfo = undefined;
     if (structural) {
       this.lastTap = undefined;
+      // The cell under the pointer is another one now.
+      this.hoverComment = undefined;
+      this.commentDismissed = undefined;
       // Row heights, column widths and hidden runs moved; the merged ranges are indexed again on their own.
       for (let i = 0; i < sheets.length; i++) {
         const state = this.states[sheets[i]];
@@ -3269,6 +3533,7 @@ export class WorkbookView {
         const over = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
         const cursor = over ? (over.axis === 'col' ? 'col-resize' : 'row-resize') : '';
         if (this.canvas.style.cursor !== cursor) this.canvas.style.cursor = cursor;
+        this.hoverAt(point.x, point.y);
       }
       return;
     }

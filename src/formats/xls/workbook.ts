@@ -26,6 +26,7 @@ import {
   type Workbook,
 } from '../../model/sheet/types';
 import { isKnownCodepage } from './codepage';
+import { REC_MSODRAWING, REC_MSODRAWINGGROUP, REC_OBJ, REC_TXO, XlsPictures, XlsSheetArt } from './drawings';
 import { errorText, formulaText, releaseFormulaBytes, type FormulaContext, type XlsSupBook, type XlsXti } from './formula';
 import { readHyperlink, readHyperlinkTooltip } from './hyperlink';
 import {
@@ -139,7 +140,7 @@ export interface XlsReadReport {
   untranslatedReasons: Map<string, number>;
   /** Records that were not read: record id -> count. */
   skippedRecords: Map<number, number>;
-  /** Cell comments (NOTE records); the model has no place for them. */
+  /** Cell comments (NOTE records). In the format of Excel 97-2003 they are read into Sheet.comments; in the older one they are only counted. */
   comments: number;
 }
 
@@ -200,6 +201,8 @@ interface Globals {
   report: XlsReadReport;
   /** What the cells of shared formulas may still cost (see SHARED_FORMULA_FACTOR). */
   sharedBudget: number;
+  /** The picture store of the workbook; its pictures are unpacked when they are first shown. */
+  pictures: XlsPictures;
 }
 
 function count(map: Map<number, number>, id: number): void {
@@ -291,6 +294,7 @@ function readGlobals(stream: RecordStream, streamName: string): Globals {
   const supBooks: XlsSupBook[] = [];
   const xti: XlsXti[] = [];
   let externalBooks = 0;
+  const pictures = new XlsPictures();
 
   let p = 4 + bofLength;
   let depth = 0;
@@ -399,7 +403,14 @@ function readGlobals(stream: RecordStream, streamName: string): Globals {
         case REC_NAME:
           rawNames.push(readName(stream, p, biff8, codepage));
           break;
+        case REC_MSODRAWINGGROUP:
+          // The pictures of all sheets; several of these records and the CONTINUE records after them are one run of bytes.
+          if (biff8) pictures.add(stream, id, p, length);
+          else count(report.skippedRecords, id);
+          break;
         case REC_CONTINUE:
+          if (biff8) pictures.add(stream, id, p, length);
+          break;
         case REC_CONTINUEFRT12:
           break;
         default:
@@ -423,7 +434,7 @@ function readGlobals(stream: RecordStream, streamName: string): Globals {
     failures: report.untranslatedReasons,
   };
   const sharedBudget = Math.max(SHARED_FORMULA_FLOOR, size * SHARED_FORMULA_FACTOR);
-  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget };
+  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget, pictures };
 }
 
 /** The defined names of the workbook; a name whose formula cannot be turned into text is left out. */
@@ -567,6 +578,8 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   let columnRecords = 0;
   let defaultWidthChars = -1;
   let standardWidth = false;
+  /** The drawing of the sheet with its objects and comments; the older format keeps them another way, which is not read. */
+  const art = biff8 ? new XlsSheetArt(stream) : undefined;
   /** Tooltips by the range of the link they belong to; a later one for the same range replaces the earlier. */
   const tooltips = new Map<string, string>();
   const rangeKey = (range: CellRange): string => range.top + ',' + range.left + ',' + range.bottom + ',' + range.right;
@@ -932,8 +945,24 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
         continue;
       case REC_NOTE:
         report.comments++;
+        if (art) art.note(d - 4, length);
+        continue;
+      case REC_MSODRAWING:
+        if (art) art.drawing(id, d - 4, length);
+        else count(report.skippedRecords, id);
+        continue;
+      case REC_OBJ:
+        if (art) art.object(d - 4, length);
+        else count(report.skippedRecords, id);
+        continue;
+      case REC_TXO:
+        if (art) art.text(d - 4, length);
+        else count(report.skippedRecords, id);
         continue;
       case REC_CONTINUE:
+        // Goes on with the drawing when it follows a part of it; the ones after a text were read with the text.
+        if (art) art.drawing(id, d - 4, length);
+        continue;
       case REC_CONTINUEFRT12:
         continue;
       default:
@@ -941,6 +970,14 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
         continue;
     }
     break;
+  }
+
+  if (art) {
+    // What floats above the cells: shown, never written (an xls file is saved as it was read).
+    const floating = art.finish({ styles: globals.styles, fontOf: globals.fontOf, pictures: globals.pictures, maxRows: XLS_MAX_ROWS, maxCols: XLS_MAX_COLS });
+    if (floating.drawings) sheet.drawings = floating.drawings;
+    if (floating.comments) sheet.comments = floating.comments;
+    if (floating.warnings) sheet.warnings = floating.warnings;
   }
 
   // Formulas that belong to a group.
@@ -1058,6 +1095,8 @@ export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook'): XlsRe
       date1904: globals.date1904,
       activeSheet: globals.activeTab < sheets.length ? globals.activeTab : 0,
     };
+    const media = globals.pictures.media();
+    if (media) workbook.media = media;
     return { workbook, report: globals.report };
   } finally {
     releaseFormulaBytes();

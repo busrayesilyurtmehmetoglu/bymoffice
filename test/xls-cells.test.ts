@@ -331,7 +331,8 @@ test('an embedded chart substream inside a sheet is skipped, the cells after it 
 
 test('records the reader does not know are counted, comments too', () => {
   const { report } = readXlsStream(workbookStream({ sheets: [{ name: 'S', records: cat(rec(0x00ec, [1, 2, 3]), rec(0x00ec), rec(0x001c, u16(0), u16(0), u16(0), u16(1), u16(0)), rec(0x1234)) }] }));
-  assert.equal(report.skippedRecords.get(0x00ec), 2);
+  // Drawing records are read now (see xls-drawings.test.ts); these two hold nothing that can be read.
+  assert.equal(report.skippedRecords.get(0x00ec), undefined);
   assert.equal(report.skippedRecords.get(0x1234), 1);
   assert.equal(report.comments, 1);
 });

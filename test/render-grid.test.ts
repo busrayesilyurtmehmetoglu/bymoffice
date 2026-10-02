@@ -269,6 +269,8 @@ interface DrawOptions {
   filter?: GridFilter;
   dropdown?: GridScene['dropdown'];
   cellMark?: GridScene['cellMark'];
+  drawings?: GridScene['drawings'];
+  comments?: GridScene['comments'];
 }
 
 function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
@@ -298,6 +300,8 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     filter: options.filter,
     dropdown: options.dropdown,
     cellMark: options.cellMark,
+    drawings: options.drawings,
+    comments: options.comments,
   });
   assert.equal(ctx.saves, ctx.restores, 'save() and restore() are balanced');
   return ctx;
@@ -1496,4 +1500,135 @@ test('grid: cell marks are small triangles in the top left corner, asked for vis
   });
   assert.equal(broken.paths.filter((path) => path.points.length === 3).length, 0);
   assert.equal(broken.textCall('1').text, '1');
+});
+
+// --- drawings and comments ---------------------------------------------------------------
+
+const COMMENT_MARK = '#E0281E';
+
+test('grid: the drawing layer is painted once per pane, under the clip of the pane, above the cells and under the selection', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 'cell');
+  const calls: { clip: Box; originX: number; originY: number; dpr: number; texts: number; selection: number; clips: Box[] }[] = [];
+  let ctx: FakeContext | undefined;
+  const layer: GridScene['drawings'] = {
+    paint(context, target) {
+      ctx = context as unknown as FakeContext;
+      // A rectangle of its own, to see the clip it is drawn under.
+      context.fillStyle = '#123456';
+      context.fillRect(0, 0, 1, 1);
+      calls.push({
+        clip: target.clip,
+        originX: target.originX,
+        originY: target.originY,
+        dpr: target.devicePixelRatio,
+        texts: ctx.cellTexts.length,
+        selection: ctx.fills(DEFAULT_GRID_THEME.selectionFill).length + ctx.strokeRects.filter((call) => call.style === DEFAULT_GRID_THEME.selectionBorder).length,
+        clips: ctx.fills('#123456')[ctx.fills('#123456').length - 1].clips,
+      });
+      // Left behind on purpose: the grid has to put the context back in order.
+      context.font = '99px evil';
+      context.lineWidth = 9;
+      context.setLineDash([5, 5]);
+    },
+  };
+  const done = draw(sheet, { drawings: layer, dpr: 2, scrollX: 30, scrollY: 50, selection: { active: { row: 0, col: 0 }, range: range(0, 0, 3, 3) } });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].clip, box(HX, HY, 800 - HX, 600 - HY));
+  assert.deepEqual([calls[0].originX, calls[0].originY, calls[0].dpr], [HX - 30, HY - 50, 2]);
+  assert.deepEqual(calls[0].clips, [box(HX, HY, 800 - HX, 600 - HY)]);
+  // The selection came after the layer.
+  assert.equal(calls[0].selection, 0);
+  assert.ok(done.fills(DEFAULT_GRID_THEME.selectionFill).length > 0);
+  // The headers are drawn with their own font, whatever the layer left behind.
+  assert.ok(done.headerTexts.length > 0);
+  assert.equal(done.texts.filter((call) => call.font === '99px evil').length, 0);
+  assert.equal(done.strokeRects.filter((call) => call.style === DEFAULT_GRID_THEME.selectionBorder && call.lineWidth === 9).length, 0);
+  assert.equal(done.strokes.filter((call) => call.dash.join() === '5,5').length, 0);
+
+  // The text of the cells is there before the layer is painted.
+  const first = newSheet();
+  put(first, 0, 0, 'cell');
+  calls.length = 0;
+  draw(first, { drawings: layer });
+  assert.equal(calls[0].texts, 1);
+});
+
+test('grid: with frozen panes every pane paints the layer with its own clip and origin', () => {
+  const sheet = newSheet();
+  sheet.view.frozenRows = 2;
+  sheet.view.frozenCols = 1;
+  const calls: { clip: Box; originX: number; originY: number }[] = [];
+  draw(sheet, {
+    scrollX: 100,
+    scrollY: 300,
+    drawings: { paint: (_ctx, target) => void calls.push({ clip: target.clip, originX: target.originX, originY: target.originY }) },
+  });
+  assert.deepEqual(calls, [
+    { clip: box(HX, HY, CW, 2 * RH), originX: HX, originY: HY },
+    { clip: box(HX + CW, HY, 800 - HX - CW, 2 * RH), originX: HX - 100, originY: HY },
+    { clip: box(HX, HY + 2 * RH, CW, 600 - HY - 2 * RH), originX: HX, originY: HY - 300 },
+    { clip: box(HX + CW, HY + 2 * RH, 800 - HX - CW, 600 - HY - 2 * RH), originX: HX - 100, originY: HY - 300 },
+  ]);
+});
+
+test('grid: a drawing layer that throws, or is not one, does not take the cells with it', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 'cell');
+  const broken = draw(sheet, {
+    selection: { active: { row: 0, col: 0 }, range: range(0, 0, 0, 0) },
+    drawings: {
+      paint() {
+        throw new Error('no');
+      },
+    },
+  });
+  assert.equal(broken.textCall('cell').text, 'cell');
+  assert.equal(broken.strokeRects.filter((call) => call.style === DEFAULT_GRID_THEME.selectionBorder).length, 1);
+  assert.ok(broken.headerTexts.length > 0);
+  assert.equal(draw(sheet, { drawings: {} as unknown as GridScene['drawings'] }).textCall('cell').text, 'cell');
+  assert.equal(draw(sheet, { comments: { has: 1 } as unknown as GridScene['comments'] }).textCall('cell').text, 'cell');
+});
+
+test('grid: a comment is a small triangle in the top right corner of its cell, asked for visible cells only', () => {
+  const sheet = newSheet();
+  const asked: string[] = [];
+  const ctx = draw(sheet, {
+    width: HX + 3 * CW,
+    height: HY + 2 * RH,
+    comments: {
+      has(row, col) {
+        asked.push(`${row},${col}`);
+        return row === 1 && col === 2;
+      },
+    },
+  });
+  assert.deepEqual(asked, ['0,0', '0,1', '0,2', '1,0', '1,1', '1,2']);
+  const triangles = ctx.paths.filter((path) => path.fill === COMMENT_MARK);
+  // Inside the grid line that is the last pixel of the cell.
+  const right = HX + 3 * CW - 1;
+  assert.deepEqual(triangles.map((path) => path.points), [[[right - 6, HY + RH], [right, HY + RH], [right, HY + RH + 6]]]);
+  // Only `true` counts, and a lookup that throws marks nothing and breaks nothing.
+  assert.equal(draw(sheet, { comments: { has: () => 'yes' as unknown as boolean } }).paths.filter((path) => path.fill === COMMENT_MARK).length, 0);
+  put(sheet, 0, 0, 'cell');
+  const broken = draw(sheet, {
+    comments: {
+      has() {
+        throw new Error('no');
+      },
+    },
+  });
+  assert.equal(broken.paths.filter((path) => path.fill === COMMENT_MARK).length, 0);
+  assert.equal(broken.textCall('cell').text, 'cell');
+});
+
+test('grid: the comment of a merged cell is marked in the corner of the merge; cells too small for a mark have none', () => {
+  const sheet = newSheet();
+  sheet.merges.push(range(1, 1, 2, 2));
+  rowOf(sheet, 5).height = 3;
+  const ctx = draw(sheet, { comments: { has: (row, col) => (row === 1 && col === 1) || (row === 2 && col === 2) || (row === 5 && col === 0) } });
+  const triangles = ctx.paths.filter((path) => path.fill === COMMENT_MARK);
+  const right = HX + 3 * CW - 1;
+  // One mark, for the top left cell of the merge, at the right edge of the merge; C3 is inside the merge and has none of its own.
+  assert.deepEqual(triangles.map((path) => path.points[1]), [[right, HY + RH]]);
 });

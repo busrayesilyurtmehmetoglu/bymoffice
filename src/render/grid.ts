@@ -8,8 +8,8 @@
 // font names through sanitizeFontFamily().
 
 import { gridPanes } from '../layout/grid-geometry';
-import type { GridLayout, GridPane } from '../layout/grid-geometry';
-import type { AxisMetrics } from '../layout/sheet-metrics';
+import type { GridLayout, GridPane, Rect } from '../layout/grid-geometry';
+import type { AxisMetrics, SheetMetrics } from '../layout/sheet-metrics';
 import { resolveCellStyle, resolveColor } from '../model/sheet/color';
 import { columnName, MAX_COLS, MAX_ROWS } from '../model/sheet/types';
 import type { BorderEdge, Cell, CellRange, Fill, Font, Row, Sheet, StyleSheet, Workbook } from '../model/sheet/types';
@@ -77,6 +77,26 @@ export function cellButtonRect(x: number, y: number, width: number, height: numb
   return { x: x + width - size - 1, y: y + height - size - 1, size };
 }
 
+/**
+ * What floats above the cells of a sheet (pictures, shapes, comment boxes), as the grid
+ * draws it: once per pane, under the clip of that pane, so that an object across the
+ * frozen boundary shows in each pane the part that belongs there. See SheetDrawings.
+ */
+export interface GridDrawingSource {
+  /**
+   * `clip` is the pane on the canvas; a point (x, y) of the sheet, in pixels from the
+   * top-left corner of cell A1, is at (originX + x, originY + y). Every save() has to be
+   * matched by a restore(), also when painting fails; what else is left behind on the
+   * context (font, fill, line) does not matter.
+   */
+  paint(ctx: CanvasRenderingContext2D, target: { metrics: SheetMetrics; clip: Rect; originX: number; originY: number; devicePixelRatio: number }): void;
+}
+
+/** Which cells carry a comment. Asked for every visible cell of every frame, so it has to be a plain lookup. */
+export interface GridCommentSource {
+  has(row: number, col: number): boolean;
+}
+
 export interface GridScene {
   workbook: Workbook;
   sheet: Sheet;
@@ -99,6 +119,10 @@ export interface GridScene {
    * visible cell of every frame, so it has to be a plain lookup.
    */
   cellMark?(row: number, col: number): string | undefined;
+  /** Pictures and shapes of the sheet, drawn above its cells and under the selection; nothing is asked of a sheet without any. */
+  drawings?: GridDrawingSource;
+  /** Comments of the sheet: a red corner in the top right of each cell that has one. */
+  comments?: GridCommentSource;
 }
 
 /** Space between a cell edge and its text, in pixels. */
@@ -265,6 +289,9 @@ interface Frame {
   filter: GridFilter | undefined;
   dropdown: { row: number; col: number } | undefined;
   cellMark: ((row: number, col: number) => string | undefined) | undefined;
+  drawings: GridDrawingSource | undefined;
+  comments: GridCommentSource | undefined;
+  dpr: number;
 }
 
 /** Draws the whole scene. The canvas backing store is layout.width*dpr by layout.height*dpr. */
@@ -302,6 +329,9 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     filter: validFilter(scene.filter),
     dropdown: scene.dropdown && scene.dropdown.row >= 0 && scene.dropdown.col >= 0 ? scene.dropdown : undefined,
     cellMark: typeof scene.cellMark === 'function' ? scene.cellMark : undefined,
+    drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
+    comments: scene.comments && typeof scene.comments.has === 'function' ? scene.comments : undefined,
+    dpr,
   };
   if (frame.conditional && frame.conditional.begin) frame.conditional.begin();
 
@@ -735,8 +765,10 @@ function drawPane(frame: Frame, view: PaneView): void {
 
   drawPaneText(frame, view, textRows, textCols);
   if (frame.cellMark) drawCellMarks(frame, view, frame.cellMark);
+  if (frame.comments) drawCommentMarks(frame, view, frame.comments);
   if (frame.filter) drawFilterButtons(frame, view, frame.filter);
   if (frame.dropdown) drawDropdown(frame, view, frame.dropdown);
+  if (frame.drawings) drawFloating(frame, view, frame.drawings);
   if (frame.selection) drawSelection(frame, view, frame.selection);
 
   ctx.restore();
@@ -1404,6 +1436,62 @@ function drawCellMarks(frame: Frame, view: PaneView, markOf: (row: number, col: 
       ctx.fill();
     }
   }
+}
+
+const COMMENT_MARK = '#E0281E';
+
+/** A small triangle in the top right corner of every visible cell that has a comment, as Excel marks them. */
+function drawCommentMarks(frame: Frame, view: PaneView, comments: GridCommentSource): void {
+  const { ctx } = frame;
+  const { cols, rows, merges } = view;
+  const mark = (right: number, y: number) => {
+    frame.painter.setFill(COMMENT_MARK);
+    ctx.beginPath();
+    // Inside the grid line that is the last pixel of the cell.
+    ctx.moveTo(right - 1 - MARK_SIZE, y);
+    ctx.lineTo(right - 1, y);
+    ctx.lineTo(right - 1, y + MARK_SIZE);
+    ctx.closePath();
+    ctx.fill();
+  };
+  try {
+    for (let ri = 0; ri < rows.index.length; ri++) {
+      if (rows.size[ri] < MARK_SIZE) continue;
+      for (let ci = 0; ci < cols.index.length; ci++) {
+        if (cols.size[ci] < MARK_SIZE) continue;
+        if (comments.has(rows.index[ri], cols.index[ci]) !== true) continue;
+        // The comment of a merged cell is marked in the corner of the merge, below.
+        if (merges.length > 0 && mergeIndexAt(merges, rows.index[ri], cols.index[ci]) > 0) continue;
+        mark(cols.pos[ci] + cols.size[ci], rows.pos[ri]);
+      }
+    }
+    for (let i = 0; i < merges.length; i++) {
+      const merge = merges[i];
+      if (merge.width < MARK_SIZE || merge.height < MARK_SIZE) continue;
+      if (comments.has(merge.range.top, merge.range.left) === true) mark(merge.x + merge.width, merge.y);
+    }
+  } catch (error) {
+    // A source that fails marks nothing more.
+  }
+}
+
+/** Pictures, shapes and comment boxes of the sheet, as far as they show in this pane. */
+function drawFloating(frame: Frame, view: PaneView, drawings: GridDrawingSource): void {
+  const { ctx } = frame;
+  ctx.save();
+  try {
+    drawings.paint(ctx, { metrics: frame.layout.metrics, clip: view.pane.rect, originX: view.cols.origin, originY: view.rows.origin, devicePixelRatio: frame.dpr });
+  } catch (error) {
+    // What floats above the cells never takes the cells with it.
+  }
+  ctx.restore();
+  // The layer may have left any font, fill and line behind.
+  frame.painter.invalidate();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1;
+  ctx.setLineDash(NO_DASH);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
 }
 
 /** A button in the bottom right corner of a cell: an arrow, or a funnel when `active`. */

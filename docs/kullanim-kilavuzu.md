@@ -18,6 +18,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - **Eski Word dosyalarını (doc, Word 97–2003) salt okunur açar ve gösterir**: metin, karakter ve paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe hücreler), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, yer imleri, satır içi ve kayan resimler, metin kutuları. `file.document()` docx ile aynı `DocModel`'i verir; resimler pakette değil `model.media` içindedir (`BymOffice.documentPictures(model, file.package)` ikisini tek arayüzle sunar).
 - **RTF dosyalarını salt okunur açar ve gösterir** (`.doc` uzantısıyla kaydedilmiş RTF dahil; biçim içerikten tanınır): metin ve kod sayfaları (Türkçe 1254 dahil), karakter/paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, resimler, metin kutuları. Yarıda kesilmiş RTF hata vermez; okunabilen kısmı gösterilir.
 - **Eski Excel dosyalarını (xls, Excel 97–2003) salt okunur açar**: hücreler, stiller, birleştirmeler, sütun/satır ölçüleri, dondurulmuş bölmeler, köprüler, tanımlı adlar, formül metinleri ve dosyadaki sonuçları. `mount()` xls'i her zaman salt okunur kurar. Ayrıntı için `BymOffice.readXlsWithReport(file.cfb)` okunmayan kayıtları ve çevrilemeyen formülleri sayar. Excel 5/95 dosyaları da okunur ama gerçek dosyayla sınanmamıştır.
+- **Excel sayfalarında görselleri, basit şekilleri/metin kutularını ve hücre yorumlarını gösterir** (xlsx ve xls): görseller (png, jpeg, gif, bmp, webp) çapalandıkları hücrelerde, satır/sütun eklenip silinince yazıcının dosyaya yazdığıyla aynı yere kayar; yorumlu hücrenin köşesinde kırmızı üçgen vardır ve üzerine gelince, hücre seçilince ya da dokununca yorum balonu açılır. Dış bağlantılı görseller yüklenmez; SVG/EMF/WMF yerinde yer tutucu görünür. Model: `sheet.drawings`, `sheet.comments`, `sheet.warnings`.
 - **Koşullu biçimleri gösterir**: hücre kuralları, formüllü kurallar, renk ölçekleri, veri çubukları, ikon kümeleri, ilk/son N, ortalama üstü/altı, yinelenen/benzersiz, metin ve tarih kuralları. Hücre düzenlenince ve geri alınınca güncellenir; kaydederken kurallar dosyada aynen korunur.
 - **Formülleri hesaplar**: 225 Excel fonksiyonu; bir hücre değişince yalnız ona bağlı formüller yeniden hesaplanır.
 - **WebView köprüsü** ile mobil ve masaüstü uygulamalara gömülür (ayrıntı: [webview-koprusu.md](webview-koprusu.md)).
@@ -44,7 +45,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx için yalnız okuma modeli var (`file.document()`); düzenleme ve modelden yazma yok |
 | doc/xls yazma | Yok; `save()` özgün baytları döndürür |
 | Parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
-| Excel'de grafik, görsel, pivot tablo gösterimi | Yok; dosyada korunur |
+| Excel'de grafik ve pivot tablo gösterimi (yerinde yer tutucu görünür); görsel/şekil ekleme, taşıma, boyutlandırma; dikdörtgen, elips ve çizgi dışındaki şekil geometrileri; gradyan/desen dolgu, gölge; yorum ekleme/düzenleme | Yok; dosyada korunur |
 | npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
 | 4 GB ve üzeri arşiv yazma | Yok |
 

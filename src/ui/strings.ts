@@ -70,6 +70,10 @@ export interface UiStrings {
   formulaNotCalculated: string;
   formulaCircular: string;
   formulaStale: string;
+  /** Said before the comment of a cell, and the label of the box that shows it. */
+  comment: string;
+  /** Said once when a sheet is shown of which some drawings or comments could not be read. */
+  drawingsNotShown: string;
   // The document view.
   document: string;
   documentTools: string;
@@ -146,6 +150,8 @@ export const STRINGS_EN: UiStrings = {
   formulaNotCalculated: 'This formula cannot be calculated here; the last value in the file is shown',
   formulaCircular: 'Circular reference',
   formulaStale: 'The calculation is not finished; the value may be out of date',
+  comment: 'Comment',
+  drawingsNotShown: 'Some drawings or comments of this sheet could not be read and are not shown',
   document: 'Document',
   documentTools: 'Document tools',
   page: (number) => `Page ${number}`,
@@ -223,6 +229,8 @@ export const STRINGS_TR: UiStrings = {
   formulaNotCalculated: 'Bu formül burada hesaplanamıyor; dosyadaki son değer gösteriliyor',
   formulaCircular: 'Döngüsel başvuru',
   formulaStale: 'Hesap bitmedi; değer eski olabilir',
+  comment: 'Yorum',
+  drawingsNotShown: 'Bu sayfadaki bazı çizimler ya da yorumlar okunamadı; gösterilmiyor',
   document: 'Belge',
   documentTools: 'Belge araçları',
   page: (number) => `Sayfa ${number}`,

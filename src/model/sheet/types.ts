@@ -492,6 +492,152 @@ export interface SheetView {
   activeCell?: string;
 }
 
+/** A corner of a drawing: a cell and how far into it, in EMU (914,400 per inch; 9,525 per pixel). */
+export interface DrawingMarker {
+  col: number;
+  colOff: number;
+  row: number;
+  rowOff: number;
+  /**
+   * How far into the cell as a share (0..1) of the column's width and the row's height, for
+   * files that state it so (xls). Where present they take the place of colOff and rowOff.
+   */
+  colShare?: number;
+  rowShare?: number;
+}
+
+/**
+ * Where a drawing is on its sheet. "twoCell": from one cell to another; "oneCell": from a
+ * cell, with a size; "absolute": a place and a size on the sheet, whatever its cells do.
+ * Sizes and absolute positions are in EMU.
+ */
+export interface DrawingAnchor {
+  kind: 'twoCell' | 'oneCell' | 'absolute';
+  /** twoCell only: what rows and columns inserted or deleted do to it. "twoCell" when the file states nothing. */
+  editAs?: 'twoCell' | 'oneCell' | 'absolute';
+  from?: DrawingMarker;
+  to?: DrawingMarker;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface DrawingTextRun {
+  text: string;
+  /** Font name as the file states it; never trusted. */
+  font?: string;
+  /** Points. */
+  size?: number;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strike?: boolean;
+  /** "#RRGGBB". */
+  color?: string;
+}
+
+export interface DrawingParagraph {
+  runs: DrawingTextRun[];
+  align?: 'left' | 'center' | 'right' | 'justify';
+}
+
+/** The text of a shape. */
+export interface DrawingText {
+  paragraphs: DrawingParagraph[];
+  /** Where the text stands in the height of the shape. Default "top". */
+  anchor?: 'top' | 'middle' | 'bottom';
+  /** Space between the shape and its text: left, top, right, bottom, in pixels. */
+  insets?: [number, number, number, number];
+  /** Lines are broken at the width of the shape. Default true. */
+  wrap?: boolean;
+}
+
+/** What every object of a drawing has, whatever it shows. */
+export interface DrawingObjectBase {
+  name?: string;
+  /** Alternative text. */
+  description?: string;
+  hidden?: boolean;
+  /** Degrees, clockwise. */
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+  /**
+   * For an object inside a group: its place in the group, as shares (0..1) of the
+   * group's width and height. The object of an anchor fills the anchor and has none.
+   */
+  box?: { x: number; y: number; width: number; height: number };
+}
+
+export interface DrawingPicture extends DrawingObjectBase {
+  type: 'picture';
+  /** Key of the picture in Workbook.media; missing for a picture that is not in the file. */
+  media?: string;
+  /** The picture is linked from outside the file. It is never fetched. */
+  external?: boolean;
+  /** Shares (0..1) cut off each side of the picture. */
+  crop?: { left: number; top: number; right: number; bottom: number };
+}
+
+export interface DrawingShape extends DrawingObjectBase {
+  type: 'shape';
+  /** Preset geometry name ("rect", "ellipse", "line", ...); "rect" when the file states none. */
+  geometry: string;
+  /** A connector or a line: drawn from corner to corner. */
+  connector?: boolean;
+  /** "#RRGGBB"; missing for a shape without a fill (or with one that is not drawn: gradients, patterns). */
+  fill?: string;
+  /** Outline: colour ("#RRGGBB") and width in pixels. */
+  line?: { color: string; width: number; dash?: boolean };
+  text?: DrawingText;
+}
+
+export interface DrawingGroup extends DrawingObjectBase {
+  type: 'group';
+  children: DrawingObject[];
+}
+
+/** Something that is not drawn as it is: a chart, a diagram, an embedded object. */
+export interface DrawingPlaceholder extends DrawingObjectBase {
+  type: 'placeholder';
+  what: 'chart' | 'diagram' | 'object';
+}
+
+export type DrawingObject = DrawingPicture | DrawingShape | DrawingGroup | DrawingPlaceholder;
+
+/**
+ * One anchor of a sheet's drawing with what it holds. A view for reading: the drawing
+ * part stays in the package and is written back from there.
+ */
+export interface SheetDrawing {
+  anchor: DrawingAnchor;
+  object: DrawingObject;
+}
+
+/** A comment (note) on a cell. A view for reading, like SheetDrawing. */
+export interface SheetComment {
+  row: number;
+  col: number;
+  author?: string;
+  /** The whole text; for a legacy note that starts with the author's name, the name is part of it. */
+  text: string;
+  /** Present when the text has mixed formatting. */
+  runs?: RichRun[];
+  /** The comment is a threaded one (a conversation); `text` is then the first message and `replies` the rest. */
+  threaded?: boolean;
+  replies?: { author?: string; text: string }[];
+  /** The box of the comment is shown all the time, not only when the cell is pointed at. */
+  visible?: boolean;
+  /** Where the box is, when the file says so. Offsets are in EMU, as in every anchor. */
+  box?: DrawingAnchor;
+}
+
+/** Where the bytes of pictures come from; read only when a picture is first shown. */
+export interface WorkbookMedia {
+  readPart(key: string): Promise<Uint8Array>;
+}
+
 export type SheetState = 'visible' | 'hidden' | 'veryHidden';
 export type SheetKind = 'worksheet' | 'chartsheet' | 'dialogsheet' | 'macrosheet';
 
@@ -561,6 +707,16 @@ export interface Sheet {
    * (conditional formats, validations, ...), so that their ranges follow.
    */
   structuralEdits?: SheetStructuralEdit[];
+  /**
+   * Pictures, shapes and placeholders of charts as the file has them, bottom one first. Like
+   * conditional formats they are not changed by edits: structuralEdits are applied where they
+   * are shown (see SheetDrawings), by the rules the writer moves the anchors in the file with.
+   */
+  drawings?: SheetDrawing[];
+  /** Comments as the file has them; structuralEdits are applied where they are shown. */
+  comments?: SheetComment[];
+  /** What of the sheet's drawings and comments could not be read and is not shown (it is still written back). */
+  warnings?: string[];
 }
 
 export interface SheetStructuralEdit {
@@ -588,6 +744,8 @@ export interface Workbook {
   date1904: boolean;
   /** Index of the sheet shown when the workbook opens. */
   activeSheet: number;
+  /** The pictures of the workbook's drawings, by DrawingPicture.media. */
+  media?: WorkbookMedia;
 }
 
 export function createSheet(init: Pick<Sheet, 'name' | 'sheetId' | 'state' | 'kind' | 'part'>): Sheet {
