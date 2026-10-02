@@ -3,7 +3,7 @@
 // with the table assembler, paragraphs into blocks.
 
 import type { Block, Inline, ParaProps, Paragraph, Run, RunItem, RunProps, Wrapper } from '../../model/doc/types';
-import { RowState, TableAssembler } from './tables';
+import { RowState, TableAssembler, type TableBudget } from './tables';
 import type { FormatContext } from './state';
 
 export type StoryKind = 'body' | 'header' | 'footnote' | 'comment' | 'textbox';
@@ -16,7 +16,7 @@ export const TEXT_DELETED = 2;
 const TEXT_TYPES = ['text', 'instrText', 'deletedText'] as const;
 
 export class Story {
-  readonly assembler = new TableAssembler();
+  readonly assembler: TableAssembler;
   readonly row: RowState;
   /** The children of the paragraph being read. */
   children: Inline[] = [];
@@ -29,12 +29,12 @@ export class Story {
   /** The text a writer puts in front of a numbered paragraph for readers that know no lists. */
   listText: Inline[] | undefined;
   /** A note mark ("\chftn") that waits for its note: where it is. */
-  pendingNote: { content: RunItem[]; index: number } | undefined;
-  pendingComment: { content: RunItem[]; index: number } | undefined;
+  pendingNote: { run: Run; index: number } | undefined;
+  pendingComment: { run: Run; index: number } | undefined;
   /** "\ftnalt": the note being read is an endnote. */
   endnote = false;
   /** The automatic marks inside the note being read. */
-  noteRefs: { content: RunItem[]; index: number }[] = [];
+  noteRefs: { run: Run; index: number }[] = [];
   /** "\atnref": what ties the comment being read to the marks of the text it is about. */
   commentRef: string | undefined;
   paragraphs = 0;
@@ -47,8 +47,10 @@ export class Story {
   constructor(
     readonly kind: StoryKind,
     ctx: FormatContext,
+    budget?: TableBudget,
   ) {
     this.row = new RowState(ctx);
+    this.assembler = new TableAssembler(budget);
   }
 
   private flushText(): void {
@@ -60,8 +62,11 @@ export class Story {
 
   /** Ends the run being read: what follows starts a new one. */
   endRun(): void {
-    if (!this.run) return;
+    const run = this.run;
+    if (!run) return;
     this.flushText();
+    // An array that grew by one item at a time holds room for many more; the model keeps one of the right size.
+    run.content = run.content.slice();
     this.run = undefined;
   }
 
@@ -89,18 +94,20 @@ export class Story {
   }
 
   /** Adds an item to the run being read; returns where it is, for an item that is changed later. */
-  addItem(item: RunItem, props: RunProps, full: RunProps, wrap: Wrapper | undefined): { content: RunItem[]; index: number } {
+  addItem(item: RunItem, props: RunProps, full: RunProps, wrap: Wrapper | undefined): { run: Run; index: number } {
     const run = this.open(props, full, wrap);
     this.flushText();
     run.content.push(item);
-    return { content: run.content, index: run.content.length - 1 };
+    return { run, index: run.content.length - 1 };
   }
 
   /** Adds an item in a run of its own, as a field mark has it in a docx file. */
-  addAlone(item: RunItem, props: RunProps, full: RunProps): void {
+  addAlone(item: RunItem, props: RunProps, full: RunProps): Run {
     this.endRun();
-    this.open(props, full, undefined).content.push(item);
+    const run = this.open(props, full, undefined);
+    run.content.push(item);
     this.endRun();
+    return run;
   }
 
   addInline(inline: Inline): void {
@@ -148,7 +155,7 @@ export class Story {
     this.styleUsed = undefined;
     this.hasRuns = false;
     this.paragraphs++;
-    return { type: 'paragraph', props, children };
+    return { type: 'paragraph', props, children: children.length ? children.slice() : [] };
   }
 
   finish(): Block[] {

@@ -15,7 +15,7 @@ import { NumberingCounters } from '../../formats/docx/numbering';
 import type { Block, Border, CellProps, DocColor, DocModel, DrawingAnchor, ParaProps, RunProps, Shading, Table, TableProps } from '../../model/doc/types';
 import type { ParaEnv } from './paragraph';
 import type { ParaPrep } from './prep';
-import { HIGHLIGHT, symbolFont, type LiveField } from './symbols';
+import { HIGHLIGHT, symbolFont, type LiveField, type SymbolKind } from './symbols';
 import type { DocLayoutOptions, FontMetrics, LayoutFont, PageItem, TextItem, TextMeasurer } from './types';
 import { eighths, finite, halfPoints, points, twips } from './units';
 
@@ -159,7 +159,7 @@ export interface RunStyle {
   /** Text is Turkish or Azeri: i/ı have their own capitals. */
   dotted: boolean;
   /** 1 Symbol, 2 Wingdings, 0 neither. */
-  symbol: 0 | 1 | 2;
+  symbol: SymbolKind;
   superscript: boolean;
   /** Decimal separator of the language of the text; undefined when no language is known. */
   decimal?: ',' | '.';

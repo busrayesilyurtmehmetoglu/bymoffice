@@ -6,6 +6,7 @@ import { formulaText, quoteSheetName, type FormulaContext } from '../src/formats
 import { fixedArgCount, functionName } from '../src/formats/xls/functions';
 import { readXlsStream } from '../src/formats/xls/workbook';
 import { getCell } from '../src/model/sheet/types';
+import { explicitFormula, sharedMasters } from '../src/ops/ops';
 import {
   arrayRec,
   cat,
@@ -344,8 +345,14 @@ test('shared formulas: every cell of the group gets the text for its own positio
   const { workbook, report } = twoSheets(records);
   const sheet = workbook.sheets[0];
   assert.deepEqual(getCell(sheet, 0, 2)?.formula, { text: 'A1+$B$1', type: 'shared', si: 0, ref: 'C1:C3' });
-  assert.deepEqual(getCell(sheet, 1, 2)?.formula, { text: 'A2+$B$1', type: 'shared', si: 0 });
-  assert.deepEqual(getCell(sheet, 2, 2)?.formula, { text: 'A3+$B$1', type: 'shared', si: 0 });
+  // The cells after the first point to it, as in an xlsx file; written out, each has the text for its own position.
+  assert.deepEqual(getCell(sheet, 1, 2)?.formula, { text: '', type: 'shared', si: 0 });
+  assert.deepEqual(getCell(sheet, 2, 2)?.formula, { text: '', type: 'shared', si: 0 });
+  const masters = sharedMasters(sheet);
+  assert.deepEqual([1, 2].map((row) => explicitFormula(getCell(sheet, row, 2)!, row, 2, masters).formula), [
+    { text: 'A2+$B$1', type: 'normal' },
+    { text: 'A3+$B$1', type: 'normal' },
+  ]);
   assert.equal(getCell(sheet, 2, 2)?.value, 'yüz üç');
   assert.deepEqual(getCell(sheet, 5, 5), { kind: 'number', value: 7, style: 0 });
   assert.equal(report.untranslatedFormulas, 1);

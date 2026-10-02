@@ -3,82 +3,122 @@
 
 import { formatCounter } from '../../formats/docx/numbering';
 
-/**
- * Characters of the Symbol font by code (0x20..0xFF) -> Unicode. Only the
- * characters documents use for bullets and simple formulas; a character that
- * is not listed stays as it is, in the font the document names.
- */
-const SYMBOL: Record<number, string> = {
-  0x2d: '−',
-  0xa3: '≤',
-  0xa5: '∞',
-  0xa7: '♣',
-  0xa8: '♦',
-  0xa9: '♥',
-  0xaa: '♠',
-  0xab: '↔',
-  0xac: '←',
-  0xad: '↑',
-  0xae: '→',
-  0xaf: '↓',
-  0xb0: '°',
-  0xb1: '±',
-  0xb3: '≥',
-  0xb4: '×',
-  0xb7: '•',
-  0xb8: '÷',
-  0xb9: '≠',
-  0xba: '≡',
-  0xbb: '≈',
-  0xbc: '…',
-  0xd7: '⋅',
-  0xde: '⇒',
-  0xe0: '◊',
-};
-const SYMBOL_LOWER = 'αβχδεφγηιϕκλμνοπθρστυϖωξψζ';
-const SYMBOL_UPPER = 'ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ';
+/** Which table a font selects: 0 none, 1 Symbol, 2 Wingdings, 3 Wingdings 2, 4 Wingdings 3, 5 Webdings. */
+export type SymbolKind = 0 | 1 | 2 | 3 | 4 | 5;
 
-/** The same for Wingdings. */
-const WINGDINGS: Record<number, string> = {
-  0x22: '✂',
-  0x28: '☎',
-  0x2a: '✉',
-  0x46: '☞',
-  0x4a: '☺',
-  0x6c: '●',
-  0x6e: '■',
-  0x6f: '□',
-  0x71: '❑',
-  0x72: '❒',
-  0x73: '⬧',
-  0x74: '⧫',
-  0x75: '◆',
-  0x76: '❖',
-  0x77: '⬥',
-  0x9f: '•',
-  0xa1: '○',
-  0xa7: '▪',
-  0xa8: '◻',
-  0xd8: '➢',
-  0xe0: '→',
-  0xe8: '➔',
-  0xf0: '⇨',
-  0xfb: '✗',
-  0xfc: '✓',
-  0xfd: '☒',
-  0xfe: '☑',
-};
+/** Characters of a symbol font -> Unicode: for a code, the characters of that code and the codes after it. */
+type Ranges = [start: number, characters: string][];
+
+/**
+ * The Symbol font (Adobe Symbol encoding, 0x21..0xFE), in full but for the
+ * two glyphs Unicode has no character for (0x60, the piece that lengthens a
+ * radical sign, and 0xF0, a logo). The pieces brackets and arrows are built
+ * from (0xBD, 0xBE, 0xE6..0xEF, 0xF3..0xFE) are the characters Unicode has
+ * for them; few fonts hold them.
+ */
+const SYMBOL_RANGES: Ranges = [
+  [0x21, '!∀#∃%&∋()∗+,−./0123456789:;<=>?≅ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟΠΘΡΣΤΥςΩΞΨΖ[∴]⊥_'],
+  [0x61, 'αβχδεφγηιϕκλμνοπθρστυϖωξψζ{|}∼'],
+  [0xa0, '€ϒ′≤⁄∞ƒ♣♦♥♠↔←↑→↓°±″≥×∝∂•÷≠≡≈…⏐⎯↵ℵℑℜ℘⊗⊕∅∩∪⊃⊇⊄⊂⊆∈∉∠∇®©™∏√⋅¬∧∨⇔⇐⇑⇒⇓◊〈®©™∑⎛⎜⎝⎡⎢⎣⎧⎨⎩⎪'],
+  [0xf1, '〉∫⌠⎮⌡⎞⎟⎠⎤⎥⎦⎫⎬⎭'],
+];
+
+/**
+ * Wingdings: the glyphs that have a character of one UTF-16 unit, so that
+ * text keeps its length. Where Unicode put the glyph beyond that (pencil,
+ * telephone, envelope, the plain and the heavy arrows 0xDF..0xEE, the ballot
+ * marks 0xFB..0xFE), the long-standing character of the same picture is used.
+ *
+ * UNSURE: written from the published mapping from memory, not checked glyph
+ * by glyph against the font. The bullets, boxes, check marks, hands, arrows,
+ * circled digits and zodiac signs are the well known ones; less certain are
+ * 0x21, 0x2B, 0x3E, 0x49, 0x4F, 0x78..0x7C and 0xB1..0xB6.
+ */
+const WINGDINGS_RANGES: Ranges = [
+  [0x21, '✏✂✁'],
+  [0x28, '☎✆✉✉'],
+  [0x36, '⌛⌨'],
+  [0x3e, '✇✍'],
+  [0x41, '✌'],
+  [0x45, '☜☞☝☟✋☺'],
+  [0x4c, '☹'],
+  [0x4e, '☠⚐'],
+  [0x51, '✈☼'],
+  [0x54, '❄'],
+  [0x56, '✞'],
+  [0x58, '✠✡☪☯ॐ☸♈♉♊♋♌♍♎♏♐♑♒♓'],
+  [0x6c, '●❍■□❐❑❒⬧⧫◆❖⬥⌧⍓⌘❀✿❝❞▯'],
+  [0x80, '⓪①②③④⑤⑥⑦⑧⑨⑩⓿❶❷❸❹❺❻❼❽❾❿'],
+  [0x9e, '·•▪○'],
+  [0xa4, '◉◎'],
+  [0xa7, '▪◻'],
+  [0xaa, '✦★✶✴✹✵'],
+  [0xb1, '⌖⟡⌑'],
+  [0xb5, '✪✰'],
+  [0xd5, '⌫⌦'],
+  [0xd8, '➢'],
+  [0xdf, '←→↑↓↖↗↙↘⬅➔⬆⬇⬉⬈⬋⬊⇦⇨⇧⇩⬄⇳⬀⬁⬃⬂▭▫✗✓☒☑'],
+];
+
+/**
+ * Wingdings 2: the check marks and boxes (0x4F..0x54), the circled digits
+ * and the round and square bullets.
+ * UNSURE: only 0x50 (check mark), 0x52 (checked box), 0x4F, 0x51, 0x53 and
+ * 0x54 (crosses, plain and boxed) and 0xA3 (empty box) are certain.
+ */
+const WINGDINGS2_RANGES: Ranges = [
+  [0x4f, '✗✓☒☑☒☒'],
+  [0x6a, '⓪①②③④⑤⑥⑦⑧⑨⑩⓿❶❷❸❹❺❻❼❽❾❿'],
+  [0x97, '●●○○'],
+  [0xa0, '▪■■□'],
+  [0xaa, '▪◆◇'],
+];
+
+/**
+ * Wingdings 3: arrows and the triangles used as bullets.
+ * UNSURE: the triangles 0x70, 0x71, 0x74, 0x75 and 0x7D are certain, the rest is from memory.
+ */
+const WINGDINGS3_RANGES: Ranges = [
+  [0x21, '←→↑↓↖↗↙↘'],
+  [0x70, '▲▼△▽◀▶◁▷◣◢◤◥◂▸▴▾'],
+];
+
+/**
+ * Webdings: the few glyphs documents use as marks and bullets.
+ * UNSURE: 0x61 (check mark), 0x72 (cross), 0x6E (dot) and the triangles 0x33..0x36 are certain.
+ */
+const WEBDINGS_RANGES: Ranges = [
+  [0x33, '◀▶▲▼'],
+  [0x59, '♥'],
+  [0x61, '✔'],
+  [0x63, '□'],
+  [0x67, '■'],
+  [0x69, 'ℹ'],
+  [0x6e, '●'],
+  [0x72, '✖'],
+  [0x73, '❓'],
+];
+
+function tableOf(ranges: Ranges): (string | undefined)[] {
+  const table: (string | undefined)[] = new Array(256);
+  for (const [start, characters] of ranges) {
+    for (let i = 0; i < characters.length && start + i < 256; i++) table[start + i] = characters.charAt(i);
+  }
+  return table;
+}
+
+/** By SymbolKind, less one. */
+const TABLES: (string | undefined)[][] = [SYMBOL_RANGES, WINGDINGS_RANGES, WINGDINGS2_RANGES, WINGDINGS3_RANGES, WEBDINGS_RANGES].map(tableOf);
 
 /** For a character in the private use area whose font is not one of the above: the bullets Word writes most. */
 const PRIVATE_USE: Record<number, string> = { 0xb7: '•', 0xa7: '▪', 0xd8: '➢', 0xfc: '✓', 0x6f: '□', 0x6e: '■', 0x76: '❖' };
 
-/** Which table a font name selects: 1 Symbol, 2 Wingdings, 0 none. */
-export function symbolFont(family: string | undefined): 0 | 1 | 2 {
+const KINDS: Record<string, SymbolKind> = { symbol: 1, wingdings: 2, 'wingdings 2': 3, 'wingdings 3': 4, webdings: 5 };
+
+/** Which table a font name selects; 0 for a font that is not one of the symbol fonts the engine knows. */
+export function symbolFont(family: string | undefined): SymbolKind {
   if (family === undefined) return 0;
-  const name = family.toLowerCase();
-  if (name === 'symbol') return 1;
-  if (name === 'wingdings') return 2;
-  return 0;
+  return KINDS[family.toLowerCase()] || 0;
 }
 
 /**
@@ -86,38 +126,62 @@ export function symbolFont(family: string | undefined): 0 | 1 | 2 {
  * not know it. Symbol fonts are addressed either directly (0x20..0xFF) or
  * through the private use area (0xF020..0xF0FF); both are accepted.
  */
-export function symbolChar(kind: 0 | 1 | 2, code: number): string | undefined {
+export function symbolChar(kind: SymbolKind, code: number): string | undefined {
   const privateUse = code >= 0xf020 && code <= 0xf0ff;
   const low = privateUse ? code - 0xf000 : code;
   if (low < 0x20 || low > 0xff) return undefined;
-  if (kind === 1) {
-    if (low >= 0x61 && low <= 0x7a) return SYMBOL_LOWER.charAt(low - 0x61);
-    if (low >= 0x41 && low <= 0x5a) return SYMBOL_UPPER.charAt(low - 0x41);
-    return SYMBOL[low];
+  if (kind !== 0) {
+    const table = TABLES[kind - 1];
+    return table ? table[low] : undefined;
   }
-  if (kind === 2) return WINGDINGS[low];
   return privateUse ? PRIVATE_USE[low] : undefined;
 }
 
+export interface MappedSymbols {
+  text: string;
+  /** A character was replaced, or is the same in Unicode as in the font. */
+  changed: boolean;
+  /**
+   * Set when some characters were mapped and others, glyphs of the font the
+   * tables do not know, were not: for each character of `text`, whether it
+   * was mapped. Unmapped glyphs have to stay in the font of the document.
+   */
+  mapped?: boolean[];
+}
+
 /** Maps the text of a run in a symbol font; `changed` says whether any character was replaced. */
-export function mapSymbols(kind: 0 | 1 | 2, text: string): { text: string; changed: boolean } {
+export function mapSymbols(kind: SymbolKind, text: string): MappedSymbols {
   let out = '';
   let changed = false;
+  let kept = false;
+  const flags: boolean[] | undefined = kind !== 0 ? [] : undefined;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
+    const privateUse = code >= 0xf020 && code <= 0xf0ff;
     // Outside a symbol font only the private use area is looked at.
-    const mapped = kind !== 0 || (code >= 0xf020 && code <= 0xf0ff) ? symbolChar(kind, code) : undefined;
-    if (mapped === undefined) out += text.charAt(i);
-    else {
+    const mapped = kind !== 0 || privateUse ? symbolChar(kind, code) : undefined;
+    if (mapped !== undefined) {
       out += mapped;
       changed = true;
+      if (flags) flags.push(true);
+      continue;
     }
+    out += text.charAt(i);
+    if (!flags) continue;
+    // A glyph of the font the tables do not know stays in the font; white space and characters that are not
+    // glyphs of it go with what is before them.
+    if (code > 0x20 && code !== 0xa0 && (privateUse || code <= 0xff)) {
+      kept = true;
+      flags.push(false);
+    } else flags.push(i > 0 ? flags[i - 1] : true);
   }
-  return { text: out, changed };
+  const result: MappedSymbols = { text: out, changed };
+  if (changed && kept && flags) result.mapped = flags;
+  return result;
 }
 
 /** True when the text has a character the tables above might replace. */
-export function mayHoldSymbols(kind: 0 | 1 | 2, text: string): boolean {
+export function mayHoldSymbols(kind: SymbolKind, text: string): boolean {
   if (kind !== 0) return true;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);

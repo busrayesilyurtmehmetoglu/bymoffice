@@ -20,7 +20,10 @@
 //     give as target.
 //   - Note ids are the number of the note counted from 1, comment ids from 0.
 //   - Fields are complex fields: a "begin" mark, the code as instrText, a
-//     "separate" mark, the result, an "end" mark, as from a binary file.
+//     "separate" mark, the result, an "end" mark, as from a binary file. The
+//     marks have the formatting of the code and of the result next to them.
+//   - Text in a font of symbols ("\fcharset2") is kept in the private use
+//     area (U+F021..U+F0FF), as Word keeps it, however the file writes it.
 //   - Control words the reader passes over are counted in `unknown`
 //     ("rtf/<word>"). The file itself is never changed: it is saved as read.
 //
@@ -28,7 +31,11 @@
 // not of the machine, and groups nested deeper than the reader follows share
 // the state of the last one it does; numbers are cut to what fits; a file
 // that is cut short ends where it ends, with what was read up to there; a
-// file that does not start with "{\rtf" is an error.
+// file that does not start with "{\rtf" is an error. What the model costs
+// in memory is bounded by the size of the file: about forty times its bytes
+// at the most, and up to sixty for a file of nothing but sections that each
+// bring a header of their own (see ReadRtfOptions for the limits a host can
+// set).
 
 import {
   EMPTY_PARA_PROPS,
@@ -50,6 +57,7 @@ import {
   type ParaBorders,
   type ParaProps,
   type Paragraph,
+  type Run,
   type RunItem,
   type RunProps,
   type SectionProps,
@@ -64,7 +72,7 @@ import { linkFields } from '../docx/body';
 import { resolveParaProps, resolveRunProps } from '../docx/resolve';
 import { charsetCodepage, decodeByte, decodePair, decodeRange, isDoubleByte, isKnownRtfCodepage, isLeadByte, SYMBOL_CODEPAGE } from './codepage';
 import * as D from './destinations';
-import { WORDS, isLegacyDrawingWord, type WordHandler } from './keywords';
+import { WORDS, isCharacterWord, isLegacyDrawingWord, type WordHandler } from './keywords';
 import { MAX_LEVEL_TEXT, MAX_LISTS, buildNumbering, levelWord, newLevel, type LevelState, type ListState, type OverrideState } from './lists';
 import { newPict, newShape, pictBin, pictHex, pictItem, pictWord, shapeItem, shapeWord, type PictState, type ShapeState } from './pictures';
 import { defaultDop, defaultSep, pageBorderSide, sectionProps, setPageBorder, type Dop, type Sep } from './sections';
@@ -84,6 +92,7 @@ import {
   type Pap,
 } from './state';
 import { Story, TEXT_CODE, TEXT_DELETED, TEXT_SHOWN, type StoryKind } from './story';
+import type { TableBudget } from './tables';
 import { MAX_STYLES, buildStyles, newRawStyle, styleWord, type RawStyle, type StyleSheet } from './styles';
 import { RtfTokenizer, hexValue, T_BIN, T_CLOSE, T_EOF, T_HEX, T_OPEN, T_SYMBOL, T_TEXT, T_WORD } from './tokenizer';
 
@@ -106,9 +115,34 @@ const MAX_SHAPE_PARTS = 256;
 /** "\ucN": bytes after a "\u" that stand for it in old readers. */
 const MAX_UC = 32;
 
+/** Bytes a file may have: 512 MiB. */
+const MAX_BYTES = 512 * 1024 * 1024;
+/**
+ * Tables the reader builds for a file, as a share of its size: one for every
+ * 32 bytes and a thousand more. A table of a genuine file takes hundreds of
+ * bytes; a file that opens tables faster than this only asks for memory
+ * ("\itap32 a\nestcell\itap1 b\cell" is 31 tables in 31 bytes).
+ */
+const TABLE_BYTES = 32;
+const TABLE_FLOOR = 1024;
+const MAX_TABLES = 4000000;
+
 export interface ReadRtfOptions {
   /** Paragraphs the document may have before it is refused; 2,000,000 when missing. A host with little memory may lower it. */
   maxParagraphs?: number;
+  /**
+   * Size of the file in bytes beyond which it is refused; 512 MiB when missing. The model of a file that is made
+   * to be expensive takes about forty times the size of the file in memory (text with a new formatting every few
+   * characters, cells and paragraphs without text; sixty for sections that each have a header), a genuine one far
+   * less, so a host with little memory may lower it.
+   */
+  maxBytes?: number;
+  /**
+   * Tables (those in cells included) the reader builds; one for every 32 bytes of the file and 1,024 more when
+   * missing, never more than 4,000,000. When they are used up no further table is opened: what follows is read as
+   * paragraphs of the innermost table still open, or of the story when none is, and the model says so in `warnings`.
+   */
+  maxTables?: number;
 }
 
 const NO_RELATIONSHIPS = new Map<string, DocRelationship>();
@@ -180,6 +214,8 @@ interface State {
   complex: boolean;
   /** Which part of the code page the text that follows is from: 0 not said, 1 low, 2 high, 3 double-byte. */
   assoc: number;
+  /** The kind of text ("\loch" 1, "\hich" 2, "\dbch" 3) the next font word is about; 0 once a font word was read, and in a new group. */
+  slot: number;
   rtl: boolean;
   /** Text is the code of a field. */
   code: boolean;
@@ -306,8 +342,27 @@ const B_CHAR = 3;
 const B_PAGE = 4;
 
 interface Place {
-  content: RunItem[];
+  run: Run;
   index: number;
+}
+
+/** A field mark and where it is, for as long as its paragraph is being read. */
+interface MarkRef {
+  run: Run;
+  story: Story;
+  /** Paragraphs the story had ended when the mark was made, and the index of its run in the paragraph. */
+  serial: number;
+  index: number;
+}
+
+/** A field whose group is open. */
+interface OpenField {
+  separated: boolean;
+  begin: MarkRef | undefined;
+  separate: MarkRef | undefined;
+  /** The formatting in full of the first text of the code and of the result. */
+  code: RunProps | undefined;
+  result: RunProps | undefined;
 }
 
 export class RtfReader {
@@ -365,7 +420,10 @@ export class RtfReader {
   private readonly shapes: ShapeState[] = [];
   private boxDepth = 0;
   private openStories = 0;
-  private readonly fields: { separated: boolean }[] = [];
+  private readonly fields: OpenField[] = [];
+  private readonly tableBudget: TableBudget;
+  private lastSection: { key: string; props: SectionProps } | undefined;
+  private lastSectionPara: { from: ParaProps; section: SectionProps; props: ParaProps } | undefined;
 
   private readonly model: DocModel;
   private readonly body: Story;
@@ -403,6 +461,10 @@ export class RtfReader {
   constructor(bytes: Uint8Array, options: ReadRtfOptions) {
     const limit = options.maxParagraphs;
     this.maxParagraphs = limit !== undefined && limit >= 1 && limit < MAX_PARAGRAPHS ? Math.floor(limit) : MAX_PARAGRAPHS;
+    const maxBytes = options.maxBytes !== undefined && options.maxBytes >= 0 && options.maxBytes < MAX_BYTES ? Math.floor(options.maxBytes) : MAX_BYTES;
+    if (bytes.length > maxBytes) throw invalid(`the file is larger than ${maxBytes} bytes`);
+    const tables = options.maxTables !== undefined && options.maxTables >= 0 ? Math.floor(options.maxTables) : Math.floor(bytes.length / TABLE_BYTES) + TABLE_FLOOR;
+    this.tableBudget = { left: Math.min(tables, MAX_TABLES), exceeded: false };
 
     // The file starts with "{\rtf"; a byte order mark and white space in front of it are let pass.
     let start = 0;
@@ -461,7 +523,7 @@ export class RtfReader {
       warnings: this.warnings,
       unknown: this.unknown,
     };
-    this.body = this.story = new Story('body', this.format);
+    this.body = this.story = new Story('body', this.format, this.tableBudget);
     this.st = this.newState();
   }
 
@@ -475,6 +537,7 @@ export class RtfReader {
       uc: 1,
       complex: false,
       assoc: 0,
+      slot: 0,
       rtl: false,
       code: false,
       star: false,
@@ -512,6 +575,7 @@ export class RtfReader {
     st.chpOwn = false;
     st.complex = false;
     st.assoc = 0;
+    st.slot = 0;
     st.rtl = false;
   }
 
@@ -662,7 +726,46 @@ export class RtfReader {
     const chp = st.chp;
     const style = this.paraStyle();
     const kind = st.code ? TEXT_CODE : chp.deleted ? TEXT_DELETED : TEXT_SHOWN;
-    this.story.addText(text, kind, this.runPropsFor(chp, st.rtl, style), this.fullRun(chp, st.rtl), this.wrapper(chp));
+    const full = this.fullRun(chp, st.rtl);
+    if (this.fields.length) this.fieldText(full);
+    this.story.addText(text, kind, this.runPropsFor(chp, st.rtl, style), full, this.wrapper(chp));
+  }
+
+  /**
+   * Text of the innermost open field arrives in the formatting `full`. The marks of a field are made before its
+   * text, in the formatting around the field; Word gives them that of the text they stand next to: the mark that
+   * begins the field that of its code, the one that separates code and result that of the result.
+   */
+  private fieldText(full: RunProps): void {
+    const field = this.fields[this.fields.length - 1];
+    // Text of another story inside the field (a note in its result) is not text of the field.
+    if (!field.begin || field.begin.story !== this.story) return;
+    if (this.st.code) {
+      if (field.code || field.separated) return;
+      field.code = full;
+      if (field.begin) this.restyle(field.begin, full);
+    } else if (field.separated && !field.result) {
+      field.result = full;
+      if (field.separate) this.restyle(field.separate, full);
+    }
+  }
+
+  /** Gives a field mark another formatting, when the paragraph it is in is still being read. */
+  private restyle(mark: MarkRef, full: RunProps): void {
+    const story = mark.story;
+    if (story !== this.story || story.paragraphs !== mark.serial || story.runs[mark.index] !== mark.run || story.styleUsed === undefined) return;
+    story.fulls[mark.index] = full;
+    mark.run.props = this.pooled(this.runPool, diffRunProps(full, this.runBase(story.styleUsed, full.style)), EMPTY_RUN_PROPS);
+  }
+
+  /** A field mark in a run of its own, in the formatting in effect. */
+  private fieldMark(charType: 'begin' | 'separate' | 'end', chp: Chp, rtl: boolean, full: RunProps | undefined): MarkRef {
+    const story = this.story;
+    const style = this.paraStyle();
+    const used = full || this.fullRun(chp, rtl);
+    const props = full ? this.pooled(this.runPool, diffRunProps(full, this.runBase(style, full.style)), EMPTY_RUN_PROPS) : this.runPropsFor(chp, rtl, style);
+    const run = story.addAlone({ type: 'fieldChar', charType }, props, used);
+    return { run, story, serial: story.paragraphs, index: story.runs.length - 1 };
   }
 
   /** Adds an item to the story being read, if the group being read is text of it. */
@@ -670,13 +773,9 @@ export class RtfReader {
     const st = this.st;
     if (st.dest !== D.D_NORMAL) return undefined;
     const chp = st.chp;
-    return this.story.addItem(item, this.runPropsFor(chp, st.rtl, this.paraStyle()), this.fullRun(chp, st.rtl), this.wrapper(chp));
-  }
-
-  private addAlone(item: RunItem): void {
-    const st = this.st;
-    const chp = st.chp;
-    this.story.addAlone(item, this.runPropsFor(chp, st.rtl, this.paraStyle()), this.fullRun(chp, st.rtl));
+    const full = this.fullRun(chp, st.rtl);
+    if (this.fields.length) this.fieldText(full);
+    return this.story.addItem(item, this.runPropsFor(chp, st.rtl, this.paraStyle()), full, this.wrapper(chp));
   }
 
   /** Text as decoded: where it goes depends on what the group is. */
@@ -757,9 +856,11 @@ export class RtfReader {
     let out = '';
     let from = p;
     let plain = true;
+    // In a font of symbols every byte is a glyph of the font, the letters and digits too.
+    const symbols = this.symbolText();
     const flush = (to: number) => {
       if (to <= from) return;
-      if (plain) {
+      if (plain && !symbols) {
         // Characters of seven bits: the bytes are the text.
         for (let i = from; i < to; i += 8192) out += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(to, i + 8192)) as unknown as number[]);
       } else out += decodeRange(bytes, from, to, this.textCodepage());
@@ -776,6 +877,16 @@ export class RtfReader {
     }
     flush(stop);
     this.route(out);
+  }
+
+  /**
+   * The text being read is shown text in a font of symbols ("\fcharset2"): its characters are glyphs of the font,
+   * which the model keeps in the private use area (U+F021..U+F0FF), however the file writes them: as bytes, as
+   * "\'hh" or as "\uN".
+   */
+  private symbolText(): boolean {
+    const st = this.st;
+    return st.dest === D.D_NORMAL && !st.code && this.textCodepage() === SYMBOL_CODEPAGE;
   }
 
   /** "\'hh". */
@@ -821,6 +932,8 @@ export class RtfReader {
       return;
     }
     if (code < 0x20 && code !== 0x09) return;
+    // Word writes a glyph of a font of symbols as "\u-3913" (U+F0B7); other writers give the code in the font.
+    if (code > 0x20 && code < 0x100 && this.symbolText()) code += 0xf000;
     this.route(String.fromCharCode(code));
   }
 
@@ -828,12 +941,8 @@ export class RtfReader {
     this.st.uc = value < 0 ? 0 : value > MAX_UC ? MAX_UC : value;
   }
 
-  /** A character a control word stands for. */
+  /** A character a control word or control symbol stands for. One that stands in for a "\u" is passed over: word() and symbol() see to that. */
   char(text: string): void {
-    if (this.skip > 0) {
-      this.skip--;
-      return;
-    }
     this.route(text);
   }
 
@@ -848,7 +957,13 @@ export class RtfReader {
       if (!withMark) byMark.set(mark, (withMark = { ...props, markProps: mark }));
       out = withMark;
     }
-    return section ? { ...out, section } : out;
+    if (!section) return out;
+    // Paragraphs that end sections described alike share their properties.
+    const last = this.lastSectionPara;
+    if (last && last.from === out && last.section === section) return last.props;
+    const ended = { ...out, section };
+    this.lastSectionPara = { from: out, section, props: ended };
+    return ended;
   }
 
   /** Ends the paragraph being read with the formatting in effect. */
@@ -876,11 +991,11 @@ export class RtfReader {
   /** Marks that waited for a note or comment that did not come are taken out. */
   private dropPending(current: Story): void {
     if (current.pendingNote) {
-      current.pendingNote.content[current.pendingNote.index] = NOTHING;
+      current.pendingNote.run.content[current.pendingNote.index] = NOTHING;
       current.pendingNote = undefined;
     }
     if (current.pendingComment) {
-      current.pendingComment.content[current.pendingComment.index] = NOTHING;
+      current.pendingComment.run.content[current.pendingComment.index] = NOTHING;
       current.pendingComment = undefined;
     }
   }
@@ -914,6 +1029,21 @@ export class RtfReader {
     const props = sectionProps(this.sep, this.dop, this.sectionIndex === 0);
     if (Object.keys(this.sectionRefs.headers).length) props.headers = this.sectionRefs.headers;
     if (Object.keys(this.sectionRefs.footers).length) props.footers = this.sectionRefs.footers;
+    // Sections described alike share one description.
+    const key = JSON.stringify(props);
+    const last = this.lastSection;
+    if (last) {
+      if (last.key === key) return last.props;
+      // What two sections that follow each other say alike (the paper, the margins) they share.
+      const mine = props as unknown as { [name: string]: unknown };
+      const theirs = last.props as unknown as { [name: string]: unknown };
+      for (const name of Object.keys(mine)) {
+        const value = mine[name];
+        const other = theirs[name];
+        if (value && other && typeof value === 'object' && value !== other && JSON.stringify(value) === JSON.stringify(other)) mine[name] = other;
+      }
+    }
+    this.lastSection = { key, props };
     return props;
   }
 
@@ -934,7 +1064,9 @@ export class RtfReader {
     const depth = nested ? Math.max(2, assembler.depth) : 1;
     // Text without a cell mark after it is a cell all the same.
     if (current.children.length) assembler.add(this.endParagraph(), depth);
-    assembler.endRow(depth, current.row.def());
+    // Word writes the description of a row of a table in a cell after its cells; a writer that puts it in front of
+    // them has the row mark there too, with no cell before it.
+    assembler.endRow(depth, current.row.def(), nested && this.st.closer === C_ROW_PROPS);
   }
 
   // ------------------------------------------------------------------ borders
@@ -1074,7 +1206,7 @@ export class RtfReader {
           return;
         }
         if (current.pendingNote) {
-          current.pendingNote.content[current.pendingNote.index] = NOTHING;
+          current.pendingNote.run.content[current.pendingNote.index] = NOTHING;
           current.pendingNote = undefined;
         }
         const place = this.addItem({ type: 'footnoteReference', id: 0 });
@@ -1088,7 +1220,7 @@ export class RtfReader {
           return;
         }
         if (current.pendingComment) {
-          current.pendingComment.content[current.pendingComment.index] = NOTHING;
+          current.pendingComment.run.content[current.pendingComment.index] = NOTHING;
           current.pendingComment = undefined;
         }
         const place = this.addItem({ type: 'commentReference', id: 0 });
@@ -1131,6 +1263,7 @@ export class RtfReader {
       uc: parent.uc,
       complex: parent.complex,
       assoc: parent.assoc,
+      slot: 0,
       rtl: parent.rtl,
       code: parent.code,
       star: false,
@@ -1202,7 +1335,7 @@ export class RtfReader {
     payload.outer = this.story;
     payload.borderTarget = this.borderTarget;
     this.setCloser(closer, payload);
-    this.story = new Story(kind, this.format);
+    this.story = new Story(kind, this.format, this.tableBudget);
     const st = this.st;
     st.dest = D.D_NORMAL;
     st.code = false;
@@ -1342,9 +1475,9 @@ export class RtfReader {
           this.skipRest();
           return true;
         }
-        this.addAlone({ type: 'fieldChar', charType: 'begin' });
+        const begin = this.fieldMark('begin', st.chp, st.rtl, undefined);
         this.setCloser(C_FIELD, undefined);
-        this.fields.push({ separated: false });
+        this.fields.push({ separated: false, begin, separate: undefined, code: undefined, result: undefined });
         st.dest = D.D_FIELD;
         return true;
       }
@@ -1360,7 +1493,7 @@ export class RtfReader {
         const field = this.fields[this.fields.length - 1];
         if (field && !field.separated) {
           field.separated = true;
-          this.addAlone({ type: 'fieldChar', charType: 'separate' });
+          field.separate = this.fieldMark('separate', st.chp, st.rtl, undefined);
         }
         return true;
       }
@@ -1595,11 +1728,11 @@ export class RtfReader {
         return;
       }
       case C_FIELD: {
-        this.fields.pop();
-        // The mark that ends a field has the formatting of the text around the field.
+        const field = this.fields.pop();
+        // The mark that ends a field has the formatting of its result, or of its code when it has none; that of the
+        // text around the field when it has neither.
         const parent = this.stack[this.depth - 1] || st;
-        const chp = parent.chp;
-        this.story.addAlone({ type: 'fieldChar', charType: 'end' }, this.runPropsFor(chp, parent.rtl, this.paraStyle()), this.fullRun(chp, parent.rtl));
+        this.fieldMark('end', parent.chp, parent.rtl, field ? field.result || field.code : undefined);
         return;
       }
       case C_NOTE: {
@@ -1609,12 +1742,12 @@ export class RtfReader {
         const id = endnote ? ++this.endnoteId : ++this.footnoteId;
         const place = payload.place as Place | undefined;
         if (place) {
-          const before = place.content[place.index] as { customMark?: boolean };
+          const before = place.run.content[place.index] as { customMark?: boolean };
           const ref: RunItem = { type: endnote ? 'endnoteReference' : 'footnoteReference', id };
           if (before.customMark) ref.customMark = true;
-          place.content[place.index] = ref;
+          place.run.content[place.index] = ref;
         }
-        if (endnote) for (const mark of ended.noteRefs) mark.content[mark.index] = ENDNOTE_REF;
+        if (endnote) for (const mark of ended.noteRefs) mark.run.content[mark.index] = ENDNOTE_REF;
         const model = this.model;
         const notes = endnote ? model.endnotes || (model.endnotes = collection<Note>('rtf:endnotes')) : model.footnotes || (model.footnotes = collection<Note>('rtf:footnotes'));
         notes.items.set(id, { id, blocks });
@@ -1625,7 +1758,7 @@ export class RtfReader {
         const blocks = this.popStory(payload);
         const id = this.commentId++;
         const place = payload.place as Place | undefined;
-        if (place) place.content[place.index] = { type: 'commentReference', id };
+        if (place) place.run.content[place.index] = { type: 'commentReference', id };
         const comment: Comment = { id, blocks };
         if (this.commentAuthor) comment.author = this.commentAuthor;
         if (this.commentInitials) comment.initials = this.commentInitials;
@@ -1771,8 +1904,15 @@ export class RtfReader {
   // -------------------------------------------------------------------- words
 
   private word(word: string, param: number, hasParam: boolean): void {
-    // What stands in for a "\u" is text; a control word ends it.
-    this.skip = 0;
+    if (this.skip > 0) {
+      // What stands in for a "\u" is characters, and a control word that is a character is one of them. Any other
+      // control word ends it and is read as it is: a paragraph or cell mark is never passed over.
+      if (isCharacterWord(word)) {
+        this.skip--;
+        return;
+      }
+      this.skip = 0;
+    }
     this.lead = -1;
     this.echo = -1;
     const st = this.st;
@@ -1897,7 +2037,8 @@ export class RtfReader {
         st.star = true;
         return;
       case 0x7e:
-        this.char(String.fromCharCode(0xa0));
+        if (this.skip > 0) this.skip--;
+        else this.char(String.fromCharCode(0xa0));
         return;
       case 0x2d:
         if (this.skip > 0) this.skip--;
@@ -1910,7 +2051,8 @@ export class RtfReader {
       case 0x5c:
       case 0x7b:
       case 0x7d:
-        this.char(String.fromCharCode(code));
+        if (this.skip > 0) this.skip--;
+        else this.char(String.fromCharCode(code));
         return;
       case 0x0a:
       case 0x0d:
@@ -1998,6 +2140,8 @@ export class RtfReader {
       if (font.pitch !== undefined && PITCHES[font.pitch] !== undefined) info.pitch = PITCHES[font.pitch];
       model.fonts.set(font.name, info);
     }
+
+    if (this.tableBudget.exceeded) this.warnings.push('The file opens more tables than the reader builds for a file of its size; the rest is read without them');
 
     const settings = model.settings;
     const dop = this.dop;

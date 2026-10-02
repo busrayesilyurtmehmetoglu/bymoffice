@@ -522,15 +522,30 @@ function buildTable(pending: PendingRow[], styleMargin: StyleMargin): Table {
   const margins = marginsOf(first);
   if (margins) props.cellMargins = margins;
   if (lines.length) {
-    // The model measures the indent to the text of the first cell, as documents of this age do. The first row
-    // states it (sprmTWidthIndent, or sprmTDxaLeft, which Word writes with the same value); a row that states
-    // neither has it at its edge plus the left cell margin in effect, which is the row's own, that of the table
-    // style, or what Word assumes (0.075 inch). A row further left than the first moves the indent with it.
-    const stated = first.indent !== undefined ? first.indent : first.left;
-    const firstEdges = edgesOf.get(first);
-    if (stated !== undefined && firstEdges && firstEdges.length) props.indent = { type: 'dxa', value: lines[0] + (stated - firstEdges[0]) };
+    // The model measures the indent to the text of the first cell, as documents of this age do. The indent is
+    // that of the left edge of the grid, so the row that says where it is is the first one that starts there: a
+    // row that starts further right (it has grid columns before it) says where it starts itself, not the table.
+    // That row states the indent (sprmTWidthIndent, or sprmTDxaLeft, which Word writes with the same value); a
+    // row that states neither has it at its edge plus the left cell margin in effect, which is the row's own,
+    // that of the table style, or what Word assumes (0.075 inch).
+    let leftmost: RowDef | undefined;
+    let stated: number | undefined;
+    for (const { def } of pending) {
+      const edges = edgesOf.get(def);
+      if (!edges || !edges.length || edges[0] !== lines[0]) continue;
+      if (!leftmost) leftmost = def;
+      const value = def.indent !== undefined ? def.indent : def.left;
+      if (value !== undefined) {
+        stated = value;
+        break;
+      }
+      // Only the first row decides when it is at the left edge itself.
+      if (def === first) break;
+    }
+    if (stated !== undefined) props.indent = { type: 'dxa', value: stated };
     else {
-      let left = margins && margins.left && margins.left.type === 'dxa' ? margins.left.value : undefined;
+      const own = leftmost && leftmost !== first ? marginsOf(leftmost) : margins;
+      let left = own && own.left && own.left.type === 'dxa' ? own.left.value : undefined;
       if (left === undefined) left = styleMargin(props.style);
       props.indent = { type: 'dxa', value: lines[0] + (left === undefined ? 108 : left) };
     }

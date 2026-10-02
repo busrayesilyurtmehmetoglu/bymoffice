@@ -13,6 +13,7 @@
 
 import type { AbstractNum, NumInstance, NumLevel, Numbering, ParaProps, RunProps } from '../../model/doc/types';
 import { numberFormat } from '../doc/sprm';
+import { SYMBOL_CODEPAGE } from './codepage';
 
 /** More lists than this in one document is not a genuine file. */
 export const MAX_LISTS = 20000;
@@ -121,7 +122,9 @@ function buildLevel(state: LevelState, index: number, decode: (codepage: number,
     const raw = codes[i] < 0;
     const code = raw ? codes[i] + 256 : codes[i];
     if (code < 9 && format !== 'bullet') text += '%' + (code + 1);
-    else text += raw ? decode(state.codepage, code) : String.fromCharCode(code);
+    else if (raw) text += decode(state.codepage, code);
+    // A character of a font of symbols is a glyph of the font however it is written (see RtfReader.symbolText).
+    else text += String.fromCharCode(state.codepage === SYMBOL_CODEPAGE && code > 0x20 && code < 0x100 ? 0xf000 + code : code);
   }
   level.text = text;
   const suffix = SUFFIXES[state.follow];

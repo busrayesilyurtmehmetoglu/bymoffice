@@ -214,10 +214,10 @@ function roman(value: number): string {
 /**
  * a..z, then aa, bb, ..., zz, aaa, ...: the letter repeats, as Word does it.
  *
- * UNSURE: the alphabet is the English one whatever the language of the text.
- * Word may count with the alphabet of the language (Turkish: a, b, c, ç, d,
- * ...); that was not verified, so it is not done. formatCounter() takes the
- * language so that callers need not change when it is.
+ * The alphabet is the English one whatever the language of the text: Word
+ * numbers a Turkish list a, b, c, d (no ç), which the numbers Word writes
+ * into RTF files next to its lists show. What does follow the language is how
+ * the letters are made upper case: see upperLetters().
  */
 function letters(value: number): string {
   if (value < 1 || value > 780) return String(value);
@@ -225,6 +225,27 @@ function letters(value: number): string {
   let out = '';
   for (let i = Math.floor((value - 1) / 26); i >= 0; i--) out += letter;
   return out;
+}
+
+/** Is the language one whose capital of "i" has a dot: Turkish, Azerbaijani. */
+function dottedCapital(lang: string | undefined): boolean {
+  if (lang === undefined || lang.length < 2) return false;
+  const code = lang.slice(0, 2).toLowerCase();
+  if (code !== 'tr' && code !== 'az') return false;
+  // "tr", "tr-TR", "az-Latn-AZ"; not a longer code that only starts the same.
+  return lang.length === 2 || lang.charCodeAt(2) === 0x2d || lang.charCodeAt(2) === 0x5f;
+}
+
+/**
+ * letters() in upper case, by the rules of the language of the text: in
+ * Turkish the ninth item of a list is "İ.", which is what Word shows.
+ *
+ * UNSURE: upper case Roman numerals are left alone ("I", "IX" in every
+ * language); there is no evidence that Word writes them with a dot.
+ */
+function upperLetters(value: number, lang: string | undefined): string {
+  const text = letters(value);
+  return (dottedCapital(lang) ? text.replace(/i/g, '\u0130') : text).toUpperCase();
 }
 
 function ordinal(value: number): string {
@@ -236,8 +257,8 @@ function ordinal(value: number): string {
 /**
  * Text of a counter value in a number format. "bullet" and "none" have no
  * counter text; formats without an implementation fall back to decimal.
- * `lang` is the language of the numbered text ("tr-TR"); no format depends on
- * it yet (see letters()).
+ * `lang` is the language of the numbered text ("tr-TR"): upper case letters
+ * follow it (see upperLetters()).
  */
 export function formatCounter(value: number, format: string | undefined, lang?: string): string {
   switch (format) {
@@ -249,7 +270,7 @@ export function formatCounter(value: number, format: string | undefined, lang?: 
     case 'lowerLetter':
       return letters(value);
     case 'upperLetter':
-      return letters(value).toUpperCase();
+      return upperLetters(value, lang);
     case 'lowerRoman':
       return roman(value);
     case 'upperRoman':
@@ -294,7 +315,8 @@ export class NumberingCounters {
     return definition && definition.start !== undefined ? definition.start : 1;
   }
 
-  next(numId: number, level: number): NumberLabel | undefined {
+  /** `lang` is the language of the numbered text, which some number formats follow (see formatCounter). */
+  next(numId: number, level: number, lang?: string): NumberLabel | undefined {
     if (!(level >= 0 && level <= MAX_LEVEL)) level = 0;
     const abstract = abstractOf(this.numbering, this.styles, numId);
     const definition = levelOf(this.numbering, this.styles, numId, level);
@@ -335,7 +357,7 @@ export class NumberingCounters {
         let format = index === level ? definition.format : levelOf(this.numbering, this.styles, numId, index)?.format;
         // Legal numbering shows every level it displays as a decimal, its own included (ECMA-376 Part 1, 17.9.4).
         if (definition.legal && format !== 'none') format = 'decimal';
-        return formatCounter(values[index], format);
+        return formatCounter(values[index], format, lang);
       });
     }
     return { text, level: definition, values };

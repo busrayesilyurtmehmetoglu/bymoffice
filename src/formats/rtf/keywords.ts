@@ -68,16 +68,43 @@ function sizeWord(r: RtfReader, param: number): void {
 WORDS.set('fs', sizeWord);
 WORDS.set('afs', sizeWord);
 
-/** "\fN" and "\afN": the font of the kind of text the words before it name. */
+/**
+ * "\fN" and "\afN". "\fN" is the font of the text: it replaces every font stated before it, the associated ones
+ * included. "\loch", "\hich" and "\dbch" name a kind of text (low and high half of the code page, double-byte);
+ * the font word right after one of them is about that kind alone: "\afN" is its associated font, "\fN" (which
+ * Word writes for the kind the text at hand is of, after the associated fonts of the others) the font of the text,
+ * which that kind follows from then on.
+ */
 function fontWord(r: RtfReader, param: number, _hasParam: boolean, word: string): void {
   const st = r.st;
-  let field: 'font' | 'fontLo' | 'fontHi' | 'fontDb' | 'fontCs' = 'font';
-  if (word === 'af' && st.assoc === 1) field = 'fontLo';
-  else if (word === 'af' && st.assoc === 2) field = 'fontHi';
-  else if (word === 'af' && st.assoc === 3) field = 'fontDb';
-  else if (st.complex) field = 'fontCs';
   const value = param < 0 ? -1 : param;
-  if (st.chp[field] !== value) r.chpW()[field] = value;
+  const slot = st.slot;
+  st.slot = 0;
+  if (word === 'af' && slot) {
+    const field = slot === 1 ? 'fontLo' : slot === 2 ? 'fontHi' : 'fontDb';
+    if (st.chp[field] !== value) r.chpW()[field] = value;
+    return;
+  }
+  if (st.complex) {
+    if (st.chp.fontCs !== value) r.chpW().fontCs = value;
+    return;
+  }
+  const chp = st.chp;
+  if (word === 'af' || slot) {
+    // The font of the text; the kind named follows it.
+    const field = slot === 1 ? 'fontLo' : slot === 2 ? 'fontHi' : slot === 3 ? 'fontDb' : undefined;
+    if (chp.font !== value || (field !== undefined && chp[field] !== -1)) {
+      const next = r.chpW();
+      next.font = value;
+      if (field !== undefined) next[field] = -1;
+    }
+    return;
+  }
+  if (chp.font !== value || chp.fontLo !== -1 || chp.fontHi !== -1 || chp.fontDb !== -1) {
+    const next = r.chpW();
+    next.font = value;
+    next.fontLo = next.fontHi = next.fontDb = -1;
+  }
 }
 WORDS.set('f', fontWord);
 WORDS.set('af', fontWord);
@@ -152,15 +179,16 @@ WORDS.set('ltrch', (r) => {
 WORDS.set('fcs', (r, param) => {
   r.st.complex = param === 1;
   r.st.assoc = 0;
+  r.st.slot = 0;
 });
 WORDS.set('loch', (r) => {
-  r.st.assoc = 1;
+  r.st.assoc = r.st.slot = 1;
 });
 WORDS.set('hich', (r) => {
-  r.st.assoc = 2;
+  r.st.assoc = r.st.slot = 2;
 });
 WORDS.set('dbch', (r) => {
-  r.st.assoc = 3;
+  r.st.assoc = r.st.slot = 3;
 });
 WORDS.set('uc', (r, param) => r.setUc(param));
 WORDS.set('u', (r, param) => r.unicode(param));
@@ -563,6 +591,9 @@ const CHARACTERS: { [word: string]: number } = lookup({
   zwnbo: 0x2060,
 });
 for (const word of Object.keys(CHARACTERS)) WORDS.set(word, (r) => r.char(String.fromCharCode(CHARACTERS[word])));
+
+/** Is the control word a character: after a "\u" it counts as one of the characters that stand in for it. */
+export const isCharacterWord = (word: string): boolean => CHARACTERS[word] !== undefined;
 
 // -------------------------------------------------------------------- ignored
 

@@ -225,7 +225,8 @@ export function decodePair(codepage: number, lead: number, trail: number): strin
 
 /** The character of one byte in a single-byte code page (the first half of a double-byte one included). */
 export function decodeByte(codepage: number, byte: number): string {
-  if (codepage === SYMBOL_CODEPAGE) return String.fromCharCode(byte < 0x20 ? byte : 0xf000 + byte);
+  // A space is a space in every font: lines break at it.
+  if (codepage === SYMBOL_CODEPAGE) return String.fromCharCode(byte <= 0x20 ? byte : 0xf000 + byte);
   if (byte < 0x80) return String.fromCharCode(byte);
   if (isDoubleByte(codepage)) {
     // Half-width katakana are single bytes in the Japanese code page.

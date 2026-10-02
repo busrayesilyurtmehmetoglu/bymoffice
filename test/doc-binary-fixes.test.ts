@@ -601,3 +601,29 @@ test('a section starts its page numbers anew only when it says so', () => {
   // The flag alone restarts nothing the model could state.
   assert.equal(read(sprm(0x3011, 1)), undefined);
 });
+
+test('the indent of a table is that of its leftmost edge: a first row that starts further right does not move it', () => {
+  // The first row is one cell far to the right (it has grid columns before it) and states the indent of the table;
+  // the rows after it start at the left edge.
+  const rows = [['top'], ['a', 'b'], ['c', 'd']];
+  const table = only(
+    tableDoc(rows, (row) => (row === 0 ? [dxaLeft(8532), gapHalf(108), defTable([8424, 10500]), widthIndent(-223)] : [dxaLeft(-223), gapHalf(108), defTable([-331, 5000, 10500]), widthIndent(-223)])).read(),
+  );
+  assert.deepEqual(table.props.indent, { type: 'dxa', value: -223 });
+  assert.deepEqual(table.grid, [5331, 3424, 2076]);
+  assert.equal(table.rows[0].props.gridBefore, 2);
+  assert.deepEqual(table.rows[0].props.widthBefore, { type: 'dxa', value: 8755 });
+  assert.equal(table.rows[1].props.gridBefore, undefined);
+
+  // The rows at the left edge state no indent: the place of their first text is the indent.
+  const old = only(tableDoc(rows, (row) => (row === 0 ? [dxaLeft(8532), gapHalf(108), defTable([8424, 10500]), widthIndent(-223)] : [dxaLeft(-223), gapHalf(108), defTable([-331, 5000, 10500])])).read());
+  assert.deepEqual(old.props.indent, { type: 'dxa', value: -223 });
+
+  // No row at the left edge says where its text starts: the edge plus the cell margin in effect.
+  const bare = only(tableDoc(rows, (row) => (row === 0 ? [defTable([8424, 10500]), widthIndent(-223)] : [gapHalf(70), defTable([-331, 5000, 10500])])).read());
+  assert.deepEqual(bare.props.indent, { type: 'dxa', value: -331 + 70 });
+
+  // The first row at the left edge still decides, whatever the rows after it state.
+  const first = only(tableDoc(rows, (row) => (row === 0 ? [dxaLeft(93), gapHalf(108), defTable([-15, 9000]), widthIndent(93)] : [dxaLeft(500), gapHalf(108), defTable([392, 5000, 9000]), widthIndent(700)])).read());
+  assert.deepEqual(first.props.indent, { type: 'dxa', value: 93 });
+});

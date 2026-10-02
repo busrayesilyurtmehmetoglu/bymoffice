@@ -73,10 +73,10 @@ test('"\\mac", "\\pc" and "\\pca" name code pages; a stated "\\ansicpg" wins ove
 });
 
 test('the character set of the font in effect says how its bytes are read', () => {
-  // f0 is Western (the code page of the document), f1 Turkish, f2 a font of symbols: its bytes above 127 are kept in
-  // the private use area, where Word keeps them.
+  // f0 is Western (the code page of the document), f1 Turkish, f2 a font of symbols: its characters are glyphs of
+  // the font, letters included, and are kept in the private use area, where Word keeps them.
   const model = read(doc(String.raw`\f0 \'fd{\f1 \'fd}\'fd\f1 \'fd\f2 \'b7A\par`));
-  assert.equal(texts(model)[0], chars(0xfd, 0x131, 0xfd, 0x131, 0xf0b7) + 'A');
+  assert.equal(texts(model)[0], chars(0xfd, 0x131, 0xfd, 0x131, 0xf0b7, 0xf041));
 });
 
 test('a font without a character set of its own takes the code page of the document', () => {

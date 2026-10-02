@@ -5,6 +5,7 @@
 // sheet list, shared strings, names) and one substream per sheet. Nothing is
 // written back: the model is for viewing, and for saving as xlsx later.
 
+import { relativeExtent, shiftFormula } from '../../calc/refs';
 import type { CfbFile } from '../../cfb';
 import {
   cellName,
@@ -100,9 +101,19 @@ export const XLS_MAX_SHEETS = 4096;
 
 /**
  * What the cells of shared formulas may cost together, in token bytes read and characters of
- * text made, for each byte of the stream. Every cell of a group gets a text of its own from
- * the tokens of the group, so a small file can ask for a lot of text; genuine files stay far
- * below this (a cell of a group takes 31 bytes in the file and has a few dozen characters).
+ * text made, for each byte of the stream.
+ *
+ * Only the first cell of a group keeps the text of the formula; the others point to it, as
+ * in an xlsx file, and get their text when it is asked for: the text of the first cell with
+ * its relative references moved. So a group costs memory for one text, however many cells
+ * it has. The budget is for the work of checking that: while it lasts, the text of every
+ * cell is made from the tokens once and compared with what moving the references gives; a
+ * cell where the two differ (references that wrap around the edge of the old sheet) keeps
+ * its own text. When the budget is used up the cells are no longer checked: one whose
+ * references stay on the sheet points to the first cell unchecked, any other is left
+ * without a formula and counted. Genuine files stay far below the budget (a cell of a group
+ * takes 31 bytes in the file and has a few dozen characters), and a group of long formulas
+ * down thousands of rows, which goes beyond it, is still read in full.
  */
 const SHARED_FORMULA_FACTOR = 64;
 /** The least the cells of shared formulas may cost, whatever the size of the stream. */
@@ -118,7 +129,8 @@ export interface XlsReadReport {
   /**
    * Formula cells whose tokens could not be turned into text; they keep their value and have no formula.
    * Counted here too: formulas longer or more deeply nested than Excel allows, and the cells of shared
-   * formulas that were left without a text because the texts of the workbook together grew too large.
+   * formulas that were left without a formula because reading the groups of the workbook cost too much
+   * and their text could not be had from the first cell of their group (see SHARED_FORMULA_FACTOR).
    */
   untranslatedFormulas: number;
   /** Defined names left out for the same reason. */
@@ -490,6 +502,10 @@ interface SharedFormula {
   si: number;
   /** The first cell of the group has been given the range. */
   placed: boolean;
+  /** The cell that holds the text of the group, once one has it: where it is, the text, and how far its relative references reach. */
+  master: { row: number; col: number; text: string; extent: ReturnType<typeof relativeExtent> } | undefined;
+  /** A cell of the group has a text that moving the references of the first cell does not give. */
+  differs: boolean;
 }
 
 /** An ARRAY or TABLE record: the formula belongs to the first cell of the range. */
@@ -722,7 +738,7 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
         const range = { top: view.getUint16(d, true), bottom: view.getUint16(d + 2, true), left: bytes[d + 4], right: bytes[d + 5] };
         // The record follows the first formula of its group, which points to the cell the group is known by.
         const group = lastLink >= 0 ? lastLink : key(range.top, range.left);
-        if (!shared.has(group)) shared.set(group, { bytes, start: d + 10, end: d + 10 + tokenSize, extraEnd: next, range, si: nextShared++, placed: false });
+        if (!shared.has(group)) shared.set(group, { bytes, start: d + 10, end: d + 10 + tokenSize, extraEnd: next, range, si: nextShared++, placed: false, master: undefined, differs: false });
         continue;
       }
       case REC_ARRAY: {
@@ -935,7 +951,14 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
     const col = at % XLS_MAX_COLS;
     const group = shared.get(linkedTo[i]);
     if (group) {
+      const master = group.master;
       if (globals.sharedBudget <= 0) {
+        // Nothing left to read the tokens with. The text of the first cell with its references moved is the
+        // text of this cell as long as none of them leaves the sheet, where the file would wrap around.
+        if (master && !group.differs && staysOnSheet(master.extent, row - master.row, col - master.col, biff8 ? XLS_MAX_ROWS : 16384)) {
+          cell.formula = { text: '', type: 'shared', si: group.si };
+          continue;
+        }
         // The cell keeps its value; the formula is left out and counted.
         report.untranslatedFormulas++;
         countReason(report.untranslatedReasons, 'shared formula: the texts of the workbook together are too large');
@@ -944,13 +967,20 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
       const text = formulaText(ctx, group.bytes, group.start, group.end, group.end, group.extraEnd, row, col);
       globals.sharedBudget -= group.end - group.start + (text === undefined ? 0 : text.length);
       if (text === undefined) report.untranslatedFormulas++;
-      else {
-        // Every cell carries its own text, so nothing depends on the first cell of the group staying as it is.
+      else if (!master) {
+        // The first cell of the group that has a text holds it for the others.
         cell.formula = { text, type: 'shared', si: group.si };
+        group.master = { row, col, text, extent: relativeExtent(text) };
         if (!group.placed) {
           group.placed = true;
           if (group.range.top <= group.range.bottom && group.range.left <= group.range.right) cell.formula.ref = rangeName(group.range);
         }
+      } else if (shiftFormula(master.text, row - master.row, col - master.col) === text) {
+        cell.formula = { text: '', type: 'shared', si: group.si };
+      } else {
+        // Moving the references does not give this text: the cell stands for itself.
+        cell.formula = { text, type: 'normal' };
+        group.differs = true;
       }
       continue;
     }
@@ -980,6 +1010,13 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   if (!standardWidth && defaultWidthChars > 0 && defaultWidthChars !== 8 && defaultWidthChars <= 255) {
     sheet.defaultColWidth = Math.floor(((Math.ceil((defaultWidthChars * 7 + 5) / 8) * 8) / 7) * 256) / 256;
   }
+}
+
+/** Do the relative references of a text stay on a sheet of the file's format when the text is moved by (dRow, dCol). */
+function staysOnSheet(extent: ReturnType<typeof relativeExtent>, dRow: number, dCol: number, rows: number): boolean {
+  if (extent.minRow <= extent.maxRow && (extent.minRow + dRow < 0 || extent.maxRow + dRow >= rows)) return false;
+  if (extent.minCol <= extent.maxCol && (extent.minCol + dCol < 0 || extent.maxCol + dCol >= XLS_MAX_COLS)) return false;
+  return true;
 }
 
 function countReason(map: Map<string, number>, reason: string): void {

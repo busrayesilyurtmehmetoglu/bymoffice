@@ -8,6 +8,7 @@ import { readerAt, recordStream } from '../src/formats/xls/records';
 import { XLS_MAX_SHEETS, readXlsStream } from '../src/formats/xls/workbook';
 import { resolveCellStyle } from '../src/model/sheet/color';
 import { getCell } from '../src/model/sheet/types';
+import { explicitFormula, sharedMasters } from '../src/ops/ops';
 import { cat, defaultStyles, eof, externSheet, formula, narrow, number, ptg, rec, shrFmla, supBookSelf, tokens, u16, u32, wide, workbookStream } from './xls-fixtures';
 
 const context = (): FormulaContext => ({ biff8: true, codepage: 1252, sheetNames: ['Sheet1'], names: [], xti: [], supBooks: [], failures: new Map() });
@@ -96,38 +97,38 @@ test('a shared formula of thousands of nested parentheses costs nothing: the cel
   assert.ok(grown < 128 * 1024 * 1024, `the heap grew by ${Math.round(grown / 1048576)} MB`);
 });
 
-test('shared formulas: the text made for all cells together is bounded by the size of the file', () => {
+test('shared formulas: one text for a group however many cells it has, and every cell has its formula', () => {
   const word = 'y'.repeat(250);
   const shared = [...ptg.str(word), ...repeat([...ptg.str(word), ...ptg.concat], 29), ...ptg.refN(0, 1), ...ptg.concat];
   const count = 2500;
   const stream = sharedSheet(count, shared);
   const { workbook, report } = readXlsStream(stream);
   const sheet = workbook.sheets[0];
+  const masters = sharedMasters(sheet);
   let chars = 0;
-  let withFormula = 0;
-  let lastWith = -1;
   for (let row = 0; row < count; row++) {
-    const cell = getCell(sheet, row, 0);
-    assert.equal(cell?.value, row + 0.5);
-    if (!cell?.formula) continue;
-    withFormula++;
-    lastWith = row;
+    const cell = getCell(sheet, row, 0)!;
+    assert.equal(cell.value, row + 0.5);
+    assert.ok(cell.formula, `row ${row} has no formula`);
     chars += cell.formula.text.length;
-    assert.equal(cell.formula.text.length, 30 * 253 - 1 + 2 + String(row + 1).length);
   }
-  // The first cells have their formula, each for its own row; the cells after the budget is used up have none.
+  // The first cell holds the text; the others point to it, checked or (once reading the group has cost too much) not.
   assert.equal(getCell(sheet, 0, 0)?.formula?.ref, `A1:A${count}`);
-  assert.ok(getCell(sheet, 1, 0)?.formula?.text.endsWith('&B2'));
-  assert.ok(withFormula > 100 && withFormula < count, String(withFormula));
-  assert.equal(lastWith, withFormula - 1);
-  assert.ok(chars <= Math.max(1024 * 1024, stream.length * 64) + MAX_FORMULA_CHARS, String(chars));
-  assert.equal(report.untranslatedFormulas, count - withFormula);
-  assert.equal(report.untranslatedReasons.get('shared formula: the texts of the workbook together are too large'), count - withFormula);
+  assert.equal(chars, 30 * 253 - 1 + 2 + 1);
+  for (const row of [1, 100, count - 1]) {
+    const cell = getCell(sheet, row, 0)!;
+    assert.deepEqual(cell.formula, { text: '', type: 'shared', si: 0 });
+    const text = explicitFormula(cell, row, 0, masters).formula!.text;
+    assert.equal(text.length, 30 * 253 - 1 + 2 + String(row + 1).length);
+    assert.ok(text.endsWith('&B' + (row + 1)));
+  }
+  assert.equal(report.untranslatedFormulas, 0);
 
-  // A genuine group is far below the bound: every cell gets its formula.
+  // A genuine group is far below the bound: every cell is checked and gets its formula.
   const plain = readXlsStream(sharedSheet(3000, tokens(ptg.refN(0, 1), ptg.int(2), ptg.mul)));
   assert.equal(plain.report.untranslatedFormulas, 0);
-  assert.equal(getCell(plain.workbook.sheets[0], 2999, 0)?.formula?.text, 'B3000*2');
+  const last = getCell(plain.workbook.sheets[0], 2999, 0)!;
+  assert.equal(explicitFormula(last, 2999, 0, sharedMasters(plain.workbook.sheets[0])).formula?.text, 'B3000*2');
 });
 
 const STD_LINK = [0xd0, 0xc9, 0xea, 0x79, 0xf9, 0xba, 0xce, 0x11, 0x8c, 0x82, 0x00, 0xaa, 0x00, 0x4b, 0xa9, 0x0b];

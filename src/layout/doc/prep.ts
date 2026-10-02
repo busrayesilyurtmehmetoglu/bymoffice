@@ -4,7 +4,7 @@
 // width the paragraph is broken to, so the result is kept per paragraph and
 // used again whenever the paragraph is laid out.
 
-import { abstractOf, formatCounter } from '../../formats/docx/numbering';
+import { abstractOf, formatCounter, levelOf } from '../../formats/docx/numbering';
 import { resolveNumberRunProps, styleChain } from '../../formats/docx/resolve';
 import {
   EMPTY_RUN_PROPS,
@@ -302,6 +302,17 @@ class Builder {
         text = result.text;
         mapped = true;
         font = symbolTextFont(ctx, font);
+        const flags = result.mapped;
+        if (flags && font !== style.font) {
+          // Glyphs the tables do not know stay in the font of the document, the others are ordinary text.
+          let start = 0;
+          for (let i = 1; i <= text.length; i++) {
+            if (i < text.length && flags[i] === flags[start]) continue;
+            this.segment(text.slice(start, i), flags[start] ? font : style.font, style, offset < 0 ? -1 : offset + start, link);
+            start = i;
+          }
+          return;
+        }
       }
     }
     if (style.caps) text = upper(text, style.dotted);
@@ -422,6 +433,8 @@ function hiddenByRevision(wrap: Wrapper | undefined): boolean {
 
 interface Walk {
   builder: Builder;
+  /** Index in the children of the paragraph of the inline being walked. */
+  inline: number;
   /** Offset in paragraphText(). */
   offset: number;
   /** Open complex fields: the link of a HYPERLINK field, undefined for the others. */
@@ -507,7 +520,10 @@ function walkItems(args: PrepArgs, walk: Walk, run: Run | undefined, items: RunI
         }
         const code = item.field ? parseFieldCode(item.field.instruction) : undefined;
         if (code && item.field && isLiveField(code.name) && !item.field.unclosed) {
-          builder.field(code.name, code.format, item.field.result, style, walk.offset, link);
+          // The value takes the place of the result in the file and its formatting with it.
+          const lender = run ? fieldFormatRun(args.para.children, walk.inline, i) : undefined;
+          const shown = lender && lender !== run ? ctx.runStyle(args.para.props, lender.props, args.where) : style;
+          builder.field(code.name, code.format, item.field.result, shown, walk.offset, link);
           walk.skip = 1;
           continue;
         }
@@ -603,9 +619,50 @@ function walkItems(args: PrepArgs, walk: Walk, run: Run | undefined, items: RunI
   }
 }
 
+/** Items looked at to find the run a field takes its formatting from. */
+const MAX_FIELD_SCAN = 4096;
+
+/**
+ * The run a live field is shown in the formatting of. Word keeps the
+ * formatting of the result when it updates a field, so that is the first run
+ * of the result in the file; a field without a result takes the formatting of
+ * its code. Undefined when the paragraph has neither: the mark that begins the
+ * field decides then. `inline` and `item` say where that mark is.
+ */
+function fieldFormatRun(children: Inline[], inline: number, item: number): Run | undefined {
+  let depth = 1;
+  let inResult = false;
+  let code: Run | undefined;
+  let scanned = 0;
+  for (let i = inline; i < children.length; i++) {
+    const child = children[i];
+    if (child.type !== 'run') continue;
+    if (child.wrap && hiddenByRevision(child.wrap)) continue;
+    const content = child.content;
+    for (let k = i === inline ? item + 1 : 0; k < content.length; k++) {
+      if (++scanned > MAX_FIELD_SCAN) return code;
+      const entry = content[k];
+      if (entry.type === 'fieldChar') {
+        if (entry.charType === 'begin') depth++;
+        else if (entry.charType === 'end') {
+          if (--depth === 0) return code;
+        } else if (depth === 1) inResult = true;
+        continue;
+      }
+      const isCode = entry.type === 'instrText' || inFieldCode(child, k);
+      // What a field in the result shows is part of the result; its code is not.
+      if (inResult && !isCode) return child;
+      if (!inResult && depth === 1 && isCode && !code) code = child;
+    }
+  }
+  return code;
+}
+
 function walkInlines(args: PrepArgs, walk: Walk, children: Inline[]): void {
   const { ctx, para, where } = args;
-  for (const inline of children) {
+  for (let at = 0; at < children.length; at++) {
+    const inline = children[at];
+    walk.inline = at;
     if (inline.type !== 'run' && inline.type !== 'math') continue;
     const wrap = inline.wrap;
     if (wrap && hiddenByRevision(wrap)) continue;
@@ -736,9 +793,14 @@ export function prepareParagraph(
   const numbering = props.numbering;
   if (numbering && numbering.numId !== undefined && numbering.numId !== 0) {
     const level = numbering.level !== undefined ? numbering.level : styleLevel(ctx, props, numbering.numId);
-    const label = (story.main ? ctx.counters : ctx.sideCounters).next(numbering.numId, level);
+    // The number is written in the language of its text: that of the formatting the number has, else of the document.
+    const definition = levelOf(ctx.doc.numbering, ctx.doc.styles, numbering.numId, level >= 0 && level <= 8 ? level : 0);
+    const numberProps = definition ? resolveNumberRunProps(ctx.doc, para.props, definition, where ? where.context : undefined) : undefined;
+    let lang = numberProps && numberProps.lang ? numberProps.lang.val : undefined;
+    if (lang === undefined && ctx.doc.settings.themeFontLang) lang = ctx.doc.settings.themeFontLang.val;
+    const label = (story.main ? ctx.counters : ctx.sideCounters).next(numbering.numId, level, lang);
     if (label) {
-      const style = ctx.makeStyle(resolveNumberRunProps(ctx.doc, para.props, label.level, where ? where.context : undefined));
+      const style = ctx.makeStyle(numberProps && label.level === definition ? numberProps : resolveNumberRunProps(ctx.doc, para.props, label.level, where ? where.context : undefined));
       let text = label.text;
       let font = style.font;
       if (mayHoldSymbols(style.symbol, text)) {
@@ -755,7 +817,7 @@ export function prepareParagraph(
   }
 
   const builder = new Builder(ctx);
-  const walk: Walk = { builder, offset: 0, fields: [], skip: 0, simpleSeen: undefined, simple: undefined, simpleLink: undefined, drawings: 0, floats: [] };
+  const walk: Walk = { builder, inline: 0, offset: 0, fields: [], skip: 0, simpleSeen: undefined, simple: undefined, simpleLink: undefined, drawings: 0, floats: [] };
   walkInlines({ ctx, para, story, path, where, depth, fields, markStyle: mark }, walk, para.children);
   prep.atoms = builder.atoms;
   prep.live = builder.live;

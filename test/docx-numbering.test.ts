@@ -251,3 +251,36 @@ test('docx numbering: the level gives the paragraph its indents, under direct fo
   assert.deepEqual(props(3), { ...IMPLICIT_PARA_PROPS, style: 'Heading1', numbering: { numId: 0 }, indent: { left: 100 } });
   assert.deepEqual(props(4), { ...IMPLICIT_PARA_PROPS, numbering: { numId: 404 } });
 });
+
+test('upper case letters of a Turkish or Azerbaijani list: the ninth is a dotted capital', () => {
+  // Word numbers such a list A, B, ... H, İ, J: the alphabet is a..z, made upper case by the rules of the language.
+  assert.equal(formatCounter(9, 'upperLetter', 'tr-TR'), 'İ');
+  assert.equal(formatCounter(9, 'upperLetter', 'tr'), 'İ');
+  assert.equal(formatCounter(9, 'upperLetter', 'TR-tr'), 'İ');
+  assert.equal(formatCounter(9, 'upperLetter', 'az-Latn-AZ'), 'İ');
+  assert.equal(formatCounter(35, 'upperLetter', 'tr-TR'), 'İİ');
+  assert.equal(formatCounter(8, 'upperLetter', 'tr-TR'), 'H');
+  assert.equal(formatCounter(10, 'upperLetter', 'tr-TR'), 'J');
+  // Any other language, and no language: a plain capital.
+  assert.equal(formatCounter(9, 'upperLetter', 'en-US'), 'I');
+  assert.equal(formatCounter(9, 'upperLetter', 'tra'), 'I');
+  assert.equal(formatCounter(9, 'upperLetter'), 'I');
+  // Lower case letters have their dot in every language; Roman numerals are not letters of the language.
+  assert.equal(formatCounter(9, 'lowerLetter', 'tr-TR'), 'i');
+  assert.equal(formatCounter(9, 'upperRoman', 'tr-TR'), 'IX');
+  assert.equal(formatCounter(1, 'upperRoman', 'tr-TR'), 'I');
+});
+
+test('NumberingCounters.next takes the language of the numbered text', async () => {
+  const numbering =
+    '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="9"/><w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1."/></w:lvl>' +
+    '<w:lvl w:ilvl="1"><w:start w:val="9"/><w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1-%2)"/></w:lvl></w:abstractNum>' +
+    '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
+  const doc = await readSpec({ body: '<w:p/>', numbering });
+  assert.equal(new NumberingCounters(doc.numbering, doc.styles).next(1, 0)!.text, 'I.');
+  const counters = new NumberingCounters(doc.numbering, doc.styles);
+  assert.equal(counters.next(1, 0, 'tr-TR')!.text, 'İ.');
+  // The counters of the levels above are written in the same language.
+  assert.equal(counters.next(1, 1, 'tr-TR')!.text, 'İ-İ)');
+  assert.equal(counters.next(1, 1, 'en-GB')!.text, 'I-J)');
+});

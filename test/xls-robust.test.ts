@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { CfbFile } from '../src/cfb';
 import { readXls, readXlsStream } from '../src/formats/xls/workbook';
 import { getCell } from '../src/model/sheet/types';
+import { explicitFormula, sharedMasters } from '../src/ops/ops';
 import {
   arrayRec,
   blank,
@@ -196,7 +197,10 @@ test('the workbook used for the damage tests reads completely', () => {
   const { workbook, report } = readXlsStream(richWorkbook());
   const sheet = workbook.sheets[0];
   assert.equal(report.untranslatedFormulas, 0);
-  assert.deepEqual([1, 2, 3, 4, 5].map((row) => getCell(sheet, row, 0)?.formula?.text), ['A1*2', 'A2+1', 'A3+1', 'A4+1', "SUM('İkinci'!$A$1:$A$2)"]);
+  // The cells of a shared formula after the first point to it; written out, each has the text for its own row.
+  const masters = sharedMasters(sheet);
+  assert.deepEqual([1, 2, 3, 4, 5].map((row) => explicitFormula(getCell(sheet, row, 0)!, row, 0, masters).formula?.text), ['A1*2', 'A2+1', 'A3+1', 'A4+1', "SUM('İkinci'!$A$1:$A$2)"]);
+  assert.deepEqual([3, 4].map((row) => getCell(sheet, row, 0)?.formula?.text), ['', '']);
   assert.equal(getCell(sheet, 1, 1)?.formula?.text, 'SUM(Ad)');
   assert.equal(getCell(sheet, 1, 1)?.value, 'metin');
   assert.equal(workbook.definedNames.length, 2);

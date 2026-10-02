@@ -519,16 +519,38 @@ interface PendingRow {
   cells: Block[][];
 }
 
+/** Properties of the many cells and rows that state nothing: shared, never changed. */
+const EMPTY_CELL: CellProps = Object.freeze({});
+const EMPTY_ROW: RowProps = Object.freeze({});
+const hasKeys = (object: object): boolean => {
+  for (const key in object) if (Object.prototype.hasOwnProperty.call(object, key)) return true;
+  return false;
+};
+
+/** Tables the reader may still open; one object for all stories of a file. */
+export interface TableBudget {
+  left: number;
+  /** A table was not opened because none were left. */
+  exceeded: boolean;
+}
+
 const hasText = (blocks: Block[]): boolean => blocks.some((block) => block.type !== 'paragraph' || block.children.length > 0);
 
 /** What rows that state the same may share, compared as text. */
 const tableKey = (props: TableProps): string => JSON.stringify([props.borders, props.cellMargins, props.cellSpacing, props.shading]);
 
+const marginsMade = new WeakMap<RowDef, CellMargins>();
+
 /** The cell margins of the table a row belongs to: always stated for the sides, so that layout assumes nothing. */
 function marginsOf(def: RowDef): CellMargins {
-  const out: CellMargins = { ...def.table.cellMargins };
-  out.left = { type: 'dxa', value: def.marginLeft };
-  out.right = { type: 'dxa', value: def.marginRight };
+  // Rows described alike share the result.
+  let out = marginsMade.get(def);
+  if (!out) {
+    out = { ...def.table.cellMargins };
+    out.left = { type: 'dxa', value: def.marginLeft };
+    out.right = { type: 'dxa', value: def.marginRight };
+    marginsMade.set(def, out);
+  }
   return out;
 }
 
@@ -567,13 +589,14 @@ function buildTable(pending: PendingRow[]): Table {
 
   const rows: TableRow[] = [];
   for (const { def, cells } of pending) {
-    const row: TableRow = { props: { ...def.row }, cells: [] };
+    const row: TableRow = { props: hasKeys(def.row) ? { ...def.row } : EMPTY_ROW, cells: [] };
     const edges = edgesOf.get(def) || def.edges;
     const known = edges.length >= 2;
     let last: TableCell | undefined;
     for (let i = 0; i < cells.length; i++) {
       const cellDef = def.cells[i];
-      const cellProps: CellProps = cellDef ? { ...cellDef.props } : {};
+      // A cell nothing is known about (the row describes fewer cells, or none) shares its properties with all like it.
+      const cellProps: CellProps = cellDef ? { ...cellDef.props } : known && i + 1 < edges.length ? {} : EMPTY_CELL;
       let span = 1;
       if (known && i + 1 < edges.length) {
         const from = indexOf.get(edges[i])!;
@@ -583,6 +606,7 @@ function buildTable(pending: PendingRow[]): Table {
       }
       if (cellDef && cellDef.merged && last) {
         // Merged into the cell before it: that cell grows; text the merged cell still holds is kept with it.
+        if (last.props === EMPTY_CELL) last.props = {};
         last.props.gridSpan = (last.props.gridSpan || 1) + span;
         if (last.props.width && cellProps.width && last.props.width.type === 'dxa') {
           last.props.width = { type: 'dxa', value: last.props.width.value + cellProps.width.value };
@@ -590,19 +614,20 @@ function buildTable(pending: PendingRow[]): Table {
         if (hasText(cells[i])) for (const block of cells[i]) last.blocks.push(block);
         continue;
       }
-      delete cellProps.hMerge;
+      if (cellProps.hMerge !== undefined) delete cellProps.hMerge;
       if (span > 1) cellProps.gridSpan = span;
       last = { props: cellProps, blocks: cells[i] };
       row.cells.push(last);
     }
     if (known && lines.length) {
       const before = indexOf.get(edges[0])!;
+      const end = edges[Math.min(edges.length - 1, cells.length)];
+      const after = lines.length - 1 - indexOf.get(end)!;
+      if ((before > 0 || after > 0) && row.props === EMPTY_ROW) row.props = {};
       if (before > 0) {
         row.props.gridBefore = before;
         row.props.widthBefore = { type: 'dxa', value: edges[0] - lines[0] };
       }
-      const end = edges[Math.min(edges.length - 1, cells.length)];
-      const after = lines.length - 1 - indexOf.get(end)!;
       if (after > 0) {
         row.props.gridAfter = after;
         row.props.widthAfter = { type: 'dxa', value: lines[lines.length - 1] - end };
@@ -622,9 +647,10 @@ function buildTable(pending: PendingRow[]): Table {
         if (Object.keys(exception).length) row.tableProps = exception;
       }
     }
+    row.cells = row.cells.slice();
     rows.push(row);
   }
-  return { type: 'table', props, grid, rows };
+  return { type: 'table', props, grid, rows: rows.slice() };
 }
 
 const NO_BORDER: Border = Object.freeze({ style: 'nil' });
@@ -640,7 +666,15 @@ interface Level {
   rows: PendingRow[];
   cells: Block[][];
   current: Block[];
+  /**
+   * The description of the next row, from a row mark that came in front of the cells of its row (see endRow);
+   * undefined in a table whose row marks follow their cells.
+   */
+  early: RowDef | undefined;
 }
+
+/** A budget that is never used up, for an assembler that is given none. */
+const NO_BUDGET: TableBudget = { left: Infinity, exceeded: false };
 
 /**
  * Takes the paragraphs of a story in order and gives back its blocks:
@@ -650,15 +684,29 @@ export class TableAssembler {
   readonly blocks: Block[] = [];
   private readonly levels: Level[] = [];
 
+  constructor(private readonly budget: TableBudget = NO_BUDGET) {}
+
   /** Depth of the innermost open table. */
   get depth(): number {
     return this.levels.length;
   }
 
-  private open(depth: number): Level {
+  /**
+   * The table open at a depth, opened now when it is not yet, with the tables around it. When the reader has no
+   * tables left to open (see TableBudget) this is the innermost table that is open, and undefined when none is.
+   */
+  private open(depth: number): Level | undefined {
     while (this.levels.length > depth) this.close();
-    while (this.levels.length < depth) this.levels.push({ rows: [], cells: [], current: [] });
-    return this.levels[depth - 1];
+    const budget = this.budget;
+    while (this.levels.length < depth) {
+      if (budget.left <= 0) {
+        budget.exceeded = true;
+        break;
+      }
+      budget.left--;
+      this.levels.push({ rows: [], cells: [], current: [], early: undefined });
+    }
+    return this.levels.length ? this.levels[this.levels.length - 1] : undefined;
   }
 
   /** A paragraph (or other block) at a table depth; 0 is outside of every table. */
@@ -668,36 +716,51 @@ export class TableAssembler {
       this.blocks.push(block);
       return;
     }
-    this.open(Math.min(depth, MAX_TABLE_DEPTH)).current.push(block);
+    const level = this.open(Math.min(depth, MAX_TABLE_DEPTH));
+    if (level) level.current.push(block);
+    else this.blocks.push(block);
   }
 
   /** Ends the cell that is open at a depth; a cell nothing was put into is a cell all the same. */
   endCell(depth: number): void {
     const level = this.open(Math.max(1, Math.min(depth, MAX_TABLE_DEPTH)));
-    level.cells.push(level.current);
-    level.current = [];
+    if (!level) return;
+    level.cells.push(level.current.slice());
+    level.current.length = 0;
   }
 
-  /** Ends the row at a depth with the description in effect. */
-  endRow(depth: number, def: RowDef): void {
+  /**
+   * Ends the row at a depth with the description in effect. `ahead` says that the row mark may stand in front of
+   * the cells of its row (it is the one of a "\nesttableprops" group): when a table starts with such a mark, each
+   * of its marks describes the cells after it.
+   */
+  endRow(depth: number, def: RowDef, ahead = false): void {
     const level = this.open(Math.max(1, Math.min(depth, MAX_TABLE_DEPTH)));
+    if (!level) return;
     // A cell left open (no cell mark before the row mark) is closed here.
     if (level.current.length) {
-      level.cells.push(level.current);
-      level.current = [];
+      level.cells.push(level.current.slice());
+      level.current.length = 0;
     }
-    // A row mark without cells before it is not a row.
-    if (!level.cells.length) return;
-    level.rows.push({ def, cells: level.cells });
+    if (!level.cells.length) {
+      // A row mark without cells before it is not a row; at the start of a table it may describe the row to come.
+      if (ahead && !level.rows.length) level.early = def;
+      return;
+    }
+    if (level.early) {
+      level.rows.push({ def: level.early, cells: level.cells });
+      level.early = def;
+    } else level.rows.push({ def, cells: level.cells });
     level.cells = [];
   }
 
   /** Ends the innermost open table and puts it where it belongs. */
   private close(): void {
     const level = this.levels.pop()!;
-    // Cells without a row mark after them (a file cut short, or damaged): a row of their own, nothing known about it.
-    if (level.current.length) level.cells.push(level.current);
-    if (level.cells.length) level.rows.push({ def: EMPTY_DEF, cells: level.cells });
+    // Cells without a row mark after them (a file cut short, or damaged): a row of their own, with the description
+    // that came ahead of them when there is one, else nothing known about it.
+    if (level.current.length) level.cells.push(level.current.slice());
+    if (level.cells.length) level.rows.push({ def: level.early || EMPTY_DEF, cells: level.cells });
     if (!level.rows.length) return;
     const table = buildTable(level.rows);
     const outer = this.levels.length ? this.levels[this.levels.length - 1].current : this.blocks;
@@ -706,6 +769,6 @@ export class TableAssembler {
 
   finish(): Block[] {
     while (this.levels.length) this.close();
-    return this.blocks;
+    return this.blocks.slice();
   }
 }
