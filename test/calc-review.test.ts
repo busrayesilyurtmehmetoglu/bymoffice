@@ -378,7 +378,8 @@ test('3D references, other workbooks, LET and LAMBDA keep their stored values', 
     T: { A1: 2 },
   }, [{ name: 'Outside', value: '[1]Sheet1!$A$1', hidden: false }, { name: 'Known', value: 'S!$A$1', hidden: false }]);
   const engine = new CalcEngine(workbook);
-  engine.recalculate();
+  // Even when every value of the file may be replaced.
+  engine.recalculate(undefined, { overwrite: true });
   const kept = ['B1', 'B2', 'B3', 'B5', 'B6', 'B7', 'B8', 'B9'].map((address) => valueAt(workbook, address));
   assert.deepEqual(kept, [11, 22, 33, 55, 66, 77, 88, 99]);
   assert.equal(valueAt(workbook, 'B10'), 2);

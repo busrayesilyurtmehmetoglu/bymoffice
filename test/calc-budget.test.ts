@@ -369,38 +369,55 @@ test('the time budget is read from the clock that was given', () => {
   assert.equal(unlimited.incomplete, false);
 });
 
-test('a formula that cannot be calculated within a whole budget keeps its value and is not tried forever', () => {
+test('a formula that cannot be calculated within the hard budget keeps its value and is not tried forever', () => {
   const cells: Cells = { D1: { f: 'SUMPRODUCT(COUNTIF(A1:A300,">"&ROW(A1:A300)))', v: 123 }, D2: '=D1+1', E1: '=A1+1', E2: '=A2*2' };
   for (let r = 1; r <= 300; r++) cells[`A${r}`] = r;
   const workbook = book(cells);
-  const engine = new CalcEngine(workbook, { budget: { work: 20000, milliseconds: 0 } });
-  engine.recalculate();
-  assert.equal(engine.incomplete, true);
-  assert.deepEqual(engine.overBudget, []);
+  const engine = new CalcEngine(workbook, { budget: { work: 20000, hardWork: 40000, milliseconds: 0 } });
+  engine.recalculate(undefined, { overwrite: true });
   let calls = 1;
   while (engine.incomplete) {
     engine.recalculate([]);
     assert.ok(++calls < 10, 'the expensive formula is given up');
   }
   assert.deepEqual(engine.overBudget, [{ sheet: 0, row: 0, col: 3 }]);
+  assert.deepEqual(engine.stale, [{ sheet: 0, row: 0, col: 3 }, { sheet: 0, row: 1, col: 3 }]);
   assert.equal(valueAt(workbook, 'D1'), 123);
   assert.equal(valueAt(workbook, 'D2'), 124);
   assert.equal(valueAt(workbook, 'E1'), 2);
   assert.equal(valueAt(workbook, 'E2'), 4);
-  // It is left alone from then on: a change it depends on costs nothing.
+  // A change of what it reads tries it again, once, and gives it up again.
   engine.recalculate([edit(workbook, 'A1', 5)]);
-  assert.equal(engine.incomplete, false);
+  calls = 1;
+  while (engine.incomplete) {
+    engine.recalculate([]);
+    assert.ok(++calls < 10, 'the expensive formula is given up again');
+  }
   assert.equal(valueAt(workbook, 'D1'), 123);
   assert.equal(valueAt(workbook, 'E1'), 6);
+  assert.deepEqual(engine.overBudget, [{ sheet: 0, row: 0, col: 3 }]);
+  // A change of something else does not.
+  assert.deepEqual(engine.recalculate([edit(workbook, 'G1', 5)]), []);
+  assert.equal(engine.incomplete, false);
   // A new formula in the cell is a new start.
   engine.recalculate([edit(workbook, 'D1', '=COUNT(A1:A300)')]);
   assert.equal(valueAt(workbook, 'D1'), 300);
   assert.equal(valueAt(workbook, 'D2'), 301);
   assert.deepEqual(engine.overBudget, []);
-  // With room enough the same formula is calculated.
+  assert.deepEqual(engine.stale, []);
+  // With the default hard budget (ten times the budget, a million units at least) the same formula is calculated,
+  // in a call that is allowed to take longer because nothing else was done in it.
   const roomy = book(cells);
-  new CalcEngine(roomy, NO_LIMIT).recalculate();
+  const patient = new CalcEngine(roomy, { budget: { work: 20000, milliseconds: 0 } });
+  patient.recalculate(undefined, { overwrite: true });
+  calls = 1;
+  while (patient.incomplete) {
+    patient.recalculate([]);
+    assert.ok(++calls < 10);
+  }
   assert.equal(valueAt(roomy, 'D1'), 44850);
+  assert.equal(valueAt(roomy, 'D2'), 44851);
+  assert.deepEqual(patient.overBudget, []);
 });
 
 test('a preview that runs out of budget is #VALUE!', () => {
@@ -436,8 +453,12 @@ test('the default budget stops a recalculation that takes too long', () => {
   const engine = new CalcEngine(workbook, { clock: () => (now += 1000) });
   const start = Date.now();
   engine.recalculate();
-  assert.equal(engine.incomplete, true);
+  // It had the call to itself and went on to the hard limit (ten times the budget): it is given up, and that is said.
+  assert.equal(engine.incomplete, false);
+  assert.deepEqual(engine.overBudget, [{ sheet: 0, row: 0, col: 7 }]);
+  assert.deepEqual(engine.stale, [{ sheet: 0, row: 0, col: 7 }]);
   assert.equal(valueAt(workbook, 'H1'), 7);
+  assert.ok(now >= 50000 && now < 80000, `the clock went to ${now}`);
   assert.ok(Date.now() - start < 3000);
 });
 

@@ -215,8 +215,9 @@ function optional(args: Value[], index: number, fallback: number, context: CalcC
 }
 
 /** Rows and columns of an array to build, or the error that says why not. */
-function shape(args: Value[], context: CalcContext, rowsDefault: number | undefined): [number, number] | CalcError {
-  const rowsArg = rowsDefault === undefined ? scalarNumber(first(args[0], context), context) : optional(args, 0, rowsDefault, context);
+function shape(args: Value[], context: CalcContext): [number, number] | CalcError {
+  // A size left empty, as in SEQUENCE(,2), is 1.
+  const rowsArg = optional(args, 0, 1, context);
   if (typeof rowsArg !== 'number') return rowsArg;
   const colsArg = optional(args, 1, 1, context);
   if (typeof colsArg !== 'number') return colsArg;
@@ -229,7 +230,7 @@ function shape(args: Value[], context: CalcContext, rowsDefault: number | undefi
 }
 
 const sequence: CalcFunction = (args, context) => {
-  const size = shape(args, context, undefined);
+  const size = shape(args, context);
   if (isError(size)) return size;
   const start = optional(args, 2, 1, context);
   if (typeof start !== 'number') return start;
@@ -243,7 +244,7 @@ const sequence: CalcFunction = (args, context) => {
 };
 
 const randomArray: CalcFunction = (args, context) => {
-  const size = shape(args, context, 1);
+  const size = shape(args, context);
   if (isError(size)) return size;
   const low = optional(args, 2, 0, context);
   if (typeof low !== 'number') return low;

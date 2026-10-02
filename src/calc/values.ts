@@ -168,8 +168,43 @@ export function parseDateText(text: string, context?: CalcContext): number | und
 }
 
 /**
+ * A whole number and a fraction, as "1 1/2" or "-0 3/4": its value; undefined when the text
+ * is anything else. A fraction alone ("1/2") is not read here: it is a date.
+ */
+function fractionText(text: string): number | undefined {
+  const n = text.length;
+  let i = 0;
+  while (i < n && isSpaceCode(text.charCodeAt(i))) i++;
+  let c = text.charCodeAt(i);
+  const negative = c === 45;
+  if (c === 43 || c === 45) i++;
+  const parts = [0, 0, 0];
+  for (let part = 0; part < 3; part++) {
+    const start = i;
+    while (i < n && (c = text.charCodeAt(i)) >= 48 && c <= 57) {
+      parts[part] = parts[part] * 10 + (c - 48);
+      i++;
+    }
+    if (i === start) return undefined;
+    if (part === 0) {
+      // Spaces between the whole number and the fraction.
+      const gap = i;
+      while (i < n && text.charCodeAt(i) === 32) i++;
+      if (i === gap) return undefined;
+    } else if (part === 1) {
+      if (text.charCodeAt(i) !== 47) return undefined;
+      i++;
+    }
+  }
+  while (i < n && isSpaceCode(text.charCodeAt(i))) i++;
+  if (i < n || parts[2] === 0) return undefined;
+  const value = parts[0] + parts[1] / parts[2];
+  return isFinite(value) ? (negative ? -value : value) : undefined;
+}
+
+/**
  * Text as a number the way Excel reads it wherever a number is needed: plain numbers,
- * percentages, thousands separators, currency, dates and times (en-US conventions).
+ * percentages, thousands separators, currency, fractions, dates and times (en-US conventions).
  * The context gives the date system and the year of dates written without one.
  */
 export function parseNumberText(text: string, context?: CalcContext): number | undefined {
@@ -179,6 +214,8 @@ export function parseNumberText(text: string, context?: CalcContext): number | u
   const c = text.charCodeAt(0);
   // Formulas and forced text are meanings of the cell editor, not of a value.
   if (c === 61 || c === 39) return undefined;
+  const fraction = fractionText(text);
+  if (fraction !== undefined) return fraction;
   const parsed = parseCellInput(text, inputOptions(context));
   return parsed.kind === 'number' && typeof parsed.value === 'number' && isFinite(parsed.value) ? parsed.value : undefined;
 }

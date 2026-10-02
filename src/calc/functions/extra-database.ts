@@ -118,14 +118,23 @@ function database(kind: Kind): CalcFunction {
       let tests = 0;
       for (let r = 1; r < criteria.rows && !everything; r++) {
         const conditions: Condition[] = [];
+        let never = false;
         for (let c = 0; c < criteria.cols; c++) {
           const cell = clean(criteria.data[r * criteria.cols + c]);
           if (cell === null || cell === '') continue;
-          // A condition under a heading that names no field is a calculated criterion: it would have
-          // to be worked out again for every record, which the value in the cell does not allow.
-          if (fields[c] < 0) return ERROR_VALUE;
+          if (fields[c] < 0) {
+            // A condition under a heading that names no field is a calculated criterion. It would
+            // have to be worked out again for every record, which the value in the cell does not
+            // allow, unless that value is the same for all of them: TRUE asks for nothing,
+            // FALSE lets no record through.
+            if (cell === true) continue;
+            if (cell !== false) return ERROR_VALUE;
+            never = true;
+            continue;
+          }
           conditions.push({ field: fields[c], criterion: cellCriterion(cell, context) });
         }
+        if (never) continue;
         if (conditions.length === 0) everything = true;
         else {
           alternatives.push(conditions);

@@ -258,7 +258,8 @@ test('a result of another kind replaces what the cell held', () => {
   // As read from a file: text from the shared strings, with formatting runs, in a styled cell.
   row.cells[1] = { ...row.cells[1], runs: [{ text: 'x' }], si: 3, style: 7, cm: 1 };
   const engine = engineFor(workbook);
-  engine.recalculate();
+  // The value of the file ("x") is not what the formula gives: it is only replaced when that is asked for.
+  engine.recalculate(undefined, { overwrite: true });
   assert.deepEqual(at(workbook, 'B1'), { kind: 'string', value: 'one', style: 7, cm: 1, formula: { text: 'IF(A1=1,"one",A1)', type: 'normal' } });
   engine.recalculate([edit(workbook, 0, 'A1', 2)]);
   assert.deepEqual([at(workbook, 'B1')?.kind, valueAt(workbook, 'B1'), at(workbook, 'B1')?.style], ['number', 2, 7]);
@@ -544,7 +545,10 @@ test('circular references give 0 and are reported', () => {
   });
   const engine = engineFor(workbook);
   engine.recalculate();
-  for (const cell of ['A1', 'B1', 'B2', 'C1', 'C2', 'C3', 'E1']) assert.deepEqual([cell, at(workbook, cell)?.kind, valueAt(workbook, cell)], [cell, 'number', 0]);
+  for (const cell of ['A1', 'B1', 'B2', 'C1', 'C2', 'C3']) assert.deepEqual([cell, at(workbook, cell)?.kind, valueAt(workbook, cell)], [cell, 'number', 0]);
+  // The file has a value for E1 (a workbook with iterative calculation would): nothing E1 reads changed, so it stays.
+  assert.equal(valueAt(workbook, 'E1'), 55);
+  assert.deepEqual(engine.mismatched, [{ sheet: 0, row: 0, col: 4 }]);
   assert.equal(valueAt(workbook, 'D1'), 10);
   assert.equal(valueAt(workbook, 'F1'), 2);
   const found = engine.circular.map((cell) => cellName(cell.row, cell.col)).sort();
@@ -579,7 +583,8 @@ test('a chain of 200,000 cells does not overflow the stack', () => {
   sheet.rows = new Map(rows);
   const engine = engineFor(workbook);
   let start = performance.now();
-  const result = engine.recalculate();
+  // The cells hold 0 as the value of the file.
+  const result = engine.recalculate(undefined, { overwrite: true });
   const full = performance.now() - start;
   assert.equal(result[0].cells.length, length - 1);
   assert.equal(getCell(sheet, length - 1, 0)?.value, length);
@@ -658,7 +663,7 @@ test('formulas that cannot be parsed keep their values', () => {
   });
   const before = at(workbook, 'B1');
   const engine = engineFor(workbook);
-  const result = engine.recalculate();
+  const result = engine.recalculate(undefined, { overwrite: true });
   // The cells with unknown syntax are not turned into errors, and what reads them uses their values.
   assert.deepEqual(names(workbook, result), ['S!C1']);
   assert.equal(at(workbook, 'B1'), before);
@@ -875,7 +880,7 @@ test('shared formulas built by hand: a cell pushed off the sheet, a group withou
     },
   });
   const engine = engineFor(workbook);
-  engine.recalculate();
+  engine.recalculate(undefined, { overwrite: true });
   assert.equal(valueAt(workbook, 'B2'), 3);
   // One row up, "A1" has nowhere to go.
   assert.equal(valueAt(workbook, 'B1'), '#REF!');

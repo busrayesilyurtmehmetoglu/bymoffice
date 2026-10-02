@@ -11,8 +11,15 @@
 //
 // Three kinds of formula are left alone, with the value the file stores for them: those
 // whose text cannot be parsed, those that use something this engine does not have (an
-// unknown function, a reference across sheets or into another workbook), and those that
-// cannot be calculated within the budget of a recalculation.
+// unknown function, a reference across sheets or into another workbook, a use of a function
+// that is only partly supported), and those that cannot be calculated within the budget of
+// a recalculation. A fourth kind is calculated but keeps its value: a formula that is
+// calculated again although nothing it reads changed, and comes out different from what the
+// file says. The file was written by a program that knew something this engine does not.
+//
+// Everything that can take long is done in slices: reading the formulas into the graph,
+// finding the circular references, calculating. A call that runs out of budget returns with
+// `incomplete` set and the next call goes on where it stopped.
 
 import { isoToSerial } from '../format/cell-format';
 import { MAX_COLS, MAX_ROWS, parseRange, type Cell, type CellFormula, type CellRange, type Row, type Sheet, type Workbook } from '../model/sheet/types';
@@ -27,8 +34,20 @@ import { ERROR_NUM, ERROR_VALUE, arrayAt, calcError, isArray, isError, isRef, pa
 export interface CalcBudget {
   /** Milliseconds on the clock. 5000 when omitted; 0 or Infinity for no limit. */
   milliseconds?: number;
-  /** Units of work: cells read, elements of arrays calculated, functions called. No limit when omitted. */
+  /**
+   * Units of work: cells read, elements of arrays calculated, functions called. No limit when
+   * omitted. Only calculating counts; building the dependency graph is limited by `milliseconds`.
+   */
   work?: number;
+  /**
+   * What a formula may take that cannot be calculated within `milliseconds` even with a call
+   * to itself: the call goes on until it is done or this limit is reached, and only then is
+   * the formula given up (see CalcEngine.overBudget). Ten times `milliseconds` and at least
+   * 2000 when omitted; 0 or Infinity for no limit.
+   */
+  hardMilliseconds?: number;
+  /** The same for `work`: ten times `work` and at least 1,000,000 when omitted. */
+  hardWork?: number;
 }
 
 export interface CalcEngineOptions {
@@ -50,6 +69,17 @@ export interface CalcEngineOptions {
   clock?: () => number;
 }
 
+export interface RecalculateOptions {
+  /**
+   * With a recalculation of everything: every formula counts as changed, so what is
+   * calculated replaces the value of the file also where the two differ. For use after an
+   * edit that can change any value without naming cells (rows or columns deleted, a defined
+   * name changed). Without it, a formula none of whose precedents changed keeps a value of
+   * the file that differs from what the engine calculates (see CalcEngine.mismatched).
+   */
+  overwrite?: boolean;
+}
+
 export interface CellAddress {
   sheet: number;
   row: number;
@@ -60,6 +90,13 @@ export interface CellAddress {
 const FRESH = 0;
 const ACTIVE = 1;
 const DONE = 2;
+
+// What becomes of the result of a formula (FormulaRec.keep).
+const KEEP_NONE = 0;
+/** The same as the value of the file: the cell is left as it is. */
+const KEEP_SAME = 1;
+/** Different from the value of the file, which stays. */
+const KEEP_STORED = 2;
 
 /** Everything the engine knows about one formula cell. */
 interface FormulaRec {
@@ -74,16 +111,16 @@ interface FormulaRec {
   /** Distance from the master of a shared formula; relative references move by this much. */
   dRow: number;
   dCol: number;
-  /** Calculated in every recalculation: reads the clock, a random number or cells chosen while calculating. */
+  /** Calculated whenever anything changed: reads the clock, a random number or cells chosen while calculating. */
   volatile: boolean;
+  /** Reads the clock or a random number: its value changes by itself. */
+  timed: boolean;
   isArray: boolean;
   /** Ranges are arrays everywhere in the formula: an array formula or a dynamic array formula. */
   arrayMode: boolean;
   /** One of its references names its own cell. */
   selfRef: boolean;
-  /** How often a recalculation ran out of budget while calculating this formula. */
-  aborts: number;
-  /** Could not be calculated within a whole budget; left alone until its formula changes. */
+  /** Could not be calculated within the hard budget; left alone until something it reads changes. */
   costly: boolean;
   /** Cells an array formula fills, when there is more than one. */
   spill?: CellRange;
@@ -94,19 +131,52 @@ interface FormulaRec {
   value: Scalar;
   /** Whole result of an array formula. */
   result?: ArrayValue;
-  /** Part of a circular reference. */
+  /** Part of a circular reference made of the references the formulas name. */
   circular: boolean;
-  /** The cell or its formula changed without the engine being told; skipped until the record is rebuilt. */
-  stale: boolean;
+  /** Part of a circular reference found while calculating (through OFFSET, INDIRECT). */
+  looped: boolean;
+  /** Something it reads, or its own formula, changed: its result replaces whatever the cell holds. */
+  live: boolean;
+  /** KEEP_*: what the last calculation decided about the value the cell holds. */
+  keep: number;
+  /** Listed in `mismatched`. */
+  kept: boolean;
+  /** The cell or its formula changed without the engine being told, or the record was taken out of the graph. */
+  gone: boolean;
   /** Index in the chain of formulas being calculated. */
   position: number;
+  // Finding circular references (see components()).
+  stamp: number;
+  index: number;
+  low: number;
+  onStack: boolean;
+  /** Group of formulas that read one another, 0 for none. */
+  comp: number;
+  /** Where the record is in the column index of its sheet. */
+  column?: Column;
+  at: number;
 }
+
+/** A range that formulas read, as a node of the graph in which circular references are looked for. */
+interface RangeNode {
+  area: true;
+  sheet: number;
+  range: CellRange;
+  stamp: number;
+  index: number;
+  low: number;
+  onStack: boolean;
+}
+
+type GraphNode = FormulaRec | RangeNode;
 
 interface Precedent {
   sheet: number;
   range: CellRange;
   /** Only asked where it is (ROW, COLUMNS, the base of OFFSET): its cells are not read. */
   shapeOnly: boolean;
+  /** Set for a range of several cells that is read. */
+  node?: RangeNode;
 }
 
 interface Entry {
@@ -121,6 +191,16 @@ interface Bucket {
   entries: Entry[];
   /** Recalculation in which every formula of the bucket was already found dirty. */
   done: number;
+  /** Recalculation in which every formula of the bucket was already found dirty and live. */
+  doneLive: number;
+}
+
+/** The formulas of one column in row order, for finding those inside a range. */
+interface Column {
+  rows: number[];
+  recs: FormulaRec[];
+  /** For every position, the first position from there on whose formula still matters (see find()). */
+  skip: Int32Array;
 }
 
 interface SheetState {
@@ -140,8 +220,13 @@ interface SheetState {
   spillRanges: FormulaRec[];
   /** Every formula that fills more than its own cell. */
   spills: Set<FormulaRec>;
-  /** Keys of `recs` in ascending order, built when a circular reference is looked into. */
-  recKeys?: number[];
+  /** The ranges of several cells that formulas read on this sheet, one node per range. */
+  ranges: Map<string, RangeNode>;
+  /** Formulas by column, built when circular references are looked for; undefined after the formulas changed. */
+  columns?: Map<number, Column>;
+  /** Keys of `columns` in ascending order. */
+  columnKeys: number[];
+  spillList: FormulaRec[];
   /** Row indexes in ascending order, built when a large range is first read in a recalculation. */
   rowKeys?: number[];
   /** Per row, the last recalculation in which a formula of the row was dirty: a cheap first test before a record is looked up. */
@@ -155,6 +240,46 @@ interface NameEntry {
   text: string;
   /** undefined: not parsed yet; null: cannot be parsed. */
   node?: Node | null;
+}
+
+/** Where reading the formulas into the graph stands. */
+interface BuildState {
+  sheet: number;
+  rows?: Iterator<[number, Row]>;
+  masters: MastersHolder;
+}
+
+/** The masters of the shared formulas of a sheet, worked out when the first one is needed. */
+interface MastersHolder {
+  masters?: SharedMasters;
+}
+
+/** A search for circular references in progress (Tarjan's algorithm with a stack of its own). */
+interface ComponentRun {
+  /** Every formula is looked at. */
+  all: boolean;
+  seeds: FormulaRec[];
+  next: number;
+  stamp: number;
+  counter: number;
+  /** Nodes whose group is not complete yet. */
+  stack: GraphNode[];
+  /** The path being walked, with where each node is in the list of what it reads. */
+  path: GraphNode[];
+  a: number[];
+  b: number[];
+  c: number[];
+  steps: number;
+  limit: number;
+}
+
+/** A changed cell whose formula was read into the graph and whose dependents are still to be marked. */
+interface ReadyCell {
+  sheet: number;
+  row: number;
+  col: number;
+  /** The cell holds a formula it did not hold before. */
+  replaced: boolean;
 }
 
 type MutableContext = { -readonly [K in keyof CalcContext]: CalcContext[K] };
@@ -171,8 +296,11 @@ const MAX_LIVE_DEPTH = 300;
 /** Below this many rows a range is read row by row instead of through the sorted row list. */
 const DIRECT_ROWS = 32;
 
-/** Calculated every time, whatever changed. */
+/** Calculated whenever anything changed. */
 const VOLATILE = new Set(['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY', 'OFFSET', 'INDIRECT']);
+
+/** Their value changes although no cell did. */
+const TIMED = new Set(['NOW', 'TODAY', 'RAND', 'RANDBETWEEN', 'RANDARRAY']);
 
 /** Functions that only ask where a reference is; the cells of a reference given to them directly are not read. */
 const SHAPE_ONLY = new Set(['ROW', 'COLUMN', 'ROWS', 'COLUMNS', 'AREAS', 'SHEET', 'SHEETS', 'ISREF', 'ISFORMULA', 'FORMULATEXT']);
@@ -180,16 +308,27 @@ const SHAPE_ONLY = new Set(['ROW', 'COLUMN', 'ROWS', 'COLUMNS', 'AREAS', 'SHEET'
 /** Functions the evaluator knows by name but cannot calculate. */
 const UNSUPPORTED_FORMS = new Set(['LET', 'LAMBDA']);
 
+/** What CELL can tell: the first three only ask where the cell is. */
+const CELL_WHERE = new Set(['row', 'col', 'address']);
+const CELL_INFO = new Set(['row', 'col', 'address', 'contents']);
+
 const DEFAULT_MILLISECONDS = 5000;
+const MIN_HARD_MILLISECONDS = 2000;
+const MIN_HARD_WORK = 1000000;
+const HARD_FACTOR = 10;
 /** Units of work between two looks at the clock. */
 const CLOCK_EVERY = 2048;
+/** Formulas read into the graph between two looks at the clock. */
+const BUILD_EVERY = 256;
+/** Steps of the search for circular references between two looks at the clock. */
+const SEARCH_EVERY = 4096;
+/** Two numbers closer than this, relative to the larger one, are the same value written twice. */
+const SAME_NUMBER = 1e-12;
 
 /** Thrown through the evaluator to start over with a shallower stack. */
 const UNWIND = new EvaluationAbort();
 /** Thrown when the budget of a recalculation is used up. */
 const BUDGET = new EvaluationAbort();
-/** Thrown when a circular reference is found among formulas that were already calculated: the pass starts over. */
-const RESTART = new EvaluationAbort();
 const ZERO: ArrayValue = { rows: 1, cols: 1, data: [0] };
 
 const keyOf = (row: number, col: number) => row * MAX_COLS + col;
@@ -226,6 +365,19 @@ function modelValue(cell: Cell, date1904: boolean): Scalar {
   return null;
 }
 
+/** Whether a cell holds a value at all; a formula without one was never calculated. */
+function hasValue(cell: Cell): boolean {
+  return cell.kind !== 'blank' && cell.value !== null && cell.value !== undefined;
+}
+
+/** Whether what was calculated is what the file holds; numbers may differ in their last digits. */
+function sameValue(stored: Scalar, value: Scalar): boolean {
+  if (stored === value) return true;
+  if (typeof stored === 'number' && typeof value === 'number') return Math.abs(stored - value) <= SAME_NUMBER * Math.max(Math.abs(stored), Math.abs(value));
+  if (isError(stored) && isError(value)) return stored.error === value.error;
+  return false;
+}
+
 /** First index whose key is not below `value`. */
 function lowerBound(keys: number[], value: number): number {
   let low = 0;
@@ -238,12 +390,74 @@ function lowerBound(keys: number[], value: number): number {
   return low;
 }
 
+/** First position from `i` on that was not struck out; the way there is shortened for the next time. */
+function find(skip: Int32Array, i: number): number {
+  let root = i;
+  while (skip[root] !== root) root = skip[root];
+  while (skip[i] !== root) {
+    const next = skip[i];
+    skip[i] = root;
+    i = next;
+  }
+  return root;
+}
+
+/** Whether `text` has `word` at `at`, without regard to case; `word` is in lower case. */
+function wordAt(text: string, at: number, word: string): boolean {
+  return text.substring(at, at + word.length).toLowerCase() === word;
+}
+
+/**
+ * Whether a number format given to TEXT uses letters the format engine does not know as
+ * placeholders: the day, month and year letters of other languages ("gg.aa.yyyy", "TT.MM.JJJJ").
+ * Excel reads the format of TEXT in the language of the user; this engine reads en-US.
+ */
+function foreignFormat(code: string): boolean {
+  const n = code.length;
+  for (let i = 0; i < n; i++) {
+    const c = code.charCodeAt(i);
+    if (c === 34) {
+      // "..."
+      i++;
+      while (i < n && code.charCodeAt(i) !== 34) i++;
+    } else if (c === 92 || c === 95 || c === 42) i++;
+    else if (c === 91) {
+      // [...]
+      while (i < n && code.charCodeAt(i) !== 93) i++;
+    } else {
+      const char = code.charAt(i);
+      const lower = char.toLowerCase();
+      // Not a letter.
+      if (lower === char.toUpperCase()) continue;
+      if (wordAt(code, i, 'general')) i += 6;
+      else if (wordAt(code, i, 'am/pm')) i += 4;
+      else if (wordAt(code, i, 'a/p')) i += 2;
+      else if ('ymdhseb'.indexOf(lower) < 0) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Cells whose value an engine wrote: such a value is not one a file vouches for. Cells are
+ * never changed in place, so a cell stays in the set exactly as long as it holds that value.
+ * Shared by all engines: a second engine over the same workbook knows what the first one wrote.
+ */
+const OWN = new WeakSet<Cell>();
+
 export class CalcEngine {
-  /** Cells found in a circular reference by the last recalculation; they hold 0. */
+  /**
+   * Cells found in a circular reference by the last recalculation; when it took several
+   * calls, by all of them. They hold 0, unless nothing they read changed and the file has
+   * another value for them (a workbook with iterative calculation): then that value stays.
+   */
   circular: CellAddress[] = [];
   /**
-   * The last recalculate() call ran out of budget: some formulas were not calculated and
-   * still hold their previous values. Call recalculate([]) (or with the next changes) to go on.
+   * The last recalculate() call ran out of budget: the graph is not built yet, or some
+   * formulas were not calculated and still hold their previous values. Call recalculate([])
+   * (or with the next changes) to go on. Every call does part of the work that is left: a
+   * workbook of N formulas is done after a number of calls proportional to N at most,
+   * however small the budget.
    */
   incomplete = false;
 
@@ -257,27 +471,76 @@ export class CalcEngine {
   private unparsedCells = new Map<string, CellAddress>();
   private unsupportedCells = new Map<string, CellAddress>();
   private costlyCells = new Map<string, CellAddress>();
-  /** Formulas a recalculation that ran out of budget left over, in the order to take them up again. */
-  private carry: FormulaRec[] = [];
+  private mismatchedCells = new Map<string, CellAddress>();
+  /** Cells whose value an engine wrote (see OWN). */
+  private readonly own = OWN;
+  /**
+   * The formulas of the recalculation in progress, and how far it has come: everything in
+   * `dirty` before `cursor` is done. A call that only goes on with it takes it up there.
+   */
+  private dirty: FormulaRec[] = [];
+  private cursor = 0;
+  /** The formula a call ran out of budget in: the next call starts with it. */
+  private first: FormulaRec | undefined;
+  /** Formulas finished by this call, to be written. */
+  private done: FormulaRec[] = [];
+  /** What evaluateText() keeps, apart from what a recalculation in progress keeps. */
+  private previewMemos = new Map<string, unknown>();
+  /** A preview is being calculated: every cell answers from the model. */
+  private previewing = false;
   /** What functions keep for the rest of a recalculation (see CalcContext.memo). */
   private memos = new Map<string, unknown>();
   private work = 0;
   private workLimit = Infinity;
   private timeLimit = Infinity;
+  private softWork = Infinity;
+  private softTime = Infinity;
+  private hardWork = Infinity;
+  private hardTime = Infinity;
   private started = 0;
   /** Amount of work at which the budget is looked at next. */
   private nextCheck = Infinity;
+  /** Formulas are being calculated: a budget that runs out before the first one is done is extended. */
+  private calculating = false;
+  private extended = false;
+  /** Formulas finished by this call. */
+  private finished = 0;
+  /** The formula this call started with. */
+  private sliceRoot: FormulaRec | undefined;
   private prepared = false;
   private built = false;
+  private building: BuildState | undefined;
   private epoch = 0;
   private nowValue: number | undefined;
-  private dirty: FormulaRec[] = [];
-  private stale: FormulaRec[] = [];
+  /** Formulas whose dependents are still to be marked. */
+  private walk: FormulaRec[] = [];
+  /** Set while the dependents of formulas are only gathered, not marked (see `stale`). */
+  private gathering: Set<FormulaRec> | undefined;
+  private outdated: FormulaRec[] = [];
   /** Formulas being calculated, each one needed by the one before it. */
   private chain: FormulaRec[] = [];
   /** Length of the chain when the formula now on top of the JavaScript stack was started. */
   private floor = 0;
   private pending: FormulaRec | undefined;
+  /** recalculate() was called for everything and that has not been done yet. */
+  private wantAll = false;
+  private wantOverwrite = false;
+  /** Changed cells not looked at yet, and those whose dependents are not marked yet. */
+  private wantCells: CellAddress[] = [];
+  private ready: ReadyCell[] = [];
+  // Circular references.
+  private searchAll = false;
+  private seeds: FormulaRec[] = [];
+  private search: ComponentRun | undefined;
+  private stamps = 0;
+  private groupIds = 0;
+  private groups = new Map<number, FormulaRec[]>();
+  /** Formulas marked `looped`. */
+  private loops: FormulaRec[] = [];
+  private circularKeys = new Set<string>();
+  private staleCells: CellAddress[] | undefined;
+  private batching = false;
+  private batchOpen = false;
 
   constructor(
     private readonly workbook: Workbook,
@@ -335,21 +598,86 @@ export class CalcEngine {
   /**
    * Formula cells that parse but use what this engine cannot calculate: a function it does
    * not have, LET or LAMBDA, a reference across sheets (3D) or into another workbook, a sheet
-   * or a name the workbook does not have, a defined name that uses one of those. They keep
-   * the values the file has for them, and formulas that read them read those values. A
-   * formula without a stored value (one just typed in) is not listed: it is calculated and
-   * shows the error (#NAME?, #REF!).
+   * or a name the workbook does not have, a defined name that uses one of those; or a use of
+   * a function that is only partly supported: CELL with anything but "row", "col", "address"
+   * or "contents", INDIRECT in R1C1 notation, INDEX with an area other than 1, a union of
+   * references where no function takes it apart, TEXT with a format that has the date letters
+   * of another language. They keep the values the file has for them, and formulas that read
+   * them read those values. A formula without a value of the file (one just typed in, or one
+   * whose value the engine wrote) is not listed: it is calculated and shows the error.
    */
   get unsupported(): CellAddress[] {
     return Array.from(this.unsupportedCells.values());
   }
 
   /**
-   * Formula cells that could not be calculated within a whole budget, twice. They keep the
-   * values they had and are not tried again until their formula changes or invalidate() is called.
+   * Formula cells that could not be calculated even within the hard budget (see CalcBudget).
+   * They keep the values they had. They are tried again, once, whenever something they read
+   * changes, when everything is recalculated and after invalidate().
    */
   get overBudget(): CellAddress[] {
     return Array.from(this.costlyCells.values());
+  }
+
+  /**
+   * The cells of `overBudget` and every formula that reads one of them, directly or through
+   * other formulas: what they show may not fit the cells they are calculated from.
+   */
+  get stale(): CellAddress[] {
+    if (!this.staleCells) {
+      const found = new Set<FormulaRec>();
+      this.costlyCells.forEach((cell) => {
+        const sh = this.sheets[cell.sheet];
+        const rec = sh ? sh.recs.get(keyOf(cell.row, cell.col)) : undefined;
+        if (rec) found.add(rec);
+      });
+      const walk = Array.from(found);
+      this.gathering = found;
+      this.walk = walk;
+      for (let k = 0; k < walk.length; k++) this.dependents(walk[k], false);
+      this.gathering = undefined;
+      this.walk = [];
+      this.staleCells = Array.from(found).map((rec) => ({ sheet: rec.sheet, row: rec.row, col: rec.col }));
+    }
+    return this.staleCells.slice();
+  }
+
+  /**
+   * Formula cells that were calculated although nothing they read had changed (everything
+   * was recalculated, or the cell was named as changed with the formula it had) and came out
+   * different from the value the file has for them. That value stays, and formulas that read
+   * the cell read it: the program that wrote the file knew something this engine does not
+   * (a number format in another language, say). A cell leaves the list when something it
+   * reads changes: from then on its value is the engine's.
+   */
+  get mismatched(): CellAddress[] {
+    return Array.from(this.mismatchedCells.values());
+  }
+
+  /**
+   * Formula cells that hold no value: a file written by a program that does not calculate
+   * stores its formulas that way. recalculate(engine.uncalculated()) gives them their values.
+   * Cells the engine cannot calculate are not listed once it has looked at them.
+   */
+  uncalculated(): CellAddress[] {
+    const out: CellAddress[] = [];
+    const sheets = this.workbook.sheets || [];
+    for (let s = 0; s < sheets.length; s++) {
+      const sh = this.built ? this.sheets[s] : undefined;
+      sheets[s].rows.forEach((row, index) => {
+        if (!isIndex(index, MAX_ROWS) || !row || !row.cells) return;
+        row.cells.forEach((cell, col) => {
+          if (!cell || !cell.formula || hasValue(cell) || col >= MAX_COLS || cell.formula.type === 'dataTable') return;
+          if (sh) {
+            const rec = sh.recs.get(keyOf(index, col));
+            // Not in the graph: it cannot be parsed, or its master is missing. Over budget: it was tried.
+            if (rec ? rec.formula === cell.formula && rec.costly : !this.wantCells.some((want) => want.sheet === s && want.row === index && want.col === col)) return;
+          }
+          out.push({ sheet: s, row: index, col });
+        });
+      });
+    }
+    return out;
   }
 
   /**
@@ -364,68 +692,142 @@ export class CalcEngine {
    * The call stops when its budget (options.budget) is used up and sets `incomplete`. What
    * was calculated by then is written; the other formulas keep their previous values, never
    * a half-calculated one, and are taken up by the next call, whatever its `changed` is.
+   * Nothing is written before the dependency graph is complete. A formula finished by one
+   * call is not calculated again by the calls that go on with the rest.
    */
-  recalculate(changed?: CellAddress[]): { sheet: number; cells: { row: number; col: number }[] }[] {
-    this.build();
-    this.epoch++;
-    this.nowValue = undefined;
-    this.circular = [];
-    this.dirty = [];
-    this.stale = [];
-    this.memos.clear();
+  recalculate(changed?: CellAddress[], options?: RecalculateOptions): { sheet: number; cells: { row: number; col: number }[] }[] {
+    this.prepare();
+    this.batchOpen = false;
     this.startBudget();
     for (const sh of this.sheets) {
-      sh.rowKeys = undefined;
       sh.copied.clear();
       sh.changed = [];
     }
-    const carried = this.carry;
-    this.carry = [];
-    this.incomplete = false;
-
     if (!Array.isArray(changed)) {
-      // What the last call left over comes first, so that every formula gets its turn at a fresh budget.
-      for (const rec of carried) if (!rec.stale) this.touch(rec);
-      for (const sh of this.sheets) sh.recs.forEach((rec) => this.touch(rec));
+      this.wantAll = true;
+      if (options && options.overwrite === true) this.wantOverwrite = true;
     } else {
-      const first = this.dirty.length;
-      for (const rec of carried) if (!rec.stale) this.touch(rec);
       for (const cell of changed) {
-        if (!cell) continue;
-        const sh = this.sheets[cell.sheet];
-        if (!sh || !isIndex(cell.row, MAX_ROWS) || !isIndex(cell.col, MAX_COLS)) continue;
-        this.refresh(sh, cell.row, cell.col);
-        const rec = sh.recs.get(keyOf(cell.row, cell.col));
-        if (rec) this.touch(rec);
-        else this.collect(sh, cell.row, cell.col, cell.row, cell.col);
-      }
-      this.volatiles.forEach((rec) => this.touch(rec));
-      // Everything that reads a dirty formula is dirty as well; `dirty` grows while it is walked.
-      for (let k = first; k < this.dirty.length; k++) {
-        const rec = this.dirty[k];
-        const sh = this.sheets[rec.sheet];
-        if (rec.spill) this.collect(sh, rec.spill.top, rec.spill.left, rec.spill.bottom, rec.spill.right);
-        else this.collect(sh, rec.row, rec.col, rec.row, rec.col);
+        if (!cell || !this.sheets[cell.sheet] || !isIndex(cell.row, MAX_ROWS) || !isIndex(cell.col, MAX_COLS)) continue;
+        this.wantCells.push({ sheet: cell.sheet, row: cell.row, col: cell.col });
       }
     }
+    this.incomplete = true;
+    if (!this.build()) return [];
+    // The graph follows the cells that were changed; only then can circular references be looked for.
+    for (const cell of this.wantCells) {
+      const sh = this.sheets[cell.sheet];
+      const before = sh.recs.get(keyOf(cell.row, cell.col));
+      this.refresh(sh, cell.row, cell.col);
+      const after = sh.recs.get(keyOf(cell.row, cell.col));
+      this.ready.push({ sheet: cell.sheet, row: cell.row, col: cell.col, replaced: after !== undefined && after !== before });
+    }
+    this.wantCells = [];
+    if (!this.components()) return [];
 
-    for (let k = 0; k < this.dirty.length; k++) if (this.dirty[k].spill) this.materialize(this.dirty[k]);
+    const all = this.wantAll;
+    const changes = this.ready.length > 0;
+    const pending = this.first !== undefined || this.cursor < this.dirty.length;
+    // Marking every formula takes a while in a large workbook: not at the end of a call that built the graph.
+    if (all && this.outOfTime()) return [];
+    // A call that only goes on with what was left takes it up where the last one stopped: what is
+    // done stays done, and what functions keep for a recalculation is still good.
+    if (all || changes || !pending) this.begin(all, changes, pending);
     this.calculateAll();
-    for (let k = 0; k < this.dirty.length; k++) this.store(this.dirty[k]);
+    this.flush();
     // Formulas that turned out to have been changed behind the engine's back are read again for next time.
-    for (const rec of this.stale) this.refresh(this.sheets[rec.sheet], rec.row, rec.col);
-    this.memos.clear();
-    this.incomplete = this.carry.length > 0;
+    for (const rec of this.outdated) this.refresh(this.sheets[rec.sheet], rec.row, rec.col);
+    this.outdated = [];
+    const dirty = this.dirty;
+    while (this.cursor < dirty.length && (dirty[this.cursor].state === DONE || dirty[this.cursor].epoch !== this.epoch)) this.cursor++;
+    this.incomplete = this.first !== undefined || this.cursor < dirty.length;
+    if (!this.incomplete) {
+      this.dirty = [];
+      this.cursor = 0;
+      this.memos.clear();
+    }
 
     const out: { sheet: number; cells: { row: number; col: number }[] }[] = [];
     for (const sh of this.sheets) if (sh.changed.length > 0) out.push({ sheet: sh.index, cells: sh.changed });
     return out;
   }
 
-  /** Call after rows or columns were inserted or deleted, sheets changed, or defined names changed: forgets the dependency graph. */
+  /** Starts a recalculation: marks what has to be calculated. */
+  private begin(all: boolean, changes: boolean, pending: boolean): void {
+    // What the last call left over comes first. Its dependents were marked when it was: the ones
+    // that are done did not read it.
+    const carried: FormulaRec[] = [];
+    if (pending) {
+      const epoch = this.epoch;
+      if (this.first) carried.push(this.first);
+      for (let k = this.cursor; k < this.dirty.length; k++) {
+        const rec = this.dirty[k];
+        if (rec.state !== DONE && rec.epoch === epoch && rec !== this.first) carried.push(rec);
+      }
+    }
+    this.epoch++;
+    this.nowValue = undefined;
+    this.memos.clear();
+    this.dirty = [];
+    this.cursor = 0;
+    this.first = undefined;
+    this.walk = [];
+    for (const sh of this.sheets) sh.rowKeys = undefined;
+    // A new recalculation: what earlier ones found while calculating may no longer hold.
+    this.circular = [];
+    this.circularKeys.clear();
+    for (const rec of this.loops) rec.looped = false;
+    this.loops = [];
+    for (const rec of carried) if (!rec.gone) this.touch(rec);
+    if (all) {
+      const overwrite = this.wantOverwrite;
+      let vouched = 0;
+      for (const sh of this.sheets) {
+        sh.recs.forEach((rec) => {
+          this.touch(rec);
+          if (overwrite || rec.live) rec.live = true;
+          else if (rec.timed || this.unvalued(rec)) {
+            // Its value changes by itself, or it has none: whatever reads it is calculated anew.
+            rec.live = true;
+            this.walk.push(rec);
+          } else if (this.storedOf(rec) !== undefined) vouched++;
+        });
+      }
+      // Without a value of the file to keep, nothing needs to know what is live.
+      if (vouched === 0) this.walk = [];
+    }
+    for (const cell of this.ready) {
+      const sh = this.sheets[cell.sheet];
+      const rec = sh.recs.get(keyOf(cell.row, cell.col));
+      if (rec) this.mark(rec, cell.replaced);
+      else this.collect(sh, cell.row, cell.col, cell.row, cell.col, true);
+    }
+    if (changes || !all) {
+      this.volatiles.forEach((rec) => {
+        // A formula that reads cells it chooses while calculating may read one that changed.
+        if (!rec.costly) this.mark(rec, rec.timed || changes);
+      });
+    }
+    this.wantAll = false;
+    this.wantOverwrite = false;
+    this.ready = [];
+    // Everything that reads a dirty formula is dirty as well; `walk` grows while it is walked.
+    const walk = this.walk;
+    for (let k = 0; k < walk.length; k++) this.dependents(walk[k], walk[k].live);
+    this.walk = [];
+    for (let k = 0; k < this.dirty.length; k++) if (this.dirty[k].spill) this.materialize(this.dirty[k]);
+  }
+
+  /**
+   * Call after rows or columns were inserted or deleted, sheets changed, or defined names
+   * changed: forgets the dependency graph. The recalculation that follows builds it again,
+   * in slices when it is large. When the edit can have changed what formulas are worth
+   * (rows deleted, a name redefined), recalculate everything with `overwrite`.
+   */
   invalidate(): void {
     this.prepared = false;
     this.built = false;
+    this.building = undefined;
     this.sheets = [];
     this.sheetByName = new Map();
     this.names = new Map();
@@ -433,13 +835,28 @@ export class CalcEngine {
     this.unparsedCells = new Map();
     this.unsupportedCells = new Map();
     this.costlyCells = new Map();
+    this.mismatchedCells = new Map();
+    this.staleCells = undefined;
     // Whatever was left over is calculated with everything else: the caller recalculates all after this.
-    this.carry = [];
     this.incomplete = false;
     this.memos.clear();
     this.dirty = [];
-    this.stale = [];
+    this.cursor = 0;
+    this.first = undefined;
+    this.done = [];
+    this.outdated = [];
     this.chain = [];
+    this.walk = [];
+    this.wantAll = false;
+    this.wantOverwrite = false;
+    this.wantCells = [];
+    this.ready = [];
+    this.searchAll = false;
+    this.seeds = [];
+    this.search = undefined;
+    this.groups = new Map();
+    this.loops = [];
+    this.batchOpen = false;
   }
 
   /**
@@ -449,20 +866,64 @@ export class CalcEngine {
    * where it goes wrong; a formula that parses never throws.
    */
   evaluateText(formula: string, at: CellAddress): Scalar {
+    return this.preview(parseFormula(formula), at, at, 0, 0);
+  }
+
+  /**
+   * The value the formula of the cell `anchor` has when it is applied to the cell `at` of
+   * the same sheet: its relative references move by the distance between the two, as they
+   * do when a cell is copied (the formula of a conditional format, of a data validation).
+   * The text is parsed once, however many cells it is calculated for. A reference that is
+   * pushed off the sheet is #REF!. Throws FormulaParseError like evaluateText().
+   */
+  evaluateShifted(formula: string, anchor: CellAddress, at: { row: number; col: number }): Scalar {
     const node = parseFormula(formula);
+    const row = at && isIndex(at.row, MAX_ROWS) ? at.row : 0;
+    const col = at && isIndex(at.col, MAX_COLS) ? at.col : 0;
+    const fromRow = anchor && isIndex(anchor.row, MAX_ROWS) ? anchor.row : 0;
+    const fromCol = anchor && isIndex(anchor.col, MAX_COLS) ? anchor.col : 0;
+    return this.preview(node, anchor, { row, col }, row - fromRow, col - fromCol);
+  }
+
+  /**
+   * Runs `run` with everything evaluateText() and evaluateShifted() work out inside it shared
+   * between the calls: one budget for all of them, and what functions keep for a
+   * recalculation (the index of a lookup table) is kept from one call to the next. The
+   * model must not change while `run` runs.
+   */
+  batch<T>(run: () => T): T {
+    if (this.batching) return run();
+    this.batching = true;
+    this.batchOpen = false;
+    try {
+      return run();
+    } finally {
+      this.batching = false;
+      this.batchOpen = false;
+      this.previewMemos = new Map();
+    }
+  }
+
+  private preview(node: Node, sheetOf: CellAddress, at: { row: number; col: number }, rowShift: number, colShift: number): Scalar {
     this.prepare();
-    // A new epoch: no formula is dirty, every cell answers from the model.
-    this.epoch++;
-    this.nowValue = undefined;
-    this.memos.clear();
-    this.startBudget();
-    for (const sh of this.sheets) sh.rowKeys = undefined;
+    if (!this.batchOpen) {
+      this.nowValue = undefined;
+      this.previewMemos = new Map();
+      this.startBudget();
+      for (const sh of this.sheets) sh.rowKeys = undefined;
+      this.batchOpen = this.batching;
+    }
+    // No formula is calculated for a preview: every cell answers from the model. What a
+    // recalculation in progress keeps is left alone.
+    const memos = this.memos;
+    this.memos = this.previewMemos;
+    this.previewing = true;
     const context = this.context;
-    context.sheet = at && isIndex(at.sheet, this.sheets.length) ? at.sheet : 0;
+    context.sheet = sheetOf && isIndex(sheetOf.sheet, this.sheets.length) ? sheetOf.sheet : 0;
     context.row = at && isIndex(at.row, MAX_ROWS) ? at.row : 0;
     context.col = at && isIndex(at.col, MAX_COLS) ? at.col : 0;
-    this.evalOptions.rowShift = 0;
-    this.evalOptions.colShift = 0;
+    this.evalOptions.rowShift = rowShift;
+    this.evalOptions.colShift = colShift;
     this.evalOptions.arrayFormula = false;
     let value: Scalar;
     try {
@@ -471,7 +932,11 @@ export class CalcEngine {
       // Out of budget, among other things.
       value = ERROR_VALUE;
     }
-    this.memos.clear();
+    this.previewing = false;
+    this.memos = memos;
+    this.evalOptions.rowShift = 0;
+    this.evalOptions.colShift = 0;
+    if (!this.batchOpen) this.previewMemos = new Map();
     if (typeof value === 'number' && !isFinite(value)) return ERROR_NUM;
     return value === null || value === undefined ? 0 : value;
   }
@@ -520,14 +985,31 @@ export class CalcEngine {
 
   // -------------------------------------------------------------------------
   // The budget
+  //
+  // A call has a budget, and formulas are given up to the next call when it runs out. But a
+  // formula that needs more than a whole budget would never be done that way. So when the
+  // budget runs out before the call has finished a single formula, the call goes on up to
+  // the hard limit, until that formula is done. Only a formula that had the hard budget to
+  // itself and did not make it is given up for good.
 
   private startBudget(): void {
     const budget = this.options.budget;
     const milliseconds = budget && budget.milliseconds !== undefined ? Number(budget.milliseconds) : DEFAULT_MILLISECONDS;
     const work = budget && budget.work !== undefined ? Number(budget.work) : Infinity;
-    this.timeLimit = milliseconds > 0 ? milliseconds : Infinity;
-    this.workLimit = work >= 0 ? work : Infinity;
+    this.softTime = milliseconds > 0 ? milliseconds : Infinity;
+    this.softWork = work >= 0 ? work : Infinity;
+    const hardTime = budget && budget.hardMilliseconds !== undefined ? Number(budget.hardMilliseconds) : NaN;
+    const hardWork = budget && budget.hardWork !== undefined ? Number(budget.hardWork) : NaN;
+    this.hardTime = hardTime === 0 ? Infinity : hardTime > 0 ? Math.max(hardTime, this.softTime) : Math.max(this.softTime * HARD_FACTOR, MIN_HARD_MILLISECONDS);
+    this.hardWork = hardWork >= 0 ? Math.max(hardWork, this.softWork) : Math.max(this.softWork * HARD_FACTOR, MIN_HARD_WORK);
+    if (this.softTime === Infinity) this.hardTime = Infinity;
+    this.timeLimit = this.softTime;
+    this.workLimit = this.softWork;
     this.work = 0;
+    this.extended = false;
+    this.finished = 0;
+    this.sliceRoot = undefined;
+    this.calculating = false;
     this.started = this.timeLimit < Infinity ? this.clock() : 0;
     this.nextCheck = Math.min(CLOCK_EVERY, this.workLimit + 1);
   }
@@ -537,13 +1019,28 @@ export class CalcEngine {
     return value === value ? value : 0;
   }
 
+  /** Whether the time of this call is used up; for the work that is not calculating. */
+  private outOfTime(): boolean {
+    return this.timeLimit < Infinity && this.clock() - this.started > this.timeLimit;
+  }
+
   /** Counts work; gives the calculation up when the budget is used up. */
   private spend(units: number): void {
     this.work += units;
     if (this.work < this.nextCheck) return;
-    if (this.work > this.workLimit) throw BUDGET;
-    this.nextCheck = Math.min(this.work + CLOCK_EVERY, this.workLimit + 1);
-    if (this.timeLimit < Infinity && this.clock() - this.started > this.timeLimit) throw BUDGET;
+    for (;;) {
+      let over = this.work > this.workLimit;
+      if (!over) {
+        this.nextCheck = Math.min(this.work + CLOCK_EVERY, this.workLimit + 1);
+        over = this.timeLimit < Infinity && this.clock() - this.started > this.timeLimit;
+      }
+      if (!over) return;
+      if (!this.calculating || this.finished > 0 || this.extended) throw BUDGET;
+      // Not one formula done: this call goes on until one is, within the hard limit.
+      this.extended = true;
+      this.workLimit = this.hardWork;
+      this.timeLimit = this.hardTime;
+    }
   }
 
   private cellFormula(sheet: number, row: number, col: number): string | undefined {
@@ -571,8 +1068,8 @@ export class CalcEngine {
     if (!cell) {
       // A cell an array formula fills may not exist yet.
       if (sh.spillCells.size > 0 || sh.spillRanges.length > 0) {
-        const owner = this.spillOwner(sh, row, col);
-        if (owner && owner.epoch === this.epoch) return this.spillValue(owner, row, col);
+        const owner = this.previewing ? undefined : this.spillOwner(sh, row, col);
+        if (owner && owner.epoch === this.epoch) return this.spillValue(owner, row, col, undefined);
       }
       return null;
     }
@@ -580,6 +1077,7 @@ export class CalcEngine {
   }
 
   private valueOf(sh: SheetState, cell: Cell, row: number, col: number): Scalar {
+    if (this.previewing) return modelValue(cell, !!this.workbook.date1904);
     if (cell.formula !== undefined) {
       if (sh.rowEpoch[row] === this.epoch) {
         const rec = sh.recs.get(keyOf(row, col));
@@ -587,7 +1085,7 @@ export class CalcEngine {
       }
     } else if (sh.spillCells.size > 0 || sh.spillRanges.length > 0) {
       const owner = this.spillOwner(sh, row, col);
-      if (owner && owner.epoch === this.epoch) return this.spillValue(owner, row, col);
+      if (owner && owner.epoch === this.epoch) return this.spillValue(owner, row, col, cell);
     }
     return modelValue(cell, !!this.workbook.date1904);
   }
@@ -652,8 +1150,11 @@ export class CalcEngine {
     return undefined;
   }
 
-  private spillValue(rec: FormulaRec, row: number, col: number): Scalar {
+  private spillValue(rec: FormulaRec, row: number, col: number, cell: Cell | undefined): Scalar {
     this.need(rec);
+    // The values of the file stay: this is one of them.
+    if (rec.keep === KEEP_STORED) return cell ? modelValue(cell, !!this.workbook.date1904) : null;
+    if (rec.circular || rec.looped) return 0;
     const range = rec.spill as CellRange;
     const value = arrayAt(rec.result || ZERO, row - range.top, col - range.left);
     return value === null ? 0 : value;
@@ -668,25 +1169,27 @@ export class CalcEngine {
   // to start is noted and everything on the stack is abandoned; the loop in calculate()
   // then starts again from that formula, with an empty stack, and works its way back up
   // the chain. A formula is calculated at most twice that way.
-
   //
-  // Circular references. A formula that is asked for while it is being calculated is part
-  // of a cycle. Which formulas were on the stack at that moment depends on where the
-  // calculation started, so the cycle is not taken from the stack alone: every formula that
-  // the references tie to the one found (each reads the other, directly or through others)
-  // is marked, and all of them get 0, in whatever order the cells are calculated. Formulas
-  // that only read a cycle are calculated normally.
+  // Circular references. The formulas that read one another through the references they
+  // name are known before anything is calculated (see components()): all of them get 0,
+  // whether or not the part of a formula that closes the circle is ever calculated, and in
+  // whatever order and however many slices the cells are calculated. A circle that only
+  // exists through cells chosen while calculating (OFFSET, INDIRECT) shows when a formula is
+  // asked for while it is being calculated: every formula waiting on the stack at that
+  // moment is part of it, and none of them has a value yet that another formula could have
+  // read. Formulas that only read a circle are calculated normally.
 
   /** The value of a dirty formula, calculating it first if needed. */
   private need(rec: FormulaRec): Scalar {
     if (rec.state === DONE) return rec.value;
     const chain = this.chain;
-    if (rec.circular) {
-      if (rec.state !== ACTIVE) this.settle(rec);
-      return 0;
+    if (rec.circular || rec.looped) {
+      if (rec.state === ACTIVE) return 0;
+      this.settle(rec);
+      return rec.value;
     }
     if (rec.state === ACTIVE) {
-      this.markCircular(rec);
+      this.markLoop(rec);
       return 0;
     }
     if (chain.length - this.floor >= MAX_LIVE || evaluationDepth() > MAX_LIVE_DEPTH) {
@@ -708,58 +1211,56 @@ export class CalcEngine {
     return rec.value;
   }
 
-  /** Calculates every dirty formula, until all are done or the budget is used up. */
+  /** Calculates the dirty formulas from where the last call stopped, until all are done or the budget is used up. */
   private calculateAll(): void {
     const dirty = this.dirty;
-    for (;;) {
-      try {
-        for (let k = 0; k < dirty.length; k++) this.calculate(dirty[k]);
-        return;
-      } catch (error) {
-        if (error === RESTART) {
-          // Formulas calculated before the cycle was known may have read what is now 0: all over again.
-          this.chain.length = 0;
-          this.circular = [];
-          this.memos.clear();
-          for (let k = 0; k < dirty.length; k++) {
-            dirty[k].state = FRESH;
-            dirty[k].result = undefined;
-          }
-          continue;
+    const epoch = this.epoch;
+    this.calculating = true;
+    try {
+      const first = this.first;
+      if (first) {
+        this.first = undefined;
+        if (first.state !== DONE && first.epoch === epoch && !first.gone) {
+          this.sliceRoot = first;
+          this.calculate(first);
+          this.flush();
         }
-        this.abandon();
-        return;
       }
+      for (; this.cursor < dirty.length; this.cursor++) {
+        const rec = dirty[this.cursor];
+        if (rec.state === DONE || rec.epoch !== epoch) continue;
+        if (!this.sliceRoot) this.sliceRoot = rec;
+        this.calculate(rec);
+        // Written while the clock runs, so that writing is part of the budget. Nothing is being
+        // calculated at this point, and what is written is final.
+        this.flush();
+      }
+    } catch (error) {
+      this.abandon();
     }
+    this.calculating = false;
   }
 
-  /** Out of budget: what is not done is left for the next recalculation. */
+  /** Out of budget: what is not done is left for the next call. */
   private abandon(): void {
     const chain = this.chain;
     const blamed = chain.length > 0 ? chain[chain.length - 1] : undefined;
-    chain.length = 0;
-    const dirty = this.dirty;
-    let done = 0;
-    for (let k = 0; k < dirty.length; k++) if (dirty[k].state === DONE) done++;
-    const carry: FormulaRec[] = [];
-    if (blamed && blamed.state !== DONE) {
-      blamed.aborts++;
-      if (done === 0 && blamed.aborts >= 2) {
-        // It had a whole budget to itself, twice. Trying again at every change would only freeze the caller.
-        blamed.costly = true;
-        blamed.epoch = 0;
-        blamed.state = FRESH;
-        this.costlyCells.set(`${blamed.sheet}:${blamed.row}:${blamed.col}`, { sheet: blamed.sheet, row: blamed.row, col: blamed.col });
-      } else carry.push(blamed);
-    }
-    for (let k = 0; k < dirty.length; k++) {
-      const rec = dirty[k];
-      if (rec.state === DONE || rec.costly) continue;
+    for (const rec of chain) {
+      if (rec.state === DONE) continue;
       rec.state = FRESH;
       rec.result = undefined;
-      if (rec !== blamed) carry.push(rec);
     }
-    this.carry = carry;
+    chain.length = 0;
+    this.pending = undefined;
+    if (!blamed || blamed.state === DONE) return;
+    if (this.finished === 0 && blamed === this.sliceRoot) {
+      // It had the hard budget to itself. It keeps its value until something it reads changes.
+      blamed.costly = true;
+      blamed.epoch = 0;
+      blamed.live = false;
+      this.costlyCells.set(`${blamed.sheet}:${blamed.row}:${blamed.col}`, { sheet: blamed.sheet, row: blamed.row, col: blamed.col });
+      this.staleCells = undefined;
+    } else this.first = blamed;
   }
 
   private calculate(root: FormulaRec): void {
@@ -768,7 +1269,7 @@ export class CalcEngine {
     // Left over from a calculation that was cut off by an exception.
     for (const rec of chain) if (rec.state === ACTIVE) rec.state = FRESH;
     chain.length = 0;
-    if (root.circular) {
+    if (root.circular || root.looped) {
       this.settle(root);
       return;
     }
@@ -791,7 +1292,7 @@ export class CalcEngine {
           chain.push(next);
           continue;
         }
-        if (error === BUDGET || error === RESTART) throw error;
+        if (error === BUDGET) throw error;
         value = ERROR_VALUE;
       }
       this.finish(top, value);
@@ -808,9 +1309,9 @@ export class CalcEngine {
     const modelRow = this.sheets[rec.sheet].model.rows.get(rec.row);
     const cell = modelRow ? modelRow.cells[rec.col] : undefined;
     if (!cell || cell.formula !== rec.formula) {
-      if (!rec.stale) {
-        rec.stale = true;
-        this.stale.push(rec);
+      if (!rec.gone) {
+        rec.gone = true;
+        this.outdated.push(rec);
       }
       return cell ? modelValue(cell, !!this.workbook.date1904) : null;
     }
@@ -841,157 +1342,141 @@ export class CalcEngine {
     // Normally `rec` is the last one; anything above it was cut off by an exception.
     for (let k = chain.length - 1; k > rec.position; k--) if (chain[k].state === ACTIVE) chain[k].state = FRESH;
     chain.length = rec.position;
-    if (rec.circular) {
+    if (rec.circular || rec.looped) {
       value = 0;
       rec.result = undefined;
-      this.circular.push({ sheet: rec.sheet, row: rec.row, col: rec.col });
+      this.reportCircular(rec);
     }
-    // An empty result shows as 0, as a reference to an empty cell does.
-    if (value === null || value === undefined) value = 0;
-    else if (typeof value === 'number' && !isFinite(value)) value = ERROR_NUM;
-    rec.value = value;
-    rec.state = DONE;
+    this.conclude(rec, value);
   }
 
   /** A formula known to be circular before it is calculated: it is 0. */
   private settle(rec: FormulaRec): void {
-    rec.value = 0;
     rec.result = undefined;
-    rec.state = DONE;
+    this.reportCircular(rec);
+    this.conclude(rec, 0);
+  }
+
+  private reportCircular(rec: FormulaRec): void {
+    const key = `${rec.sheet}:${rec.row}:${rec.col}`;
+    if (this.circularKeys.has(key)) return;
+    this.circularKeys.add(key);
     this.circular.push({ sheet: rec.sheet, row: rec.row, col: rec.col });
   }
 
-  /** `rec` was asked for while it was being calculated: marks every formula of its cycles. */
-  private markCircular(rec: FormulaRec): void {
-    const chain = this.chain;
-    const members = this.component(rec);
-    // What the stack shows is a cycle too, also when it runs through references made while calculating (OFFSET, INDIRECT).
-    for (let k = rec.position; k < chain.length; k++) members.push(chain[k]);
-    let restart = false;
-    for (const member of members) {
-      if (member.circular) continue;
-      member.circular = true;
-      if (member.state === DONE) restart = true;
-    }
-    if (restart) throw RESTART;
-  }
-
   /**
-   * The formulas tied to `start` by references in both directions: those it reads, directly
-   * or through other formulas, that also read it. Worked out from the references the formulas
-   * name, whether or not they are reached when calculating. Only dirty formulas matter: what
-   * reads a dirty formula is dirty itself.
+   * Decides what a calculated formula is worth. When nothing it reads has changed and the
+   * file has a value for it, that value stands: the same one is not written again, a
+   * different one is kept and the cell reported.
    */
-  private component(start: FormulaRec): FormulaRec[] {
-    interface Group {
-      /** The formulas inside one precedent range. */
-      members: FormulaRec[];
-      /** The formulas that read that range. */
-      users: FormulaRec[];
-      walked: boolean;
-    }
-    const groups = new Map<string, Group>();
-    const reached = new Set<FormulaRec>([start]);
-    const stack: FormulaRec[] = [start];
-    while (stack.length > 0) {
-      const rec = stack.pop() as FormulaRec;
-      for (const precedent of rec.precedents) {
-        if (precedent.shapeOnly) continue;
-        const range = precedent.range;
-        const key = `${precedent.sheet}:${range.top}:${range.left}:${range.bottom}:${range.right}`;
-        let group = groups.get(key);
-        if (!group) {
-          group = { members: this.formulasIn(precedent.sheet, range), users: [], walked: false };
-          groups.set(key, group);
-          for (const member of group.members) {
-            if (reached.has(member)) continue;
-            reached.add(member);
-            stack.push(member);
-          }
-        }
-        group.users.push(rec);
+  private conclude(rec: FormulaRec, value: Scalar): void {
+    // An empty result shows as 0, as a reference to an empty cell does.
+    if (value === null || value === undefined) value = 0;
+    else if (typeof value === 'number' && !isFinite(value)) value = ERROR_NUM;
+    let keep = KEEP_NONE;
+    if (!rec.live) {
+      const stored = this.storedOf(rec);
+      if (stored !== undefined) {
+        keep = sameValue(stored, value) && !(rec.spill && this.spillDiffers(rec)) ? KEEP_SAME : KEEP_STORED;
+        value = stored;
       }
     }
-    // Back from `start`: whoever reads a range it lies in, and whoever reads those.
-    const inside = new Map<FormulaRec, Group[]>();
-    groups.forEach((group) => {
-      for (const member of group.members) {
-        const list = inside.get(member);
-        if (list) list.push(group);
-        else inside.set(member, [group]);
+    if (keep === KEEP_STORED) {
+      if (!rec.kept) {
+        rec.kept = true;
+        this.mismatchedCells.set(`${rec.sheet}:${rec.row}:${rec.col}`, { sheet: rec.sheet, row: rec.row, col: rec.col });
       }
-    });
-    const out: FormulaRec[] = [start];
-    const seen = new Set<FormulaRec>(out);
-    stack.push(start);
-    while (stack.length > 0) {
-      const list = inside.get(stack.pop() as FormulaRec);
-      if (!list) continue;
-      for (const group of list) {
-        if (group.walked) continue;
-        group.walked = true;
-        for (const user of group.users) {
-          if (seen.has(user)) continue;
-          seen.add(user);
-          out.push(user);
-          stack.push(user);
-        }
-      }
+    } else if (rec.kept) {
+      rec.kept = false;
+      this.mismatchedCells.delete(`${rec.sheet}:${rec.row}:${rec.col}`);
     }
-    return out;
+    rec.keep = keep;
+    rec.value = value;
+    rec.state = DONE;
+    this.done.push(rec);
+    if (++this.finished === 1 && this.extended) {
+      // The formula the budget was extended for is done: the next look at the budget ends the call.
+      this.workLimit = this.softWork;
+      this.timeLimit = this.softTime;
+      this.nextCheck = 0;
+    }
   }
 
-  /** The dirty formulas whose cell, or one of the cells they fill, lies in a range. */
-  private formulasIn(sheet: number, range: CellRange): FormulaRec[] {
-    const sh = this.sheets[sheet];
-    const out: FormulaRec[] = [];
-    if (!sh) return out;
-    const epoch = this.epoch;
-    if (range.top === range.bottom && range.left === range.right) {
-      const rec = sh.recs.get(keyOf(range.top, range.left));
-      if (rec && rec.epoch === epoch) out.push(rec);
-    } else {
-      let keys = sh.recKeys;
-      if (!keys) {
-        keys = Array.from(sh.recs.keys()).sort((a, b) => a - b);
-        sh.recKeys = keys;
+  /** The value the file has for a formula; undefined when the cell has none or the engine wrote it. */
+  private storedOf(rec: FormulaRec): Scalar | undefined {
+    const modelRow = this.sheets[rec.sheet].model.rows.get(rec.row);
+    const cell = modelRow ? modelRow.cells[rec.col] : undefined;
+    if (!cell || cell.formula !== rec.formula || this.own.has(cell)) return undefined;
+    const value = modelValue(cell, !!this.workbook.date1904);
+    return value === null ? undefined : value;
+  }
+
+  /** Whether the cell of a formula holds no value at all. */
+  private unvalued(rec: FormulaRec): boolean {
+    const modelRow = this.sheets[rec.sheet].model.rows.get(rec.row);
+    const cell = modelRow ? modelRow.cells[rec.col] : undefined;
+    return !cell || cell.formula !== rec.formula || !hasValue(cell);
+  }
+
+  /** Whether a cell an array formula fills holds a value of the file other than the one calculated. */
+  private spillDiffers(rec: FormulaRec): boolean {
+    const sh = this.sheets[rec.sheet];
+    const range = rec.spill as CellRange;
+    const result = rec.result || ZERO;
+    const zero = rec.circular || rec.looped;
+    const date1904 = !!this.workbook.date1904;
+    for (let r = range.top; r <= range.bottom; r++) {
+      const row = sh.model.rows.get(r);
+      if (!row) continue;
+      for (let c = range.left; c <= range.right; c++) {
+        const cell = row.cells[c];
+        if (!cell || cell.formula || this.own.has(cell) || (r === rec.row && c === rec.col)) continue;
+        const stored = modelValue(cell, date1904);
+        if (stored === null) continue;
+        const value = zero ? 0 : arrayAt(result, r - range.top, c - range.left);
+        if (!sameValue(stored, value === null ? 0 : value)) return true;
       }
-      const last = keyOf(range.bottom, range.right);
-      let k = lowerBound(keys, keyOf(range.top, range.left));
-      const from = k;
-      for (; k < keys.length && keys[k] <= last; k++) {
-        const col = keys[k] % MAX_COLS;
-        if (col < range.left || col > range.right) continue;
-        const rec = sh.recs.get(keys[k]);
-        if (rec && rec.epoch === epoch) out.push(rec);
-      }
-      this.spend(k - from);
     }
-    if (sh.spills.size > 0) {
-      this.spend(sh.spills.size);
-      sh.spills.forEach((rec) => {
-        const spill = rec.spill as CellRange;
-        if (rec.epoch !== epoch || spill.top > range.bottom || spill.bottom < range.top || spill.left > range.right || spill.right < range.left) return;
-        if (out.indexOf(rec) < 0) out.push(rec);
-      });
+    return false;
+  }
+
+  /** `rec` was asked for while it was being calculated: every formula waiting on it is part of a circle. */
+  private markLoop(rec: FormulaRec): void {
+    const chain = this.chain;
+    for (let k = rec.position; k < chain.length; k++) {
+      const member = chain[k];
+      if (member.looped) continue;
+      member.looped = true;
+      this.loops.push(member);
     }
-    return out;
   }
 
   // -------------------------------------------------------------------------
   // Writing results
 
+  /** Writes the results of the formulas that were finished since the last time. */
+  private flush(): void {
+    const done = this.done;
+    if (done.length === 0) return;
+    for (let k = 0; k < done.length; k++) {
+      this.store(done[k]);
+      done[k].live = false;
+    }
+    done.length = 0;
+  }
+
   private store(rec: FormulaRec): void {
     // What a recalculation that ran out of budget did not reach keeps its value.
-    if (rec.stale || rec.state !== DONE) return;
+    if (rec.gone || rec.state !== DONE || rec.keep === KEEP_STORED) return;
     const sh = this.sheets[rec.sheet];
     const modelRow = sh.model.rows.get(rec.row);
     const cell = modelRow ? modelRow.cells[rec.col] : undefined;
     if (!cell || cell.formula !== rec.formula) return;
-    this.put(sh, rec.row, rec.col, cell, rec.value);
+    if (rec.keep === KEEP_NONE) this.put(sh, rec.row, rec.col, cell, rec.value);
     const range = rec.spill;
     if (!range) return;
     const result = rec.result || ZERO;
+    const zero = rec.circular || rec.looped;
     for (let r = range.top; r <= range.bottom; r++) {
       for (let c = range.left; c <= range.right; c++) {
         if (r === rec.row && c === rec.col) continue;
@@ -1000,7 +1485,7 @@ export class CalcEngine {
         // A formula of its own is not what the array formula left there.
         if (existing && existing.formula) continue;
         // Where the result does not reach, arrayAt() answers #N/A, as Excel fills such cells.
-        const value = rec.circular ? 0 : arrayAt(result, r - range.top, c - range.left);
+        const value = zero ? 0 : arrayAt(result, r - range.top, c - range.left);
         this.put(sh, r, c, existing, value);
       }
     }
@@ -1050,12 +1535,14 @@ export class CalcEngine {
     // The text no longer comes from the shared string the cell was read from.
     delete next.runs;
     delete next.si;
+    this.own.add(next);
     const model = sh.model;
     let target = model.rows.get(row);
     if (!target) {
       target = { customHeight: false, hidden: false, outlineLevel: 0, collapsed: false, cells: [] };
       model.rows.set(row, target);
       sh.copied.add(row);
+      sh.rowKeys = undefined;
     } else if (!sh.copied.has(row)) {
       target = { ...target, cells: target.cells.slice() };
       model.rows.set(row, target);
@@ -1084,10 +1571,13 @@ export class CalcEngine {
       cellDeps: new Map(),
       rowBands: new Map(),
       colBands: new Map(),
-      wide: { entries: [], done: 0 },
+      wide: { entries: [], done: 0, doneLive: 0 },
       spillCells: new Map(),
       spillRanges: [],
       spills: new Set(),
+      ranges: new Map(),
+      columnKeys: [],
+      spillList: [],
       rowEpoch: new Uint32Array(Math.min(Math.max(model.rowCount || 0, 0), MAX_ROWS) + 16),
       copied: new Set(),
       changed: [],
@@ -1113,23 +1603,44 @@ export class CalcEngine {
     }
   }
 
-  private build(): void {
-    this.prepare();
-    if (this.built) return;
-    this.built = true;
-    for (const sh of this.sheets) {
-      const masters = sharedMasters(sh.model);
-      sh.model.rows.forEach((row, index) => {
-        if (!isIndex(index, MAX_ROWS) || !row || !row.cells) return;
-        row.cells.forEach((cell, col) => {
-          if (cell && cell.formula && col < MAX_COLS) this.addFormula(sh, index, col, cell, masters);
-        });
-      });
+  /**
+   * Reads the formulas of the workbook into the graph, as far as the time of this call
+   * goes; false when there are more. Every call reads some.
+   */
+  private build(): boolean {
+    if (this.built) return true;
+    const state = this.building || (this.building = { sheet: 0, masters: {} });
+    let count = 0;
+    for (; state.sheet < this.sheets.length; state.sheet++, state.rows = undefined, state.masters = {}) {
+      const sh = this.sheets[state.sheet];
+      if (!state.rows) state.rows = sh.model.rows.entries();
+      for (;;) {
+        const next = state.rows.next();
+        if (next.done) break;
+        const index = next.value[0];
+        const row = next.value[1];
+        if (!isIndex(index, MAX_ROWS) || !row || !row.cells) continue;
+        const cells = row.cells;
+        for (let col = 0; col < cells.length && col < MAX_COLS; col++) {
+          const cell = cells[col];
+          if (!cell || !cell.formula) continue;
+          this.addFormula(sh, index, col, cell, state.masters);
+          count++;
+        }
+        if (count >= BUILD_EVERY) {
+          count = 0;
+          if (this.outOfTime()) return false;
+        }
+      }
     }
+    this.built = true;
+    this.building = undefined;
+    this.searchAll = true;
+    return true;
   }
 
   /** Reads the formula of a cell into the graph. */
-  private addFormula(sh: SheetState, row: number, col: number, cell: Cell, masters: SharedMasters | undefined): void {
+  private addFormula(sh: SheetState, row: number, col: number, cell: Cell, holder: MastersHolder): void {
     const formula = cell.formula as CellFormula;
     // The inputs of a data table are substituted by Excel itself; its cells keep their values.
     if (formula.type === 'dataTable') return;
@@ -1137,7 +1648,7 @@ export class CalcEngine {
     let dRow = 0;
     let dCol = 0;
     if (formula.type === 'shared' && text === '') {
-      const master = formula.si === undefined ? undefined : (masters || sharedMasters(sh.model)).get(formula.si);
+      const master = formula.si === undefined ? undefined : (holder.masters || (holder.masters = sharedMasters(sh.model))).get(formula.si);
       // Without its master the cell cannot be calculated; it keeps its value.
       if (!master) return;
       text = master.text;
@@ -1152,9 +1663,9 @@ export class CalcEngine {
       return;
     }
     // What cannot be calculated here keeps the value the file has for it. Without such a value
-    // (a formula just typed in) it is calculated anyway, so that the cell shows the error.
-    const hasValue = cell.kind !== 'blank' && cell.value !== null && cell.value !== undefined;
-    if (hasValue && !this.supports(node, sh.index)) {
+    // (a formula just typed in, an error the engine wrote itself) it is calculated anyway, so
+    // that the cell shows the error.
+    if (hasValue(cell) && !this.own.has(cell) && !this.supports(node, sh.index)) {
       this.unsupportedCells.set(`${sh.index}:${row}:${col}`, { sheet: sh.index, row, col });
       return;
     }
@@ -1168,19 +1679,29 @@ export class CalcEngine {
       dRow,
       dCol,
       volatile: false,
+      timed: false,
       isArray: formula.type === 'array',
       // Excel marks the cell of a dynamic array formula with cell metadata.
       arrayMode: formula.type === 'array' || cell.cm !== undefined,
       selfRef: false,
-      aborts: 0,
       costly: false,
       precedents: [],
       epoch: 0,
       state: FRESH,
       value: null,
       circular: false,
-      stale: false,
+      looped: false,
+      live: false,
+      keep: KEEP_NONE,
+      kept: false,
+      gone: false,
       position: 0,
+      stamp: 0,
+      index: 0,
+      low: 0,
+      onStack: false,
+      comp: 0,
+      at: 0,
     };
     if (rec.isArray && typeof formula.ref === 'string') {
       const range = parseRange(formula.ref);
@@ -1197,16 +1718,20 @@ export class CalcEngine {
       }
     }
     this.findPrecedents(rec);
+    rec.circular = rec.selfRef;
     if (rec.volatile) this.volatiles.add(rec);
     sh.recs.set(keyOf(row, col), rec);
-    sh.recKeys = undefined;
+    this.graphChanged(sh);
+    // While the graph is being built every formula is looked at for circular references in the end.
+    if (this.built) this.seeds.push(rec);
   }
 
   /**
    * Whether everything a formula uses can be calculated here: no function the library lacks,
    * no LET or LAMBDA, no reference across sheets or into another workbook, no sheet or name
    * the workbook does not have (the name of a table is one: tables are not in the model), no
-   * defined name that cannot be parsed or uses one of those.
+   * defined name that cannot be parsed or uses one of those, and no use of a function that
+   * the evaluator only knows in part.
    */
   private supports(root: Node, sheet: number): boolean {
     const names = new Set<string>();
@@ -1229,16 +1754,59 @@ export class CalcEngine {
           nodes.push(target);
           break;
         }
-        case 'call':
-          if (UNSUPPORTED_FORMS.has(node.name) || (!isBuiltinForm(node.name) && !this.functions.has(node.name))) return false;
-          for (const arg of node.args) if (arg) nodes.push(arg);
+        case 'call': {
+          const builtin = isBuiltinForm(node.name);
+          const spec = builtin ? undefined : this.functions.get(node.name);
+          if (UNSUPPORTED_FORMS.has(node.name) || (!builtin && !spec)) return false;
+          if (!this.supportsCall(node.name, node.args)) return false;
+          // A union of references is taken apart by AREAS and by functions of any number of arguments.
+          const takesUnion = node.name === 'AREAS' || (spec !== undefined && spec.max === undefined);
+          for (const arg of node.args) {
+            let part = arg;
+            while (takesUnion && part && part.type === 'binary' && part.op === ',') {
+              nodes.push(part.right);
+              part = part.left;
+            }
+            if (part) nodes.push(part);
+          }
           break;
+        }
         case 'unary':
           nodes.push(node.operand);
           break;
         case 'binary':
+          // A union anywhere else has no value here.
+          if (node.op === ',') return false;
           nodes.push(node.left, node.right);
           break;
+      }
+    }
+    return true;
+  }
+
+  /** The uses of functions the evaluator knows only in part. */
+  private supportsCall(name: string, args: (Node | null)[]): boolean {
+    switch (name) {
+      case 'CELL': {
+        // What is asked for must be known before the formula is calculated.
+        const info = args[0];
+        return !!info && info.type === 'string' && CELL_INFO.has(info.value.toLowerCase());
+      }
+      case 'INDIRECT': {
+        // R1C1 notation is not supported: the second argument must say "A1" for certain.
+        const a1 = args.length > 1 ? args[1] : undefined;
+        if (!a1) return true;
+        return (a1.type === 'boolean' && a1.value) || (a1.type === 'number' && a1.value !== 0);
+      }
+      case 'INDEX': {
+        // Only the first area of a reference.
+        const area = args.length > 3 ? args[3] : undefined;
+        return !area || (area.type === 'number' && area.value === 1);
+      }
+      case 'TEXT': {
+        // A format that is not a constant is calculated: what it holds is known only then.
+        const format = args.length > 1 ? args[1] : undefined;
+        return !format || format.type !== 'string' || !foreignFormat(format.value);
       }
     }
     return true;
@@ -1252,20 +1820,46 @@ export class CalcEngine {
     const cell = modelRow ? modelRow.cells[col] : undefined;
     const formula = cell ? cell.formula : undefined;
     if (rec && rec.formula === formula) return;
-    this.unparsedCells.delete(`${sh.index}:${row}:${col}`);
-    this.unsupportedCells.delete(`${sh.index}:${row}:${col}`);
-    this.costlyCells.delete(`${sh.index}:${row}:${col}`);
+    const name = `${sh.index}:${row}:${col}`;
+    this.unparsedCells.delete(name);
+    this.unsupportedCells.delete(name);
+    this.mismatchedCells.delete(name);
+    if (this.costlyCells.delete(name)) this.staleCells = undefined;
     if (rec) this.removeFormula(sh, rec);
-    if (cell && formula) this.addFormula(sh, row, col, cell, undefined);
+    if (cell && formula) this.addFormula(sh, row, col, cell, {});
+  }
+
+  /** The formulas of a sheet changed: what was worked out from them is worked out again. */
+  private graphChanged(sh: SheetState): void {
+    sh.columns = undefined;
+    this.staleCells = undefined;
+    const search = this.search;
+    if (!search) return;
+    // The search in progress walked a graph that is no longer there: it starts over.
+    if (search.all) this.searchAll = true;
+    else for (const rec of search.seeds) this.seeds.push(rec);
+    this.search = undefined;
   }
 
   private removeFormula(sh: SheetState, rec: FormulaRec): void {
     sh.recs.delete(keyOf(rec.row, rec.col));
-    sh.recKeys = undefined;
     sh.spills.delete(rec);
     this.volatiles.delete(rec);
     // Whoever still holds the record (the list of dirty formulas) must not write it.
-    rec.stale = true;
+    rec.gone = true;
+    this.graphChanged(sh);
+    if (rec.comp) {
+      // The formulas it made a circle with may no longer make one.
+      const members = this.groups.get(rec.comp);
+      this.groups.delete(rec.comp);
+      if (members) {
+        for (const member of members) {
+          member.comp = 0;
+          member.circular = member.selfRef;
+          if (member !== rec) this.seeds.push(member);
+        }
+      }
+    }
     if (rec.spill) {
       const range = rec.spill;
       const at = sh.spillRanges.indexOf(rec);
@@ -1350,14 +1944,18 @@ export class CalcEngine {
         }
         case 'call': {
           if (VOLATILE.has(node.name)) rec.volatile = true;
+          if (TIMED.has(node.name)) rec.timed = true;
           const asksWhere = SHAPE_ONLY.has(node.name);
+          // CELL("row", A1) asks where A1 is; CELL("contents", A1) reads it.
+          const info = node.name === 'CELL' ? node.args[0] : undefined;
+          const cellWhere = !!info && info.type === 'string' && CELL_WHERE.has(info.value.toLowerCase());
           for (let k = 0; k < node.args.length; k++) {
             const arg = node.args[k];
             if (!arg) continue;
             const reference = arg.type === 'ref' || arg.type === 'name';
             nodes.push(arg);
             own.push(shifted);
-            shape.push((asksWhere || (k === 0 && node.name === 'OFFSET')) && reference);
+            shape.push((asksWhere || (k === 0 && node.name === 'OFFSET') || (k === 1 && cellWhere)) && reference);
             picked.push(k === 0 && node.name === 'INDEX' && reference);
           }
           break;
@@ -1383,7 +1981,8 @@ export class CalcEngine {
   private addPrecedent(rec: FormulaRec, sheet: number, range: CellRange, shapeOnly: boolean): void {
     const target = this.sheets[sheet];
     if (!target) return;
-    rec.precedents.push({ sheet, range, shapeOnly });
+    const precedent: Precedent = { sheet, range, shapeOnly };
+    rec.precedents.push(precedent);
     if (range.top === range.bottom && range.left === range.right) {
       const key = keyOf(range.top, range.left);
       const list = target.cellDeps.get(key);
@@ -1391,13 +1990,20 @@ export class CalcEngine {
       else target.cellDeps.set(key, [rec]);
       return;
     }
+    if (!shapeOnly) {
+      const name = `${range.top}:${range.left}:${range.bottom}:${range.right}`;
+      let node = target.ranges.get(name);
+      if (!node) target.ranges.set(name, (node = { area: true, sheet, range, stamp: 0, index: 0, low: 0, onStack: false }));
+      precedent.node = node;
+    }
     const entry: Entry = { top: range.top, left: range.left, bottom: range.bottom, right: range.right, rec };
     const add = (map: Map<number, Bucket>, key: number) => {
       const bucket = map.get(key);
       if (bucket) {
         bucket.entries.push(entry);
         bucket.done = 0;
-      } else map.set(key, { entries: [entry], done: 0 });
+        bucket.doneLive = 0;
+      } else map.set(key, { entries: [entry], done: 0, doneLive: 0 });
     };
     const firstBand = range.top >> BAND_SHIFT;
     const lastBand = range.bottom >> BAND_SHIFT;
@@ -1406,15 +2012,249 @@ export class CalcEngine {
     else {
       target.wide.entries.push(entry);
       target.wide.done = 0;
+      target.wide.doneLive = 0;
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Circular references among the references the formulas name
+  //
+  // The formulas and the ranges they read make a graph: a formula points at every range it
+  // reads, a range at every formula inside it. Formulas that can reach one another in it
+  // are circular (the strongly connected parts of the graph, found with Tarjan's algorithm).
+  // A range is one node however many formulas read it, and a formula whose part is known is
+  // struck out of the lists the ranges are read from, so the search looks at every formula
+  // and every reference a few times, not at every pair of them. Like building the graph it
+  // is done in slices; a change of a formula starts it again from the formulas the change
+  // can have tied together or set free.
+
+  /** Goes on finding circular references, as far as the time of this call goes; false when there is more to do. */
+  private components(): boolean {
+    let run = this.search;
+    if (!run) {
+      if (!this.searchAll && this.seeds.length === 0) return true;
+      let seeds = this.seeds;
+      let total = 0;
+      for (const sh of this.sheets) total += sh.recs.size;
+      if (this.searchAll) {
+        seeds = [];
+        for (const sh of this.sheets) sh.recs.forEach((rec) => seeds.push(rec));
+      }
+      run = { all: this.searchAll, seeds, next: 0, stamp: ++this.stamps, counter: 0, stack: [], path: [], a: [], b: [], c: [], steps: 0, limit: 64 * (total + seeds.length) + 4000000 };
+      this.search = run;
+      this.searchAll = false;
+      this.seeds = [];
+      for (const sh of this.sheets) this.indexColumns(sh);
+    }
+    const path = run.path;
+    const stamp = run.stamp;
+    let since = 0;
+    for (;;) {
+      if (path.length === 0) {
+        let seed: FormulaRec | undefined;
+        while (run.next < run.seeds.length && !seed) {
+          const candidate = run.seeds[run.next++];
+          if (!candidate.gone && candidate.stamp !== stamp) seed = candidate;
+        }
+        if (!seed) break;
+        this.enter(run, seed);
+      }
+      if (++since >= SEARCH_EVERY) {
+        since = 0;
+        run.steps += SEARCH_EVERY;
+        // A graph made to be slow (thousands of ranges that all hold one another's formulas):
+        // the search is given up, and only circles met while calculating are found.
+        if (run.steps > run.limit) break;
+        if (this.outOfTime()) return false;
+      }
+      const top = path.length - 1;
+      const node = path[top];
+      const next = this.successor(run, node, top);
+      if (next) {
+        if (next.stamp !== stamp) this.enter(run, next);
+        else if (next.onStack && next.index < node.low) node.low = next.index;
+        continue;
+      }
+      path.pop();
+      run.a.pop();
+      run.b.pop();
+      run.c.pop();
+      if (top > 0 && node.low < path[top - 1].low) path[top - 1].low = node.low;
+      if (node.low === node.index) this.closeGroup(run, node);
+    }
+    this.search = undefined;
+    return true;
+  }
+
+  private enter(run: ComponentRun, node: GraphNode): void {
+    node.stamp = run.stamp;
+    node.index = node.low = run.counter++;
+    node.onStack = true;
+    run.stack.push(node);
+    run.path.push(node);
+    // A range starts at the first column it covers; a formula at its first precedent.
+    run.a.push((node as RangeNode).area ? lowerBound(this.sheets[node.sheet].columnKeys, (node as RangeNode).range.left) : 0);
+    run.b.push((node as RangeNode).area ? -1 : 0);
+    run.c.push(0);
+  }
+
+  /** The next node `node` points at, or undefined when there are no more. */
+  private successor(run: ComponentRun, node: GraphNode, frame: number): GraphNode | undefined {
+    if ((node as RangeNode).area) {
+      const range = (node as RangeNode).range;
+      const sh = this.sheets[node.sheet];
+      const keys = sh.columnKeys;
+      const columns = sh.columns as Map<number, Column>;
+      let ci = run.a[frame];
+      let at = run.b[frame];
+      while (ci < keys.length && keys[ci] <= range.right) {
+        const column = columns.get(keys[ci]) as Column;
+        if (at < 0) at = lowerBound(column.rows, range.top);
+        at = find(column.skip, at);
+        if (at < column.rows.length && column.rows[at] <= range.bottom) {
+          run.a[frame] = ci;
+          run.b[frame] = at + 1;
+          return column.recs[at];
+        }
+        ci++;
+        at = -1;
+      }
+      run.a[frame] = ci;
+      run.b[frame] = -1;
+      // Formulas elsewhere that fill cells of the range.
+      const spills = sh.spillList;
+      let si = run.c[frame];
+      while (si < spills.length) {
+        const rec = spills[si++];
+        const spill = rec.spill as CellRange;
+        if (spill.top <= range.bottom && spill.bottom >= range.top && spill.left <= range.right && spill.right >= range.left) {
+          run.c[frame] = si;
+          return rec;
+        }
+      }
+      run.c[frame] = si;
+      return undefined;
+    }
+    const precedents = (node as FormulaRec).precedents;
+    let pi = run.a[frame];
+    while (pi < precedents.length) {
+      const precedent = precedents[pi];
+      if (precedent.shapeOnly) {
+        pi++;
+        continue;
+      }
+      if (precedent.node) {
+        run.a[frame] = pi + 1;
+        return precedent.node;
+      }
+      // One cell: the formula in it, then the formula that fills it.
+      const sh = this.sheets[precedent.sheet];
+      const row = precedent.range.top;
+      const col = precedent.range.left;
+      const inCell = sh.recs.get(keyOf(row, col));
+      if (run.b[frame] === 0) {
+        run.b[frame] = 1;
+        run.a[frame] = pi;
+        if (inCell) return inCell;
+      }
+      run.b[frame] = 0;
+      pi++;
+      if (sh.spillCells.size > 0 || sh.spillRanges.length > 0) {
+        const owner = this.spillOwner(sh, row, col);
+        if (owner && owner !== inCell) {
+          run.a[frame] = pi;
+          return owner;
+        }
+      }
+    }
+    run.a[frame] = pi;
+    return undefined;
+  }
+
+  /** `node` is the first of a part of the graph whose nodes all reach one another: everything above it on the stack. */
+  private closeGroup(run: ComponentRun, node: GraphNode): void {
+    const stack = run.stack;
+    const members: FormulaRec[] = [];
+    for (;;) {
+      const member = stack.pop() as GraphNode;
+      member.onStack = false;
+      if (!(member as RangeNode).area) {
+        const rec = member as FormulaRec;
+        members.push(rec);
+        // Its part is known: ranges read from now on pass over it.
+        if (rec.column) rec.column.skip[rec.at] = rec.at + 1;
+      }
+      if (member === node) break;
+    }
+    if (members.length > 1) {
+      const id = ++this.groupIds;
+      for (const rec of members) {
+        if (rec.comp) this.groups.delete(rec.comp);
+        rec.comp = id;
+        rec.circular = true;
+      }
+      this.groups.set(id, members);
+    } else if (members.length === 1) {
+      // Alone: circular only when it names its own cell.
+      const rec = members[0];
+      if (rec.comp) this.groups.delete(rec.comp);
+      rec.comp = 0;
+      rec.circular = rec.selfRef;
+    }
+  }
+
+  /** The formulas of a sheet by column, in row order, with nothing struck out. */
+  private indexColumns(sh: SheetState): void {
+    let columns = sh.columns;
+    if (columns) {
+      columns.forEach((column) => {
+        const skip = column.skip;
+        for (let k = 0; k < skip.length; k++) skip[k] = k;
+      });
+      return;
+    }
+    columns = new Map();
+    const unsorted = new Set<Column>();
+    sh.recs.forEach((rec) => {
+      let column = (columns as Map<number, Column>).get(rec.col);
+      if (!column) (columns as Map<number, Column>).set(rec.col, (column = { rows: [], recs: [], skip: new Int32Array(0) }));
+      if (column.rows.length > 0 && column.rows[column.rows.length - 1] > rec.row) unsorted.add(column);
+      column.rows.push(rec.row);
+      column.recs.push(rec);
+    });
+    unsorted.forEach((column) => {
+      column.recs.sort((a, b) => a.row - b.row);
+      for (let k = 0; k < column.recs.length; k++) column.rows[k] = column.recs[k].row;
+    });
+    columns.forEach((column) => {
+      const skip = new Int32Array(column.rows.length + 1);
+      for (let k = 0; k < skip.length; k++) skip[k] = k;
+      column.skip = skip;
+      for (let k = 0; k < column.recs.length; k++) {
+        column.recs[k].column = column;
+        column.recs[k].at = k;
+      }
+    });
+    sh.columns = columns;
+    sh.columnKeys = Array.from(columns.keys()).sort((a, b) => a - b);
+    sh.spillList = Array.from(sh.spills);
+  }
+
+  // -------------------------------------------------------------------------
+  // Marking what has to be calculated
+
   /** Marks a formula dirty for this recalculation. */
   private touch(rec: FormulaRec): void {
-    if (rec.epoch === this.epoch || rec.costly) return;
+    if (rec.epoch === this.epoch) return;
+    if (rec.costly) {
+      // Something it reads changed: it is tried again.
+      rec.costly = false;
+      this.costlyCells.delete(`${rec.sheet}:${rec.row}:${rec.col}`);
+      this.staleCells = undefined;
+    }
     rec.epoch = this.epoch;
     rec.state = FRESH;
-    rec.circular = rec.selfRef;
+    rec.keep = KEEP_NONE;
     rec.result = undefined;
     this.dirty.push(rec);
     const sh = this.sheets[rec.sheet];
@@ -1426,25 +2266,57 @@ export class CalcEngine {
     sh.rowEpoch[rec.row] = this.epoch;
   }
 
+  /**
+   * Marks a formula dirty, and live when something it reads really changed; its dependents
+   * are marked in turn when it is new to either.
+   */
+  private mark(rec: FormulaRec, live: boolean): void {
+    const gathering = this.gathering;
+    if (gathering) {
+      if (!gathering.has(rec)) {
+        gathering.add(rec);
+        this.walk.push(rec);
+      }
+      return;
+    }
+    const fresh = rec.epoch !== this.epoch;
+    if (fresh) {
+      this.touch(rec);
+      // A formula without a value gets one: what reads it reads something new.
+      if (!live && !rec.live && this.unvalued(rec)) live = true;
+    }
+    if (live && !rec.live) {
+      rec.live = true;
+      this.walk.push(rec);
+    } else if (fresh) this.walk.push(rec);
+  }
+
+  /** Marks the formulas that read the cells of a formula. */
+  private dependents(rec: FormulaRec, live: boolean): void {
+    const sh = this.sheets[rec.sheet];
+    if (rec.spill) this.collect(sh, rec.spill.top, rec.spill.left, rec.spill.bottom, rec.spill.right, live);
+    else this.collect(sh, rec.row, rec.col, rec.row, rec.col, live);
+  }
+
   /** Marks every formula that reads a cell of the range. */
-  private collect(sh: SheetState, top: number, left: number, bottom: number, right: number): void {
+  private collect(sh: SheetState, top: number, left: number, bottom: number, right: number, live: boolean): void {
     const deps = sh.cellDeps;
     if (top === bottom && left === right) {
       const list = deps.get(keyOf(top, left));
-      if (list) for (let k = 0; k < list.length; k++) this.touch(list[k]);
+      if (list) for (let k = 0; k < list.length; k++) this.mark(list[k], live);
     } else if (deps.size > 0) {
       if ((bottom - top + 1) * (right - left + 1) <= deps.size) {
         for (let r = top; r <= bottom; r++) {
           for (let c = left; c <= right; c++) {
             const list = deps.get(keyOf(r, c));
-            if (list) for (let k = 0; k < list.length; k++) this.touch(list[k]);
+            if (list) for (let k = 0; k < list.length; k++) this.mark(list[k], live);
           }
         }
       } else {
         deps.forEach((list, key) => {
           const r = Math.floor(key / MAX_COLS);
           const c = key - r * MAX_COLS;
-          if (r >= top && r <= bottom && c >= left && c <= right) for (let k = 0; k < list.length; k++) this.touch(list[k]);
+          if (r >= top && r <= bottom && c >= left && c <= right) for (let k = 0; k < list.length; k++) this.mark(list[k], live);
         });
       }
     }
@@ -1452,36 +2324,43 @@ export class CalcEngine {
       const first = top >> BAND_SHIFT;
       const last = bottom >> BAND_SHIFT;
       if (last - first < sh.rowBands.size) {
-        for (let band = first; band <= last; band++) this.scan(sh.rowBands.get(band), top, left, bottom, right);
+        for (let band = first; band <= last; band++) this.scan(sh.rowBands.get(band), top, left, bottom, right, live);
       } else {
         sh.rowBands.forEach((bucket, band) => {
-          if (band >= first && band <= last) this.scan(bucket, top, left, bottom, right);
+          if (band >= first && band <= last) this.scan(bucket, top, left, bottom, right, live);
         });
       }
     }
     if (sh.colBands.size > 0) {
       if (right - left < sh.colBands.size) {
-        for (let c = left; c <= right; c++) this.scan(sh.colBands.get(c), top, left, bottom, right);
+        for (let c = left; c <= right; c++) this.scan(sh.colBands.get(c), top, left, bottom, right, live);
       } else {
         sh.colBands.forEach((bucket, c) => {
-          if (c >= left && c <= right) this.scan(bucket, top, left, bottom, right);
+          if (c >= left && c <= right) this.scan(bucket, top, left, bottom, right, live);
         });
       }
     }
-    this.scan(sh.wide, top, left, bottom, right);
+    this.scan(sh.wide, top, left, bottom, right, live);
   }
 
-  private scan(bucket: Bucket | undefined, top: number, left: number, bottom: number, right: number): void {
-    if (!bucket || bucket.done === this.epoch) return;
+  private scan(bucket: Bucket | undefined, top: number, left: number, bottom: number, right: number, live: boolean): void {
+    if (!bucket) return;
+    const gathering = this.gathering;
+    const epoch = this.epoch;
+    if (!gathering && (live ? bucket.doneLive : bucket.done) === epoch) return;
     const entries = bucket.entries;
     let clean = 0;
     for (let k = 0; k < entries.length; k++) {
       const entry = entries[k];
-      if (entry.rec.epoch === this.epoch) continue;
-      if (entry.top <= bottom && entry.bottom >= top && entry.left <= right && entry.right >= left) this.touch(entry.rec);
+      const rec = entry.rec;
+      if (gathering ? gathering.has(rec) : rec.epoch === epoch && (rec.live || !live)) continue;
+      if (entry.top <= bottom && entry.bottom >= top && entry.left <= right && entry.right >= left) this.mark(rec, live);
       else clean++;
     }
     // Nothing left to find here until the next recalculation.
-    if (clean === 0) bucket.done = this.epoch;
+    if (!gathering && clean === 0) {
+      bucket.done = epoch;
+      if (live) bucket.doneLive = epoch;
+    }
   }
 }

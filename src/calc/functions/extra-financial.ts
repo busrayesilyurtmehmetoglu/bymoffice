@@ -75,18 +75,22 @@ function datedValue(rate: number, flows: DatedFlows): { value: number; slope: nu
   return { value, slope };
 }
 
-const xnpv = mapScalarsExcept(
-  (index) => index > 0,
-  (args, context) => {
-    const rate = scalarNumber(args[0] as Scalar, context);
-    if (typeof rate !== 'number') return rate;
-    const flows = datedFlows(args[1], args[2], context);
-    if (isError(flows)) return flows;
-    // Excel's XNPV refuses a negative rate (XIRR, which searches, does not).
-    if (!(rate >= 0)) return ERROR_NUM;
-    return checkNumber(datedValue(rate, flows).value);
-  },
-);
+const xnpv: CalcFunction = (args, context) => {
+  // With an array of rates the flows are the same for every one of them: they are read once.
+  let flows: DatedFlows | CalcError | undefined;
+  return mapScalarsExcept(
+    (index) => index > 0,
+    (parts) => {
+      const rate = scalarNumber(parts[0] as Scalar, context);
+      if (typeof rate !== 'number') return rate;
+      if (flows === undefined) flows = datedFlows(parts[1], parts[2], context);
+      if (isError(flows)) return flows;
+      // Excel's XNPV refuses a negative rate (XIRR, which searches, does not).
+      if (!(rate >= 0)) return ERROR_NUM;
+      return checkNumber(datedValue(rate, flows).value);
+    },
+  )(args, context);
+};
 
 function datedRate(flows: DatedFlows, guess: number): number | CalcError {
   let positive = false;
@@ -134,21 +138,25 @@ function datedRate(flows: DatedFlows, guess: number): number | CalcError {
   return ERROR_NUM;
 }
 
-const xirr = mapScalarsExcept(
-  (index) => index < 2,
-  (args, context) => {
-    const flows = datedFlows(args[0], args[1], context);
-    if (isError(flows)) return flows;
-    let guess = 0.1;
-    if (args.length > 2 && args[2] !== null) {
-      const given = scalarNumber(args[2] as Scalar, context);
-      if (typeof given !== 'number') return given;
-      guess = given;
-    }
-    const result = datedRate(flows, guess);
-    return typeof result === 'number' ? checkNumber(result) : result;
-  },
-);
+const xirr: CalcFunction = (args, context) => {
+  // With an array of guesses the flows are the same for every one of them: they are read once.
+  let flows: DatedFlows | CalcError | undefined;
+  return mapScalarsExcept(
+    (index) => index < 2,
+    (parts) => {
+      if (flows === undefined) flows = datedFlows(parts[0], parts[1], context);
+      if (isError(flows)) return flows;
+      let guess = 0.1;
+      if (parts.length > 2 && parts[2] !== null) {
+        const given = scalarNumber(parts[2] as Scalar, context);
+        if (typeof given !== 'number') return given;
+        guess = given;
+      }
+      const result = datedRate(flows, guess);
+      return typeof result === 'number' ? checkNumber(result) : result;
+    },
+  )(args, context);
+};
 
 // ---------------------------------------------------------------------------
 // Loans
@@ -181,7 +189,8 @@ function cumulative(principal: boolean): CalcFunction {
     const from = Math.trunc(start);
     const to = Math.trunc(end);
     const when = Math.trunc(type);
-    if (!(from >= 1 && to >= 1 && from <= to) || (when !== 0 && when !== 1)) return ERROR_NUM;
+    // The periods must lie inside the loan, in order.
+    if (!(from >= 1 && to >= 1 && from <= to && to <= nper) || (when !== 0 && when !== 1)) return ERROR_NUM;
     const pmt = payment(rate, nper, pv, 0, when);
     // Each payment lowers the debt by its principal part, so the parts of a run of
     // periods add up to the change of the debt; the rest of the payments is interest.
