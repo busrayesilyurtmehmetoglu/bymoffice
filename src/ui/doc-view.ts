@@ -12,7 +12,7 @@
 
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, TextItem, TextMeasurer } from '../layout/doc/types';
-import { paragraphText, safeHyperlinkTarget, type Block, type DocModel } from '../model/doc/types';
+import { findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
 import { renderPage, type PageImage } from '../render/doc';
 import { CanvasTextMeasurer } from '../render/doc-measure';
 import { getUiStrings, type UiStrings } from './strings';
@@ -60,6 +60,9 @@ export interface DocumentViewState {
   width: number;
   height: number;
   devicePixelRatio: number;
+  /** Bytes of decoded pictures the view holds right now, and the most it ever holds. */
+  imageBytes: number;
+  imageBudget: number;
 }
 
 const MIN_ZOOM = 0.1;
@@ -91,11 +94,17 @@ const MAX_LINKS_PER_PAGE = 2000;
 const MAX_TEXT_DEPTH = 64;
 const SELECTION_FILL = 'rgba(26, 115, 232, 0.28)';
 
+/** Decoded pictures held at any one time, in bytes (four per pixel). The limit is strict. */
 const IMAGE_BUDGET_BYTES = 96 * 1024 * 1024;
 const IMAGE_BUDGET_BYTES_COARSE = 48 * 1024 * 1024;
-/** A picture with more pixels than this is not decoded. */
+/** A picture with more pixels than this is not decoded at all. */
 const MAX_IMAGE_PIXELS = 50000000;
-const MAX_IMAGE_LOADS = 4;
+/** One decoded picture takes at most this share of the budget; larger ones are kept at a lower resolution. */
+const IMAGE_SHARE = 1 / 8;
+/** Pictures decoded at the same time. */
+const MAX_IMAGE_LOADS = 2;
+/** Smallest side a picture is decoded to, canvas px: zooming in a little does not start a new decode. */
+const MIN_DECODED_SIDE = 64;
 
 // Cosmetic rules only; what the layout depends on is set inline.
 const STYLE_TEXT =
@@ -126,7 +135,8 @@ const STYLE_TEXT =
 const styleUsers = new WeakMap<Node, { element: HTMLStyleElement; count: number }>();
 
 function acquireStyle(container: HTMLElement): Node {
-  const root = container.getRootNode();
+  // Older browsers have no getRootNode (and no shadow roots either): the document of the container is the root there.
+  const root: Node = typeof container.getRootNode === 'function' ? container.getRootNode() : container.ownerDocument || document;
   const host: Node = root.nodeType === 9 ? (root as Document).head || (root as Document).documentElement : root;
   const entry = styleUsers.get(host);
   if (entry) {
@@ -198,17 +208,18 @@ export function sniffImageType(bytes: Uint8Array): string | undefined {
 }
 
 /**
- * Number of pixels the picture claims to have, read from its header without
+ * Width and height the picture claims to have, read from its header without
  * decoding it; undefined when the header does not say (the decoder decides then).
  */
-export function declaredImagePixels(bytes: Uint8Array, type: string): number | undefined {
+export function declaredImageSize(bytes: Uint8Array, type: string): { width: number; height: number } | undefined {
   const u16be = (at: number) => (bytes[at] << 8) | bytes[at + 1];
   const u16le = (at: number) => bytes[at] | (bytes[at + 1] << 8);
   const u32be = (at: number) => bytes[at] * 0x1000000 + ((bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]);
   const i32le = (at: number) => bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24);
-  if (type === 'image/png') return bytes.length >= 24 ? u32be(16) * u32be(20) : undefined;
-  if (type === 'image/gif') return u16le(6) * u16le(8);
-  if (type === 'image/bmp') return bytes.length >= 26 ? Math.abs(i32le(18)) * Math.abs(i32le(22)) : undefined;
+  const size = (width: number, height: number) => ({ width, height });
+  if (type === 'image/png') return bytes.length >= 24 ? size(u32be(16), u32be(20)) : undefined;
+  if (type === 'image/gif') return size(u16le(6), u16le(8));
+  if (type === 'image/bmp') return bytes.length >= 26 ? size(Math.abs(i32le(18)), Math.abs(i32le(22))) : undefined;
   if (type === 'image/jpeg') {
     // Segments until the frame header; every step moves forward, so the loop ends with the data.
     let at = 2;
@@ -219,7 +230,7 @@ export function declaredImagePixels(bytes: Uint8Array, type: string): number | u
         at++;
         continue;
       }
-      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return u16be(at + 5) * u16be(at + 7);
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return size(u16be(at + 7), u16be(at + 5));
       if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
         at += 2;
         continue;
@@ -232,59 +243,130 @@ export function declaredImagePixels(bytes: Uint8Array, type: string): number | u
   }
   if (type === 'image/webp' && bytes.length >= 30) {
     const kind = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
-    if (kind === 'VP8X') return (1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16))) * (1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)));
-    if (kind === 'VP8 ') return (u16le(26) & 0x3fff) * (u16le(28) & 0x3fff);
+    if (kind === 'VP8X') return size(1 + (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)), 1 + (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)));
+    if (kind === 'VP8 ') return size(u16le(26) & 0x3fff, u16le(28) & 0x3fff);
     if (kind === 'VP8L') {
       const bits = bytes[21] | (bytes[22] << 8) | (bytes[23] << 16) | (bytes[24] << 24);
-      return (1 + (bits & 0x3fff)) * (1 + ((bits >>> 14) & 0x3fff));
+      return size(1 + (bits & 0x3fff), 1 + ((bits >>> 14) & 0x3fff));
     }
   }
   return undefined;
 }
 
+/** Number of pixels the picture claims to have; undefined when its header does not say. */
+export function declaredImagePixels(bytes: Uint8Array, type: string): number | undefined {
+  const size = declaredImageSize(bytes, type);
+  return size ? size.width * size.height : undefined;
+}
+
 interface ImageEntry {
   state: 'waiting' | 'loading' | 'ready' | 'failed';
   image?: PageImage;
+  /** Bytes of the decoded picture held. */
   bytes: number;
   /** update() pass in which the picture was last asked for. */
   used: number;
   close?(): void;
+  /** Largest size the picture was asked for, canvas px; 0 when no size was given. */
+  wantWidth: number;
+  wantHeight: number;
+  /** Size of the picture in the file, once it is known. */
+  naturalWidth: number;
+  naturalHeight: number;
+  /** In the queue or being decoded (a picture that is ready is there again when more of its pixels are wanted). */
+  pending: boolean;
+  /** Pass in which there was no room for the picture: it is not tried again before the next. */
+  deferred: number;
 }
 
-/** Decodes the pictures of a package on demand and keeps the decoded ones within a budget of bytes, least recently used first out. */
+interface Decoded {
+  image: PageImage;
+  close?(): void;
+}
+
+/** The size a picture is decoded to: what the page needs of it, never more than it has or than `maxPixels`. */
+export function decodedImageSize(
+  naturalWidth: number,
+  naturalHeight: number,
+  wantWidth: number,
+  wantHeight: number,
+  maxPixels: number,
+): { width: number; height: number } {
+  let scale = 1;
+  if (wantWidth > 0 && wantHeight > 0) {
+    const wanted = Math.max(Math.max(wantWidth, MIN_DECODED_SIDE) / naturalWidth, Math.max(wantHeight, MIN_DECODED_SIDE) / naturalHeight);
+    // In steps of a half: a slightly larger zoom finds the pixels already there.
+    while (scale / 2 >= wanted) scale /= 2;
+  }
+  const limit = Math.sqrt(maxPixels / (naturalWidth * naturalHeight));
+  if (scale > limit) scale = limit;
+  return { width: Math.max(1, Math.floor(naturalWidth * scale)), height: Math.max(1, Math.floor(naturalHeight * scale)) };
+}
+
+/**
+ * Decodes the pictures of a package on demand and never holds more decoded
+ * bytes than its budget. A picture is decoded to the size the page shows it
+ * at, not to the size it has in the file, and to no more than a share of the
+ * budget; when the budget is used up by pictures of the pages being painted,
+ * one more stays a placeholder until there is room.
+ */
 class ImageStore {
   /** In order of use: the first entry is the one used longest ago. */
   private entries = new Map<string, ImageEntry>();
   private queue: string[] = [];
   private loading = 0;
+  /** Bytes held, and bytes promised to pictures being decoded. */
   private total = 0;
+  private reserved = 0;
+  /** Decodes of large pictures run one after the other. */
+  private heavy: Promise<unknown> = Promise.resolve();
   private urls: string[] = [];
   private destroyed = false;
-  /** Counts the passes of the view; pictures used in the current or the last pass are never dropped. */
+  /** Counts the passes of the view; a picture used in the current pass is never dropped. */
   pass = 0;
 
   constructor(
     private readonly source: { readPart(part: string): Promise<Uint8Array> } | undefined,
-    private readonly budget: number,
+    readonly budget: number,
     private readonly onLoad: (part: string) => void,
   ) {}
 
-  get(part: string): PageImage | undefined {
+  /** Bytes of decoded pictures held now, those being decoded included. */
+  get bytes(): number {
+    return this.total + this.reserved;
+  }
+
+  /** The decoded picture of a part, undefined while there is none. `width` and `height`: the canvas pixels it will cover. */
+  get(part: string, width?: number, height?: number): PageImage | undefined {
     if (this.destroyed || !this.source) return undefined;
+    const wantWidth = typeof width === 'number' && width > 0 && width < Infinity ? width : 0;
+    const wantHeight = typeof height === 'number' && height > 0 && height < Infinity ? height : 0;
     let entry = this.entries.get(part);
     if (!entry) {
-      entry = { state: 'waiting', bytes: 0, used: this.pass };
+      entry = { state: 'waiting', bytes: 0, used: this.pass, wantWidth, wantHeight, naturalWidth: 0, naturalHeight: 0, pending: false, deferred: -1 };
       this.entries.set(part, entry);
-      this.queue.push(part);
-      this.pump();
+      this.enqueue(part, entry);
       return undefined;
     }
     entry.used = this.pass;
+    if (wantWidth > entry.wantWidth) entry.wantWidth = wantWidth;
+    if (wantHeight > entry.wantHeight) entry.wantHeight = wantHeight;
+    if (entry.state === 'waiting') {
+      // There was no room for it; a later pass may have some.
+      if (entry.deferred !== this.pass) this.enqueue(part, entry);
+      return undefined;
+    }
     if (entry.state !== 'ready') return undefined;
     // Most recently used last.
     this.entries.delete(part);
     this.entries.set(part, entry);
-    return entry.image;
+    const image = entry.image as PageImage;
+    if (entry.deferred !== this.pass && entry.naturalWidth > 0) {
+      // Shown larger than it was decoded for (the zoom grew): decoded again when it has more pixels to give.
+      const better = decodedImageSize(entry.naturalWidth, entry.naturalHeight, entry.wantWidth, entry.wantHeight, this.maxPixels());
+      if (better.width > image.width * 1.25 || better.height > image.height * 1.25) this.enqueue(part, entry);
+    }
+    return image;
   }
 
   destroy(): void {
@@ -299,75 +381,141 @@ class ImageStore {
     this.total = 0;
   }
 
+  private maxPixels(): number {
+    return Math.floor((this.budget * IMAGE_SHARE) / 4);
+  }
+
+  private enqueue(part: string, entry: ImageEntry): void {
+    if (entry.pending) return;
+    entry.pending = true;
+    this.queue.push(part);
+    this.pump();
+  }
+
   private pump(): void {
     while (this.loading < MAX_IMAGE_LOADS && this.queue.length > 0) {
       const part = this.queue.shift() as string;
       const entry = this.entries.get(part);
-      if (!entry || entry.state !== 'waiting') continue;
-      entry.state = 'loading';
+      if (!entry || !entry.pending) continue;
+      if (entry.state === 'waiting') entry.state = 'loading';
       this.loading++;
-      this.load(part).then(
+      this.load(part, entry).then(
         (loaded) => this.settle(part, entry, loaded),
-        () => this.settle(part, entry, undefined),
+        () => this.settle(part, entry, null),
       );
     }
   }
 
-  private settle(part: string, entry: ImageEntry, loaded: { image: PageImage; close?(): void } | undefined): void {
+  /** `loaded`: the decoded picture, null when it cannot be shown, undefined when there was no room for it. */
+  private settle(part: string, entry: ImageEntry, loaded: Decoded | null | undefined): void {
     this.loading--;
+    entry.pending = false;
     if (this.destroyed || this.entries.get(part) !== entry) {
       if (loaded && loaded.close) loaded.close();
+      this.pump();
       return;
     }
     if (loaded && loaded.image.width > 0 && loaded.image.height > 0) {
+      // A picture decoded again replaces its smaller self.
+      if (entry.close) entry.close();
+      this.total -= entry.bytes;
       entry.state = 'ready';
       entry.image = loaded.image;
       entry.close = loaded.close;
       entry.bytes = loaded.image.width * loaded.image.height * 4;
       this.total += entry.bytes;
-      this.evict();
       this.onLoad(part);
     } else {
       if (loaded && loaded.close) loaded.close();
-      entry.state = 'failed';
+      if (loaded === undefined) entry.deferred = this.pass;
+      // What it had before stays: a picture that could not be decoded larger is still shown as it was.
+      if (entry.state === 'loading') entry.state = loaded === undefined ? 'waiting' : 'failed';
     }
     this.pump();
   }
 
-  private evict(): void {
-    if (this.total <= this.budget) return;
+  /**
+   * Makes room for `bytes` more by dropping pictures that no page painted in
+   * the current pass uses, the one used longest ago first. False when the
+   * rest is all in use: the budget is not exceeded for anything.
+   */
+  private makeRoom(bytes: number, keep: ImageEntry): boolean {
+    if (this.total + this.reserved + bytes <= this.budget) return true;
     const drop: string[] = [];
-    let total = this.total;
+    let free = this.budget - this.total - this.reserved;
     this.entries.forEach((entry, part) => {
-      if (total <= this.budget || entry.state !== 'ready' || entry.used >= this.pass - 1) return;
-      total -= entry.bytes;
+      if (free >= bytes || entry === keep || entry.state !== 'ready' || entry.pending || entry.used >= this.pass) return;
+      free += entry.bytes;
       drop.push(part);
     });
+    if (free < bytes) return false;
     for (let i = 0; i < drop.length; i++) {
       const entry = this.entries.get(drop[i]) as ImageEntry;
       if (entry.close) entry.close();
+      this.total -= entry.bytes;
       this.entries.delete(drop[i]);
     }
-    this.total = total;
+    return true;
   }
 
-  private async load(part: string): Promise<{ image: PageImage; close?(): void } | undefined> {
+  private async load(part: string, entry: ImageEntry): Promise<Decoded | null | undefined> {
     const bytes = await (this.source as { readPart(part: string): Promise<Uint8Array> }).readPart(part);
     const type = sniffImageType(bytes);
     // Vector and other formats are not handed to the browser: an SVG, say, could ask for outside resources.
-    if (type === undefined) return undefined;
-    const pixels = declaredImagePixels(bytes, type);
-    if (pixels !== undefined && !(pixels > 0 && pixels <= MAX_IMAGE_PIXELS)) return undefined;
-    const blob = new Blob([bytes as unknown as BlobPart], { type });
+    if (type === undefined) return null;
+    const size = declaredImageSize(bytes, type);
+    const pixels = size ? size.width * size.height : undefined;
+    if (pixels !== undefined && !(pixels > 0 && pixels <= MAX_IMAGE_PIXELS)) return null;
+    const limit = this.maxPixels();
+    // Without a size in the header the decoder decides; room is kept for the most a picture may take.
+    const target = size ? decodedImageSize(size.width, size.height, entry.wantWidth, entry.wantHeight, limit) : undefined;
+    if (size) {
+      entry.naturalWidth = size.width;
+      entry.naturalHeight = size.height;
+      // Asked for again, and what is there is as good as it gets within the budget.
+      if (entry.image && target && target.width <= entry.image.width && target.height <= entry.image.height) return undefined;
+    }
+    const room = target ? target.width * target.height * 4 : limit * 4;
+    if (!this.makeRoom(room, entry)) return undefined;
+    this.reserved += room;
+    try {
+      const blob = new Blob([bytes as unknown as BlobPart], { type });
+      const decode = () => this.decode(blob, size, target, limit);
+      // The decoder holds the whole picture for a moment, whatever size is asked for: large ones go one at a time.
+      if (pixels === undefined || pixels * 4 > this.budget / 4) {
+        const run = this.heavy.then(decode, decode);
+        this.heavy = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return await run;
+      }
+      return await decode();
+    } finally {
+      this.reserved -= room;
+    }
+  }
+
+  private async decode(
+    blob: Blob,
+    size: { width: number; height: number } | undefined,
+    target: { width: number; height: number } | undefined,
+    limit: number,
+  ): Promise<Decoded | null> {
+    if (this.destroyed) return null;
     if (typeof createImageBitmap === 'function') {
       try {
-        const bitmap = await createImageBitmap(blob);
-        return { image: { source: bitmap, width: bitmap.width, height: bitmap.height }, close: () => bitmap.close() };
+        const smaller = size !== undefined && target !== undefined && (target.width < size.width || target.height < size.height);
+        const bitmap = smaller
+          ? await createImageBitmap(blob, { resizeWidth: (target as { width: number }).width, resizeHeight: (target as { height: number }).height, resizeQuality: 'medium' })
+          : await createImageBitmap(blob);
+        const close = () => bitmap.close();
+        return this.fitted(bitmap, bitmap.width, bitmap.height, close, target, limit);
       } catch {
         // Some browsers decode fewer formats here than in an image element.
       }
     }
-    if (this.destroyed || typeof Image !== 'function' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return undefined;
+    if (this.destroyed || typeof Image !== 'function' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return null;
     return new Promise((resolve) => {
       const url = URL.createObjectURL(blob);
       this.urls.push(url);
@@ -380,12 +528,61 @@ class ImageStore {
           this.urls.splice(index, 1);
           URL.revokeObjectURL(url);
         }
-        resolve(ok ? { image: { source: element, width: element.naturalWidth, height: element.naturalHeight } } : undefined);
+        const release = () => {
+          element.removeAttribute('src');
+        };
+        resolve(ok ? this.fitted(element, element.naturalWidth, element.naturalHeight, release, target, limit) : null);
       };
       element.onload = () => finish(true);
       element.onerror = () => finish(false);
       element.src = url;
     });
+  }
+
+  /**
+   * The decoded picture as it is kept: itself when it is no larger than was
+   * asked for, otherwise drawn down to that size on a canvas of its own, with
+   * the large original given back at once (a browser that ignores the resize
+   * options of createImageBitmap, or a picture decoded in an image element).
+   */
+  private fitted(
+    source: CanvasImageSource,
+    width: number,
+    height: number,
+    close: () => void,
+    target: { width: number; height: number } | undefined,
+    limit: number,
+  ): Decoded | null {
+    if (!(width > 0) || !(height > 0)) {
+      close();
+      return null;
+    }
+    const wanted = target || decodedImageSize(width, height, 0, 0, limit);
+    // Not one pixel more than room was kept for: the budget is strict.
+    if (width * height <= wanted.width * wanted.height) return { image: { source, width, height }, close };
+    const canvas = document.createElement('canvas');
+    canvas.width = wanted.width;
+    canvas.height = wanted.height;
+    const context = canvas.getContext('2d');
+    let drawn = false;
+    if (context) {
+      try {
+        context.drawImage(source, 0, 0, wanted.width, wanted.height);
+        drawn = true;
+      } catch {
+        // A picture the canvas refuses is not shown.
+      }
+    }
+    close();
+    const release = () => {
+      canvas.width = 0;
+      canvas.height = 0;
+    };
+    if (!drawn) {
+      release();
+      return null;
+    }
+    return { image: { source: canvas, width: wanted.width, height: wanted.height }, close: release };
   }
 }
 
@@ -418,14 +615,261 @@ export function documentText(doc: DocModel): string {
   return out.join('\n');
 }
 
-/** A place in the text of the laid out pages: before character `offset` of text item `item` of page `page`. */
+/**
+ * A place in the text of the document: before character `offset` (as in
+ * paragraphText) of the paragraph at `path` of a story. The same as
+ * TextItem.source, so a place does not depend on how the pages are painted.
+ */
 interface TextPosition {
-  page: number;
-  item: number;
+  story: string;
+  path: number[];
   offset: number;
 }
 
-const comparePositions = (a: TextPosition, b: TextPosition): number => a.page - b.page || a.item - b.item || a.offset - b.offset;
+/**
+ * Length of the part of a path that says which flow of text a paragraph is
+ * in: nothing for the story itself, the path up to and with the text box for
+ * a paragraph in a text box (see TextItem.source). A selection stays in the
+ * flow it began in.
+ */
+function flowPrefix(path: number[]): number {
+  const marker = path.lastIndexOf(-1);
+  return marker < 0 ? 0 : Math.min(marker + 3, path.length);
+}
+
+function sameFlow(a: { story: string; path: number[] }, b: { story: string; path: number[] }): boolean {
+  if (a.story !== b.story) return false;
+  const prefix = flowPrefix(a.path);
+  if (flowPrefix(b.path) !== prefix) return false;
+  for (let i = 0; i < prefix; i++) if (a.path[i] !== b.path[i]) return false;
+  return true;
+}
+
+/** Document order of two paths of one flow. */
+function comparePaths(a: number[], b: number[]): number {
+  const shared = Math.min(a.length, b.length);
+  for (let i = 0; i < shared; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+}
+
+const comparePositions = (a: TextPosition, b: TextPosition): number => comparePaths(a.path, b.path) || a.offset - b.offset;
+
+/** A selection put in order. */
+interface TextRange {
+  start: TextPosition;
+  end: TextPosition;
+  /** Length of the flow prefix of the paths. */
+  prefix: number;
+  /**
+   * The two ends are in different cells of one table: whole cells are
+   * selected, those of the rows and of the cells (by their number in the row)
+   * between the two. `table` is the path of the table.
+   */
+  cells?: { table: number[]; row: number; lastRow: number; cell: number; lastCell: number };
+}
+
+function orderedRange(anchor: TextPosition, focus: TextPosition): TextRange | undefined {
+  if (!sameFlow(anchor, focus)) return undefined;
+  const order = comparePositions(anchor, focus);
+  if (order === 0) return undefined;
+  const start = order < 0 ? anchor : focus;
+  const end = order < 0 ? focus : anchor;
+  const range: TextRange = { start, end, prefix: flowPrefix(start.path) };
+  const a = start.path;
+  const b = end.path;
+  // Down the tables both ends are in, as long as they are in the same cell.
+  for (let i = range.prefix; i + 3 < a.length && i + 3 < b.length && a[i] === b[i]; i += 3) {
+    if (a[i + 1] === b[i + 1] && a[i + 2] === b[i + 2]) continue;
+    range.cells = {
+      table: a.slice(0, i + 1),
+      row: Math.min(a[i + 1], b[i + 1]),
+      lastRow: Math.max(a[i + 1], b[i + 1]),
+      cell: Math.min(a[i + 2], b[i + 2]),
+      lastCell: Math.max(a[i + 2], b[i + 2]),
+    };
+    break;
+  }
+  return range;
+}
+
+/** The part of a text item that is in the range, as offsets into its text; undefined when none is. */
+function selectedPart(range: TextRange, item: TextItem): [number, number] | undefined {
+  const source = item.source;
+  // Text the engine made up and repeated header rows are not part of the story.
+  if (!source || item.repeat || !sameFlow(source, range.start)) return undefined;
+  const path = source.path;
+  const length = item.text.length;
+  const cells = range.cells;
+  if (cells) {
+    const at = cells.table.length;
+    if (path.length < at + 3) return undefined;
+    for (let i = 0; i < at; i++) if (path[i] !== cells.table[i]) return undefined;
+    return path[at] >= cells.row && path[at] <= cells.lastRow && path[at + 1] >= cells.cell && path[at + 1] <= cells.lastCell ? [0, length] : undefined;
+  }
+  const afterStart = comparePaths(path, range.start.path);
+  const beforeEnd = comparePaths(path, range.end.path);
+  if (afterStart < 0 || beforeEnd > 0) return undefined;
+  const from = afterStart === 0 ? clamp(range.start.offset - source.offset, 0, length) : 0;
+  const to = beforeEnd === 0 ? clamp(range.end.offset - source.offset, 0, length) : length;
+  return to > from ? [from, to] : undefined;
+}
+
+/** The text boxes of the n-th drawing of a paragraph, counted as the layout engine counts them. */
+function drawingBoxes(paragraph: Paragraph, wanted: number): Block[][] | undefined {
+  let count = 0;
+  const search = (items: RunItem[], code: (index: number) => boolean, depth: number): Block[][] | null | undefined => {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type === 'fieldChar' || code(i)) continue;
+      if (item.type === 'alternate') {
+        if (depth >= MAX_TEXT_DEPTH) continue;
+        const inner = search(item.items, () => false, depth + 1);
+        if (inner !== undefined) return inner;
+      } else if (item.type === 'drawing' || item.type === 'pict' || item.type === 'object') {
+        if (count++ === wanted) return item.textBoxes || null;
+      }
+    }
+    return undefined;
+  };
+  for (const inline of paragraph.children) {
+    if (inline.type !== 'run') continue;
+    if (inline.wrap && (findWrapper(inline, 'del') || findWrapper(inline, 'moveFrom'))) continue;
+    const found = search(inline.content, (index) => inFieldCode(inline, index), 0);
+    if (found !== undefined) return found || undefined;
+  }
+  return undefined;
+}
+
+/** The blocks of a story of the document ("body", "header:<rId>", "footnote:<id>", ...). */
+function storyBlocks(doc: DocModel, story: string): Block[] | undefined {
+  if (story === 'body') return doc.body.blocks;
+  const colon = story.indexOf(':');
+  if (colon < 0) return undefined;
+  const kind = story.slice(0, colon);
+  const id = story.slice(colon + 1);
+  if (kind === 'header' || kind === 'footer') {
+    const part = (kind === 'header' ? doc.headers : doc.footers).get(id);
+    return part ? part.blocks : undefined;
+  }
+  if (kind === 'footnote' || kind === 'endnote') {
+    const notes = kind === 'footnote' ? doc.footnotes : doc.endnotes;
+    const note = notes && /^-?\d{1,10}$/.test(id) ? notes.items.get(Number(id)) : undefined;
+    return note ? note.blocks : undefined;
+  }
+  return undefined;
+}
+
+/** The table at a path (block index, then row, cell and block index for every table it is in) under `blocks`. */
+function tableAt(blocks: Block[], path: number[]): Table | undefined {
+  let list = blocks;
+  for (let i = 0; i < path.length; i += 3) {
+    const block = list[path[i]];
+    if (!block || block.type !== 'table') return undefined;
+    if (i + 1 >= path.length) return block;
+    const row = block.rows[path[i + 1]];
+    const cell = row ? row.cells[path[i + 2]] : undefined;
+    if (!cell) return undefined;
+    list = cell.blocks;
+  }
+  return undefined;
+}
+
+/** The blocks of the flow a path prefix names: those of the story, or of a text box in it. */
+function flowBlocks(doc: DocModel, story: string, prefix: number[]): Block[] | undefined {
+  let blocks: Block[] | undefined = storyBlocks(doc, story);
+  let i = 0;
+  // Every round follows one text box: the paragraph that anchors it (through the tables it is in), then the box.
+  while (blocks && i < prefix.length) {
+    let list: Block[] = blocks;
+    let block: Block | undefined = list[prefix[i++]];
+    while (block && block.type === 'table') {
+      const table: Table = block;
+      const row = table.rows[prefix[i]];
+      const inner: Block[] | undefined = row && row.cells[prefix[i + 1]] ? row.cells[prefix[i + 1]].blocks : undefined;
+      if (!inner) return undefined;
+      list = inner;
+      block = list[prefix[i + 2]];
+      i += 3;
+    }
+    if (!block || block.type !== 'paragraph' || prefix[i] !== -1) return undefined;
+    const boxes = drawingBoxes(block, prefix[i + 1]);
+    blocks = boxes ? boxes[prefix[i + 2]] : undefined;
+    i += 3;
+  }
+  return blocks;
+}
+
+/**
+ * The text of `blocks` from the place (`from`, `fromOffset`) to (`to`,
+ * `toOffset`), both paths relative to the blocks; a missing path stands for
+ * the start or the end of the blocks. Paragraphs on lines of their own, the
+ * cells of a table row separated by tabs: the rules of documentText().
+ */
+function blocksRangeText(blocks: Block[], from: number[] | undefined, fromOffset: number, to: number[] | undefined, toOffset: number, out: string[], depth: number): void {
+  if (depth > MAX_TEXT_DEPTH) return;
+  const first = from && from.length ? from[0] : 0;
+  const last = to && to.length ? Math.min(to[0], blocks.length - 1) : blocks.length - 1;
+  for (let i = Math.max(0, first); i <= last; i++) {
+    const block = blocks[i];
+    const starts = from !== undefined && from.length > 0 && i === from[0];
+    const ends = to !== undefined && to.length > 0 && i === to[0];
+    if (block.type === 'paragraph') {
+      const text = paragraphText(block);
+      const a = starts && from.length === 1 ? clamp(fromOffset, 0, text.length) : 0;
+      const b = ends && to.length === 1 ? clamp(toOffset, 0, text.length) : text.length;
+      out.push(text.slice(a, Math.max(a, b)));
+    } else if (block.type === 'table') {
+      const deepStart = starts && from.length >= 4;
+      const deepEnd = ends && to.length >= 4;
+      const firstRow = deepStart ? Math.max(0, from[1]) : 0;
+      const lastRow = deepEnd ? Math.min(to[1], block.rows.length - 1) : block.rows.length - 1;
+      for (let r = firstRow; r <= lastRow; r++) {
+        const row = block.rows[r];
+        const firstCell = deepStart && r === from[1] ? Math.max(0, from[2]) : 0;
+        const lastCell = deepEnd && r === to[1] ? Math.min(to[2], row.cells.length - 1) : row.cells.length - 1;
+        const cells: string[] = [];
+        for (let c = firstCell; c <= lastCell; c++) {
+          const inner: string[] = [];
+          blocksRangeText(
+            row.cells[c].blocks,
+            deepStart && r === from[1] && c === from[2] ? from.slice(3) : undefined,
+            fromOffset,
+            deepEnd && r === to[1] && c === to[2] ? to.slice(3) : undefined,
+            toOffset,
+            inner,
+            depth + 1,
+          );
+          cells.push(inner.join('\n'));
+        }
+        out.push(cells.join('\t'));
+      }
+    }
+  }
+}
+
+/** The text of a selection, from the model. */
+function rangeTextOf(doc: DocModel, range: TextRange): string {
+  const prefix = range.prefix;
+  const blocks = flowBlocks(doc, range.start.story, range.start.path.slice(0, prefix));
+  if (!blocks) return '';
+  const out: string[] = [];
+  const cells = range.cells;
+  if (cells) {
+    const table = tableAt(blocks, cells.table.slice(prefix));
+    if (!table) return '';
+    for (let r = cells.row; r <= cells.lastRow && r < table.rows.length; r++) {
+      const row = table.rows[r];
+      const line: string[] = [];
+      for (let c = cells.cell; c <= cells.lastCell && c < row.cells.length; c++) {
+        const inner: string[] = [];
+        blocksText(row.cells[c].blocks, inner, 1);
+        line.push(inner.join('\n'));
+      }
+      out.push(line.join('\t'));
+    }
+  } else blocksRangeText(blocks, range.start.path.slice(prefix), range.start.offset, range.end.path.slice(prefix), range.end.offset, out, 0);
+  return out.join('\n');
+}
 
 function sameSource(a: TextItem, b: TextItem): boolean {
   const x = a.source;
@@ -713,7 +1157,8 @@ export class DocumentView {
     const selection = this.selection;
     if (selection === undefined) return '';
     if (selection === 'all') return documentText(this.document);
-    return this.rangeText(selection.anchor, selection.focus);
+    const range = orderedRange(selection.anchor, selection.focus);
+    return range ? rangeTextOf(this.document, range) : '';
   }
 
   /** Changes the language of the view's own words. */
@@ -773,6 +1218,8 @@ export class DocumentView {
       width: this.width,
       height: this.height,
       devicePixelRatio: this.dpr,
+      imageBytes: this.images.bytes,
+      imageBudget: this.images.budget,
     };
   }
 
@@ -1264,7 +1711,8 @@ export class DocumentView {
       lineY = item.y;
       previous = item;
 
-      if (item.link === undefined || slot.links.length >= MAX_LINKS_PER_PAGE || !(item.width > 0)) {
+      // A link in vertical text is painted but has no element: its box would be in the wrong place.
+      if (item.link === undefined || slot.links.length >= MAX_LINKS_PER_PAGE || !(item.width > 0) || item.rotation !== undefined) {
         if (item.link === undefined) previousLink = undefined;
         continue;
       }
@@ -1381,16 +1829,23 @@ export class DocumentView {
     return clamp(width, 0, item.width);
   }
 
-  /** The place in the text nearest to a point of a page (px of the page). */
-  private positionAt(pageIndex: number, x: number, y: number): TextPosition | undefined {
+  /**
+   * The text item nearest to a point of a page (px of the page) and the
+   * character boundary in it nearest to the point. Only text of the document
+   * counts: not what the engine made up, not repeated header rows. With
+   * `flow`, only text of the flow that place is in.
+   */
+  private hitAt(pageIndex: number, x: number, y: number, flow?: TextPosition): { item: TextItem; offset: number } | undefined {
     const page = this.pages[pageIndex];
     if (!page) return undefined;
     const items = page.items;
-    let best = -1;
+    let best: TextItem | undefined;
     let bestDistance = Infinity;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      if (item.type !== 'text' || item.text.length === 0) continue;
+      // Vertical text is painted and copied, but a point is not looked up in it.
+      if (item.type !== 'text' || item.text.length === 0 || !item.source || item.repeat || item.rotation !== undefined) continue;
+      if (flow && !sameFlow(item.source, flow)) continue;
       const box = this.measurer.metrics(item.font);
       const dy = y < item.y - box.ascent ? item.y - box.ascent - y : y > item.y + box.descent ? y - item.y - box.descent : 0;
       const dx = x < item.x ? item.x - x : x > item.x + item.width ? x - item.x - item.width : 0;
@@ -1398,11 +1853,11 @@ export class DocumentView {
       const distance = dy * 1000 + dx;
       if (distance < bestDistance) {
         bestDistance = distance;
-        best = i;
+        best = item;
       }
     }
-    if (best < 0) return undefined;
-    const item = items[best] as TextItem;
+    if (!best) return undefined;
+    const item = best;
     const target = x - item.x;
     let low = 0;
     let high = item.text.length;
@@ -1413,7 +1868,12 @@ export class DocumentView {
       else high = mid - 1;
     }
     if (low < item.text.length && target - this.advance(item, low) > this.advance(item, low + 1) - target) low++;
-    return { page: pageIndex, item: best, offset: low };
+    return { item, offset: low };
+  }
+
+  private static positionOf(item: TextItem, offset: number): TextPosition {
+    const source = item.source as NonNullable<TextItem['source']>;
+    return { story: source.story, path: source.path, offset: source.offset + offset };
   }
 
   /** The page under a point of the window and the point in px of that page. */
@@ -1436,34 +1896,37 @@ export class DocumentView {
     return found;
   }
 
-  private positionFromEvent(event: { clientX: number; clientY: number }): TextPosition | undefined {
+  private hitFromEvent(event: { clientX: number; clientY: number }, flow?: TextPosition): { item: TextItem; offset: number } | undefined {
     const point = this.pagePoint(event.clientX, event.clientY);
-    return point ? this.positionAt(point.page, point.x, point.y) : undefined;
+    return point ? this.hitAt(point.page, point.x, point.y, flow) : undefined;
   }
 
+  private positionFromEvent(event: { clientX: number; clientY: number }, flow?: TextPosition): TextPosition | undefined {
+    const hit = this.hitFromEvent(event, flow);
+    return hit ? DocumentView.positionOf(hit.item, hit.offset) : undefined;
+  }
+
+  /** Paints the selection over a page: only over the text that is selected, wherever on the page it is painted. */
   private paintSelection(context: CanvasRenderingContext2D, pageIndex: number, scale: number): void {
     const selection = this.selection;
     if (selection === undefined) return;
-    const page = this.pages[pageIndex];
-    let start: TextPosition | undefined;
-    let end: TextPosition | undefined;
-    if (selection !== 'all') {
-      const forward = comparePositions(selection.anchor, selection.focus) <= 0;
-      start = forward ? selection.anchor : selection.focus;
-      end = forward ? selection.focus : selection.anchor;
-      if (pageIndex < start.page || pageIndex > end.page || comparePositions(start, end) === 0) return;
-    }
-    const items = page.items;
-    const from = start && start.page === pageIndex ? start.item : 0;
-    const to = end && end.page === pageIndex ? end.item : items.length - 1;
+    const range = selection === 'all' ? undefined : orderedRange(selection.anchor, selection.focus);
+    if (selection !== 'all' && !range) return;
+    const items = this.pages[pageIndex].items;
     context.save();
     context.scale(scale, scale);
     context.fillStyle = SELECTION_FILL;
-    for (let i = from; i <= to && i < items.length; i++) {
+    for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      if (item.type !== 'text' || !(item.width > 0)) continue;
-      const a = start && start.page === pageIndex && i === start.item ? this.advance(item, start.offset) : 0;
-      const b = end && end.page === pageIndex && i === end.item ? this.advance(item, end.offset) : item.width;
+      if (item.type !== 'text' || !(item.width > 0) || item.rotation !== undefined) continue;
+      let a = 0;
+      let b = item.width;
+      if (range) {
+        const part = selectedPart(range, item);
+        if (!part) continue;
+        a = this.advance(item, part[0]);
+        b = this.advance(item, part[1]);
+      }
       if (!(b > a)) continue;
       const box = this.measurer.metrics(item.font);
       context.fillRect(item.x + a, item.y - box.ascent, b - a, box.ascent + box.descent);
@@ -1471,42 +1934,13 @@ export class DocumentView {
     context.restore();
   }
 
-  private rangeText(anchor: TextPosition, focus: TextPosition): string {
-    const forward = comparePositions(anchor, focus) <= 0;
-    const start = forward ? anchor : focus;
-    const end = forward ? focus : anchor;
-    let out = '';
-    let previous: TextItem | undefined;
-    for (let p = start.page; p <= end.page && p < this.pages.length; p++) {
-      const items = this.pages[p].items;
-      const from = p === start.page ? start.item : 0;
-      const to = p === end.page ? end.item : items.length - 1;
-      for (let i = from; i <= to && i < items.length; i++) {
-        const item = items[i];
-        // Text the engine made up (list numbers, leaders) and repeated header rows are not part of the story.
-        if (item.type !== 'text' || !item.source || item.repeat) continue;
-        const a = p === start.page && i === start.item ? start.offset : 0;
-        const b = p === end.page && i === end.item ? end.offset : item.text.length;
-        if (!(b > a)) continue;
-        if (previous && !sameSource(previous, item)) out += '\n';
-        out += item.text.slice(a, b);
-        previous = item;
-      }
-    }
-    return out;
-  }
-
   private setFocusPosition(position: TextPosition): void {
     const selection = this.selection;
     if (!selection || selection === 'all') return;
     if (comparePositions(selection.focus, position) === 0) return;
-    const low = Math.min(selection.focus.page, position.page);
-    const high = Math.max(selection.focus.page, position.page);
     selection.focus = position;
-    this.slots.forEach((slot) => {
-      if (slot.index >= low && slot.index <= high) slot.dirty = true;
-    });
-    this.schedule();
+    // The selected text may be on any page that is mounted: there are only a few.
+    this.repaintAll();
   }
 
   private onPointerDown = (event: PointerEvent | MouseEvent): void => {
@@ -1514,13 +1948,15 @@ export class DocumentView {
     this.dragMoved = false;
     // A finger scrolls; only a mouse or a pen selects.
     if ('pointerType' in event && event.pointerType === 'touch') return;
-    const position = this.positionFromEvent(event);
+    const selection = this.selection;
+    const extend = event.shiftKey && selection !== undefined && selection !== 'all';
+    // A selection stays in the flow of text it began in: the body, one header, one note, one text box.
+    const position = this.positionFromEvent(event, extend ? (selection as { anchor: TextPosition }).anchor : undefined);
     if (!position) {
-      this.clearSelection();
+      if (!extend) this.clearSelection();
       return;
     }
-    const selection = this.selection;
-    if (event.shiftKey && selection && selection !== 'all') {
+    if (extend) {
       this.setFocusPosition(position);
     } else {
       const had = selection !== undefined;
@@ -1535,10 +1971,11 @@ export class DocumentView {
 
   private onPointerMove = (event: PointerEvent | MouseEvent): void => {
     if (!this.dragging || this.destroyed) return;
-    const position = this.positionFromEvent(event);
-    if (!position) return;
     const selection = this.selection;
-    if (selection && selection !== 'all' && comparePositions(selection.anchor, position) !== 0) this.dragMoved = true;
+    if (!selection || selection === 'all') return;
+    const position = this.positionFromEvent(event, selection.anchor);
+    if (!position) return;
+    if (comparePositions(selection.anchor, position) !== 0) this.dragMoved = true;
     this.setFocusPosition(position);
   };
 
@@ -1558,16 +1995,15 @@ export class DocumentView {
 
   private onDoubleClick = (event: MouseEvent): void => {
     if (this.destroyed) return;
-    const position = this.positionFromEvent(event);
-    if (!position) return;
-    const item = this.pages[position.page].items[position.item] as TextItem;
-    const text = item.text;
-    let start = Math.min(position.offset, text.length - 1);
+    const hit = this.hitFromEvent(event);
+    if (!hit) return;
+    const text = hit.item.text;
+    let start = Math.min(hit.offset, text.length - 1);
     if (start < 0 || /\s/.test(text.charAt(start))) return;
     let end = start;
     while (start > 0 && !/\s/.test(text.charAt(start - 1))) start--;
     while (end < text.length && !/\s/.test(text.charAt(end))) end++;
-    this.selection = { anchor: { page: position.page, item: position.item, offset: start }, focus: { page: position.page, item: position.item, offset: end } };
+    this.selection = { anchor: DocumentView.positionOf(hit.item, start), focus: DocumentView.positionOf(hit.item, end) };
     this.repaintAll();
   };
 

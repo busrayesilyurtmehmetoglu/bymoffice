@@ -53,6 +53,244 @@ function bodyInsets(xml: XmlElement): Insets {
   return { left: read('lIns', INSET_X), top: read('tIns', INSET_Y), right: read('rIns', INSET_X), bottom: read('bIns', INSET_Y) };
 }
 
+const localName = (name: string): string => {
+  const colon = name.indexOf(':');
+  return colon < 0 ? name : name.slice(colon + 1);
+};
+
+/** The first child element with the local name. */
+function childElement(el: XmlElement | undefined, local: string): XmlElement | undefined {
+  if (!el) return undefined;
+  for (const node of el.children) if (node.type === 'element' && localName(node.name) === local) return node;
+  return undefined;
+}
+
+/** Fill and outline of the box a text box is drawn in. */
+interface BoxStyle {
+  fill?: string;
+  line?: { color: string; width: number };
+}
+
+/** DrawingML names of theme colours -> the names resolveColor knows. */
+const SCHEME_COLORS: { [name: string]: string } = {
+  tx1: 'text1',
+  tx2: 'text2',
+  bg1: 'background1',
+  bg2: 'background2',
+  dk1: 'dark1',
+  dk2: 'dark2',
+  lt1: 'light1',
+  lt2: 'light2',
+  hlink: 'hyperlink',
+  folHlink: 'followedHyperlink',
+  accent1: 'accent1',
+  accent2: 'accent2',
+  accent3: 'accent3',
+  accent4: 'accent4',
+  accent5: 'accent5',
+  accent6: 'accent6',
+};
+
+/** The colour names shapes are most often given, as "RRGGBB". */
+const NAMED_COLORS: { [name: string]: string } = {
+  black: '000000',
+  white: 'FFFFFF',
+  red: 'FF0000',
+  green: '008000',
+  lime: '00FF00',
+  blue: '0000FF',
+  yellow: 'FFFF00',
+  cyan: '00FFFF',
+  aqua: '00FFFF',
+  magenta: 'FF00FF',
+  fuchsia: 'FF00FF',
+  gray: '808080',
+  grey: '808080',
+  silver: 'C0C0C0',
+  maroon: '800000',
+  navy: '000080',
+  olive: '808000',
+  purple: '800080',
+  teal: '008080',
+  orange: 'FFA500',
+};
+
+const HEX6 = /^[0-9A-Fa-f]{6}$/;
+
+/** A share stated in thousandths of a percent ("85000" is 0.85); undefined when it is not one. */
+function share(text: string | undefined): number | undefined {
+  if (text === undefined || !/^\d{1,7}$/.test(text)) return undefined;
+  return Math.min(Number(text) / 100000, 1);
+}
+
+/**
+ * The colour of a DrawingML colour element (<a:srgbClr>, <a:schemeClr>,
+ * <a:sysClr>, <a:prstClr>) with the commonest changes to it applied, as
+ * "#RRGGBB"; undefined when it states none or is fully transparent.
+ * Luminance changes are applied to the channels, which is exact for greys
+ * and close for colours.
+ */
+function drawingColor(ctx: LayoutContext, el: XmlElement | undefined): string | undefined {
+  if (!el) return undefined;
+  const kind = localName(el.name);
+  const value = el.attrs.get('val');
+  let rgb: string | undefined;
+  if (kind === 'srgbClr') rgb = value !== undefined && HEX6.test(value) ? value : undefined;
+  else if (kind === 'sysClr') {
+    const last = el.attrs.get('lastClr');
+    rgb = last !== undefined && HEX6.test(last) ? last : value === 'window' ? 'FFFFFF' : value === 'windowText' ? '000000' : undefined;
+  } else if (kind === 'prstClr') rgb = value !== undefined && Object.prototype.hasOwnProperty.call(NAMED_COLORS, value) ? NAMED_COLORS[value] : undefined;
+  else if (kind === 'schemeClr') {
+    const name = value !== undefined && Object.prototype.hasOwnProperty.call(SCHEME_COLORS, value) ? SCHEME_COLORS[value] : undefined;
+    const resolved = name === undefined ? '' : ctx.color({ theme: name }, '');
+    rgb = resolved.charAt(0) === '#' && HEX6.test(resolved.slice(1)) ? resolved.slice(1) : undefined;
+  }
+  if (rgb === undefined) return undefined;
+  const channels = [parseInt(rgb.slice(0, 2), 16), parseInt(rgb.slice(2, 4), 16), parseInt(rgb.slice(4, 6), 16)];
+  for (const node of el.children) {
+    if (node.type !== 'element') continue;
+    const amount = share(node.attrs.get('val'));
+    if (amount === undefined) continue;
+    const change = localName(node.name);
+    if (change === 'alpha' && amount === 0) return undefined;
+    for (let i = 0; i < 3; i++) {
+      if (change === 'lumMod' || change === 'shade') channels[i] *= amount;
+      else if (change === 'lumOff') channels[i] += 255 * amount;
+      else if (change === 'tint') channels[i] += (255 - channels[i]) * (1 - amount);
+    }
+  }
+  let out = '#';
+  for (let i = 0; i < 3; i++) {
+    const channel = Math.round(clamp(channels[i], 0, 255));
+    out += (channel < 16 ? '0' : '') + channel.toString(16).toUpperCase();
+  }
+  return out;
+}
+
+/** Shapes that are drawn as the rectangle of their size. */
+const BOX_SHAPES: { [prst: string]: true } = {
+  rect: true,
+  roundRect: true,
+  round1Rect: true,
+  round2SameRect: true,
+  round2DiagRect: true,
+  snip1Rect: true,
+  snip2SameRect: true,
+  snip2DiagRect: true,
+  snipRoundRect: true,
+  flowChartProcess: true,
+  flowChartAlternateProcess: true,
+};
+
+/** 0.75 pt, the outline of a shape that states a colour but no width; px. */
+const DEFAULT_OUTLINE = 1;
+const MAX_OUTLINE = 16;
+
+/**
+ * Fill and outline of the shape of a DrawingML text box: what <wps:spPr>
+ * states (<a:solidFill>, <a:ln>), and for what it leaves open the colours of
+ * the shape style. Only a single shape whose geometry is a box is looked at;
+ * gradients, patterns and pictures as fills are not shown.
+ */
+function shapeStyle(ctx: LayoutContext, xml: XmlElement): BoxStyle {
+  const shape = findElement(xml, 'wsp', 0);
+  const out: BoxStyle = {};
+  if (!shape) return out;
+  const props = childElement(shape, 'spPr');
+  const geometry = childElement(props, 'prstGeom');
+  const preset = geometry ? geometry.attrs.get('prst') : undefined;
+  if (preset !== undefined && !Object.prototype.hasOwnProperty.call(BOX_SHAPES, preset)) return out;
+  const style = childElement(shape, 'style');
+  const styleColor = (name: string): string | undefined => {
+    const ref = childElement(style, name);
+    const idx = ref ? ref.attrs.get('idx') : undefined;
+    if (!ref || idx === undefined || idx === '0') return undefined;
+    for (const node of ref.children) if (node.type === 'element') return drawingColor(ctx, node);
+    return undefined;
+  };
+  const colorOf = (holder: XmlElement | undefined): string | undefined => {
+    if (!holder) return undefined;
+    for (const node of holder.children) if (node.type === 'element') return drawingColor(ctx, node);
+    return undefined;
+  };
+  /** A fill stated among the children: a colour, null for a fill that shows nothing here, undefined when none is stated. */
+  const stated = (holder: XmlElement | undefined): string | null | undefined => {
+    if (!holder) return undefined;
+    for (const node of holder.children) {
+      if (node.type !== 'element') continue;
+      const local = localName(node.name);
+      if (local === 'solidFill') return colorOf(node) || null;
+      if (local === 'noFill' || local === 'gradFill' || local === 'pattFill' || local === 'blipFill' || local === 'grpFill') return null;
+    }
+    return undefined;
+  };
+  const fill = stated(props);
+  const fillColor = fill === undefined ? styleColor('fillRef') : fill;
+  if (fillColor) out.fill = fillColor;
+  const outline = childElement(props, 'ln');
+  const stroke = stated(outline);
+  const strokeColor = stroke === undefined ? styleColor('lnRef') : stroke;
+  if (strokeColor) {
+    const text = outline ? outline.attrs.get('w') : undefined;
+    const width = text !== undefined && /^\d{1,9}$/.test(text) ? emu(Number(text)) : DEFAULT_OUTLINE;
+    if (width > 0) out.line = { color: strokeColor, width: Math.min(width, MAX_OUTLINE) };
+  }
+  return out;
+}
+
+/** A colour as VML writes it: "#rrggbb", "#rgb" or a name, at times followed by a palette index ("#4f81bd [3204]"). */
+function vmlColor(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined;
+  const match = /^\s*(#[0-9A-Fa-f]{6}|#[0-9A-Fa-f]{3}|[A-Za-z]{3,20})\b/.exec(text);
+  if (!match) return undefined;
+  const value = match[1];
+  if (value.charAt(0) !== '#') {
+    const name = value.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(NAMED_COLORS, name) ? '#' + NAMED_COLORS[name] : undefined;
+  }
+  if (value.length === 7) return value.toUpperCase();
+  return ('#' + value.charAt(1) + value.charAt(1) + value.charAt(2) + value.charAt(2) + value.charAt(3) + value.charAt(3)).toUpperCase();
+}
+
+const vmlOff = (text: string | undefined): boolean => text === 'f' || text === 'false' || text === '0';
+
+/**
+ * Fill and stroke of a VML shape with a text box. A VML shape is stroked in
+ * black, 0.75 pt wide, unless it says otherwise; its default white fill is
+ * not painted (white paper shows the same, and nothing behind it is covered).
+ */
+function vmlStyle(shape: XmlElement | undefined): BoxStyle {
+  const out: BoxStyle = {};
+  if (!shape) return out;
+  const fillElement = childElement(shape, 'fill');
+  const strokeElement = childElement(shape, 'stroke');
+  if (!vmlOff(shape.attrs.get('filled')) && !(fillElement && vmlOff(fillElement.attrs.get('on')))) {
+    const fill = vmlColor(shape.attrs.get('fillcolor')) || (fillElement ? vmlColor(fillElement.attrs.get('color')) : undefined);
+    if (fill !== undefined) out.fill = fill;
+  }
+  if (!vmlOff(shape.attrs.get('stroked')) && !(strokeElement && vmlOff(strokeElement.attrs.get('on')))) {
+    const stated = cssLength(shape.attrs.get('strokeweight'));
+    const width = stated === undefined ? DEFAULT_OUTLINE : stated;
+    if (width > 0) out.line = { color: vmlColor(shape.attrs.get('strokecolor')) || '#000000', width: Math.min(width, MAX_OUTLINE) };
+  }
+  return out;
+}
+
+/** The fill of a box under its content and its outline over it. */
+function framed(style: BoxStyle, width: number, height: number, content: PageItem[], out: PageItem[]): void {
+  const visible = width > 0 && height > 0;
+  if (visible && style.fill !== undefined) out.push({ type: 'rect', x: 0, y: 0, width, height, fill: style.fill });
+  for (let i = 0; i < content.length; i++) out.push(content[i]);
+  if (visible && style.line) {
+    const { color, width: thickness } = style.line;
+    const side = (x1: number, y1: number, x2: number, y2: number) => out.push({ type: 'line', x1, y1, x2, y2, color, width: thickness, style: 'single' });
+    side(0, 0, width, 0);
+    side(0, height, width, height);
+    side(0, 0, 0, height);
+    side(width, 0, width, height);
+  }
+}
+
 function textBoxItems(
   ctx: LayoutContext,
   boxes: Block[][],
@@ -110,9 +348,11 @@ export function drawingContent(
     items.push(placeholder);
   }
   if (item.textBoxes) {
-    const used = textBoxItems(ctx, item.textBoxes, width, bodyInsets(item.xml), story, path, depth, fields, items);
+    const content: PageItem[] = [];
+    const used = textBoxItems(ctx, item.textBoxes, width, bodyInsets(item.xml), story, path, depth, fields, content);
     // A box without a height of its own is as high as its text.
     if (height === 0) height = used;
+    framed(item.image ? {} : shapeStyle(ctx, item.xml), width, height, content, items);
   }
   return { width, height, items };
 }
@@ -181,8 +421,10 @@ export function legacyContent(
     items.push({ type: 'image', x: 0, y: 0, width, height, placeholder: item.type === 'object' ? 'object' : 'vml' });
   }
   if (item.textBoxes) {
-    const used = textBoxItems(ctx, item.textBoxes, width, DEFAULT_INSETS, story, path, depth, fields, items);
+    const content: PageItem[] = [];
+    const used = textBoxItems(ctx, item.textBoxes, width, DEFAULT_INSETS, story, path, depth, fields, content);
     if (height === 0) height = used;
+    framed(item.image ? {} : vmlStyle(shape), width, height, content, items);
   }
   const out: LegacyContent = { width, height, items };
   if (style.get('position') === 'absolute') {
@@ -300,8 +542,11 @@ export function floatPosition(float: FloatSpec, frame: FloatFrame): { x: number;
   return { x: finite(x), y: finite(y) };
 }
 
+/** Where text may be beside a drawing it wraps around: on both sides, on one, or on the wider one. */
+export type WrapSide = 'both' | 'left' | 'right' | 'largest';
+
 /** The area text keeps out of for a float at (x, y); undefined when text runs over or under it. */
-export function floatExclusion(float: FloatSpec, x: number, y: number): (Rect & { whole: boolean }) | undefined {
+export function floatExclusion(float: FloatSpec, x: number, y: number): (Rect & { whole: boolean; side: WrapSide }) | undefined {
   const anchor = float.anchor;
   const wrap = anchor.wrap;
   if (float.inCell || wrap === undefined || wrap === 'none' || float.width <= 0 || float.height <= 0) return undefined;
@@ -314,5 +559,6 @@ export function floatExclusion(float: FloatSpec, x: number, y: number): (Rect & 
     bottom: y + float.height + pick(d.bottom, anchor.distB),
     // Text stays clear of the whole width, not just of the drawing.
     whole: wrap === 'topAndBottom',
+    side: anchor.wrapText === 'left' || anchor.wrapText === 'right' || anchor.wrapText === 'largest' ? anchor.wrapText : 'both',
   };
 }

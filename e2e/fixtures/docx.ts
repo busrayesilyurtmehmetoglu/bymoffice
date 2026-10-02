@@ -38,14 +38,14 @@ export function png(width: number, height: number, left: [number, number, number
   view.setUint32(4, height);
   header[8] = 8; // bit depth
   header[9] = 2; // RGB
-  const raw = new Uint8Array(height * (1 + width * 3));
-  for (let y = 0; y < height; y++) {
-    const row = y * (1 + width * 3);
-    for (let x = 0; x < width; x++) {
-      const colour = right && x >= width / 2 ? right : left;
-      raw.set(colour, row + 1 + x * 3);
-    }
+  const stride = 1 + width * 3;
+  const raw = new Uint8Array(height * stride);
+  for (let x = 0; x < width; x++) {
+    const colour = right && x >= width / 2 ? right : left;
+    raw.set(colour, 1 + x * 3);
   }
+  // Every row is the same: the first one is copied down, which keeps a picture of many megapixels quick to make.
+  for (let y = 1; y < height; y++) raw.copyWithin(y * stride, 0, stride);
   const parts = [Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', header), chunk('IDAT', deflateSync(raw)), chunk('IEND', new Uint8Array(0))];
   const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
   let offset = 0;
@@ -138,3 +138,60 @@ export function longDocx(count: number): Promise<Uint8Array> {
 export function docx(body: string, extra: Partial<DocxSpec> = {}): Promise<Uint8Array> {
   return buildDocx({ styles: DOC_STYLES, body: body + docSection(), ...extra });
 }
+
+/** Document defaults with another font: `size` in half points. */
+export const fontStyles = (family: string, size: number) =>
+  `<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="${family}" w:hAnsi="${family}" w:eastAsia="${family}" w:cs="${family}"/><w:sz w:val="${size}"/></w:rPr></w:rPrDefault>` +
+  '<w:pPrDefault><w:pPr><w:widowControl w:val="0"/></w:pPr></w:pPrDefault></w:docDefaults>';
+
+/**
+ * One word of `length` letters, in Arial 11 pt. The letters follow no
+ * pattern, so that no cache of a browser's text measuring finds a piece of
+ * the word it has measured before.
+ */
+export function longWordDocx(length: number): Promise<Uint8Array> {
+  const letters = new Array<string>(length);
+  let seed = 12345;
+  for (let i = 0; i < length; i++) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    letters[i] = String.fromCharCode(97 + ((seed >>> 8) % 26));
+  }
+  return buildDocx({ styles: fontStyles('Arial', 22), body: p(letters.join('')) + docSection() });
+}
+
+/** `count` paragraphs of one short line each ("Line 1" ...) in the given font. */
+export function linesDocx(family: string, size: number, count: number): Promise<Uint8Array> {
+  let body = '';
+  for (let i = 1; i <= count; i++) body += p(`Line ${i}`);
+  return buildDocx({ styles: fontStyles(family, size), body: body + docSection() });
+}
+
+let hugePicture: Uint8Array | undefined;
+
+/**
+ * `count` pages, each with one picture shown at 400 x 300 px whose file holds
+ * 6500 x 6500 pixels (169 MB decoded; the file is a few kilobytes): every
+ * page has a part of its own, so that nothing is shared between them.
+ */
+export function hugePicturesDocx(count: number): Promise<Uint8Array> {
+  if (!hugePicture) hugePicture = png(6500, 6500, RED, BLUE);
+  let body = '';
+  const rels: [string, string, string][] = [];
+  const parts: [string, Uint8Array][] = [];
+  for (let i = 1; i <= count; i++) {
+    body += p(picture(400, 300, `rIdBig${i}`), i > 1 ? '<w:pageBreakBefore/>' : '');
+    rels.push([`rIdBig${i}`, 'image', `media/big${i}.png`]);
+    parts.push([`word/media/big${i}.png`, hugePicture]);
+  }
+  return buildDocx({ styles: DOC_STYLES, body: body + docSection(), rels, parts });
+}
+
+/** A text box of the given size, `x` px into the column and `y` px below its paragraph, that text does not wrap around. */
+export const textBoxRun = (x: number, y: number, width: number, height: number, inner: string) =>
+  '<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">' +
+  `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>${x * PX}</wp:posOffset></wp:positionH>` +
+  `<wp:positionV relativeFrom="paragraph"><wp:posOffset>${y * PX}</wp:posOffset></wp:positionV>` +
+  `<wp:extent cx="${width * PX}" cy="${height * PX}"/><wp:wrapNone/><wp:docPr id="7" name="Box"/>` +
+  '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp>' +
+  '<wps:spPr><a:solidFill><a:srgbClr val="00B400"/></a:solidFill></wps:spPr>' +
+  `<wps:txbx><w:txbxContent>${inner}</w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>`;

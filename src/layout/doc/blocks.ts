@@ -5,7 +5,7 @@
 import type { Block, ParaProps, Paragraph } from '../../model/doc/types';
 import type { Band, CellWhere, FieldValues, LayoutContext, StoryRef } from './context';
 import { paragraphBands, type ParaEnv } from './paragraph';
-import { isAutoSpace, paragraphSpace, prepareParagraph, type ParaPrep } from './prep';
+import { isAutoSpace, isHiddenParagraph, paragraphSpace, prepareParagraph, type ParaPrep } from './prep';
 import { tableBands } from './table';
 
 const PREPS = new WeakMap<LayoutContext, WeakMap<Paragraph, ParaPrep>>();
@@ -119,6 +119,7 @@ export function layoutBlocks(
     let bands: Band[];
     if (block.type === 'paragraph') {
       const prep = getPrep(ctx, block, story, path.concat([i]), where, depth, fields);
+      if (isHiddenParagraph(prep)) continue;
       bands = paragraphBands(ctx, prep, width, paragraphEnv(ctx, blocks, i, prep, where, fields));
     } else if (block.type === 'table') bands = tableBands(ctx, block, width, story, path.concat([i]), depth, fields);
     else continue;

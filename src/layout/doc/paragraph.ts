@@ -10,7 +10,7 @@ import { breakLine, type Line, type Piece } from './line-break';
 import { borderRoom, type ParaPrep } from './prep';
 import { LEADER } from './symbols';
 import type { PageItem } from './types';
-import { EPSILON } from './units';
+import { EPSILON, MAX_PARAGRAPH_LINES } from './units';
 
 /** What a paragraph is laid out in, beyond its width. */
 export interface ParaEnv {
@@ -34,12 +34,16 @@ export interface WrapEnv {
   /** The space before of the first band does not apply (top of a column). */
   dropBefore: boolean;
   /**
-   * The part of the column a line from `top` to `bottom` may use, as offsets
-   * from the left edge of the column; a number when the line has to move down
-   * to that y instead.
+   * The parts of the column a line from `top` to `bottom` may use, from left
+   * to right, as offsets from the left edge of the column (a line beside a
+   * drawing in the middle of the column has two); a number when the line has
+   * to move down to that y instead.
    */
-  free(top: number, bottom: number): { left: number; right: number } | number;
+  free(top: number, bottom: number): { left: number; right: number }[] | number;
 }
+
+/** Right edge for a line that takes all that is left of its paragraph, px. */
+const UNBROKEN = 1e7;
 
 interface LineBox {
   height: number;
@@ -59,32 +63,56 @@ function lineBox(ctx: LayoutContext, prep: ParaPrep, line: Line, grid: number | 
     if (m.lineGap > gap) gap = m.lineGap;
   };
   const pieces = line.pieces;
+  /** Something other than boxes is on the line. */
+  let hasText = false;
+  let boxDescent = 0;
   for (let i = 0; i < pieces.length; i++) {
     const piece = pieces[i];
     if (piece.kind === 'box') {
-      // A box stands on the baseline like a character of its run: the descent of the font stays below it.
+      // A box stands on the baseline like a character of its run.
       const top = (piece.height || 0) + piece.style.shift;
       if (top > boxes) boxes = top;
       const m = ctx.metrics(piece.font);
-      if (m.descent - piece.style.shift > descent) descent = m.descent - piece.style.shift;
-    } else add(piece.font, piece.style.shift);
+      if (m.descent - piece.style.shift > boxDescent) boxDescent = m.descent - piece.style.shift;
+    } else {
+      hasText = true;
+      add(piece.font, piece.style.shift);
+    }
   }
   // The paragraph mark sits on the last line; a line that only holds a break has the height of the break.
   if (line.last) add(prep.mark.font, 0);
   else if (pieces.length === 0) add(line.brkFont || prep.mark.font, 0);
 
   // Line spacing is a matter of the text: a picture makes the line as much taller as it is taller than the text.
-  const text = ascent + descent + gap;
-  if (boxes > ascent) ascent = boxes;
-  const natural = ascent + descent + gap;
+  let text = ascent + descent + gap;
+  let natural: number;
+  /** Room under the baseline. */
+  let below: number;
+  if (boxes > 0 && !hasText) {
+    // Nothing but pictures (and the paragraph mark): the line is as high as the higher of the picture and the
+    // text of the mark. No descent and no leading go under a picture that is higher than that, which is what
+    // the page breaks Word leaves in real documents show.
+    natural = Math.max(text, boxes);
+    if (boxes > ascent) ascent = boxes;
+    below = Math.max(0, natural - ascent);
+  } else {
+    // Text beside the picture keeps its descent under the baseline.
+    if (boxes > 0 && boxDescent > descent) {
+      descent = boxDescent;
+      text = ascent + descent + gap;
+    }
+    if (boxes > ascent) ascent = boxes;
+    below = descent + gap;
+    natural = ascent + below;
+  }
   let height: number;
   let baseline: number;
   if (prep.rule === 'exact' && prep.line > 0) {
     height = prep.line;
-    baseline = height - descent;
+    baseline = height - Math.min(descent, below);
   } else if (prep.rule === 'atLeast') {
     height = Math.max(natural, prep.line);
-    baseline = height - descent - gap;
+    baseline = height - below;
   } else {
     // A multiple of the natural height of the text. More room goes below the text, less is taken from above it.
     height = Math.max(natural + text * (prep.line - 1), boxes);
@@ -254,10 +282,14 @@ export function paragraphBands(
     const firstLine = atom === 0 && ch === 0;
     let x0 = left + (firstLine ? prep.first : 0);
     let x1 = right;
+    // A paragraph has no more than MAX_PARAGRAPH_LINES lines: after that only the breaks in the text end a line.
+    const unbroken = bands.length >= MAX_PARAGRAPH_LINES - 1;
     const lead = first ? before + topRoom : 0;
     let gap = 0;
     let line: Line;
     let box: LineBox;
+    let justified = false;
+    let aligned = false;
     if (wrap) {
       // Find room beside the drawings for a line of the height of the paragraph mark, then check with the real height.
       const m = ctx.metrics(prep.mark.font);
@@ -272,32 +304,59 @@ export function paragraphBands(
             gap += room - top;
             continue;
           }
-          line = breakLine(ctx, prep, atom, ch, x0, x1, env.fields, markStays);
+          line = breakLine(ctx, prep, atom, ch, x0, unbroken ? UNBROKEN : x1, env.fields, markStays);
           box = lineBox(ctx, prep, line, env.grid);
           break;
         }
-        const l = Math.max(left, room.left) + (firstLine && prep.first > 0 ? prep.first : 0);
-        const from0 = room.left > left ? l : x0;
-        const to = Math.min(right, room.right);
-        line = breakLine(ctx, prep, atom, ch, from0, Math.max(to, from0 + 1), env.fields, markStays);
+        // The line is filled part by part, from left to right; a word that fits in no part but the last is forced there.
+        const pieces: Line['pieces'] = [];
+        let part: Line | undefined;
+        let a = atom;
+        let c = ch;
+        justified = false;
+        for (let s = 0; s < room.length; s++) {
+          const lastPart = s === room.length - 1;
+          const l = Math.max(left, room[s].left) + (firstLine && !part && prep.first > 0 ? prep.first : 0);
+          const from0 = room[s].left > left ? l : part ? left : x0;
+          const to = Math.max(Math.min(right, room[s].right), from0 + 1);
+          if (to - from0 <= 1 && !lastPart) continue;
+          const next = breakLine(ctx, prep, a, c, from0, unbroken ? UNBROKEN : to, env.fields, markStays, lastPart && !part);
+          // Nothing fits here: on to the next part.
+          if (!next.pieces.length && !next.last && !next.brk && next.atom === a && next.ch === c) continue;
+          const stretch = !next.last && (next.brk === undefined || (next.brk === 'line' && stretchBreaks));
+          if (alignLine(prep, next, to, stretch)) justified = true;
+          for (let k = 0; k < next.pieces.length; k++) pieces.push(next.pieces[k]);
+          part = next;
+          a = next.atom;
+          c = next.ch;
+          if (next.last || next.brk) break;
+        }
+        // The last part always takes something, so there is one.
+        line = part ? { ...part, pieces, free: 0 } : breakLine(ctx, prep, atom, ch, x0, unbroken ? UNBROKEN : x1, env.fields, markStays);
+        aligned = part !== undefined;
         box = lineBox(ctx, prep, line, env.grid);
         if (box.height > estimate + 0.5 && tries++ < 64) {
           const again = wrap.free(top, top + box.height);
-          if (typeof again === 'number' || again.left > room.left + EPSILON || again.right < room.right - EPSILON) {
+          let same = typeof again !== 'number' && again.length === room.length;
+          if (same) {
+            const now = again as { left: number; right: number }[];
+            for (let s = 0; s < room.length; s++) if (now[s].left > room[s].left + EPSILON || now[s].right < room[s].right - EPSILON) same = false;
+          }
+          if (!same) {
             estimate = box.height;
             continue;
           }
         }
-        x0 = from0;
-        x1 = Math.max(to, from0 + 1);
         break;
       }
     } else {
-      line = breakLine(ctx, prep, atom, ch, x0, x1, env.fields, markStays);
+      line = breakLine(ctx, prep, atom, ch, x0, unbroken ? UNBROKEN : x1, env.fields, markStays);
       box = lineBox(ctx, prep, line, env.grid);
     }
-    const stretch = !line.last && (line.brk === undefined || (line.brk === 'line' && stretchBreaks));
-    const justified = alignLine(prep, line, x1, stretch);
+    if (!aligned) {
+      const stretch = !line.last && (line.brk === undefined || (line.brk === 'line' && stretchBreaks));
+      justified = alignLine(prep, line, x1, stretch);
+    }
 
     const bottomRoom = line.last ? borderRoom(bottomLine) : 0;
     const top = gap + (first ? topRoom : 0);

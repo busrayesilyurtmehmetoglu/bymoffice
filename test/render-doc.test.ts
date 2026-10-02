@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import type { ImageItem, LayoutFont, LayoutPage, LineItem, PageItem, TextItem } from '../src/layout/doc/types';
 import { renderPage, type PageImage, type RenderPageOptions } from '../src/render/doc';
 import { CanvasTextMeasurer, docCssFont, type MeasureContext } from '../src/render/doc-measure';
-import { declaredImagePixels, documentText, sniffImageType } from '../src/ui/doc-view';
+import { declaredImagePixels, declaredImageSize, decodedImageSize, documentText, sniffImageType } from '../src/ui/doc-view';
 import { STRINGS_EN, STRINGS_TR, getUiStrings } from '../src/ui/strings';
 import { p, r, tbl, tc, tr } from './doc-layout-fixtures';
 import { readSpec } from './docx-fixtures';
@@ -741,4 +741,154 @@ test('document view: its words in Turkish and English', () => {
   assert.deepEqual(['picture', 'chart', 'diagram', 'object', 'shape'].map(STRINGS_EN.placeholder), ['Picture', 'Chart', 'Diagram', 'Embedded object', 'Drawing']);
   // Every string of one language exists in the other.
   assert.deepEqual(Object.keys(STRINGS_TR).sort(), Object.keys(STRINGS_EN).sort());
+});
+
+// ------------------------------------------------ fixes after the layout review
+
+test('renderPage: text turned by a quarter is drawn along its own baseline, with its highlight and underline', () => {
+  const rec = draw(
+    [
+      text({ rotation: 270, highlight: '#ffff00', underline: { color: '#0000ff', style: 'single' } }),
+      text({ rotation: 90, x: 200, highlight: '#00ff00' }),
+      text({ text: 'after', x: 300 }),
+    ],
+    { metrics: () => ({ ascent: 16, descent: 4 }) },
+  );
+  // Upwards from (40, 100): the line of the font (16 above, 4 below the baseline) lies left and right of x = 40.
+  assert.deepEqual(rec.rects[0], { x: 24, y: 50, width: 20, height: 50, fill: '#ffff00' });
+  // The underline: 2.4 px "below" the baseline, which is to the right of it.
+  assert.deepEqual(rec.rects[1], { x: 43, y: 50, width: 1, height: 50, fill: '#0000ff' });
+  // Downwards from (200, 100): the ascent is on the right.
+  assert.deepEqual(rec.rects[2], { x: 196, y: 100, width: 20, height: 50, fill: '#00ff00' });
+  assert.deepEqual(
+    rec.texts.map((call) => [call.text, call.x, call.y, call.sx]),
+    [
+      ['Hello', 40, 100, 0],
+      ['Hello', 200, 100, 0],
+      // What follows is drawn straight again.
+      ['after', 300, 100, 1],
+    ],
+  );
+  // A turn that is no quarter is not a turn.
+  const odd = draw([text({ rotation: 45 as unknown as 90 })]);
+  assert.deepEqual([odd.texts[0].x, odd.texts[0].y, odd.texts[0].sx], [40, 100, 1]);
+});
+
+/** A canvas whose font box is rounded to whole pixels, as some browsers report it; `box` is [ascent, descent] per em. */
+function roundingContext(box: [number, number] = [0.93, 0.27]): { context: MeasureContext; calls: string[] } {
+  const calls: string[] = [];
+  const context: MeasureContext = {
+    font: '',
+    measureText(textToMeasure: string) {
+      calls.push(`${this.font}|${textToMeasure}`);
+      const size = Number((/(\d+(?:\.\d+)?)px/.exec(this.font) || [])[1] || 10);
+      return { width: textToMeasure.length * size * 0.5, fontBoundingBoxAscent: Math.round(size * box[0]), fontBoundingBoxDescent: Math.round(size * box[1]) };
+    },
+  };
+  return { context, calls };
+}
+
+const near = (actual: number, expected: number, tolerance: number, what: string) =>
+  assert.ok(Math.abs(actual - expected) <= tolerance, `${what}: ${actual}, expected ${expected} within ${tolerance}`);
+const lineOf = (metrics: { ascent: number; descent: number; lineGap: number }) => metrics.ascent + metrics.descent + metrics.lineGap;
+
+test('doc measure: common fonts take their line metrics from a table, whatever the canvas says', () => {
+  const { context, calls } = roundingContext();
+  const measurer = new CanvasTextMeasurer({ context });
+  // Word sets Times New Roman 12 pt on lines of 13.8 pt and Arial 11 pt on lines of 12.65 pt.
+  near(lineOf(measurer.metrics(font('Times New Roman', 16))), 18.4, 0.01, 'Times New Roman 12 pt');
+  near(lineOf(measurer.metrics(font('Arial', 44 / 3))), 16.87, 0.01, 'Arial 11 pt');
+  near(lineOf(measurer.metrics(font('Arial', 40 / 3))), 15.33, 0.01, 'Arial 10 pt');
+  near(lineOf(measurer.metrics(font('Calibri', 44 / 3))), (44 / 3) * 1.2207, 0.01, 'Calibri 11 pt');
+  near(lineOf(measurer.metrics(font('Courier New', 16))), 16 * 1.1328, 0.01, 'Courier New 12 pt');
+  near(lineOf(measurer.metrics(font('Verdana', 16))), 16 * 1.2153, 0.01, 'Verdana 12 pt');
+  near(lineOf(measurer.metrics(font('Tahoma', 16))), 16 * 1.207, 0.01, 'Tahoma 12 pt');
+  near(lineOf(measurer.metrics(font('Georgia', 16))), 16 * 1.1362, 0.01, 'Georgia 12 pt');
+  // The parts: ascent, descent and the leading Word puts between lines.
+  const arial = measurer.metrics(font('Arial', 2048));
+  assert.deepEqual([arial.ascent, arial.descent, arial.lineGap], [1854, 434, 67]);
+  const times = measurer.metrics(font('Times New Roman', 2048));
+  assert.deepEqual([times.ascent, times.descent, times.lineGap], [1825, 443, 87]);
+  // The name is what the document asks for, in any case; bold and italic share the metrics; substitutes have their own entry.
+  assert.deepEqual(measurer.metrics(font('ARIAL', 2048, true, true)), arial);
+  assert.deepEqual(measurer.metrics(font(' arial ', 2048)), arial);
+  assert.deepEqual(measurer.metrics(font('Liberation Sans', 2048)), arial);
+  assert.deepEqual(measurer.metrics(font('Liberation Serif', 2048)), times);
+  // Nothing was measured for any of this.
+  assert.deepEqual(calls, []);
+});
+
+test('doc measure: other fonts are measured at a large size, so that rounding by the canvas does not show', () => {
+  const { context, calls } = roundingContext();
+  const measurer = new CanvasTextMeasurer({ context });
+  // At 13 px the canvas would say 12 and 4; the real font box is 12.09 and 3.51.
+  const metrics = measurer.metrics(font('Some Font', 13));
+  near(metrics.ascent, 12.09, 0.001, 'ascent');
+  near(metrics.descent, 3.51, 0.001, 'descent');
+  assert.equal(metrics.lineGap, 0);
+  assert.deepEqual(calls, ['1000px "Some Font", sans-serif|Hg']);
+  // Other sizes of the family need no other measurement; bold is another face.
+  near(measurer.metrics(font('Some Font', 26)).ascent, 24.18, 0.001, 'ascent at 26 px');
+  assert.equal(calls.length, 1);
+  measurer.metrics(font('Some Font', 26, true));
+  assert.deepEqual(calls[1], 'bold 1000px "Some Font", sans-serif|Hg');
+  // After clear() the canvas is asked again.
+  measurer.clear();
+  measurer.metrics(font('Some Font', 13));
+  assert.equal(calls.length, 3);
+});
+
+test('renderPage: the placeholder of a mirrored picture is turned with it but its words are not mirrored', () => {
+  const rec = draw([image({ part: '/word/media/other.png', alt: 'Logo', flipH: true, flipV: true }), image({ part: '/word/media/other.png', alt: 'Logo', y: 150, flipH: true, rotation: 180 })], {
+    images: loaded().store,
+    placeholderLabel: (item) => item.alt,
+  });
+  // Not flipped: the label reads from left to right, upright.
+  assert.deepEqual(rec.texts.map((call) => [call.text, call.x, call.y, call.sx, call.sy]), [
+    ['Logo', 70, 55, 1, 1],
+    // Half a turn turns the words with the box; the flip still does not mirror them.
+    ['Logo', 70, 175, -1, -1],
+  ]);
+  assert.deepEqual(rec.rects[0], { x: 20, y: 30, width: 100, height: 50, fill: '#f1f3f4' });
+});
+
+test('renderPage: the picture store is told how many canvas pixels the whole picture covers', () => {
+  const asked: (number | undefined)[][] = [];
+  const store = {
+    get(part: string, width?: number, height?: number) {
+      asked.push([width, height]);
+      return part === '' ? undefined : undefined;
+    },
+  };
+  // 100 x 50 px at twice the size; then a picture of which the crop shows half the width and a quarter of the height.
+  draw([image(), image({ crop: { left: 0.25, top: 0.5, right: 0.25, bottom: 0.25 } }), image({ crop: { left: 0.6, top: 0, right: 0.6, bottom: 0 } })], { images: store, scale: 2 });
+  assert.deepEqual(asked, [
+    [200, 100],
+    [400, 400],
+    // A crop that leaves nothing is not applied.
+    [200, 100],
+  ]);
+});
+
+test('document view: the size a picture declares, and the size it is decoded to', () => {
+  const png = bytes(0x89, 'PNG', 13, 10, 26, 10, 0, 0, 0, 13, 'IHDR', ...be32(6500), ...be32(100));
+  assert.deepEqual(declaredImageSize(png, 'image/png'), { width: 6500, height: 100 });
+  assert.equal(declaredImagePixels(png, 'image/png'), 650000);
+  assert.equal(declaredImageSize(bytes(0x89, 'PNG'), 'image/x-unknown'), undefined);
+
+  const limit = (96 * 1024 * 1024) / 8 / 4;
+  // Shown at 200 px: decoded at the smallest halving of 6500 px that is not below it.
+  assert.deepEqual(decodedImageSize(6500, 6500, 200, 200, limit), { width: 203, height: 203 });
+  // Shown larger than the budget allows one picture to be: as many pixels as its share of the budget.
+  const capped = decodedImageSize(6500, 6500, 6500, 6500, limit);
+  assert.deepEqual(capped, { width: 1773, height: 1773 });
+  assert.ok(capped.width * capped.height <= limit);
+  // No size asked for: the picture as it is, within the same limit.
+  assert.deepEqual(decodedImageSize(6500, 6500, 0, 0, limit), capped);
+  assert.deepEqual(decodedImageSize(300, 200, 0, 0, limit), { width: 300, height: 200 });
+  // Never larger than the picture is, and not below a small size that a little zooming would outgrow at once.
+  assert.deepEqual(decodedImageSize(100, 50, 1000, 1000, limit), { width: 100, height: 50 });
+  assert.deepEqual(decodedImageSize(1000, 1000, 10, 10, limit), { width: 125, height: 125 });
+  // The side that needs more decides.
+  assert.deepEqual(decodedImageSize(4000, 1000, 100, 500, limit), { width: 2000, height: 500 });
 });

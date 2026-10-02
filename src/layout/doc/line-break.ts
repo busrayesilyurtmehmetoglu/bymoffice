@@ -128,6 +128,13 @@ function fitCharacters(ctx: LayoutContext, atom: TextAtom, from: number, availab
   return count - from;
 }
 
+/**
+ * The rest of a word that was cut at the end of the line before is not
+ * measured as a whole when it is longer than this: every line of a very long
+ * word would measure all that is left of it, which is quadratic in its length.
+ */
+const LONG_REST = 256;
+
 interface OpenTab {
   /** Index of the tab piece. */
   index: number;
@@ -137,19 +144,49 @@ interface OpenTab {
   start: number;
 }
 
-/** Width of the text of the pieces up to the decimal separator; undefined when there is none. */
+/**
+ * Width of the text of the pieces up to the decimal separator; undefined when
+ * there is none. The separator is that of the language of the text ("," in
+ * Turkish or German, "." in English): "1.250.000,5" aligns on its comma there.
+ * Text of no known language aligns on the last "." or "," after a digit, the
+ * one a number written either way ends its whole part with.
+ */
 function widthToDecimal(ctx: LayoutContext, pieces: Piece[], from: number): number | undefined {
   let width = 0;
+  let guess: number | undefined;
   for (let i = from; i < pieces.length; i++) {
     const piece = pieces[i];
     if (piece.kind === 'text') {
-      // The first separator after a digit: "1.234,5" aligns on the first one, as Word does for a "." locale.
-      const match = /\d[.,]/.exec(piece.text);
-      if (match) return width + ctx.width(piece.font, piece.text.slice(0, match.index + 1)) * piece.style.scale + piece.style.spacing * (match.index + 1);
+      const text = piece.text;
+      const separator = piece.style.decimal;
+      let at = -1;
+      if (separator !== undefined) {
+        for (let k = text.indexOf(separator, 1); k > 0; k = text.indexOf(separator, k + 1)) {
+          const before = text.charCodeAt(k - 1);
+          if (before >= 0x30 && before <= 0x39) {
+            at = k;
+            break;
+          }
+        }
+      } else {
+        for (let k = text.length - 1; k > 0; k--) {
+          const code = text.charCodeAt(k);
+          const before = text.charCodeAt(k - 1);
+          if ((code === 0x2c || code === 0x2e) && before >= 0x30 && before <= 0x39) {
+            at = k;
+            break;
+          }
+        }
+      }
+      if (at > 0) {
+        const upTo = width + ctx.width(piece.font, text.slice(0, at)) * piece.style.scale + piece.style.spacing * at;
+        if (separator !== undefined) return upTo;
+        guess = upTo;
+      }
     }
     width += piece.width;
   }
-  return undefined;
+  return guess;
 }
 
 /**
@@ -157,6 +194,9 @@ function widthToDecimal(ctx: LayoutContext, pieces: Piece[], from: number): numb
  * and lies between x0 and x1 (relative to the left edge of the column).
  * `markStays`: a page or column break that ends the paragraph ends it on
  * this line (the paragraph mark does not go to the next page).
+ * Without `force` a line that cannot take its first word whole stays empty
+ * (the caller has another place for the word); with it the word is placed
+ * anyway, cut if need be, so that every line takes something.
  */
 export function breakLine(
   ctx: LayoutContext,
@@ -167,6 +207,7 @@ export function breakLine(
   x1: number,
   fields: FieldValues | undefined,
   markStays: boolean,
+  force = true,
 ): Line {
   const atoms = prep.atoms;
   const pieces: Piece[] = [];
@@ -284,8 +325,24 @@ export function breakLine(
       breakOpen = open;
     }
     let piece: Piece;
-    if (atom.t === 'text') piece = ch === 0 ? pieceOf(ctx, atom, 0, atom.text.length) : pieceOf(ctx, atom, ch, atom.text.length);
-    else if (atom.t === 'box') {
+    if (atom.t === 'text') {
+      if (ch > 0 && atom.word - ch > LONG_REST && pieces.length === base) {
+        // What is left of a long word: only as many characters as the line takes are looked at.
+        const count = fitCharacters(ctx, atom, ch, x1 - settledEnd(x), force);
+        if (count < atom.word - ch) {
+          if (count > 0) {
+            const part = pieceOf(ctx, atom, ch, ch + count);
+            part.x = x;
+            pieces.push(part);
+            x += part.width;
+            ch += count;
+          } else pieces.length = 0;
+          ended = true;
+          break;
+        }
+      }
+      piece = ch === 0 ? pieceOf(ctx, atom, 0, atom.text.length) : pieceOf(ctx, atom, ch, atom.text.length);
+    } else if (atom.t === 'box') {
       piece = { kind: 'box', x: 0, width: atom.width, trail: 0, spaces: 0, text: '', font: atom.font, style: atom.style, offset: atom.offset, height: atom.height, items: atom.items };
     } else {
       const text = fieldText(atom.field, atom.format, atom.cached, fields);
@@ -304,6 +361,12 @@ export function breakLine(
         open = breakOpen && breakOpen.index < breakCount ? breakOpen : undefined;
         if (free > breakCount) free = breakCount;
         x = breakCount > 0 ? pieces[breakCount - 1].x + pieces[breakCount - 1].width : x0;
+        ended = true;
+        break;
+      }
+      if (!force && pieces.length === base) {
+        // Nothing of the paragraph is on the line and its next word does not fit: the line stays empty.
+        pieces.length = 0;
         ended = true;
         break;
       }

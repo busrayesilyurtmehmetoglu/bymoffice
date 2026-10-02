@@ -59,6 +59,12 @@ export interface TextItem {
   /** Horizontal stretch of the glyphs, 1 = none; `width` includes it. */
   scale?: number;
   /**
+   * The text is turned around (x, y), the start of its baseline: clockwise by
+   * 90 degrees (it reads downwards) or by 270 (upwards). Text in table cells
+   * with a vertical text direction. `width` is the advance along the baseline.
+   */
+  rotation?: 90 | 270;
+  /**
    * The item repeats text that is laid out elsewhere (a table header row
    * repeated at the top of a page): it has no place of its own in the story.
    */

@@ -69,8 +69,8 @@ test('doc layout: cells that span columns and rows', async () => {
   const merged = await modern(
     tbl(tr(tc(p('m1') + p('m2') + p('m3'), '<w:vMerge w:val="restart"/>') + tc('r1')) + tr(tc(p(''), '<w:vMerge/>') + tc('r2')), [1500, 1500]) + p('after'),
   );
-  // The merged cell needs 48 px; the second row grows to make room.
-  assert.deepEqual(at(merged.pages[0]), ['m1@50,52.8', 'm2@50,68.8', 'm3@50,84.8', 'r1@150,52.8', 'r2@150,68.8', 'after@40,100.8']);
+  // The merged cell needs 48 px; the second row grows to make room. Each row carries the lines that start in it.
+  assert.deepEqual(at(merged.pages[0]), ['m1@50,52.8', 'r1@150,52.8', 'm2@50,68.8', 'm3@50,84.8', 'r2@150,68.8', 'after@40,100.8']);
 });
 
 test('doc layout: row heights, at least and exact; vertical alignment', async () => {
@@ -143,7 +143,7 @@ test('doc layout: a row is divided between pages unless it must not be', async (
   assert.deepEqual(at(stuck.pages[1]), ['after@40,52.8']);
 });
 
-test('doc layout: a heading that keeps with next stays with the first row of the table after it; rows of a tall merged cell stay together', async () => {
+test('doc layout: a heading that keeps with next stays with the first row of the table after it; a tall merged cell is divided between pages', async () => {
   const { pages } = await modern(filler(19) + p('Heading', '<w:keepNext/>') + tbl(tr(tc(p('r1a') + p('r1b'))) + tr(tc('r2')), [1500]));
   // The heading fits on the last line of the page, the row after it does not: the heading goes with the row.
   assert.equal(pageText(pages[0]).slice(-3), 'L18');
@@ -151,9 +151,10 @@ test('doc layout: a heading that keeps with next stays with the first row of the
 
   const merged = tbl(tr(tc(p('m1') + p('m2') + p('m3'), '<w:vMerge w:val="restart"/>') + tc('r1')) + tr(tc(p(''), '<w:vMerge/>') + tc('r2')), [1500, 1500]);
   const tall = await modern(filler(18) + merged);
-  // One row fits, but the merged cell needs both.
-  assert.equal(pageText(tall.pages[0]).slice(-3), 'L17');
-  assert.equal(pageText(tall.pages[1]), 'm1m2m3r1r2');
+  // Two lines are left on the page: the first row and the first line of the second, which is divided as any row is.
+  // The merged cell goes on with its third line on the next page, as it does in Word.
+  assert.equal(pageText(tall.pages[0]).slice(-11), 'L17m1r1m2r2');
+  assert.equal(pageText(tall.pages[1]), 'm3');
 });
 
 test('doc layout: header rows repeat at the top of every page of the table', async () => {

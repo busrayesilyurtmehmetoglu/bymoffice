@@ -1,7 +1,7 @@
 import type { Page } from '@playwright/test';
-import { p, r } from '../test/doc-layout-fixtures';
+import { p, r, tbl, tc, tr } from '../test/doc-layout-fixtures';
 import { buildDocx } from '../test/docx-fixtures';
-import { DOC_STYLES, docSection, docx, field, link, longDocx, manyPagesDocx, picture, png, sampleDocx } from './fixtures/docx';
+import { DOC_STYLES, docSection, docx, field, hugePicturesDocx, linesDocx, link, longDocx, longWordDocx, manyPagesDocx, picture, png, sampleDocx, textBoxRun } from './fixtures/docx';
 import { expect, expectResponsive, gotoHarness, test, type Flavour } from './helpers';
 
 // The sample pages are 600 x 400 px with margins of 40 px.
@@ -1184,7 +1184,7 @@ test.describe('BymOffice.mount with a document', () => {
     await expect(page.locator('#editor')).toBeEmpty();
   });
 
-  test('a doc (binary Word) file is still refused', async ({ page }) => {
+  test('a damaged xls and plain text are refused', async ({ page }) => {
     const { minimalCfb } = await import('../test/fixtures');
     // A compound file with a stream called "Workbook" is an xls; neither it nor plain text can be shown.
     const names = await page.evaluate(async (input) => {
@@ -1195,7 +1195,7 @@ test.describe('BymOffice.mount with a document', () => {
       }
       return out;
     }, Array.from(minimalCfb(new Uint8Array(9 * 512), new Uint8Array(10))));
-    expect(names).toEqual(['UnsupportedFileError', 'UnsupportedFileError']);
+    expect(names).toEqual(['Error', 'UnsupportedFileError']);
     await expect(page.locator('#editor')).toBeEmpty();
   });
 });
@@ -1239,3 +1239,313 @@ for (const flavour of ['script', 'esm'] as Flavour[]) {
 
 // Used by the fixtures above; kept here so that an unused import is noticed.
 void link;
+
+// Defects found by the independent review of the layout engine and the view; every test here failed before its fix.
+test.describe('document view: review fixes', () => {
+  test('a single word of 300,000 characters is laid out in under three seconds and the page keeps responding', async ({ page }) => {
+    test.setTimeout(90_000);
+    const bytes = await longWordDocx(300_000);
+    await page.goto('/e2e/pages/doc.html');
+    await expect(page.locator('#state')).toHaveText('ready');
+    const result = await page.evaluate(async (input) => {
+      // What measuring costs: the characters handed to the canvas.
+      let measured = 0;
+      const original = CanvasRenderingContext2D.prototype.measureText;
+      CanvasRenderingContext2D.prototype.measureText = function (text: string) {
+        measured += text.length;
+        return original.call(this, text);
+      };
+      const started = performance.now();
+      await (window as any).__mountDoc(input, { zoom: 1 });
+      const view = (window as any).__docView;
+      await new Promise<void>((resolve) => {
+        const tick = () => (view.layoutDone ? resolve() : setTimeout(tick, 0));
+        tick();
+      });
+      const ms = performance.now() - started;
+      CanvasRenderingContext2D.prototype.measureText = original;
+      return { ms, measured, pages: view.pageCount as number };
+    }, Array.from(bytes));
+    console.log(
+      `one word of 300,000 characters [${test.info().project.name}]: ${result.pages} pages after ${result.ms.toFixed(0)} ms, ${result.measured} characters measured`,
+    );
+    expect(result.ms).toBeLessThan(3000);
+    // Linear in the length of the word: once as a whole, once more line by line. (It was 1.4 thousand million.)
+    expect(result.measured).toBeLessThan(4 * 300_000);
+    // About 70 letters a line and 18 lines a page.
+    expect(result.pages).toBeGreaterThan(150);
+    await expectResponsive(page);
+    expect((await canvasStats(page, 1)).dark).toBeGreaterThan(500);
+    // The end of the word is there.
+    await page.evaluate((count) => (window as any).__docView.goToPage(count), result.pages);
+    await settled(page);
+    expect(((await pageText(page, result.pages)) || '').length).toBeGreaterThan(0);
+    const all = await page.evaluate(() => (window as any).__docView.selectAll() || (window as any).__docView.getSelectedText().length);
+    expect(all).toBe(300_000);
+  });
+
+  test('pictures far larger than they are shown never take more decoded memory than the budget', async ({ page }) => {
+    test.setTimeout(240_000);
+    const count = 14;
+    const bytes = await hugePicturesDocx(count);
+    expect(bytes.length).toBeLessThan(400_000);
+    await mountDoc(page, bytes, { zoom: 1 });
+    await laidOut(page);
+    expect((await state(page)).pageCount).toBe(count);
+    // Shown at 400 x 300 px: the red half and the blue half are there, decoded from 42 megapixels.
+    await expect.poll(async () => (await canvasStats(page, 1)).red, { timeout: 60_000 }).toBeGreaterThan(10_000);
+    const first = await state(page);
+    expect(first.imageBudget).toBeGreaterThan(0);
+    // 169 MB each as the file has them; held at about the size they are shown at, and no picture at more than an
+    // eighth of the budget. Only the pictures of the pages that have a canvas are held at all.
+    expect(first.imageBytes).toBeGreaterThan(0);
+    expect(first.imageBytes).toBeLessThanOrEqual((first.mounted.length * first.imageBudget) / 8);
+    expect(first.mounted.length).toBeLessThanOrEqual(4);
+
+    // At the largest zoom every picture is wanted at more pixels than its share of the budget: each is held at that
+    // share, and going through all the pages never takes the total over the budget.
+    await page.evaluate(() => (window as any).__docView.setZoom(5));
+    let most = 0;
+    for (let n = 1; n <= count; n++) {
+      await page.evaluate((number) => (window as any).__docView.goToPage(number), n);
+      await expect
+        .poll(
+          async () => {
+            const now = await state(page);
+            most = Math.max(most, now.imageBytes);
+            expect(now.imageBytes).toBeLessThanOrEqual(now.imageBudget);
+            return (await canvasStats(page, n)).red;
+          },
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(10_000);
+    }
+    const end = await state(page);
+    console.log(`14 pictures of 6500 x 6500 px [${test.info().project.name}]: at most ${(most / 1048576).toFixed(1)} MB of ${(end.imageBudget / 1048576).toFixed(0)} MB held`);
+    expect(most).toBeLessThanOrEqual(end.imageBudget);
+    // More than half of the budget was in use: the limit was reached and pictures were given up, not just few held.
+    expect(most).toBeGreaterThan(end.imageBudget / 2);
+    await expectResponsive(page);
+    // Destroying the view gives everything back.
+    await page.evaluate(() => (window as any).__docView.destroy());
+  });
+
+  for (const [family, size, pitch] of [
+    ['Times New Roman', 24, 18.4],
+    ['Arial', 22, 16.87],
+  ] as const) {
+    test(`lines of ${family} ${size / 2} pt are as high as in Word, in every browser`, async ({ page }) => {
+      await mountDoc(page, await linesDocx(family, size, 200), { zoom: 1 });
+      await laidOut(page);
+      const measured = await page.evaluate(async () => {
+        const api = (window as any).BymOffice;
+        const doc = await (window as any).__docFile.document();
+        const layout = new api.DocLayout(doc, api.createCanvasMeasurer({ fonts: doc.fonts }));
+        layout.layout();
+        const ys: number[] = layout.pages[0].items.filter((item: any) => item.type === 'text').map((item: any) => item.y);
+        return { pages: layout.pages.length as number, first: ys[0], pitch: ys[1] - ys[0], lines: ys.length, last: ys[ys.length - 1] - ys[ys.length - 2] };
+      });
+      // Word: 13.8 pt for Times New Roman 12 pt, 12.65 pt for Arial 11 pt.
+      expect(Math.abs(measured.pitch - pitch)).toBeLessThanOrEqual(0.05);
+      expect(Math.abs(measured.last - pitch)).toBeLessThanOrEqual(0.05);
+      // 320 px of text area: the same number of lines on a page, and so of pages, whatever the browser.
+      const perPage = Math.floor(320 / pitch);
+      expect(measured.lines).toBe(perPage);
+      expect(measured.pages).toBe(Math.ceil(200 / perPage));
+      expect((await state(page)).pageCount).toBe(measured.pages);
+    });
+  }
+
+  test('a selection dragged from one page to the next holds the text between, without footer or header', async ({ page, isMobile }) => {
+    test.skip(isMobile, 'a finger scrolls; selecting by dragging is for the mouse');
+    // Half size: two pages are in sight.
+    await mountDoc(page, await sampleDocx(), { zoom: 0.5 });
+    await laidOut(page);
+    // The first paragraph of the second page.
+    let k = 0;
+    for (let n = 2; n <= 40 && !k; n++) if ((await textBox(page, `Paragraph ${n} of`)).page === 2) k = n;
+    expect(k).toBeGreaterThan(3);
+    const from = await textBox(page, `Paragraph ${k - 2} of`);
+    const to = await textBox(page, `Paragraph ${k + 1} of`);
+    expect([from.page, to.page]).toEqual([1, 2]);
+    const sentence = (n: number) => `Paragraph ${n} of the sample document.`;
+    const expected = [sentence(k - 2), sentence(k - 1), sentence(k), `Paragraph ${k + 1} of`].join('\n');
+
+    await page.mouse.move(from.x + 0.5, from.y + from.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(from.x + 40, from.y + from.height / 2 + 30, { steps: 3 });
+    await page.mouse.move(to.x + to.width, to.y + to.height / 2, { steps: 5 });
+    await page.mouse.up();
+    await settled(page);
+    const forward = await page.evaluate(() => (window as any).__docView.getSelectedText());
+    expect(forward).toBe(expected);
+    expect((await copyEvent(page)).text).toBe(expected);
+
+    // The other way round: the same text.
+    await page.mouse.click(from.x + 250, from.y + from.height / 2);
+    expect(await page.evaluate(() => (window as any).__docView.getSelectedText())).toBe('');
+    await page.mouse.move(to.x + to.width, to.y + to.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(to.x + 20, to.y - 20, { steps: 3 });
+    await page.mouse.move(from.x + 0.5, from.y + from.height / 2, { steps: 5 });
+    await page.mouse.up();
+    await settled(page);
+    expect(await page.evaluate(() => (window as any).__docView.getSelectedText())).toBe(expected);
+
+    // A selection that starts in the footer stays there: the body it is dragged over is not taken.
+    const footer = await textBox(page, 'Page ');
+    await page.mouse.move(footer.x + 0.5, footer.y + footer.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(from.x + 100, from.y, { steps: 4 });
+    await page.mouse.up();
+    const inFooter = await page.evaluate(() => (window as any).__docView.getSelectedText());
+    expect(inFooter).not.toContain('Paragraph');
+    expect('Page 1 of 1').toContain(inFooter);
+  });
+
+  test('a selection across the cells of a table takes whole cells of the rows and columns between', async ({ page, isMobile }) => {
+    test.skip(isMobile, 'selecting by dragging is for the mouse');
+    let rows = '';
+    for (let r = 1; r <= 3; r++) rows += tr(tc(`A${r} one`) + tc(`B${r} two`) + tc(`C${r} three`));
+    await mountDoc(page, await docx(p('Before the table') + tbl(rows, [2000, 2000, 2000]) + p('After the table')), { zoom: 1 });
+    await laidOut(page);
+    const drag = async (start: string, end: string) => {
+      const a = await textBox(page, start);
+      const b = await textBox(page, end);
+      await page.mouse.move(a.x + 2, a.y + a.height / 2);
+      await page.mouse.down();
+      await page.mouse.move((a.x + b.x) / 2, (a.y + b.y) / 2 + 3, { steps: 3 });
+      // The nearest character boundary is the end of the prefix.
+      await page.mouse.move(b.x + b.width - 0.5, b.y + b.height / 2, { steps: 3 });
+      await page.mouse.up();
+      await settled(page);
+      return page.evaluate(() => (window as any).__docView.getSelectedText());
+    };
+    // Down a column: only that column.
+    expect(await drag('B1', 'B3')).toBe('B1 two\nB2 two\nB3 two');
+    expect(await drag('B3', 'B1')).toBe('B1 two\nB2 two\nB3 two');
+    // A block of cells: tabs between the cells of a row.
+    expect(await drag('A1', 'B2')).toBe('A1 one\tB1 two\nA2 one\tB2 two');
+    expect(await drag('C2', 'B1')).toBe('B1 two\tC1 three\nB2 two\tC2 three');
+    // Inside one cell the selection is of its text.
+    expect(await drag('B2', 'B2')).toBe('B2');
+    // From the text before the table into it and beyond: in document order, the table as rows of cells.
+    expect(await drag('Before', 'After')).toBe('Before the table\nA1 one\tB1 two\tC1 three\nA2 one\tB2 two\tC2 three\nA3 one\tB3 two\tC3 three\nAfter');
+    // The selection is painted over the selected cells only: A1 keeps its white paper when B1 to B3 are selected.
+    await drag('B1', 'B3');
+    const shade = await page.evaluate(async () => {
+      const canvas = document.querySelector('#host .bym-doc-page[data-page="1"] canvas') as HTMLCanvasElement;
+      const scale = canvas.width / 600;
+      const context = canvas.getContext('2d')!;
+      // The first column is x = 40..173, the second 173..307; the rows start at y = 58.
+      const count = (x: number, y: number, w: number, h: number) => {
+        const data = context.getImageData(Math.round(x * scale), Math.round(y * scale), Math.round(w * scale), Math.round(h * scale)).data;
+        let tinted = 0;
+        for (let i = 0; i < data.length; i += 4) if (data[i] < 240 && data[i + 2] > 200 && data[i + 2] > data[i] + 20) tinted++;
+        return tinted;
+      };
+      return { first: count(45, 60, 120, 50), second: count(180, 60, 120, 50) };
+    });
+    expect(shade.first).toBe(0);
+    expect(shade.second).toBeGreaterThan(300);
+  });
+
+  test('a selection that starts in the body leaves a text box out; one that starts in the box stays in it', async ({ page, isMobile }) => {
+    test.skip(isMobile, 'selecting by dragging is for the mouse');
+    const box = textBoxRun(300, 0, 180, 60, p('Boxed words here') + p('Second box line'));
+    const body = p('First paragraph of the body') + p('<w:r><w:t>Second paragraph, with a box</w:t></w:r>' + box) + p('Third paragraph of the body') + p('Fourth paragraph of the body');
+    await mountDoc(page, await docx(body), { zoom: 1 });
+    await laidOut(page);
+    // The box is filled green: fill and frame of text boxes are painted.
+    expect((await canvasStats(page, 1)).green).toBeGreaterThan(180 * 60 * 0.6);
+    const first = await textBox(page, 'First paragraph');
+    const fourth = await textBox(page, 'Fourth paragraph');
+    const boxed = await textBox(page, 'Boxed words');
+    const second = await textBox(page, 'Second box');
+    await page.mouse.move(first.x + 1, first.y + first.height / 2);
+    await page.mouse.down();
+    // Over the box on the way.
+    await page.mouse.move(boxed.x + 20, boxed.y + boxed.height / 2, { steps: 3 });
+    await page.mouse.move(fourth.x + fourth.width, fourth.y + fourth.height / 2, { steps: 3 });
+    await page.mouse.up();
+    expect(await page.evaluate(() => (window as any).__docView.getSelectedText())).toBe(
+      'First paragraph of the body\nSecond paragraph, with a box\nThird paragraph of the body\nFourth paragraph',
+    );
+    // From the box outwards: only text of the box.
+    await page.mouse.move(boxed.x + 1, boxed.y + boxed.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(second.x + second.width, second.y + second.height / 2, { steps: 3 });
+    await page.mouse.move(fourth.x + 5, fourth.y + fourth.height / 2, { steps: 3 });
+    await page.mouse.up();
+    const inBox = await page.evaluate(() => (window as any).__docView.getSelectedText());
+    expect(inBox.startsWith('Boxed words here')).toBe(true);
+    expect(inBox).not.toContain('paragraph');
+    // Select all is still the text of the body.
+    await page.evaluate(() => (window as any).__docView.selectAll());
+    expect(await page.evaluate(() => (window as any).__docView.getSelectedText())).toBe(
+      'First paragraph of the body\nSecond paragraph, with a box\nThird paragraph of the body\nFourth paragraph of the body',
+    );
+  });
+
+  test('the view mounts where elements have no getRootNode', async ({ page }) => {
+    await page.goto('/e2e/pages/doc.html');
+    await expect(page.locator('#state')).toHaveText('ready');
+    const bytes = await sampleDocx();
+    const result = await page.evaluate(async (input) => {
+      const original = Node.prototype.getRootNode;
+      // An old WebView: the method is not there at all.
+      delete (Node.prototype as any).getRootNode;
+      try {
+        await (window as any).__mountDoc(input, { zoom: 1 });
+        const styles = document.querySelectorAll('style[data-bymoffice-doc]').length;
+        const canvases = document.querySelectorAll('#host canvas').length;
+        (window as any).__docView.destroy();
+        return { missing: typeof document.body.getRootNode, styles, canvases, left: document.querySelectorAll('style[data-bymoffice-doc]').length };
+      } finally {
+        Node.prototype.getRootNode = original;
+      }
+    }, Array.from(bytes));
+    expect(result).toEqual({ missing: 'undefined', styles: 1, canvases: result.canvases, left: 0 });
+    expect(result.canvases).toBeGreaterThanOrEqual(1);
+  });
+
+  test('text in a cell with a vertical text direction is painted turned', async ({ page }) => {
+    const vertical = tc('Vertical words', '<w:textDirection w:val="btLr"/>');
+    const table = tbl(tr(vertical + tc('across'), '<w:trHeight w:val="3000" w:hRule="atLeast"/>'), [1500, 3000]);
+    await mountDoc(page, await docx(table), { zoom: 1 });
+    await laidOut(page);
+    // The extent of the dark pixels in the first cell (x = 40..140 of the page) and in the second.
+    const ink = await page.evaluate(() => {
+      const canvas = document.querySelector('#host .bym-doc-page[data-page="1"] canvas') as HTMLCanvasElement;
+      const scale = canvas.width / 600;
+      const context = canvas.getContext('2d')!;
+      const extent = (x0: number, x1: number) => {
+        const left = Math.round(x0 * scale);
+        const width = Math.round((x1 - x0) * scale);
+        const data = context.getImageData(left, 0, width, canvas.height).data;
+        let minX = Infinity;
+        let maxX = -1;
+        let minY = Infinity;
+        let maxY = -1;
+        for (let i = 0; i < data.length; i += 4) {
+          if (data[i] > 90 || data[i + 1] > 90 || data[i + 2] > 90) continue;
+          const x = (i / 4) % width;
+          const y = Math.floor(i / 4 / width);
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+        return { width: (maxX - minX) / scale, height: (maxY - minY) / scale };
+      };
+      return { first: extent(42, 138), second: extent(142, 330) };
+    });
+    // Vertical: one line of 16 px set upwards, about 100 px long. Horizontal: the other way round.
+    expect(ink.first.height).toBeGreaterThan(60);
+    expect(ink.first.width).toBeLessThan(25);
+    expect(ink.second.width).toBeGreaterThan(30);
+    expect(ink.second.height).toBeLessThan(25);
+    // The text is still there for copying and for assistive technology.
+    expect(await pageText(page, 1)).toContain('Vertical words');
+  });
+});

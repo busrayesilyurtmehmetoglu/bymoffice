@@ -79,6 +79,12 @@ export interface Band {
   keep: boolean;
   breakBefore?: 'page' | 'column';
   breakAfter?: 'page' | 'column';
+  /**
+   * How far content hangs out below the band: a line of a vertically merged
+   * cell that starts in this row and ends in the next. The band needs room
+   * for it where it is placed, though what follows starts right below the band.
+   */
+  overhang?: number;
   /** Ids of the footnotes referred to in the band. */
   notes?: number[];
   floats?: FloatSpec[];
@@ -155,6 +161,25 @@ export interface RunStyle {
   /** 1 Symbol, 2 Wingdings, 0 neither. */
   symbol: 0 | 1 | 2;
   superscript: boolean;
+  /** Decimal separator of the language of the text; undefined when no language is known. */
+  decimal?: ',' | '.';
+}
+
+/** Languages (primary subtag) that write the decimal separator as a comma. */
+const COMMA_LANGUAGES =
+  ' af az be bg bs ca cs da de el es et eu fi fo fr gl hr hu hy id is it ka kk ky lt lv mk mn nb nl nn no pl pt ro ru sk sl sq sr sv tk tr uk uz vi ';
+/** Regional forms of those languages that use the point. */
+const POINT_REGIONS = ' de-ch de-li es-mx es-us es-pr es-do es-gt es-hn es-ni es-pa es-sv ';
+
+/** Decimal separator of a language tag ("tr-TR" -> ","); undefined without a usable tag. */
+export function decimalSeparator(tag: string | undefined): ',' | '.' | undefined {
+  if (tag === undefined) return undefined;
+  const match = /^([A-Za-z]{2,3})(?:[-_]([A-Za-z]{2}))?/.exec(tag);
+  if (!match) return undefined;
+  const language = match[1].toLowerCase();
+  if (COMMA_LANGUAGES.indexOf(' ' + language + ' ') < 0) return '.';
+  if (match[2] !== undefined && POINT_REGIONS.indexOf(' ' + language + '-' + match[2].toLowerCase() + ' ') >= 0) return '.';
+  return ',';
 }
 
 interface FontEntry {
@@ -165,6 +190,8 @@ interface FontEntry {
 
 /** Entries one font may cache before its cache is emptied. */
 const MAX_WIDTHS_PER_FONT = 60000;
+/** Longer texts are measured every time they are asked for: a cache of very long words would hold the document many times over. */
+const MAX_CACHED_TEXT = 96;
 
 export type LayoutBlocksFn = (
   ctx: LayoutContext,
@@ -254,6 +281,10 @@ export class LayoutContext {
   /** Advance width of the text, cached by font and text. */
   width(font: LayoutFont, text: string): number {
     if (text === '') return 0;
+    if (text.length > MAX_CACHED_TEXT) {
+      const measured = finite(this.measurer.width(font, text));
+      return measured < 0 ? 0 : measured;
+    }
     const entry = this.entry(font);
     let width = entry.widths.get(text);
     if (width === undefined) {
@@ -391,6 +422,10 @@ export class LayoutContext {
       symbol: symbolFont(family),
       superscript: raised,
     };
+    // The language of the run, or the one the document states for its theme fonts.
+    const themeLang = this.doc.settings.themeFontLang;
+    const decimal = decimalSeparator(props.lang && props.lang.val) || decimalSeparator(themeLang && themeLang.val);
+    if (decimal !== undefined) style.decimal = decimal;
     const eastAsia = fonts.eastAsia;
     if (eastAsia !== undefined && eastAsia !== family && !complex) style.eastAsia = this.font(eastAsia, size, bold, italic);
     if (style.smallCaps) style.small = this.font(family, size * 0.8, bold, italic);

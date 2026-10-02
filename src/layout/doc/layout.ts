@@ -15,12 +15,12 @@
 import type { Block, DocModel, DrawingAnchor, DrawingPosition, HeaderFooterKind, SectionProps, Story, Table } from '../../model/doc/types';
 import { getPrep, layoutBlocks, paragraphEnv } from './blocks';
 import { bandsHeight, LayoutContext, shifted, type Band, type FieldTextItem, type FieldValues, type FloatSpec, type StoryRef } from './context';
-import { floatExclusion, floatPosition, type FloatFrame, type Rect } from './drawing';
+import { floatExclusion, floatPosition, type FloatFrame, type Rect, type WrapSide } from './drawing';
 import { inheritedPart, findSections, pageBorderItems, pageGeometry, type PageGeometry, type SectionInfo } from './page';
 import { paragraphBands, type WrapEnv } from './paragraph';
-import { noteLabel } from './prep';
+import { isHiddenParagraph, noteLabel } from './prep';
 import { formatPageNumber } from './symbols';
-import { tableBands } from './table';
+import { tableBands, tableLayout, type TableLayout } from './table';
 import type { DocLayoutOptions, LayoutBudget, LayoutPage, LayoutProgress, PageItem, TextMeasurer } from './types';
 import { EPSILON, MAX_PAGES, MIN_TEXT_EXTENT, MIN_WRAP_WIDTH, twips } from './units';
 
@@ -36,6 +36,7 @@ const isMark = (item: QueueItem): item is SectionMark => (item as SectionMark).m
 
 interface Exclusion extends Rect {
   whole: boolean;
+  side: WrapSide;
 }
 
 interface PlacedFloat {
@@ -133,6 +134,8 @@ const CARRIED_NOTES_SHARE = 0.75;
 /** Height of the default footnote separator, px. */
 const SEPARATOR_HEIGHT = 10;
 const SEPARATOR_WIDTH = 192;
+/** Rows of a table of the body laid out in one step. */
+const TABLE_STEP_ROWS = 32;
 
 const now = (): number => Date.now();
 
@@ -153,6 +156,8 @@ export class DocLayout {
   private head = 0;
   /** Next block of the body to turn into bands, and the section it is in. */
   private nextBlock = 0;
+  /** The table of the body whose rows are being fed, a few at a time. */
+  private table: TableLayout | undefined;
   private feedSection = 0;
   private endnotesQueued = false;
 
@@ -239,6 +244,13 @@ export class DocLayout {
     const blocks = this.doc.body.blocks;
     this.queue.length = 0;
     this.head = 0;
+    while (this.table) {
+      // More rows of the table that is under way.
+      const bands = this.table.next(TABLE_STEP_ROWS);
+      if (this.table.done) this.table = undefined;
+      for (let i = 0; i < bands.length; i++) this.queue.push(bands[i]);
+      if (this.queue.length) return true;
+    }
     while (this.nextBlock < blocks.length) {
       const index = this.nextBlock++;
       const bands = this.blockBands(blocks, index);
@@ -262,12 +274,21 @@ export class DocLayout {
     const column = this.needColumn();
     if (block.type === 'paragraph') {
       const prep = getPrep(this.ctx, block, BODY, [index], undefined, 0, this.fields);
+      if (isHiddenParagraph(prep)) return [];
       const env = paragraphEnv(this.ctx, blocks, index, prep, undefined, this.fields);
       const dropBefore = this.dropsBefore(column);
       const wrap = this.wrapEnv(column, prep.floats, dropBefore ? 0 : env.before, dropBefore);
       return paragraphBands(this.ctx, prep, column.width, env, wrap);
     }
-    if (block.type === 'table') return this.floatingTable(block, index, column) || tableBands(this.ctx, block, column.width, BODY, [index], 0, this.fields);
+    if (block.type === 'table') {
+      const floating = this.floatingTable(block, index, column);
+      if (floating) return floating;
+      // A long table must not hold up the pages before it: its rows are laid out as they are placed.
+      const table = tableLayout(this.ctx, block, column.width, BODY, [index], 0, this.fields);
+      const bands = table.next(TABLE_STEP_ROWS);
+      if (!table.done) this.table = table;
+      return bands;
+    }
     return [];
   }
 
@@ -367,6 +388,14 @@ export class DocLayout {
       this.closeColumn();
       this.closePage();
     }
+    // Lines of footnotes that found no room on the pages of the text take pages of their own: nothing of a note is dropped.
+    while (this.carry.length && !this.truncated && this.pages.length < MAX_PAGES) {
+      const left = this.carry.length;
+      this.openPage();
+      this.closeColumn();
+      this.closePage();
+      if (this.carry.length >= left) break;
+    }
     this.done = true;
     this.fillTotals();
   }
@@ -415,7 +444,7 @@ export class DocLayout {
       need = (column.notes.length === 0 ? SEPARATOR_HEIGHT : 0) + (first ? first.before + first.height : 0);
     }
     const limit = column.bottom - column.notesHeight - need;
-    if (y + band.height <= limit + EPSILON) {
+    if (y + band.height + (band.overhang || 0) <= limit + EPSILON) {
       this.put(column, band, y);
       this.head++;
       this.afterPlaced(band);
@@ -610,21 +639,32 @@ export class DocLayout {
       dropBefore,
       free: (top, bottom) => {
         const hit = this.blockers(column, top, bottom, own);
-        if (!hit) return { left: 0, right: column.width };
+        if (!hit) return [{ left: 0, right: column.width }];
         let down = Infinity;
         for (const e of hit) if (e.bottom < down) down = e.bottom;
         for (const e of hit) if (e.whole) return down;
-        // The widest gap the drawings leave.
-        hit.sort((a, b) => a.left - b.left);
-        let best = { left: 0, right: 0 };
-        let edge = 0;
+        // What the drawings leave of the column: each takes its own width away, and with it the side text may not be on.
+        let gaps = [{ left: 0, right: column.width }];
         for (const e of hit) {
           const left = e.left - column.x;
-          if (left - edge > best.right - best.left) best = { left: edge, right: left };
-          if (e.right - column.x > edge) edge = e.right - column.x;
+          const right = e.right - column.x;
+          const side = e.side === 'largest' ? (left >= column.width - right ? 'left' : 'right') : e.side;
+          const from = side === 'right' ? -Infinity : left;
+          const to = side === 'left' ? Infinity : right;
+          const next: { left: number; right: number }[] = [];
+          for (const gap of gaps) {
+            if (to <= gap.left || from >= gap.right) next.push(gap);
+            else {
+              if (from > gap.left) next.push({ left: gap.left, right: from });
+              if (to < gap.right) next.push({ left: to, right: gap.right });
+            }
+          }
+          gaps = next;
         }
-        if (column.width - edge > best.right - best.left) best = { left: edge, right: column.width };
-        return best.right - best.left >= Math.min(MIN_WRAP_WIDTH, column.width / 2) ? best : down;
+        // Text is not squeezed into a sliver.
+        const narrowest = Math.min(MIN_WRAP_WIDTH, column.width / 2);
+        gaps = gaps.filter((gap) => gap.right - gap.left >= narrowest);
+        return gaps.length ? gaps : down;
       },
     };
   }
@@ -1038,6 +1078,8 @@ export class DocLayout {
     this.closePage();
     if (type === 'evenPage' || type === 'oddPage') {
       // A page of the wrong parity is left empty.
+      // UNSURE: a section that restarts its page numbers (pgNumType start) gets no empty page here, whatever the
+      // parity of the number it starts with; whether Word inserts one then was not checked against a document.
       const numbering = to.pageNumbering;
       const previous = this.pages.length ? this.pages[this.pages.length - 1].number : 0;
       const number = numbering && numbering.start !== undefined ? numbering.start : previous + 1;

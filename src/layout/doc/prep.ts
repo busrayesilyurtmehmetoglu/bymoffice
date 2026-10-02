@@ -500,6 +500,11 @@ function walkItems(args: PrepArgs, walk: Walk, run: Run | undefined, items: RunI
           walk.skip++;
           continue;
         }
+        if (run && inFieldCode(run, i)) {
+          // A field in the code of another field is part of that code: it shows nothing and computes nothing.
+          walk.fields.push(undefined);
+          continue;
+        }
         const code = item.field ? parseFieldCode(item.field.instruction) : undefined;
         if (code && item.field && isLiveField(code.name) && !item.field.unclosed) {
           builder.field(code.name, code.format, item.field.result, style, walk.offset, link);
@@ -756,6 +761,14 @@ export function prepareParagraph(
   prep.live = builder.live;
   if (walk.floats.length) prep.floats = walk.floats;
   return prep;
+}
+
+/**
+ * A paragraph of which nothing shows, its mark included (all of it is hidden
+ * text): it takes no room at all, as if it were not there.
+ */
+export function isHiddenParagraph(prep: ParaPrep): boolean {
+  return prep.mark.hidden && prep.atoms.length === 0 && !prep.label && !prep.floats;
 }
 
 /** Narrowest and widest the content of the paragraph can be set, px, for automatic table layout. */

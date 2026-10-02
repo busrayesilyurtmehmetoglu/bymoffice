@@ -8,7 +8,7 @@
 import type { ImageItem, LayoutFont, LayoutPage, LineItem, RectItem, TextItem } from '../layout/doc/types';
 import { docCssFont } from './doc-measure';
 
-/** A decoded picture and its size in its own pixels. */
+/** A decoded picture and its size in its own pixels (which may be fewer than the file has). */
 export interface PageImage {
   source: CanvasImageSource;
   width: number;
@@ -18,8 +18,13 @@ export interface PageImage {
 export interface RenderPageOptions {
   /** Canvas pixels per px of the page: zoom times device pixel ratio. Default 1. */
   scale?: number;
-  /** The decoded picture of a part, undefined while it is not loaded (a placeholder is drawn). */
-  images?: { get(part: string): PageImage | undefined };
+  /**
+   * The decoded picture of a part, undefined while it is not loaded (a
+   * placeholder is drawn). `width` and `height` say how many canvas pixels the
+   * whole picture covers where it is drawn, so that a store can decode it to
+   * that size instead of the size it has in the file.
+   */
+  images?: { get(part: string, width?: number, height?: number): PageImage | undefined };
   /** The CSS font for a layout font; must be the one the page was measured with. */
   cssFont?(font: LayoutFont): string;
   /** Line extent of a font, for highlights; estimated from the size when missing. */
@@ -317,6 +322,21 @@ function charLength(text: string, index: number): number {
 function drawText(p: Painter, item: TextItem): void {
   if (!finite(item.x) || !finite(item.y) || !item.font || typeof item.text !== 'string') return;
   const ctx = p.ctx;
+  if (item.rotation === 90 || item.rotation === 270) {
+    // Vertical text: the same drawing in a frame turned around the start of the baseline.
+    ctx.save();
+    ctx.translate(item.x, item.y);
+    ctx.rotate(item.rotation === 90 ? Math.PI / 2 : -Math.PI / 2);
+    const straight: TextItem = { ...item, x: 0, y: 0 };
+    delete straight.rotation;
+    try {
+      drawText(p, straight);
+    } finally {
+      ctx.restore();
+      forget(p);
+    }
+    return;
+  }
   const size = finite(item.font.size) && item.font.size > 0 ? item.font.size : 12;
   const width = finite(item.width) && item.width > 0 ? item.width : 0;
 
@@ -415,7 +435,28 @@ function drawImage(p: Painter, item: ImageItem): void {
   if (!finite(item.x) || !finite(item.y) || !finite(item.width) || !finite(item.height) || !(item.width > 0) || !(item.height > 0)) return;
   const ctx = p.ctx;
   const images = p.options.images;
-  const loaded = item.part !== undefined && item.placeholder === undefined && images ? images.get(item.part) : undefined;
+  // The part of the picture that is shown, as shares of it; a crop that leaves nothing is not applied.
+  const crop = item.crop;
+  let cropLeft = 0;
+  let cropTop = 0;
+  let shownWidth = 1;
+  let shownHeight = 1;
+  if (crop) {
+    const left = fraction(crop.left);
+    const top = fraction(crop.top);
+    const cw = 1 - left - fraction(crop.right);
+    const ch = 1 - top - fraction(crop.bottom);
+    if (cw > 0 && ch > 0) {
+      cropLeft = left;
+      cropTop = top;
+      shownWidth = cw;
+      shownHeight = ch;
+    }
+  }
+  const loaded =
+    item.part !== undefined && item.placeholder === undefined && images
+      ? images.get(item.part, Math.ceil((item.width * p.scale) / shownWidth), Math.ceil((item.height * p.scale) / shownHeight))
+      : undefined;
   const rotation = finite(item.rotation) ? item.rotation % 360 : 0;
   const transformed = rotation !== 0 || item.flipH === true || item.flipV === true;
   if (transformed) {
@@ -428,24 +469,10 @@ function drawImage(p: Painter, item: ImageItem): void {
   }
   let drawn = false;
   if (loaded && loaded.width > 0 && loaded.height > 0) {
-    const crop = item.crop;
-    let sx = 0;
-    let sy = 0;
-    let sw = loaded.width;
-    let sh = loaded.height;
-    if (crop) {
-      const left = fraction(crop.left);
-      const top = fraction(crop.top);
-      const cw = 1 - left - fraction(crop.right);
-      const ch = 1 - top - fraction(crop.bottom);
-      // A crop that leaves nothing is not applied.
-      if (cw > 0 && ch > 0) {
-        sx = left * loaded.width;
-        sy = top * loaded.height;
-        sw = cw * loaded.width;
-        sh = ch * loaded.height;
-      }
-    }
+    const sx = cropLeft * loaded.width;
+    const sy = cropTop * loaded.height;
+    const sw = shownWidth * loaded.width;
+    const sh = shownHeight * loaded.height;
     try {
       ctx.drawImage(loaded.source, sx, sy, sw, sh, item.x, item.y, item.width, item.height);
       drawn = true;

@@ -42,7 +42,8 @@ const images = (page: { items: unknown[] }) => (page.items as ImageItem[]).filte
 test('doc layout: an inline picture is a box on the baseline that makes its line taller', async () => {
   const { pages } = await lay({ body: p(r('ab') + inline(100, 50) + r('cd')) + p('next'), rels: RELS });
   const [image] = images(pages[0]);
-  // The line: 50 px above the baseline, the 3.2 px of descent below it.
+  // The line: 50 px above the baseline; the text beside the picture keeps its 3.2 px of descent below it.
+  // (A line with nothing but a picture has no descent: see doc-layout-fixes.test.ts.)
   assert.deepEqual(at(pages[0]), ['ab@40,90', 'cd@156,90', 'next@40,106']);
   assert.deepEqual([image.x, image.y, image.width, image.height], [56, 40, 100, 50]);
   assert.equal(image.part, '/word/media/image1.png');
@@ -56,12 +57,13 @@ test('doc layout: an inline picture is a box on the baseline that makes its line
 test('doc layout: a picture wider than what is left of the line goes to the next line', async () => {
   const { pages } = await lay({ body: p(r(words(6)) + inline(100, 20) + inline(300, 20) + inline(500, 20)), rels: RELS });
   // 30 characters end at 280: 100 px do not fit behind them. The widest one is placed although it does not fit anywhere.
+  // A line that holds nothing but a picture is as high as the picture: no descent of the font under it.
   assert.deepEqual(
     images(pages[0]).map((image) => [image.x, image.y]),
     [
       [40, 56],
-      [40, 79.2],
-      [40, 102.4],
+      [40, 76],
+      [40, 96],
     ],
   );
 });
