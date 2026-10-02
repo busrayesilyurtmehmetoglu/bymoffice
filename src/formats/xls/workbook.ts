@@ -92,6 +92,21 @@ import { XlsStyles } from './styles';
 /** Sheet limits of the format; a cell outside them makes the file invalid. */
 export const XLS_MAX_ROWS = 65536;
 export const XLS_MAX_COLS = 256;
+/**
+ * Sheets one workbook may have. The format has no limit of its own; a sheet takes a few dozen
+ * bytes in the file and a hundred times that in the model, so a file of nothing but sheets is refused.
+ */
+export const XLS_MAX_SHEETS = 4096;
+
+/**
+ * What the cells of shared formulas may cost together, in token bytes read and characters of
+ * text made, for each byte of the stream. Every cell of a group gets a text of its own from
+ * the tokens of the group, so a small file can ask for a lot of text; genuine files stay far
+ * below this (a cell of a group takes 31 bytes in the file and has a few dozen characters).
+ */
+const SHARED_FORMULA_FACTOR = 64;
+/** The least the cells of shared formulas may cost, whatever the size of the stream. */
+const SHARED_FORMULA_FLOOR = 1024 * 1024;
 
 const REC_SHEETEXT = 0x0862;
 
@@ -100,7 +115,11 @@ export interface XlsReadReport {
   /** 8 for the format of Excel 97-2003, 5 for the one of Excel 5 and 95. */
   biff: 5 | 8;
   codepage: number;
-  /** Formula cells whose tokens could not be turned into text; they keep their value and have no formula. */
+  /**
+   * Formula cells whose tokens could not be turned into text; they keep their value and have no formula.
+   * Counted here too: formulas longer or more deeply nested than Excel allows, and the cells of shared
+   * formulas that were left without a text because the texts of the workbook together grew too large.
+   */
   untranslatedFormulas: number;
   /** Defined names left out for the same reason. */
   untranslatedNames: number;
@@ -167,6 +186,8 @@ interface Globals {
   fontOf(index: number): Font | undefined;
   ctx: FormulaContext;
   report: XlsReadReport;
+  /** What the cells of shared formulas may still cost (see SHARED_FORMULA_FACTOR). */
+  sharedBudget: number;
 }
 
 function count(map: Map<number, number>, id: number): void {
@@ -313,6 +334,7 @@ function readGlobals(stream: RecordStream, streamName: string): Globals {
           const offset = r.u32();
           const visibility = r.u8() & 0x03;
           const type = r.u8();
+          if (sheets.length >= XLS_MAX_SHEETS) throw new XlsUnsupportedError(`Workbooks with more than ${XLS_MAX_SHEETS} sheets are not supported`);
           sheets.push({
             offset,
             state: visibility === 1 ? 'hidden' : visibility === 2 ? 'veryHidden' : 'visible',
@@ -388,7 +410,8 @@ function readGlobals(stream: RecordStream, streamName: string): Globals {
     supBooks,
     failures: report.untranslatedReasons,
   };
-  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report };
+  const sharedBudget = Math.max(SHARED_FORMULA_FLOOR, size * SHARED_FORMULA_FACTOR);
+  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget };
 }
 
 /** The defined names of the workbook; a name whose formula cannot be turned into text is left out. */
@@ -528,7 +551,9 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   let columnRecords = 0;
   let defaultWidthChars = -1;
   let standardWidth = false;
-  const tooltips: { top: number; left: number; bottom: number; right: number; text: string }[] = [];
+  /** Tooltips by the range of the link they belong to; a later one for the same range replaces the earlier. */
+  const tooltips = new Map<string, string>();
+  const rangeKey = (range: CellRange): string => range.top + ',' + range.left + ',' + range.bottom + ',' + range.right;
 
   let p = start + 4 + recordLength(stream, start);
   let depth = 0;
@@ -823,14 +848,17 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
       case REC_HLINK:
         // Links come in more layouts than this reader knows; one it cannot read is left out, not the whole file.
         try {
-          const link = readHyperlink(readerAt(stream, d - 4));
+          const link = readHyperlink(readerAt(stream, d - 4), codepage);
           if (link) sheet.hyperlinks.push(link);
         } catch {
           count(report.skippedRecords, id);
         }
         continue;
       case REC_HLINKTOOLTIP:
-        if (length >= 10) tooltips.push(readHyperlinkTooltip(readerAt(stream, d - 4)));
+        if (length >= 10) {
+          const tip = readHyperlinkTooltip(readerAt(stream, d - 4));
+          if (tip.text !== '') tooltips.set(rangeKey(tip), tip.text);
+        }
         continue;
       case REC_WINDOW2: {
         if (length < 2) continue;
@@ -907,7 +935,14 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
     const col = at % XLS_MAX_COLS;
     const group = shared.get(linkedTo[i]);
     if (group) {
+      if (globals.sharedBudget <= 0) {
+        // The cell keeps its value; the formula is left out and counted.
+        report.untranslatedFormulas++;
+        countReason(report.untranslatedReasons, 'shared formula: the texts of the workbook together are too large');
+        continue;
+      }
       const text = formulaText(ctx, group.bytes, group.start, group.end, group.end, group.extraEnd, row, col);
+      globals.sharedBudget -= group.end - group.start + (text === undefined ? 0 : text.length);
       if (text === undefined) report.untranslatedFormulas++;
       else {
         // Every cell carries its own text, so nothing depends on the first cell of the group staying as it is.
@@ -934,10 +969,10 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
 
   const active = paneActive !== undefined ? paneActive : firstActive;
   if (active !== undefined) sheet.view.activeCell = active;
-  for (const tip of tooltips) {
+  if (tooltips.size > 0) {
     for (const link of sheet.hyperlinks) {
-      const range = link.range;
-      if (range.top === tip.top && range.left === tip.left && range.bottom === tip.bottom && range.right === tip.right && tip.text !== '') link.tooltip = tip.text;
+      const text = tooltips.get(rangeKey(link.range));
+      if (text !== undefined) link.tooltip = text;
     }
   }
   // The default width is stated in characters of the default font; a file stores widths with the padding

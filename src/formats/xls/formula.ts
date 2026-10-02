@@ -55,6 +55,11 @@ const P_INTERSECT = 9;
 const P_RANGE = 10;
 const P_ATOM = 11;
 
+/** Longest formula text that is produced: the limit Excel itself has for a formula. */
+export const MAX_FORMULA_CHARS = 8192;
+/** Deepest nesting of parentheses and function calls that is followed; Excel allows 64 levels of functions. */
+export const MAX_FORMULA_DEPTH = 64;
+
 /** Binary operators by token, 0x03..0x11. */
 const BINARY: readonly [text: string, precedence: number][] = [
   ['+', P_ADD],
@@ -127,15 +132,26 @@ interface Decoder {
   col: number;
   texts: string[];
   precs: number[];
+  /** Levels of parentheses and function calls inside each operand. */
+  depths: number[];
+  /** Deepest nesting among the operands popArgs() took last. */
+  popped: number;
 }
 
 function need(d: Decoder, size: number): void {
   if (d.p + size > d.end) fail('truncated token');
 }
 
-function push(d: Decoder, text: string, precedence: number): void {
-  d.texts.push(text);
+/** A token array is small, but it can ask for a text that is not: every text is checked as it is made. */
+function checked(text: string): string {
+  return text.length > MAX_FORMULA_CHARS ? fail('formula text too long') : text;
+}
+
+function push(d: Decoder, text: string, precedence: number, depth = 0): void {
+  if (depth > MAX_FORMULA_DEPTH) fail('formula nested too deeply');
+  d.texts.push(checked(text));
   d.precs.push(precedence);
+  d.depths.push(depth);
 }
 
 /** Row and column limits of the BIFF version: references wrap around inside them. */
@@ -286,6 +302,7 @@ function stringLiteral(text: string): string {
 /** Text of `count` characters at `at`, for a BIFF8 string with its flags byte already read. */
 function wideText(d: Decoder, at: number, count: number, wide: boolean, limit: number): string {
   if (at + count * (wide ? 2 : 1) > limit) return fail('truncated string');
+  if (count > MAX_FORMULA_CHARS) return fail('formula text too long');
   let out = '';
   if (wide) {
     for (let i = 0; i < count; i++) out += String.fromCharCode(d.view.getUint16(at + i * 2, true));
@@ -313,6 +330,8 @@ function readArrayConstant(d: Decoder): string {
     if (r > 0) out += ';';
     for (let c = 0; c < cols; c++) {
       if (c > 0) out += ',';
+      // The constant may have 256 x 65536 elements; the text of a formula may not.
+      if (out.length > MAX_FORMULA_CHARS) return fail('formula text too long');
       if (p + 1 > limit) return fail('PtgArray: truncated data');
       const type = d.bytes[p++];
       if (type === 0x01) {
@@ -351,7 +370,7 @@ function readArrayConstant(d: Decoder): string {
     }
   }
   d.extra = p;
-  return out + '}';
+  return checked(out + '}');
 }
 
 /** Skips the rectangles a PtgMemArea keeps after the tokens. */
@@ -361,13 +380,20 @@ function skipMemAreaData(d: Decoder): void {
   d.extra = Math.min(d.extraEnd, d.extra + 2 + count * (d.ctx.biff8 ? 8 : 6));
 }
 
+/** Takes the last `count` operands off the stack; `d.popped` is then the deepest nesting among them. */
 function popArgs(d: Decoder, count: number, what: string): string[] {
   if (d.texts.length < count) return fail(`${what}: too few operands`);
   const at = d.texts.length - count;
   const args = d.texts.splice(at, count);
   const precs = d.precs.splice(at, count);
+  const depths = d.depths.splice(at, count);
+  let deepest = 0;
   // A union as an argument would read as two arguments without its parentheses.
-  for (let i = 0; i < count; i++) if (precs[i] === P_UNION) args[i] = `(${args[i]})`;
+  for (let i = 0; i < count; i++) {
+    if (precs[i] === P_UNION) args[i] = `(${args[i]})`;
+    if (depths[i] > deepest) deepest = depths[i];
+  }
+  d.popped = deepest;
   return args;
 }
 
@@ -378,12 +404,13 @@ function callFunction(d: Decoder, index: number, count: number): void {
     const args = popArgs(d, count, 'PtgFuncVar');
     const name = args[0];
     if (!/^[A-Za-z_\\][A-Za-z0-9_.\\]*$/.test(name)) return fail('user-defined function with an unusable name');
-    push(d, `${name}(${args.slice(1).join(',')})`, P_ATOM);
+    push(d, `${name}(${args.slice(1).join(',')})`, P_ATOM, d.popped + 1);
     return;
   }
   const name = functionName(index);
   if (name === undefined) return fail(`unknown function ${index}`);
-  push(d, `${name}(${popArgs(d, count, name).join(',')})`, P_ATOM);
+  const args = popArgs(d, count, name);
+  push(d, `${name}(${args.join(',')})`, P_ATOM, d.popped + 1);
 }
 
 function nameText(d: Decoder, index: number): string {
@@ -408,10 +435,12 @@ function decode(d: Decoder): string {
       const [op, precedence] = BINARY[base - 0x03];
       const right = d.texts.pop() as string;
       const rightPrec = d.precs.pop() as number;
+      const rightDepth = d.depths.pop() as number;
       const left = d.texts.pop() as string;
       const leftPrec = d.precs.pop() as number;
+      const leftDepth = d.depths.pop() as number;
       // Operators group from the left, so an operand of the same precedence on the right needs parentheses.
-      push(d, (leftPrec < precedence ? `(${left})` : left) + op + (rightPrec <= precedence ? `(${right})` : right), precedence);
+      push(d, (leftPrec < precedence ? `(${left})` : left) + op + (rightPrec <= precedence ? `(${right})` : right), precedence, Math.max(leftDepth, rightDepth));
       continue;
     }
 
@@ -424,21 +453,22 @@ function decode(d: Decoder): string {
       case 0x13: {
         if (d.texts.length < 1) return fail('operator without operands');
         const at = d.texts.length - 1;
-        d.texts[at] = (base === 0x12 ? '+' : '-') + (d.precs[at] < P_UNARY ? `(${d.texts[at]})` : d.texts[at]);
+        d.texts[at] = checked((base === 0x12 ? '+' : '-') + (d.precs[at] < P_UNARY ? `(${d.texts[at]})` : d.texts[at]));
         d.precs[at] = P_UNARY;
         break;
       }
       case 0x14: {
         if (d.texts.length < 1) return fail('operator without operands');
         const at = d.texts.length - 1;
-        d.texts[at] = (d.precs[at] < P_PERCENT ? `(${d.texts[at]})` : d.texts[at]) + '%';
+        d.texts[at] = checked((d.precs[at] < P_PERCENT ? `(${d.texts[at]})` : d.texts[at]) + '%');
         d.precs[at] = P_PERCENT;
         break;
       }
       case 0x15: {
         if (d.texts.length < 1) return fail('parentheses without an operand');
         const at = d.texts.length - 1;
-        d.texts[at] = `(${d.texts[at]})`;
+        if (++d.depths[at] > MAX_FORMULA_DEPTH) return fail('formula nested too deeply');
+        d.texts[at] = checked(`(${d.texts[at]})`);
         d.precs[at] = P_ATOM;
         break;
       }
@@ -471,7 +501,8 @@ function decode(d: Decoder): string {
           d.p += (data + 1) * 2;
         } else if (flags & 0x10) {
           if (d.texts.length < 1) return fail('SUM without an operand');
-          push(d, `SUM(${popArgs(d, 1, 'SUM')[0]})`, P_ATOM);
+          const args = popArgs(d, 1, 'SUM');
+          push(d, `SUM(${args[0]})`, P_ATOM, d.popped + 1);
         } else if (flags & 0x20) {
           return fail('PtgAttrBaxcel');
         }
@@ -639,6 +670,19 @@ function decode(d: Decoder): string {
   const text = d.texts[0];
   // A missing argument on its own is not a formula.
   if (text === '') return fail('empty formula');
+  return flat(text);
+}
+
+let flattened = 0;
+
+/**
+ * The text as one run of characters. What the operators above put together is a tree of
+ * the pieces it was made from, which takes several times the room of the text; an engine
+ * replaces the tree by the characters the first time one of them is looked at.
+ */
+function flat(text: string): string {
+  // The result is used, so that the look cannot be optimised away.
+  if (text.length > 12) flattened = (flattened + text.charCodeAt(text.length - 1)) | 0;
   return text;
 }
 
@@ -680,6 +724,8 @@ export function formulaText(
     col,
     texts: [],
     precs: [],
+    depths: [],
+    popped: 0,
   };
   try {
     return decode(decoder);

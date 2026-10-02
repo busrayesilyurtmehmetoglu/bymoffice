@@ -395,6 +395,79 @@ export function inlinePicture(data: Uint8Array, offset: number, store: MediaStor
 /** The largest width and height Word gives a picture: 22 inches. */
 const MAX_PICTURE_TWIPS = 31680;
 
+/** Segments of a JPEG file that are looked at for its size; a genuine file has the size within the first few. */
+const MAX_JPEG_SEGMENTS = 4096;
+
+const be16 = (b: Uint8Array, o: number): number => (b[o] << 8) | b[o + 1];
+const be32 = (b: Uint8Array, o: number): number => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+
+/**
+ * Width and height of a picture as its own header states them: pixels for PNG, JPEG and
+ * BMP, the frame for EMF and placeable WMF. Only the proportion of the two is used.
+ * Undefined when the header is not there, is cut off, or states no size.
+ */
+export function pictureSize(media: DocMedia): { width: number; height: number } | undefined {
+  const b = media.bytes;
+  let width = 0;
+  let height = 0;
+  if (media.type === 'image/png') {
+    // The signature, then the IHDR chunk: length, name, width, height.
+    if (b.length < 24 || b[0] !== 0x89 || b[1] !== 0x50 || b[12] !== 0x49 || b[13] !== 0x48 || b[14] !== 0x44 || b[15] !== 0x52) return undefined;
+    width = be32(b, 16);
+    height = be32(b, 20);
+  } else if (media.type === 'image/jpeg') {
+    if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return undefined;
+    let p = 2;
+    // Each round takes a marker and its segment: at least two bytes.
+    for (let i = 0; i < MAX_JPEG_SEGMENTS && p + 4 <= b.length; i++) {
+      if (b[p] !== 0xff) return undefined;
+      const marker = b[p + 1];
+      // Fill bytes before a marker, and markers that stand alone.
+      if (marker === 0xff) {
+        p += 1;
+        continue;
+      }
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+        p += 2;
+        continue;
+      }
+      // The picture data starts, or the file ends: no size was stated.
+      if (marker === 0xda || marker === 0xd9) return undefined;
+      const length = be16(b, p + 2);
+      if (length < 2) return undefined;
+      // A frame header (SOF0..SOF15 without the three markers in that range that are something else).
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (length < 7 || p + 9 > b.length) return undefined;
+        height = be16(b, p + 5);
+        width = be16(b, p + 7);
+        break;
+      }
+      p += 2 + length;
+    }
+  } else if (media.type === 'image/bmp') {
+    // The file header, then the bitmap header: the newer one has 32-bit sizes, the older one 16-bit ones.
+    if (b.length < 26 || b[0] !== 0x42 || b[1] !== 0x4d) return undefined;
+    if (u32(b, 14) >= 40) {
+      width = Math.abs(i32(b, 18));
+      height = Math.abs(i32(b, 22));
+    } else {
+      width = u16(b, 18);
+      height = u16(b, 20);
+    }
+  } else if (media.type === 'image/x-emf') {
+    // The header record: its frame in hundredths of a millimetre, then the signature.
+    if (b.length < 44 || u32(b, 0) !== 1 || u32(b, 40) !== 0x464d4520) return undefined;
+    width = i32(b, 32) - i32(b, 24);
+    height = i32(b, 36) - i32(b, 28);
+  } else if (media.type === 'image/x-wmf') {
+    // Only a "placeable" metafile says how large it is.
+    if (b.length < 14 || u32(b, 0) !== 0x9ac6cdd7) return undefined;
+    width = i16(b, 10) - i16(b, 6);
+    height = i16(b, 12) - i16(b, 8);
+  }
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
 function readInlinePicture(data: Uint8Array, offset: number, store: MediaStore): DrawingItem | undefined {
   if (offset < 0 || offset + 68 > data.length) return undefined;
   const size = i32(data, offset);
@@ -412,18 +485,6 @@ function readInlinePicture(data: Uint8Array, offset: number, store: MediaStore):
   const cropBottom = i16(data, offset + 42);
 
   const item: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'picture', xml: drawingXml() };
-  // The size shown: the natural size less what is cropped away, scaled (in thousandths).
-  let width = Math.max(0, ((goalWidth - cropLeft - cropRight) * scaleX) / 1000);
-  let height = Math.max(0, ((goalHeight - cropTop - cropBottom) * scaleY) / 1000);
-  // No picture is wider or taller than 22 inches in Word. Files of other producers carry a
-  // scale on one axis that gives several metres; the picture then keeps its shape at the
-  // size the other axis gives.
-  if (width > MAX_PICTURE_TWIPS && height <= MAX_PICTURE_TWIPS && goalHeight > 0) width = (height * goalWidth) / goalHeight;
-  else if (height > MAX_PICTURE_TWIPS && width <= MAX_PICTURE_TWIPS && goalWidth > 0) height = (width * goalHeight) / goalWidth;
-  width = Math.min(width, MAX_PICTURE_TWIPS);
-  height = Math.min(height, MAX_PICTURE_TWIPS);
-  item.width = Math.round(width * TWIP);
-  item.height = Math.round(height * TWIP);
   if ((cropLeft || cropTop || cropRight || cropBottom) && goalWidth > 0 && goalHeight > 0) {
     const crop: ImageCrop = {};
     if (cropLeft) crop.left = Math.round((cropLeft / goalWidth) * 100000);
@@ -478,6 +539,37 @@ function readInlinePicture(data: Uint8Array, offset: number, store: MediaStore):
     item.image = image;
     item.images = item.crop ? [{ image, crop: item.crop }] : [{ image }];
   }
+
+  // The size shown: the natural size less what is cropped away, scaled (in thousandths).
+  let width = Math.max(0, ((goalWidth - cropLeft - cropRight) * scaleX) / 1000);
+  let height = Math.max(0, ((goalHeight - cropTop - cropBottom) * scaleY) / 1000);
+  // No picture is wider or taller than 22 inches in Word. Files of other producers carry a
+  // scale on one axis that gives several metres; the picture then keeps its shape at the
+  // size the other axis gives. The shape is that of the picture itself where its header says
+  // how large it is: the natural size in the file is no measure of it, since it stops at 22
+  // inches too and a picture larger than that has lost its proportion there.
+  const wide = width > MAX_PICTURE_TWIPS && height <= MAX_PICTURE_TWIPS;
+  const tall = height > MAX_PICTURE_TWIPS && width <= MAX_PICTURE_TWIPS;
+  if (wide || tall) {
+    let ratio = goalWidth > 0 && goalHeight > 0 ? goalWidth / goalHeight : 0;
+    const media = image && image.target !== undefined ? store.media.get(image.target) : undefined;
+    const size = media ? pictureSize(media) : undefined;
+    if (size) {
+      ratio = size.width / size.height;
+      // What is cropped away, as the share of each side that is left.
+      const shownX = goalWidth > 0 ? 1 - (cropLeft + cropRight) / goalWidth : 1;
+      const shownY = goalHeight > 0 ? 1 - (cropTop + cropBottom) / goalHeight : 1;
+      if (shownX > 0 && shownY > 0) ratio = (ratio * shownX) / shownY;
+    }
+    if (ratio > 0) {
+      if (wide) width = height * ratio;
+      else height = width / ratio;
+    }
+  }
+  width = Math.min(width, MAX_PICTURE_TWIPS);
+  height = Math.min(height, MAX_PICTURE_TWIPS);
+  item.width = Math.round(width * TWIP);
+  item.height = Math.round(height * TWIP);
   return item;
 }
 

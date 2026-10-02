@@ -5,7 +5,7 @@ import type { Block, DrawingAnchor, DrawingItem, LegacyGraphicItem } from '../..
 import type { XmlElement } from '../../xml';
 import { stackBands, type FieldValues, type FloatSpec, type LayoutContext, type StoryRef } from './context';
 import type { ImageItem, PageItem } from './types';
-import { MAX_LAYOUT_DEPTH, MAX_PAGE_SIDE, clamp, emu, finite } from './units';
+import { MAX_LAYOUT_DEPTH, MAX_PAGE_SIDE, MAX_TEXT_BOX_WORK, clamp, emu, finite } from './units';
 
 export interface BoxContent {
   width: number;
@@ -291,8 +291,52 @@ function framed(style: BoxStyle, width: number, height: number, content: PageIte
   }
 }
 
+/** What a paragraph or a table row counts for beside its characters. */
+const BLOCK_WEIGHT = 16;
+
+/** What the blocks cost to lay out: their characters, and something for each paragraph and table row. */
+function blocksWeight(blocks: Block[], depth: number): number {
+  let weight = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    weight += BLOCK_WEIGHT;
+    if (block.type === 'paragraph') {
+      for (const inline of block.children) {
+        if (inline.type !== 'run') continue;
+        for (const item of inline.content) if (item.type === 'text' || item.type === 'deletedText') weight += item.text.length;
+      }
+    } else if (block.type === 'table' && depth < MAX_LAYOUT_DEPTH) {
+      for (const row of block.rows) {
+        weight += BLOCK_WEIGHT;
+        for (const cell of row.cells) weight += blocksWeight(cell.blocks, depth + 1);
+      }
+    }
+  }
+  return weight;
+}
+
+/**
+ * Whether the text of a box is laid out for the drawing `owner`. The text of a box belongs
+ * to one drawing: a second drawing that shows the same blocks (a model may share them) gets
+ * an empty box, so the text is not laid out, and kept, once for each of them. And all boxes
+ * of a document together are laid out only up to a limit; the ones after it stay empty.
+ */
+function takesBox(ctx: LayoutContext, blocks: Block[], owner: object): boolean {
+  const first = ctx.boxOwners.get(blocks);
+  if (first === undefined) ctx.boxOwners.set(blocks, owner);
+  else if (first !== owner) return false;
+  const stated = ctx.options.maxTextBoxWork;
+  const limit = stated !== undefined && stated >= 0 ? stated : MAX_TEXT_BOX_WORK;
+  if (ctx.boxWork >= limit) return false;
+  let weight = ctx.boxWeights.get(blocks);
+  if (weight === undefined) ctx.boxWeights.set(blocks, (weight = blocksWeight(blocks, 0)));
+  ctx.boxWork += weight;
+  return true;
+}
+
 function textBoxItems(
   ctx: LayoutContext,
+  owner: object,
   boxes: Block[][],
   width: number,
   insets: Insets,
@@ -305,6 +349,7 @@ function textBoxItems(
   if (depth >= MAX_LAYOUT_DEPTH) return 0;
   let y = insets.top;
   for (let k = 0; k < boxes.length; k++) {
+    if (!takesBox(ctx, boxes[k], owner)) continue;
     const bands = ctx.layoutBlocks(ctx, boxes[k], Math.max(1, width - insets.left - insets.right), story, path.concat([k]), undefined, depth + 1, fields);
     y += stackBands(bands, out, insets.left, y);
   }
@@ -349,7 +394,7 @@ export function drawingContent(
   }
   if (item.textBoxes) {
     const content: PageItem[] = [];
-    const used = textBoxItems(ctx, item.textBoxes, width, bodyInsets(item.xml), story, path, depth, fields, content);
+    const used = textBoxItems(ctx, item, item.textBoxes, width, bodyInsets(item.xml), story, path, depth, fields, content);
     // A box without a height of its own is as high as its text.
     if (height === 0) height = used;
     framed(item.image ? {} : shapeStyle(ctx, item.xml), width, height, content, items);
@@ -422,7 +467,7 @@ export function legacyContent(
   }
   if (item.textBoxes) {
     const content: PageItem[] = [];
-    const used = textBoxItems(ctx, item.textBoxes, width, DEFAULT_INSETS, story, path, depth, fields, content);
+    const used = textBoxItems(ctx, item, item.textBoxes, width, DEFAULT_INSETS, story, path, depth, fields, content);
     if (height === 0) height = used;
     framed(item.image ? {} : vmlStyle(shape), width, height, content, items);
   }

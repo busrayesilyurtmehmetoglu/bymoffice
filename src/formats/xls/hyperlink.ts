@@ -35,7 +35,7 @@ function linkString(r: RecordReader): string {
 }
 
 /** Reads the target out of a moniker; undefined for a kind this reader does not know (the rest of the record is then unreadable). */
-function readMoniker(r: RecordReader): string | undefined {
+function readMoniker(r: RecordReader, codepage: number): string | undefined {
   const classId = r.take(16);
   if (classId[0] === 0xe0 && classId[1] === 0xc9 && classId[2] === 0xea && classId[3] === 0x79) {
     // URL moniker: the text may be followed by a GUID and flags inside the same length.
@@ -44,14 +44,14 @@ function readMoniker(r: RecordReader): string | undefined {
     return utf16(r.take(size));
   }
   if (classId[0] === 0x03 && classId[1] === 0x03 && classId[2] === 0x00 && classId[3] === 0x00) {
-    // File moniker: a path in the ANSI code page, and often the same path in UTF-16.
+    // File moniker: a path in the ANSI code page of the workbook, and often the same path in UTF-16.
     const up = r.u16();
     const ansiSize = r.u32();
     if (ansiSize > MAX_LINK_CHARS) throw new Error('Invalid xls: a hyperlink target is too long');
     const ansi = r.take(ansiSize);
     let end = 0;
     while (end < ansi.length && ansi[end] !== 0) end++;
-    let path = decodeBytes(ansi, 0, end, 1252);
+    let path = decodeBytes(ansi, 0, end, codepage);
     r.skip(24);
     const unicodeSize = r.u32();
     if (unicodeSize > 0) {
@@ -67,8 +67,11 @@ function readMoniker(r: RecordReader): string | undefined {
   return undefined;
 }
 
-/** Reads an HLINK record. A link whose range is outside the sheet is left out (undefined). */
-export function readHyperlink(r: RecordReader): Hyperlink | undefined {
+/**
+ * Reads an HLINK record. A link whose range is outside the sheet is left out (undefined).
+ * `codepage` is the code page of the workbook, in which the path of a file is written.
+ */
+export function readHyperlink(r: RecordReader, codepage = 1252): Hyperlink | undefined {
   const top = r.u16();
   const bottom = r.u16();
   const left = r.u16();
@@ -84,7 +87,7 @@ export function readHyperlink(r: RecordReader): Hyperlink | undefined {
   }
   if (flags & HAS_FRAME_NAME) linkString(r);
   if (flags & HAS_MONIKER) {
-    const target = flags & MONIKER_AS_STRING ? linkString(r) : readMoniker(r);
+    const target = flags & MONIKER_AS_STRING ? linkString(r) : readMoniker(r, codepage);
     // After a moniker of an unknown kind there is no telling where the location starts.
     if (target === undefined) return link;
     if (target !== '') link.target = target;

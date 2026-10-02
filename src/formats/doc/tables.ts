@@ -36,6 +36,10 @@ export interface RowDef {
   row: RowProps;
   /** Half the space between the text of neighbouring cells: the left and right cell margin of Word 97. */
   gapHalf: number | undefined;
+  /** sprmTDxaLeft: where the text of the first cell starts, in twips from the margin; the edge is half a gap to the left of it. */
+  left?: number;
+  /** sprmTWidthIndent, when it is stated in twips: the indent of the table as a docx file states it. */
+  indent?: number;
 }
 
 const SIDES = ['top', 'left', 'bottom', 'right'] as const;
@@ -68,6 +72,10 @@ export function readTap(ctx: PropContext, sprms: TableSprm[]): RowDef {
   const { cells, table, row } = def;
   let position: TablePosition | undefined;
   const floating = (): TablePosition => position || (position = {});
+  /** The edges come from a table definition, not from cells put in one at a time. */
+  let defined = false;
+  /** sprmTDxaLeft was read and no table definition after it: the row is moved once all of it is known. */
+  let moved = false;
   /** Runs `fn` for the cells [first, limit) of an operand that starts with these two indexes. */
   const range = (b: Uint8Array, at: number, fn: (cell: CellDef) => void) => {
     const first = u8(b, at);
@@ -82,6 +90,9 @@ export function readTap(ctx: PropContext, sprms: TableSprm[]): RowDef {
         if (length < 1 + (count + 1) * 2) break;
         def.edges = [];
         cells.length = 0;
+        // The definition says where the edges are: nothing read before it moves them.
+        defined = true;
+        moved = false;
         for (let i = 0; i <= count; i++) {
           let edge = i16(b, at + 1 + i * 2);
           // Edges go from left to right; one that does not is pulled up to the edge before it.
@@ -120,13 +131,12 @@ export function readTap(ctx: PropContext, sprms: TableSprm[]): RowDef {
         }
         break;
       }
-      case 0x9601: {
-        // sprmTDxaLeft: moves the row so that its first edge is here.
-        if (!def.edges.length) def.edges.push(0);
-        const shift = i16(b, at) - def.edges[0];
-        for (let i = 0; i < def.edges.length; i++) def.edges[i] += shift;
+      case 0x9601:
+        // sprmTDxaLeft: moves the row so that the text of its first cell starts here. Where that puts the first
+        // edge depends on the gap between the cells, which may be stated later: see the end of the function.
+        def.left = i16(b, at);
+        moved = true;
         break;
-      }
       case 0x7621: {
         // sprmTInsert: new cells of one width at an index; what follows moves right. Rows of some writers are
         // made of these alone, a cell at a time, instead of a table definition.
@@ -424,15 +434,40 @@ export function readTap(ctx: PropContext, sprms: TableSprm[]): RowDef {
       case 0x941f:
         floating().bottomFromText = Math.max(0, i16(b, at));
         break;
+      case 0xf661: {
+        // sprmTWidthIndent
+        const width = tableWidth(b, at);
+        if (width && width.type === 'dxa') def.indent = width.value;
+        break;
+      }
       case 0x740a: // sprmTTlp: the "auto format" the table was made with
       case 0x7479: // sprmTRsid
-      case 0xf661: // sprmTWidthIndent: the edges say the same
         break;
       default:
         countUnknown(ctx, op);
     }
   }
   if (position) table.floating = position;
+  const edges = def.edges;
+  if (!defined && edges.length >= 2) {
+    // A row made of inserted cells: writers that build rows this way give every insert the width of the whole
+    // table and state the width of each cell on its own (sprmTCellWidth). Where a cell states its width in twips,
+    // that is its width; the width of the insert stands for the cells that state none.
+    let at = edges[0];
+    for (let i = 0; i + 1 < edges.length; i++) {
+      const stated = i < cells.length ? cells[i].props.width : undefined;
+      const width = stated && stated.type === 'dxa' && stated.value > 0 ? stated.value : edges[i + 1] - edges[i];
+      edges[i] = at;
+      at += width;
+    }
+    edges[edges.length - 1] = at;
+  }
+  if (moved && def.left !== undefined) {
+    // The first edge is half a gap to the left of where the text starts, whatever order the sprms came in.
+    if (!edges.length) edges.push(0);
+    const shift = def.left - (def.gapHalf || 0) - edges[0];
+    for (let i = 0; i < edges.length; i++) edges[i] += shift;
+  }
   return def;
 }
 
@@ -487,11 +522,18 @@ function buildTable(pending: PendingRow[], styleMargin: StyleMargin): Table {
   const margins = marginsOf(first);
   if (margins) props.cellMargins = margins;
   if (lines.length) {
-    // The model measures the indent to the text of the first cell, as documents of this age do: the edge plus the
-    // left cell margin in effect, which is the row's own, that of the table style, or what Word assumes (0.075 inch).
-    let left = margins && margins.left && margins.left.type === 'dxa' ? margins.left.value : undefined;
-    if (left === undefined) left = styleMargin(props.style);
-    props.indent = { type: 'dxa', value: lines[0] + (left === undefined ? 108 : left) };
+    // The model measures the indent to the text of the first cell, as documents of this age do. The first row
+    // states it (sprmTWidthIndent, or sprmTDxaLeft, which Word writes with the same value); a row that states
+    // neither has it at its edge plus the left cell margin in effect, which is the row's own, that of the table
+    // style, or what Word assumes (0.075 inch). A row further left than the first moves the indent with it.
+    const stated = first.indent !== undefined ? first.indent : first.left;
+    const firstEdges = edgesOf.get(first);
+    if (stated !== undefined && firstEdges && firstEdges.length) props.indent = { type: 'dxa', value: lines[0] + (stated - firstEdges[0]) };
+    else {
+      let left = margins && margins.left && margins.left.type === 'dxa' ? margins.left.value : undefined;
+      if (left === undefined) left = styleMargin(props.style);
+      props.indent = { type: 'dxa', value: lines[0] + (left === undefined ? 108 : left) };
+    }
   }
   const key = tableKey(props);
 
@@ -572,9 +614,11 @@ export class BlockAssembler {
   private readonly levels: Level[] = [];
   private readonly defs = new WeakMap<ParaInfo, RowDef>();
 
+  /** `onTable` is called with every table when it is complete, the tables in its cells before it. */
   constructor(
     private readonly ctx: PropContext,
     private readonly styleMargin: StyleMargin = () => undefined,
+    private readonly onTable?: (table: Table) => void,
   ) {}
 
   /** `endChar` is the character that ends the paragraph: a cell mark (7) ends a cell of an outermost table. */
@@ -616,6 +660,7 @@ export class BlockAssembler {
     if (level.cells.length) level.rows.push({ def: EMPTY_DEF, cells: level.cells });
     if (!level.rows.length) return;
     const table = buildTable(level.rows, this.styleMargin);
+    if (this.onTable) this.onTable(table);
     const outer = this.levels.length ? this.levels[this.levels.length - 1].current : this.blocks;
     outer.push(table);
   }

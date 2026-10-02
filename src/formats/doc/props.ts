@@ -437,9 +437,19 @@ export interface ParaInfo {
   innerCell: boolean;
   innerRowEnd: boolean;
   table: TableSprm[];
+  /**
+   * The alignment is a side of the page (sprmPJc80 alone) and the list does not say which way the
+   * paragraph runs: in a right-to-left paragraph, which only its style can make it, left and right
+   * change places.
+   */
+  physicalAlign?: boolean;
 }
 
 interface ParaBuild extends ParaInfo {
+  /** sprmPJc80: the alignment as a side of the page. */
+  jc80?: number;
+  /** sprmPJc: the alignment as the model has it, "left" being the side a paragraph starts at. */
+  jc?: number;
   itap: number;
   /** Property lists in the Data stream that were followed for this paragraph. */
   followed: number;
@@ -533,11 +543,11 @@ function applyPara(ctx: PropContext, state: ParaBuild, b: Uint8Array, op: number
       return;
     }
     case 0x2403:
-    case 0x2461: {
-      const name = ALIGNMENTS[u8(b, at)];
-      if (name !== undefined) props.align = name;
+      state.jc80 = u8(b, at);
       return;
-    }
+    case 0x2461:
+      state.jc = u8(b, at);
+      return;
     case 0x840f:
     case 0x845e:
       indentOf(props).left = i16(b, at);
@@ -658,6 +668,8 @@ function applyPara(ctx: PropContext, state: ParaBuild, b: Uint8Array, op: number
         state.props = {};
         state.table = [];
         delete state.frame;
+        delete state.jc80;
+        delete state.jc;
       }
       paraSprms(ctx, state, ctx.data, offset + 2, offset + 2 + size, depth + 1, inStyle);
       return;
@@ -751,12 +763,25 @@ export function paraProps(ctx: PropContext, istd: number, lists: [Uint8Array, nu
   const state: ParaBuild = { props: {}, istd, inTable: false, rowEnd: false, depth: 0, innerCell: false, innerRowEnd: false, table: [], itap: 0, followed: 0 };
   for (const [b, start, end] of lists) paraSprms(ctx, state, b, start, end, 0, inStyle);
   if (state.frame) state.props.frame = state.frame;
+  // Word 2000 and later state the alignment twice: as a side of the page (sprmPJc80) and as the model has it
+  // (sprmPJc), where "left" is the side the paragraph starts at. The second is taken as it is. The first alone
+  // (Word 97) names a side: in a right-to-left paragraph the sides change places.
+  let physicalAlign = false;
+  const logical = state.jc === undefined ? undefined : ALIGNMENTS[state.jc];
+  if (logical !== undefined) state.props.align = logical;
+  else {
+    const side = state.jc80 === undefined ? undefined : ALIGNMENTS[state.jc80];
+    if (side !== undefined) {
+      state.props.align = state.props.bidi === true ? mirrored(side) : side;
+      physicalAlign = state.props.bidi === undefined && (side === 'left' || side === 'right');
+    }
+  }
   // Word 97 knows no depth: a paragraph is in a table or not.
   let depth = state.itap;
   if (state.inTable && depth === 0) depth = 1;
   if (!state.inTable && !inStyle) depth = 0;
   if (depth > MAX_TABLE_DEPTH) depth = MAX_TABLE_DEPTH;
-  return {
+  const info: ParaInfo = {
     props: state.props,
     istd: state.istd,
     inTable: state.inTable,
@@ -766,7 +791,12 @@ export function paraProps(ctx: PropContext, istd: number, lists: [Uint8Array, nu
     innerRowEnd: state.innerRowEnd,
     table: state.table,
   };
+  if (physicalAlign) info.physicalAlign = true;
+  return info;
 }
+
+/** The other side of the page for "left" and "right"; every other alignment is the same either way. */
+export const mirrored = (align: string): string => (align === 'left' ? 'right' : align === 'right' ? 'left' : align);
 
 // ------------------------------------------------------------------- sections
 

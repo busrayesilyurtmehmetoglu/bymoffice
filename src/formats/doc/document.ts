@@ -33,6 +33,7 @@ import type { CfbFile } from '../../cfb';
 import {
   EMPTY_PARA_PROPS,
   EMPTY_RUN_PROPS,
+  TOGGLE_RUN_PROPS,
   defaultSettings,
   emptyTheme,
   type Block,
@@ -52,9 +53,11 @@ import {
   type SectionProps,
   type Story,
   type StoryCollection,
+  type StyleType,
+  type Table,
   type Wrapper,
 } from '../../model/doc/types';
-import { resolveRunProps, styleChain } from '../docx/resolve';
+import { styleChain } from '../docx/resolve';
 import { bytesKey, invalid, readPlc, readSttb, u16, u32, u8, utf16, type Plc } from './bytes';
 import { MediaStore, floatingDrawing, inlinePicture, readDrawings, type Drawings } from './drawings';
 import { FC, readFib, type Fib } from './fib';
@@ -62,7 +65,7 @@ import { linkDocFields } from './fields';
 import { readChpxTable, readPapxTable, type RunTable } from './fkp';
 import { readNumbering } from './lists';
 import { readPieceTable, type Piece, type PieceTable } from './piece-table';
-import { HEADER_ORDER, charProps, paraProps, sectionProps, type CharProps, type ParaInfo, type PropContext } from './props';
+import { HEADER_ORDER, charProps, mirrored, paraProps, sectionProps, type CharProps, type ParaInfo, type PropContext } from './props';
 import { finishStyles, readFonts, readStyleSheet, type StyleSheet } from './styles';
 import { BlockAssembler } from './tables';
 
@@ -104,6 +107,11 @@ export interface ReadDocOptions {
 const MAX_BOX_DEPTH = 4;
 
 type StoryKind = 'main' | 'footnote' | 'endnote' | 'comment' | 'header' | 'textbox';
+
+/** What a level of styles says about a toggle: on, off, or the opposite of the levels below (character styles only). */
+type ToggleState = 'on' | 'off' | 'flip';
+type ToggleKey = (typeof TOGGLE_RUN_PROPS)[number];
+type ToggleLevel = Map<ToggleKey, ToggleState>;
 
 /** Something that sits between two characters: a bookmark end, a note with a mark of its own. */
 interface Mark {
@@ -169,6 +177,10 @@ class DocReader {
   private readonly charCache = new Map<number, CharProps>();
   private readonly charByKey = new Map<string, CharProps>();
   private readonly inverted = new WeakMap<CharProps, Map<string, RunProps>>();
+  /** What the reader made each set of run properties of the model from, to make them again inside a table with a style. */
+  private readonly runSource = new WeakMap<RunProps, CharProps>();
+  private readonly toggleLevels = new Map<string, ToggleLevel | null>();
+  private readonly tableParas = new WeakMap<ParaProps, Map<string, ParaProps>>();
 
   /** Character positions that end a section (all but the last section), in order, and whether a position is one. */
   private readonly sectionEnds: number[] = [];
@@ -181,8 +193,8 @@ class DocReader {
   private marks: Mark[] = [];
   /** Text boxes of the main text and of the headers: the list of their texts and the index of each by the id of its shape. */
   private readonly boxes: { plc: Plc; start: number; byShape: Map<number, number> }[] = [];
-  private readonly boxesOpen = new Set<string>();
-  private readonly boxesRead = new Map<string, Block[]>();
+  /** Texts of text boxes that a shape has been given: each is read once and belongs to that shape alone. */
+  private readonly boxesTaken = new Set<string>();
   private paragraphs = 0;
   /** Bytes of piece modifiers that may still be read (see modifierOf). */
   private modifierBudget = 64 * 1024 * 1024;
@@ -303,6 +315,12 @@ class DocReader {
       }
       info = paraProps(this.ctx, istd, lists);
       const style = this.sheet.ids[info.istd];
+      if (info.physicalAlign && info.props.align !== undefined) {
+        // The alignment names a side of the page, and whether the paragraph runs from the right is up to its style.
+        let bidi = false;
+        for (const entry of styleChain(this.sheet.styles, style, 'paragraph')) if (entry.para && entry.para.bidi !== undefined) bidi = entry.para.bidi;
+        if (bidi) info.props.align = mirrored(info.props.align);
+      }
       // A paragraph of the default style states no style, as in a docx file.
       if (style !== undefined && style !== this.sheet.styles.defaultIds.paragraph) info.props.style = style;
       if (!Object.keys(info.props).length) info.props = EMPTY_PARA_PROPS;
@@ -353,22 +371,116 @@ class DocReader {
     return info;
   }
 
-  /** The run properties for the model: toggles stated as "the opposite of the style" worked out for the styles in effect. */
-  private runProps(info: CharProps, para: ParaProps): RunProps {
-    if (!info.invert) return info.props;
-    const style = para.style === undefined ? '' : para.style;
-    let byStyle = this.inverted.get(info);
-    if (!byStyle) this.inverted.set(info, (byStyle = new Map()));
-    let props = byStyle.get(style);
-    if (!props) {
-      const base: RunProps = info.props.style === undefined ? {} : { style: info.props.style };
-      const effective = resolveRunProps(this.model, para, base);
-      props = { ...info.props };
-      for (const name of info.invert) props[name] = !effective[name];
-      byStyle.set(style, props);
+  /**
+   * What the styles of one level say about the toggles (bold, italic, ...): the style and those it is based
+   * on, a derived style over its base. Undefined when they say nothing.
+   */
+  private toggleLevel(type: StyleType, id: string | undefined): ToggleLevel | undefined {
+    const key = type + '\u0001' + (id === undefined ? '' : id);
+    let level = this.toggleLevels.get(key);
+    if (level === undefined) {
+      const found: ToggleLevel = new Map();
+      const flips = this.sheet.flips;
+      for (const style of styleChain(this.sheet.styles, id, type)) {
+        const run = style.run;
+        if (!run) continue;
+        const flipped = flips ? flips.get(style.id) : undefined;
+        for (const name of TOGGLE_RUN_PROPS) {
+          const value = run[name];
+          if (value !== undefined) found.set(name, flipped && flipped.indexOf(name) >= 0 ? 'flip' : value ? 'on' : 'off');
+        }
+      }
+      level = found.size ? found : null;
+      this.toggleLevels.set(key, level);
     }
+    return level === null ? undefined : level;
+  }
+
+  /**
+   * The run properties for the model.
+   *
+   * A toggle (bold, italic, ...) works differently in this format than in the model. Here a
+   * style states it as on or off, and the innermost statement holds: the character style
+   * over the paragraph style over the table style. Only "the opposite" (operand 0x81) looks
+   * at what is below. The model follows docx, where "on" in a style flips what the levels
+   * below say, and only the run's own formatting is absolute. So where the two rules give
+   * different answers for the styles of a run, and for every toggle the run itself states
+   * as "the opposite of the style", the value this format gives is written into the run's
+   * own formatting, which holds whatever the styles say.
+   *
+   * `tableStyle` is given for a run in a table: the id of the style of the table, null when
+   * the table names none.
+   */
+  private runProps(info: CharProps, para: ParaProps, tableStyle?: string | null): RunProps {
+    const table = tableStyle === undefined ? undefined : this.toggleLevel('table', tableStyle === null ? undefined : tableStyle);
+    const paragraph = this.toggleLevel('paragraph', para.style);
+    const character = this.toggleLevel('character', info.props.style);
+    let props = info.props;
+    // One level of styles at most and nothing relative: both rules agree.
+    if (info.invert || (table ? 1 : 0) + (paragraph ? 1 : 0) + (character ? 1 : 0) > 1) {
+      const key = (para.style === undefined ? '' : para.style) + '\u0001' + (tableStyle === undefined ? '' : tableStyle === null ? '\u0002' : '\u0003' + tableStyle);
+      let byStyle = this.inverted.get(info);
+      if (!byStyle) this.inverted.set(info, (byStyle = new Map()));
+      const known = byStyle.get(key);
+      if (known) props = known;
+      else {
+        let changed: RunProps | undefined;
+        for (const name of TOGGLE_RUN_PROPS) {
+          const inverted = info.invert !== undefined && (info.invert as string[]).indexOf(name) >= 0;
+          if (!inverted && info.props[name] !== undefined) continue;
+          const t = table && table.get(name);
+          const p = paragraph && paragraph.get(name);
+          const c = character && character.get(name);
+          // This format: the innermost statement holds.
+          let styled = false;
+          if (t) styled = t === 'on';
+          if (p) styled = p === 'on';
+          if (c) styled = c === 'flip' ? !styled : c === 'on';
+          // The model: every "on" flips.
+          const flipped = (t === 'on') !== (p === 'on') !== (c === 'on' || c === 'flip');
+          if (inverted) (changed || (changed = { ...info.props }))[name] = !styled;
+          else if (styled !== flipped) (changed || (changed = { ...info.props }))[name] = styled;
+        }
+        if (changed) props = changed;
+        byStyle.set(key, props);
+      }
+    }
+    this.runSource.set(props, info);
     return props;
   }
+
+  /**
+   * A table with a style whose text has toggles: its runs were read before the table was known, so
+   * their properties are made again with the style. Tables inside its cells have had their turn.
+   */
+  private readonly restyleTable = (table: Table): void => {
+    const style = table.props.style === undefined ? null : table.props.style;
+    if (!this.toggleLevel('table', style === null ? undefined : style)) return;
+    const key = style === null ? '\u0002' : '\u0003' + style;
+    for (const row of table.rows) {
+      for (const cell of row.cells) {
+        for (const block of cell.blocks) {
+          if (block.type !== 'paragraph') continue;
+          for (const inline of block.children) {
+            if (inline.type !== 'run') continue;
+            const source = this.runSource.get(inline.props);
+            if (source) inline.props = this.runProps(source, block.props, style);
+          }
+          const mark = block.props.markProps;
+          const source = mark ? this.runSource.get(mark) : undefined;
+          if (!mark || !source) continue;
+          const again = this.runProps(source, block.props, style);
+          if (again === mark) continue;
+          // Paragraph properties are shared between paragraphs: a changed copy is shared the same way.
+          let byKey = this.tableParas.get(block.props);
+          if (!byKey) this.tableParas.set(block.props, (byKey = new Map()));
+          let changed = byKey.get(key);
+          if (!changed) byKey.set(key, (changed = { ...block.props, markProps: again }));
+          block.props = changed;
+        }
+      }
+    }
+  };
 
   private finalPara(info: ParaInfo, mark: RunProps, section: SectionProps | undefined): ParaProps {
     let props = info.props;
@@ -390,7 +502,7 @@ class DocReader {
    */
   private blocks(from: number, to: number, kind: StoryKind, depth: number): Block[] {
     const text = this.text;
-    const assembler = new BlockAssembler(this.ctx, this.styleMargin);
+    const assembler = new BlockAssembler(this.ctx, this.styleMargin, this.restyleTable);
     const main = kind === 'main';
     // The marks of this stretch of text, in order.
     const marks = this.marks;
@@ -622,7 +734,17 @@ class DocReader {
     this.unknown.set(key, (this.unknown.get(key) || 0) + 1);
   }
 
-  /** The text of the text box of a shape; undefined when the shape has none. */
+  /**
+   * The text of the text box of a shape; undefined when the shape has none.
+   *
+   * In a genuine file the text of a box belongs to one shape. Here it goes to
+   * the first shape that asks for it and to no other, whatever the depth: a
+   * second shape that names the same text gets none, and so does a shape
+   * inside the text it is the box of (which would never end). Every text is
+   * therefore read once at most, and the texts do not overlap (the list of
+   * them is read in order), so all boxes together hold no more than the text
+   * of the file that is set aside for them.
+   */
   private boxText(set: number, shapeId: number, textId: number, depth: number): Block[] | undefined {
     const boxes = this.boxes[set];
     if (!boxes || depth >= MAX_BOX_DEPTH) return undefined;
@@ -630,24 +752,14 @@ class DocReader {
     if (index === undefined && textId > 0 && textId <= boxes.plc.count) index = textId - 1;
     if (index === undefined) return undefined;
     const key = set + ':' + index;
-    // A text box whose text holds the shape it belongs to would never end.
-    if (this.boxesOpen.has(key)) return undefined;
-    // Shapes that share a text share its blocks: it is read once.
-    if (this.boxesRead.has(key)) return this.boxesRead.get(key);
+    if (this.boxesTaken.has(key)) return undefined;
     const limit = this.starts[set === 0 ? 7 : 8];
     const from = Math.min(limit, boxes.start + boxes.plc.cps[index]);
     // The last character of the text of a box is a paragraph mark that separates it from the next one.
     const to = Math.min(limit, boxes.start + boxes.plc.cps[index + 1]) - 1;
     if (to <= from) return undefined;
-    this.boxesOpen.add(key);
-    try {
-      const blocks = this.blocks(from, to, 'textbox', depth + 1);
-      // Read at the outermost level it is complete; deeper down the boxes inside it may have been left out.
-      if (depth === 0) this.boxesRead.set(key, blocks);
-      return blocks;
-    } finally {
-      this.boxesOpen.delete(key);
-    }
+    this.boxesTaken.add(key);
+    return this.blocks(from, to, 'textbox', depth + 1);
   }
 
   // ------------------------------------------------------------------- lookups

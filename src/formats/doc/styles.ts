@@ -146,6 +146,12 @@ export interface StyleSheet {
   byId: Map<string, number>;
   /** Fonts the file names as its defaults: for Latin text, East Asian text, other text and complex scripts. */
   defaultFonts: [ascii: number, eastAsia: number, other: number, complex: number | undefined] | undefined;
+  /**
+   * Character styles that state a toggle as "the opposite of what is below" (operand 0x81), by style id. In the
+   * model such a toggle is `true`, which is what a docx file means by it; every other toggle of a character
+   * style is absolute in this format (see DocReader.runProps).
+   */
+  flips?: Map<string, ToggleName[]>;
 }
 
 function makeId(sti: number, name: string, istd: number, used: Set<string>): string {
@@ -289,8 +295,12 @@ export function finishStyles(ctx: PropContext, table: Uint8Array, sheet: StyleSh
       const info = charProps(ctx, [run]);
       // A style does not name another style for its text.
       delete info.props.style;
+      if (info.invert && style.type === 'character') {
+        // The opposite of what the paragraph has: what `true` says in a character style of the model.
+        for (const name of info.invert) info.props[name] = true;
+        (sheet.flips || (sheet.flips = new Map())).set(style.id, info.invert);
+      } else if (info.invert) entry.invert = info.invert;
       if (Object.keys(info.props).length) style.run = info.props;
-      if (info.invert) entry.invert = info.invert;
     }
     if (tap && tap[2] > tap[1]) {
       const sprms: { op: number; b: Uint8Array; at: number; length: number }[] = [];

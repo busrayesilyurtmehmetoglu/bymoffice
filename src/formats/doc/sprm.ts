@@ -284,24 +284,75 @@ export function shd(b: Uint8Array, o: number): Shading | undefined {
   return makeShading(pattern, colorRef(b, o), colorRef(b, o + 4));
 }
 
-/** Number formats by MSONFC (MS-OSHARED 2.2.1.3), as the names of ST_NumberFormat. */
-const NUMBER_FORMATS: Record<number, string> = {
-  0: 'decimal',
-  1: 'upperRoman',
-  2: 'lowerRoman',
-  3: 'upperLetter',
-  4: 'lowerLetter',
-  5: 'ordinal',
-  6: 'cardinalText',
-  7: 'ordinalText',
-  8: 'hex',
-  9: 'chicago',
-  22: 'decimalZero',
-  23: 'bullet',
-  0xff: 'none',
-};
+/**
+ * Number formats by MSONFC (MS-OSHARED 2.2.1.3), as the names of ST_NumberFormat: 0 to 59 in the
+ * order of the enumeration. 40 (a fourth Chinese format) has no name there.
+ */
+const NUMBER_FORMATS: readonly (string | undefined)[] = [
+  'decimal',
+  'upperRoman',
+  'lowerRoman',
+  'upperLetter',
+  'lowerLetter',
+  'ordinal',
+  'cardinalText',
+  'ordinalText',
+  'hex',
+  'chicago',
+  'ideographDigital',
+  'japaneseCounting',
+  'aiueo',
+  'iroha',
+  'decimalFullWidth',
+  'decimalHalfWidth',
+  'japaneseLegal',
+  'japaneseDigitalTenThousand',
+  'decimalEnclosedCircle',
+  'decimalFullWidth2',
+  'aiueoFullWidth',
+  'irohaFullWidth',
+  'decimalZero',
+  'bullet',
+  'ganada',
+  'chosung',
+  'decimalEnclosedFullstop',
+  'decimalEnclosedParen',
+  'decimalEnclosedCircleChinese',
+  'ideographEnclosedCircle',
+  'ideographTraditional',
+  'ideographZodiac',
+  'ideographZodiacTraditional',
+  'taiwaneseCounting',
+  'ideographLegalTraditional',
+  'taiwaneseCountingThousand',
+  'taiwaneseDigital',
+  'chineseCounting',
+  'chineseLegalSimplified',
+  'chineseCountingThousand',
+  undefined,
+  'koreanDigital',
+  'koreanCounting',
+  'koreanLegal',
+  'koreanDigital2',
+  'hebrew1',
+  'arabicAlpha',
+  'hebrew2',
+  'arabicAbjad',
+  'hindiVowels',
+  'hindiConsonants',
+  'hindiNumbers',
+  'hindiCounting',
+  'thaiLetters',
+  'thaiNumbers',
+  'thaiCounting',
+  'vietnameseCounting',
+  'numberInDash',
+  'russianLower',
+  'russianUpper',
+];
 
-export const numberFormat = (nfc: number): string => NUMBER_FORMATS[nfc] || 'decimal';
+/** The number format for an MSONFC value; "none" for 255, "decimal" for a value without a name. */
+export const numberFormat = (nfc: number): string => (nfc === 0xff ? 'none' : NUMBER_FORMATS[nfc] || 'decimal');
 
 /** Language tags for the language ids documents of this kind carry most; others are written as "x-lcid-<hex>". */
 const LANGUAGES: Record<number, string> = {

@@ -42,6 +42,11 @@ export const MAX_PAGES = 100000;
 export const MAX_PARAGRAPH_LINES = 200000;
 /** Depth of tables in tables and boxes in boxes that is laid out; deeper content is skipped. */
 export const MAX_LAYOUT_DEPTH = 70;
+/**
+ * What laying out the text of text boxes may cost in one document (see DocLayoutOptions.maxTextBoxWork):
+ * a file can name the same text for many boxes, or put a box in the header of thousands of pages.
+ */
+export const MAX_TEXT_BOX_WORK = 4000000;
 /** Narrowest gap beside a wrapped drawing that text is put in, px (Word uses about an inch). */
 export const MIN_WRAP_WIDTH = 96;
 

@@ -82,6 +82,8 @@ export class RecordReader {
   private segment = 0;
   private pos: number;
   private end: number;
+  /** Bytes in the records after the current one: added up once, so that asking what is left costs nothing. */
+  private after = 0;
 
   /** `segments` holds the start and the end offset of each run of bytes, in reading order. */
   constructor(
@@ -90,6 +92,7 @@ export class RecordReader {
   ) {
     this.pos = segments[0];
     this.end = segments[1];
+    for (let i = 2; i < segments.length; i += 2) this.after += segments[i + 1] - segments[i];
   }
 
   /** Bytes left in the current record, not counting the records that continue it. */
@@ -99,18 +102,12 @@ export class RecordReader {
 
   /** Nothing is left, in this record or in the ones that continue it. */
   get done(): boolean {
-    if (this.pos < this.end) return false;
-    for (let i = (this.segment + 1) * 2; i < this.segments.length; i += 2) {
-      if (this.segments[i + 1] > this.segments[i]) return false;
-    }
-    return true;
+    return this.pos >= this.end && this.after === 0;
   }
 
   /** Bytes left in all records together. */
   get remaining(): number {
-    let total = this.end - this.pos;
-    for (let i = (this.segment + 1) * 2; i < this.segments.length; i += 2) total += this.segments[i + 1] - this.segments[i];
-    return total;
+    return this.end - this.pos + this.after;
   }
 
   /** Moves to the next record that has content; false when there is none. */
@@ -119,6 +116,7 @@ export class RecordReader {
       this.segment++;
       this.pos = this.segments[this.segment * 2];
       this.end = this.segments[this.segment * 2 + 1];
+      this.after -= this.end - this.pos;
       if (this.end > this.pos) return true;
     }
     return false;

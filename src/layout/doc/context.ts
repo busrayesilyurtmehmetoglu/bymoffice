@@ -224,6 +224,12 @@ export class LayoutContext {
   grid: number | undefined;
   /** Set by blocks.ts: lays out a list of blocks. A property to break the import cycle. */
   layoutBlocks!: LayoutBlocksFn;
+  /** Text boxes: the drawing the text of a box was first laid out for; no other drawing shows it. */
+  readonly boxOwners = new WeakMap<Block[], object>();
+  /** What the text of a box costs to lay out, counted once. */
+  readonly boxWeights = new WeakMap<Block[], number>();
+  /** What laying out text boxes has cost so far (see DocLayoutOptions.maxTextBoxWork). */
+  boxWork = 0;
 
   private fonts = new Map<string, FontEntry>();
   private byFont = new Map<LayoutFont, FontEntry>();

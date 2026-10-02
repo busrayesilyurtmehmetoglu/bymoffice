@@ -153,6 +153,12 @@ export interface DocLayoutOptions {
   fallbackFamily?: string;
   /** Pages laid out before `layout` stops with `done: false`; no limit when missing. */
   maxPages?: number;
+  /**
+   * What laying out the text of text boxes may cost in one document, in characters (a paragraph
+   * or a table row counts as 16 more); 4,000,000 when missing. Boxes that come after the limit
+   * is reached are drawn empty. A host with little memory may lower it.
+   */
+  maxTextBoxWork?: number;
 }
 
 /** How much one call of DocLayout.layout() may do; without a budget it runs to the end. */
