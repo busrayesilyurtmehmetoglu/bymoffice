@@ -235,7 +235,7 @@ function selectBranch(ctx: PartContext, el: XmlElement): { selected: 'choice' | 
  * entering matches. Of an <mc:AlternateContent> on the way only the selected
  * branch is searched, as everywhere else in the reader. Bounded in depth.
  */
-function findSelected(ctx: PartContext, el: XmlElement, local: string, out: XmlElement[] = [], depth = 0): XmlElement[] {
+export function findSelected(ctx: PartContext, el: XmlElement, local: string, out: XmlElement[] = [], depth = 0): XmlElement[] {
   if (depth > MAX_XML_DEPTH) throw new Error(`Invalid docx: XML is nested deeper than ${MAX_XML_DEPTH} levels`);
   for (const node of el.children) {
     if (node.type !== 'element') continue;

@@ -29,6 +29,7 @@ function* walk(dir: string): Generator<string> {
 
 let sheets = 0;
 let cells = 0;
+let convertedFiles = 0;
 let rtfFiles = 0;
 let rtfBlocks = 0;
 let docFiles = 0;
@@ -168,6 +169,15 @@ async function checkOoxml(file: OfficeFile, original: Uint8Array): Promise<void>
   if (!isDeepStrictEqual(await rewritten.readXml(main), before)) throw new Error('main part changed after rewrite');
 }
 
+/** Every tenth old document is written out as a docx, which must open and hold as many blocks. */
+async function checkConversion(file: OfficeFile, blocks: number): Promise<void> {
+  const converted = await open(await file.saveAsDocx!());
+  if (converted.format !== 'docx') throw new Error('the converted file is not a docx');
+  const again = await converted.document!();
+  if (again.body.blocks.length !== blocks) throw new Error(`converted to docx: ${again.body.blocks.length} blocks instead of ${blocks}`);
+  convertedFiles++;
+}
+
 function checkCfb(file: OfficeFile): void {
   for (const entry of file.cfb!.entries) {
     if (entry.type !== 'stream') continue;
@@ -237,7 +247,11 @@ for (const root of roots) {
         rtfFiles++;
         rtfBlocks += model.body.blocks.length;
         if (!isDeepStrictEqual(await file.save(), bytes)) throw new Error('saved bytes differ from the file');
-      } else checkCfb(file);
+        if (rtfFiles % 10 === 0) await checkConversion(file, model.body.blocks.length);
+      } else {
+        checkCfb(file);
+        if (file.format === 'doc' && docFiles % 10 === 0) await checkConversion(file, (await file.document!()).body.blocks.length);
+      }
       passed[file.format] = (passed[file.format] ?? 0) + 1;
     } catch (error) {
       if (error instanceof UnsupportedFileError) unsupported++;
@@ -248,6 +262,7 @@ for (const root of roots) {
 
 const total = Object.values(passed).reduce((sum, n) => sum + n, 0);
 console.log(`passed: ${total}`, passed);
+console.log(`converted to docx and read back: ${convertedFiles}`);
 console.log(`rtf model: ${rtfFiles} documents, ${rtfBlocks} blocks`);
 console.log(`doc model: ${docFiles} documents, ${docBlocksBinary} blocks`);
 console.log(`xls model: ${xlsBooks} workbooks, ${xlsSheets} sheets, ${xlsCells} cells`);

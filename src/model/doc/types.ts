@@ -1087,6 +1087,8 @@ export interface NumInstance {
 export interface Numbering {
   abstracts: Map<number, AbstractNum>;
   nums: Map<number, NumInstance>;
+  /** An edit added definitions or instances (lists made in the editor): the numbering part has to be written. */
+  modified?: boolean;
 }
 
 export interface ThemeFont {

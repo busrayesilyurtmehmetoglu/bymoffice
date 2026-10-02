@@ -2,6 +2,7 @@ import { CfbFile } from './cfb';
 import { readDoc } from './formats/doc/document';
 import { readRtf } from './formats/rtf/document';
 import { readDocx } from './formats/docx/document';
+import { buildDocx, writeDocx } from './formats/docx/write';
 import { documentPictures } from './model/doc/pictures';
 import type { DocModel } from './model/doc/types';
 import { readXls } from './formats/xls/workbook';
@@ -22,6 +23,8 @@ export * from './model/sheet/color';
 export { readXlsx } from './formats/xlsx/workbook';
 export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
 export { readDocx } from './formats/docx/document';
+export { buildDocx, writeDocx, type DocxWriteReport } from './formats/docx/write';
+export * as docOps from './ops/doc/index';
 export { readDoc } from './formats/doc/document';
 export { readRtf } from './formats/rtf/document';
 export { documentPictures } from './model/doc/pictures';
@@ -87,6 +90,12 @@ export interface OfficeFile {
    */
   document?(): Promise<DocModel>;
   /**
+   * The document as a docx file. For a docx this is save(); for doc and RTF,
+   * which cannot be written, the model is written out as a new docx (shapes
+   * lose their geometry, theme colours become plain ones).
+   */
+  saveAsDocx?(): Promise<Uint8Array>;
+  /**
    * The file as bytes. For xlsx, changes made to the model are written into
    * it; everything that was not changed keeps its original bytes.
    */
@@ -126,7 +135,16 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
     const base = { container: 'ooxml' as const, package: pkg, save: () => pkg.save() };
     if (/wordprocessingml|ms-word/.test(contentType)) {
       let model: Promise<DocModel> | undefined;
-      return { format: 'docx', kind: 'document', ...base, workbook: notASpreadsheet, document: () => (model ??= readDocx(pkg)) };
+      // Saving writes the edited stories of the model into the package first; a model that
+      // was never read, or read and not changed, leaves the package as it is.
+      const save = async () => {
+        if (model) {
+          const doc = await model.catch(() => undefined);
+          if (doc) await writeDocx(pkg, doc);
+        }
+        return pkg.save();
+      };
+      return { format: 'docx', kind: 'document', ...base, save, workbook: notASpreadsheet, document: () => (model ??= readDocx(pkg)), saveAsDocx: save };
     }
     if (/spreadsheetml|ms-excel/.test(contentType)) {
       let workbook: Promise<Workbook> | undefined;
@@ -160,7 +178,7 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
             throw error;
           }
         }));
-      return { format: 'doc', kind: 'document', ...base, workbook: notASpreadsheet, document };
+      return { format: 'doc', kind: 'document', ...base, workbook: notASpreadsheet, document, saveAsDocx: async () => buildDocx(await document()) };
     }
     if (cfb.has('Workbook') || cfb.has('Book')) {
       let model: Promise<Workbook> | undefined;
@@ -191,6 +209,7 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
       save: async () => bytes,
       workbook: notASpreadsheet,
       document: () => (model ??= Promise.resolve().then(() => readRtf(bytes))),
+      saveAsDocx: async () => buildDocx(await (model ??= Promise.resolve().then(() => readRtf(bytes)))),
     };
   }
 

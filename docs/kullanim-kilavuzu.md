@@ -240,7 +240,8 @@ for (const block of doc.body.blocks) {
 - Modelde hiçbir şey miras alınmaz; etkin biçimi `BymOffice.resolveParaProps(doc, props)` ve `BymOffice.resolveRunProps(doc, paraProps, runProps)` hesaplar. Liste sayaçları için `new BymOffice.NumberingCounters(...)`.
 - Köprü hedefini bağlamadan önce `BymOffice.safeHyperlinkTarget(target)` kullanın: yalnız `http(s)`, `mailto`, `tel` ve belge içi `#yerimi` geçer.
 - Anlaşılmayan öğeler modelde saklanır; her üst düzey bloğun özgün XML'i `BymOffice.rawOf(story, block)` ile alınır.
-- Model değiştirilip kaydedilemez; `file.save()` dosyayı olduğu gibi verir.
+- **Kaydetme:** docx'te `file.save()` modelde düzenlenen blokları dosyaya yazar; düzenlenmeyen bloklar ve parçalar bayt bayt korunur (`BymOffice.writeDocx(pkg, doc)`). doc ve RTF kendi biçimlerine yazılamaz; `file.saveAsDocx()` modeli yeni bir docx olarak verir (`BymOffice.buildDocx(doc)`). Dönüştürmede şekillerin geometrisi/dolgusu ve tema bilgisi taşınmaz; `javascript:` gibi güvensiz bağlantılar düz metne çevrilir. Üretilen dosyalar yeniden okunarak ve şema sırası denetlenerek sınandı; Microsoft Word'de açılarak sınanmadı.
+- **Düzenleme işlemleri** (`BymOffice.docOps`): `insertText`, `deleteRange`, `splitParagraph`, `setRunFormat`, `setParaFormat`, `toggleList`, `insertTable`, `insertImage`, `insertHyperlink`… her biri `DocEdit` döndürür; `docOps.applyDocOps(doc, edit.ops)` uygular, `docOps.DocHistory` geri al/yinele sağlar.
 
 ### Word belgesini gösterme (salt okunur)
 
