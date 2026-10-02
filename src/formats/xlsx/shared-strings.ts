@@ -29,7 +29,8 @@ function uint(text: string | undefined): number | undefined {
 
 function finite(text: string | undefined): number | undefined {
   // xsd:double as written in files; Number() alone would also take "0x10".
-  if (text === undefined || !/^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(text)) return undefined;
+  // Long text is refused first: on a long run of digits the expression backtracks for minutes.
+  if (text === undefined || text.length > 64 || !/^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(text)) return undefined;
   const value = Number(text);
   return isFinite(value) ? value : undefined;
 }

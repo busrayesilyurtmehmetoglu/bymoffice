@@ -224,6 +224,8 @@ function parseColor(content: string): string | undefined {
 }
 
 function parseCondition(content: string): Condition | null {
+  // No condition is this long, and on a long run of digits the expression below backtracks for minutes.
+  if (content.length > 64) return null;
   const match = /^(<=|>=|<>|<|>|=)\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)$/.exec(content);
   if (!match) return null;
   const value = Number(match[2]);

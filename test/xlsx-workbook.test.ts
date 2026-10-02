@@ -115,9 +115,19 @@ test('xlsx: broken workbooks are rejected with a clear error', async () => {
   assert.equal((await activeOutOfRange.workbook()).activeSheet, 0);
 });
 
-test('workbook(): xls and documents report that the model is not available', async () => {
+test('workbook(): an xls file whose stream is not a workbook is reported as damaged', async () => {
   const xls = await open(minimalCfb(new Uint8Array(9 * 512), new Uint8Array(10)));
-  await assert.rejects(xls.workbook(), UnsupportedFileError);
+  await assert.rejects(xls.workbook(), /Invalid xls/);
+});
+
+test('styles: a number attribute of a million digits is refused at once', async () => {
+  const started = Date.now();
+  const bytes = await buildXlsx({
+    sheets: [{ name: 'S', xml: worksheetXml('<sheetData/>') }],
+    styles: `<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><color theme="1" tint="${'1'.repeat(1000000)}x"/></font></fonts></styleSheet>`,
+  });
+  await (await open(bytes)).workbook();
+  assert.ok(Date.now() - started < 3000);
 });
 
 test('xlsx: a file whose model cannot be read is still saved as it was', async () => {

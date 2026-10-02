@@ -47,11 +47,49 @@ function parseUint(text: string | undefined): number {
   return value;
 }
 
-// xsd:double as files write it. Number() alone would also take "0x1F", "0b11" and "".
-const DECIMAL = /^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/;
+const isXmlSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 13;
+
+/**
+ * Whether the text is an xsd:double as files write it: an optional sign, digits with an
+ * optional point (at least one digit), an optional exponent, white space around. Number()
+ * alone would also take "0x1F", "0b11" and "". Read by hand, one pass: a regular
+ * expression for this backtracks quadratically over a long run of digits that ends in
+ * something else.
+ */
+function isDecimal(text: string): boolean {
+  const n = text.length;
+  let i = 0;
+  while (i < n && isXmlSpace(text.charCodeAt(i))) i++;
+  let c = text.charCodeAt(i);
+  if (c === 43 || c === 45) i++;
+  let digits = 0;
+  while (i < n && (c = text.charCodeAt(i)) >= 48 && c <= 57) {
+    i++;
+    digits++;
+  }
+  if (i < n && text.charCodeAt(i) === 46) {
+    i++;
+    while (i < n && (c = text.charCodeAt(i)) >= 48 && c <= 57) {
+      i++;
+      digits++;
+    }
+  }
+  if (digits === 0) return false;
+  c = text.charCodeAt(i);
+  if (c === 69 || c === 101) {
+    i++;
+    c = text.charCodeAt(i);
+    if (c === 43 || c === 45) i++;
+    const exponent = i;
+    while (i < n && (c = text.charCodeAt(i)) >= 48 && c <= 57) i++;
+    if (i === exponent) return false;
+  }
+  while (i < n && isXmlSpace(text.charCodeAt(i))) i++;
+  return i === n;
+}
 
 function parseFinite(text: string | undefined): number | undefined {
-  if (text === undefined || !DECIMAL.test(text)) return undefined;
+  if (text === undefined || !isDecimal(text)) return undefined;
   const value = Number(text);
   return isFinite(value) ? value : undefined;
 }
@@ -582,8 +620,11 @@ const percentAttr = (el: XmlElement, name: string, fallback: number): number => 
 /** Reads the properties only <x14:dataBar> states into `bar`. */
 function readDataBarExtension(el: XmlElement, bar: ConditionalDataBar): void {
   bar.extended = true;
-  bar.minLength = percentAttr(el, 'minLength', 0);
-  bar.maxLength = percentAttr(el, 'maxLength', 100);
+  // UNSURE: the schema of the extension gives the same defaults as the 2007 element, 10 and 90.
+  // Excel always writes both (0 and 100 for a bar made in 2010 or later), so the defaults only
+  // matter for files of other producers.
+  bar.minLength = percentAttr(el, 'minLength', 10);
+  bar.maxLength = percentAttr(el, 'maxLength', 90);
   bar.gradient = flagAttr(el, 'gradient', true);
   bar.negativeFillSameAsPositive = flagAttr(el, 'negativeBarColorSameAsPositive', false);
   bar.negativeBorderSameAsPositive = flagAttr(el, 'negativeBarBorderColorSameAsPositive', true);

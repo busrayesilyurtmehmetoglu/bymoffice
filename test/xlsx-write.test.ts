@@ -1997,3 +1997,53 @@ test('write: a styles part added to a strict workbook gets a strict relationship
   ok((await partText(saved, 'xl/_rels/workbook.xml.rels')).includes(`<Relationship Id="rId2" Type="${strict}/styles" Target="styles.xml"/>`));
   eq((await reopen(saved)).styles.cellXfs.length, doc.wb.styles.cellXfs.length);
 });
+
+// --- whole columns and rows in reference lists ---------------------------------------------
+
+test('write: whole columns and rows of rules and validations stay whole through structural edits', () => {
+  // A column inserted before a whole column moves it; "C" alone would not be a reference.
+  eq(adjusted(rule('B:B', 'B1&gt;0'), cols('insert', 0, 1)), rule('C:C', 'C1&gt;0'));
+  eq(adjusted(rule('$B:$B', 'B1&gt;0'), cols('insert', 0, 1)), rule('$C:$C', 'C1&gt;0'));
+  eq(adjusted(rule('3:3', 'A3&gt;0'), rows('insert', 0, 1)), rule('4:4', 'A4&gt;0'));
+  eq(adjusted(rule('D1:D4 B:B', 'D1&gt;0'), cols('insert', 0, 1)), rule('E1:E4 C:C', 'E1&gt;0'));
+  eq(adjusted(rule('B:B D1:D4', 'B1&gt;0'), cols('insert', 0, 1)), rule('C:C E1:E4', 'C1&gt;0'));
+  // Rows do not move a whole column, columns do not move a whole row; what is anchored still follows.
+  eq(adjusted(rule('B:B', 'B1&gt;$A$5'), rows('insert', 0, 1)), rule('B:B', 'B1&gt;$A$6'));
+  eq(adjusted(rule('B:B', 'B1&gt;0'), rows('delete', 0, 3)), rule('B:B', 'B1&gt;0'));
+  eq(adjusted(rule('D1:D4 B:B', 'D1&gt;0'), rows('insert', 0, 1)), rule('D2:D5 B:B', 'D2&gt;0'));
+  eq(adjusted(rule('3:3', 'A3&gt;$B$1'), cols('insert', 0, 2)), rule('3:3', 'A3&gt;$D$1'));
+  // The same column written as a range keeps that form.
+  eq(adjusted(rule('B1:B1048576', 'B1&gt;0'), cols('insert', 0, 1)), rule('C1:C1048576', 'C1&gt;0'));
+  eq(adjusted(rule('B1:B1048576', 'B1&gt;0'), rows('insert', 0, 1)), rule('B1:B1048576', 'B1&gt;0'));
+  eq(adjusted(rule('B1:B1048576', 'B1&gt;0'), rows('delete', 2, 4)), rule('B1:B1048576', 'B1&gt;0'));
+  eq(adjusted(rule('A3:XFD3', 'A3&gt;0'), cols('insert', 0, 1)), rule('A3:XFD3', 'A3&gt;0'));
+  // Deleting: a span shrinks, a range that is gone leaves the list, the last one takes the element along.
+  eq(adjusted(rule('B:C', 'B1&gt;0'), cols('delete', 1, 1)), rule('B:B', 'B1&gt;0'));
+  eq(adjusted(rule('2:3', 'A2&gt;0'), rows('delete', 1, 1)), rule('2:2', 'A2&gt;0'));
+  eq(adjusted(rule('B:B D1:D3', 'B1&gt;0'), cols('delete', 1, 1)), rule('C1:C3', 'C1&gt;0'));
+  eq(adjusted(rule('B:B', 'B1&gt;0'), cols('delete', 1, 1)), '');
+  eq(adjusted(rule('3:3', 'A3&gt;0'), rows('delete', 2, 1)), '');
+  // A range that shrinks to one cell is still written as that cell.
+  eq(adjusted(rule('B2:B3', 'B2&gt;0'), rows('delete', 2, 1)), rule('B2', 'B2&gt;0'));
+
+  // Validations and every other element that carries a reference list.
+  eq(adjusted(validation('B:B', 'B1&gt;0'), cols('insert', 0, 1)), validation('C:C', 'C1&gt;0'));
+  eq(adjusted(validation('B:B', 'B1&gt;0'), rows('insert', 0, 1)), validation('B:B', 'B1&gt;0'));
+  eq(adjusted(validation('3:3 B:B', 'A3&gt;0'), rows('insert', 0, 1)), validation('4:4 B:B', 'A4&gt;0'));
+  const others = (a: string, b: string, c: string) =>
+    `<protectedRanges><protectedRange sqref="${a}" name="p"/></protectedRanges><ignoredErrors><ignoredError sqref="${b}" numberStoredAsText="1"/></ignoredErrors>` +
+    `<extLst><ext uri="{c}"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="expression"><xm:f>B1&gt;0</xm:f></x14:cfRule><xm:sqref>${c}</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>`;
+  eq(adjusted(others('B:B', '2:2 B:C', 'B:B'), cols('insert', 0, 1)), others('C:C', '2:2 C:D', 'C:C').replace('B1&gt;0', 'C1&gt;0'));
+  eq(adjusted(others('B:B', '2:2 B:C', 'B:B'), rows('insert', 0, 1)), others('B:B', '3:3 B:C', 'B:B'));
+});
+
+test('write: a relative reference of a rule that leaves the sheet goes round its edge', () => {
+  // "The cell above is positive", and row 1 goes: for the new first row that is the last row of the sheet.
+  eq(adjusted(rule('B2:B5', 'B1&gt;0'), rows('delete', 0, 1)), rule('B1:B4', 'B1048576&gt;0'));
+  eq(adjusted(rule('B2:B5', 'A2&gt;0'), cols('delete', 0, 1)), rule('A2:A5', 'XFD2&gt;0'));
+  // And back again when a row comes in above.
+  eq(adjusted(rule('B1:B4', 'B1048576&gt;0'), rows('insert', 0, 1)), rule('B2:B5', 'B1&gt;0'));
+  eq(adjusted(validation('B2:B5', 'B1&gt;0'), rows('delete', 0, 1)), validation('B1:B4', 'B1048576&gt;0'));
+  // What is anchored with "$" named a cell that is gone.
+  eq(adjusted(rule('B2:B5', '$B$1&gt;0'), rows('delete', 0, 1)), rule('B1:B4', '#REF!&gt;0'));
+});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { adjustAnchoredFormula, adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from '../src/calc/refs';
+import { adjustAnchoredFormula, adjustFormula, adjustRange, adjustReferenceText, relativeExtent, shiftFormula, type StructuralEdit } from '../src/calc/refs';
 import { MAX_COLS, MAX_ROWS } from '../src/model/sheet/types';
 
 const SHEET = 'Sheet1';
@@ -246,9 +246,8 @@ test('refs adjust: insertion at the end of the sheet', () => {
     [`A${last - 6}:A${last}`, `A${last - 3}:A${last}`],
     [`A${last - 1}:A${last}`, '#REF!'],
     [`Sheet1!A${last}`, 'Sheet1!#REF!'],
-    // UNSURE: Excel refuses the insertion when it would push data off the sheet, and may keep
-    // a reference to every row as it is. Here it is treated like any other range.
-    [`1:${last}`, `4:${last}`],
+    // A reference to every row is "all rows" and stays that (see the whole-axis tests below).
+    [`1:${last}`, `1:${last}`],
   ]);
   checkAdjust(edit('insert', 'row', 5, 3), [[`A1:A${last}`, `A1:A${last}`]]);
   checkAdjust(edit('insert', 'col', 0, 1), [
@@ -907,4 +906,98 @@ test('refs: 100,000 characters in linear time', () => {
   }
   const many = fill('A1+');
   assert.equal(shiftFormula(many, 1, 0), fill('A2+'));
+});
+
+// ---------------------------------------------------------------------------
+// Whole columns and rows, and references that go round the edge of the sheet
+
+test('refs adjust: a span over a whole axis stays whole', () => {
+  const lastRow = MAX_ROWS;
+  // Whole columns: rows inserted or deleted change nothing, columns move them.
+  for (const e of [edit('insert', 'row', 0, 1), edit('insert', 'row', 7, 3), edit('delete', 'row', 0, 5), edit('delete', 'row', lastRow - 1, 1)]) {
+    checkAdjust(e, [
+      ['B:B', 'B:B'],
+      [`B1:B${lastRow}`, `B1:B${lastRow}`],
+      [`$B$1:$C$${lastRow}`, `$B$1:$C$${lastRow}`],
+      [`SUM(B${lastRow}:B1)`, `SUM(B${lastRow}:B1)`],
+      [`1:${lastRow}`, `1:${lastRow}`],
+    ]);
+    assert.deepEqual(adjustRange({ top: 0, left: 1, bottom: MAX_ROWS - 1, right: 1 }, e), { top: 0, left: 1, bottom: MAX_ROWS - 1, right: 1 });
+    assert.ok(adjustReferenceText(`D9:D12 B:B B1:B${lastRow}`, SHEET, e).endsWith(` B:B B1:B${lastRow}`));
+  }
+  checkAdjust(edit('insert', 'col', 0, 1), [
+    ['B:B', 'C:C'],
+    [`B1:B${lastRow}`, `C1:C${lastRow}`],
+    ['A3:XFD3', 'A3:XFD3'],
+    ['3:3', '3:3'],
+    ['A:XFD', 'A:XFD'],
+  ]);
+  checkAdjust(edit('delete', 'col', 1, 1), [
+    ['B:C', 'B:B'],
+    [`B1:C${lastRow}`, `B1:B${lastRow}`],
+    ['B:B', '#REF!'],
+    ['A3:XFD3', 'A3:XFD3'],
+  ]);
+  // Almost whole is not whole.
+  checkAdjust(edit('insert', 'row', 0, 1), [
+    [`B2:B${lastRow}`, `B3:B${lastRow}`],
+    [`B1:B${lastRow - 1}`, `B2:B${lastRow}`],
+    ['3:3', '4:4'],
+  ]);
+  assert.deepEqual(adjustRange({ top: 2, left: 0, bottom: 2, right: MAX_COLS - 1 }, edit('insert', 'col', 3, 2)), { top: 2, left: 0, bottom: 2, right: MAX_COLS - 1 });
+  assert.deepEqual(adjustRange({ top: 2, left: 0, bottom: 2, right: MAX_COLS - 1 }, edit('insert', 'row', 0, 1)), { top: 3, left: 0, bottom: 3, right: MAX_COLS - 1 });
+  // Lists keep the form each reference was written in.
+  assert.equal(adjustReferenceText('D1:D4 B:B', SHEET, edit('insert', 'col', 0, 1)), 'E1:E4 C:C');
+  assert.equal(adjustReferenceText('3:3 A1', SHEET, edit('insert', 'row', 0, 1)), '4:4 A2');
+  assert.equal(adjustReferenceText('B:B D1', SHEET, edit('delete', 'col', 1, 1)), 'C1');
+  // Anchored formulas: a fully anchored whole column behaves the same.
+  assert.equal(adjustAnchoredFormula(`SUM($B$1:$B$${lastRow})+B1`, SHEET, edit('insert', 'row', 0, 1), { row: 0, col: 1 }, { row: 0, col: 1 }), `SUM($B$1:$B$${lastRow})+B1`);
+});
+
+test('refs shift: with wrap, a reference pushed off the sheet comes back at the other edge', () => {
+  const cases: [string, number, number, string][] = [
+    ['A1', -1, 0, `A${MAX_ROWS}`],
+    ['A1', 0, -1, 'XFD1'],
+    ['A1', -2, -2, `XFC${MAX_ROWS - 1}`],
+    [`A${MAX_ROWS}`, 1, 0, 'A1'],
+    ['XFD1', 0, 2, 'B1'],
+    ['$A1', -1, -1, `$A${MAX_ROWS}`],
+    ['A$1', -1, -1, 'XFD$1'],
+    ['$A$1', -1, -1, '$A$1'],
+    ['A1:B2', -1, 0, `A${MAX_ROWS}:B1`],
+    ['A:B', 0, -1, 'XFD:A'],
+    ['1:2', -1, 0, `${MAX_ROWS}:1`],
+    ['Sheet2!A1+B5', -1, 0, `Sheet2!A${MAX_ROWS}+B4`],
+    ['B5', 2, 3, 'E7'],
+    ['"A1"&A1', -1, 0, `"A1"&A${MAX_ROWS}`],
+  ];
+  for (const [input, dRow, dCol, expected] of cases) assert.equal(shiftFormula(input, dRow, dCol, true), expected, input);
+  // Without the flag nothing changed.
+  assert.equal(shiftFormula('A1', -1, 0), '#REF!');
+  assert.equal(shiftFormula('A1', -1, 0, false), '#REF!');
+});
+
+test('refs adjust: anchored formulas with wrap', () => {
+  const none = edit('delete', 'row', 0, 1);
+  // The anchor moved up one row: "the cell above" of row 1 is the last row.
+  assert.equal(adjustAnchoredFormula('B1>0', SHEET, none, { row: 1, col: 1 }, { row: 0, col: 1 }, true), `B${MAX_ROWS}>0`);
+  assert.equal(adjustAnchoredFormula('B1>0', SHEET, none, { row: 1, col: 1 }, { row: 0, col: 1 }), '#REF!>0');
+  assert.equal(adjustAnchoredFormula('A2>0', SHEET, edit('delete', 'col', 0, 1), { row: 1, col: 1 }, { row: 1, col: 0 }, true), 'XFD2>0');
+  assert.equal(adjustAnchoredFormula(`A${MAX_ROWS}>0`, SHEET, edit('insert', 'row', 0, 1), { row: 0, col: 0 }, { row: 1, col: 0 }, true), 'A1>0');
+  // What is anchored with "$" names a cell, and a deleted cell is gone whatever the flag says.
+  assert.equal(adjustAnchoredFormula('$B$1>B1', SHEET, none, { row: 1, col: 1 }, { row: 0, col: 1 }, true), `#REF!>B${MAX_ROWS}`);
+  assert.equal(adjustAnchoredFormula('$B1>0', SHEET, edit('delete', 'col', 1, 1), { row: 0, col: 2 }, { row: 0, col: 1 }, true), '#REF!>0');
+});
+
+test('refs: how far the relative references of a formula reach', () => {
+  assert.deepEqual(relativeExtent('B3+D10'), { minRow: 2, maxRow: 9, minCol: 1, maxCol: 3 });
+  assert.deepEqual(relativeExtent('$B3+D$10'), { minRow: 2, maxRow: 2, minCol: 3, maxCol: 3 });
+  assert.deepEqual(relativeExtent('$B$3+"C7"+1'), { minRow: Infinity, maxRow: -1, minCol: Infinity, maxCol: -1 });
+  assert.deepEqual(relativeExtent('SUM(C:D)+SUM(5:6)'), { minRow: 4, maxRow: 5, minCol: 2, maxCol: 3 });
+  assert.deepEqual(relativeExtent('SUM(B2:$E$9)+Other!A1'), { minRow: 0, maxRow: 1, minCol: 0, maxCol: 1 });
+  assert.deepEqual(relativeExtent(undefined as unknown as string), { minRow: Infinity, maxRow: -1, minCol: Infinity, maxCol: -1 });
+  // A megabyte of text is one pass.
+  const start = Date.now();
+  assert.equal(relativeExtent('A1+'.repeat(350000)).maxRow, 0);
+  assert.ok(Date.now() - start < 1000);
 });

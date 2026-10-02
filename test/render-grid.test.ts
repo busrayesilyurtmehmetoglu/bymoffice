@@ -1286,3 +1286,105 @@ test('grid: a sheet without conditional formats is drawn without asking for any'
   // A source that throws at construction time or is not a source at all is ignored.
   assert.doesNotThrow(() => draw(sheet, { conditional: {} as ConditionalSource }));
 });
+
+// --- conditional formats: what the first tests let through ----------------------
+
+test('grid: a right-to-left data bar mirrors its gradient and its axis', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 5);
+  put(sheet, 1, 0, -5);
+  put(sheet, 2, 0, 5);
+  const ctx = draw(sheet, {
+    conditional: fixedConditional({
+      '0,0': { bar: { from: 0.25, to: 0.75, color: '#00B050', gradient: true, negative: false, rightToLeft: true, axis: 0.25, axisColor: '#111111' } },
+      '1,0': { bar: { from: 0, to: 0.25, color: '#FF0000', gradient: true, negative: true, rightToLeft: true, axis: 0.25, axisColor: '#222222' } },
+      '2,0': { bar: { from: 0.25, to: 0.75, color: '#0000FF', gradient: true, negative: false, rightToLeft: false, axis: 0.25, axisColor: '#333333' } },
+    }),
+  });
+  const room = CW - 5;
+  const x = (share: number) => HX + 2 + Math.round(room * share);
+  assert.equal(ctx.gradientRects.length, 3);
+  const [positive, negative, plain] = ctx.gradientRects;
+  // Mirrored: the bar that ran from 25% to 75% is still there, but it starts at its right end.
+  assert.deepEqual([positive.x, positive.width], [x(0.25), x(0.75) - x(0.25)]);
+  assert.deepEqual(positive.gradient.stops, [[1, '#00B050'], [0, fadeOf('#00B050')]]);
+  // A negative bar right-to-left lies right of the axis and is solid at its left end, the axis.
+  assert.deepEqual([negative.x, negative.width], [x(0.75), x(1) - x(0.75)]);
+  assert.deepEqual(negative.gradient.stops, [[0, '#FF0000'], [1, fadeOf('#FF0000')]]);
+  // Left to right, for comparison: solid at the left.
+  assert.deepEqual(plain.gradient.stops, [[0, '#0000FF'], [1, fadeOf('#0000FF')]]);
+  // The axis at 25% from the start is at 75% from the left when mirrored.
+  assert.deepEqual(ctx.strokesOf('#111111')[0].lines, [[x(0.75) + 0.5, HY, x(0.75) + 0.5, HY + RH - 1]]);
+  assert.deepEqual(ctx.strokesOf('#222222')[0].lines, [[x(0.75) + 0.5, HY + RH, x(0.75) + 0.5, HY + 2 * RH - 1]]);
+  assert.deepEqual(ctx.strokesOf('#333333')[0].lines, [[x(0.25) + 0.5, HY + 2 * RH, x(0.25) + 0.5, HY + 3 * RH - 1]]);
+});
+
+/** A colour faded towards white the way the end of a gradient bar is (three quarters of the way). */
+function fadeOf(color: string): string {
+  let out = '#';
+  for (let i = 1; i < 7; i += 2) {
+    const channel = parseInt(color.slice(i, i + 2), 16);
+    const value = Math.round(channel + (255 - channel) * 0.85);
+    out += (value < 16 ? '0' : '') + value.toString(16).toUpperCase();
+  }
+  return out;
+}
+
+test('grid: the colour of a colour scale fills a merged area', () => {
+  const styles = emptyStyleSheet();
+  const yellow = xf(styles, { fill: solid('FFFF00') });
+  const sheet = newSheet();
+  put(sheet, 1, 1, 8, yellow);
+  sheet.merges = [range(1, 1, 2, 3)];
+  const source = fixedConditional({
+    // The scale wins over the fill of a format and over the cell's own fill.
+    '1,1': { fill: '#ABCDEF', style: { fill: '#FF0000' } },
+    '2,3': { fill: '#123456' },
+  });
+  const ctx = draw(sheet, { styles, conditional: source });
+  assert.deepEqual(ctx.fills('#ABCDEF').map((call) => [call.x, call.y, call.width, call.height]), [[HX + CW - 1, HY + RH - 1, 3 * CW + 1, 2 * RH + 1]]);
+  assert.equal(ctx.fills('#FF0000').length, 0);
+  assert.equal(ctx.fills('#FFFF00').length, 0);
+  assert.equal(ctx.fills('#123456').length, 0);
+  // A colour that is not a colour leaves the fill of the format, and without one the cell's own.
+  const unsafe = draw(sheet, { styles, conditional: fixedConditional({ '1,1': { fill: 'url(x)', style: { fill: '#FF0000' } } }) });
+  assert.equal(unsafe.fills('#FF0000').length, 1);
+  const own = draw(sheet, { styles, conditional: fixedConditional({ '1,1': { fill: 'url(x)' } }) });
+  assert.equal(own.fills('#FFFF00').length, 1);
+});
+
+test('grid: the number format of a conditional format follows the date system of the workbook', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 2);
+  put(sheet, 1, 0, 2);
+  const source = () => fixedConditional({ '0,0': { style: { numFmt: { id: 164, code: 'yy-m-d' } } } });
+  // Serial 2 is 2 January 1900, and 3 January 1904 in the 1904 system.
+  const ctx1900 = draw(sheet, { conditional: source() });
+  assert.ok(ctx1900.textCall('00-1-2'));
+  assert.ok(ctx1900.textCall('2'));
+  const ctx1904 = draw(sheet, { conditional: source(), date1904: true });
+  assert.ok(ctx1904.textCall('04-1-3'));
+  assert.ok(ctx1904.textCall('2'));
+});
+
+test('grid: when an icon leaves no room, the text is not drawn', () => {
+  const sheet = newSheet();
+  // Column A is 19 px wide: an icon of 13 px and its gap leave 3 px, less than the padding on both sides.
+  sheet.columns = [{ min: 0, max: 0, width: 2, customWidth: true, hidden: false, outlineLevel: 0, collapsed: false }];
+  // A text, which would otherwise be drawn clipped rather than replaced by "#".
+  put(sheet, 0, 0, 'ab');
+  put(sheet, 0, 1, 7);
+  put(sheet, 1, 0, 7);
+  const ctx = draw(sheet, {
+    conditional: fixedConditional({
+      '0,0': { icon: { set: '3TrafficLights1', index: 2 } },
+      '0,1': { icon: { set: '3TrafficLights1', index: 2 } },
+    }),
+  });
+  const circles = ctx.paths.filter((path) => path.arcs.length === 1 && path.fill === '#68A490');
+  assert.equal(circles.length, 2);
+  // Neither the number nor a row of "#" in the narrow cell; the wider one and the cell without an icon keep theirs.
+  const inA1 = ctx.cellTexts.filter((call) => call.y < HY + RH && call.x < HX + 19);
+  assert.deepEqual(inA1.map((call) => call.text), []);
+  assert.equal(ctx.cellTexts.filter((call) => call.text === '7').length, 2);
+});

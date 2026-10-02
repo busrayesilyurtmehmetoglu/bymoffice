@@ -562,13 +562,19 @@ interface Adjuster {
   changed: boolean;
 }
 
-/** "B2:B2" -> "B2" for each reference of a list: a range that shrank to one cell is written as that cell. */
+/**
+ * "B2:B2" -> "B2" for each reference of a list: a range that shrank to one cell is written as
+ * that cell. A whole column or row ("C:C", "4:4") has no shorter form: "C" alone is not a
+ * reference, and a rule written with it is lost on the next read.
+ */
 function collapseSingleCells(list: string): string {
   if (list.indexOf(':') < 0) return list;
   const refs = list.split(' ');
   for (let i = 0; i < refs.length; i++) {
     const colon = refs[i].indexOf(':');
-    if (colon > 0 && refs[i].slice(0, colon) === refs[i].slice(colon + 1)) refs[i] = refs[i].slice(0, colon);
+    if (colon <= 0) continue;
+    const first = refs[i].slice(0, colon);
+    if (first === refs[i].slice(colon + 1) && parseCellRef(first)) refs[i] = first;
   }
   return refs.join(' ');
 }
@@ -698,11 +704,44 @@ function formulaSlots(el: XmlElement, out: FormulaSlot[]): void {
   }
 }
 
-/** Top-left cell of the first range of a reference list. */
+/** One side of a whole-column or whole-row reference ("$B", "7") as a 0-based index; -1 for anything else. */
+function axisIndex(text: string, rows: boolean): number {
+  let i = text.charCodeAt(0) === 36 ? 1 : 0;
+  const n = text.length;
+  if (i >= n || n - i > 7) return -1;
+  let value = 0;
+  for (; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (rows) {
+      if (c < 48 || c > 57) return -1;
+      value = value * 10 + (c - 48);
+    } else {
+      const letter = c & ~32;
+      if (letter < 65 || letter > 90) return -1;
+      value = value * 26 + (letter - 64);
+    }
+  }
+  return value >= 1 && value <= (rows ? MAX_ROWS : MAX_COLS) ? value - 1 : -1;
+}
+
+/**
+ * Top-left cell of the first range of a reference list. A whole column starts at row 1 and a
+ * whole row at column A, as the reader has them.
+ */
 function anchorOf(list: string): { row: number; col: number } | undefined {
   const first = list.trim().split(/\s+/)[0];
-  const range = first ? parseRange(first) : undefined;
-  return range ? { row: range.top, col: range.left } : undefined;
+  if (!first) return undefined;
+  const range = parseRange(first);
+  if (range) return { row: range.top, col: range.left };
+  const colon = first.indexOf(':');
+  if (colon <= 0) return undefined;
+  const a = first.slice(0, colon);
+  const b = first.slice(colon + 1);
+  const cols = [axisIndex(a, false), axisIndex(b, false)];
+  if (cols[0] >= 0 && cols[1] >= 0) return { row: 0, col: Math.min(cols[0], cols[1]) };
+  const rows = [axisIndex(a, true), axisIndex(b, true)];
+  if (rows[0] >= 0 && rows[1] >= 0) return { row: Math.min(rows[0], rows[1]), col: 0 };
+  return undefined;
 }
 
 /**
@@ -710,8 +749,14 @@ function anchorOf(list: string): { row: number; col: number } | undefined {
  * the top-left cell of its range: a relative reference means "the cell this
  * far from the one the rule is applied to". So what a relative reference has
  * to follow is that corner, not the rows and columns it happens to name;
- * only references anchored with "$" follow those. Returns undefined for an
- * element that has no range of its own.
+ * only references anchored with "$" follow those. A relative reference the
+ * move of the corner takes off the sheet comes back in at the opposite edge,
+ * as it does when the rule is evaluated (see ConditionalFormats): what the
+ * file says and what the view showed before saving stay the same thing.
+ * Returns undefined for an element that has no range of its own.
+ *
+ * UNSURE: Excel is known to wrap such references in conditional formats; data
+ * validations are treated the same way here.
  */
 function adjustRule(el: XmlElement, adjuster: Adjuster): number | undefined {
   // The range is an attribute in the main namespace and an <xm:sqref> child in the extension list.
@@ -734,7 +779,7 @@ function adjustRule(el: XmlElement, adjuster: Adjuster): number | undefined {
     }
     const to = anchorOf(next);
     for (let i = 0; i < texts.length; i++) {
-      texts[i] = from && to ? adjustAnchoredFormula(texts[i], name, edit, from, to) : adjustFormula(texts[i], name, edit);
+      texts[i] = from && to ? adjustAnchoredFormula(texts[i], name, edit, from, to, true) : adjustFormula(texts[i], name, edit);
     }
     list = next;
   }
@@ -742,7 +787,7 @@ function adjustRule(el: XmlElement, adjuster: Adjuster): number | undefined {
   const anchor = anchorOf(list);
   for (const edit of adjuster.foreign) {
     for (let i = 0; i < texts.length; i++) {
-      texts[i] = anchor ? adjustAnchoredFormula(texts[i], name, edit, anchor, anchor) : adjustFormula(texts[i], name, edit);
+      texts[i] = anchor ? adjustAnchoredFormula(texts[i], name, edit, anchor, anchor, true) : adjustFormula(texts[i], name, edit);
     }
   }
 

@@ -385,12 +385,20 @@ function toInt(value: number): number {
   return value === value ? Math.trunc(value) : 0;
 }
 
+/** `value` brought back onto an axis of `limit` items by going round its edge. */
+function wrapIndex(value: number, limit: number): number {
+  const rest = value % limit;
+  return rest < 0 ? rest + limit : rest;
+}
+
 /**
  * Moves relative references by (dRow, dCol), as copying or filling a formula does; parts
- * anchored with "$" stay. A reference pushed off the sheet becomes #REF!. References into
- * other workbooks move like any other.
+ * anchored with "$" stay. A reference pushed off the sheet becomes #REF!, or, with `wrap`,
+ * comes back in at the opposite edge, which is what the formulas of conditional formats and
+ * data validations do ("the cell above" of row 1 is the last row). References into other
+ * workbooks move like any other.
  */
-export function shiftFormula(text: string, dRow: number, dCol: number): string {
+export function shiftFormula(text: string, dRow: number, dCol: number, wrap = false): string {
   if (typeof text !== 'string') return toText(text);
   dRow = toInt(dRow);
   dCol = toInt(dCol);
@@ -400,16 +408,53 @@ export function shiftFormula(text: string, dRow: number, dCol: number): string {
     if (ref.kind !== K_ROW) {
       if (!ref.absC1) c1 += dCol;
       if (!ref.absC2) c2 += dCol;
-      if (c1 < 0 || c2 < 0 || c1 >= MAX_COLS || c2 >= MAX_COLS) return REF_ERROR;
+      if (wrap) {
+        c1 = wrapIndex(c1, MAX_COLS);
+        c2 = wrapIndex(c2, MAX_COLS);
+      } else if (c1 < 0 || c2 < 0 || c1 >= MAX_COLS || c2 >= MAX_COLS) return REF_ERROR;
     }
     if (ref.kind !== K_COL) {
       if (!ref.absR1) r1 += dRow;
       if (!ref.absR2) r2 += dRow;
-      if (r1 < 0 || r2 < 0 || r1 >= MAX_ROWS || r2 >= MAX_ROWS) return REF_ERROR;
+      if (wrap) {
+        r1 = wrapIndex(r1, MAX_ROWS);
+        r2 = wrapIndex(r2, MAX_ROWS);
+      } else if (r1 < 0 || r2 < 0 || r1 >= MAX_ROWS || r2 >= MAX_ROWS) return REF_ERROR;
     }
     if (r1 === ref.r1 && c1 === ref.c1 && r2 === ref.r2 && c2 === ref.c2) return undefined;
     return formatRef({ ...ref, r1, c1, r2, c2 });
   });
+}
+
+/**
+ * How far the relative references of a formula reach: the smallest and largest row and
+ * column named by a side that is not anchored with "$". Moving the formula by (dRow, dCol)
+ * keeps every reference on the sheet exactly when these stay on it. An axis without a
+ * relative side has min > max (Infinity and -1).
+ */
+export function relativeExtent(text: string): { minRow: number; maxRow: number; minCol: number; maxCol: number } {
+  const extent = { minRow: Infinity, maxRow: -1, minCol: Infinity, maxCol: -1 };
+  if (typeof text !== 'string') return extent;
+  const row = (value: number) => {
+    if (value < extent.minRow) extent.minRow = value;
+    if (value > extent.maxRow) extent.maxRow = value;
+  };
+  const col = (value: number) => {
+    if (value < extent.minCol) extent.minCol = value;
+    if (value > extent.maxCol) extent.maxCol = value;
+  };
+  rewrite(text, (ref) => {
+    if (ref.kind !== K_ROW) {
+      if (!ref.absC1) col(ref.c1);
+      if (!ref.absC2) col(ref.c2);
+    }
+    if (ref.kind !== K_COL) {
+      if (!ref.absR1) row(ref.r1);
+      if (!ref.absR2) row(ref.r2);
+    }
+    return undefined;
+  });
+  return extent;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +472,9 @@ function isEffective(edit: AxisEdit): boolean {
  * is left. `limit` is the size of the sheet along the axis.
  */
 function adjustSpan(lo: number, hi: number, limit: number, edit: AxisEdit): [number, number] | undefined {
+  // A span over the whole axis ("B1:B1048576", the rows of "B:B" as a range) is "all of
+  // them" and stays that: inserting does not push its start down, deleting does not shorten it.
+  if (lo === 0 && hi === limit - 1) return [lo, hi];
   const at = Math.trunc(edit.at);
   const count = Math.trunc(edit.count);
   if (edit.kind === 'insert') {
@@ -499,7 +547,7 @@ export function adjustFormula(text: string, formulaSheetName: string, edit: Stru
  * with "$" (it follows `edit`, when the edit is about this axis of its sheet) or relative (it
  * moves by `delta` with the anchor cell). Undefined when the result is #REF!.
  */
-function adjustAnchoredAxis(a: number, b: number, absA: boolean, absB: boolean, delta: number, limit: number, edit: AxisEdit | undefined): [number, number] | undefined {
+function adjustAnchoredAxis(a: number, b: number, absA: boolean, absB: boolean, delta: number, limit: number, edit: AxisEdit | undefined, wrap: boolean): [number, number] | undefined {
   if (absA && absB) {
     // Fully anchored: a span, with the growing and shrinking of adjustFormula.
     if (!edit) return [a, b];
@@ -507,13 +555,13 @@ function adjustAnchoredAxis(a: number, b: number, absA: boolean, absB: boolean, 
     if (!span) return undefined;
     return a <= b ? span : [span[1], span[0]];
   }
-  if (!absA) a += delta;
+  if (!absA) a = wrap ? wrapIndex(a + delta, limit) : a + delta;
   else if (edit) {
     const moved = adjustSpan(a, a, limit, edit);
     if (!moved) return undefined;
     a = moved[0];
   }
-  if (!absB) b += delta;
+  if (!absB) b = wrap ? wrapIndex(b + delta, limit) : b + delta;
   else if (edit) {
     const moved = adjustSpan(b, b, limit, edit);
     if (!moved) return undefined;
@@ -527,7 +575,8 @@ function adjustAnchoredAxis(a: number, b: number, absA: boolean, absB: boolean, 
  * Adjusts a formula that is written relative to an anchor cell (conditional formats, data
  * validations) after a structural edit. Parts of a reference anchored with "$" follow the
  * edit as in adjustFormula; relative parts keep their distance from the anchor, which moved
- * from `before` to `after`.
+ * from `before` to `after`. A relative part that the move takes off the sheet is #REF!, or
+ * with `wrap` comes back in at the opposite edge (see shiftFormula).
  */
 export function adjustAnchoredFormula(
   text: string,
@@ -535,6 +584,7 @@ export function adjustAnchoredFormula(
   edit: StructuralEdit,
   before: { row: number; col: number },
   after: { row: number; col: number },
+  wrap = false,
 ): string {
   if (typeof text !== 'string') return toText(text);
   const dRow = before && after ? toInt(after.row - before.row) : 0;
@@ -548,13 +598,13 @@ export function adjustAnchoredFormula(
     const edited = onEditedSheet(sheets, external);
     let { r1, c1, r2, c2 } = ref;
     if (ref.kind !== K_COL) {
-      const rows = adjustAnchoredAxis(r1, r2, ref.absR1, ref.absR2, dRow, MAX_ROWS, edited && edit.axis === 'row' ? edit : undefined);
+      const rows = adjustAnchoredAxis(r1, r2, ref.absR1, ref.absR2, dRow, MAX_ROWS, edited && edit.axis === 'row' ? edit : undefined, wrap);
       if (!rows) return REF_ERROR;
       r1 = rows[0];
       r2 = rows[1];
     }
     if (ref.kind !== K_ROW) {
-      const cols = adjustAnchoredAxis(c1, c2, ref.absC1, ref.absC2, dCol, MAX_COLS, edited && edit.axis === 'col' ? edit : undefined);
+      const cols = adjustAnchoredAxis(c1, c2, ref.absC1, ref.absC2, dCol, MAX_COLS, edited && edit.axis === 'col' ? edit : undefined, wrap);
       if (!cols) return REF_ERROR;
       c1 = cols[0];
       c2 = cols[1];

@@ -491,10 +491,10 @@ test('conditional: above and below average', () => {
 
 test('conditional: unique and repeated values', () => {
   const values: Value[] = [1, 'Ali', 'ALI', 2, 1, '1', null, '', true, true, { error: '#N/A' }, { error: '#N/A' }, 3];
-  // Text compares without case; the text "1" is not the number 1; empty cells and errors take no part.
+  // Text compares without case; the text "1" counts as the number 1 (see conditional-fixes); empty cells and errors take no part.
   // UNSURE: booleans are counted like any other value here.
-  assert.deepEqual(rule(values, 'type="duplicateValues"'), ['A1', 'A2', 'A3', 'A5', 'A9', 'A10']);
-  assert.deepEqual(rule(values, 'type="uniqueValues"'), ['A4', 'A6', 'A13']);
+  assert.deepEqual(rule(values, 'type="duplicateValues"'), ['A1', 'A2', 'A3', 'A5', 'A6', 'A9', 'A10']);
+  assert.deepEqual(rule(values, 'type="uniqueValues"'), ['A4', 'A13']);
 });
 
 test('conditional: text rules', () => {

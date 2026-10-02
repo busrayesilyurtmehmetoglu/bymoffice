@@ -86,8 +86,9 @@ function intAttr(el: XmlElement, name: string): number | undefined {
 
 function numAttr(el: XmlElement, name: string): number | undefined {
   const text = el.attrs.get(name);
-  // xsd:double as written in files; Number() alone would also take "0x10".
-  if (text === undefined || !/^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(text)) return undefined;
+  // xsd:double as written in files; Number() alone would also take "0x10". The length is
+  // checked first: on a long run of digits the expression backtracks for minutes.
+  if (text === undefined || text.length > 64 || !/^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(text)) return undefined;
   const value = Number(text);
   return Number.isFinite(value) ? value : undefined;
 }

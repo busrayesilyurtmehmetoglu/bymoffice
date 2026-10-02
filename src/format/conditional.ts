@@ -14,10 +14,10 @@
 // apply.
 
 import type { CalcEngine } from '../calc/engine';
-import { adjustAnchoredFormula, adjustFormula, adjustRange, shiftFormula, type StructuralEdit } from '../calc/refs';
-import { compareScalars, isError, numberToText, type Scalar } from '../calc/values';
+import { adjustAnchoredFormula, adjustFormula, adjustRange, relativeExtent, shiftFormula, type StructuralEdit } from '../calc/refs';
+import { compareScalars, isError, numberToText, textToNumber, type Scalar } from '../calc/values';
 import { resolveColor } from '../model/sheet/color';
-import { MAX_COLS } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName } from '../model/sheet/types';
 import type {
   BorderEdge,
   Cell,
@@ -93,6 +93,11 @@ export interface ConditionalSource {
   /** Called once before the cells of a frame are asked for. */
   begin?(): void;
   resolve(row: number, col: number): CellConditional | undefined;
+  /**
+   * Runs `run` - the resolve() calls of one frame, say - so that the formulas calculated in
+   * it share what the engine works out for them. The model must not change inside.
+   */
+  batch?<T>(run: () => T): T;
 }
 
 export interface ConditionalOptions {
@@ -209,15 +214,17 @@ function textOfValue(value: CellValue): string {
   return value as string;
 }
 
-const NUMBER_TEXT = /^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?\s*$/;
 const NOT_CONSTANT = { formula: true };
 
-/** A formula text that is only a number, a quoted text or TRUE/FALSE, read without an engine. */
+/**
+ * A formula text that is only a number, a quoted text or TRUE/FALSE, read without an engine.
+ * Numbers are read by textToNumber(), a hand-written scanner that looks at each character
+ * once: texts come from the file and can be a megabyte of digits ("12%" is 0.12, as it is
+ * in a formula).
+ */
 function constantOf(text: string): Scalar | typeof NOT_CONSTANT {
-  if (NUMBER_TEXT.test(text)) {
-    const value = Number(text);
-    return isFinite(value) ? value : NOT_CONSTANT;
-  }
+  const number = textToNumber(text);
+  if (number !== undefined) return number;
   const trimmed = text.trim();
   if (trimmed.length >= 2 && trimmed.charCodeAt(0) === 34 && trimmed.charCodeAt(trimmed.length - 1) === 34) {
     const inner = trimmed.slice(1, -1);
@@ -229,6 +236,32 @@ function constantOf(text: string): Scalar | typeof NOT_CONSTANT {
   if (upper === 'TRUE') return true;
   if (upper === 'FALSE') return false;
   return NOT_CONSTANT;
+}
+
+/** TRIM takes away the space character only: a text of nothing else is blank, one with a tab or a no-break space is not. */
+function isBlankText(text: string): boolean {
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) !== 32) return false;
+  return true;
+}
+
+/**
+ * Whether `formula` is what Excel writes for a text rule of this kind and text, applied to
+ * the cell `cell` ("A1"). Then the rule can be answered from the text alone.
+ */
+function isStandardTextFormula(kind: number, text: string, formula: string, cell: string): boolean {
+  const quoted = '"' + text.replace(/"/g, '""') + '"';
+  const written = formula.trim();
+  switch (kind) {
+    case K_CONTAINS_TEXT:
+      return written === `NOT(ISERROR(SEARCH(${quoted},${cell})))`;
+    case K_NOT_CONTAINS_TEXT:
+      return written === `ISERROR(SEARCH(${quoted},${cell}))`;
+    case K_BEGINS_WITH:
+      return written === `LEFT(${cell},${text.length})=${quoted}` || written === `LEFT(${cell},LEN(${quoted}))=${quoted}`;
+    case K_ENDS_WITH:
+      return written === `RIGHT(${cell},${text.length})=${quoted}` || written === `RIGHT(${cell},LEN(${quoted}))=${quoted}`;
+  }
+  return false;
 }
 
 /** Longest text a wildcard pattern is matched against, and longest pattern. */
@@ -243,8 +276,41 @@ function searchText(text: string, pattern: string): boolean {
   if (pattern === '') return true;
   if (text.length > MAX_MATCH_TEXT) text = text.slice(0, MAX_MATCH_TEXT);
   if (pattern.length > MAX_PATTERN) pattern = pattern.slice(0, MAX_PATTERN);
-  const haystack = text.toUpperCase();
-  const needle = pattern.toUpperCase();
+  return searchFolded(foldCase(text, true), foldCase(pattern, true)) || searchFolded(foldCase(text, false), foldCase(pattern, false));
+}
+
+/**
+ * Upper or lower case, letter by letter and without a locale. A letter whose other case is
+ * not a single letter ("İ" in lower case, "ß" in upper case) stays as it is, so that the
+ * text keeps its length and a position in it means the same before and after.
+ */
+function foldCase(text: string, upper: boolean): string {
+  const whole = upper ? text.toUpperCase() : text.toLowerCase();
+  if (whole.length === text.length) return whole;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const letter = text[i];
+    const folded = upper ? letter.toUpperCase() : letter.toLowerCase();
+    out += folded.length === 1 ? folded : letter;
+  }
+  return out;
+}
+
+/**
+ * Whether two texts are the same without regard to case.
+ *
+ * UNSURE: Excel compares with a simple case mapping that does not depend on the language of
+ * the system. Which one exactly is not documented; here two texts are equal when their upper
+ * case forms or their lower case forms are, which makes "i", "I" and the Turkish dotless "ı"
+ * one letter and leaves the dotted capital "İ" on its own.
+ */
+function sameFolded(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return foldCase(a, true) === foldCase(b, true) || foldCase(a, false) === foldCase(b, false);
+}
+
+/** searchText() for a text and a pattern already in one case. */
+function searchFolded(haystack: string, needle: string): boolean {
   if (!/[?*~]/.test(needle)) return haystack.indexOf(needle) >= 0;
   // Pieces between the stars are looked for one after the other; that never backtracks over a star.
   const pieces: { chars: string[]; any: boolean[] }[] = [{ chars: [], any: [] }];
@@ -458,7 +524,12 @@ interface Stats {
   min: number;
   max: number;
   mean: number;
-  /** Sample standard deviation; 0 for fewer than two numbers. */
+  /**
+   * Standard deviation of the numbers as a whole population (STDEV.P).
+   *
+   * UNSURE: Excel does not document which deviation "1 std dev above average" uses; the
+   * population one is what its results are reported to match.
+   */
   deviation: number;
 }
 
@@ -467,7 +538,15 @@ interface Entry {
   rule: ConditionalRule;
   kind: number;
   ranges: CellRange[];
-  /** The cell the formulas are written for: the top-left cell of the first range. */
+  /**
+   * The cell the formulas are written for: the top-left cell of the first range of the
+   * list, whether or not another range starts further up or left. Excel keeps a rule
+   * relative to the active cell of the selection it was made for and, when it writes the
+   * file, relative to the first range of sqref; files of Excel and of openpyxl read that
+   * way, and the writer moves formulas by the same corner.
+   *
+   * UNSURE: not stated by the standard; taken from files Excel writes.
+   */
   anchorRow: number;
   anchorCol: number;
   formulas: string[];
@@ -479,6 +558,8 @@ interface Entry {
   style: ConditionalStyle | undefined;
   /** As `style`, as the whole result for a cell only this rule formats. */
   alone: CellConditional | undefined;
+  /** A text rule that is answered from its text attribute: it has no formula, or the formula Excel writes for that text. */
+  textOnly: boolean;
   stats?: Stats;
   /** How often each value occurs, for the rules about unique and repeated values. */
   counts?: Map<string, number>;
@@ -517,9 +598,20 @@ function inRanges(ranges: CellRange[], row: number, col: number): boolean {
   return false;
 }
 
+/**
+ * What two cells have to share to be "the same value" for the rules about unique and
+ * repeated values.
+ *
+ * UNSURE: Excel is believed to count the way COUNTIF does: a text that reads as a number is
+ * that number ("1" repeats 1), and texts compare without regard to case.
+ */
 function countKey(value: CellValue): string | undefined {
   if (typeof value === 'number') return 'n' + value;
-  if (typeof value === 'string') return value === '' ? undefined : 's' + value.toUpperCase();
+  if (typeof value === 'string') {
+    if (value === '') return undefined;
+    const number = textToNumber(value);
+    return number !== undefined ? 'n' + number : 's' + value.toUpperCase();
+  }
   if (typeof value === 'boolean') return value ? 'b1' : 'b0';
   return undefined;
 }
@@ -532,6 +624,14 @@ function percentile(sorted: Float64Array, p: number): number {
   const low = Math.floor(position);
   const high = Math.min(low + 1, n - 1);
   return sorted[low] + (sorted[high] - sorted[low]) * (position - low);
+}
+
+/** Whether a threshold of the rule is given as something the engine has to calculate. */
+function hasFormulaThreshold(rule: ConditionalRule): boolean {
+  const calculated = (value: ConditionalValue | undefined) => !!value && typeof value.value === 'string' && value.value !== '' && constantOf(value.value) === NOT_CONSTANT;
+  if (rule.colorScale && Array.isArray(rule.colorScale.values) && rule.colorScale.values.some(calculated)) return true;
+  if (rule.iconSet && Array.isArray(rule.iconSet.values) && rule.iconSet.values.some(calculated)) return true;
+  return !!rule.dataBar && (calculated(rule.dataBar.min) || calculated(rule.dataBar.max));
 }
 
 export class ConditionalFormats implements ConditionalSource {
@@ -550,6 +650,10 @@ export class ConditionalFormats implements ConditionalSource {
   private cells = new Map<number, CellConditional | null>();
   private combined = new Map<string, CellConditional>();
   private constants = new Map<string, Scalar | typeof NOT_CONSTANT>();
+  /** How far the relative references of a formula text reach, by the text. */
+  private extents = new Map<string, ReturnType<typeof relativeExtent>>();
+  /** Some rule needs the engine: the cells are then evaluated in a batch of it. */
+  private usesFormulas = false;
   /** Formula texts the engine could not parse. */
   private unparsed = new Set<string>();
   private todayValue: number | undefined;
@@ -619,7 +723,10 @@ export class ConditionalFormats implements ConditionalSource {
       if (known !== undefined) return known === null ? undefined : known;
       const candidates = this.block(entries, row, col);
       if (candidates.length === 0) return undefined;
-      const result = this.evaluate(candidates, row, col);
+      // All the formulas of one cell are one batch for the engine; inside batch() of this
+      // object the batches of the cells are part of the larger one.
+      const engine = this.usesFormulas ? this.engine() : undefined;
+      const result = engine && typeof engine.batch === 'function' ? engine.batch(() => this.evaluate(candidates, row, col)) : this.evaluate(candidates, row, col);
       if (result === PENDING) {
         this.pending = true;
         return undefined;
@@ -631,6 +738,17 @@ export class ConditionalFormats implements ConditionalSource {
     } catch (error) {
       return undefined;
     }
+  }
+
+  /**
+   * Runs `run` as one batch of the engine: formulas calculated by the resolve() calls inside
+   * share one calculation budget and what functions keep between calls (the index of a
+   * lookup table). The model must not change while `run` runs. Without an engine, or with
+   * one that has no batches, `run` is simply called.
+   */
+  batch<T>(run: () => T): T {
+    const engine = this.engine();
+    return engine && typeof engine.batch === 'function' ? engine.batch(run) : run();
   }
 
   // -------------------------------------------------------------------------
@@ -667,6 +785,7 @@ export class ConditionalFormats implements ConditionalSource {
     this.blocks.clear();
     this.cells.clear();
     this.combined.clear();
+    this.usesFormulas = false;
 
     const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: sheet.name }));
     const foreign: StructuralEdit[] = [];
@@ -687,7 +806,8 @@ export class ConditionalFormats implements ConditionalSource {
       const adjust = (edit: StructuralEdit, from: CellRange, to: CellRange) => {
         const before = { row: from.top, col: from.left };
         const after = { row: to.top, col: to.left };
-        for (const list of texts) for (let i = 0; i < list.length; i++) list[i] = adjustAnchoredFormula(list[i], sheet.name, edit, before, after);
+        // Relative references go round the edge of the sheet, as they do when a rule is evaluated.
+        for (const list of texts) for (let i = 0; i < list.length; i++) list[i] = adjustAnchoredFormula(list[i], sheet.name, edit, before, after, true);
       };
       for (const edit of own) {
         const moved: CellRange[] = [];
@@ -711,17 +831,24 @@ export class ConditionalFormats implements ConditionalSource {
         if (!rule || kind === undefined) continue;
         const dxfs = styles.dxfFormats;
         const style = styleOfFormat(rule.dxf || (rule.dxfId !== undefined && dxfs ? dxfs[rule.dxfId] : undefined), styles);
+        const moved = own.length > 0 || foreign.length > 0 ? this.movedRule(rule, own.concat(foreign)) : rule;
+        const constants = texts[r].map(constantOf);
+        const textRule = kind === K_CONTAINS_TEXT || kind === K_NOT_CONTAINS_TEXT || kind === K_BEGINS_WITH || kind === K_ENDS_WITH;
+        const textOnly =
+          textRule && typeof rule.text === 'string' && (texts[r].length === 0 || isStandardTextFormula(kind, rule.text, texts[r][0], cellName(ranges[0].top, ranges[0].left)));
+        if (!this.usesFormulas && !textOnly && (constants.indexOf(NOT_CONSTANT) >= 0 || hasFormulaThreshold(moved))) this.usesFormulas = true;
         entries.push({
-          rule: own.length > 0 || foreign.length > 0 ? this.movedRule(rule, own.concat(foreign)) : rule,
+          rule: moved,
           kind,
           ranges,
           anchorRow: ranges[0].top,
           anchorCol: ranges[0].left,
           formulas: texts[r],
-          constants: texts[r].map(constantOf),
+          constants,
           order: entries.length,
           style,
           alone: style ? { style } : undefined,
+          textOnly,
         });
       }
     }
@@ -750,7 +877,7 @@ export class ConditionalFormats implements ConditionalSource {
   private movedRule(rule: ConditionalRule, edits: StructuralEdit[]): ConditionalRule {
     const move = (values: ConditionalValue[]): ConditionalValue[] =>
       values.map((value) => {
-        if (!value || typeof value.value !== 'string' || NUMBER_TEXT.test(value.value)) return value;
+        if (!value || typeof value.value !== 'string' || textToNumber(value.value) !== undefined) return value;
         let text = value.value;
         for (const edit of edits) text = adjustFormula(text, this.sheet.name, edit);
         return text === value.value ? value : { ...value, value: text };
@@ -918,13 +1045,33 @@ export class ConditionalFormats implements ConditionalSource {
     if (this.calculated > 0 && this.deadline < Infinity && this.clock() > this.deadline) return PENDING;
     this.calculated++;
     try {
-      const shifted = shiftFormula(text, row - entry.anchorRow, col - entry.anchorCol);
-      return engine.evaluateText(shifted, { sheet: this.sheetIndex(), row, col });
+      const dRow = row - entry.anchorRow;
+      const dCol = col - entry.anchorCol;
+      const sheet = this.sheetIndex();
+      // The engine moves the references itself, from one parse of the text, as long as none
+      // of them leaves the sheet: those it would make #REF!, while in a conditional format
+      // they come back in at the opposite edge (the cell above row 1 is the last row).
+      // An engine without evaluateShifted() gets the moved text.
+      if (typeof engine.evaluateShifted === 'function' && ((dRow === 0 && dCol === 0) || this.staysOnSheet(text, dRow, dCol))) {
+        return engine.evaluateShifted(text, { sheet, row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+      }
+      return engine.evaluateText(shiftFormula(text, dRow, dCol, true), { sheet, row, col });
     } catch (error) {
       if (this.unparsed.size >= MAX_CONSTANTS) this.unparsed.clear();
       this.unparsed.add(text);
       return undefined;
     }
+  }
+
+  /** Whether every relative reference of the formula is still on the sheet once moved by (dRow, dCol). */
+  private staysOnSheet(text: string, dRow: number, dCol: number): boolean {
+    let extent = this.extents.get(text);
+    if (!extent) {
+      extent = relativeExtent(text);
+      if (this.extents.size >= MAX_CONSTANTS) this.extents.clear();
+      this.extents.set(text, extent);
+    }
+    return extent.minRow + dRow >= 0 && extent.maxRow + dRow < MAX_ROWS && extent.minCol + dCol >= 0 && extent.maxCol + dCol < MAX_COLS;
   }
 
   private sheetIndex(): number {
@@ -973,24 +1120,27 @@ export class ConditionalFormats implements ConditionalSource {
       case K_NOT_CONTAINS_TEXT:
       case K_BEGINS_WITH:
       case K_ENDS_WITH: {
-        if (typeof rule.text !== 'string') {
-          // Without the text the rule is only its formula.
+        if (!entry.textOnly) {
+          // Excel evaluates the formula; the text attribute is what its dialog shows. They
+          // differ in files other programs wrote, and in rules edited as formulas.
           const result = this.operand(entry, 0, row, col);
           if (result === PENDING) return PENDING;
-          return typeof result === 'number' ? result !== 0 : result === true;
+          // No engine, or a formula it cannot read: the text attribute is all there is.
+          if (result !== undefined || typeof rule.text !== 'string') return typeof result === 'number' ? result !== 0 : result === true;
         }
+        const wanted = rule.text as string;
         if (value === ERROR_CELL) return entry.kind === K_NOT_CONTAINS_TEXT;
         const text = textOfValue(value);
-        if (entry.kind === K_CONTAINS_TEXT) return searchText(text, rule.text);
-        if (entry.kind === K_NOT_CONTAINS_TEXT) return !searchText(text, rule.text);
-        const wanted = rule.text.toUpperCase();
-        const part = entry.kind === K_BEGINS_WITH ? text.slice(0, wanted.length) : wanted.length === 0 ? '' : text.slice(-wanted.length);
-        return part.toUpperCase() === wanted;
+        if (entry.kind === K_CONTAINS_TEXT) return searchText(text, wanted);
+        if (entry.kind === K_NOT_CONTAINS_TEXT) return !searchText(text, wanted);
+        if (entry.kind === K_BEGINS_WITH) return sameFolded(text.slice(0, wanted.length), wanted);
+        return sameFolded(wanted.length === 0 ? '' : text.slice(-wanted.length), wanted);
       }
+      // As LEN(TRIM(cell))=0, which Excel writes for these rules.
       case K_CONTAINS_BLANKS:
-        return value !== ERROR_CELL && textOfValue(value).trim() === '';
+        return value !== ERROR_CELL && isBlankText(textOfValue(value));
       case K_NOT_CONTAINS_BLANKS:
-        return value !== ERROR_CELL && textOfValue(value).trim() !== '';
+        return value !== ERROR_CELL && !isBlankText(textOfValue(value));
       case K_CONTAINS_ERRORS:
         return value === ERROR_CELL;
       case K_NOT_CONTAINS_ERRORS:
@@ -1061,28 +1211,39 @@ export class ConditionalFormats implements ConditionalSource {
   // -------------------------------------------------------------------------
   // What a rule knows about all of its cells
 
-  /** Calls `visit` for every cell the rule applies to that exists in the sheet. */
+  /**
+   * Calls `visit` for every cell the rule applies to that exists in the sheet, once: a cell
+   * that several ranges of the rule name is one cell of it.
+   */
   private eachCell(entry: Entry, visit: (cell: Cell) => void): void {
     const rows = this.sheet.rows;
+    // With one range no cell can come up twice.
+    const seen = entry.ranges.length > 1 ? new Set<number>() : undefined;
     for (let k = 0; k < entry.ranges.length; k++) {
       const { top, left, bottom, right } = entry.ranges[k];
-      const scan = (row: { cells: Cell[] }) => {
+      const scan = (row: { cells: Cell[] }, r: number) => {
         const cells = row.cells;
         const last = Math.min(right, cells.length - 1);
         for (let c = left; c <= last; c++) {
           const cell = cells[c];
-          if (cell) visit(cell);
+          if (!cell) continue;
+          if (seen) {
+            const key = r * MAX_COLS + c;
+            if (seen.has(key)) continue;
+            seen.add(key);
+          }
+          visit(cell);
         }
       };
       if (bottom - top + 1 <= rows.size) {
         for (let r = top; r <= bottom; r++) {
           const row = rows.get(r);
-          if (row) scan(row);
+          if (row) scan(row, r);
         }
       } else {
         // A range taller than the sheet is full: only the rows that exist are looked at.
         rows.forEach((row, r) => {
-          if (r >= top && r <= bottom) scan(row);
+          if (r >= top && r <= bottom) scan(row, r);
         });
       }
     }
@@ -1109,7 +1270,7 @@ export class ConditionalFormats implements ConditionalSource {
       min: count > 0 ? sorted[0] : NaN,
       max: count > 0 ? sorted[count - 1] : NaN,
       mean,
-      deviation: count > 1 ? Math.sqrt(squares / (count - 1)) : 0,
+      deviation: count > 0 ? Math.sqrt(squares / count) : 0,
     };
     return entry.stats;
   }
@@ -1252,7 +1413,9 @@ export class ConditionalFormats implements ConditionalSource {
     const clamp = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
     const span = high - low;
     const axisPosition = extended ? rule.axisPosition : 'none';
-    if (axisPosition === 'middle' && low < 0) {
+    if (axisPosition === 'middle') {
+      // UNSURE: the axis is in the middle of the cell whatever the signs of the values; with
+      // none below zero the bars use the right half only. Believed to be what Excel draws.
       const reach = Math.max(Math.abs(low), Math.abs(high));
       const length = reach > 0 ? clamp(Math.abs(value) / reach) / 2 : 0;
       bar.axis = 0.5;
@@ -1270,8 +1433,9 @@ export class ConditionalFormats implements ConditionalSource {
         bar.to = axis;
       }
     } else {
-      const minLength = (rule.minLength >= 0 && rule.minLength <= 100 ? rule.minLength : extended ? 0 : 10) / 100;
-      const maxLength = (rule.maxLength >= 0 && rule.maxLength <= 100 ? rule.maxLength : extended ? 100 : 90) / 100;
+      // The defaults of both the 2007 element and its 2010 extension.
+      const minLength = (rule.minLength >= 0 && rule.minLength <= 100 ? rule.minLength : 10) / 100;
+      const maxLength = (rule.maxLength >= 0 && rule.maxLength <= 100 ? rule.maxLength : 90) / 100;
       const share = span > 0 ? clamp((value - low) / span) : value >= high ? 1 : 0;
       bar.to = clamp(minLength + share * (maxLength - minLength));
       bar.negative = false;

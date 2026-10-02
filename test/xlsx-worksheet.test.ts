@@ -735,3 +735,51 @@ test('worksheet: conditional formats are read beside everything else, from both 
   // Broken XML inside a rule is still an error of the part, as anywhere else in it.
   assert.throws(() => read('<sheetData/><conditionalFormatting sqref="A1"><cfRule type="cellIs"></conditionalFormatting>'), /Invalid XML/);
 });
+
+// --- conditional formats: numbers and defaults ------------------------------------------------
+
+test('worksheet: a data bar of the 2010 extension without lengths has the lengths of the schema', () => {
+  const X14 = 'xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"';
+  const bar = (main: string, extension: string) => {
+    const sheet = emptySheet();
+    parseWorksheet(
+      utf8(
+        `${HEADER}<worksheet ${NS} ${X14}><sheetData/>` +
+          `<conditionalFormatting sqref="A1:A3"><cfRule type="dataBar" priority="1"><dataBar ${main}><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="{B025F937-C7B1-47D3-B67F-A62EFF666E3E}"><x14:id>{1}</x14:id></ext></extLst></cfRule></conditionalFormatting>` +
+          `<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}"><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{1}"><x14:dataBar ${extension}><x14:cfvo type="autoMin"/><x14:cfvo type="autoMax"/></x14:dataBar></x14:cfRule><xm:sqref>A1:A3</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst></worksheet>`,
+      ),
+      [],
+      sheet,
+    );
+    const found = sheet.conditionalFormats![0].rules[0].dataBar!;
+    return [found.extended, found.minLength, found.maxLength];
+  };
+  // UNSURE: 10 and 90 are the defaults of both elements; Excel writes 0 and 100 explicitly in the extension.
+  assert.deepEqual(bar('', ''), [true, 10, 90]);
+  // The lengths of the main element do not reach the extension, which states (or implies) its own.
+  assert.deepEqual(bar('minLength="20" maxLength="80"', ''), [true, 10, 90]);
+  assert.deepEqual(bar('', 'minLength="0" maxLength="100"'), [true, 0, 100]);
+  assert.deepEqual(bar('', 'minLength="5"'), [true, 5, 90]);
+  // Out of range or not a number: the default.
+  assert.deepEqual(bar('', 'minLength="-1" maxLength="101"'), [true, 10, 90]);
+  assert.deepEqual(bar('', 'minLength="x" maxLength="0x10"'), [true, 10, 90]);
+});
+
+test('worksheet: numbers are read by hand, in one pass', () => {
+  const value = (text: string) => getCell(read(data(`<row r="1"><c r="A1"><v>${text}</v></c></row>`)), 0, 0)!.value;
+  assert.equal(value('1'), 1);
+  assert.equal(value(' -1.5 '), -1.5);
+  assert.equal(value('+.5'), 0.5);
+  assert.equal(value('5.'), 5);
+  assert.equal(value('1e3'), 1000);
+  assert.equal(value('1.5E-2'), 0.015);
+  assert.equal(value('\n2\t'), 2);
+  for (const bad of [' ', '.', '+', '1e', '1e+', 'e5', '1.2.3', '0x10', '1 2', '1,5', 'NaN', 'INF', '--1', '1e5x', ' 1']) {
+    assert.throws(() => value(bad), /./, JSON.stringify(bad));
+  }
+  // 200,000 digits followed by a letter took minutes with a regular expression.
+  const start = Date.now();
+  assert.throws(() => value('9'.repeat(200000) + 'x'));
+  assert.equal(value('0.' + '0'.repeat(200000) + '1'), 0);
+  assert.ok(Date.now() - start < 1000, `${Date.now() - start} ms`);
+});
