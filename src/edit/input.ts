@@ -8,6 +8,7 @@
 import { LOCALE_EN, LOCALE_TR, normalizeLocale, type FormatLocale } from '../format/locale';
 import { isDateFormat, serialToDate } from '../format/number-format';
 import type { Cell } from '../model/sheet/types';
+import { formulaFromLocal, formulaToLocal } from './formula-locale';
 
 export interface InputOptions {
   locale?: FormatLocale;
@@ -568,7 +569,8 @@ export function parseCellInput(text: string, options?: InputOptions): ParsedInpu
   const first = text.charAt(0);
   if (first === '=') {
     if (text.length === 1) return { kind: 'string', value: text };
-    return { kind: 'blank', value: null, formula: text.substring(1) };
+    // Typed the way the locale writes formulas (";" between arguments, "1,5"); stored the one way files have them.
+    return { kind: 'blank', value: null, formula: formulaFromLocal(text.substring(1), resolveLocale(options)) };
   }
   // A leading apostrophe means "text, exactly as typed".
   if (first === "'") return stringResult(text.substring(1));
@@ -688,7 +690,7 @@ function isoSerial(text: string, date1904: boolean): number {
 export function cellEditText(cell: Cell | undefined, numFmt: string, options?: InputOptions): string {
   if (cell === undefined || cell === null) return '';
   if (cell.formula && typeof cell.formula.text === 'string' && cell.formula.text.length > 0) {
-    return '=' + cell.formula.text;
+    return '=' + formulaToLocal(cell.formula.text, resolveLocale(options));
   }
   const value = cell.value;
   if (value === null || value === undefined) return '';

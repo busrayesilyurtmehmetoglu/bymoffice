@@ -147,6 +147,10 @@ export class Toolbar {
     this.addSeparator();
     this.formatSelect = this.addSelect('bym-tb-format');
     this.addSeparator();
+    this.addButton('sortAscending', () => host.view.sort(false));
+    this.addButton('sortDescending', () => host.view.sort(true));
+    this.addButton('filter', () => host.view.toggleFilter(), true);
+    this.addSeparator();
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
 
     this.bars.textColor = this.barOf('textColor');
@@ -183,7 +187,7 @@ export class Toolbar {
     // Not during an edit either: the view would answer by dropping what was typed.
     this.setDisabled('undo', view.readOnly || view.isEditing || !view.history.canUndo);
     this.setDisabled('redo', view.readOnly || view.isEditing || !view.history.canRedo);
-    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'rowsColumns'];
+    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.sizeSelect.disabled = !editable;
     this.formatSelect.disabled = !editable;
@@ -198,6 +202,7 @@ export class Toolbar {
     this.setPressed('alignRight', horizontal === 'right');
     this.setPressed('wrapText', format.alignment.wrapText === true);
     this.setPressed('merge', view.selectionMerged);
+    this.setPressed('filter', view.hasFilter);
 
     this.showFontSize(fontSizeOf(format));
     this.showFormat(formatKindOf(format.numFmt, this.strings));
@@ -292,6 +297,9 @@ export class Toolbar {
       alignRight: s.alignRight,
       wrapText: s.wrapText,
       merge: s.mergeCells,
+      sortAscending: s.sortAscending,
+      sortDescending: s.sortDescending,
+      filter: s.filter,
       rowsColumns: s.rowsAndColumns,
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {

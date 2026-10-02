@@ -1,0 +1,541 @@
+// Data validation: what may be typed into a cell, the message a cell shows
+// when it is selected, and the list a cell offers its values in.
+//
+// The rules are read from the file and never changed here; the writer copies
+// their source. Rows and columns inserted or deleted since the sheet was read
+// are applied to the ranges and formulas when the rules are looked up, the way
+// conditional formats do it (see ConditionalFormats).
+//
+// Formulas are calculated by the engine the caller provides. A rule that needs
+// one and cannot get it (no engine, a formula the engine cannot read) is not
+// applied: the value is let through rather than refused for no reason.
+
+import type { CalcEngine } from '../calc/engine';
+import { parseFormula, type Node } from '../calc/parse';
+import { adjustAnchoredFormula, adjustRange, type StructuralEdit } from '../calc/refs';
+import { MAX_COLS, MAX_ROWS, type Cell, type CellRange, type DataValidation, type Sheet, type Workbook } from '../model/sheet/types';
+import { resolveCellStyle } from '../model/sheet/color';
+import { builtinFormatId, formatCell, isoToSerial } from './cell-format';
+import type { FormatLocale } from './locale';
+import { formatValue } from './number-format';
+
+/** Most values the list of a cell offers. */
+export const MAX_LIST_ITEMS = 10000;
+
+/** Most cells of a list source that are looked at to find a value. */
+const MAX_SOURCE_CELLS = 2000000;
+
+/** Defined names that only point at other names are followed this far. */
+const MAX_NAME_DEPTH = 8;
+
+export interface ValidationOptions {
+  /** The formula engine, made on first use; without one, rules that need formulas are not applied. */
+  engine?: () => CalcEngine | undefined;
+  locale?: FormatLocale;
+}
+
+export interface ValidationVerdict {
+  ok: boolean;
+  /** How strict the rule is: "stop" refuses the value, the others only tell. */
+  style?: 'stop' | 'warning' | 'information';
+  /** Title and text of the rule's own message, as the file states them; either may be missing. */
+  title?: string;
+  message?: string;
+}
+
+export interface ValidationList {
+  /** The values, as the cells of the source show them. */
+  items: string[];
+  /** The source has more values than the list holds. */
+  truncated: boolean;
+}
+
+/** A value refused by a rule of style "stop". `display` is what to tell the user: the rule's own words. */
+export class ValidationError extends RangeError {
+  readonly display: string;
+
+  constructor(display: string) {
+    super('The value does not match the data validation of the cell');
+    this.name = 'ValidationError';
+    this.display = display;
+  }
+}
+
+interface Entry {
+  rule: DataValidation;
+  ranges: CellRange[];
+  anchorRow: number;
+  anchorCol: number;
+  formula1: string | undefined;
+  formula2: string | undefined;
+}
+
+/** Where the values of a list come from. */
+type Source =
+  | { kind: 'constant'; items: string[] }
+  | { kind: 'cells'; sheet: Sheet; range: CellRange }
+  | { kind: 'formula'; text: string };
+
+type Plain = number | string | boolean;
+
+const OK: ValidationVerdict = { ok: true };
+
+function fold(text: string): string {
+  return text.replace(/[İIı]/g, 'i').toLowerCase();
+}
+
+/** A number as files write it; undefined for any other text. */
+function plainNumber(text: string): number | undefined {
+  const trimmed = text.trim();
+  if (trimmed.length === 0 || trimmed.length > 32 || !/^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(trimmed)) return undefined;
+  const value = Number(trimmed);
+  return isFinite(value) ? value : undefined;
+}
+
+function inRanges(ranges: CellRange[], row: number, col: number): boolean {
+  for (let i = 0; i < ranges.length; i++) {
+    const range = ranges[i];
+    if (row >= range.top && row <= range.bottom && col >= range.left && col <= range.right) return true;
+  }
+  return false;
+}
+
+/** The value a cell holds, as rules compare it; undefined for an empty cell and for an error. */
+function plainValue(cell: Cell | undefined, date1904: boolean): Plain | undefined {
+  if (!cell || cell.value === null || cell.value === undefined || cell.kind === 'blank' || cell.kind === 'error') return undefined;
+  if (cell.kind === 'date' && typeof cell.value === 'string') {
+    const serial = isoToSerial(cell.value, date1904);
+    return serial === undefined ? cell.value : serial;
+  }
+  return cell.value;
+}
+
+/** The items of a list written into the rule: "a,b,c" in quotes. */
+function constantItems(formula: string): string[] | undefined {
+  const text = formula.trim();
+  if (text.length < 2 || text.charAt(0) !== '"' || text.charAt(text.length - 1) !== '"') return undefined;
+  const inner = text.slice(1, -1);
+  // One string and nothing else: a quote inside it is doubled.
+  if (/(^|[^"])"([^"]|$)/.test(inner.replace(/""/g, ''))) return undefined;
+  // In the file the items are always separated by commas, whatever the locale of its author.
+  return inner
+    .replace(/""/g, '"')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item !== '');
+}
+
+function compare(value: number, operator: string, a: number, b: number | undefined): boolean {
+  switch (operator) {
+    case 'between':
+      return b === undefined ? value >= a : value >= Math.min(a, b) && value <= Math.max(a, b);
+    case 'notBetween':
+      return b === undefined ? value < a : value < Math.min(a, b) || value > Math.max(a, b);
+    case 'equal':
+      return value === a;
+    case 'notEqual':
+      return value !== a;
+    case 'greaterThan':
+      return value > a;
+    case 'lessThan':
+      return value < a;
+    case 'greaterThanOrEqual':
+      return value >= a;
+    case 'lessThanOrEqual':
+      return value <= a;
+    default:
+      // An operator this engine does not know: nothing is refused for it.
+      return true;
+  }
+}
+
+/** The data validations of one sheet, as they apply now. */
+export class DataValidations {
+  private readonly workbook: Workbook;
+  private readonly sheet: Sheet;
+  private readonly options: ValidationOptions;
+  private entries: Entry[] | undefined;
+  private rulesSeen: DataValidation[] | undefined;
+  /** The structuralEdits lists of all sheets the entries were built for. */
+  private editsSeen: (Sheet['structuralEdits'] | undefined)[] = [];
+
+  constructor(workbook: Workbook, sheet: Sheet, options: ValidationOptions = {}) {
+    this.workbook = workbook;
+    this.sheet = sheet;
+    this.options = options || {};
+  }
+
+  /** The sheet has at least one rule. */
+  get active(): boolean {
+    const rules = this.sheet.dataValidations;
+    return Array.isArray(rules) && rules.length > 0;
+  }
+
+  /** Changes the locale lists are shown in. */
+  setLocale(locale: FormatLocale | undefined): void {
+    this.options.locale = locale;
+  }
+
+  /** The rule that applies to a cell, with its ranges and formulas where they are now. */
+  ruleAt(row: number, col: number): DataValidation | undefined {
+    const entry = this.entryAt(row, col);
+    if (!entry) return undefined;
+    const rule: DataValidation = { ...entry.rule, ranges: entry.ranges };
+    if (entry.formula1 !== undefined) rule.formula1 = entry.formula1;
+    if (entry.formula2 !== undefined) rule.formula2 = entry.formula2;
+    return rule;
+  }
+
+  /** The message a cell shows while it is selected; undefined when it has none. */
+  prompt(row: number, col: number): { title: string; text: string } | undefined {
+    const entry = this.entryAt(row, col);
+    if (!entry || !entry.rule.showInputMessage) return undefined;
+    const title = typeof entry.rule.promptTitle === 'string' ? entry.rule.promptTitle : '';
+    const text = typeof entry.rule.prompt === 'string' ? entry.rule.prompt : '';
+    return title === '' && text === '' ? undefined : { title, text };
+  }
+
+  /** Whether a cell shows the button of a list: a list rule that does not hide it, with a source that can be read. */
+  hasList(row: number, col: number): boolean {
+    const entry = this.entryAt(row, col);
+    if (!entry || entry.rule.type !== 'list' || entry.rule.hideDropDown) return false;
+    try {
+      const source = this.source(entry, row, col);
+      if (!source || source.kind !== 'formula') return source !== undefined;
+      // A formula has a list to offer when the engine can count its values.
+      const engine = this.engine();
+      if (!engine) return false;
+      const count = engine.evaluateShifted(`ROWS(${source.text})*COLUMNS(${source.text})`, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+      return typeof count === 'number' && count >= 1;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /** The values a cell offers; undefined when its rule is not a list or the source cannot be read. */
+  list(row: number, col: number): ValidationList | undefined {
+    try {
+      const entry = this.entryAt(row, col);
+      if (!entry || entry.rule.type !== 'list') return undefined;
+      const items: string[] = [];
+      let truncated = false;
+      const known = this.eachSource(entry, row, col, (_value, text) => {
+        if (items.length >= MAX_LIST_ITEMS) {
+          truncated = true;
+          return true;
+        }
+        const shown = text();
+        if (shown !== '') items.push(shown);
+        return false;
+      });
+      return known === 'unknown' ? undefined : { items, truncated: truncated || known === 'cut' };
+    } catch (error) {
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether a cell may hold what is about to be written into it. `cell` is the cell the
+   * typed text turns into (undefined: the cell is emptied) and `typed` the text itself.
+   * A custom rule reads the cell through its formula, so it needs the new cell in place:
+   * `tryOut` runs a function while it is, and puts the old cell back.
+   *
+   * A formula is not checked (UNSURE: Excel checks its result), and neither is a cell
+   * whose rule says nothing happens on a wrong value. Never throws.
+   */
+  check(row: number, col: number, cell: Cell | undefined, typed: string, tryOut?: <T>(run: () => T) => T): ValidationVerdict {
+    try {
+      const entry = this.entryAt(row, col);
+      if (!entry) return OK;
+      const rule = entry.rule;
+      if (!rule.showErrorMessage || rule.type === 'none' || (cell && cell.formula)) return OK;
+      const date1904 = this.workbook.date1904 === true;
+      const value = plainValue(cell, date1904);
+      const failed: ValidationVerdict = { ok: false, style: rule.errorStyle };
+      if (typeof rule.errorTitle === 'string' && rule.errorTitle !== '') failed.title = rule.errorTitle;
+      if (typeof rule.error === 'string' && rule.error !== '') failed.message = rule.error;
+      if (value === undefined || value === '') {
+        // An error value typed in is never what a rule asks for; an empty cell is, where blanks are allowed.
+        if (cell && cell.kind === 'error') return failed;
+        return rule.allowBlank ? OK : failed;
+      }
+      let passes: boolean | undefined;
+      switch (rule.type) {
+        case 'whole':
+          passes = typeof value === 'number' && Math.floor(value) === value ? this.inLimits(entry, value, row, col) : false;
+          break;
+        case 'decimal':
+        case 'date':
+        case 'time':
+          passes = typeof value === 'number' ? this.inLimits(entry, value, row, col) : false;
+          break;
+        case 'textLength': {
+          const text = typeof value === 'string' ? value : typeof value === 'boolean' ? (value ? 'TRUE' : 'FALSE') : formatValue(value, 'General').text;
+          passes = this.inLimits(entry, text.length, row, col);
+          break;
+        }
+        case 'list':
+          passes = this.inList(entry, value, typed, row, col);
+          break;
+        case 'custom': {
+          const formula = entry.formula1;
+          if (formula === undefined) break;
+          const evaluate = () => this.truth(formula, entry, row, col);
+          passes = tryOut ? tryOut(evaluate) : evaluate();
+          break;
+        }
+        default:
+        // A kind of rule this engine does not know.
+      }
+      // undefined: the rule could not be worked out, and nothing is refused for that.
+      return passes === false ? failed : OK;
+    } catch (error) {
+      return OK;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+
+  private engine(): CalcEngine | undefined {
+    try {
+      return this.options.engine ? this.options.engine() : undefined;
+    } catch (error) {
+      return undefined;
+    }
+  }
+
+  private entryAt(row: number, col: number): Entry | undefined {
+    const entries = this.stale() ? this.build() : (this.entries as Entry[]);
+    for (let i = 0; i < entries.length; i++) if (inRanges(entries[i].ranges, row, col)) return entries[i];
+    return undefined;
+  }
+
+  /** Rows or columns were inserted or deleted, or the rules replaced, since the entries were built. */
+  private stale(): boolean {
+    if (!this.entries || this.rulesSeen !== this.sheet.dataValidations) return true;
+    const sheets = this.workbook.sheets || [];
+    if (sheets.length !== this.editsSeen.length) return true;
+    for (let i = 0; i < sheets.length; i++) if (sheets[i].structuralEdits !== this.editsSeen[i]) return true;
+    return false;
+  }
+
+  private build(): Entry[] {
+    const sheet = this.sheet;
+    const sheets = this.workbook.sheets || [];
+    this.rulesSeen = sheet.dataValidations;
+    this.editsSeen = sheets.map((other) => other.structuralEdits);
+    const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: sheet.name }));
+    const foreign: StructuralEdit[] = [];
+    for (const other of sheets) {
+      if (other === sheet || !other.structuralEdits) continue;
+      for (const edit of other.structuralEdits) foreign.push({ ...edit, sheetName: other.name });
+    }
+    const entries: Entry[] = [];
+    const rules = Array.isArray(sheet.dataValidations) ? sheet.dataValidations : [];
+    for (const rule of rules) {
+      if (!rule || !Array.isArray(rule.ranges)) continue;
+      let ranges = rule.ranges.filter((range) => !!range && range.top <= range.bottom && range.left <= range.right);
+      if (ranges.length === 0) continue;
+      const texts = [rule.formula1, rule.formula2].map((text) => (typeof text === 'string' ? text : undefined));
+      // The formulas are written for the top-left cell of the first range; they follow that corner.
+      const adjust = (edit: StructuralEdit, from: CellRange, to: CellRange) => {
+        for (let i = 0; i < texts.length; i++) {
+          const text = texts[i];
+          if (text !== undefined) texts[i] = adjustAnchoredFormula(text, sheet.name, edit, { row: from.top, col: from.left }, { row: to.top, col: to.left }, true);
+        }
+      };
+      for (const edit of own) {
+        const moved: CellRange[] = [];
+        for (const range of ranges) {
+          const next = adjustRange(range, edit);
+          if (next) moved.push(next);
+        }
+        if (moved.length === 0) {
+          ranges = moved;
+          break;
+        }
+        adjust(edit, ranges[0], moved[0]);
+        ranges = moved;
+      }
+      if (ranges.length === 0) continue;
+      for (const edit of foreign) adjust(edit, ranges[0], ranges[0]);
+      entries.push({ rule, ranges, anchorRow: ranges[0].top, anchorCol: ranges[0].left, formula1: texts[0], formula2: texts[1] });
+    }
+    this.entries = entries;
+    return entries;
+  }
+
+  /** The number a limit of a rule stands for at a cell; undefined when it cannot be worked out. */
+  private limit(text: string | undefined, entry: Entry, row: number, col: number): number | undefined {
+    if (text === undefined || text.trim() === '') return undefined;
+    const constant = plainNumber(text);
+    if (constant !== undefined) return constant;
+    const engine = this.engine();
+    if (!engine) return undefined;
+    const value = engine.evaluateShifted(text, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+    return typeof value === 'number' ? value : typeof value === 'boolean' ? (value ? 1 : 0) : undefined;
+  }
+
+  private inLimits(entry: Entry, value: number, row: number, col: number): boolean | undefined {
+    const a = this.limit(entry.formula1, entry, row, col);
+    if (a === undefined) return undefined;
+    const operator = entry.rule.operator || 'between';
+    const two = operator === 'between' || operator === 'notBetween';
+    const b = two ? this.limit(entry.formula2, entry, row, col) : undefined;
+    if (two && b === undefined) return undefined;
+    return compare(value, operator, a, b);
+  }
+
+  /** What a custom formula says of the cell: any number but 0, or TRUE, lets the value pass. */
+  private truth(formula: string, entry: Entry, row: number, col: number): boolean | undefined {
+    const engine = this.engine();
+    if (!engine) return undefined;
+    const value = engine.evaluateShifted(formula, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    // Text or an error: the formula does not say yes.
+    return false;
+  }
+
+  private sheetIndex(): number {
+    const index = (this.workbook.sheets || []).indexOf(this.sheet);
+    return index < 0 ? 0 : index;
+  }
+
+  /** A tree node that names cells of one sheet, as the range it names for the cell (row, col). */
+  private cellsOf(node: Node, home: Sheet, entry: Entry | undefined, row: number, col: number): { sheet: Sheet; range: CellRange } | undefined {
+    if (node.type !== 'ref' || node.external || node.sheetEnd !== undefined) return undefined;
+    let sheet = home;
+    if (node.sheet !== undefined) {
+      const wanted = node.sheet.toLowerCase();
+      const found = (this.workbook.sheets || []).find((other) => other.name.toLowerCase() === wanted);
+      if (!found) return undefined;
+      sheet = found;
+    }
+    // Relative sides are as far from the cell as they are, in the rule, from its first cell.
+    const dRow = entry ? row - entry.anchorRow : 0;
+    const dCol = entry ? col - entry.anchorCol : 0;
+    const abs = node.abs;
+    const top = node.wholeCols ? 0 : node.range.top + (abs.top ? 0 : dRow);
+    const bottom = node.wholeCols ? MAX_ROWS - 1 : node.range.bottom + (abs.bottom ? 0 : dRow);
+    const left = node.wholeRows ? 0 : node.range.left + (abs.left ? 0 : dCol);
+    const right = node.wholeRows ? MAX_COLS - 1 : node.range.right + (abs.right ? 0 : dCol);
+    if (!(top >= 0 && left >= 0 && bottom < MAX_ROWS && right < MAX_COLS && top <= bottom && left <= right)) return undefined;
+    return { sheet, range: { top, left, bottom, right } };
+  }
+
+  /** Where the list of a rule takes its values from, for one cell; undefined when the rule states nothing usable. */
+  private source(entry: Entry, row: number, col: number): Source | undefined {
+    const formula = entry.formula1;
+    if (formula === undefined || formula.trim() === '') return undefined;
+    const constant = constantItems(formula);
+    if (constant) return { kind: 'constant', items: constant };
+    let node: Node;
+    try {
+      node = parseFormula(formula);
+    } catch (error) {
+      return undefined;
+    }
+    const direct = this.cellsOf(node, this.sheet, entry, row, col);
+    if (direct) return { kind: 'cells', ...direct };
+    // A defined name: the sheet's own before the workbook's; names that name names are followed a few steps.
+    let home = this.sheet;
+    for (let depth = 0; node.type === 'name' && depth < MAX_NAME_DEPTH; depth++) {
+      const wanted = node.name.toLowerCase();
+      const scope = node.sheet === undefined ? this.sheetIndex() : (this.workbook.sheets || []).findIndex((other) => other.name.toLowerCase() === (node as { sheet: string }).sheet.toLowerCase());
+      const names = this.workbook.definedNames || [];
+      const found = names.find((name) => name.localSheet === scope && name.name.toLowerCase() === wanted) || names.find((name) => name.localSheet === undefined && name.name.toLowerCase() === wanted);
+      if (!found) return undefined;
+      try {
+        node = parseFormula(found.value.charAt(0) === '=' ? found.value.slice(1) : found.value);
+      } catch (error) {
+        return undefined;
+      }
+      if (found.localSheet !== undefined && this.workbook.sheets[found.localSheet]) home = this.workbook.sheets[found.localSheet];
+      // A name stands for the same cells wherever it is used.
+      const cells = this.cellsOf(node, home, undefined, row, col);
+      if (cells) return { kind: 'cells', ...cells };
+    }
+    return node.type === 'name' || node.type === 'ref' ? undefined : { kind: 'formula', text: formula };
+  }
+
+  /**
+   * Calls `visit` with every value of the list of a cell, in order, until it returns true.
+   * `text` gives the value as its cell shows it. Returns "unknown" when the source cannot
+   * be read, "cut" when it was too large to be read to its end.
+   */
+  private eachSource(entry: Entry, row: number, col: number, visit: (value: Plain, text: () => string) => boolean): 'done' | 'cut' | 'unknown' {
+    const source = this.source(entry, row, col);
+    if (!source) return 'unknown';
+    const locale = this.options.locale;
+    const date1904 = this.workbook.date1904 === true;
+    if (source.kind === 'constant') {
+      for (const item of source.items) if (visit(item, () => item)) break;
+      return 'done';
+    }
+    if (source.kind === 'cells') {
+      const { sheet, range } = source;
+      const bottom = Math.min(range.bottom, sheet.rowCount - 1);
+      const right = Math.min(range.right, sheet.colCount - 1);
+      if ((bottom - range.top + 1) * (right - range.left + 1) > MAX_SOURCE_CELLS) return 'unknown';
+      const styles = this.workbook.styles;
+      for (let r = range.top; r <= bottom; r++) {
+        const data = sheet.rows.get(r);
+        if (!data) continue;
+        for (let c = range.left; c <= right && c < data.cells.length; c++) {
+          const cell = data.cells[c];
+          const value = plainValue(cell, date1904);
+          if (value === undefined || value === '') continue;
+          const text = () => {
+            const style = resolveCellStyle(styles, cell.style);
+            return formatCell(cell, style.numFmt, { locale, date1904, builtinId: builtinFormatId(styles, style.numFmtId) }).text;
+          };
+          if (visit(value, text)) return 'done';
+        }
+      }
+      return 'done';
+    }
+    // Any other formula (OFFSET, INDIRECT, ...): the engine is asked for its values one by one.
+    const engine = this.engine();
+    if (!engine) return 'unknown';
+    const anchor = { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol };
+    const at = { row, col };
+    return engine.batch(() => {
+      const count = engine.evaluateShifted(`ROWS(${source.text})*COLUMNS(${source.text})`, anchor, at);
+      if (typeof count !== 'number' || !(count >= 1)) return 'unknown';
+      const single = engine.evaluateShifted(`ROWS(${source.text})`, anchor, at) === 1;
+      const last = Math.min(Math.floor(count), MAX_LIST_ITEMS);
+      for (let i = 1; i <= last; i++) {
+        const value = engine.evaluateShifted(single ? `INDEX(${source.text},1,${i})` : `INDEX(${source.text},${i})`, anchor, at);
+        if (value === null || value === '' || typeof value === 'object') continue;
+        const plain = value as Plain;
+        if (visit(plain, () => (typeof plain === 'string' ? plain : formatValue(plain, 'General', { locale }).text))) return 'done';
+      }
+      return count > last ? 'cut' : 'done';
+    });
+  }
+
+  private inList(entry: Entry, value: Plain, typed: string, row: number, col: number): boolean | undefined {
+    const source = this.source(entry, row, col);
+    if (!source) return undefined;
+    const text = typeof value === 'string' ? value : typed.trim();
+    let found = false;
+    if (source.kind === 'constant') {
+      // UNSURE: Excel compares a typed value with the items of a list written into the rule by case,
+      // and with the cells of a range without regard to it.
+      const known = this.eachSource(entry, row, col, (item) => {
+        const number = typeof value === 'number' ? plainNumber(String(item)) : undefined;
+        found = item === text || (number !== undefined && number === value) || (typeof value === 'boolean' && String(item).toUpperCase() === (value ? 'TRUE' : 'FALSE'));
+        return found;
+      });
+      return known === 'unknown' ? undefined : found;
+    }
+    const folded = typeof value === 'string' ? fold(value) : undefined;
+    const known = this.eachSource(entry, row, col, (item) => {
+      found = typeof item === 'string' ? folded !== undefined && fold(item) === folded : item === value;
+      return found;
+    });
+    // A source that could not be read to its end may hold the value further down.
+    return found ? true : known === 'done' ? false : undefined;
+  }
+}

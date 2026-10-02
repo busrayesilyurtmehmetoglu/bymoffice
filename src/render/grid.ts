@@ -30,6 +30,8 @@ export interface GridTheme {
   selectionFill: string;
   frozenLine: string;
   defaultText: string;
+  /** Row numbers of the rows a filter with criteria governs. Blue when missing. */
+  filterHeaderText?: string;
 }
 
 export const DEFAULT_GRID_THEME: GridTheme = {
@@ -50,6 +52,31 @@ export interface GridSelection {
   range: CellRange;
 }
 
+/** The filter of a sheet as the grid draws it: a button in each header cell, and the rows it governs. */
+export interface GridFilter {
+  /** The header row is the first row of the range. */
+  range: CellRange;
+  /** By column, counted from the left edge of the range: 0 no button, 1 a button, 2 the button of a column with a criterion. */
+  buttons: ArrayLike<number>;
+  /** Some criterion is set: the numbers of the rows under the header are drawn in the filter colour. */
+  filtered: boolean;
+}
+
+/** Largest size of the button a filter or a list draws inside a cell, in pixels. */
+export const CELL_BUTTON_SIZE = 16;
+const MIN_CELL_BUTTON = 8;
+
+/**
+ * The square a cell's button (filter, list) takes: the bottom right corner of the cell, inside
+ * its grid lines. Undefined for a cell too small to hold one. The view uses the same function
+ * to tell a press on the button from a press on the cell.
+ */
+export function cellButtonRect(x: number, y: number, width: number, height: number): { x: number; y: number; size: number } | undefined {
+  const size = Math.min(CELL_BUTTON_SIZE, Math.floor(width) - 2, Math.floor(height) - 2);
+  if (!(size >= MIN_CELL_BUTTON)) return undefined;
+  return { x: x + width - size - 1, y: y + height - size - 1, size };
+}
+
 export interface GridScene {
   workbook: Workbook;
   sheet: Sheet;
@@ -62,6 +89,16 @@ export interface GridScene {
   devicePixelRatio: number;
   /** Conditional formats of the sheet; nothing is asked of it for a sheet that has none. */
   conditional?: ConditionalSource;
+  /** The filter of the sheet. */
+  filter?: GridFilter;
+  /** The cell that shows the button of a list to choose from (a data validation). */
+  dropdown?: { row: number; col: number };
+  /**
+   * A mark in the top left corner of a cell, as Excel marks cells it has something to say
+   * about: the colour of the mark ("#RRGGBB"), or undefined for no mark. Asked for every
+   * visible cell of every frame, so it has to be a plain lookup.
+   */
+  cellMark?(row: number, col: number): string | undefined;
 }
 
 /** Space between a cell edge and its text, in pixels. */
@@ -225,6 +262,9 @@ interface Frame {
   conditional: ConditionalSource | undefined;
   /** Cell formats with a conditional format on top, by the conditional format and the index of the cell format. */
   conditionalStyles: Map<ConditionalStyle, Map<number, DrawStyle>>;
+  filter: GridFilter | undefined;
+  dropdown: { row: number; col: number } | undefined;
+  cellMark: ((row: number, col: number) => string | undefined) | undefined;
 }
 
 /** Draws the whole scene. The canvas backing store is layout.width*dpr by layout.height*dpr. */
@@ -259,6 +299,9 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     colorStyleCache: new Map(),
     conditional: scene.conditional && typeof scene.conditional.resolve === 'function' ? scene.conditional : undefined,
     conditionalStyles: new Map(),
+    filter: validFilter(scene.filter),
+    dropdown: scene.dropdown && scene.dropdown.row >= 0 && scene.dropdown.col >= 0 ? scene.dropdown : undefined,
+    cellMark: typeof scene.cellMark === 'function' ? scene.cellMark : undefined,
   };
   if (frame.conditional && frame.conditional.begin) frame.conditional.begin();
 
@@ -283,6 +326,12 @@ function validSelection(selection: GridSelection | undefined): GridSelection | u
   const { row, col } = selection.active;
   if (!(row >= 0 && row < MAX_ROWS && col >= 0 && col < MAX_COLS)) return undefined;
   return { active: { row: Math.floor(row), col: Math.floor(col) }, range };
+}
+
+function validFilter(filter: GridFilter | undefined): GridFilter | undefined {
+  if (!filter || !filter.range || !filter.buttons) return undefined;
+  const range = clampRange(filter.range);
+  return range === filter.range ? filter : undefined;
 }
 
 /** The range cut to the sheet; undefined when it is not a range (NaN, inverted, outside). */
@@ -685,6 +734,9 @@ function drawPane(frame: Frame, view: PaneView): void {
   if (hEdges && vEdges) strokeEdges(ctx, view, hEdges, vEdges);
 
   drawPaneText(frame, view, textRows, textCols);
+  if (frame.cellMark) drawCellMarks(frame, view, frame.cellMark);
+  if (frame.filter) drawFilterButtons(frame, view, frame.filter);
+  if (frame.dropdown) drawDropdown(frame, view, frame.dropdown);
   if (frame.selection) drawSelection(frame, view, frame.selection);
 
   ctx.restore();
@@ -1317,6 +1369,106 @@ function drawIcon(frame: Frame, icon: IconGlyph, x: number, y: number, size: num
 }
 
 // ---------------------------------------------------------------------------
+// Marks and buttons inside cells
+
+const MARK_SIZE = 6;
+const BUTTON_FACE = '#FFFFFF';
+const BUTTON_BORDER = '#9AA0A6';
+const BUTTON_GLYPH = '#444746';
+const BUTTON_ACTIVE = '#1A7F45';
+const DEFAULT_FILTER_TEXT = '#1A56C4';
+
+/** A small triangle in the top left corner of every visible cell that has a mark. */
+function drawCellMarks(frame: Frame, view: PaneView, markOf: (row: number, col: number) => string | undefined): void {
+  const { ctx } = frame;
+  const { cols, rows } = view;
+  for (let ri = 0; ri < rows.index.length; ri++) {
+    if (rows.size[ri] < MARK_SIZE) continue;
+    for (let ci = 0; ci < cols.index.length; ci++) {
+      if (cols.size[ci] < MARK_SIZE) continue;
+      let color: string | undefined;
+      try {
+        color = markOf(rows.index[ri], cols.index[ci]);
+      } catch (error) {
+        return;
+      }
+      if (typeof color !== 'string' || !HEX_COLOR.test(color)) continue;
+      const x = cols.pos[ci];
+      const y = rows.pos[ri];
+      frame.painter.setFill(color);
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + MARK_SIZE, y);
+      ctx.lineTo(x, y + MARK_SIZE);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
+/** A button in the bottom right corner of a cell: an arrow, or a funnel when `active`. */
+function drawCellButton(frame: Frame, x: number, y: number, width: number, height: number, active: boolean): void {
+  const rect = cellButtonRect(x, y, width, height);
+  if (!rect) return;
+  const { ctx } = frame;
+  const size = rect.size;
+  frame.painter.setFill(active ? BUTTON_ACTIVE : BUTTON_FACE);
+  ctx.fillRect(rect.x, rect.y, size, size);
+  ctx.strokeStyle = active ? BUTTON_ACTIVE : BUTTON_BORDER;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, size - 1, size - 1);
+  frame.painter.setFill(active ? BUTTON_FACE : BUTTON_GLYPH);
+  const cx = rect.x + size / 2;
+  const cy = rect.y + size / 2;
+  const half = size / 4;
+  ctx.beginPath();
+  if (active) {
+    // A funnel: wide at the top, with a stem.
+    ctx.moveTo(cx - half - 1, cy - half);
+    ctx.lineTo(cx + half + 1, cy - half);
+    ctx.lineTo(cx + 1, cy);
+    ctx.lineTo(cx + 1, cy + half + 1);
+    ctx.lineTo(cx - 1, cy + half);
+    ctx.lineTo(cx - 1, cy);
+  } else {
+    ctx.moveTo(cx - half, cy - half / 2);
+    ctx.lineTo(cx + half, cy - half / 2);
+    ctx.lineTo(cx, cy + half / 2 + 1);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawFilterButtons(frame: Frame, view: PaneView, filter: GridFilter): void {
+  const { cols, rows } = view;
+  const ri = lowerBound(rows.index, filter.range.top);
+  if (ri >= rows.index.length || rows.index[ri] !== filter.range.top) return;
+  for (let ci = lowerBound(cols.index, filter.range.left); ci < cols.index.length && cols.index[ci] <= filter.range.right; ci++) {
+    const state = filter.buttons[cols.index[ci] - filter.range.left];
+    if (state === 1 || state === 2) drawCellButton(frame, cols.pos[ci], rows.pos[ri], cols.size[ci], rows.size[ri], state === 2);
+  }
+}
+
+/** The button of a list in a cell; in a merged cell it sits in the corner of the whole area. */
+function drawDropdown(frame: Frame, view: PaneView, cell: { row: number; col: number }): void {
+  const metrics = frame.layout.metrics;
+  let area: CellRange = { top: cell.row, left: cell.col, bottom: cell.row, right: cell.col };
+  for (const merge of frame.merges) {
+    if (cell.row >= merge.top && cell.row <= merge.bottom && cell.col >= merge.left && cell.col <= merge.right) {
+      area = merge;
+      break;
+    }
+  }
+  const pane = view.pane.rect;
+  const x0 = Math.round(view.cols.origin + metrics.cols.offset(area.left));
+  const x1 = Math.round(view.cols.origin + metrics.cols.offset(area.right + 1));
+  const y0 = Math.round(view.rows.origin + metrics.rows.offset(area.top));
+  const y1 = Math.round(view.rows.origin + metrics.rows.offset(area.bottom + 1));
+  if (x1 <= pane.x || y1 <= pane.y || x1 > pane.x + pane.width + 1 || y1 > pane.y + pane.height + 1) return;
+  drawCellButton(frame, x0, y0, x1 - x0, y1 - y0, false);
+}
+
+// ---------------------------------------------------------------------------
 // Selection, headers, frozen lines
 
 function drawSelection(frame: Frame, view: PaneView, selection: GridSelection): void {
@@ -1446,8 +1598,18 @@ function drawHeaders(frame: Frame, views: PaneView[]): void {
     }
     ctx.stroke();
     ctx.fillStyle = theme.headerText;
+    // The rows a filter with criteria governs show their numbers in another colour, as Excel does.
+    const filter = frame.filter && frame.filter.filtered ? frame.filter.range : undefined;
+    const filterText = filter ? safeColor(theme.filterHeaderText) || DEFAULT_FILTER_TEXT : theme.headerText;
+    let filterOn = false;
     for (let ri = 0; ri < count; ri++) {
-      if (rows.size[ri] >= MIN_ROW_LABEL_HEIGHT) ctx.fillText(String(rows.index[ri] + 1), headerWidth / 2, rows.pos[ri] + rows.size[ri] / 2);
+      if (rows.size[ri] < MIN_ROW_LABEL_HEIGHT) continue;
+      const inside = filter !== undefined && rows.index[ri] > filter.top && rows.index[ri] <= filter.bottom;
+      if (inside !== filterOn) {
+        filterOn = inside;
+        ctx.fillStyle = inside ? filterText : theme.headerText;
+      }
+      ctx.fillText(String(rows.index[ri] + 1), headerWidth / 2, rows.pos[ri] + rows.size[ri] / 2);
     }
     ctx.restore();
   }

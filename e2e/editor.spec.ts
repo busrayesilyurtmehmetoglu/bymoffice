@@ -215,7 +215,7 @@ test.describe('layout', () => {
         viewport: document.documentElement.clientWidth,
       };
     });
-    expect(facts.buttons).toBe(15);
+    expect(facts.buttons).toBe(18);
     expect(facts.sizes).toEqual([facts.coarse ? '40x40' : '32x32']);
     expect(facts.scrolls).toBe(true);
     expect(facts.scrolled).toBe(true);
@@ -648,6 +648,11 @@ test.describe('keyboard and focus', () => {
     expect(await focused()).toBe('rowsColumns');
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('rowsColumns');
+    await page.keyboard.press('ArrowLeft');
+    expect(await focused()).toBe('filter');
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    expect(await focused()).toBe('sortAscending');
     // The number format list lies between these two buttons.
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('merge');
@@ -1026,7 +1031,7 @@ test.describe('read-only', () => {
   test('disables every editing control, locks the formula bar and says so', async ({ page }) => {
     await mount(page, await editorWorkbook(), { readOnly: true });
     const controls = page.locator('#host .bym-toolbar button, #host .bym-toolbar select');
-    await expect(controls).toHaveCount(17);
+    await expect(controls).toHaveCount(20);
     expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).length)).toBe(0);
     await expect(page.locator('#host .bym-formula-input')).toHaveAttribute('readonly', '');
     const badge = page.locator('#host .bym-status-badge');

@@ -42,6 +42,9 @@ export interface EditorStrings {
   /** Format codes the "Currency" and "Date" entries apply. */
   currencyCode: string;
   dateCode: string;
+  sortAscending: string;
+  sortDescending: string;
+  filter: string;
   rowsAndColumns: string;
   insertRowsAbove(count: number): string;
   insertRowsBelow(count: number): string;
@@ -117,6 +120,9 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   formatCustom: 'Custom',
   currencyCode: '"$"#,##0.00',
   dateCode: 'm/d/yyyy',
+  sortAscending: 'Sort A to Z',
+  sortDescending: 'Sort Z to A',
+  filter: 'Filter',
   rowsAndColumns: 'Rows and columns',
   insertRowsAbove: (count) => `Insert ${rows(count)} above`,
   insertRowsBelow: (count) => `Insert ${rows(count)} below`,
@@ -175,6 +181,9 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   formatCustom: 'Özel',
   currencyCode: '#,##0.00 "₺"',
   dateCode: 'dd.mm.yyyy',
+  sortAscending: "A'dan Z'ye sırala",
+  sortDescending: "Z'den A'ya sırala",
+  filter: 'Süzgeç',
   rowsAndColumns: 'Satırlar ve sütunlar',
   insertRowsAbove: (count) => `Üste ${satir(count)} ekle`,
   insertRowsBelow: (count) => `Alta ${satir(count)} ekle`,

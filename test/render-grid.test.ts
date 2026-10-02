@@ -4,8 +4,8 @@ import { createLayout } from '../src/layout/grid-geometry';
 import { createSheetMetrics } from '../src/layout/sheet-metrics';
 import { createSheet, emptyStyleSheet } from '../src/model/sheet/types';
 import type { Alignment, Border, Cell, CellRange, Fill, Font, Row, Sheet, StyleSheet, Workbook } from '../src/model/sheet/types';
-import { DEFAULT_GRID_THEME, renderGrid } from '../src/render/grid';
-import type { GridSelection } from '../src/render/grid';
+import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid } from '../src/render/grid';
+import type { GridFilter, GridScene, GridSelection } from '../src/render/grid';
 import { clearTextMeasureCache, FONT_FALLBACK } from '../src/render/text';
 import { LOCALE_TR, type FormatLocale } from '../src/format/locale';
 import { ConditionalFormats, type CellConditional, type ConditionalSource } from '../src/format/conditional';
@@ -266,6 +266,9 @@ interface DrawOptions {
   date1904?: boolean;
   /** Conditional formats; `true` for the ones the sheet itself holds. */
   conditional?: ConditionalSource | true;
+  filter?: GridFilter;
+  dropdown?: GridScene['dropdown'];
+  cellMark?: GridScene['cellMark'];
 }
 
 function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
@@ -292,6 +295,9 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     locale: options.locale,
     devicePixelRatio: options.dpr === undefined ? 1 : options.dpr,
     conditional: options.conditional === true ? new ConditionalFormats(workbook, sheet) : options.conditional,
+    filter: options.filter,
+    dropdown: options.dropdown,
+    cellMark: options.cellMark,
   });
   assert.equal(ctx.saves, ctx.restores, 'save() and restore() are balanced');
   return ctx;
@@ -1387,4 +1393,107 @@ test('grid: when an icon leaves no room, the text is not drawn', () => {
   const inA1 = ctx.cellTexts.filter((call) => call.y < HY + RH && call.x < HX + 19);
   assert.deepEqual(inA1.map((call) => call.text), []);
   assert.equal(ctx.cellTexts.filter((call) => call.text === '7').length, 2);
+});
+
+// --- buttons and marks inside cells ---------------------------------------------------
+
+const BUTTON_BORDER = '#9AA0A6';
+const BUTTON_ACTIVE = '#1A7F45';
+
+test('grid: the square of a cell button sits in the bottom right corner and needs room', () => {
+  assert.deepEqual(cellButtonRect(HX, HY, CW, RH), { x: HX + CW - 17, y: HY + RH - 17, size: 16 });
+  // A low row gets a smaller button; a cell too small for one gets none.
+  assert.deepEqual(cellButtonRect(0, 0, 64, 12), { x: 53, y: 1, size: 10 });
+  assert.equal(cellButtonRect(0, 0, 64, 9), undefined);
+  assert.equal(cellButtonRect(0, 0, 8, 20), undefined);
+  assert.equal(cellButtonRect(0, 0, 0, 0), undefined);
+});
+
+test('grid: a filter draws a button in each header cell, a filled one where a criterion is set', () => {
+  const sheet = newSheet();
+  for (let c = 0; c < 4; c++) put(sheet, 1, c, `h${c}`);
+  for (let r = 2; r < 6; r++) put(sheet, r, 0, r);
+  const filter: GridFilter = { range: range(1, 0, 5, 3), buttons: [1, 2, 0, 1], filtered: true };
+  const ctx = draw(sheet, { filter });
+  const top = HY + RH + RH - 17;
+  // Three buttons (column C has none): a border each, the one of column B in the colour of an active filter.
+  const borders = ctx.strokeRects.filter((call) => call.style === BUTTON_BORDER || call.style === BUTTON_ACTIVE);
+  assert.deepEqual(
+    borders.map((call) => [call.x, call.y, call.width, call.height, call.style]),
+    [
+      [HX + CW - 17 + 0.5, top + 0.5, 15, 15, BUTTON_BORDER],
+      [HX + 2 * CW - 17 + 0.5, top + 0.5, 15, 15, BUTTON_ACTIVE],
+      [HX + 4 * CW - 17 + 0.5, top + 0.5, 15, 15, BUTTON_BORDER],
+    ],
+  );
+  assert.deepEqual(ctx.fills(BUTTON_ACTIVE).map((call) => [call.x, call.y, call.width, call.height]), [[HX + 2 * CW - 17, top, 16, 16]]);
+  // An arrow in the plain buttons, a funnel in the filled one.
+  assert.equal(ctx.paths.filter((path) => path.fill === '#444746' && path.points.length === 3).length, 2);
+  assert.equal(ctx.paths.filter((path) => path.fill === '#FFFFFF' && path.points.length === 6).length, 1);
+
+  // The numbers of the rows under the header are blue; the header row and the rows outside keep their colour.
+  const numbers = ctx.headerTexts.filter((call) => /^\d+$/.test(call.text));
+  const colourOf = (text: string) => numbers.filter((call) => call.text === text)[0].fill;
+  assert.equal(colourOf('1'), DEFAULT_GRID_THEME.headerText);
+  assert.equal(colourOf('2'), DEFAULT_GRID_THEME.headerText);
+  assert.equal(colourOf('3'), '#1A56C4');
+  assert.equal(colourOf('6'), '#1A56C4');
+  assert.equal(colourOf('7'), DEFAULT_GRID_THEME.headerText);
+  // Column letters are never coloured.
+  assert.equal(ctx.headerTexts.filter((call) => call.text === 'A')[0].fill, DEFAULT_GRID_THEME.headerText);
+});
+
+test('grid: a filter without criteria leaves the row numbers alone, and a header row out of sight draws no buttons', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 'h');
+  const plain = draw(sheet, { filter: { range: range(0, 0, 9, 1), buttons: [1, 1], filtered: false } });
+  assert.equal(plain.strokeRects.filter((call) => call.style === BUTTON_BORDER).length, 2);
+  assert.equal(plain.headerTexts.filter((call) => call.fill === '#1A56C4').length, 0);
+  // Scrolled down by five rows: the header row is not drawn, the numbers still are.
+  const scrolled = draw(sheet, { filter: { range: range(0, 0, 9, 1), buttons: [1, 1], filtered: true }, scrollY: 5 * RH });
+  assert.equal(scrolled.strokeRects.filter((call) => call.style === BUTTON_BORDER).length, 0);
+  assert.equal(scrolled.headerTexts.filter((call) => call.text === '6')[0].fill, '#1A56C4');
+  assert.equal(scrolled.headerTexts.filter((call) => call.text === '11')[0].fill, DEFAULT_GRID_THEME.headerText);
+  // A filter that is not a range, or has no buttons, is ignored.
+  for (const filter of [{ range: range(5, 0, 1, 1), buttons: [1, 1], filtered: true }, { range: range(Number.NaN, 0, 1, 1), buttons: [1], filtered: true }, { range: range(0, 0, 1, 1), filtered: true }]) {
+    const ctx = draw(sheet, { filter: filter as GridFilter });
+    assert.equal(ctx.strokeRects.filter((call) => call.style === BUTTON_BORDER).length, 0);
+  }
+});
+
+test('grid: the button of a list is drawn in its cell, and in the corner of a merged cell', () => {
+  const sheet = newSheet();
+  put(sheet, 1, 1, 'x');
+  const ctx = draw(sheet, { dropdown: { row: 1, col: 1 } });
+  assert.deepEqual(ctx.strokeRects.filter((call) => call.style === BUTTON_BORDER).map((call) => [call.x, call.y]), [[HX + 2 * CW - 17 + 0.5, HY + 2 * RH - 17 + 0.5]]);
+  sheet.merges = [range(1, 1, 2, 2)];
+  const merged = draw(sheet, { dropdown: { row: 1, col: 1 } });
+  assert.deepEqual(merged.strokeRects.filter((call) => call.style === BUTTON_BORDER).map((call) => [call.x, call.y]), [[HX + 3 * CW - 17 + 0.5, HY + 3 * RH - 17 + 0.5]]);
+  assert.equal(draw(sheet, { dropdown: { row: -1, col: 0 } }).strokeRects.filter((call) => call.style === BUTTON_BORDER).length, 0);
+});
+
+test('grid: cell marks are small triangles in the top left corner, asked for visible cells only', () => {
+  const sheet = newSheet();
+  put(sheet, 0, 0, 1);
+  const asked: string[] = [];
+  const ctx = draw(sheet, {
+    width: HX + 3 * CW,
+    height: HY + 2 * RH,
+    cellMark: (row, col) => {
+      asked.push(`${row},${col}`);
+      return row === 1 && col === 2 ? '#E8710A' : row === 0 && col === 0 ? 'red; evil' : undefined;
+    },
+  });
+  assert.deepEqual(asked, ['0,0', '0,1', '0,2', '1,0', '1,1', '1,2']);
+  // One triangle: the colour that is not a plain "#RRGGBB" is not used.
+  const triangles = ctx.paths.filter((path) => path.points.length === 3 && path.arcs.length === 0);
+  assert.deepEqual(triangles.map((path) => [path.fill, path.points]), [['#E8710A', [[HX + 2 * CW, HY + RH], [HX + 2 * CW + 6, HY + RH], [HX + 2 * CW, HY + RH + 6]]]]);
+  // A lookup that throws draws nothing and breaks nothing.
+  const broken = draw(sheet, {
+    cellMark: () => {
+      throw new Error('no');
+    },
+  });
+  assert.equal(broken.paths.filter((path) => path.points.length === 3).length, 0);
+  assert.equal(broken.textCall('1').text, '1');
 });

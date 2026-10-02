@@ -19,6 +19,9 @@ export type IconName =
   | 'alignRight'
   | 'wrapText'
   | 'merge'
+  | 'sortAscending'
+  | 'sortDescending'
+  | 'filter'
   | 'rowsColumns';
 
 type Shape = [tag: string, attrs: { [name: string]: string }];
@@ -54,6 +57,10 @@ const ICONS: { [name in IconName]: Shape[] } = {
   alignRight: [path('M4 6h16 M10 10h10 M4 14h16 M10 18h10')],
   wrapText: [path('M4 6h16 M4 18h5 M4 12h13a3 3 0 0 1 0 6h-4'), path('m15 16-2 2 2 2')],
   merge: [path('M3 6h18v12H3z'), path('M6 12h4 M8 10l2 2-2 2 M18 12h-4 M16 10l-2 2 2 2')],
+  // Bars that grow (or shrink) beside an arrow that points down.
+  sortAscending: [path('M17 5v14 M14 16l3 3 3-3'), path('M4 7h4 M4 12h6 M4 17h8')],
+  sortDescending: [path('M17 5v14 M14 16l3 3 3-3'), path('M4 7h8 M4 12h6 M4 17h4')],
+  filter: [path('M4 5h16l-6.2 7.4V18l-3.6 1.8v-7.4z')],
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
 };
 

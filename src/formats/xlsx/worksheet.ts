@@ -10,6 +10,7 @@ import {
   cellName,
   parseCellRef,
   parseRange,
+  type AutoFilter,
   type Cell,
   type CellFormula,
   type CellRange,
@@ -20,13 +21,19 @@ import {
   type ConditionalIconSet,
   type ConditionalRule,
   type ConditionalValue,
+  type DataValidation,
+  type FilterColumn,
+  type FilterCondition,
+  type FilterDateGroup,
   type Hyperlink,
   type Row,
   type SharedString,
   type Sheet,
   type SheetView,
+  type SortCondition,
+  type SortState,
 } from '../../model/sheet/types';
-import { childElements, localName, parseXml, type XmlElement } from '../../xml';
+import { childElements, localName, parseXml, serializeXml, type XmlElement } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { decodeXstring, parseColor, parseStringItem } from './shared-strings';
 import { parseColor as parseColorElement, parseDifferentialFormat } from './styles';
@@ -756,6 +763,215 @@ function parseConditionalFormatting(sc: XmlScanner, extension: boolean): Conditi
   return format;
 }
 
+// ---------------------------------------------------------------------------
+// Filter and sort state
+//
+// Read as a tree like the conditional formats. Unlike them the filter is kept up to
+// date by edits, and written from the model once it was changed; what the model has
+// no field for is kept as source text beside the fields.
+
+const sourceText = (root: XmlElement) => serializeXml({ declaration: null, leading: [], root, trailing: [] });
+
+/** The attributes of an element that are not in `known`, in document order. */
+function otherAttrs(el: XmlElement, known: string[]): [string, string][] | undefined {
+  let out: [string, string][] | undefined;
+  for (const [name, value] of el.attrs) {
+    if (known.indexOf(name) >= 0) continue;
+    if (out) out.push([name, value]);
+    else out = [[name, value]];
+  }
+  return out;
+}
+
+function parseDateGroup(el: XmlElement): FilterDateGroup | undefined {
+  const year = parseUint(el.attrs.get('year'));
+  if (year < 0) return undefined;
+  const group: FilterDateGroup = { grouping: el.attrs.get('dateTimeGrouping') || 'year', year };
+  for (const part of ['month', 'day', 'hour', 'minute', 'second'] as const) {
+    const value = parseUint(el.attrs.get(part));
+    if (value >= 0) group[part] = value;
+  }
+  return group;
+}
+
+/** Reads a <filterColumn>; undefined when it names no column of the sheet. */
+function parseFilterColumn(el: XmlElement): FilterColumn | undefined {
+  const colId = parseUint(el.attrs.get('colId'));
+  if (colId < 0 || colId >= MAX_COLS) return undefined;
+  const column: FilterColumn = { colId, kind: 'none', raw: sourceText(el) };
+  if (flagAttr(el, 'hiddenButton', false) || !flagAttr(el, 'showButton', true)) column.hiddenButton = true;
+  for (const child of el.children) {
+    if (child.type !== 'element') continue;
+    const local = localName(child.name);
+    // More than one criterion is not valid; what comes after the first is not understood.
+    if (local !== 'extLst' && column.kind !== 'none') {
+      column.kind = 'unknown';
+      continue;
+    }
+    switch (local) {
+      case 'filters': {
+        column.kind = 'values';
+        column.values = [];
+        if (flagAttr(child, 'blank', false)) column.blank = true;
+        for (const item of child.children) {
+          if (item.type !== 'element') continue;
+          const name = localName(item.name);
+          if (name === 'filter') {
+            const value = item.attrs.get('val');
+            if (value !== undefined) column.values.push(decodeXstring(value));
+          } else if (name === 'dateGroupItem') {
+            const group = parseDateGroup(item);
+            if (group) (column.dateGroups || (column.dateGroups = [])).push(group);
+          }
+        }
+        break;
+      }
+      case 'customFilters': {
+        column.kind = 'custom';
+        column.and = flagAttr(child, 'and', false);
+        const conditions: FilterCondition[] = [];
+        for (const item of childElements(child, 'customFilter')) {
+          conditions.push({ operator: item.attrs.get('operator') || 'equal', value: decodeXstring(item.attrs.get('val') || '') });
+        }
+        column.conditions = conditions;
+        break;
+      }
+      case 'top10': {
+        const value = parseFinite(child.attrs.get('val'));
+        column.kind = value === undefined ? 'unknown' : 'top10';
+        column.top = flagAttr(child, 'top', true);
+        column.percent = flagAttr(child, 'percent', false);
+        if (value !== undefined) column.value = value;
+        break;
+      }
+      case 'dynamicFilter':
+        column.kind = 'dynamic';
+        column.dynamicType = child.attrs.get('type') || '';
+        break;
+      case 'colorFilter':
+        column.kind = 'color';
+        break;
+      case 'iconFilter':
+        column.kind = 'icon';
+        break;
+      case 'extLst':
+        break;
+      default:
+        column.kind = 'unknown';
+    }
+  }
+  return column;
+}
+
+function parseSortState(el: XmlElement): SortState | undefined {
+  const range = parseRange(el.attrs.get('ref') || '');
+  if (!range) return undefined;
+  const state: SortState = { range, conditions: [] };
+  if (flagAttr(el, 'caseSensitive', false)) state.caseSensitive = true;
+  if (flagAttr(el, 'columnSort', false)) state.columnSort = true;
+  const attrs = otherAttrs(el, ['ref', 'caseSensitive', 'columnSort']);
+  if (attrs) state.attrs = attrs;
+  let extra = '';
+  for (const child of el.children) {
+    if (child.type !== 'element') continue;
+    if (localName(child.name) !== 'sortCondition') {
+      extra += sourceText(child);
+      continue;
+    }
+    const ref = parseRange(child.attrs.get('ref') || '');
+    if (!ref) continue;
+    const condition: SortCondition = { range: ref, descending: flagAttr(child, 'descending', false) };
+    // Anything beyond the two attributes the model holds: the element is kept to be written back.
+    if (child.attrs.size > (child.attrs.has('descending') ? 2 : 1) || child.children.length > 0) condition.raw = sourceText(child);
+    state.conditions.push(condition);
+  }
+  if (extra !== '') state.extra = extra;
+  return state;
+}
+
+/** With an <autoFilter> open tag current: reads the filter and consumes the element. */
+function parseAutoFilter(sc: XmlScanner): AutoFilter | undefined {
+  const el = parseXml(sc.readRaw()).root;
+  const range = parseRange(el.attrs.get('ref') || '');
+  if (!range) return undefined;
+  const filter: AutoFilter = { range, columns: [] };
+  const attrs = otherAttrs(el, ['ref']);
+  if (attrs) filter.attrs = attrs;
+  const seen = new Set<number>();
+  let extra = '';
+  for (const child of el.children) {
+    if (child.type !== 'element') continue;
+    const local = localName(child.name);
+    if (local === 'filterColumn') {
+      const column = parseFilterColumn(child);
+      // A column stated twice, or one that is not a column: kept as text, never applied.
+      if (column && !seen.has(column.colId)) {
+        seen.add(column.colId);
+        filter.columns.push(column);
+        continue;
+      }
+    } else if (local === 'sortState' && !filter.sortState) {
+      const state = parseSortState(child);
+      if (state) {
+        filter.sortState = state;
+        continue;
+      }
+    }
+    extra += sourceText(child);
+  }
+  if (extra !== '') filter.extra = extra;
+  return filter;
+}
+
+// ---------------------------------------------------------------------------
+// Data validations
+//
+// A view for reading, like the conditional formats: the writer copies the source elements.
+
+/** Most validations read from one sheet; the format allows 65,534. */
+const MAX_VALIDATIONS = 65534;
+
+function parseDataValidation(el: XmlElement, extension: boolean): DataValidation | undefined {
+  // The range is an attribute in the main namespace and an <xm:sqref> child in the extension list.
+  const sqref = firstElement(el, 'sqref');
+  const ranges = parseSqref(sqref ? elementText(sqref) : el.attrs.get('sqref'));
+  if (ranges.length === 0) return undefined;
+  const style = el.attrs.get('errorStyle');
+  const rule: DataValidation = {
+    ranges,
+    type: el.attrs.get('type') || 'none',
+    operator: el.attrs.get('operator') || 'between',
+    allowBlank: flagAttr(el, 'allowBlank', false),
+    hideDropDown: flagAttr(el, 'showDropDown', false),
+    showInputMessage: flagAttr(el, 'showInputMessage', false),
+    showErrorMessage: flagAttr(el, 'showErrorMessage', false),
+    errorStyle: style === 'warning' || style === 'information' ? style : 'stop',
+  };
+  for (const name of ['promptTitle', 'prompt', 'errorTitle', 'error'] as const) {
+    const value = el.attrs.get(name);
+    // Like cell text, these may hold characters written as _xHHHH_.
+    if (value !== undefined) rule[name] = decodeXstring(value);
+  }
+  for (const name of ['formula1', 'formula2'] as const) {
+    const child = firstElement(el, name);
+    if (!child) continue;
+    // <formula1>text</formula1>, or <x14:formula1><xm:f>text</xm:f></x14:formula1>.
+    const inner = firstElement(child, 'f');
+    rule[name] = elementText(inner || child);
+  }
+  if (extension) rule.extended = true;
+  return rule;
+}
+
+/** With a <dataValidations> open tag current (either namespace): reads its rules and consumes the element. */
+function parseDataValidations(sc: XmlScanner, out: DataValidation[], extension: boolean): void {
+  eachChild(sc, () => {
+    if (sc.local !== 'dataValidation' || out.length >= MAX_VALIDATIONS) return sc.skip();
+    const rule = parseDataValidation(parseXml(sc.readRaw()).root, extension);
+    if (rule) out.push(rule);
+  });
+}
+
 /**
  * With an open tag current: calls `visit` at the open tag of every child element and
  * consumes the element. `visit` has to consume the child it is called for (skip() does).
@@ -768,11 +984,12 @@ function eachChild(sc: XmlScanner, visit: () => void): void {
   }
 }
 
-/** With the worksheet's <extLst> open tag current: reads the conditional formats of the 2010 extension. */
-function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[]): void {
+/** With the worksheet's <extLst> open tag current: reads the conditional formats and the validations of the 2010 extension. */
+function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[], validations: DataValidation[]): void {
   eachChild(sc, () => {
     if (sc.local !== 'ext') return sc.skip();
     eachChild(sc, () => {
+      if (sc.local === 'dataValidations') return parseDataValidations(sc, validations, true);
       if (sc.local !== 'conditionalFormattings') return sc.skip();
       eachChild(sc, () => {
         if (sc.local === 'conditionalFormatting') extended.push(parseConditionalFormatting(sc, true));
@@ -836,6 +1053,7 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
   const colState = { count: 0 };
   const conditional: ConditionalFormat[] = [];
   const extended: ConditionalFormat[] = [];
+  const validations: DataValidation[] = [];
   if (!sc.selfClosing) {
     while (sc.next()) {
       if (sc.kind === 'close') break;
@@ -879,17 +1097,26 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
         case 'conditionalFormatting':
           conditional.push(parseConditionalFormatting(sc, false));
           break;
+        case 'autoFilter': {
+          const filter = parseAutoFilter(sc);
+          if (filter && !sheet.autoFilter) sheet.autoFilter = filter;
+          break;
+        }
+        case 'dataValidations':
+          parseDataValidations(sc, validations, false);
+          break;
         case 'extLst':
-          parseSheetExtensions(sc, extended);
+          parseSheetExtensions(sc, extended, validations);
           break;
         default:
-          // Validations, drawings, ...: kept in the source part.
+          // Drawings, page setup, ...: kept in the source part.
           sc.skip();
       }
     }
   }
   const formats = linkConditionalFormats(conditional, extended).filter((format) => format.ranges.length > 0 && format.rules.length > 0);
   if (formats.length > 0) sheet.conditionalFormats = formats;
+  if (validations.length > 0) sheet.dataValidations = validations;
   // Anything after the root is still checked for well-formedness.
   while (sc.next());
 }

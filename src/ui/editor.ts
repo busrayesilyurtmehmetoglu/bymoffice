@@ -161,6 +161,8 @@ export class SpreadsheetEditor {
   private readonly styleHost: Node;
   private strings: EditorStrings;
   private locale: FormatLocale;
+  /** What a command or the view last had to say; it stays until the selection moves on. */
+  private notice = '';
   private frame = 0;
   private destroyed = false;
 
@@ -208,6 +210,7 @@ export class SpreadsheetEditor {
       ...options,
       focusScope: root,
       onSelectionChange: (selection, sheetIndex) => {
+        this.notice = '';
         if (this.statusBar) this.statusBar.showMessage('');
         this.refresh();
         if (options.onSelectionChange) options.onSelectionChange(selection, sheetIndex);
@@ -218,6 +221,9 @@ export class SpreadsheetEditor {
       },
       onNotice: (notice) => {
         // What the view tells assistive technology (a command from a key or its menu failed, say) is shown as well.
+        // What the view also has as its standing status (how many rows a filter shows) is shown from
+        // there, and goes when the status does; anything else stays until the selection moves on.
+        this.notice = this.view && notice.message === this.view.statusText ? '' : notice.message;
         if (this.statusBar) this.statusBar.showMessage(notice.message);
         if (options.onNotice) options.onNotice(notice);
       },
@@ -288,12 +294,14 @@ export class SpreadsheetEditor {
 
   private run(action: () => void, keepFocus: boolean): void {
     if (this.destroyed) return;
+    this.notice = '';
     if (this.statusBar) this.statusBar.showMessage('');
     try {
       action();
     } catch (error) {
       // In the language of the interface; the operations themselves speak English.
-      if (this.statusBar) this.statusBar.showMessage(this.view.localizeError(error));
+      this.notice = this.view.localizeError(error);
+      if (this.statusBar) this.statusBar.showMessage(this.notice);
     }
     if (!keepFocus) this.view.focus();
     this.refresh();
@@ -318,6 +326,8 @@ export class SpreadsheetEditor {
     if (this.toolbar) this.toolbar.update();
     if (this.formulaBar) this.formulaBar.update(single);
     if (this.statusBar) {
+      // With nothing else to say: what the view knows about the active cell and the filter of the sheet.
+      this.statusBar.showMessage(this.notice || view.statusText);
       this.statusBar.setReadOnly(view.readOnly);
       this.statusBar.showSummary(sheet, selection.range, single, this.locale);
     }

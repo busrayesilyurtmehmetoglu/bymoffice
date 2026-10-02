@@ -8,9 +8,13 @@
 
 import { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from '../calc/refs';
 import {
+  FILTER_NAME,
   MAX_COLS,
   MAX_ROWS,
+  cellName,
+  parseCellRef,
   parseRange,
+  type AutoFilter,
   type Cell,
   type CellFormat,
   type CellRange,
@@ -41,6 +45,7 @@ export interface SheetSnapshot {
   rowCount: number;
   colCount: number;
   structuralEdits: SheetStructuralEdit[] | undefined;
+  autoFilter?: AutoFilter;
 }
 
 export type Op =
@@ -64,6 +69,29 @@ export type Op =
       rows: { row: number; props: RowProps }[];
     }
   | { type: 'setMerges'; sheet: number; merges: CellRange[] }
+  | {
+      /**
+       * Replaces the filter of a sheet (undefined: no filter) and shows and hides rows with it.
+       * Which rows a criterion hides depends on what the cells show, so it is worked out by the
+       * commands (see filter.ts) and stated here: applying the operation needs no locale.
+       */
+      type: 'setAutoFilter';
+      sheet: number;
+      autoFilter: AutoFilter | undefined;
+      show?: number[];
+      hide?: number[];
+    }
+  | {
+      /**
+       * Moves the cells of the rows of a range, as sorting does: row `range.top + i` takes the
+       * cells that row `range.top + order[i]` has within the columns of the range. `order` is a
+       * permutation of 0 .. height - 1. Relative references of moved formulas move with them.
+       */
+      type: 'sortRange';
+      sheet: number;
+      range: CellRange;
+      order: number[];
+    }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | {
@@ -180,6 +208,7 @@ function snapshotOf(sheet: Sheet): SheetSnapshot {
     rowCount: sheet.rowCount,
     colCount: sheet.colCount,
     structuralEdits: sheet.structuralEdits,
+    autoFilter: sheet.autoFilter,
   };
 }
 
@@ -192,6 +221,8 @@ function restoreSnapshot(sheet: Sheet, snapshot: SheetSnapshot): void {
   sheet.rowCount = snapshot.rowCount;
   sheet.colCount = snapshot.colCount;
   sheet.structuralEdits = snapshot.structuralEdits;
+  if (snapshot.autoFilter) sheet.autoFilter = snapshot.autoFilter;
+  else delete sheet.autoFilter;
 }
 
 export type SharedMasters = Map<number, { text: string; row: number; col: number }>;
@@ -387,6 +418,11 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   }
   sheet.hyperlinks = hyperlinks;
   if (sheet.dimension) sheet.dimension = moveRange(sheet.dimension);
+  if (sheet.autoFilter) {
+    const filter = shiftAutoFilter(sheet.autoFilter, edit);
+    if (filter) sheet.autoFilter = filter;
+    else delete sheet.autoFilter;
+  }
   sheet.structuralEdits = (sheet.structuralEdits || []).concat([{ kind, axis, at, count }]);
   sheet.modified = true;
 
@@ -431,6 +467,230 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   });
 
   return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, weight };
+}
+
+/**
+ * A filter after rows or columns moved: its range follows, and its criteria stay with their
+ * columns (a criterion on a deleted column goes with it). Undefined when the range is gone.
+ * The writer does the same to the source element of a filter that was not changed otherwise.
+ */
+function shiftAutoFilter(filter: AutoFilter, edit: SheetStructuralEdit): AutoFilter | undefined {
+  const range = adjustRange(filter.range, edit);
+  if (!range) return undefined;
+  const next: AutoFilter = { ...filter, range };
+  if (edit.axis === 'col') {
+    next.columns = [];
+    for (const column of filter.columns) {
+      const at = filter.range.left + column.colId;
+      const moved = adjustRange({ top: 0, bottom: 0, left: at, right: at }, edit);
+      if (!moved || moved.left < range.left || moved.left > range.right) continue;
+      const colId = moved.left - range.left;
+      next.columns.push(colId === column.colId ? column : { ...column, colId });
+    }
+  } else if (filter.held) {
+    next.held = [];
+    for (const row of filter.held) {
+      const moved = adjustRange({ top: row, bottom: row, left: 0, right: 0 }, edit);
+      if (moved) next.held.push(moved.top);
+    }
+  }
+  const state = filter.sortState;
+  if (state) {
+    const sorted = adjustRange(state.range, edit);
+    if (!sorted) delete next.sortState;
+    else {
+      const conditions = [];
+      for (const condition of state.conditions) {
+        const key = adjustRange(condition.range, edit);
+        if (key) conditions.push({ ...condition, range: key });
+      }
+      next.sortState = { ...state, range: sorted, conditions };
+    }
+  }
+  return next;
+}
+
+/** A sheet name as it stands before "!" in a reference. */
+function quotedSheetName(name: string): string {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && !parseCellRef(name) && !/^[Rr][Cc]?\d*$/.test(name)) return name;
+  return `'${name.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Brings the hidden defined name of a sheet's filter in line with the filter: applications
+ * expect "_xlnm._FilterDatabase", local to the sheet, to name the filter range.
+ */
+function syncFilterName(workbook: Workbook, index: number): void {
+  const sheet = workbook.sheets[index];
+  const names = workbook.definedNames;
+  const at = names.findIndex((name) => name.localSheet === index && name.name.toLowerCase() === FILTER_NAME.toLowerCase());
+  if (!sheet.autoFilter) {
+    if (at >= 0) workbook.definedNames = names.filter((_, i) => i !== at);
+    return;
+  }
+  const { top, left, bottom, right } = sheet.autoFilter.range;
+  const value = `${quotedSheetName(sheet.name)}!${absoluteName(top, left)}${top === bottom && left === right ? '' : `:${absoluteName(bottom, right)}`}`;
+  if (at >= 0) {
+    if (names[at].value === value) return;
+    workbook.definedNames = names.map((name, i) => (i === at ? { ...name, value } : name));
+  } else workbook.definedNames = names.concat([{ name: FILTER_NAME, value, localSheet: index, hidden: true }]);
+}
+
+function absoluteName(row: number, col: number): string {
+  const name = cellName(row, col);
+  const digits = name.search(/\d/);
+  return `$${name.slice(0, digits)}$${name.slice(digits)}`;
+}
+
+/** Hides or shows rows; returns the rows whose state changed. */
+function setRowsHidden(sheet: Sheet, rows: number[] | undefined, hidden: boolean): number[] {
+  const changed: number[] = [];
+  if (!rows) return changed;
+  for (let i = 0; i < rows.length; i++) {
+    const index = rows[i];
+    const current = sheet.rows.get(index);
+    if ((current ? current.hidden : false) === hidden) continue;
+    const next: Row = current ? { ...current, hidden } : { ...newRow(), hidden };
+    if (isPlainRow(next) && !next.cells.some(() => true)) sheet.rows.delete(index);
+    else sheet.rows.set(index, next);
+    (sheet.changedRows || (sheet.changedRows = new Set())).add(index);
+    changed.push(index);
+  }
+  return changed;
+}
+
+/** Kinds of anchored parts that hold positions of cells which a sort cannot take along. */
+const SORT_BLOCKERS = ['comments', 'pivotTable', 'table'];
+
+const intersects = (a: CellRange, b: CellRange) => a.top <= b.bottom && a.bottom >= b.top && a.left <= b.right && a.right >= b.left;
+
+/** Moves the cells of rows within a range (see the operation "sortRange"). */
+function sortRows(workbook: Workbook, index: number, range: CellRange, order: number[]): Op {
+  const sheet = sheetAt(workbook, index);
+  checkCell(range.top, range.left);
+  checkCell(range.bottom, range.right);
+  const height = range.bottom - range.top + 1;
+  const width = range.right - range.left + 1;
+  if (height < 1 || width < 1 || !Array.isArray(order) || order.length !== height) throw new RangeError('Invalid sort order');
+  const seen = new Uint8Array(height);
+  for (let i = 0; i < height; i++) {
+    const from = order[i];
+    if (!(from >= 0 && from < height) || Math.floor(from) !== from || seen[from]) throw new RangeError('Invalid sort order');
+    seen[from] = 1;
+  }
+  // Where each source row goes; rows that stay need no work.
+  const target = new Int32Array(height);
+  let moved = 0;
+  for (let i = 0; i < height; i++) {
+    target[order[i]] = i;
+    if (order[i] !== i) moved++;
+  }
+
+  // What is placed by cell position in other parts would stay behind while its cell moves.
+  const stuck = (sheet.anchored || []).filter((part) => SORT_BLOCKERS.indexOf(part) >= 0);
+  if (stuck.length > 0) throw new RangeError(`Cannot sort in a sheet with ${stuck.join(', ')}: not supported yet`);
+  // Like Excel: merged cells cannot be told apart from their rows.
+  for (const merge of sheet.merges) if (intersects(merge, range)) throw new RangeError('Cannot sort a range that contains merged cells');
+  // An array formula covers its range as one unit; one that fills a single cell moves with it.
+  for (const [rowIndex, row] of sheet.rows) {
+    row.cells.forEach((cell, col) => {
+      const formula = cell.formula;
+      if (!formula || (formula.type !== 'array' && formula.type !== 'dataTable')) return;
+      const area = (formula.ref !== undefined && parseRange(formula.ref)) || { top: rowIndex, left: col, bottom: rowIndex, right: col };
+      if (!intersects(area, range)) return;
+      const single = formula.type === 'array' && area.top === area.bottom && area.left === area.right;
+      if (!single) throw new RangeError(`Cannot sort through the array formula in ${formula.ref === undefined ? cellName(rowIndex, col) : formula.ref}`);
+    });
+  }
+
+  const snapshot = snapshotOf(sheet);
+  const rows = new Map(sheet.rows);
+  let weight = moved;
+
+  // A shared formula describes its cells by where they are; the groups a moved cell belongs to are written out.
+  let groups: Set<number> | undefined;
+  for (let i = 0; i < height; i++) {
+    if (order[i] === i) continue;
+    const row = rows.get(range.top + i);
+    if (!row) continue;
+    const last = Math.min(range.right, row.cells.length - 1);
+    for (let col = range.left; col <= last; col++) {
+      const cell = row.cells[col];
+      const formula = cell ? cell.formula : undefined;
+      if (formula && formula.type === 'shared' && formula.si !== undefined) (groups || (groups = new Set())).add(formula.si);
+    }
+  }
+  if (groups) {
+    const masters = sharedMasters(sheet);
+    const wanted = groups;
+    for (const [rowIndex, row] of sheet.rows) {
+      let cells: Cell[] | undefined;
+      row.cells.forEach((cell, col) => {
+        const formula = cell.formula;
+        if (!formula || formula.type !== 'shared' || formula.si === undefined || !wanted.has(formula.si)) return;
+        if (!cells) cells = row.cells.slice();
+        cells[col] = explicitFormula(cell, rowIndex, col, masters);
+      });
+      if (cells) {
+        rows.set(rowIndex, { ...row, cells });
+        (sheet.changedRows || (sheet.changedRows = new Set())).add(rowIndex);
+        weight++;
+      }
+    }
+  }
+
+  // The cells of every row that moves, taken before any row is written.
+  const taken: (Cell | undefined)[][] = new Array(height);
+  for (let i = 0; i < height; i++) {
+    if (target[i] === i) continue;
+    const row = rows.get(range.top + i);
+    taken[i] = row ? row.cells.slice(range.left, range.right + 1) : [];
+  }
+  const changedRows = sheet.changedRows || (sheet.changedRows = new Set());
+  for (let i = 0; i < height; i++) {
+    const from = order[i];
+    if (from === i) continue;
+    const at = range.top + i;
+    const current = rows.get(at);
+    const cells = current ? current.cells.slice() : [];
+    for (let col = range.left; col <= range.right && col < cells.length; col++) delete cells[col];
+    const source = taken[from];
+    for (let k = 0; k < source.length; k++) {
+      let cell = source[k];
+      if (!cell) continue;
+      const formula = cell.formula;
+      if (formula) {
+        // As when a cell is copied: what it refers to relative to itself is still that far from it.
+        const text = shiftFormula(formula.text, i - from, 0);
+        const single = formula.type === 'array' && formula.ref !== undefined;
+        if (text !== formula.text || single) cell = { ...cell, formula: { ...formula, text, ...(single ? { ref: cellName(at, range.left + k) } : {}) } };
+      }
+      cells[range.left + k] = cell;
+    }
+    while (cells.length > 0 && !(cells.length - 1 in cells)) cells.length--;
+    const next: Row = current ? { ...current, cells } : newRow(cells);
+    if (isPlainRow(next) && cells.length === 0) rows.delete(at);
+    else rows.set(at, next);
+    changedRows.add(at);
+  }
+  sheet.rows = rows;
+
+  // A link on one cell goes where its cell goes.
+  let links: Hyperlink[] | undefined;
+  sheet.hyperlinks.forEach((link, i) => {
+    const at = link.range;
+    if (at.top !== at.bottom || at.top < range.top || at.top > range.bottom || at.left < range.left || at.right > range.right) return;
+    const row = range.top + target[at.top - range.top];
+    if (row === at.top) return;
+    if (!links) links = sheet.hyperlinks.slice();
+    links[i] = { ...link, range: { ...at, top: row, bottom: row } };
+  });
+  if (links) {
+    sheet.hyperlinks = links;
+    sheet.hyperlinksModified = true;
+  }
+  sheet.modified = true;
+  return { type: 'restore', sheet: index, snapshot, others: [], definedNames: workbook.definedNames, weight };
 }
 
 /** Column settings sorted, clipped to the sheet and free of overlaps (an earlier range wins). */
@@ -505,6 +765,21 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       sheet.modified = true;
       return { type: 'setMerges', sheet: op.sheet, merges: previous };
     }
+    case 'setAutoFilter': {
+      const sheet = sheetAt(workbook, op.sheet);
+      for (const list of [op.show, op.hide]) if (list) for (let i = 0; i < list.length; i++) checkCell(list[i], 0);
+      const previous = sheet.autoFilter;
+      const shown = setRowsHidden(sheet, op.show, false);
+      const hidden = setRowsHidden(sheet, op.hide, true);
+      if (op.autoFilter) sheet.autoFilter = op.autoFilter;
+      else delete sheet.autoFilter;
+      sheet.autoFilterModified = true;
+      sheet.modified = true;
+      syncFilterName(workbook, op.sheet);
+      return { type: 'setAutoFilter', sheet: op.sheet, autoFilter: previous, show: hidden, hide: shown };
+    }
+    case 'sortRange':
+      return sortRows(workbook, op.sheet, op.range, op.order);
     case 'insert':
     case 'delete':
       return structural(workbook, op.sheet, { kind: op.type, axis: op.axis, at: op.at, count: op.count });
@@ -538,7 +813,11 @@ const MAX_UNDO_WEIGHT = 300000;
 
 function weightOf(ops: Op[]): number {
   let weight = 0;
-  for (const op of ops) weight += op.type === 'restore' ? op.weight || 0 : op.type === 'setCells' ? op.cells.length / 16 : 0;
+  for (const op of ops) {
+    if (op.type === 'restore') weight += op.weight || 0;
+    else if (op.type === 'setCells') weight += op.cells.length / 16;
+    else if (op.type === 'setAutoFilter') weight += ((op.show ? op.show.length : 0) + (op.hide ? op.hide.length : 0)) / 16;
+  }
   return weight;
 }
 

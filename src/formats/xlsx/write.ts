@@ -9,6 +9,7 @@
 
 import { adjustAnchoredFormula, adjustFormula, adjustRange, adjustReferenceText, type StructuralEdit } from '../../calc/refs';
 import {
+  FILTER_NAME,
   MAX_COLS,
   MAX_ROWS,
   cellName,
@@ -27,6 +28,7 @@ import {
   type Color,
   type ColumnRange,
   type Fill,
+  type FilterColumn,
   type Font,
   type Protection,
   type RichRun,
@@ -34,6 +36,7 @@ import {
   type SharedString,
   type Sheet,
   type SheetStructuralEdit,
+  type SortState,
   type StyleSheet,
   type Workbook,
 } from '../../model/sheet/types';
@@ -1065,6 +1068,85 @@ function colsXml(sheet: Sheet, prefix: string, originals: OriginalColumns[]): st
   return out === '' ? '' : `<${prefix}cols>${out}</${prefix}cols>`;
 }
 
+/** A source element with some of its attributes set; an attribute given as undefined is removed. */
+function withAttrs(raw: string, attrs: [name: string, value: string | undefined][]): string {
+  const root = parseXml(raw).root;
+  let changed = false;
+  for (const [name, value] of attrs) {
+    if (root.attrs.get(name) === value) continue;
+    if (value === undefined) root.attrs.delete(name);
+    else root.attrs.set(name, value);
+    changed = true;
+  }
+  return changed ? elementText(root) : raw;
+}
+
+function filterColumnXml(column: FilterColumn, prefix: string): string {
+  // As the file had it, at the place the column is now.
+  if (column.raw !== undefined) return withAttrs(column.raw, [['colId', String(column.colId)]]);
+  let inner = '';
+  switch (column.kind) {
+    case 'values': {
+      for (const value of column.values || []) inner += `<${prefix}filter val="${escapeAttr(encodeXstring(String(value)))}"/>`;
+      for (const group of column.dateGroups || []) {
+        inner += `<${prefix}dateGroupItem year="${group.year}"`;
+        for (const part of ['month', 'day', 'hour', 'minute', 'second'] as const) if (group[part] !== undefined) inner += ` ${part}="${group[part]}"`;
+        inner += ` dateTimeGrouping="${escapeAttr(group.grouping)}"/>`;
+      }
+      const open = `<${prefix}filters${column.blank ? ' blank="1"' : ''}`;
+      inner = inner === '' ? `${open}/>` : `${open}>${inner}</${prefix}filters>`;
+      break;
+    }
+    case 'custom': {
+      for (const condition of column.conditions || []) {
+        inner += `<${prefix}customFilter${condition.operator && condition.operator !== 'equal' ? ` operator="${escapeAttr(condition.operator)}"` : ''} val="${escapeAttr(encodeXstring(String(condition.value)))}"/>`;
+      }
+      if (inner !== '') inner = `<${prefix}customFilters${column.and ? ' and="1"' : ''}>${inner}</${prefix}customFilters>`;
+      break;
+    }
+    case 'top10':
+      if (column.value !== undefined) inner = `<${prefix}top10${column.top === false ? ' top="0"' : ''}${column.percent ? ' percent="1"' : ''} val="${column.value}"/>`;
+      break;
+    case 'dynamic':
+      if (column.dynamicType) inner = `<${prefix}dynamicFilter type="${escapeAttr(column.dynamicType)}"/>`;
+      break;
+    default:
+    // A colour or an icon criterion only exists as the element it was read from.
+  }
+  if (inner === '' && !column.hiddenButton) return '';
+  const open = `<${prefix}filterColumn colId="${column.colId}"${column.hiddenButton ? ' hiddenButton="1"' : ''}`;
+  return inner === '' ? `${open}/>` : `${open}>${inner}</${prefix}filterColumn>`;
+}
+
+function sortStateXml(state: SortState, prefix: string): string {
+  let out = `<${prefix}sortState`;
+  if (state.columnSort) out += ' columnSort="1"';
+  if (state.caseSensitive) out += ' caseSensitive="1"';
+  out += ` ref="${rangeName(state.range)}"`;
+  for (const [name, value] of state.attrs || []) out += ` ${name}="${escapeAttr(value)}"`;
+  let inner = '';
+  for (const condition of state.conditions) {
+    const ref = rangeName(condition.range);
+    if (condition.raw !== undefined) inner += withAttrs(condition.raw, [['ref', ref], ['descending', condition.descending ? '1' : undefined]]);
+    else inner += `<${prefix}sortCondition${condition.descending ? ' descending="1"' : ''} ref="${ref}"/>`;
+  }
+  if (state.extra) inner += state.extra;
+  return inner === '' ? `${out}/>` : `${out}>${inner}</${prefix}sortState>`;
+}
+
+/** The filter of the sheet from the model: its range, the criteria of its columns and how it was last sorted. */
+function autoFilterXml(sheet: Sheet, prefix: string): string {
+  const filter = sheet.autoFilter;
+  if (!filter) return '';
+  let out = `<${prefix}autoFilter ref="${rangeName(filter.range)}"`;
+  for (const [name, value] of filter.attrs || []) out += ` ${name}="${escapeAttr(value)}"`;
+  let inner = '';
+  for (const column of filter.columns) inner += filterColumnXml(column, prefix);
+  if (filter.sortState) inner += sortStateXml(filter.sortState, prefix);
+  if (filter.extra) inner += filter.extra;
+  return inner === '' ? `${out}/>` : `${out}>${inner}</${prefix}autoFilter>`;
+}
+
 function mergeCellsXml(sheet: Sheet, prefix: string): string {
   if (sheet.merges.length === 0) return '';
   let out = `<${prefix}mergeCells count="${sheet.merges.length}">`;
@@ -1152,6 +1234,8 @@ interface ChildState {
   colsRaw: string | undefined;
   linksRaw: string | undefined;
   changed: boolean;
+  /** What <sheetPr filterMode> has to say once the filter was changed; undefined leaves it as it is. */
+  filterMode: boolean | undefined;
 }
 
 /**
@@ -1190,6 +1274,13 @@ function writeChild(
     const root = parseXml(raw).root;
     root.attrs.set('ref', ref as string);
     return { text: elementText(root), end };
+  }
+
+  if (local === 'sheetPr' && state.filterMode !== undefined) {
+    // The source has the element: it is brought in line instead of being replaced.
+    regenerated.delete(local);
+    const text = withAttrs(raw, [['filterMode', state.filterMode ? '1' : undefined]]);
+    if (text !== raw) return { text, end };
   }
 
   const replacement = regenerated.get(local);
@@ -1260,11 +1351,19 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
     if (structural || sheet.mergesModified) regenerated.set('mergeCells', mergeCellsXml(sheet, prefix));
     if (structural || sheet.hyperlinksModified) regenerated.set('hyperlinks', sheet.hyperlinks.length > 0 ? LINKS_MARKER : '');
   }
-  const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false };
+  // A filter that was changed is written from the model; one that was not is copied, and only follows moved rows and columns.
+  let filterMode: boolean | undefined;
+  if (!rawOnly && sheet.autoFilterModified) {
+    regenerated.set('autoFilter', autoFilterXml(sheet, prefix));
+    filterMode = !!sheet.autoFilter && sheet.autoFilter.columns.some((column) => column.kind !== 'none');
+    // Applications mark a sheet whose filter hides rows; without a <sheetPr> to hold the mark, one is made.
+    if (filterMode) regenerated.set('sheetPr', `<${prefix}sheetPr filterMode="1"/>`);
+  }
+  const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode };
   /** Writes the regenerated elements that belong before the element of rank `rank` and were not in the source. */
   const flush = (rank: number) => {
     if (regenerated.size === 0) return;
-    for (const local of ['cols', 'mergeCells', 'hyperlinks']) {
+    for (const local of ['sheetPr', 'cols', 'autoFilter', 'mergeCells', 'hyperlinks']) {
       const text = regenerated.get(local);
       if (text === undefined || WORKSHEET_ORDER.indexOf(local) >= rank) continue;
       out.push(text);
@@ -1891,11 +1990,13 @@ const WORKBOOK_ORDER = [
   'extLst',
 ];
 
+const isFilterName = (name: string) => name.toLowerCase() === FILTER_NAME.toLowerCase();
+
 /** Brings workbook.xml up to date: defined names follow the model, and formulas are recalculated on load. */
 function updateWorkbookXml(doc: XmlDocument, workbook: Workbook): void {
   const root = doc.root;
   const prefix = prefixOf(root);
-  const container = childrenNamed(root, 'definedNames')[0];
+  let container: XmlElement | undefined = childrenNamed(root, 'definedNames')[0];
   const elements = container ? childrenNamed(container, 'definedName') : [];
   const used = new Set<XmlElement>();
   const matches = (el: XmlElement, name: string, localSheet: number | undefined) => {
@@ -1907,10 +2008,32 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook): void {
     // The lists normally line up; otherwise the name and its scope identify the element.
     let target: XmlElement | undefined = elements[index];
     if (!target || !matches(target, name.name, name.localSheet)) target = elements.find((el) => matches(el, name.name, name.localSheet));
-    if (!target) throw new Error(`Cannot write the workbook: the defined name "${name.name}" is not in the file`);
+    if (!target) {
+      // The only name the model adds is the range of a filter that was switched on; any other
+      // name that is not in the file is a mistake of the caller.
+      if (!isFilterName(name.name)) throw new Error(`Cannot write the workbook: the defined name "${name.name}" is not in the file`);
+      const attrs: Attrs = [['name', name.name]];
+      if (name.localSheet !== undefined) attrs.push(['localSheetId', String(name.localSheet)]);
+      if (name.hidden) attrs.push(['hidden', '1']);
+      target = element(`${prefix}definedName`, attrs, [{ type: 'text', value: name.value }]);
+      if (!container) {
+        container = element(`${prefix}definedNames`);
+        insertInOrder(root, container, WORKBOOK_ORDER);
+      }
+      container.children.push(target);
+      used.add(target);
+      return;
+    }
     used.add(target);
     if (textOf(target) !== name.value) target.children = [{ type: 'text', value: name.value }];
   });
+  // The range of a filter that was switched off goes with it; an empty list is not valid.
+  const gone = (el: XmlElement) => !used.has(el) && isFilterName(el.attrs.get('name') || '');
+  if (container && elements.some(gone)) {
+    const list = container;
+    list.children = list.children.filter((node) => node.type !== 'element' || localName(node.name) !== 'definedName' || !gone(node));
+    if (!list.children.some((node) => node.type === 'element')) root.children = root.children.filter((node) => node !== list);
+  }
 
   // Results stored in the file may be stale after an edit; the application recalculates when it opens the file.
   let calcPr = childrenNamed(root, 'calcPr')[0];

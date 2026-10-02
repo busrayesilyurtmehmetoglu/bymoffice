@@ -241,6 +241,132 @@ export interface ConditionalFormat {
   rules: ConditionalRule[];
 }
 
+/** One condition of a custom filter ("greater than 5", "begins with a"). */
+export interface FilterCondition {
+  /** "equal", "notEqual", "greaterThan", "greaterThanOrEqual", "lessThan", "lessThanOrEqual". */
+  operator: string;
+  /** As written; "*" and "?" are wildcards of "equal" and "notEqual". */
+  value: string;
+}
+
+/** A date or a part of one chosen in a filter list (<dateGroupItem>): everything up to `grouping` has to match. */
+export interface FilterDateGroup {
+  /** "year", "month", "day", "hour", "minute", "second". */
+  grouping: string;
+  year: number;
+  month?: number;
+  day?: number;
+  hour?: number;
+  minute?: number;
+  second?: number;
+}
+
+/**
+ * What a filter asks of one of its columns (<filterColumn>). Exactly one kind
+ * of criterion is stated; a column without any has only button settings.
+ */
+export interface FilterColumn {
+  /** Offset of the column from the left edge of the filter range. */
+  colId: number;
+  /**
+   * "values": the texts in `values` (compared with what the cells show), blanks and dates;
+   * "custom": one or two conditions; "top10"; "dynamic" (above average, today, ...);
+   * "color" and "icon" are read and kept but never applied; "none": no criterion;
+   * "unknown": something this engine does not know, kept as it is.
+   */
+  kind: 'values' | 'custom' | 'top10' | 'dynamic' | 'color' | 'icon' | 'none' | 'unknown';
+  /** values: the texts that are shown. */
+  values?: string[];
+  /** values: empty cells are shown as well. */
+  blank?: boolean;
+  dateGroups?: FilterDateGroup[];
+  /** custom: both conditions have to hold (`and`) or one of them. */
+  and?: boolean;
+  conditions?: FilterCondition[];
+  /** top10: the `value` largest (or smallest) items, or that percentage of them. */
+  top?: boolean;
+  percent?: boolean;
+  value?: number;
+  /** dynamic: "aboveAverage", "belowAverage", "today", ... as in ST_DynamicFilterType. */
+  dynamicType?: string;
+  /** The column shows no button (hiddenButton="1" or showButton="0"). */
+  hiddenButton?: boolean;
+  /**
+   * The source element. While it is there the column is written back exactly as it
+   * was read (attributes and extensions the model has no field for included);
+   * a column changed by an edit has none.
+   */
+  raw?: string;
+}
+
+export interface SortCondition {
+  /** The cells of the key column or row. */
+  range: CellRange;
+  descending: boolean;
+  /** The source element, for what the model has no field for (sortBy, customList, dxfId, iconSet). */
+  raw?: string;
+}
+
+/** How a range was last sorted (<sortState>); kept so that the application can sort again. */
+export interface SortState {
+  range: CellRange;
+  conditions: SortCondition[];
+  caseSensitive?: boolean;
+  columnSort?: boolean;
+  /** Attributes and children the model has no field for, as they go into the element. */
+  attrs?: [name: string, value: string][];
+  extra?: string;
+}
+
+/** Defined name, local to a sheet and hidden, under which applications keep the range of the sheet's filter. */
+export const FILTER_NAME = '_xlnm._FilterDatabase';
+
+/** The filter of a sheet (<autoFilter>): a header row with a button per column, and the rows under it. */
+export interface AutoFilter {
+  /** Header row and data rows. */
+  range: CellRange;
+  /** Columns that state something, by colId; at most one per column. */
+  columns: FilterColumn[];
+  sortState?: SortState;
+  /** Attributes of the element the model has no field for (xr:uid, ...), kept to be written back. */
+  attrs?: [name: string, value: string][];
+  /** Child elements the model has no field for (<extLst>), as source text. */
+  extra?: string;
+  /**
+   * Rows that a criterion this engine cannot apply (a colour, an icon) keeps hidden, noted
+   * when another criterion is changed, so that they stay hidden whatever that one shows.
+   * Not part of the file.
+   */
+  held?: number[];
+}
+
+/**
+ * One <dataValidation>: what may be typed into its cells. A view for reading;
+ * the writer copies the source element.
+ */
+export interface DataValidation {
+  ranges: CellRange[];
+  /** "none", "whole", "decimal", "list", "date", "time", "textLength", "custom". */
+  type: string;
+  /** "between" (the default), "notBetween", "equal", "notEqual", "greaterThan", "lessThan", "greaterThanOrEqual", "lessThanOrEqual". */
+  operator: string;
+  /** Formula texts without "=", written for the top-left cell of the first range. */
+  formula1?: string;
+  formula2?: string;
+  allowBlank: boolean;
+  /** A list shows no arrow in the cell. The file calls this showDropDown="1": the attribute means the opposite of its name. */
+  hideDropDown: boolean;
+  showInputMessage: boolean;
+  promptTitle?: string;
+  prompt?: string;
+  showErrorMessage: boolean;
+  errorStyle: 'stop' | 'warning' | 'information';
+  errorTitle?: string;
+  error?: string;
+  /** The rule comes from the 2010 extension list (its list may be on another sheet). */
+  extended?: boolean;
+}
+
 export interface RichRun {
   text: string;
   font?: Font;
@@ -399,6 +525,15 @@ export interface Sheet {
    * columns inserted or deleted since (structuralEdits) are applied where they are evaluated.
    */
   conditionalFormats?: ConditionalFormat[];
+  /** The filter of the sheet, kept up to date by edits. Rows it hides are `hidden`, like rows hidden by hand. */
+  autoFilter?: AutoFilter;
+  /** The filter was changed (switched on or off, a criterion, a sort); the writer regenerates <autoFilter> from the model. */
+  autoFilterModified?: boolean;
+  /**
+   * Data validations as the file has them. Like conditional formats they are not changed
+   * by edits: structuralEdits are applied where they are evaluated (see DataValidations).
+   */
+  dataValidations?: DataValidation[];
   /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */
   modified?: boolean;
   /**

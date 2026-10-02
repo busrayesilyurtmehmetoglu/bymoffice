@@ -35,6 +35,39 @@ export interface UiStrings {
   tooManyFormats: string;
   badFormula: string;
   copyTooLarge: string;
+  // Sorting and filtering.
+  /** Label of the menu of a filter button: "Sort and filter column B". */
+  filterMenu(column: string): string;
+  sortAscending: string;
+  sortDescending: string;
+  clearFilter: string;
+  searchValues: string;
+  selectAll: string;
+  blanks: string;
+  apply: string;
+  cancel: string;
+  noMatches: string;
+  valueList: string;
+  /** Under a value list that does not hold every value of its column. */
+  tooManyValues(max: number): string;
+  /** What a filter with criteria shows: "12 of 340 records shown". */
+  recordsShown(shown: number, total: number): string;
+  nothingToFilter: string;
+  cannotSortMerged: string;
+  cannotSortArray(ref: string): string;
+  /** `what` names the content in the way: comments, tables, pivot tables. */
+  sortNotSupportedWith(action: 'sort' | 'filter', what: string): string;
+  // Data validation.
+  /** Label of the list a cell offers its values in. */
+  chooseFromList: string;
+  /** What a rule says when it has no message of its own. */
+  validationFailed: string;
+  /** Said when a value breaks a rule that only warns: the value is kept. */
+  validationWarning(message: string): string;
+  // Formulas this engine has something to say about (the cell has a mark in its corner).
+  formulaNotCalculated: string;
+  formulaCircular: string;
+  formulaStale: string;
   // The document view.
   document: string;
   documentTools: string;
@@ -87,6 +120,29 @@ export const STRINGS_EN: UiStrings = {
   tooManyFormats: 'The workbook has too many cell formats',
   badFormula: 'This formula cannot be read. Use English function names and commas between arguments.',
   copyTooLarge: 'The range is too large to copy',
+  filterMenu: (column) => `Sort and filter column ${column}`,
+  sortAscending: 'Sort A to Z',
+  sortDescending: 'Sort Z to A',
+  clearFilter: 'Clear filter',
+  searchValues: 'Search',
+  selectAll: '(Select all)',
+  blanks: '(Blanks)',
+  apply: 'Apply',
+  cancel: 'Cancel',
+  noMatches: 'Nothing matches',
+  valueList: 'Values',
+  tooManyValues: (max) => `Only the first ${max} values are listed`,
+  recordsShown: (shown, total) => `${shown} of ${total} records shown`,
+  nothingToFilter: 'There is no data to filter here',
+  cannotSortMerged: 'A range with merged cells cannot be sorted',
+  cannotSortArray: (ref) => `The array formula in ${ref} cannot be sorted through`,
+  sortNotSupportedWith: (action, what) => `${action === 'sort' ? 'Sorting' : 'Filtering'} is not supported yet in a sheet with ${what}`,
+  chooseFromList: 'Choose from the list',
+  validationFailed: 'This value does not match the data validation rule of the cell.',
+  validationWarning: (message) => `${message} (the value was entered anyway)`,
+  formulaNotCalculated: 'This formula cannot be calculated here; the last value in the file is shown',
+  formulaCircular: 'Circular reference',
+  formulaStale: 'The calculation is not finished; the value may be out of date',
   document: 'Document',
   documentTools: 'Document tools',
   page: (number) => `Page ${number}`,
@@ -138,8 +194,31 @@ export const STRINGS_TR: UiStrings = {
     `Bu sayfada ${axis === 'row' ? 'satır' : 'sütun'} ${kind === 'insert' ? 'ekleme' : 'silme'} henüz desteklenmiyor (sayfada bulunan: ${what})`,
   pasteTooLarge: (max) => `Bir kerede ${max} hücreden fazlası yapıştırılamaz`,
   tooManyFormats: 'Çalışma kitabında çok fazla hücre biçimi var',
-  badFormula: 'Bu formül okunamadı. İngilizce fonksiyon adlarını ve argümanlar arasında virgül kullanın.',
+  badFormula: 'Bu formül okunamadı. Argümanları noktalı virgülle (;) ayırın, ondalıkları virgülle yazın; tanınmayan fonksiyonlarda İngilizce adı kullanın.',
   copyTooLarge: 'Aralık kopyalanamayacak kadar büyük',
+  filterMenu: (column) => `${column} sütununu sırala ve süz`,
+  sortAscending: "A'dan Z'ye sırala",
+  sortDescending: "Z'den A'ya sırala",
+  clearFilter: 'Süzgeci temizle',
+  searchValues: 'Ara',
+  selectAll: '(Tümünü seç)',
+  blanks: '(Boşlar)',
+  apply: 'Uygula',
+  cancel: 'İptal',
+  noMatches: 'Eşleşen değer yok',
+  valueList: 'Değerler',
+  tooManyValues: (max) => `Yalnız ilk ${max} değer listeleniyor`,
+  recordsShown: (shown, total) => `${total} kayıttan ${shown} tanesi gösteriliyor`,
+  nothingToFilter: 'Burada süzülecek veri yok',
+  cannotSortMerged: 'Birleştirilmiş hücre içeren aralık sıralanamaz',
+  cannotSortArray: (ref) => `${ref} aralığındaki dizi formülü bölünerek sıralanamaz`,
+  sortNotSupportedWith: (action, what) => `Bu sayfada ${action === 'sort' ? 'sıralama' : 'süzme'} henüz desteklenmiyor (sayfada bulunan: ${what})`,
+  chooseFromList: 'Listeden seçin',
+  validationFailed: 'Bu değer hücrenin veri doğrulama kuralına uymuyor.',
+  validationWarning: (message) => `${message} (değer yine de yazıldı)`,
+  formulaNotCalculated: 'Bu formül burada hesaplanamıyor; dosyadaki son değer gösteriliyor',
+  formulaCircular: 'Döngüsel başvuru',
+  formulaStale: 'Hesap bitmedi; değer eski olabilir',
   document: 'Belge',
   documentTools: 'Belge araçları',
   page: (number) => `Sayfa ${number}`,

@@ -9,7 +9,7 @@
 
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { MAX_COLS, MAX_ROWS, cellName, getCell, parseCellRef, rangeName, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { getUiStrings, type UiStrings } from './strings';
@@ -26,10 +26,14 @@ import {
 } from '../ops/format';
 import { CalcEngine } from '../calc/engine';
 import { ConditionalFormats } from '../format/conditional';
-import { History, type Op } from '../ops/ops';
-import { DEFAULT_GRID_THEME, renderGrid, type GridSelection } from '../render/grid';
+import { DataValidations, MAX_LIST_ITEMS, ValidationError } from '../format/validation';
+import { MAX_FILTER_VALUES, filterSummary, filterValues, isFilterActive, setAutoFilter, setFilterColumn } from '../ops/filter';
+import { History, applyOp, type Op } from '../ops/ops';
+import { currentRegion, sortRange } from '../ops/sort';
+import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { cssFont } from '../render/text';
 import { ContextMenu, type MenuItem } from './context-menu';
+import { FilterMenu, ListMenu } from './filter-menu';
 
 export interface WorkbookViewOptions {
   /**
@@ -193,6 +197,20 @@ const AUTO_SCROLL_MAX = 48;
 /** Upper bound for the steps one Shift+arrow takes to get out of a merged range. */
 const MAX_EXTEND_STEPS = 4096;
 
+/** Colours of the mark in the corner of a formula cell the engine has something to say about, by what it says. */
+const MARK_COLORS: { [kind: string]: string } = { file: '#E8710A', circular: '#D93025', stale: '#5F6368' };
+
+/** What is known about the active cell beyond its content: worked out once per selection and change. */
+interface CellInfo {
+  sheet: number;
+  row: number;
+  col: number;
+  /** The cell offers a list to choose from. */
+  list: boolean;
+  /** The message its data validation shows while it is selected. */
+  prompt: { title: string; text: string } | undefined;
+}
+
 /** How long a touch has to rest on a header to open its menu, and how close in time and place two taps make a double tap. */
 const LONG_PRESS_MS = 550;
 /** How near a border between two headers the pointer has to be to resize, for a mouse and for a finger. */
@@ -228,6 +246,40 @@ const STYLE_TEXT =
   '.bym-menu-item:disabled{color:#9aa0a6;background:transparent;cursor:default}' +
   '.bym-menu-separator{height:1px;margin:4px 0;background:#dadce0}' +
   '.bym-resize-guide{background:#1a7f45}' +
+  // What drops down from a cell: the menu of a filter button and the list of a data validation.
+  '.bym-panel{padding:6px;background:#fff;border:1px solid #dadce0;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.18);color:#202124;' +
+  'font:13px/1.2 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;letter-spacing:normal;text-transform:none;text-align:left;overflow-y:auto;overscroll-behavior:contain}' +
+  '.bym-panel-item,.bym-panel-button,.bym-panel-search{-webkit-appearance:none;appearance:none;box-sizing:border-box;float:none;margin:0;min-width:0;min-height:0;' +
+  'max-width:none;max-height:none;font:inherit;line-height:1.2;letter-spacing:normal;text-transform:none;text-indent:0;text-shadow:none;opacity:1}' +
+  '.bym-panel-item{display:block;flex:none;width:100%;height:32px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:inherit;' +
+  'text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}' +
+  '.bym-panel-item:hover,.bym-panel-item:focus{background:#e8eaed;outline:none}' +
+  '.bym-panel-item:disabled{color:#9aa0a6;background:transparent;cursor:default}' +
+  '.bym-panel-separator{flex:none;height:1px;margin:4px 0;background:#dadce0}' +
+  '.bym-panel-search{display:block;flex:none;width:100%;height:32px;margin:6px 0;padding:0 8px;border:1px solid #dadce0;border-radius:6px;background:#fff;color:inherit;outline:none}' +
+  '.bym-panel-search:focus,.bym-list:focus{border-color:#1a7f45;box-shadow:0 0 0 1px #1a7f45}' +
+  '.bym-list{border:1px solid #dadce0;border-radius:6px;outline:none}' +
+  '.bym-dropdown .bym-list{border:0}' +
+  '.bym-list-row{display:flex;align-items:center;padding:0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}' +
+  '.bym-list-row:hover,.bym-list:focus .bym-list-row[data-active]{background:#e8eaed}' +
+  '.bym-dropdown .bym-list-row{display:block;line-height:28px}' +
+  '.bym-dropdown .bym-list-row[aria-selected="true"]{font-weight:600;color:#0f5c31}' +
+  '.bym-list-text{overflow:hidden;text-overflow:ellipsis}' +
+  '.bym-check{flex:none;box-sizing:border-box;width:16px;height:16px;margin-right:8px;border:1px solid #5f6368;border-radius:3px;background:#fff}' +
+  '.bym-check[data-state="on"],.bym-check[data-state="mixed"]{background:#1a7f45;border-color:#1a7f45}' +
+  '.bym-check[data-state="on"]::after{content:"";display:block;width:4px;height:8px;margin:1px 0 0 4px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}' +
+  '.bym-check[data-state="mixed"]::after{content:"";display:block;width:8px;height:2px;margin:6px 0 0 3px;background:#fff}' +
+  '.bym-panel-note{flex:none;padding:6px 4px 0;color:#5f6368;font-size:12px;white-space:normal}' +
+  '.bym-panel-actions{display:flex;flex:none;justify-content:flex-end;margin-top:8px}' +
+  '.bym-panel-button{display:block;flex:none;width:auto;height:32px;margin-left:8px;padding:0 14px;border:1px solid #dadce0;border-radius:6px;background:#fff;color:inherit;cursor:pointer}' +
+  '.bym-panel-primary{background:#1a7f45;border-color:#1a7f45;color:#fff}' +
+  '.bym-panel-button:disabled{opacity:.45;cursor:default}' +
+  '.bym-panel-button:focus{outline:2px solid #1a7f45;outline-offset:1px}' +
+  // A finger needs more to hit; text smaller than 16 px makes iOS zoom the page when a field takes the focus.
+  '@media (pointer:coarse){.bym-panel-item,.bym-panel-button,.bym-panel-search{height:40px}.bym-panel-search{font-size:16px}.bym-dropdown .bym-list-row{line-height:40px}}' +
+  '.bym-tip{max-width:240px;padding:6px 8px;background:#fffbe6;border:1px solid #e0d9a8;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.2);color:#202124;' +
+  'font:12px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;white-space:pre-wrap;overflow-wrap:break-word}' +
+  '.bym-tip-title{font-weight:600}' +
   '.bym-tabs{background:#f1f3f4;border-top:1px solid #dadce0}' +
   '.bym-tab{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;width:auto;height:auto;min-width:0;' +
   'max-width:none;max-height:none;margin:0;border:0;border-right:1px solid #dadce0;border-radius:0;' +
@@ -398,6 +450,7 @@ export class WorkbookView {
   private engine: CalcEngine | undefined;
   private calcTimer: ReturnType<typeof setTimeout> | undefined;
   private missingTimer: ReturnType<typeof setTimeout> | undefined;
+  private noticeTimer: ReturnType<typeof setTimeout> | undefined;
   /** Conditional formats of the sheets that have any, made when a sheet is first drawn. */
   private conditional = new Map<Sheet, ConditionalFormats>();
   private strings: UiStrings;
@@ -444,6 +497,22 @@ export class WorkbookView {
   private touch: Touch | undefined;
   private edit: Edit | undefined;
   private menu: ContextMenu | undefined;
+  /** What dropped down from a cell: the menu of a filter button or the list of a data validation. */
+  private panel: FilterMenu | ListMenu | undefined;
+  /** What the grid draws for each filter; a filter is replaced, never changed, so one entry serves until then. */
+  private filterViews = new WeakMap<AutoFilter, GridFilter>();
+  /** Data validations of the sheets that have any, made when first asked for. */
+  private validation = new Map<Sheet, DataValidations>();
+  private cellInfo: CellInfo | undefined;
+  /** The message of the active cell's data validation, shown beside the cell. */
+  private tip: HTMLDivElement | undefined;
+  /**
+   * Formula cells the engine has something to say about, per sheet, by row * MAX_COLS + column:
+   * "file" (not calculated here, the value of the file is shown), "circular", "stale".
+   * Built again after a recalculation, when it is next asked for.
+   */
+  private marks: (Map<number, string> | undefined)[] | undefined;
+  private marksDirty = true;
   /** What copy() last put on the clipboard; pasting the same text back pastes these cells. */
   private copied: CopiedRange | undefined;
   private longPressTimer = 0;
@@ -663,6 +732,7 @@ export class WorkbookView {
   /** Changes the language of number and date formats, and of the view's own labels, and redraws. */
   setLocale(locale: string | FormatLocale): void {
     this.locale = resolveLocale(locale);
+    this.validation.forEach((rules) => rules.setLocale(this.locale));
     // The view's own words follow a language tag; a locale object only changes formats.
     if (typeof locale === 'string') this.strings = resolveStrings(locale);
     this.root.setAttribute('aria-label', this.strings.spreadsheet);
@@ -688,6 +758,7 @@ export class WorkbookView {
     this.destroyed = true;
     if (this.calcTimer !== undefined) clearTimeout(this.calcTimer);
     if (this.missingTimer !== undefined) clearTimeout(this.missingTimer);
+    if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer);
     this.endDrag();
     this.endTouch();
     this.edit = undefined;
@@ -1068,11 +1139,243 @@ export class WorkbookView {
       locale: this.locale,
       devicePixelRatio: this.dpr,
       conditional,
+      filter: this.gridFilter(state.sheet),
+      dropdown: this.activeInfo().list ? state.active : undefined,
+      cellMark: this.markLookup(),
     });
     // Rules whose formulas took too long are finished in the next frames.
     if (conditional && conditional.pending) this.schedule();
     // The input follows its cell through every scroll and resize.
     this.placeInput();
+    this.placeTip();
+  }
+
+  // ------------------------------------------------- validation and marks
+
+  /** The data validations of a sheet; undefined for a sheet without any, which then costs nothing. */
+  private validationOf(sheet: Sheet): DataValidations | undefined {
+    if (!sheet.dataValidations || sheet.dataValidations.length === 0) return undefined;
+    let found = this.validation.get(sheet);
+    if (!found) {
+      found = new DataValidations(this.workbook, sheet, { engine: () => this.conditionalEngine(), locale: this.locale });
+      this.validation.set(sheet, found);
+    }
+    return found;
+  }
+
+  /** What the active cell's data validation gives it: a list to choose from, a message. */
+  private activeInfo(): CellInfo {
+    const state = this.state();
+    const { row, col } = state.active;
+    let info = this.cellInfo;
+    if (info && info.sheet === this.sheetIndex && info.row === row && info.col === col) return info;
+    info = { sheet: this.sheetIndex, row, col, list: false, prompt: undefined };
+    const rules = state.sheet.kind === 'worksheet' ? this.validationOf(state.sheet) : undefined;
+    if (rules) {
+      try {
+        // A list cannot be chosen from in a read-only view; its message can still be read.
+        info.list = !this.locked && rules.hasList(row, col);
+        info.prompt = rules.prompt(row, col);
+      } catch (error) {
+        // A rule that cannot be read gives the cell nothing.
+      }
+    }
+    this.cellInfo = info;
+    return info;
+  }
+
+  /** Whether a canvas point is on the list button of the active cell. */
+  private dropdownAt(x: number, y: number, reach: number): boolean {
+    if (!this.activeInfo().list) return false;
+    const state = this.state();
+    const { active } = state;
+    const merge = mergeIn(this.merges(), active.row, active.col);
+    const cell = rangeRect(this.layout(state), merge || { top: active.row, left: active.col, bottom: active.row, right: active.col });
+    const box = cellButtonRect(cell.x, cell.y, cell.width, cell.height);
+    return box !== undefined && x >= box.x - reach && y >= box.y - reach && x <= box.x + box.size + reach && y <= box.y + box.size + reach;
+  }
+
+  /**
+   * Opens the list the active cell's data validation offers; choosing a value writes it
+   * to the cell as one undo step. Returns false when the cell has no list.
+   */
+  openValidationList(touch = false): boolean {
+    if (this.destroyed || this.locked) return false;
+    const state = this.state();
+    const sheet = state.sheet;
+    const rules = sheet.kind === 'worksheet' ? this.validationOf(sheet) : undefined;
+    const { row, col } = state.active;
+    if (!rules || !rules.hasList(row, col)) return false;
+    const list = rules.list(row, col);
+    if (!list) return false;
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    const strings = this.strings;
+    const merge = mergeIn(this.merges(), row, col);
+    const cell = rangeRect(this.layout(state), merge || { top: row, left: col, bottom: row, right: col });
+    const x = clamp(cell.x, 0, Math.max(this.width - 1, 0));
+    const y = clamp(cell.y, 0, Math.max(this.height - 1, 0));
+    const anchor = { x, y, width: clamp(cell.x + cell.width - x, 0, this.width - x), height: clamp(cell.y + cell.height - y, 0, this.height - y) };
+    const shown = cellDisplayText(this.workbook, getCell(sheet, row, col), this.locale);
+    const sheetIndex = this.sheetIndex;
+    this.panel = new ListMenu({
+      parent: this.root,
+      anchor,
+      label: strings.chooseFromList,
+      items: list.items,
+      selected: list.items.indexOf(shown),
+      note: list.truncated ? strings.tooManyValues(MAX_LIST_ITEMS) : undefined,
+      openedByTouch: touch,
+      onChoose: (index) =>
+        this.attempt(() => {
+          if (this.sheetIndex === sheetIndex) this.applyOps(setCellInput(this.workbook, sheetIndex, row, col, list.items[index], { locale: this.locale }));
+        }),
+      onClose: () => this.panelClosed(),
+    });
+    // The message beside the cell makes room for the list.
+    this.placeTip();
+    return true;
+  }
+
+  /**
+   * Checks what is about to be typed into a cell against the cell's data validation.
+   * A rule that stops wrong values throws a ValidationError with the rule's message;
+   * a rule that only warns gives back what to say once the value is written.
+   */
+  private validateInput(sheetIndex: number, row: number, col: number, text: string, ops: Op[]): string | undefined {
+    const sheet = this.workbook.sheets[sheetIndex];
+    const rules = sheet ? this.validationOf(sheet) : undefined;
+    if (!rules) return undefined;
+    // The cell the text turns into; without an operation the cell stays what it is.
+    let cell = getCell(sheet, row, col);
+    for (const op of ops) {
+      if (op.type !== 'setCells' || op.sheet !== sheetIndex) continue;
+      for (const change of op.cells) if (change.row === row && change.col === col) cell = change.cell;
+    }
+    const verdict = rules.check(row, col, cell, text, (run) => this.withCandidate(sheet, ops, run));
+    if (verdict.ok) return undefined;
+    const message = verdict.message || this.strings.validationFailed;
+    const display = verdict.title ? `${verdict.title}: ${message}` : message;
+    if (verdict.style === 'stop' || verdict.style === undefined) throw new ValidationError(display);
+    return this.strings.validationWarning(display);
+  }
+
+  /**
+   * Runs `run` with operations applied to the workbook and takes them back afterwards, as if
+   * nothing had happened: the formula of a custom rule reads the cell it is asked about.
+   */
+  private withCandidate<T>(sheet: Sheet, ops: Op[], run: () => T): T {
+    const modified = sheet.modified;
+    const changedRows = sheet.changedRows;
+    if (changedRows) sheet.changedRows = new Set(changedRows);
+    const inverse: Op[] = [];
+    try {
+      for (const op of ops) inverse.push(applyOp(this.workbook, op));
+      return run();
+    } finally {
+      for (let i = inverse.length - 1; i >= 0; i--) applyOp(this.workbook, inverse[i]);
+      if (modified) sheet.modified = modified;
+      else delete sheet.modified;
+      if (changedRows) sheet.changedRows = changedRows;
+      else delete sheet.changedRows;
+    }
+  }
+
+  /** Puts the message of the active cell's data validation beside the cell, or takes it away. */
+  private placeTip(): void {
+    const prompt = this.activeInfo().prompt;
+    const state = this.state();
+    const { active } = state;
+    const layout = this.layout(state);
+    const merge = prompt ? mergeIn(this.merges(), active.row, active.col) : undefined;
+    const rect = prompt ? rangeRect(layout, merge || { top: active.row, left: active.col, bottom: active.row, right: active.col }) : undefined;
+    const paneLeft = layout.metrics.headerWidth + (active.col < layout.frozenCols ? 0 : layout.frozenWidth);
+    const paneTop = layout.metrics.headerHeight + (active.row < layout.frozenRows ? 0 : layout.frozenHeight);
+    const inView = rect !== undefined && rect.width > 0 && rect.height > 0 && rect.x + rect.width > paneLeft && rect.y + rect.height > paneTop && rect.x < this.width && rect.y < this.height;
+    if (!prompt || !rect || !inView || this.panel) {
+      if (this.tip && this.tip.parentNode) this.tip.parentNode.removeChild(this.tip);
+      this.tip = undefined;
+      return;
+    }
+    let tip = this.tip;
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.className = 'bym-tip';
+      // Never in the way of a press: it is a note, not a control.
+      tip.style.cssText = 'position:absolute;z-index:1;left:0;top:0;box-sizing:border-box;pointer-events:none';
+      const title = document.createElement('div');
+      title.className = 'bym-tip-title';
+      const text = document.createElement('div');
+      text.className = 'bym-tip-text';
+      tip.appendChild(title);
+      tip.appendChild(text);
+      this.root.appendChild(tip);
+      this.tip = tip;
+    }
+    const title = tip.firstChild as HTMLDivElement;
+    const text = tip.lastChild as HTMLDivElement;
+    if (title.textContent !== prompt.title) title.textContent = prompt.title;
+    if (text.textContent !== prompt.text) text.textContent = prompt.text;
+    title.style.display = prompt.title === '' ? 'none' : 'block';
+    text.style.display = prompt.text === '' ? 'none' : 'block';
+    // Under the cell, a little to the right as Excel has it; above the cell when there is no room below.
+    tip.style.maxWidth = `${Math.max(Math.min(240, this.width - 8), 0)}px`;
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = clamp(rect.x + Math.min(rect.width / 2, 24), 4, Math.max(this.width - width - 4, 4));
+    const below = rect.y + rect.height + 6;
+    const top = below + height <= this.height || rect.y - height - 6 < 0 ? below : rect.y - height - 6;
+    tip.style.left = `${Math.round(left)}px`;
+    tip.style.top = `${Math.round(top)}px`;
+  }
+
+  /** The marks of every sheet, built again after the engine calculated. Without an engine there are none. */
+  private cellMarks(): (Map<number, string> | undefined)[] | undefined {
+    const engine = this.engine;
+    if (!engine) return undefined;
+    if (!this.marksDirty && this.marks) return this.marks;
+    const marks: (Map<number, string> | undefined)[] = [];
+    const add = (cells: { sheet: number; row: number; col: number }[], kind: string) => {
+      for (let i = 0; i < cells.length; i++) {
+        const cell = cells[i];
+        let map = marks[cell.sheet];
+        if (!map) map = marks[cell.sheet] = new Map();
+        map.set(cell.row * MAX_COLS + cell.col, kind);
+      }
+    };
+    try {
+      // The later a kind is added, the more it counts where a cell is of several.
+      add(engine.stale, 'stale');
+      add(engine.mismatched, 'file');
+      add(engine.unsupported, 'file');
+      add(engine.unparsed, 'file');
+      add(engine.circular, 'circular');
+    } catch (error) {
+      // Lists that cannot be read give no marks.
+    }
+    this.marks = marks;
+    this.marksDirty = false;
+    return marks;
+  }
+
+  /** What the grid asks for the mark of each cell; undefined while the shown sheet has no marks. */
+  private markLookup(): ((row: number, col: number) => string | undefined) | undefined {
+    const marks = this.cellMarks();
+    const map = marks ? marks[this.sheetIndex] : undefined;
+    if (!map || map.size === 0) return undefined;
+    return (row, col) => {
+      const kind = map.get(row * MAX_COLS + col);
+      return kind === undefined ? undefined : MARK_COLORS[kind];
+    };
+  }
+
+  /** What there is to say about the formula of a cell that has a mark; '' for a cell without one. */
+  private formulaNote(row: number, col: number): string {
+    const marks = this.cellMarks();
+    const map = marks ? marks[this.sheetIndex] : undefined;
+    const kind = map ? map.get(row * MAX_COLS + col) : undefined;
+    if (kind === undefined) return '';
+    return kind === 'circular' ? this.strings.formulaCircular : kind === 'stale' ? this.strings.formulaStale : this.strings.formulaNotCalculated;
   }
 
   /** The conditional formats of a sheet; undefined for a sheet without any, which then costs nothing to draw. */
@@ -1102,6 +1405,7 @@ export class WorkbookView {
         const missing = engine.uncalculated();
         if (missing.length === 0) return;
         this.engine = engine;
+        this.marksDirty = true;
         engine.recalculate(missing);
         if (engine.incomplete) this.continueCalculation();
         this.conditional.forEach((formats) => formats.invalidate());
@@ -1119,6 +1423,215 @@ export class WorkbookView {
     return this.engine;
   }
 
+  // ------------------------------------------------------- filter and sort
+
+  /** What the grid draws for the filter of a sheet; undefined for a sheet without one. */
+  private gridFilter(sheet: Sheet): GridFilter | undefined {
+    const filter = sheet.autoFilter;
+    // A table brings its own filter, which is only kept; no buttons are shown in such a sheet.
+    if (!filter || sheet.kind !== 'worksheet' || (sheet.anchored !== undefined && sheet.anchored.indexOf('table') >= 0)) return undefined;
+    let view = this.filterViews.get(filter);
+    if (!view) {
+      const width = Math.min(Math.max(filter.range.right - filter.range.left + 1, 0), MAX_COLS);
+      const buttons = new Uint8Array(width);
+      for (let i = 0; i < width; i++) buttons[i] = 1;
+      let filtered = false;
+      for (const column of filter.columns) {
+        if (!(column.colId >= 0 && column.colId < width)) continue;
+        if (isFilterActive(column)) filtered = true;
+        buttons[column.colId] = column.hiddenButton ? 0 : isFilterActive(column) ? 2 : 1;
+      }
+      view = { range: filter.range, buttons, filtered };
+      this.filterViews.set(filter, view);
+    }
+    return view;
+  }
+
+  /**
+   * The column whose filter button a canvas point is on, or -1. A finger gets some
+   * room around the button, but never beyond its cell.
+   */
+  private filterButtonAt(x: number, y: number, reach: number): number {
+    const state = this.state();
+    const filter = this.gridFilter(state.sheet);
+    if (!filter) return -1;
+    const layout = this.layout(state);
+    const hit = hitTest(layout, x, y);
+    if (hit.area !== 'cell' || hit.row !== filter.range.top || hit.col < filter.range.left || hit.col > filter.range.right) return -1;
+    if (!filter.buttons[hit.col - filter.range.left]) return -1;
+    const cell = rangeRect(layout, { top: hit.row, left: hit.col, bottom: hit.row, right: hit.col });
+    const box = cellButtonRect(cell.x, cell.y, cell.width, cell.height);
+    if (!box) return -1;
+    return x >= box.x - reach && y >= box.y - reach && x <= box.x + box.size + reach && y <= box.y + box.size + reach ? hit.col : -1;
+  }
+
+  /** A press on a button inside a cell opens what the button stands for instead of selecting the cell. */
+  private pressCellButton(x: number, y: number, touch: boolean): boolean {
+    if (this.locked) return false;
+    const col = this.filterButtonAt(x, y, touch ? 8 : 0);
+    if (col >= 0) return this.openFilterMenu(col, touch);
+    if (this.dropdownAt(x, y, touch ? 8 : 0)) return this.openValidationList(touch);
+    return false;
+  }
+
+  /** Whether the shown sheet has a filter. */
+  get hasFilter(): boolean {
+    return this.state().sheet.autoFilter !== undefined;
+  }
+
+  /** How many rows under its header the filter of the shown sheet shows; undefined without a filter that has criteria. */
+  get filterSummary(): { shown: number; total: number } | undefined {
+    return filterSummary(this.state().sheet);
+  }
+
+  /**
+   * What there is to say about the active cell and the sheet while nothing else is
+   * being said, in the language of the view; an editor shell shows it in its status bar.
+   */
+  get statusText(): string {
+    const state = this.state();
+    const note = this.formulaNote(state.active.row, state.active.col);
+    if (note !== '') return note;
+    const summary = this.filterSummary;
+    return summary ? this.strings.recordsShown(summary.shown, summary.total) : '';
+  }
+
+  /** Whether a selection is one cell: a single cell, or exactly one merged cell. */
+  private singleCell(): boolean {
+    const { range, active } = this.state();
+    if (range.top === range.bottom && range.left === range.right) return true;
+    const merge = mergeIn(this.merges(), active.row, active.col);
+    return merge !== undefined && sameRange(merge, range);
+  }
+
+  /**
+   * Switches the filter of the sheet on or off. It goes over the selection, or, with one
+   * cell selected, over the block of cells around it; its first row becomes the header.
+   */
+  toggleFilter(): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    const state = this.state();
+    const sheet = state.sheet;
+    if (sheet.kind !== 'worksheet') return;
+    this.closeMenu();
+    if (sheet.autoFilter) {
+      this.applyOps(setAutoFilter(this.workbook, this.sheetIndex, undefined));
+      return;
+    }
+    const range = this.singleCell() ? currentRegion(sheet, state.active.row, state.active.col) : state.range;
+    const first = getCell(sheet, range.top, range.left);
+    if (range.top === range.bottom && range.left === range.right && (!first || first.value === null || first.value === '')) {
+      throw new RangeError('There is no data to filter');
+    }
+    this.applyOps(setAutoFilter(this.workbook, this.sheetIndex, range));
+  }
+
+  /**
+   * Sorts by the column of the active cell: inside the filter its rows, with one cell
+   * selected the block of cells around it (its first row is taken to be a header and
+   * stays), otherwise exactly the selection.
+   */
+  sort(descending: boolean): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    const state = this.state();
+    const sheet = state.sheet;
+    if (sheet.kind !== 'worksheet') return;
+    this.closeMenu();
+    const { active } = state;
+    const filter = sheet.autoFilter;
+    let range: CellRange;
+    let header: boolean;
+    if (filter && active.row >= filter.range.top && active.row <= filter.range.bottom && active.col >= filter.range.left && active.col <= filter.range.right) {
+      range = filter.range;
+      header = true;
+    } else if (this.singleCell()) {
+      range = currentRegion(sheet, active.row, active.col);
+      header = range.bottom > range.top;
+    } else {
+      range = state.range;
+      header = false;
+    }
+    this.applyOps(sortRange(this.workbook, this.sheetIndex, range, [{ col: active.col, descending: descending === true }], { locale: this.locale, header }));
+  }
+
+  /**
+   * Sets which values a column of the filter shows (as its cells show them), and whether
+   * empty cells are shown; undefined removes the criterion of the column. One undo step.
+   */
+  setColumnFilter(col: number, choice: { values: string[]; blank?: boolean } | undefined): void {
+    if (this.destroyed || this.locked) return;
+    this.commitEditing();
+    const sheet = this.state().sheet;
+    const filter = sheet.autoFilter;
+    if (!filter) throw new RangeError('The sheet has no filter');
+    const criterion = choice ? { kind: 'values' as const, values: choice.values.map(String), ...(choice.blank ? { blank: true } : {}) } : undefined;
+    this.applyOps(setFilterColumn(this.workbook, this.sheetIndex, toIndex(col, MAX_COLS) - filter.range.left, criterion, { locale: this.locale }));
+    const summary = filterSummary(sheet);
+    if (summary) this.notify(this.strings.recordsShown(summary.shown, summary.total), 'info');
+  }
+
+  /**
+   * Opens the menu of the filter button of a column (sort, search, the values to show).
+   * Returns false when the column has no button, or the view is read-only.
+   */
+  openFilterMenu(col: number, touch = false): boolean {
+    if (this.destroyed || this.locked) return false;
+    const state = this.state();
+    const sheet = state.sheet;
+    const filter = this.gridFilter(sheet);
+    if (!filter || !(col >= filter.range.left && col <= filter.range.right) || !filter.buttons[col - filter.range.left]) return false;
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    const colId = col - filter.range.left;
+    const strings = this.strings;
+    const list = filterValues(this.workbook, this.sheetIndex, colId, { locale: this.locale });
+    const model = sheet.autoFilter as AutoFilter;
+    const cell = rangeRect(this.layout(state), { top: filter.range.top, left: col, bottom: filter.range.top, right: col });
+    const x = clamp(cell.x, 0, Math.max(this.width - 1, 0));
+    const y = clamp(cell.y, 0, Math.max(this.height - 1, 0));
+    const anchor = { x, y, width: clamp(cell.x + cell.width - x, 0, this.width - x), height: clamp(cell.y + cell.height - y, 0, this.height - y) };
+    this.panel = new FilterMenu({
+      parent: this.root,
+      anchor,
+      label: strings.filterMenu(columnName(col)),
+      strings,
+      values: list.items,
+      blanks: list.blanks,
+      blanksChecked: list.blanksChecked,
+      note: list.truncated ? strings.tooManyValues(MAX_FILTER_VALUES) : undefined,
+      canClear: isFilterActive(model.columns.find((column) => column.colId === colId)),
+      openedByTouch: touch,
+      onSort: (descending) =>
+        this.attempt(() => {
+          const current = this.state().sheet.autoFilter;
+          if (current) this.applyOps(sortRange(this.workbook, this.sheetIndex, current.range, [{ col, descending }], { locale: this.locale, header: true }));
+        }),
+      onApply: (choice) => this.attempt(() => this.setColumnFilter(col, choice)),
+      onClose: () => this.panelClosed(),
+    });
+    this.placeTip();
+    return true;
+  }
+
+  private panelClosed(): void {
+    this.panel = undefined;
+    if (this.destroyed) return;
+    // Back to the cells; the message beside the active cell, hidden while the panel was open, comes back.
+    this.focusInput(true);
+    this.schedule();
+  }
+
+  /** Alt+Down on a cell with a button: opens what the button stands for. */
+  private openCellList(): boolean {
+    const state = this.state();
+    const { active } = state;
+    const filter = this.gridFilter(state.sheet);
+    if (filter && active.row === filter.range.top && active.col >= filter.range.left && active.col <= filter.range.right) return this.openFilterMenu(active.col);
+    return this.openValidationList();
+  }
+
   // ------------------------------------------------------------- selection
 
   private expandRange(range: CellRange): CellRange {
@@ -1128,6 +1641,8 @@ export class WorkbookView {
   private setSelection(active: CellPos, range: CellRange, focus: CellPos, revealCell?: CellPos): void {
     const state = this.state();
     const changed = !sameCell(active, state.active) || !sameRange(range, state.range);
+    // A list that belongs to another cell has nothing to choose for this one.
+    if (changed && this.panel) this.panel.close();
     state.active = { row: active.row, col: active.col };
     state.range = { ...range };
     state.focus = { row: focus.row, col: focus.col };
@@ -1167,6 +1682,11 @@ export class WorkbookView {
     const merge = mergeIn(this.merges(), active.row, active.col);
     const single = range.top === range.bottom && range.left === range.right;
     if (!single && !(merge && sameRange(merge, range))) text += `, ${this.strings.selected(rangeName(range))}`;
+    // What a sighted user sees beside the cell: the message of its validation, and what its mark says.
+    const prompt = this.activeInfo().prompt;
+    if (prompt) text += `. ${prompt.title}${prompt.title !== '' && prompt.text !== '' ? ': ' : ''}${prompt.text}`;
+    const note = this.formulaNote(active.row, active.col);
+    if (note !== '') text += `. ${note}`;
     this.live.textContent = text;
     this.syncInput();
   }
@@ -1193,6 +1713,11 @@ export class WorkbookView {
     const ctrl = event.ctrlKey || event.metaKey;
     const shift = event.shiftKey;
     if (event.altKey) {
+      // Alt+Down opens the list of the cell: the menu of a filter button, the values of a validation.
+      if (event.key === 'ArrowDown' && !ctrl && !shift) {
+        if (this.openCellList()) event.preventDefault();
+        return;
+      }
       // Browsers keep Ctrl+PageUp/PageDown for their own tabs; Alt does the same here.
       if (event.key !== 'Delete' && event.key !== 'Backspace') {
         if (ctrl || shift || (event.key !== 'PageUp' && event.key !== 'PageDown')) return;
@@ -1482,6 +2007,8 @@ export class WorkbookView {
    */
   localizeError(error: unknown): string {
     const strings = this.strings;
+    // A data validation speaks for itself: the words are those of the file.
+    if (error instanceof ValidationError) return error.display;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
     let match: RegExpExecArray | null;
     if (message === 'Too many cells to format at once') return strings.tooManyCells;
@@ -1498,6 +2025,10 @@ export class WorkbookView {
     if (message === 'The workbook has too many cell formats') return strings.tooManyFormats;
     if (message === 'The formula cannot be read') return strings.badFormula;
     if (message === 'The range is too large to copy') return strings.copyTooLarge;
+    if (message === 'There is no data to filter') return strings.nothingToFilter;
+    if (message === 'Cannot sort a range that contains merged cells') return strings.cannotSortMerged;
+    if ((match = /^Cannot sort through the array formula in (.+)$/.exec(message))) return strings.cannotSortArray(match[1]);
+    if ((match = /^Cannot (sort|filter) in a sheet with (.+): not supported yet$/.exec(message))) return strings.sortNotSupportedWith(match[1] as 'sort' | 'filter', match[2]);
     return strings.actionFailed;
   }
 
@@ -1505,6 +2036,19 @@ export class WorkbookView {
   private notify(message: string, kind: 'error' | 'info'): void {
     this.live.textContent = message;
     if (this.options.onNotice) this.options.onNotice({ message, kind });
+  }
+
+  /**
+   * Says something once the key or press that is being handled is done with: the selection
+   * usually moves on right after a cell is written, and what is said about the new cell
+   * would take the place of this.
+   */
+  private notifyLater(message: string): void {
+    if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer);
+    this.noticeTimer = setTimeout(() => {
+      this.noticeTimer = undefined;
+      if (!this.destroyed) this.notify(message, 'info');
+    }, 0);
   }
 
   private emitEditing(): void {
@@ -1574,11 +2118,19 @@ export class WorkbookView {
     if (!unchanged) {
       // The editor stays open until the cell is written: if that fails, what was typed is still there.
       this.committing = true;
+      let warning: string | undefined;
       try {
-        this.applyOps(setCellInput(this.workbook, edit.sheet, edit.row, edit.col, text, { locale: this.locale }));
+        const ops = setCellInput(this.workbook, edit.sheet, edit.row, edit.col, text, { locale: this.locale });
+        // A value the cell's data validation refuses is not written, and the editor stays open with it.
+        warning = this.validateInput(edit.sheet, edit.row, edit.col, text, ops);
+        this.applyOps(ops);
       } finally {
         this.committing = false;
       }
+      this.endEdit();
+      // UNSURE: Excel asks before it keeps a value that breaks a rule that only warns; here it is kept and said.
+      if (warning !== undefined) this.notifyLater(warning);
+      return true;
     }
     this.endEdit();
     return true;
@@ -1610,6 +2162,8 @@ export class WorkbookView {
     }
     this.locked = next;
     this.input.readOnly = next;
+    this.cellInfo = undefined;
+    this.schedule();
   }
 
   /** Closes the editor and leaves the cell as it was. */
@@ -1746,6 +2300,7 @@ export class WorkbookView {
     if (this.options.calculate === false) return [];
     try {
       if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      this.marksDirty = true;
       if (!cells) this.engine.invalidate();
       // After rows or columns moved every result may have changed for a reason the engine cannot
       // see in the cells (a deleted row makes a sum smaller), so the values of the file give way.
@@ -1769,6 +2324,7 @@ export class WorkbookView {
       const engine = this.engine;
       if (this.destroyed || !engine || !engine.incomplete) return;
       let sheets: number[] = [];
+      this.marksDirty = true;
       try {
         sheets = engine.recalculate([]).map((entry) => entry.sheet);
         if (engine.incomplete) this.continueCalculation();
@@ -1849,6 +2405,7 @@ export class WorkbookView {
   private afterChange(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): void {
     // A rule may read any cell of any sheet.
     this.conditional.forEach((formats) => formats.invalidate());
+    this.cellInfo = undefined;
     if (structural) {
       this.lastTap = undefined;
       // Row heights, column widths and hidden runs moved; the merged ranges are indexed again on their own.
@@ -2154,6 +2711,7 @@ export class WorkbookView {
 
   private closeMenu(): void {
     if (this.menu) this.menu.close();
+    if (this.panel) this.panel.close();
   }
 
   /**
@@ -2457,6 +3015,8 @@ export class WorkbookView {
     const point = this.canvasPoint(event);
     const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
     if (resize) this.autoFit(resize);
+    // A second click on a button inside a cell belongs to the button.
+    else if (this.filterButtonAt(point.x, point.y, 0) >= 0 || this.dropdownAt(point.x, point.y, 0)) return;
     else if (hitTest(this.layout(), point.x, point.y).area === 'cell') this.startEditing();
   };
 
@@ -2567,6 +3127,7 @@ export class WorkbookView {
       this.beginResize(pointerId, point, resize);
       return;
     }
+    if (this.pressCellButton(point.x, point.y, false)) return;
     const mode = this.press(point.x, point.y, event.shiftKey);
     this.drag = { pointerId, mode, x: point.x, y: point.y, originX: point.x, originY: point.y, moved: false };
     this.capturePointer(pointerId);
@@ -2656,6 +3217,10 @@ export class WorkbookView {
       if (touch.consumed || touch.moved || !still || touch.domX !== this.domX || touch.domY !== this.domY) return;
       if (!this.tryCommit()) return;
       this.focusInput(true);
+      if (this.pressCellButton(point.x, point.y, true)) {
+        this.lastTap = undefined;
+        return;
+      }
       const mode = this.press(point.x, point.y, false);
       // A second tap that selects the same cell (or the same merged cell) edits it; two quick taps on neighbours do not.
       const last = this.lastTap;
