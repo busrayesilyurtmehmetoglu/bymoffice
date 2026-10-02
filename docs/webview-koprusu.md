@@ -113,7 +113,7 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 |---|---|
 | `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
 | `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale` gönderildi ama açık dosya yok |
-| `unsupported` | Dosya gösterilemeyen bir türde (xlsx ya da docx değil: doc, xls, RTF, parola korumalı, Office dosyası olmayan içerik, boş içerik) |
+| `unsupported` | Dosya gösterilemeyen bir türde (Word 95 ve öncesi, parola korumalı, Office dosyası olmayan içerik, boş içerik) |
 | `corrupt` | Dosya xlsx gibi başlıyor ama okunamıyor (kesik, bozuk) |
 | `load-failed` | `url` getirilemedi (ağ hatası, HTTP hata kodu, zaman aşımı, boyut sınırı, içerik güvenliği ilkesi engeli) ya da yükleme bir `close` / yeni `load` ile iptal edildi |
 | `save-failed` | Kaydetme sırasında hata; ya da `saved` iletisi uygulamaya teslim edilemeden bekleyen iletiler sınırı aşıldı |
@@ -289,7 +289,9 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 
 ## 7. Sınırlar
 
-- **xlsx gösterilir ve düzenlenir; docx salt okunur gösterilir.** doc, xls ve RTF `unsupported` ile reddedilir.
+- **xlsx gösterilir ve düzenlenir; docx, doc, RTF ve xls salt okunur gösterilir.** Parola korumalı dosyalar `unsupported` ile reddedilir. RTF için sözleşme docx ile aynıdır (`format: 'rtf'`).
+- **xls için sözleşme:** `loaded` iletisi `readOnly: true` taşır. `setReadOnly` ile düzenleme açılamaz: istek `done` ile yanıtlanır ama yanıt `readOnly: true` taşır ve görünüm değişmez (xls'e yazılamadığı için düzenlemeler kaydedilemezdi). `save` özgün baytları döner.
+- **doc için sözleşme** docx ile aynıdır.
 - **docx için sözleşme:** `loaded` iletisi `{ format: 'docx', kind: 'document', sheets: [], activeSheet: 0 }` taşır. `save` özgün baytları döner; `changed` ve `selection` hiç gelmez; `setReadOnly`, `undo`, `redo` etkisizdir ama `done` ile onaylanır; `setLocale` çalışır. Belgede bir bağlantıya basılınca sayfa onu kendisi açmaz, uygulamaya `{ type: 'link', url }` iletisi gönderir (yalnız http, https, mailto, tel).
 - **Base64 bellek maliyeti.** Dosya iki yönde de base64 dizgisi olarak taşınır: metin dosyadan üçte bir büyüktür ve yükleme/kaydetme sırasında dosyanın birkaç kopyası aynı anda bellekte durur (uygulamadaki baytlar, base64 metni, WebView'e geçirilen betik, sayfadaki dizgi, çözülmüş baytlar). Sayfanın kendi kodlama/çözme işlemi parça parça ve doğrusal sürede çalışır (20 MB için Node'da gidiş-dönüş ≈ 0,4 sn; tarayıcılarda 5 MB'lık dosya için yükleme ≈ 0,1–0,4 sn, kaydetme < 0,1 sn ölçüldü). Asıl maliyet platformun dizgiyi WebView'e geçirmesindedir ve gerçek cihazda ölçülmedi.
 - **Gerçek cihazda sınanmadı.** Özellikle şunlar doğrulanmayı bekliyor: iOS'ta odak yakınlaştırmasının gerçekten engellendiği, güvenli alan boşlukları, ekran klavyesi açıldığında yerleşim, çok büyük `runJavaScript` betiklerinin davranışı, Android'in eski WebView sürümleri.

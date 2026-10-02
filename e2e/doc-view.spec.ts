@@ -1190,7 +1190,7 @@ test.describe('BymOffice.mount with a document', () => {
     const names = await page.evaluate(async (input) => {
       const api = (window as any).BymOffice;
       const out: string[] = [];
-      for (const file of [new Uint8Array(input), new TextEncoder().encode('{\\rtf1 text}')]) {
+      for (const file of [new Uint8Array(input), new TextEncoder().encode('plain text')]) {
         await api.mount(document.getElementById('editor'), { file }).catch((error: Error) => out.push(error.name));
       }
       return out;

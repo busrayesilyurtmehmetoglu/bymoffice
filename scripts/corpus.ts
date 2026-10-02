@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { OpcPackage, UnsupportedFileError, applyOp, open, parseXml, serializeXml, type OfficeFile, type Workbook } from '../src/index';
 
-const EXTENSIONS = /\.(docx|docm|dotx|xlsx|xlsm|xltx|doc|xls)$/i;
+const EXTENSIONS = /\.(docx|docm|dotx|xlsx|xlsm|xltx|doc|xls|rtf)$/i;
 const SKIP_DIRS = new Set(['node_modules', 'vendor', '.git']);
 
 function* walk(dir: string): Generator<string> {
@@ -29,6 +29,8 @@ function* walk(dir: string): Generator<string> {
 
 let sheets = 0;
 let cells = 0;
+let rtfFiles = 0;
+let rtfBlocks = 0;
 let docFiles = 0;
 let docBlocksBinary = 0;
 let xlsBooks = 0;
@@ -229,7 +231,13 @@ for (const root of roots) {
       const bytes = new Uint8Array(readFileSync(path));
       const file = await open(bytes);
       if (file.container === 'ooxml') await checkOoxml(file, bytes);
-      else checkCfb(file);
+      else if (file.container === 'rtf') {
+        // RTF must read into the model and be saved as it was.
+        const model = await file.document!();
+        rtfFiles++;
+        rtfBlocks += model.body.blocks.length;
+        if (!isDeepStrictEqual(await file.save(), bytes)) throw new Error('saved bytes differ from the file');
+      } else checkCfb(file);
       passed[file.format] = (passed[file.format] ?? 0) + 1;
     } catch (error) {
       if (error instanceof UnsupportedFileError) unsupported++;
@@ -240,6 +248,7 @@ for (const root of roots) {
 
 const total = Object.values(passed).reduce((sum, n) => sum + n, 0);
 console.log(`passed: ${total}`, passed);
+console.log(`rtf model: ${rtfFiles} documents, ${rtfBlocks} blocks`);
 console.log(`doc model: ${docFiles} documents, ${docBlocksBinary} blocks`);
 console.log(`xls model: ${xlsBooks} workbooks, ${xlsSheets} sheets, ${xlsCells} cells`);
 console.log(`docx model: ${documents} documents, ${docBlocks} blocks`);

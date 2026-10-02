@@ -110,6 +110,9 @@ test.describe('BymOffice.mount', () => {
         const first = await api.mount(host, { file: new Uint8Array(xls) });
         const sheetView = first.view;
         const before = sheetView.workbook.sheets[0].rows.get(0).cells[0].value;
+        // Editing cannot be turned on for a file that cannot be written.
+        first.editor.setReadOnly(false);
+        sheetView.setReadOnly(false);
         sheetView.setCellInput(0, 0, '7');
         const result = {
           xlsKind: first.kind,
@@ -123,6 +126,10 @@ test.describe('BymOffice.mount', () => {
           text: '',
         };
         first.destroy();
+        const third = await api.mount(host, { file: new TextEncoder().encode('{\\rtf1\\ansi Hello {\\b rich} text\\par Second\\par}') });
+        const rtf = [third.kind, third.file.format, third.view.pageCount, api.paragraphText(third.document.body.blocks[0])].join('|');
+        third.destroy();
+        if (rtf !== 'document|rtf|1|Hello rich text') throw new Error('rtf: ' + rtf);
         const second = await api.mount(host, { file: new Uint8Array(doc) });
         result.docKind = second.kind;
         result.pages = second.view.pageCount;

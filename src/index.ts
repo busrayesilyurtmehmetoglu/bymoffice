@@ -1,5 +1,6 @@
 import { CfbFile } from './cfb';
 import { readDoc } from './formats/doc/document';
+import { readRtf } from './formats/rtf/document';
 import { readDocx } from './formats/docx/document';
 import { documentPictures } from './model/doc/pictures';
 import type { DocModel } from './model/doc/types';
@@ -22,6 +23,7 @@ export { readXlsx } from './formats/xlsx/workbook';
 export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
 export { readDocx } from './formats/docx/document';
 export { readDoc } from './formats/doc/document';
+export { readRtf } from './formats/rtf/document';
 export { documentPictures } from './model/doc/pictures';
 export { inFieldCode, paragraphText, rawOf, safeHyperlinkTarget, type DocModel } from './model/doc/types';
 export { NumberingCounters } from './formats/docx/numbering';
@@ -56,12 +58,12 @@ export { renderPage, type PageImage, type RenderPageOptions } from './render/doc
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 
-export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls';
+export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
 
 export interface OfficeFile {
   format: OfficeFormat;
   kind: 'document' | 'spreadsheet';
-  container: 'ooxml' | 'cfb';
+  container: 'ooxml' | 'cfb' | 'rtf';
   /** Present for docx/xlsx. */
   package?: OpcPackage;
   /** Present for doc/xls. */
@@ -165,7 +167,16 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
 
   // "{\rtf": Word documents are often RTF saved with a .doc extension.
   if (bytes[0] === 0x7b && bytes[1] === 0x5c && bytes[2] === 0x72 && bytes[3] === 0x74 && bytes[4] === 0x66) {
-    throw new UnsupportedFileError('RTF documents are not supported yet');
+    let model: Promise<DocModel> | undefined;
+    // Nothing writes RTF and nothing can be changed, so saving returns the original bytes.
+    return {
+      format: 'rtf',
+      kind: 'document',
+      container: 'rtf',
+      save: async () => bytes,
+      workbook: notASpreadsheet,
+      document: () => (model ??= Promise.resolve().then(() => readRtf(bytes))),
+    };
   }
 
   throw new UnsupportedFileError('Not a Word or Excel file');
@@ -270,6 +281,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   // An xls file cannot be written yet: it is shown read-only, so that no edit is lost on saving.
   const editor = new SpreadsheetEditor(container, workbook, file.format === 'xls' ? { ...options, readOnly: true } : options);
   const view = editor.view;
+  if (file.format === 'xls') {
+    // Nothing may turn editing on: saving would give the original bytes and the edits would be lost.
+    const lockView = view.setReadOnly.bind(view);
+    const lockEditor = editor.setReadOnly.bind(editor);
+    view.setReadOnly = () => lockView(true);
+    editor.setReadOnly = () => lockEditor(true);
+  }
   save = async () => {
     if (view.isEditing) view.commitEditing();
     return file.save();

@@ -1007,3 +1007,62 @@ test('bridge: a document load that is overtaken shows nothing', async () => {
     ],
   );
 });
+
+/** Makes the fake host open every file as an xls workbook. */
+function withXls(f: Fake): void {
+  f.host.open = async (bytes) => {
+    f.opened.push(bytes);
+    return {
+      format: 'xls',
+      workbook: async () => ({ sheets: [{ name: 'Sheet1', state: 'visible', kind: 'worksheet' }] }),
+      save: () => f.saveResult(),
+    } as unknown as OfficeFile;
+  };
+}
+
+test('bridge: an xls file is shown read-only whatever the load asks for, and loaded says so', async () => {
+  for (const asked of [false, true, undefined]) {
+    const f = fake();
+    withXls(f);
+    const bridge = createBridge(f.host);
+    const message: Record<string, unknown> = { type: 'load', id: 'x', data: DATA };
+    if (asked !== undefined) message.readOnly = asked;
+    await bridge.receive(JSON.stringify(message));
+    // The view is never created editable.
+    assert.equal(f.views[0].readOnly, true, String(asked));
+    assert.deepEqual(f.sent[1], { type: 'loaded', id: 'x', format: 'xls', sheets: [{ name: 'Sheet1', state: 'visible', kind: 'worksheet' }], activeSheet: 0, readOnly: true });
+  }
+  // A file that can be edited states nothing: what the load asked for holds.
+  const g = fake();
+  await createBridge(g.host).receive(JSON.stringify({ type: 'load', id: 'y', data: DATA, readOnly: false }));
+  assert.equal(g.views[0].readOnly, false);
+  assert.equal('readOnly' in g.sent[1], false);
+});
+
+test('bridge: setReadOnly cannot make an xls file editable; the confirmation says that it stays read-only', async () => {
+  const f = fake();
+  withXls(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive(JSON.stringify({ type: 'load', data: DATA }));
+  await bridge.receive('{"type":"setReadOnly","readOnly":false,"id":"a"}');
+  await bridge.receive('{"type":"setReadOnly","readOnly":false}');
+  await bridge.receive('{"type":"setReadOnly","readOnly":true,"id":"b"}');
+  // The view is told "read-only" every time, never "editable".
+  assert.deepEqual(f.calls, ['view', 'setReadOnly true', 'setReadOnly true', 'setReadOnly true']);
+  assert.deepEqual(f.sent.slice(2), [
+    { type: 'done', id: 'a', command: 'setReadOnly', readOnly: true },
+    // What was asked for is what holds: confirmed as for any other file.
+    { type: 'done', id: 'b', command: 'setReadOnly' },
+  ]);
+  // The other commands are not touched by it.
+  await bridge.receive('{"type":"undo","id":"u"}');
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'done', id: 'u', command: 'undo' });
+
+  // An xlsx file follows the request, and its confirmation carries nothing more.
+  const g = fake();
+  const other = createBridge(g.host);
+  await other.receive(JSON.stringify({ type: 'load', data: DATA }));
+  await other.receive('{"type":"setReadOnly","readOnly":false,"id":"a"}');
+  assert.deepEqual(g.calls, ['view', 'setReadOnly false']);
+  assert.deepEqual(g.sent[g.sent.length - 1], { type: 'done', id: 'a', command: 'setReadOnly' });
+});

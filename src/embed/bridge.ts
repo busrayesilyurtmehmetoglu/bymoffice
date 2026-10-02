@@ -587,6 +587,8 @@ export function createBridge(host: BridgeHost): Bridge {
     out.format = file.format;
     out.sheets = workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind }));
     out.activeSheet = view.activeSheet;
+    // The file is shown read-only whatever was asked for, and `setReadOnly` will not change that.
+    if (file.format === 'xls') out.readOnly = true;
     send(out);
   };
 
@@ -633,6 +635,8 @@ export function createBridge(host: BridgeHost): Bridge {
       const locale = type === 'setLocale' ? field<string>(fields, 'locale', 'string', true) : undefined;
       if (!shown) return fail('not-loaded', 'No file is open', id);
       const view = shown.view;
+      /** Set when the command was heard but could not have its effect: the answer says what holds instead. */
+      let forced = false;
       if (!view) {
         // A document: nothing to edit, so only the language has an effect; the other commands are confirmed as done.
         if (type === 'setLocale') {
@@ -641,6 +645,7 @@ export function createBridge(host: BridgeHost): Bridge {
         }
       } else if (type === 'setReadOnly') {
         // An xls file cannot be written yet, so it stays read-only whatever is asked.
+        forced = shown.file.format === 'xls' && readOnly === false;
         view.setReadOnly(shown.file.format === 'xls' ? true : (readOnly as boolean));
       }
       else if (type === 'setLocale') {
@@ -648,7 +653,9 @@ export function createBridge(host: BridgeHost): Bridge {
         setLocale(locale);
       } else if (type === 'undo') view.undo();
       else view.redo();
-      done(type, id);
+      // The command is confirmed as before; a request to make an xls file editable also learns that it stays read-only.
+      if (forced && id !== undefined) send({ type: 'done', id, command: type, readOnly: true });
+      else done(type, id);
     } catch (error) {
       // Whatever went wrong, the page stays alive and the application hears about it.
       fail('bad-message', errorText(error), id);
