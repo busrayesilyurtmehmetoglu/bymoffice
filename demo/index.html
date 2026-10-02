@@ -42,6 +42,7 @@
       .bad { color: var(--bad); background: var(--bad-bg); }
       .warn { color: var(--warn); background: var(--warn-bg); }
       #grid { height: 560px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+      #doc { height: 640px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #status { font-weight: 600; overflow-wrap: anywhere; }
       #summary { font-size: 13px; color: var(--muted); }
       pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 420px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -51,8 +52,8 @@
     <main>
       <h1>BYM Office test arayüzü</h1>
       <p class="muted">
-        Sürüm durumu: kapsayıcı katmanı (dosyayı aç, parçalarını oku, kayıpsız yeniden kaydet). Tablo ve belge
-        görüntüleme henüz yok; eklendikçe bu sayfaya gelecek. Dosyalar yalnız tarayıcınızda işlenir, hiçbir yere gönderilmez.
+        xlsx dosyaları tablo düzenleyicide, docx dosyaları salt okunur belge görüntüleyicide açılır; doc ve xls için yalnız
+        kapsayıcı katmanı vardır (parçaları oku, kayıpsız yeniden kaydet). Dosyalar yalnız tarayıcınızda işlenir, hiçbir yere gönderilmez.
       </p>
 
       <section>
@@ -111,6 +112,17 @@
           Sağ tık menüsü kes/kopyala/yapıştır ve satır-sütun ekle-sil sunar; sütun ya da satır başlığının kenarını sürükleyerek boyutlandırın, çift tıklayarak içeriğe sığdırın.
         </p>
         <p class="muted"><strong>Kaydetme:</strong> "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; değiştirmediğiniz her şey özgün baytlarıyla kalır. İndirilen dosyayı Excel'de açıp denetleyebilirsiniz. Formüller burada hesaplanmaz; Excel dosyayı açarken yeniden hesaplar.</p>
+      </section>
+
+      <section id="doc-section" hidden>
+        <h2>Belge görünümü</h2>
+        <p class="muted" id="doc-note"></p>
+        <div id="doc"></div>
+        <p class="muted" id="doc-info" style="margin: 10px 0 0"></p>
+        <p class="muted">
+          Belge salt okunurdur. Üst çubuktan ya da Ctrl/Cmd ile birlikte + / − / 0 tuşlarıyla (ve Ctrl/Cmd + tekerlekle, dokunmatikte iki parmakla) yakınlaştırın;
+          PageUp / PageDown / Home / End ile gezinin. Fareyle sürükleyerek metin seçin, Ctrl/Cmd+A tümünü seçer, Ctrl/Cmd+C kopyalar. Köprülere tıklanınca yeni sekmede açılır.
+        </p>
       </section>
 
       <section>
@@ -253,7 +265,36 @@
 
       let editor = null;
       let view = null;
+      let docView = null;
       let changes = 0;
+
+      async function showDocument(record) {
+        const section = $('doc-section');
+        section.hidden = false;
+        $('doc-note').textContent = '';
+        $('doc-info').textContent = '';
+        try {
+          const started = performance.now();
+          const model = await record.file.document();
+          const ms = performance.now() - started;
+          if (selected !== record) return;
+          const painted = performance.now();
+          docView = new BymOffice.DocumentView($('doc'), model, {
+            package: record.file.package,
+            locale: 'tr',
+            onPageChange: (page, count) => {
+              $('doc-info').textContent = `Sayfa ${page} / ${count}${docView && !docView.layoutDone ? ' (sayfalar hazırlanıyor)' : ''} · yakınlaştırma %${Math.round((docView ? docView.zoom : 1) * 100)}`;
+            },
+            onNotice: (notice) => {
+              $('doc-note').textContent = notice.message;
+            },
+          });
+          window.__docView = docView;
+          $('doc-note').textContent = `Model ${ms.toFixed(1)} ms'de okundu, ilk sayfalar ${(performance.now() - painted).toFixed(1)} ms'de çizildi.`;
+        } catch (error) {
+          $('doc-note').textContent = `Belge gösterilemedi: ${error.message}`;
+        }
+      }
 
       function refreshTools() {
         $('edit-state').textContent = !view ? '' : $('readonly').checked ? 'Salt okunur.' : changes === 0 ? 'Değişiklik yok.' : `${changes} değişiklik adımı (geri al/yinele dahil).`;
@@ -283,11 +324,16 @@
       async function showPreview(record) {
         const section = $('preview-section');
         if (editor) editor.destroy();
+        if (docView) docView.destroy();
         editor = null;
         view = null;
+        docView = null;
+        window.__docView = null;
+        $('doc-section').hidden = true;
         section.hidden = true;
         $('preview-note').textContent = '';
         $('cell-info').textContent = '';
+        if (record && record.file && record.file.format === 'docx') return showDocument(record);
         if (!record || !record.file || record.file.format !== 'xlsx') return;
         section.hidden = false;
         try {

@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { XLSX_PARTS, XLS_STREAMS, readPartsInNode, textFile, xls, xlsx } from './fixtures/files';
 import { formatAt, getCell, open as openInNode } from '../src/index';
 import { sampleWorkbook } from '../test/fixtures';
+import { sampleDocx } from './fixtures/docx';
 import { expect, expectResponsive, test } from './helpers';
 
 const upload = (name: string, bytes: Uint8Array) => ({
@@ -166,6 +167,47 @@ test.describe('demo page', () => {
     await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
     await expect(page.locator('#preview-section')).toBeHidden();
   });
+  test('a docx opens in the document view; another file takes its place', async ({ page }) => {
+    const input = await sampleDocx();
+    await page.locator('#file').setInputFiles(upload('belge.docx', input));
+    await expect(page.locator('#status')).toHaveText('Biçim: docx (ooxml)');
+    await expect(page.locator('#doc-section')).toBeVisible();
+    await expect(page.locator('#preview-section')).toBeHidden();
+    await expect(page.locator('#doc .bym-doc')).toHaveCount(1);
+    await expect(page.locator('#doc .bym-doc-pages')).toHaveText('Sayfa 1 / 3');
+    await expect(page.locator('#doc-info')).toContainText('Sayfa 1 / 3');
+    await expect(page.locator('#doc-note')).toContainText('Model');
+    await expect(page.locator('#doc canvas').first()).toBeVisible();
+    const dark = await page.locator('#doc canvas').first().evaluate((element) => {
+      const canvas = element as HTMLCanvasElement;
+      const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+      let count = 0;
+      for (let i = 0; i < data.length; i += 4) if (data[i] < 80 && data[i + 1] < 80 && data[i + 2] < 80) count++;
+      return count;
+    });
+    expect(dark).toBeGreaterThan(300);
+    // The parts of the package are still listed, and the file still saves as it was.
+    await expect(page.locator('#parts tr td:first-child', { hasText: '/word/document.xml' })).toHaveCount(1);
+    await expect(page.locator('#save')).toBeEnabled();
+
+    await page.evaluate(() => (window as any).__docView.goToPage(2));
+    await expect(page.locator('#doc-info')).toContainText('Sayfa 2 / 3');
+
+    // A second document replaces the first; a workbook hides the document view; clearing removes it.
+    await page.locator('#file').setInputFiles(upload('belge2.docx', input));
+    await expect(page.locator('#doc .bym-doc')).toHaveCount(1);
+    await page.locator('#file').setInputFiles(upload('model.xlsx', await sampleWorkbook()));
+    await expect(page.locator('#preview-section')).toBeVisible();
+    await expect(page.locator('#doc-section')).toBeHidden();
+    await expect(page.locator('#doc .bym-doc')).toHaveCount(0);
+    await page.locator('#files tr', { hasText: 'belge.docx' }).click();
+    await expect(page.locator('#doc .bym-doc')).toHaveCount(1);
+    await expect(page.locator('#grid .bym-view')).toHaveCount(0);
+    await page.locator('#clear').click();
+    await expect(page.locator('#doc .bym-doc')).toHaveCount(0);
+    await expect(page.locator('#doc-section')).toBeHidden();
+  });
+
   test('the editor shell is shown: cells can be edited, formatted, undone and restructured', async ({ page }) => {
     await page.locator('#file').setInputFiles(upload('model.xlsx', await sampleWorkbook()));
     await expect(page.locator('#edit-state')).toHaveText('Değişiklik yok.');

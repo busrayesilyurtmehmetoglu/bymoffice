@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: document view</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      /* Fixed size on desktop; narrower screens get the full width. */
+      #host {
+        width: 800px;
+        max-width: 100%;
+        height: 500px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Text fields: every browser has them in the Tab order (Safari leaves buttons out). -->
+    <input id="before" type="text" aria-label="before" />
+    <div id="host"></div>
+    <input id="after" type="text" aria-label="after" />
+    <p id="state">loading</p>
+    <script src="/dist/bymoffice.min.js"></script>
+    <script>
+      // "?hostile": rules a host page might have for bare elements; the view must not care.
+      if (location.search.indexOf('hostile') >= 0) {
+        var hostile = document.createElement('style');
+        hostile.textContent =
+          'canvas{max-width:50%;border:5px solid red;margin:10px}' +
+          'button{min-width:200px;height:90px;text-transform:uppercase}' +
+          'div{line-height:3}' +
+          'textarea{width:300px;height:100px;opacity:1}' +
+          'svg{width:100%;height:100%}' +
+          'span{display:inline-block;padding:9px}';
+        document.head.appendChild(hostile);
+      }
+      window.__pages = [];
+      window.__links = [];
+      window.__notices = [];
+      window.__opened = [];
+      // Nothing may really be opened from a test; what would have been is recorded.
+      window.open = function (url, target, features) {
+        window.__opened.push({ url: String(url), target: target, features: features });
+        return null;
+      };
+      // Opens a document from bytes and shows it in #host. Resolves once the view exists.
+      // options.shadow: 'open' | 'closed' builds the view inside a shadow root; options.transform: a CSS
+      // transform for the host; options.veto: the link handler returns false; options.noPackage: no pictures.
+      window.__mountDoc = async function (bytes, options) {
+        options = options || {};
+        if (window.__docView) window.__docView.destroy();
+        window.__docView = null;
+        window.__pages.length = 0;
+        window.__links.length = 0;
+        window.__notices.length = 0;
+        window.__opened.length = 0;
+        var host = document.getElementById('host');
+        host.style.transform = options.transform || '';
+        host.style.transformOrigin = '0 0';
+        var container = host;
+        if (window.__shadowHost) window.__shadowHost.remove();
+        window.__shadow = null;
+        if (options.shadow) {
+          var shadowHost = document.createElement('div');
+          shadowHost.id = 'shadow-host';
+          shadowHost.style.cssText = 'width:100%;height:100%';
+          host.appendChild(shadowHost);
+          window.__shadowHost = shadowHost;
+          window.__shadow = shadowHost.attachShadow({ mode: options.shadow });
+          container = document.createElement('div');
+          container.style.cssText = 'width:100%;height:100%';
+          window.__shadow.appendChild(container);
+        }
+        var started = performance.now();
+        var file = await BymOffice.open(new Uint8Array(bytes));
+        var doc = await file.document();
+        window.__docFile = file;
+        window.__readMs = performance.now() - started;
+        var viewStarted = performance.now();
+        window.__docView = new BymOffice.DocumentView(container, doc, {
+          package: options.noPackage ? undefined : file.package,
+          locale: options.locale,
+          zoom: options.zoom,
+          toolbar: options.toolbar,
+          onPageChange: function (page, count) {
+            window.__pages.push([page, count]);
+          },
+          onNotice: function (notice) {
+            window.__notices.push({ message: notice.message, kind: notice.kind });
+          },
+          onLinkClick: function (target) {
+            window.__links.push(target);
+            return options.veto ? false : undefined;
+          },
+        });
+        window.__viewMs = performance.now() - viewStarted;
+        return true;
+      };
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>

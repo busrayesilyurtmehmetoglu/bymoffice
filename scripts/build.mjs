@@ -63,7 +63,8 @@ await Promise.all([
     `script-src ${hashes.join(' ')}`,
     // The view adds its own style element, whose text is not known here.
     "style-src 'unsafe-inline'",
-    'img-src data:',
+    // blob: the pictures of a document, made by the page itself from the bytes of the file.
+    'img-src data: blob:',
     // No remote hosts: a `load` with a URL reaches the page's own origin, blob: and data: only.
     "connect-src 'self' blob: data:",
     "base-uri 'none'",

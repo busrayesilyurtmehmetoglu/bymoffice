@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { FrameLocator, Page } from '@playwright/test';
 import { ZipArchive, getCell, open } from '../src/index';
 import { buildXlsx, sampleWorkbook, worksheetXml } from '../test/fixtures';
+import { sampleDocx } from './fixtures/docx';
 import { textFile, truncatedXlsx, xls } from './fixtures/files';
 import { expect, expectResponsive, test } from './helpers';
 
@@ -350,6 +351,78 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       const back = ZipArchive.read(new Uint8Array(Buffer.from(await bridge.savedData(), 'base64')));
       expect(Buffer.compare(Buffer.from(await back.read('xl/media/noise.bin')), Buffer.from(noise))).toBe(0);
       await expectResponsive(page);
+    });
+
+    test('a docx is shown read-only as pages: loaded, pictures, link, save, commands', async ({ page, isMobile }) => {
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      const input = await sampleDocx();
+      await bridge.send({ type: 'load', id: 'd1', data: base64(input), name: 'belge.docx', locale: 'tr', readOnly: false });
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+      await expect(bridge.editor.locator('#status')).toBeHidden();
+      await expect(bridge.editor.locator('#editor .bym-doc')).toHaveAttribute('aria-label', 'Belge');
+      await expect(bridge.editor.locator('#editor .bym-doc-pages')).toHaveText('Sayfa 1 / 3');
+      await expect(bridge.editor.locator('#editor .bym-view')).toHaveCount(0);
+
+      // The page's policy lets the picture of the document be decoded from its package: red pixels appear.
+      const red = () =>
+        bridge.editor.locator('#editor .bym-doc-page[data-page="1"] canvas').evaluate((element) => {
+          const canvas = element as HTMLCanvasElement;
+          const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+          let count = 0;
+          for (let i = 0; i < data.length; i += 4) if (data[i] > 180 && data[i + 1] < 60 && data[i + 2] < 60) count++;
+          return count;
+        });
+      await expect.poll(red).toBeGreaterThan(1000);
+
+      // A link is handed to the application; the page itself goes nowhere and opens nothing.
+      const address = page.url();
+      const link = bridge.editor.locator('#editor .bym-doc-link');
+      await expect(link).toHaveCount(1);
+      if (isMobile) await link.tap();
+      else await link.click();
+      expect(await bridge.waitFor('link')).toEqual({ type: 'link', url: 'https://example.com/docs?a=1' });
+      expect(page.url()).toBe(address);
+      expect(page.context().pages().length).toBe(1);
+
+      // Saving returns the file as it came.
+      await bridge.send({ type: 'save', id: 's1' });
+      expect(await bridge.waitFor('saved')).toEqual({ type: 'saved', id: 's1', data: expect.any(Number), name: 'belge.docx' });
+      expect(Buffer.from(await bridge.savedData(), 'base64').equals(Buffer.from(input))).toBe(true);
+
+      await bridge.send({ type: 'setLocale', id: 'c1', locale: 'en' });
+      await bridge.send({ type: 'setReadOnly', id: 'c2', readOnly: false });
+      await bridge.send({ type: 'undo', id: 'c3' });
+      await bridge.send({ type: 'redo', id: 'c4' });
+      expect(await bridge.waitFor('done', 4)).toEqual({ type: 'done', id: 'c4', command: 'redo' });
+      await expect(bridge.editor.locator('#editor .bym-doc-pages')).toHaveText('Page 1 / 3');
+      await expect(bridge.editor.locator('html')).toHaveAttribute('lang', 'en');
+
+      // A workbook takes the place of the document, and a document that of the workbook.
+      await bridge.send({ type: 'load', id: 'x1', data: base64(await smallWorkbook()) });
+      await bridge.waitFor('loaded', 2);
+      await expect(bridge.editor.locator('#editor .bym-doc')).toHaveCount(0);
+      await expect(bridge.editor.locator('#editor .bym-view')).toHaveCount(1);
+      await bridge.send({ type: 'load', id: 'd2', data: base64(input) });
+      await bridge.waitFor('loaded', 3);
+      await expect(bridge.editor.locator('#editor .bym-view')).toHaveCount(0);
+      await expect(bridge.editor.locator('#editor .bym-doc')).toHaveCount(1);
+
+      // A damaged document is refused and the open one stays.
+      await bridge.send({ type: 'load', id: 'bad', data: base64(input.slice(0, input.length >> 1)) });
+      expect(await bridge.waitFor('error')).toMatchObject({ type: 'error', id: 'bad', code: 'corrupt' });
+      await expect(bridge.editor.locator('#editor .bym-doc')).toHaveCount(1);
+
+      await bridge.send({ type: 'close', id: 'z' });
+      expect(await bridge.waitFor('done', 5)).toEqual({ type: 'done', id: 'z', command: 'close' });
+      await expect(bridge.editor.locator('#editor')).toBeEmpty();
+      await expect(bridge.editor.locator('#status')).toHaveText('No file is open');
+
+      // A document never reports changes or a selection.
+      const all = await bridge.messages();
+      expect(all.filter((message) => message.notAString || message.type === 'changed' || message.type === 'selection')).toEqual([]);
+      expect(all.filter((message) => message.type === 'error').length).toBe(1);
+      expectNoOutsideRequests(bridge.requests);
     });
   });
 }

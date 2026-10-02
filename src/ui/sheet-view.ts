@@ -25,6 +25,7 @@ import {
   type StylePatch,
 } from '../ops/format';
 import { CalcEngine } from '../calc/engine';
+import { ConditionalFormats } from '../format/conditional';
 import { History, type Op } from '../ops/ops';
 import { DEFAULT_GRID_THEME, renderGrid, type GridSelection } from '../render/grid';
 import { cssFont } from '../render/text';
@@ -396,6 +397,8 @@ export class WorkbookView {
   private locale: FormatLocale;
   private engine: CalcEngine | undefined;
   private calcTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Conditional formats of the sheets that have any, made when a sheet is first drawn. */
+  private conditional = new Map<Sheet, ConditionalFormats>();
   private strings: UiStrings;
   private locked: boolean;
 
@@ -594,6 +597,7 @@ export class WorkbookView {
     this.measure();
     this.showSheet();
     this.draw();
+    this.calculateMissing();
   }
 
   get activeSheet(): number {
@@ -1053,6 +1057,7 @@ export class WorkbookView {
     const context = this.canvas.getContext('2d');
     if (!context) return;
     const state = this.state();
+    const conditional = this.conditionalOf(state.sheet);
     renderGrid(context, {
       workbook: this.workbook,
       sheet: state.sheet,
@@ -1060,9 +1065,55 @@ export class WorkbookView {
       selection: { active: state.active, range: state.range },
       locale: this.locale,
       devicePixelRatio: this.dpr,
+      conditional,
     });
+    // Rules whose formulas took too long are finished in the next frames.
+    if (conditional && conditional.pending) this.schedule();
     // The input follows its cell through every scroll and resize.
     this.placeInput();
+  }
+
+  /** The conditional formats of a sheet; undefined for a sheet without any, which then costs nothing to draw. */
+  private conditionalOf(sheet: Sheet): ConditionalFormats | undefined {
+    if (!sheet.conditionalFormats || sheet.conditionalFormats.length === 0) return undefined;
+    let found = this.conditional.get(sheet);
+    if (!found) {
+      found = new ConditionalFormats(this.workbook, sheet, { engine: () => this.conditionalEngine() });
+      this.conditional.set(sheet, found);
+    }
+    return found;
+  }
+
+  /**
+   * Formulas that came without a result (files written by libraries that do not
+   * calculate) would show nothing until something they read is edited; they are
+   * calculated once the view is up.
+   */
+  private calculateMissing(): void {
+    if (this.options.calculate === false) return;
+    this.calcTimer = setTimeout(() => {
+      this.calcTimer = undefined;
+      if (this.destroyed || this.engine) return;
+      try {
+        const engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+        const missing = engine.uncalculated();
+        if (missing.length === 0) return;
+        this.engine = engine;
+        engine.recalculate(missing);
+        if (engine.incomplete) this.continueCalculation();
+        this.conditional.forEach((formats) => formats.invalidate());
+        this.schedule();
+      } catch (error) {
+        this.engine = undefined;
+      }
+    }, 0);
+  }
+
+  /** The engine for the formulas of conditional formats: made on first use, also in a read-only view. */
+  private conditionalEngine(): CalcEngine | undefined {
+    if (this.options.calculate === false) return undefined;
+    if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+    return this.engine;
   }
 
   // ------------------------------------------------------------- selection
@@ -1693,7 +1744,9 @@ export class WorkbookView {
     try {
       if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
       if (!cells) this.engine.invalidate();
-      const changed = cells ? this.engine.recalculate(cells) : this.engine.recalculate();
+      // After rows or columns moved every result may have changed for a reason the engine cannot
+      // see in the cells (a deleted row makes a sum smaller), so the values of the file give way.
+      const changed = cells ? this.engine.recalculate(cells) : this.engine.recalculate(undefined, { overwrite: true });
       if (this.engine.incomplete) this.continueCalculation();
       return changed.map((entry) => entry.sheet);
     } catch (error) {
@@ -1719,6 +1772,7 @@ export class WorkbookView {
       } catch (error) {
         this.engine = undefined;
       }
+      this.conditional.forEach((formats) => formats.invalidate());
       this.schedule();
       if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
     }, 0);
@@ -1790,6 +1844,8 @@ export class WorkbookView {
 
   /** Everything that has to follow a change of the model. */
   private afterChange(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): void {
+    // A rule may read any cell of any sheet.
+    this.conditional.forEach((formats) => formats.invalidate());
     if (structural) {
       this.lastTap = undefined;
       // Row heights, column widths and hidden runs moved; the merged ranges are indexed again on their own.

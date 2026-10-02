@@ -807,3 +807,203 @@ test('bridge: after destroy nothing is handled or sent', async () => {
   assert.deepEqual(f.calls, ['view', 'destroy']);
   assert.equal(f.sent.length, 2);
 });
+
+// ------------------------------------------------------------------ documents
+
+interface FakeDocument {
+  file: OfficeFile;
+  model: object;
+  views: { container: unknown; doc: unknown; options: import('../src/ui/doc-view').DocumentViewOptions }[];
+  calls: string[];
+  documentError?: Error;
+  viewError?: Error;
+}
+
+/** Makes the fake host open a docx and able to show it. */
+function withDocument(f: Fake, canShow = true): FakeDocument {
+  const state: FakeDocument = { file: undefined as unknown as OfficeFile, model: { body: { blocks: [] } }, views: [], calls: [] };
+  state.file = {
+    format: 'docx',
+    kind: 'document',
+    container: 'ooxml',
+    package: { readPart: async () => new Uint8Array(0) },
+    workbook: () => Promise.reject(Object.assign(new Error('This file is a document, not a spreadsheet'), { name: 'UnsupportedFileError' })),
+    document: async () => {
+      if (state.documentError) throw state.documentError;
+      return state.model;
+    },
+    save: () => f.saveResult(),
+  } as unknown as OfficeFile;
+  f.host.open = async (bytes) => {
+    f.opened.push(bytes);
+    return state.file;
+  };
+  if (canShow) {
+    f.host.createDocumentView = (container, doc, options) => {
+      state.calls.push('view');
+      if (state.viewError) throw state.viewError;
+      state.views.push({ container, doc, options });
+      return { destroy: () => state.calls.push('destroy'), setLocale: (locale: string) => state.calls.push(`setLocale ${locale}`) };
+    };
+  }
+  return state;
+}
+
+test('bridge: a document is shown read-only and answered with loaded', async () => {
+  const f = fake();
+  const d = withDocument(f);
+  const bridge = createBridge(f.host);
+  // `readOnly` and `sheet` mean nothing for a document and are not complained about.
+  await bridge.receive(JSON.stringify({ type: 'load', id: 'd1', data: DATA, name: 'a.docx', locale: 'tr', readOnly: false, sheet: 3 }));
+  assert.deepEqual(f.sent[1], { type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+  assert.deepEqual(f.states, ['loading', 'open']);
+  assert.deepEqual(f.locales, ['tr']);
+  assert.equal(d.views.length, 1);
+  assert.equal(d.views[0].container, f.host.container);
+  assert.equal(d.views[0].doc, d.model);
+  assert.equal(d.views[0].options.locale, 'tr');
+  // Pictures are read from the package of the file.
+  assert.equal(d.views[0].options.package, d.file.package);
+  // The spreadsheet view was never asked for.
+  assert.deepEqual(f.calls, []);
+});
+
+test('bridge: a link in a document is reported to the application and never opened by the page', async () => {
+  const f = fake();
+  const d = withDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  const handler = d.views[0].options.onLinkClick!;
+  assert.equal(handler('https://example.com/a?b=1'), false);
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'link', url: 'https://example.com/a?b=1' });
+  // Every click is reported, also the same link twice.
+  assert.equal(handler('https://example.com/a?b=1'), false);
+  assert.deepEqual(types(f), ['ready', 'loaded', 'link', 'link']);
+});
+
+test('bridge: save returns the bytes of a document; it never sends changed', async () => {
+  const f = fake();
+  withDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, name: 'a.docx' });
+  await bridge.receive({ type: 'save', id: 's1' });
+  assert.deepEqual(f.sent[2], { type: 'saved', id: 's1', data: base64Encode(new Uint8Array([1, 2, 3, 250])), name: 'a.docx' });
+  f.saveResult = () => Promise.reject(new Error('disk full'));
+  await bridge.receive({ type: 'save', id: 's2' });
+  assert.deepEqual(f.sent[3], { type: 'error', id: 's2', code: 'save-failed', message: 'disk full' });
+  assert.equal(types(f).indexOf('changed'), -1);
+  assert.equal(types(f).indexOf('selection'), -1);
+});
+
+test('bridge: commands on a document are confirmed; only the language has an effect', async () => {
+  const f = fake();
+  const d = withDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'setLocale', id: 'a', locale: 'en' });
+  await bridge.receive({ type: 'setReadOnly', id: 'b', readOnly: false });
+  await bridge.receive({ type: 'undo', id: 'c' });
+  await bridge.receive({ type: 'redo', id: 'd' });
+  await bridge.receive({ type: 'setLocale' });
+  assert.deepEqual(d.calls, ['view', 'setLocale en']);
+  assert.deepEqual(f.locales, ['en']);
+  assert.deepEqual(f.sent.slice(2), [
+    { type: 'done', id: 'a', command: 'setLocale' },
+    { type: 'done', id: 'b', command: 'setReadOnly' },
+    { type: 'done', id: 'c', command: 'undo' },
+    { type: 'done', id: 'd', command: 'redo' },
+    { type: 'error', code: 'bad-message', message: '"locale" is missing' },
+  ]);
+  await bridge.receive({ type: 'close', id: 'e' });
+  assert.deepEqual(d.calls, ['view', 'setLocale en', 'destroy']);
+  await bridge.receive({ type: 'save', id: 'f' });
+  assert.equal(f.sent[f.sent.length - 1].code, 'not-loaded');
+});
+
+test('bridge: a document replaces a workbook and a workbook a document', async () => {
+  const f = fake();
+  const open = f.host.open;
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.deepEqual(f.calls, ['view']);
+  const d = withDocument(f);
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.deepEqual(f.calls, ['view', 'destroy']);
+  assert.deepEqual(d.calls, ['view']);
+  f.host.open = open;
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.deepEqual(d.calls, ['view', 'destroy']);
+  assert.deepEqual(f.calls, ['view', 'destroy', 'view']);
+  // Commands reach the workbook again.
+  await bridge.receive({ type: 'undo' });
+  assert.deepEqual(f.calls, ['view', 'destroy', 'view', 'undo']);
+  bridge.destroy();
+  assert.deepEqual(f.calls, ['view', 'destroy', 'view', 'undo', 'destroy']);
+});
+
+test('bridge: a page that cannot show documents refuses them as unsupported and keeps what is open', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  withDocument(f, false);
+  await bridge.receive({ type: 'load', id: 'x', data: DATA });
+  assert.deepEqual(f.sent[2], { type: 'error', id: 'x', code: 'unsupported', message: 'This kind of document cannot be shown' });
+  // The workbook that was open stays open.
+  assert.deepEqual(f.calls, ['view']);
+  assert.deepEqual(f.states, ['loading', 'open']);
+
+  // A document format without a reader yet (doc) has no document(): unsupported as well.
+  const g = fake();
+  const d = withDocument(g);
+  delete (d.file as { document?: unknown }).document;
+  const second = createBridge(g.host);
+  await second.receive({ type: 'load', id: 'y', data: DATA });
+  assert.equal(g.sent[1].code, 'unsupported');
+  assert.deepEqual(g.states, ['loading', 'error: unsupported']);
+  assert.deepEqual(d.calls, []);
+});
+
+test('bridge: a document that cannot be read or shown is corrupt', async () => {
+  const f = fake();
+  const d = withDocument(f);
+  const bridge = createBridge(f.host);
+  d.documentError = new Error('Invalid XML at offset 12');
+  await bridge.receive({ type: 'load', id: 'a', data: DATA });
+  assert.deepEqual(f.sent[1], { type: 'error', id: 'a', code: 'corrupt', message: 'Invalid XML at offset 12' });
+  assert.deepEqual(d.calls, []);
+  d.documentError = undefined;
+  d.viewError = new Error('no canvas');
+  await bridge.receive({ type: 'load', id: 'b', data: DATA });
+  assert.deepEqual(f.sent[2], { type: 'error', id: 'b', code: 'corrupt', message: 'no canvas' });
+  assert.deepEqual(f.states, ['loading', 'error: corrupt', 'loading', 'error: corrupt']);
+  d.viewError = undefined;
+  await bridge.receive({ type: 'load', id: 'c', data: DATA });
+  assert.equal(f.sent[3].type, 'loaded');
+  assert.deepEqual(d.calls, ['view', 'view']);
+});
+
+test('bridge: a document load that is overtaken shows nothing', async () => {
+  const f = fake();
+  const d = withDocument(f);
+  let release: (() => void) | undefined;
+  const reading = new Promise<void>((resolve) => (release = resolve));
+  const read = d.file.document!;
+  (d.file as { document: unknown }).document = async () => {
+    await reading;
+    return read();
+  };
+  const bridge = createBridge(f.host);
+  const first = bridge.receive({ type: 'load', id: 'slow', data: DATA });
+  await settle();
+  await bridge.receive({ type: 'close', id: 'c' });
+  release!();
+  await first;
+  assert.deepEqual(d.calls, []);
+  assert.deepEqual(
+    f.sent.slice(1).map((message) => [message.type, message.id, message.code]),
+    [
+      ['done', 'c', undefined],
+      ['error', 'slow', 'load-failed'],
+    ],
+  );
+});

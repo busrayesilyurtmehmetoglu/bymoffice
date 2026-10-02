@@ -378,3 +378,11 @@ test('review: a typed formula that cannot be read is refused', async () => {
   }
   assert.equal(setCellInput(wb, 0, 20, 0, '=SUM(A1,A2)*2').length, 1);
 });
+
+test('review: pasted text that cannot be read as a formula stays text', async () => {
+  const wb = await workbook();
+  const ops = pasteAt(wb, 0, { top: 30, left: 0, bottom: 30, right: 0 }, '=SUM(\t=A1+\t=A1*2').ops;
+  for (const op of ops) applyOp(wb, op);
+  const row = [0, 1, 2].map((col) => getCell(wb.sheets[0], 30, col) as Cell);
+  assert.deepEqual(row.map((cell) => [cell.kind, cell.formula ? cell.formula.text : cell.value]), [['string', '=SUM('], ['string', '=A1+'], ['blank', 'A1*2']]);
+});

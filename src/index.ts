@@ -6,6 +6,7 @@ import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
 import type { WorkbookView } from './ui/sheet-view';
+import { DocumentView, type DocumentZoom } from './ui/doc-view';
 import { OpcPackage } from './opc';
 
 export { CfbFile, type CfbEntry } from './cfb';
@@ -20,6 +21,7 @@ export { inFieldCode, paragraphText, rawOf, safeHyperlinkTarget, type DocModel }
 export { NumberingCounters } from './formats/docx/numbering';
 export { resolveNumberRunProps, resolveParaProps, resolveRunProps } from './formats/docx/resolve';
 export { CalcEngine, type CalcEngineOptions } from './calc/engine';
+export { ConditionalFormats, type CellConditional, type ConditionalSource } from './format/conditional';
 export { FormulaParseError, parseFormula } from './calc/parse';
 export { FUNCTIONS } from './calc/functions/index';
 export { calcError, isError, type CalcError, type ErrorCode, type Scalar, type Value } from './calc/values';
@@ -40,7 +42,13 @@ export { EDITOR_STRINGS_EN, EDITOR_STRINGS_TR, getEditorStrings, type EditorStri
 export { ensureStyle, formatAt, formatRange, mergeRange, setColumnWidth, setColumnsHidden, setRowHeight, setRowsHidden, unmergeRange, type BorderPreset, type StylePatch } from './ops/format';
 export { STRINGS_EN, STRINGS_TR, getUiStrings, type UiStrings } from './ui/strings';
 export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
-export { base64Decode, base64Encode, createBridge, installBridge, type Bridge, type BridgeErrorCode, type BridgeHost, type BridgeState, type InstallBridgeOptions } from './embed/bridge';
+export { base64Decode, base64Encode, createBridge, installBridge, type Bridge, type BridgeDocumentView, type BridgeErrorCode, type BridgeHost, type BridgeState, type InstallBridgeOptions } from './embed/bridge';
+
+export { DocLayout } from './layout/doc/layout';
+export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, TextItem, TextMeasurer } from './layout/doc/types';
+export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
+export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
+export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls';
 
@@ -145,9 +153,16 @@ export interface MountOptions extends SpreadsheetEditorOptions {
   onSave?(bytes: Uint8Array): void;
   /** Called when saving from the shortcut fails. */
   onError?(error: unknown): void;
+  /** Documents: the zoom, 1 = 100%, or a mode that follows the container. Default: 100%, less when the page is wider than the container. */
+  zoom?: DocumentZoom;
+  /** Documents: called when the page in view or the number of pages changes. `page` counts from 1. */
+  onPageChange?(page: number, pageCount: number): void;
+  /** Documents: called when a hyperlink is activated; return false to keep the view from opening it in a new window. */
+  onLinkClick?(target: string): boolean | void;
 }
 
-export interface MountedView {
+export interface MountedSpreadsheet {
+  kind: 'spreadsheet';
   file: OfficeFile;
   workbook: Workbook;
   /** The grid: selection, editing, undo and redo, formatting. */
@@ -163,10 +178,26 @@ export interface MountedView {
   destroy(): void;
 }
 
+export interface MountedDocument {
+  kind: 'document';
+  file: OfficeFile;
+  document: DocModel;
+  /** The pages: zoom, navigation, selection. Documents are shown read-only. */
+  view: DocumentView;
+  /** The file as bytes; a document cannot be changed yet, so these are the bytes it was opened from. */
+  save(): Promise<Uint8Array>;
+  /** Removes the view from the container. */
+  destroy(): void;
+}
+
+/** What mount() resolves to; `kind` tells which of the two it is. */
+export type MountedView = MountedSpreadsheet | MountedDocument;
+
 /**
- * Opens a spreadsheet and shows it inside `container`, which must have a size,
- * with a toolbar, a formula bar and a status bar unless the options turn them off.
- * Only xlsx can be shown so far; other formats reject with UnsupportedFileError.
+ * Opens a file and shows it inside `container`, which must have a size: a
+ * spreadsheet (xlsx) in the editor, with a toolbar, a formula bar and a status
+ * bar unless the options turn them off; a document (docx) read-only, as pages.
+ * Other formats reject with UnsupportedFileError.
  */
 export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
   let input = options.file;
@@ -176,13 +207,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     input = await response.arrayBuffer();
   }
   const file = await open(input);
-  const workbook = await file.workbook();
-  const editor = new SpreadsheetEditor(container, workbook, options);
-  const view = editor.view;
-  const save = async () => {
-    if (view.isEditing) view.commitEditing();
-    return file.save();
-  };
+  let save: () => Promise<Uint8Array>;
   const onKeyDown = (event: KeyboardEvent) => {
     if (!options.onSave || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || (event.key !== 's' && event.key !== 'S')) return;
     event.preventDefault();
@@ -191,10 +216,39 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       else throw error;
     });
   };
+
+  if (file.kind === 'document') {
+    if (!file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
+    const model = await file.document();
+    const view = new DocumentView(container, model, {
+      package: file.package,
+      locale: options.locale,
+      zoom: options.zoom,
+      toolbar: options.toolbar,
+      onPageChange: options.onPageChange,
+      onNotice: options.onNotice,
+      onLinkClick: options.onLinkClick,
+    });
+    save = () => file.save();
+    container.addEventListener('keydown', onKeyDown);
+    const destroy = () => {
+      container.removeEventListener('keydown', onKeyDown);
+      view.destroy();
+    };
+    return { kind: 'document', file, document: model, view, save, destroy };
+  }
+
+  const workbook = await file.workbook();
+  const editor = new SpreadsheetEditor(container, workbook, options);
+  const view = editor.view;
+  save = async () => {
+    if (view.isEditing) view.commitEditing();
+    return file.save();
+  };
   container.addEventListener('keydown', onKeyDown);
   const destroy = () => {
     container.removeEventListener('keydown', onKeyDown);
     editor.destroy();
   };
-  return { file, workbook, view, editor, save, destroy };
+  return { kind: 'spreadsheet', file, workbook, view, editor, save, destroy };
 }

@@ -113,7 +113,7 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 |---|---|
 | `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
 | `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale` gönderildi ama açık dosya yok |
-| `unsupported` | Dosya gösterilemeyen bir türde (xlsx değil: docx, doc, xls, RTF, parola korumalı, Office dosyası olmayan içerik, boş içerik) |
+| `unsupported` | Dosya gösterilemeyen bir türde (xlsx ya da docx değil: doc, xls, RTF, parola korumalı, Office dosyası olmayan içerik, boş içerik) |
 | `corrupt` | Dosya xlsx gibi başlıyor ama okunamıyor (kesik, bozuk) |
 | `load-failed` | `url` getirilemedi (ağ hatası, HTTP hata kodu, zaman aşımı, boyut sınırı, içerik güvenliği ilkesi engeli) ya da yükleme bir `close` / yeni `load` ile iptal edildi |
 | `save-failed` | Kaydetme sırasında hata; ya da `saved` iletisi uygulamaya teslim edilemeden bekleyen iletiler sınırı aşıldı |
@@ -262,12 +262,12 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 
   ```
   default-src 'none'; script-src 'sha256-…' 'sha256-…'; style-src 'unsafe-inline';
-  img-src data:; connect-src 'self' blob: data:; base-uri 'none'; form-action 'none'
+  img-src data: blob:; connect-src 'self' blob: data:; base-uri 'none'; form-action 'none'
   ```
 
   - `script-src`: yalnız sayfanın kendi iki satır içi betiği (motor ve başlatıcı), derlemede hesaplanan SHA-256 özetleriyle. `unsafe-inline` ve `unsafe-eval` yoktur; sonradan eklenen hiçbir betik çalışmaz.
   - `style-src 'unsafe-inline'`: motor kendi `<style>` öğesini çalışma zamanında ekler ve içeriği derleme sırasında köprü derlemesine açık değildir, bu yüzden özet kullanılamadı. Stil kod çalıştıramaz; `img-src`/`font-src` kapalı olduğu için stil üzerinden dışarıya istek de atılamaz.
-  - `img-src data:`: yalnız boş sayfa simgesi için.
+  - `img-src data: blob:`: boş sayfa simgesi ve belgedeki görseller (sayfanın dosya baytlarından kendi ürettiği `blob:` adresleri) için.
   - `connect-src 'self' blob: data:`: **uzak adreslere çıkış yoktur.** Karar: köprü sayfası çoğunlukla çevrimdışı bir uygulama varlığıdır ve dosya `data` ile verilir. `url` yalnız sayfanın kendi kökeni (sanal ana makine ya da web sunucusuyla sunulduğunda, en üst pencere olarak), `blob:` ve `data:` adresleri için çalışır. Kod da aynı kuralı uygular: başka kökenden bir adres daha istek atılmadan `bad-message` ile reddedilir; ilke ikinci savunma hattıdır (ör. kendi kökenden başka kökene yönlendirme `load-failed` ile sonuçlanır). Uzak bir dosya gerekiyorsa uygulama onu kendisi indirip `data` ile verir; kimlik doğrulama da böylece uygulamada kalır.
 - **iframe içinde kim konuşabilir.** İzinli üst kökenler yalnız sayfanın **içindeki** ayardan okunur: `<meta name="bymoffice-parent-origins" content="">` (boşlukla ayrılmış köken listesi). Boşsa iframe taşıması kapalıdır: sayfa üst pencereden hiçbir ileti kabul etmez ve ona hiçbir ileti göndermez. Liste derlemede `BYM_PARENT_ORIGINS` ortam değişkeniyle ya da sunan tarafın dosyadaki etiketi doldurmasıyla verilir. Sayfanın adresindeki hiçbir parametre bu listeyi etkilemez; çünkü adresi, sayfayı gömen (güvenilmeyen) taraf seçer.
   - Gelen ileti yalnız `event.source === window.parent` ise ve `event.origin` listedeyse kabul edilir; giden iletiler yalnız o kökeni hedef alır, `*` hiç kullanılmaz. Kökenler `new URL(x).origin` biçimine getirilerek karşılaştırılır (sondaki `/`, `:443`, büyük harf fark yaratmaz). `"null"` köken (sandbox'lı iframe, `file:`, `data:`) asla kabul edilmez ve hedef olmaz.
@@ -289,7 +289,8 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 
 ## 7. Sınırlar
 
-- **Yalnız xlsx gösterilir ve düzenlenir.** docx, doc, xls ve RTF `unsupported` ile reddedilir.
+- **xlsx gösterilir ve düzenlenir; docx salt okunur gösterilir.** doc, xls ve RTF `unsupported` ile reddedilir.
+- **docx için sözleşme:** `loaded` iletisi `{ format: 'docx', kind: 'document', sheets: [], activeSheet: 0 }` taşır. `save` özgün baytları döner; `changed` ve `selection` hiç gelmez; `setReadOnly`, `undo`, `redo` etkisizdir ama `done` ile onaylanır; `setLocale` çalışır. Belgede bir bağlantıya basılınca sayfa onu kendisi açmaz, uygulamaya `{ type: 'link', url }` iletisi gönderir (yalnız http, https, mailto, tel).
 - **Base64 bellek maliyeti.** Dosya iki yönde de base64 dizgisi olarak taşınır: metin dosyadan üçte bir büyüktür ve yükleme/kaydetme sırasında dosyanın birkaç kopyası aynı anda bellekte durur (uygulamadaki baytlar, base64 metni, WebView'e geçirilen betik, sayfadaki dizgi, çözülmüş baytlar). Sayfanın kendi kodlama/çözme işlemi parça parça ve doğrusal sürede çalışır (20 MB için Node'da gidiş-dönüş ≈ 0,4 sn; tarayıcılarda 5 MB'lık dosya için yükleme ≈ 0,1–0,4 sn, kaydetme < 0,1 sn ölçüldü). Asıl maliyet platformun dizgiyi WebView'e geçirmesindedir ve gerçek cihazda ölçülmedi.
 - **Gerçek cihazda sınanmadı.** Özellikle şunlar doğrulanmayı bekliyor: iOS'ta odak yakınlaştırmasının gerçekten engellendiği, güvenli alan boşlukları, ekran klavyesi açıldığında yerleşim, çok büyük `runJavaScript` betiklerinin davranışı, Android'in eski WebView sürümleri.
 - `load` ve `save` için ileti boyutu sınırı yoktur (`url` ile getirmede 256 MB); bellek sınırı platformundur.

@@ -2012,6 +2012,8 @@ test.describe('review: teardown', () => {
       const data = new Uint8Array(text.length);
       for (let i = 0; i < text.length; i++) data[i] = text.charCodeAt(i);
       await (window as any).__mountView(data, { locale: 'en-US' });
+      // The view looks for formulas without a result in a turn of its own; that one is over before the count.
+      await new Promise((resolve) => setTimeout(resolve, 30));
       const view = (window as any).__view;
       const canvas = document.querySelector('.bym-canvas') as HTMLCanvasElement;
       const box = canvas.getBoundingClientRect();
@@ -2081,6 +2083,28 @@ test.describe('calculation', () => {
     await view(page, 'view.redo()');
     await view(page, 'view.redo()');
     expect((await cell(page, 'A7')).value).toBe(144);
+  });
+
+  test('deleting a row recalculates the sums that lost it, although their inputs kept their values', async ({ page }) => {
+    const bytes = await buildXlsx({
+      sheets: [
+        {
+          name: 'Sum',
+          xml: worksheetXml(
+            `<sheetData><row r="1">${num('A1', 1)}</row><row r="2">${num('A2', 2)}</row><row r="3">${num('A3', 4)}</row>` +
+              '<row r="4"><c r="A4"><f>SUM(A1:A3)</f><v>7</v></c><c r="B4"><f>A2*10</f></c></row></sheetData>',
+          ),
+        },
+      ],
+    });
+    await mount(page, bytes);
+    // B4 came without a result; it is calculated once the view is up.
+    await expect.poll(async () => (await cell(page, 'B4')).value).toBe(20);
+    expect((await cell(page, 'A4')).value).toBe(7);
+    await view(page, 'view.deleteRows(1, 1)');
+    expect((await cell(page, 'A3')).value).toBe(5);
+    await view(page, 'view.undo()');
+    expect((await cell(page, 'A4')).value).toBe(7);
   });
 
   test('a formula that cannot be read keeps the editor open and says why', async ({ page }) => {

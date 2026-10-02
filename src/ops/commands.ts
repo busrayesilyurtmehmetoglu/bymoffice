@@ -69,6 +69,15 @@ export function cellFromInput(workbook: Workbook, sheet: Sheet, row: number, col
   return cell;
 }
 
+function readable(formula: string): boolean {
+  try {
+    parseFormula(formula);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
 export function setCellInput(workbook: Workbook, sheetIndex: number, row: number, col: number, text: string, options: EditOptions = {}): Op[] {
   const sheet = workbook.sheets[sheetIndex];
   const cell = cellFromInput(workbook, sheet, row, col, text, options);
@@ -225,7 +234,11 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
       let cell: Cell | undefined;
       // A row of pasted text that is shorter than the others leaves the cells beyond its end alone.
       if (item === undefined && !internal) continue;
-      if (typeof item === 'string') cell = cellFromInput(workbook, sheet, r, c, item, options);
+      if (typeof item === 'string') {
+        cell = cellFromInput(workbook, sheet, r, c, item, options);
+        // Pasted text that looks like a formula and cannot be read as one stays the text it is.
+        if (cell && cell.formula && !readable(cell.formula.text)) cell = { kind: 'string', value: item.length > MAX_CELL_TEXT ? item.slice(0, MAX_CELL_TEXT) : item, style: cell.style };
+      }
       else if (item && copied) {
         const fromRow = copied.range.top + ((r - selection.top) % height);
         const fromCol = copied.range.left + ((c - selection.left) % width);

@@ -1,5 +1,5 @@
-// The few words the view itself says: labels for assistive technology, the
-// header menu, notes. Cell content is never translated.
+// The few words the views themselves say: labels for assistive technology, the
+// header menu, notes, the document view's bar. Content of files is never translated.
 
 export interface UiStrings {
   spreadsheet: string;
@@ -35,6 +35,24 @@ export interface UiStrings {
   tooManyFormats: string;
   badFormula: string;
   copyTooLarge: string;
+  // The document view.
+  document: string;
+  documentTools: string;
+  /** Label of one page: "Page 3". */
+  page(number: number): string;
+  /** The page indicator: "Page 3 / 12". */
+  pageOf(page: number, count: number): string;
+  zoomIn: string;
+  zoomOut: string;
+  fitWidth: string;
+  /** Label of the button that shows the zoom and resets it to 100%. */
+  zoomLevel(percent: number): string;
+  /** Shown while the pages are still being laid out. */
+  preparingPages: string;
+  documentTooLong: string;
+  documentLayoutFailed: string;
+  /** What stands in a placeholder: `kind` is "picture", "chart", "diagram", "shape", "vml", "object", ... */
+  placeholder(kind: string): string;
 }
 
 const rows = (count: number) => (count === 1 ? 'row' : `${count} rows`);
@@ -69,6 +87,18 @@ export const STRINGS_EN: UiStrings = {
   tooManyFormats: 'The workbook has too many cell formats',
   badFormula: 'This formula cannot be read. Use English function names and commas between arguments.',
   copyTooLarge: 'The range is too large to copy',
+  document: 'Document',
+  documentTools: 'Document tools',
+  page: (number) => `Page ${number}`,
+  pageOf: (page, count) => `Page ${page} / ${count}`,
+  zoomIn: 'Zoom in',
+  zoomOut: 'Zoom out',
+  fitWidth: 'Fit to width',
+  zoomLevel: (percent) => `Zoom ${percent}%, reset to 100%`,
+  preparingPages: 'Preparing pages\u2026',
+  documentTooLong: 'The document is too long: only its first pages are shown',
+  documentLayoutFailed: 'The document could not be laid out completely',
+  placeholder: (kind) => (kind === 'chart' ? 'Chart' : kind === 'diagram' ? 'Diagram' : kind === 'object' ? 'Embedded object' : kind === 'picture' ? 'Picture' : 'Drawing'),
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -110,6 +140,18 @@ export const STRINGS_TR: UiStrings = {
   tooManyFormats: 'Çalışma kitabında çok fazla hücre biçimi var',
   badFormula: 'Bu formül okunamadı. İngilizce fonksiyon adlarını ve argümanlar arasında virgül kullanın.',
   copyTooLarge: 'Aralık kopyalanamayacak kadar büyük',
+  document: 'Belge',
+  documentTools: 'Belge araçları',
+  page: (number) => `Sayfa ${number}`,
+  pageOf: (page, count) => `Sayfa ${page} / ${count}`,
+  zoomIn: 'Yakınlaştır',
+  zoomOut: 'Uzaklaştır',
+  fitWidth: 'Genişliğe sığdır',
+  zoomLevel: (percent) => `Yakınlaştırma %${percent}, %100'e döndür`,
+  preparingPages: 'Sayfalar hazırlanıyor\u2026',
+  documentTooLong: 'Belge çok uzun: yalnız ilk sayfaları gösteriliyor',
+  documentLayoutFailed: 'Belgenin tamamı sayfalara yerleştirilemedi',
+  placeholder: (kind) => (kind === 'chart' ? 'Grafik' : kind === 'diagram' ? 'Diyagram' : kind === 'object' ? 'Gömülü nesne' : kind === 'picture' ? 'Görsel' : 'Çizim'),
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

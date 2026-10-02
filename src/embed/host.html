@@ -165,6 +165,10 @@
             };
             return view;
           },
+          // Documents are shown read-only, as pages.
+          createDocumentView: function (container, doc, options) {
+            return new window.BymOffice.DocumentView(container, doc, options);
+          },
           version: '__BYM_VERSION__',
           parentOrigins: origins ? origins.getAttribute('content') : '',
           onState: show,

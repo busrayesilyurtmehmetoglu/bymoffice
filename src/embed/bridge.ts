@@ -4,13 +4,21 @@
 // same contract. Nothing here touches the DOM when the module is imported;
 // the window and the container are handed in.
 import type { OfficeFile } from '../index';
+import type { DocModel } from '../model/doc/types';
 import { cellName, rangeName, type Workbook } from '../model/sheet/types';
+import type { DocumentViewOptions } from '../ui/doc-view';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 
 export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded';
 
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
 export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
+
+/** What the bridge needs of a document view. */
+export interface BridgeDocumentView {
+  destroy(): void;
+  setLocale?(locale: string): void;
+}
 
 export interface BridgeHost {
   /** The element the editor is shown in. */
@@ -19,6 +27,11 @@ export interface BridgeHost {
   open(bytes: Uint8Array): Promise<OfficeFile>;
   /** Shows a workbook in the container: `new WorkbookView(container, workbook, options)`. */
   createView(container: HTMLElement, workbook: Workbook, options: WorkbookViewOptions): WorkbookView;
+  /**
+   * Shows a document in the container: `new DocumentView(container, doc, options)`.
+   * Without it documents are refused as unsupported.
+   */
+  createDocumentView?(container: HTMLElement, doc: DocModel, options: DocumentViewOptions): BridgeDocumentView;
   /**
    * Hands one message to the application. Returns false (or throws) when there
    * is no channel to send it on yet; the message is then kept and sent later.
@@ -234,11 +247,11 @@ interface Outgoing {
   sheets?: number[];
 }
 
-/** The file that is shown. */
+/** The file that is shown: a workbook in `view`, or a document in `pages`. */
 interface Shown {
   file: OfficeFile;
-  workbook: Workbook;
-  view: WorkbookView;
+  view: WorkbookView | undefined;
+  pages: BridgeDocumentView | undefined;
   name: string | undefined;
 }
 
@@ -369,9 +382,9 @@ export function createBridge(host: BridgeHost): Bridge {
     selectionDue = undefined;
     selectionSent = '';
     if (!shown) return;
-    const view = shown.view;
+    const view = shown.view || shown.pages;
     shown = undefined;
-    view.destroy();
+    if (view) view.destroy();
   };
 
   /** Gives up whatever load is under way or waiting. */
@@ -481,17 +494,57 @@ export function createBridge(host: BridgeHost): Bridge {
     }
 
     let file: OfficeFile;
-    let workbook: Workbook;
+    let workbook: Workbook | undefined;
+    let doc: DocModel | undefined;
     try {
       file = await host.open(bytes);
       if (overtaken()) return;
-      workbook = await file.workbook();
-      if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
+      if (file.kind === 'document') {
+        if (!file.document || !host.createDocumentView) throw Object.assign(new Error('This kind of document cannot be shown'), { name: 'UnsupportedFileError' });
+        doc = await file.document();
+      } else {
+        workbook = await file.workbook();
+        if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
+      }
     } catch (error) {
       if (overtaken()) return;
       return refuse(error instanceof Error && error.name === 'UnsupportedFileError' ? 'unsupported' : 'corrupt', errorText(error));
     }
     if (overtaken()) return;
+
+    if (doc) {
+      // A document is shown read-only: `readOnly` and `sheet` mean nothing for it, and it never sends `changed`.
+      const documentOptions: DocumentViewOptions = {
+        package: file.package,
+        // The page must not be replaced by what a link points to: the application decides what to do with it.
+        onLinkClick: (target) => {
+          send({ type: 'link', url: target });
+          return false;
+        },
+      };
+      if (locale !== undefined) documentOptions.locale = locale;
+      closeShown();
+      let pages: BridgeDocumentView;
+      try {
+        pages = (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>)(host.container, doc, documentOptions);
+      } catch (error) {
+        setState('error', 'corrupt');
+        return fail('corrupt', errorText(error), id);
+      }
+      shown = { file, view: undefined, pages, name };
+      setLocale(locale);
+      setState('open');
+      const answer: Message = { type: 'loaded' };
+      if (id !== undefined) answer.id = id;
+      answer.format = file.format;
+      answer.kind = 'document';
+      answer.sheets = [];
+      answer.activeSheet = 0;
+      send(answer);
+      return;
+    }
+    if (!workbook) return;
+    const book = workbook;
     if (sheet !== undefined && sheet >= workbook.sheets.length) return refuse('bad-message', `No sheet with index ${sheet}`);
 
     let view: WorkbookView | undefined;
@@ -508,7 +561,7 @@ export function createBridge(host: BridgeHost): Bridge {
         frame(flushSelection);
       },
       onSheetChange: (index) => {
-        const entry = workbook.sheets[index];
+        const entry = book.sheets[index];
         send({ type: 'sheet', index, name: entry ? entry.name : '' });
       },
     };
@@ -523,7 +576,7 @@ export function createBridge(host: BridgeHost): Bridge {
       setState('error', 'corrupt');
       return fail('corrupt', errorText(error), id);
     }
-    shown = { file, workbook, view, name };
+    shown = { file, view, pages: undefined, name };
     setLocale(locale);
     setState('open');
 
@@ -541,7 +594,7 @@ export function createBridge(host: BridgeHost): Bridge {
     let data: string;
     try {
       // A cell that is being edited is written first, as leaving it would do.
-      if (current.view.isEditing) current.view.commitEditing();
+      if (current.view && current.view.isEditing) current.view.commitEditing();
       data = base64Encode(await current.file.save());
     } catch (error) {
       return fail('save-failed', errorText(error), id);
@@ -578,7 +631,13 @@ export function createBridge(host: BridgeHost): Bridge {
       const locale = type === 'setLocale' ? field<string>(fields, 'locale', 'string', true) : undefined;
       if (!shown) return fail('not-loaded', 'No file is open', id);
       const view = shown.view;
-      if (type === 'setReadOnly') view.setReadOnly(readOnly as boolean);
+      if (!view) {
+        // A document: nothing to edit, so only the language has an effect; the other commands are confirmed as done.
+        if (type === 'setLocale') {
+          if (shown.pages && shown.pages.setLocale) shown.pages.setLocale(locale as string);
+          setLocale(locale);
+        }
+      } else if (type === 'setReadOnly') view.setReadOnly(readOnly as boolean);
       else if (type === 'setLocale') {
         view.setLocale(locale as string);
         setLocale(locale);
@@ -655,6 +714,7 @@ export interface InstallBridgeOptions {
   container: HTMLElement;
   open: BridgeHost['open'];
   createView: BridgeHost['createView'];
+  createDocumentView?: BridgeHost['createDocumentView'];
   version: string;
   /**
    * Origins that may embed the page in an iframe and drive it with window
@@ -790,6 +850,7 @@ export function installBridge(options: InstallBridgeOptions): Bridge {
     container: options.container,
     open: options.open,
     createView: options.createView,
+    createDocumentView: options.createDocumentView,
     version: options.version,
     post,
     baseUrl: win.location.href,
