@@ -144,6 +144,36 @@ test.describe('example page: a file of the site in the editor', () => {
     expect((await contentOf(page, saved[0])).text).toBe('by the key');
   });
 
+  test('convert=1: an RTF file is edited as a docx; the name, the header of the request and the message to the parent say so', async ({ page }) => {
+    const formats: (string | undefined)[] = [];
+    const saved: Buffer[] = [];
+    await page.route((url) => url.pathname === '/files/sample', (route) => route.fulfill({ status: 200, contentType: 'application/octet-stream', body: Buffer.from('{\\rtf1\\ansi Old text\\par}') }));
+    await page.route((url) => url.pathname === '/files/save', (route) => {
+      formats.push(route.request().headers()['x-bym-format']);
+      saved.push(route.request().postDataBuffer() || Buffer.alloc(0));
+      return route.fulfill({ status: 204, body: '' });
+    });
+    // Without it the file is shown as it is, read-only.
+    await page.goto(`${PAGE}?file=/files/sample&save=/files/save&name=old.rtf`);
+    await ready(page);
+    await expect(page.locator('#save')).toBeHidden();
+    await expect(page.locator('#name')).toHaveText('old.rtf');
+
+    await page.goto(`${PAGE}?file=/files/sample&save=/files/save&name=old.rtf&convert=1&lang=tr`);
+    await ready(page);
+    await expect(page.locator('#name')).toHaveText('old.docx');
+    await expect(page.locator('#save')).toBeVisible();
+    await page.evaluate(() => {
+      const view = (window as any).bymEditor.view;
+      view.setSelection({ story: 'body', path: [0], offset: 0 });
+      view.insertText('New and ');
+    });
+    await page.locator('#save').click();
+    await expect(page.locator('#status')).toHaveText('Kaydedildi');
+    expect(formats).toEqual(['docx']);
+    expect(await contentOf(page, saved[0])).toEqual({ format: 'docx', text: 'New and Old text' });
+  });
+
   test('addresses of another site are refused, and so is a page without a file', async ({ page }) => {
     await page.goto(`${PAGE}?file=https://example.com/a.docx`);
     await expect(page.locator('#status')).toHaveText('Only files of this site can be opened');

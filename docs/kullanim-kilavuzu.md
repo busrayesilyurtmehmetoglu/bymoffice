@@ -155,6 +155,7 @@ Bir dosyayı açar ve `container` içinde gösterir: xlsx ve xls tablo düzenley
 | `sheet` | İlk gösterilecek sayfanın dizini. Verilmezse dosyanın etkin sayfası; o gizliyse ilk görünür sayfa |
 | `readOnly` | `true` ise düzenleme kapalıdır (editör, yapıştırma, kesme, silme, geri al, satır/sütun komutları çalışmaz); kopyalama çalışır. Varsayılan `false` |
 | `onChange({ sheets })` | Çalışma kitabı her değiştiğinde çağrılır (geri al ve yinele dahil); `sheets` etkilenmiş olabilecek sayfa dizinleridir |
+| `convert` | `true` ise yazılamayan biçimler (doc, RTF, xls) **dönüştürülerek düzenlenebilir açılır**: doc ve RTF docx'e, xls xlsx'e çevrilir; gösterilen, düzenlenen ve `save()` ile alınan dosya yeni biçimdedir. Dönüş değerinde `conversion: { from, to, warnings }` bulunur ve `onNotice` ile bildirilir. `readOnly: true` ile birlikte verilirse dönüştürme yapılmaz. Varsayılan `false`: bu dosyalar olduğu gibi, salt okunur gösterilir |
 | `onSave(bytes)` | Kullanıcı görünümde Ctrl+S / Cmd+S'e basınca dosyanın baytlarıyla çağrılır; verilmezse kısayol tarayıcıya bırakılır. Hata olursa `onError(error)` çağrılır |
 | `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
 | `onSheetChange(sheetIndex)` | Gösterilen sayfa değişince çağrılır |
@@ -232,6 +233,22 @@ Doğrulama: her değişiklikte, gerçek dosyalardan oluşan bir havuzda "düzenl
 
 Değişen satırlar yeniden üretilirken şunlar o satırlarda korunmaz (dokunulmayan satırlarda korunur): `spans` ipucu, hücrelerin fonetik (furigana) metni, zengin metinde `outline`/`shadow` gibi nadir font ayrıntıları.
 
+### Eski biçimleri düzenleme: `convert`
+
+```js
+const mounted = await BymOffice.mount(container, { file: docBytes, convert: true, locale: 'tr' });
+if (mounted.conversion) {
+  // { from: 'doc', to: 'docx', warnings: [...] }: dosya artık docx; sunucuda adını ve türünü buna göre saklayın
+  console.log(mounted.file.format);         // 'docx'
+}
+const bytes = await mounted.save();          // docx baytları
+```
+
+- doc ve RTF docx'e, xls xlsx'e çevrilir (`saveAsDocx()` / `saveAsXlsx()` ile aynı yazıcılar); özgün dosya değişmez, `save()` yeni biçimi verir. Uygulamanız dosya adını ve türünü `mounted.conversion.to`'ya göre güncellemelidir.
+- Dönüştürmede taşınamayanlar `mounted.conversion.warnings` içindedir (belgede şekil geometrisi/dolgusu ve tema; tabloda grafik ve makro sayfaları, EMF/WMF görseller, dış kitap bağlantıları). Okuyucunun modele hiç almadığı içerik ("Henüz olmayanlar" tablosu) yeni dosyada yoktur ve uyarılmaz; bu yüzden **arşivlik bir dosyanın özgün halini saklamaya devam edin**.
+- `convert` verilmezse ya da `readOnly: true` ise davranış eskisi gibidir: dosya olduğu gibi, salt okunur gösterilir ve `save()` özgün baytları verir.
+- Örnek sayfada `convert=1` parametresiyle kullanılır; kaydetme isteği biçimi `X-Bym-Format` başlığında bildirir, üst sayfaya giden iletilerde `format` ve `convertedFrom` bulunur. WebView köprü sayfası bu seçeneği henüz taşımaz.
+
 ### Yeni (boş) dosya: `createBlank(kind, options?)`
 
 ```js
@@ -262,10 +279,11 @@ examples/html/index.html?new=docx&save=/files&name=yazi.docx      yeni, boş bel
 | `mode` | `edit` (varsayılan) ya da `view` |
 | `lang` | `tr` ya da `en`: editörün ve yeni dosyanın dili |
 | `new` | `docx` ya da `xlsx`: dosya almak yerine boş dosyayla başlar |
+| `convert` | `1`: doc, RTF ve xls dosyalarını docx/xlsx'e çevirerek düzenlenebilir açar; ad yeni uzantıyı alır, `PUT` isteği biçimi `X-Bym-Format` başlığında bildirir |
 | `name` | Gösterilen ve indirmede kullanılan dosya adı |
 
 - Kaydet düğmesi ve Ctrl/Cmd+S aynı işi yapar. Dosya yoldayken yazılan şey "kaydedildi" sayılmaz: durum "Kaydedilmedi" kalır ve `saved` iletisi gitmez. Kaydedilmemiş değişiklik varken sayfadan çıkılırsa tarayıcı sorar. doc, xls ve RTF kendi biçimlerine yazılamadığı için salt okunur gösterilir ve Kaydet gizlenir.
-- `<iframe>` içindeyken sayfa üst sayfaya (yalnız aynı kökte) `{ source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message? }` iletileri yollar.
+- `<iframe>` içindeyken sayfa üst sayfaya (yalnız aynı kökte) `{ source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message?, format?, convertedFrom? }` iletileri yollar.
 - Başka kökten adresler reddedilir: sayfa yalnız kendi sitesinden dosya alır ve yalnız oraya yollar. Sunucunuz `PUT` isteğinde oturumu ve yetkiyi kendi denetlemelidir; CSRF belirteci gerekiyorsa `fetch` çağrısına başlık olarak ekleyin.
 - Sayfayı kendi projenize kopyalayıp `<script src>` adresini kendi sunucunuza ya da CDN'e çevirin. React ve Vue için ayrı örnek yoktur; `mount()` çağrısı bir `ref`'e bağlanmış kapsayıcıyla aynı şekilde kullanılır ve bileşen kaldırılırken `mounted.destroy()` çağrılır (bu kullanım sınanmadı).
 

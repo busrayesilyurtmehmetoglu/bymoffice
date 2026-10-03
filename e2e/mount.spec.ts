@@ -143,6 +143,70 @@ test.describe('BymOffice.mount', () => {
     await expect(page.locator('#editor')).toBeEmpty();
   });
 
+  test('convert: doc, RTF and xls are opened for editing as docx and xlsx, and saved as such', async ({ page }) => {
+    const sheet = cat(number(0, 0, 41), number(1, 0, 1.5));
+    const xlsBytes = Array.from(xlsFile(workbookStream({ sheets: [{ name: 'Old', records: sheet }] })));
+    const docBytes = Array.from(simpleDoc('First paragraph\rSecond paragraph\r').build());
+    const outcome = await page.evaluate(
+      async ([xls, doc]) => {
+        const api = (window as any).BymOffice;
+        const host = document.getElementById('editor')!;
+        const out: Record<string, unknown> = {};
+        const notices: string[] = [];
+        const onNotice = (notice: { message: string }) => notices.push(notice.message);
+
+        // A doc file: converted, edited, saved as docx.
+        let mounted = await api.mount(host, { file: new Uint8Array(doc), convert: true, onNotice });
+        out.doc = [mounted.kind, mounted.file.format, mounted.conversion.from, mounted.conversion.to, mounted.view.readOnly];
+        mounted.view.setSelection({ story: 'body', path: [0], offset: 0 });
+        mounted.view.insertText('Edited ');
+        let again = await api.open(await mounted.save());
+        out.docSaved = [again.format, api.documentText(await again.document())];
+        mounted.destroy();
+
+        // RTF, in Turkish.
+        mounted = await api.mount(host, { file: new TextEncoder().encode('{\\rtf1\\ansi Hello {\\b rich} text\\par}'), convert: true, locale: 'tr', onNotice });
+        out.rtf = [mounted.file.format, mounted.conversion.from, mounted.view.readOnly, mounted.conversion.warnings.length];
+        mounted.destroy();
+
+        // An xls file: a cell is changed and the xlsx holds it.
+        mounted = await api.mount(host, { file: new Uint8Array(xls), convert: true, onNotice });
+        out.xls = [mounted.kind, mounted.file.format, mounted.conversion.from, mounted.view.readOnly];
+        mounted.view.setCellInput(0, 0, '7');
+        again = await api.open(await mounted.save());
+        const book = await again.workbook();
+        out.xlsSaved = [again.format, book.sheets[0].name, api.getCell(book.sheets[0], 0, 0).value, api.getCell(book.sheets[0], 1, 0).value];
+        mounted.destroy();
+
+        // Read-only, and files that need no conversion: nothing is converted.
+        mounted = await api.mount(host, { file: new Uint8Array(doc), convert: true, readOnly: true, onNotice });
+        out.readOnly = [mounted.file.format, mounted.conversion === undefined, mounted.view.readOnly];
+        mounted.destroy();
+        mounted = await api.mount(host, { file: await api.createBlank('docx'), convert: true, onNotice });
+        out.docx = [mounted.file.format, mounted.conversion === undefined, mounted.view.readOnly];
+        mounted.destroy();
+        out.notices = notices;
+        return out;
+      },
+      [xlsBytes, docBytes],
+    );
+    expect(outcome).toEqual({
+      doc: ['document', 'docx', 'doc', 'docx', false],
+      docSaved: ['docx', 'Edited First paragraph\nSecond paragraph'],
+      rtf: ['docx', 'rtf', false, 0],
+      xls: ['spreadsheet', 'xlsx', 'xls', false],
+      xlsSaved: ['xlsx', 'Old', 7, 1.5],
+      readOnly: ['doc', true, true],
+      docx: ['docx', true, false],
+      notices: [
+        'This doc file was converted to docx to be edited; it is saved as docx',
+        'Bu rtf dosyası düzenlenebilmesi için docx biçimine çevrildi; docx olarak kaydedilir',
+        'This xls file was converted to xlsx to be edited; it is saved as xlsx',
+      ],
+    });
+    await expect(page.locator('#editor')).toBeEmpty();
+  });
+
   test('rejects files it cannot show and leaves the container empty', async ({ page }) => {
     const xls = Array.from(minimalCfb(new Uint8Array(9 * 512), new Uint8Array(10)));
     const outcome = await page.evaluate(async (input) => {

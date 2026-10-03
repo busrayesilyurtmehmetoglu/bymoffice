@@ -59,10 +59,13 @@
       mode   "edit" (default) or "view"
       lang   "tr" or "en": the language of the editor and of a new file
       new    "docx" or "xlsx": start from an empty file instead of fetching one
+      convert  "1": open doc, RTF and xls files for editing by converting them to docx / xlsx.
+               The saved file is then of the new format: the request says which in the
+               X-Bym-Format header, and the name shown gets the new extension.
       name   the file name shown, and used for a download
 
       Inside an <iframe> the page tells its parent what happens:
-        { source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message? }
+        { source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message?, format?, convertedFrom? }
 
       In production load the script from your own server or from a CDN:
         <script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js"></script>
@@ -93,7 +96,13 @@
 
         function tell(type, message) {
           // The parent page of an <iframe>, on the same site only.
-          if (window.parent !== window) window.parent.postMessage({ source: 'bymoffice', type: type, message: message }, location.origin);
+          if (window.parent === window) return;
+          var data = { source: 'bymoffice', type: type, message: message };
+          if (mounted) {
+            data.format = mounted.file.format;
+            if (mounted.conversion) data.convertedFrom = mounted.conversion.from;
+          }
+          window.parent.postMessage(data, location.origin);
         }
         function status(message, kind) {
           // Text from a file or a server is shown as text, never as HTML.
@@ -170,7 +179,8 @@
                 }, 1000);
                 return;
               }
-              return fetch(saveUrl, { method: 'PUT', body: bytes, headers: { 'Content-Type': 'application/octet-stream' }, credentials: 'same-origin' }).then(function (response) {
+              // The format of what is sent: not the one of the file that was fetched when it was converted.
+              return fetch(saveUrl, { method: 'PUT', body: bytes, headers: { 'Content-Type': 'application/octet-stream', 'X-Bym-Format': mounted.file.format }, credentials: 'same-origin' }).then(function (response) {
                 if (!response.ok) throw new Error('HTTP ' + response.status);
               });
             })
@@ -197,6 +207,7 @@
               file: file,
               locale: lang,
               readOnly: readOnly,
+              convert: params.get('convert') === '1',
               onSave: function () {
                 // Ctrl+S / Cmd+S in the editor: the same as the button.
                 save();
@@ -214,12 +225,19 @@
           })
           .then(function (result) {
             mounted = result;
+            if (result.conversion) {
+              // "report.doc" is now a docx: the name says so, here and in a download.
+              name = name.replace(/\.[A-Za-z0-9]{1,5}$/, '') + '.' + result.conversion.to;
+              document.getElementById('name').textContent = name;
+              document.title = name;
+            }
             // Formats that cannot be written back (doc, xls, RTF) are shown read-only by the editor itself.
             var writable = result.file.format === 'docx' || result.file.format === 'xlsx';
             if (!writable) readOnly = true;
             saveButton.hidden = readOnly;
             saveButton.addEventListener('click', save);
-            status('');
+            // The notice that the file was converted stays until something else is said.
+            if (!result.conversion) status('');
             // For the console, and for tests of this page.
             window.bymEditor = result;
             tell('ready');

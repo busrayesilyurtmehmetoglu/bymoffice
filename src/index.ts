@@ -2,12 +2,13 @@ import { CfbFile } from './cfb';
 import { readDoc } from './formats/doc/document';
 import { readRtf } from './formats/rtf/document';
 import { readDocx } from './formats/docx/document';
-import { buildDocx, writeDocx } from './formats/docx/write';
+import { buildDocx, emptyWriteReport, writeDocx } from './formats/docx/write';
 import { documentPictures } from './model/doc/pictures';
 import type { DocModel } from './model/doc/types';
 import { readXls } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
 import { buildXlsx } from './formats/xlsx/build';
+import { getUiStrings } from './ui/strings';
 import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
@@ -242,6 +243,15 @@ export interface MountOptions extends SpreadsheetEditorOptions {
   onSave?(bytes: Uint8Array): void;
   /** Called when saving from the shortcut fails. */
   onError?(error: unknown): void;
+  /**
+   * Opens the formats that cannot be written back (doc, RTF, xls) for
+   * editing by converting them first: doc and RTF to docx, xls to xlsx. What
+   * is mounted, edited and saved is then the converted file, and the result
+   * says so in `conversion`; onNotice is told as well. Without it, and with
+   * `readOnly`, these files are shown as they are, read-only. Has no effect
+   * on docx and xlsx.
+   */
+  convert?: boolean;
   /** Documents: the zoom, 1 = 100%, or a mode that follows the container. Default: 100%, less when the page is wider than the container. */
   zoom?: DocumentZoom;
   /** Documents: called when the page in view or the number of pages changes. `page` counts from 1. */
@@ -252,9 +262,22 @@ export interface MountOptions extends SpreadsheetEditorOptions {
   onDocumentChange?(): void;
 }
 
+/** A file that mount() converted to open it for editing. */
+export interface MountConversion {
+  /** The format of the file that was given. */
+  from: 'doc' | 'rtf' | 'xls';
+  /** The format of the file that is mounted and that save() gives. */
+  to: 'docx' | 'xlsx';
+  /** What the conversion could not carry over, as the writers report it; empty when nothing was lost that the model held. */
+  warnings: string[];
+}
+
 export interface MountedSpreadsheet {
   kind: 'spreadsheet';
+  /** The file that is shown: the converted one when `conversion` is set. */
   file: OfficeFile;
+  /** Set when the file was converted to be opened for editing (see MountOptions.convert). */
+  conversion?: MountConversion;
   workbook: Workbook;
   /** The grid: selection, editing, undo and redo, formatting. */
   view: WorkbookView;
@@ -271,7 +294,10 @@ export interface MountedSpreadsheet {
 
 export interface MountedDocument {
   kind: 'document';
+  /** The file that is shown: the converted one when `conversion` is set. */
   file: OfficeFile;
+  /** Set when the file was converted to be opened for editing (see MountOptions.convert). */
+  conversion?: MountConversion;
   document: DocModel;
   /** The pages: zoom, navigation, the caret and the selection, editing, undo and redo. */
   view: DocumentView;
@@ -300,7 +326,31 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
     input = await response.arrayBuffer();
   }
-  const file = await open(input);
+  let file = await open(input);
+  let conversion: MountConversion | undefined;
+  if (options.convert === true && options.readOnly !== true && (file.format === 'doc' || file.format === 'rtf' || file.format === 'xls')) {
+    // The model is written out as a new file of the format that can be saved, and that file is what is opened.
+    const from = file.format;
+    let bytes: Uint8Array;
+    let warnings: string[];
+    if (file.kind === 'document') {
+      if (!file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
+      const report = emptyWriteReport();
+      bytes = await buildDocx(await file.document(), { report });
+      warnings = report.warnings;
+    } else {
+      const report = { parts: [], warnings: [] as string[] };
+      bytes = await buildXlsx(await file.workbook(), { report });
+      warnings = report.warnings;
+    }
+    file = await open(bytes);
+    conversion = { from, to: file.format as 'docx' | 'xlsx', warnings };
+  }
+  const converted = (): void => {
+    if (!conversion || !options.onNotice) return;
+    const strings = getUiStrings(typeof options.locale === 'string' ? options.locale : undefined);
+    options.onNotice({ message: strings.openedConverted(conversion.from, conversion.to), kind: 'info' });
+  };
   let save: () => Promise<Uint8Array>;
   const onKeyDown = (event: KeyboardEvent) => {
     if (!options.onSave || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || (event.key !== 's' && event.key !== 'S')) return;
@@ -342,7 +392,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       container.removeEventListener('keydown', onKeyDown);
       editor.destroy();
     };
-    return { kind: 'document', file, document: model, view, editor, save, destroy };
+    converted();
+    return conversion ? { kind: 'document', file, conversion, document: model, view, editor, save, destroy } : { kind: 'document', file, document: model, view, editor, save, destroy };
   }
 
   const workbook = await file.workbook();
@@ -365,5 +416,6 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     container.removeEventListener('keydown', onKeyDown);
     editor.destroy();
   };
-  return { kind: 'spreadsheet', file, workbook, view, editor, save, destroy };
+  converted();
+  return conversion ? { kind: 'spreadsheet', file, conversion, workbook, view, editor, save, destroy } : { kind: 'spreadsheet', file, workbook, view, editor, save, destroy };
 }

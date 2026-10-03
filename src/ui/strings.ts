@@ -101,6 +101,8 @@ export interface UiStrings {
   /** Said after Escape: the next Tab moves the focus out of the editor instead of typing a tab. */
   tabLeaves: string;
   documentPasteTooLarge: string;
+  /** A file was converted to be opened for editing; the formats as they are written ("doc", "docx"). */
+  openedConverted(from: string, to: string): string;
   pictureNotSupported: string;
   linkNotAllowed: string;
   /** Said when the caret enters another part of the document: `kind` is "body", "header", "footer", "footnote" or "endnote". */
@@ -190,6 +192,7 @@ export const STRINGS_EN: UiStrings = {
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
   tabLeaves: 'Press Tab to leave the editor',
   documentPasteTooLarge: 'The text on the clipboard is too long to paste',
+  openedConverted: (from, to) => `This ${from} file was converted to ${to} to be edited; it is saved as ${to}`,
   pictureNotSupported: 'This picture cannot be inserted',
   linkNotAllowed: 'This address cannot be used as a link',
   editingStory: (kind) => (kind === 'header' ? 'Editing the header' : kind === 'footer' ? 'Editing the footer' : kind === 'footnote' ? 'Editing a footnote' : kind === 'endnote' ? 'Editing an endnote' : 'Editing the text'),
@@ -283,6 +286,7 @@ export const STRINGS_TR: UiStrings = {
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',
   tabLeaves: 'Düzenleyiciden çıkmak için Sekme tuşuna basın',
   documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
+  openedConverted: (from, to) => `Bu ${from} dosyası düzenlenebilmesi için ${to} biçimine çevrildi; ${to} olarak kaydedilir`,
   pictureNotSupported: 'Bu görsel eklenemiyor',
   linkNotAllowed: 'Bu adres bağlantı olarak kullanılamaz',
   editingStory: (kind) => (kind === 'header' ? 'Üstbilgi düzenleniyor' : kind === 'footer' ? 'Altbilgi düzenleniyor' : kind === 'footnote' ? 'Dipnot düzenleniyor' : kind === 'endnote' ? 'Sonnot düzenleniyor' : 'Metin düzenleniyor'),
