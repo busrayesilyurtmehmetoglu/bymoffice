@@ -17,8 +17,17 @@ Bu dosya [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) düzenini izle
 - **Yeni dosya:** `createBlank('docx' | 'xlsx')` boş belge ya da tablo üretir.
 - **Gömme örneği:** `examples/html/index.html` — dosyayı sitenin adresinden alıp düzenleten ve `PUT` ile geri yollayan, sekmede ya da `<iframe>` içinde açılan sayfa.
 - **Dönüştürme:** doc ve RTF → docx (`saveAsDocx()`), xls → xlsx (`saveAsXlsx()`). `mount()`'ta `convert: true` bu dosyaları dönüştürerek düzenlenebilir açar.
+- **WebView köprüsü:** docx köprüde düzenlenir (`changed`, `undo`, `redo`, `setReadOnly` belgede de çalışır; belgenin `changed` iletisinde `sheets` boş dizidir); `load.convert` doc/RTF/xls'i docx/xlsx'e çevirerek düzenlenebilir açar (`loaded`/`saved` iletilerinde `format` ve `convertedFrom`, `loaded.warnings`); `load.blank` boş docx/xlsx ile başlar; `load.toolbar` belgeyi biçimlendirme araç çubuğuyla gösterir. Dönüştürülmemiş doc ve RTF `loaded.readOnly: true` bildirir ve `setReadOnly(false)` ile açılamaz.
+- **Dönüştürme raporu:** `buildDocx(…, { report })` ve `conversion.warnings` taşınamayanları sayılarıyla bildirir (dikdörtgene çevrilen şekiller, gruplar, baytı olmayan görseller, düz metne çevrilen bağlantılar, tema, atılan karakterler). `convertForEditing()` ve `openConverted()` dışa açıldı.
 - **Gömme:** tek `<script>` (global `BymOffice`), ES modülü ve TypeScript tipleri; WebView'ler için tek dosyalık köprü sayfası (`bymoffice/webview.html`) ve mesaj sözleşmesi.
 - **Eski cihazlar:** yerleşik sıkıştırma akışı olmayan ortamlar için kendi inflate/deflate kodu; derleme hedefi ES2019.
+
+### Değişti
+
+- `mount()`: dönüştürülmemiş doc ve RTF görünümlerinde `setReadOnly(false)` artık düzenlemeyi açmaz (düzenlemeler kaydedilemiyordu; xls'teki kuralın aynısı).
+- `mount()`: dönüştürme bildirimi (`onNotice`), `locale` verilmediğinde ya da nesne olduğunda görünümler gibi tarayıcının dilinde verilir (önceden hep İngilizceydi). Dönüştürme başarısız olursa dosya reddedilmez, salt okunur gösterilir ve bildirilir.
+- Köprü: `load`'da `data`, `url`, `blank`'ten tam olarak biri gerekir; hata iletisinin metni buna göre değişti.
+- Örnek sayfa (`examples/html`): dönüştürmede addan yalnız `.doc`/`.rtf`/`.xls` uzantısı atılır.
 
 ### Bilinen sınırlar
 

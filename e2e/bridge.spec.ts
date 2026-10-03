@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises';
 import type { FrameLocator, Page } from '@playwright/test';
-import { ZipArchive, getCell, open } from '../src/index';
+import { ZipArchive, documentText, getCell, open } from '../src/index';
 import { buildXlsx, sampleWorkbook, worksheetXml } from '../test/fixtures';
-import { sampleDocx } from './fixtures/docx';
+import { cat, number, workbookStream, xlsFile } from '../test/xls-fixtures';
+import { docx, sampleDocx } from './fixtures/docx';
 import { textFile, truncatedXlsx, xls } from './fixtures/files';
 import { expect, expectResponsive, test } from './helpers';
 
@@ -129,6 +130,26 @@ async function typeIntoGrid(page: Page, editor: Page | FrameLocator, text: strin
   await expect(input).toBeFocused();
   await page.keyboard.type(text);
   await page.keyboard.press('Enter');
+}
+
+const p = (text: string) => `<w:p><w:r><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+
+/** Puts the caret at the start of the document that is shown and types there. */
+async function typeIntoDocument(page: Page, editor: Page | FrameLocator, text: string, isMobile: boolean): Promise<void> {
+  const sheet = editor.locator('#editor .bym-doc-page[data-page="1"]');
+  await expect(sheet).toBeVisible();
+  // Near the top left corner of the page: the caret goes to the start of the first line.
+  if (isMobile) await sheet.tap({ position: { x: 6, y: 6 } });
+  else await sheet.click({ position: { x: 6, y: 6 } });
+  const input = editor.locator('#editor .bym-doc-input');
+  await expect(input).toBeFocused();
+  await page.keyboard.type(text);
+}
+
+/** The format and the text of the document in the n-th `saved` message. */
+async function textOfSaved(bridge: App, index: number): Promise<{ format: string; text: string }> {
+  const file = await open(new Uint8Array(Buffer.from(await bridge.savedData(index), 'base64')));
+  return { format: file.format, text: documentText(await file.document!()) };
 }
 
 /** Gives messages that should not come the time to come, then checks that none did. */
@@ -358,7 +379,8 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       const bridge = await start(page, mode);
       await bridge.waitFor('ready');
       const input = await sampleDocx();
-      await bridge.send({ type: 'load', id: 'd1', data: base64(input), name: 'belge.docx', locale: 'tr', readOnly: false });
+      // Read-only: in a document that is edited a plain click puts the caret, and a link needs Ctrl.
+      await bridge.send({ type: 'load', id: 'd1', data: base64(input), name: 'belge.docx', locale: 'tr', readOnly: true });
       expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
       await expect(bridge.editor.locator('#status')).toBeHidden();
       await expect(bridge.editor.locator('#editor .bym-doc')).toHaveAttribute('aria-label', 'Belge');
@@ -419,10 +441,186 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       await expect(bridge.editor.locator('#editor')).toBeEmpty();
       await expect(bridge.editor.locator('#status')).toHaveText('No file is open');
 
-      // A document never reports changes or a selection.
+      // A document that is not edited reports no changes, and none reports a selection.
       const all = await bridge.messages();
       expect(all.filter((message) => message.notAString || message.type === 'changed' || message.type === 'selection')).toEqual([]);
       expect(all.filter((message) => message.type === 'error').length).toBe(1);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
+    test('a docx is edited: typing sends changed, undo and redo work, the saved file holds the text', async ({ page, isMobile }) => {
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 'd1', data: base64(await docx(p('First paragraph.') + p('Second paragraph.'))), name: 'yazı.docx' });
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+      // The pages alone: the formatting toolbar comes with `toolbar`.
+      await expect(bridge.editor.locator('#editor .bym-doc')).toHaveCount(1);
+      await expect(bridge.editor.locator('#editor .bym-toolbar')).toHaveCount(0);
+      await expect(bridge.editor.locator('#editor .bym-doc-input')).toHaveJSProperty('readOnly', false);
+
+      await typeIntoDocument(page, bridge.editor, 'Typed ', isMobile);
+      expect(await bridge.waitFor('changed')).toEqual({ type: 'changed', sheets: [], canUndo: true, canRedo: false });
+      await bridge.send({ type: 'save', id: 's1' });
+      expect(await bridge.waitFor('saved')).toEqual({ type: 'saved', id: 's1', data: expect.any(Number), name: 'yazı.docx' });
+      expect(await textOfSaved(bridge, 0)).toEqual({ format: 'docx', text: expect.stringContaining('Typed ') });
+      expect((await textOfSaved(bridge, 0)).text).toContain('Second paragraph.');
+
+      // Undo takes the typing back, redo brings it again; both are reported.
+      const before = (await bridge.messages()).filter((message) => message.type === 'changed').length;
+      await bridge.send({ type: 'undo', id: 'u' });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'u', command: 'undo' });
+      const undone = await bridge.waitFor('changed', before + 1);
+      expect(undone).toEqual({ type: 'changed', sheets: [], canUndo: false, canRedo: true });
+      await bridge.send({ type: 'save', id: 's2' });
+      await bridge.waitFor('saved', 2);
+      expect((await textOfSaved(bridge, 1)).text).toBe('First paragraph.\nSecond paragraph.');
+      await bridge.send({ type: 'redo' });
+      expect(await bridge.waitFor('changed', before + 2)).toEqual({ type: 'changed', sheets: [], canUndo: true, canRedo: false });
+
+      // Read-only: typing changes nothing and nothing is reported.
+      await bridge.send({ type: 'setReadOnly', id: 'ro', readOnly: true });
+      expect(await bridge.waitFor('done', 2)).toEqual({ type: 'done', id: 'ro', command: 'setReadOnly' });
+      await expect(bridge.editor.locator('#editor .bym-doc-input')).toHaveJSProperty('readOnly', true);
+      const count = (await bridge.messages()).filter((message) => message.type === 'changed').length;
+      await bridge.editor.locator('#editor .bym-doc-input').focus();
+      await page.keyboard.type('no');
+      await bridge.send({ type: 'save', id: 's3' });
+      await bridge.waitFor('saved', 3);
+      expect((await textOfSaved(bridge, 2)).text).toContain('Typed ');
+      expect((await textOfSaved(bridge, 2)).text).not.toContain('no');
+      expect((await bridge.messages()).filter((message) => message.type === 'changed')).toHaveLength(count);
+
+      const all = await bridge.messages();
+      expect(all.filter((message) => message.notAString || message.type === 'error' || message.type === 'selection')).toEqual([]);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
+    test('convert: an RTF file is edited and saved as a docx; without convert it stays read-only', async ({ page, isMobile }) => {
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      const rtf = new TextEncoder().encode('{\\rtf1\\ansi Old text of the file.\\par}');
+
+      await bridge.send({ type: 'load', id: 'r1', data: base64(rtf), name: 'eski.rtf' });
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'r1', format: 'rtf', kind: 'document', sheets: [], activeSheet: 0, readOnly: true });
+      await expect(bridge.editor.locator('#editor .bym-doc-input')).toHaveJSProperty('readOnly', true);
+      await bridge.send({ type: 'setReadOnly', id: 'open', readOnly: false });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'open', command: 'setReadOnly', readOnly: true });
+      await expect(bridge.editor.locator('#editor .bym-doc-input')).toHaveJSProperty('readOnly', true);
+      await bridge.send({ type: 'save', id: 's0' });
+      await bridge.waitFor('saved');
+      expect(Buffer.from(await bridge.savedData(0), 'base64').equals(Buffer.from(rtf))).toBe(true);
+
+      await bridge.send({ type: 'load', id: 'r2', data: base64(rtf), name: 'eski.rtf', convert: true });
+      expect(await bridge.waitFor('loaded', 2)).toEqual({ type: 'loaded', id: 'r2', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, convertedFrom: 'rtf', warnings: [] });
+      await expect(bridge.editor.locator('#editor .bym-doc-input')).toHaveJSProperty('readOnly', false);
+      await typeIntoDocument(page, bridge.editor, 'New ', isMobile);
+      expect(await bridge.waitFor('changed')).toEqual({ type: 'changed', sheets: [], canUndo: true, canRedo: false });
+      await bridge.send({ type: 'save', id: 's1' });
+      expect(await bridge.waitFor('saved', 2)).toEqual({ type: 'saved', id: 's1', data: expect.any(Number), name: 'eski.rtf', format: 'docx', convertedFrom: 'rtf' });
+      const saved = await textOfSaved(bridge, 1);
+      expect(saved.format).toBe('docx');
+      expect(saved.text).toContain('New ');
+      expect(saved.text).toContain('text of the file.');
+
+      // An xls file with a chart sheet: converted, and the answer says what was left behind.
+      const xlsBytes = xlsFile(workbookStream({ sheets: [{ name: 'Old', records: cat(number(0, 0, 41)) }, { name: 'Chart1', type: 2 }] }));
+      await bridge.send({ type: 'load', id: 'x1', data: base64(xlsBytes), convert: true });
+      const loaded = await bridge.waitFor('loaded', 3);
+      expect(loaded).toMatchObject({ id: 'x1', format: 'xlsx', convertedFrom: 'xls' });
+      expect(loaded.readOnly).toBeUndefined();
+      expect(loaded.warnings).toHaveLength(1);
+      await typeIntoGrid(page, bridge.editor, '7');
+      await bridge.send({ type: 'save', id: 's2' });
+      expect(await bridge.waitFor('saved', 3)).toEqual({ type: 'saved', id: 's2', data: expect.any(Number), format: 'xlsx', convertedFrom: 'xls' });
+      const again = await open(new Uint8Array(Buffer.from(await bridge.savedData(2), 'base64')));
+      expect(again.format).toBe('xlsx');
+      expect(getCell((await again.workbook()).sheets[0], 0, 0)).toMatchObject({ value: 7 });
+
+      expect((await bridge.messages()).filter((message) => message.notAString || message.type === 'error')).toEqual([]);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
+    test('blank: a new workbook and a new document are started, edited and saved', async ({ page, isMobile }) => {
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 'b1', blank: 'xlsx', locale: 'tr', name: 'yeni.xlsx' });
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'b1', format: 'xlsx', sheets: [{ name: 'Sayfa1', state: 'visible', kind: 'worksheet' }], activeSheet: 0 });
+      await expect(bridge.editor.locator('#editor .bym-tabs button')).toHaveText(['Sayfa1']);
+      await typeIntoGrid(page, bridge.editor, '12');
+      await bridge.waitFor('changed');
+      await bridge.send({ type: 'save', id: 's1' });
+      expect(await bridge.waitFor('saved')).toEqual({ type: 'saved', id: 's1', data: expect.any(Number), name: 'yeni.xlsx' });
+      const workbook = await (await open(new Uint8Array(Buffer.from(await bridge.savedData(0), 'base64')))).workbook();
+      expect(getCell(workbook.sheets[0], 0, 0)).toMatchObject({ kind: 'number', value: 12 });
+
+      await bridge.send({ type: 'load', id: 'b2', blank: 'docx' });
+      expect(await bridge.waitFor('loaded', 2)).toEqual({ type: 'loaded', id: 'b2', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+      await typeIntoDocument(page, bridge.editor, 'Hello', isMobile);
+      await bridge.waitFor('changed', 2);
+      await bridge.send({ type: 'save', id: 's2' });
+      await bridge.waitFor('saved', 2);
+      expect(await textOfSaved(bridge, 1)).toEqual({ format: 'docx', text: 'Hello' });
+
+      // Exactly one source, and only the two kinds.
+      await bridge.send({ type: 'load', id: 'e1', blank: 'pptx' });
+      await bridge.send({ type: 'load', id: 'e2', blank: 'docx', data: 'AAAA' });
+      expect(await bridge.waitFor('error', 2)).toMatchObject({ id: 'e2', code: 'bad-message' });
+      expect((await bridge.messages()).filter((message) => message.type === 'error').map((message) => [message.id, message.code])).toEqual([
+        ['e1', 'bad-message'],
+        ['e2', 'bad-message'],
+      ]);
+      // The document that was open is still there.
+      await expect(bridge.editor.locator('#editor .bym-doc')).toHaveCount(1);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
+    test('toolbar: the editors with their bars are shown, and the commands and messages stay the same', async ({ page, isMobile }) => {
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 't1', blank: 'docx', toolbar: true, locale: 'tr' });
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 't1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+      const toolbar = bridge.editor.locator('#editor .bym-doc-editor .bym-toolbar');
+      await expect(toolbar).toBeVisible();
+      await expect(bridge.editor.locator('#editor .bym-doc-editor .bym-doc')).toHaveCount(1);
+
+      await typeIntoDocument(page, bridge.editor, 'Bold', isMobile);
+      expect(await bridge.waitFor('changed')).toEqual({ type: 'changed', sheets: [], canUndo: true, canRedo: false });
+      await bridge.send({ type: 'undo', id: 'u' });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'u', command: 'undo' });
+      await bridge.send({ type: 'redo', id: 'r' });
+      expect(await bridge.waitFor('done', 2)).toEqual({ type: 'done', id: 'r', command: 'redo' });
+      await bridge.send({ type: 'save', id: 's' });
+      await bridge.waitFor('saved');
+      expect(await textOfSaved(bridge, 0)).toEqual({ format: 'docx', text: 'Bold' });
+
+      // The shell follows the commands: no toolbar while the document is read-only, and its words in the language asked for.
+      await bridge.send({ type: 'setReadOnly', id: 'ro', readOnly: true });
+      await bridge.waitFor('done', 3);
+      await expect(toolbar).toBeHidden();
+      await bridge.send({ type: 'setReadOnly', id: 'rw', readOnly: false });
+      await bridge.waitFor('done', 4);
+      await expect(toolbar).toBeVisible();
+      const label = () => toolbar.locator('button').first().getAttribute('aria-label');
+      const turkish = await label();
+      await bridge.send({ type: 'setLocale', id: 'en', locale: 'en' });
+      await bridge.waitFor('done', 5);
+      await expect.poll(label).not.toBe(turkish);
+
+      // A workbook with `toolbar`: the spreadsheet editor, as the page shows it without it too.
+      await bridge.send({ type: 'load', id: 't2', blank: 'xlsx', toolbar: true });
+      await bridge.waitFor('loaded', 2);
+      await expect(bridge.editor.locator('#editor .bym-doc-editor')).toHaveCount(0);
+      await expect(bridge.editor.locator('#editor .bym-editor .bym-toolbar')).toBeVisible();
+      await expect(bridge.editor.locator('#editor .bym-editor .bym-formula')).toBeVisible();
+      await bridge.send({ type: 'load', id: 't3', blank: 'xlsx' });
+      await bridge.waitFor('loaded', 3);
+      await expect(bridge.editor.locator('#editor .bym-editor .bym-toolbar')).toBeVisible();
+
+      // Closing removes the shell with the view.
+      await bridge.send({ type: 'close', id: 'c' });
+      await bridge.waitFor('done', 6);
+      await expect(bridge.editor.locator('#editor')).toBeEmpty();
+      expect((await bridge.messages()).filter((message) => message.notAString || message.type === 'error')).toEqual([]);
       expectNoOutsideRequests(bridge.requests);
     });
   });

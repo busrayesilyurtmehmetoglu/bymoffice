@@ -24,7 +24,7 @@ import { CanvasTextMeasurer } from '../render/doc-measure';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
 import { hasCopyMark, sliceHtml, cutLoses, sliceOf, type DocSlice } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
-import { getUiStrings, type UiStrings } from './strings';
+import { resolveUiStrings, type UiStrings } from './strings';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
 export { declaredImagePixels, declaredImageSize, decodedImageSize, sniffImageType } from '../render/images';
@@ -225,9 +225,7 @@ const outsideBoxes = (mark: LineMark): boolean => mark.source.path.indexOf(-1) <
 
 const coarsePointer = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia('(pointer:coarse)').matches;
 
-function resolveStrings(locale: string | object | undefined): UiStrings {
-  return getUiStrings(typeof locale === 'string' ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
-}
+const resolveStrings = resolveUiStrings;
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 

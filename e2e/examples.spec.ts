@@ -144,7 +144,7 @@ test.describe('example page: a file of the site in the editor', () => {
     expect((await contentOf(page, saved[0])).text).toBe('by the key');
   });
 
-  test('convert=1: an RTF file is edited as a docx; the name, the header of the request and the message to the parent say so', async ({ page }) => {
+  test('convert=1: an RTF file is edited as a docx; the name and the header of the request say so, and the notice stays in the status line', async ({ page }) => {
     const formats: (string | undefined)[] = [];
     const saved: Buffer[] = [];
     await page.route((url) => url.pathname === '/files/sample', (route) => route.fulfill({ status: 200, contentType: 'application/octet-stream', body: Buffer.from('{\\rtf1\\ansi Old text\\par}') }));
@@ -163,6 +163,8 @@ test.describe('example page: a file of the site in the editor', () => {
     await ready(page);
     await expect(page.locator('#name')).toHaveText('old.docx');
     await expect(page.locator('#save')).toBeVisible();
+    // The notice of the conversion is still there once the page is ready.
+    await expect(page.locator('#status')).toHaveText('Bu rtf dosyası düzenlenebilmesi için docx biçimine çevrildi; docx olarak kaydedilir');
     await page.evaluate(() => {
       const view = (window as any).bymEditor.view;
       view.setSelection({ story: 'body', path: [0], offset: 0 });
@@ -172,6 +174,69 @@ test.describe('example page: a file of the site in the editor', () => {
     await expect(page.locator('#status')).toHaveText('Kaydedildi');
     expect(formats).toEqual(['docx']);
     expect(await contentOf(page, saved[0])).toEqual({ format: 'docx', text: 'New and Old text' });
+  });
+
+  test('convert=1: only the extension of the old format is replaced in the name; any other end of a name is kept', async ({ page }) => {
+    await page.route((url) => url.pathname === '/files/sample', (route) => route.fulfill({ status: 200, contentType: 'application/octet-stream', body: Buffer.from('{\\rtf1\\ansi Old text\\par}') }));
+    for (const [given, shown] of [
+      ['Rapor 2024.10', 'Rapor 2024.10.docx'],
+      ['teklif.v2', 'teklif.v2.docx'],
+      ['OLD.RTF', 'OLD.docx'],
+      ['letter.doc', 'letter.docx'],
+      ['noextension', 'noextension.docx'],
+      ['notes.docx', 'notes.docx.docx'],
+    ]) {
+      await page.goto(`${PAGE}?file=/files/sample&name=${encodeURIComponent(given)}&convert=1`);
+      await ready(page);
+      await expect(page.locator('#name')).toHaveText(shown);
+      expect(await page.title()).toBe(shown);
+    }
+  });
+
+  test('convert=1 inside an iframe: the messages to the parent carry the new format and the one it was converted from', async ({ page }) => {
+    await page.route((url) => url.pathname === '/files/sample', (route) => route.fulfill({ status: 200, contentType: 'application/octet-stream', body: Buffer.from('{\\rtf1\\ansi Old text\\par}') }));
+    await page.route((url) => url.pathname === '/files/save', (route) => route.fulfill({ status: 204, body: '' }));
+    await page.goto('/e2e/pages/blank.html');
+    const embed = (src: string) =>
+      page.evaluate((address) => {
+        (window as any).__messages = [];
+        if (!(window as any).__listening) {
+          (window as any).__listening = true;
+          window.addEventListener('message', (event) => {
+            if (event.origin === location.origin && event.data && event.data.source === 'bymoffice') (window as any).__messages.push(event.data);
+          });
+        }
+        for (const old of Array.from(document.querySelectorAll('iframe'))) old.remove();
+        const frame = document.createElement('iframe');
+        frame.src = address;
+        frame.style.cssText = 'width:800px;height:500px;border:0';
+        document.body.appendChild(frame);
+      }, src);
+    const messages = () => page.evaluate(() => (window as any).__messages as { type: string; format?: string; convertedFrom?: string }[]);
+    const waitFor = (type: string) => page.waitForFunction((wanted) => (window as any).__messages.some((message: { type: string }) => message.type === wanted), type, { timeout: 60_000 });
+
+    await embed(`${PAGE}?file=/files/sample&save=/files/save&name=old.rtf&convert=1`);
+    await waitFor('ready');
+    expect((await messages())[0]).toMatchObject({ source: 'bymoffice', type: 'ready', format: 'docx', convertedFrom: 'rtf' });
+    const frame = page.frames().find((candidate) => candidate.url().includes('/examples/html/'))!;
+    await frame.evaluate(() => {
+      const view = (window as any).bymEditor.view;
+      view.setSelection({ story: 'body', path: [0], offset: 0 });
+      view.insertText('New ');
+    });
+    await frame.locator('#save').click();
+    await waitFor('saved');
+    expect((await messages()).map((message) => [message.type, message.format, message.convertedFrom])).toEqual([
+      ['ready', 'docx', 'rtf'],
+      ['changed', 'docx', 'rtf'],
+      ['saved', 'docx', 'rtf'],
+    ]);
+
+    // Without convert the file is what it was, and nothing says it was converted.
+    await embed(`${PAGE}?file=/files/sample&name=old.rtf`);
+    await waitFor('ready');
+    const plain = (await messages())[0];
+    expect([plain.type, plain.format, 'convertedFrom' in plain]).toEqual(['ready', 'rtf', false]);
   });
 
   test('addresses of another site are refused, and so is a page without a file', async ({ page }) => {

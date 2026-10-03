@@ -1,4 +1,4 @@
-// Example application: pick an xlsx file, edit it, save it.
+// Example application: pick a Word or Excel file, edit it, save it.
 //
 // NOTE: never compiled or run; see README.md. The file_picker calls are
 // UNVERIFIED against the package's current API.
@@ -66,15 +66,22 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _open() async {
     final FilePickerResult? picked = await FilePicker.platform.pickFiles(
       type: FileType.custom,
-      allowedExtensions: <String>['xlsx'],
+      allowedExtensions: <String>['xlsx', 'docx', 'xls', 'doc', 'rtf'],
       withData: true,
     );
     final Uint8List? bytes = picked?.files.single.bytes;
     if (picked == null || bytes == null) return;
     try {
-      await _editor.load(bytes, name: picked.files.single.name, locale: 'tr');
+      // Old formats are converted so that they can be edited; documents get the formatting toolbar.
+      final BymOfficeDocument opened = await _editor.load(bytes, name: picked.files.single.name, locale: 'tr', convert: true, toolbar: true);
+      String name = picked.files.single.name;
+      if (opened.convertedFrom != null) {
+        // "report.doc" is now a docx: only the extension of the old format is replaced.
+        name = '${name.replaceFirst(RegExp(r'\.(doc|rtf|xls)$', caseSensitive: false), '')}.${opened.format}';
+        if (opened.warnings.isNotEmpty) _show('${opened.format} biçimine çevrildi; bazı içerik taşınamadı');
+      }
       setState(() {
-        _name = picked.files.single.name;
+        _name = name;
         _dirty = false;
         _canUndo = false;
         _canRedo = false;

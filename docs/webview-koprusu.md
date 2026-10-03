@@ -58,11 +58,11 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 
 | İleti | Alanlar | İş |
 |---|---|---|
-| `load` | `data` (base64) **ya da** `url`; isteğe bağlı `id`, `name`, `locale`, `readOnly`, `sheet` | Dosyayı açar ve gösterir. Yanıt: `loaded` ya da `error` |
+| `load` | `data` (base64), `url` **ya da** `blank` (`"docx"` / `"xlsx"`); isteğe bağlı `id`, `name`, `locale`, `readOnly`, `sheet`, `convert`, `toolbar` | Dosyayı açar (ya da boş bir dosyayla başlar) ve gösterir. Yanıt: `loaded` ya da `error` |
 | `save` | isteğe bağlı `id` | Düzenlenmiş dosyanın baytlarını ister. Yanıt: `saved` ya da `error` |
-| `setReadOnly` | `readOnly` (boolean); isteğe bağlı `id` | Salt okunur kipini açar/kapatır |
+| `setReadOnly` | `readOnly` (boolean); isteğe bağlı `id` | Salt okunur kipini açar/kapatır (tablo ve belge). Yazılamayan biçimlerde (dönüştürülmemiş doc, RTF, xls) düzenleme açılamaz: yanıt `readOnly: true` taşır |
 | `setLocale` | `locale` (ör. `"tr"`, `"en"`); isteğe bağlı `id` | Sayı/tarih biçimlerinin, görünüm metinlerinin ve sayfanın kendi yazılarının dilini değiştirir |
-| `undo`, `redo` | isteğe bağlı `id` | Geri al, yinele. Bir şey değişirse `changed` gelir |
+| `undo`, `redo` | isteğe bağlı `id` | Geri al, yinele (tablo ve belge). Bir şey değişirse `changed` gelir |
 | `close` | isteğe bağlı `id` | Dosyayı kapatır, süren yüklemeyi iptal eder, boş duruma döner. Dosya yokken de hata vermez |
 | `hello` | — | Sayfa `ready`'yi yeniden gönderir |
 
@@ -72,29 +72,35 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 { "type": "load", "id": "1", "data": "UEsDBBQ…", "name": "rapor.xlsx", "locale": "tr", "readOnly": false, "sheet": 0 }
 { "type": "save", "id": "2" }
 { "type": "setReadOnly", "readOnly": true }
+{ "type": "load", "id": "3", "data": "0M8R4KGx…", "name": "eski.doc", "convert": true, "toolbar": true }
+{ "type": "load", "id": "4", "blank": "docx", "locale": "tr" }
 ```
 
 `load` ayrıntıları:
 
-- `data` ve `url`'den tam olarak biri verilir. `data` standart ya da URL-güvenli base64 olabilir; satır sonları ve boşluklar yok sayılır, dolgu (`=`) eksik olabilir. `data:` öneki konmaz.
+- `data`, `url` ve `blank`'ten **tam olarak biri** verilir; hiçbiri ya da birden fazlası `bad-message` döner. `data` standart ya da URL-güvenli base64 olabilir; satır sonları ve boşluklar yok sayılır, dolgu (`=`) eksik olabilir. `data:` öneki konmaz.
 - `url` sayfanın kendi adresine göre çözülür ve çözülen adres denetlenir. Kabul edilenler: `blob:` ve `data:` adresleri ile **sayfanın kendi kökenindeki** `http(s):` adresleri (göreli adresler dahil). Reddedilenler (`bad-message`): başka köken (`https://başka.example/…`, `//başka.example/…`), kullanıcı adı/parola içeren adres, `javascript:`, `file:` ve diğer şemalar, boşluk, denetim karakteri ya da ters eğik çizgi içeren adresler. Sayfa `http(s)` dışından yüklendiyse (uygulama varlığı: `file:`, özel şema) göreli ve `file:` adresler de reddedilir; yalnız `blob:` ve `data:` çalışır.
 - Sayfa bir `<iframe>` içindeyse `url` **hiç kabul edilmez** (`bad-message`); dosya yalnız `data` ile verilir. Gerekçe: getirme, sayfanın kendi kökeninin çerezleriyle yapılır; `url` kabul edilseydi sayfayı gömen taraf o kökendeki dosyaları `load` + `save` ile okuyabilirdi.
 - Getirme 30 saniyede yanıt vermezse ya da dosya 256 MB'tan büyükse (`Content-Length` ve okunan bayt sayısı) `load-failed` döner.
 - `name` yalnız saklanır ve `saved` iletisinde geri verilir; biçim her zaman içerikten algılanır.
 - `sheet` ilk gösterilecek sayfanın 0 tabanlı dizinidir; dosyada yoksa `bad-message` döner. Gizli (`hidden`, `veryHidden`) bir sayfanın dizini de verilebilir: sayfa gösterilir, ama sekmesi görünmez; kullanıcı başka sekmeye geçince ona sekmelerden dönemez.
-- Yeni dosya **önce** okunur ve doğrulanır (base64, biçim, çalışma kitabı, `sheet`); ancak başarılıysa açık dosya kapatılıp yenisi gösterilir. Başarısız bir `load`, açık dosyayı ve kaydedilmemiş değişikliklerini olduğu gibi bırakır.
+- `blank`: `"docx"` ya da `"xlsx"`; dosya yerine yeni, boş bir belge ya da tabloyla başlar (`BymOffice.createBlank` ile aynı dosya; `locale` verilmişse onunla: Türkçede sayfa adı `Sayfa1`, belge A4). Başka bir değer `bad-message` döner. Boş dosya normal bir docx/xlsx'tir: düzenlenir, `save` ile alınır.
+- `convert` (boolean, varsayılan `false`): `true` ise ve `readOnly` `true` değilse, kendi biçimine yazılamayan dosyalar **dönüştürülerek düzenlenebilir açılır**: doc ve RTF docx'e, xls xlsx'e çevrilir (`mount()`'un `convert` seçeneğiyle aynı kod). Gösterilen, düzenlenen ve `save` ile alınan dosya yeni biçimdedir; `loaded` ve o dosyanın her `saved` iletisi `format` (yeni biçim) ve `convertedFrom` (özgün biçim) taşır, `loaded.warnings` dönüştürmede taşınamayanları listeler (boş dizi olabilir). Uygulama dosyanın adını ve türünü buna göre güncellemelidir; `name` olduğu gibi geri verilir, sayfa onu değiştirmez. docx ve xlsx'te `convert` hiçbir şey değiştirmez. Dönüştürme başarısız olursa (yeni dosya yazılamadı ya da geri okunamadı) dosya reddedilmez: olduğu gibi, salt okunur gösterilir; `loaded` özgün `format`'ı, `readOnly: true`'yu ve nedeni anlatan tek bir `warnings` girdisini taşır, `convertedFrom` bulunmaz.
+- `toolbar` (boolean, varsayılan `false`): `true` ise belge, sayfaların üstünde **biçimlendirme araç çubuğuyla** gösterilir (`DocumentEditor`; belge salt okunurken araç çubuğu gizlenir). `false` iken belge yalnız sayfalar olarak gösterilir (altta sayfa numarası ve yakınlaştırma çubuğu vardır); klavyeyle yazma ve kısayollar iki kipte de çalışır. **Tablo, köprü sayfasında her iki kipte de editör kabuğuyla (araç çubuğu, formül çubuğu, durum çubuğu) gösterilir**; `toolbar` tabloda bir şey değiştirmez. Komutlar ve iletiler iki kipte de aynıdır.
+- Yeni dosya **önce** okunur ve doğrulanır (base64, biçim, çalışma kitabı, `sheet`, varsa dönüştürme); ancak başarılıysa açık dosya kapatılıp yenisi gösterilir. Başarısız bir `load`, açık dosyayı ve kaydedilmemiş değişikliklerini olduğu gibi bırakır.
 
 ### Sayfa → uygulama
 
 | İleti | Alanlar | Ne zaman |
 |---|---|---|
 | `ready` | `version` | Sayfa yüklendi, ileti alabilir. Bir kez gönderilir |
-| `loaded` | `id`?, `format`, `sheets: [{ name, state, kind }]`, `activeSheet` | `load` başarılı |
-| `changed` | `sheets: number[]`, `canUndo`, `canRedo` | Çalışma kitabı her değiştiğinde (geri al/yinele dahil) |
-| `saved` | `id`?, `data` (base64), `name`? | `save` başarılı |
+| `loaded` | `id`?, `format`, `kind`? (`"document"`, yalnız belgede), `sheets: [{ name, state, kind }]` (belgede `[]`), `activeSheet`, `readOnly`? (`true`: dosya yazılamayan bir biçimde, hep salt okunur), `convertedFrom`?, `warnings`? (`string[]`) | `load` başarılı |
+| `changed` | `sheets: number[]` (değişen sayfalar; belgede hep `[]`), `canUndo`, `canRedo` | Çalışma kitabı ya da belge her değiştiğinde (geri al/yinele dahil) |
+| `saved` | `id`?, `data` (base64), `name`?, `format`? ve `convertedFrom`? (yalnız dönüştürülerek açılmış dosyada, ikisi birlikte) | `save` başarılı |
 | `selection` | `sheet`, `range` (`"A1:B2"`, tek hücrede `"A1"`), `active` (`"A1"`) | Seçim değişince; **kare başına en çok bir kez**, yalnız o karedeki son seçim, bir öncekiyle aynıysa gönderilmez |
 | `sheet` | `index`, `name` | Gösterilen sayfa (sekme) değişince |
-| `done` | `id`, `command` | `id` taşıyan `setReadOnly`, `setLocale`, `undo`, `redo`, `close` başarılı |
+| `done` | `id`, `command`, `readOnly`? (`true`: `setReadOnly(false)` istendi ama dosya salt okunur kalıyor) | `id` taşıyan `setReadOnly`, `setLocale`, `undo`, `redo`, `close` başarılı |
+| `link` | `url` | Belgede bir bağlantı etkinleştirildi (Bölüm 7) |
 | `error` | `id`?, `code`, `message` | Aşağıdaki durumlarda |
 
 `sheets[].state`: `visible`, `hidden`, `veryHidden`. `sheets[].kind`: `worksheet`, `chartsheet`.
@@ -105,13 +111,18 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 { "type": "changed", "sheets": [0], "canUndo": true, "canRedo": false }
 { "type": "saved", "id": "2", "data": "UEsDBBQ…", "name": "rapor.xlsx" }
 { "type": "error", "id": "2", "code": "not-loaded", "message": "No file is open" }
+{ "type": "loaded", "id": "3", "format": "docx", "kind": "document", "sheets": [], "activeSheet": 0, "convertedFrom": "doc", "warnings": [] }
+{ "type": "changed", "sheets": [], "canUndo": true, "canRedo": false }
+{ "type": "saved", "id": "5", "data": "UEsDBBQ…", "name": "eski.doc", "format": "docx", "convertedFrom": "doc" }
 ```
+
+`warnings` girdileri İngilizce, geliştiriciye yönelik metinlerdir (ör. `"2 shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over"`, `"Sheet: the content of a chart sheet is not in the model; it is written as an empty worksheet"`). Yalnız okuyucunun modele aldığı ama yeni dosyaya taşınamayan içerik listelenir; okuyucunun hiç okumadığı içerik (kılavuzdaki "Henüz olmayanlar" tablosu) yeni dosyada yoktur ve uyarılmaz. Bu yüzden arşivlik bir dosyanın özgün hali saklanmalıdır.
 
 ### Hata kodları
 
 | Kod | Anlam |
 |---|---|
-| `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
+| `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), `data`/`url`/`blank`'ten birden fazlası ya da hiçbiri, `"docx"`/`"xlsx"` dışında bir `blank`, olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
 | `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale` gönderildi ama açık dosya yok |
 | `unsupported` | Dosya gösterilemeyen bir türde (Word 95 ve öncesi, parola korumalı, Office dosyası olmayan içerik, boş içerik) |
 | `corrupt` | Dosya xlsx gibi başlıyor ama okunamıyor (kesik, bozuk) |
@@ -289,10 +300,10 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 
 ## 7. Sınırlar
 
-- **xlsx gösterilir ve düzenlenir; docx, doc, RTF ve xls salt okunur gösterilir.** Parola korumalı dosyalar `unsupported` ile reddedilir. RTF için sözleşme docx ile aynıdır (`format: 'rtf'`).
-- **xls için sözleşme:** `loaded` iletisi `readOnly: true` taşır. `setReadOnly` ile düzenleme açılamaz: istek `done` ile yanıtlanır ama yanıt `readOnly: true` taşır ve görünüm değişmez (xls'e yazılamadığı için düzenlemeler kaydedilemezdi). `save` özgün baytları döner.
-- **doc için sözleşme** docx ile aynıdır.
-- **docx için sözleşme:** `loaded` iletisi `{ format: 'docx', kind: 'document', sheets: [], activeSheet: 0 }` taşır. `save` özgün baytları döner; `changed` ve `selection` hiç gelmez; `setReadOnly`, `undo`, `redo` etkisizdir ama `done` ile onaylanır; `setLocale` çalışır. Belgede bir bağlantıya basılınca sayfa onu kendisi açmaz, uygulamaya `{ type: 'link', url }` iletisi gönderir (yalnız http, https, mailto, tel).
+- **xlsx ve docx gösterilir ve düzenlenir; doc, RTF ve xls kendi biçimlerine yazılamadığı için salt okunur gösterilir**, `load.convert` ile docx/xlsx'e çevrilerek düzenlenebilir açılır (Bölüm 3). Parola korumalı dosyalar `unsupported` ile reddedilir.
+- **Yazılamayan biçimler (dönüştürülmemiş doc, RTF, xls) için sözleşme:** `loaded` iletisi `readOnly: true` taşır. `setReadOnly` ile düzenleme açılamaz: istek `done` ile yanıtlanır ama yanıt `readOnly: true` taşır ve görünüm değişmez (düzenlemeler kaydedilemezdi). `save` özgün baytları döner; `changed` hiç gelmez.
+- **Belge (docx; doc ve RTF) için sözleşme:** `loaded` iletisi `{ format, kind: 'document', sheets: [], activeSheet: 0 }` taşır; `load.sheet` yok sayılır. docx, `load.readOnly` `true` değilse düzenlenebilir açılır. Belge her değiştiğinde (yazma, silme, biçimlendirme, yapıştırma, geri al/yinele) tablodakiyle **aynı** `changed` iletisi gelir; belgenin sayfa (sheet) kavramı olmadığı için `sheets` hep boş dizidir, `canUndo`/`canRedo` belgenin geri alma geçmişini bildirir. `undo`, `redo`, `setReadOnly`, `setLocale` belgede de çalışır. `save`, süren bir giriş yöntemi (IME) kompozisyonunu önce belgeye işler ve değişiklikleri içeren docx baytlarını döner; hiç değiştirilmemiş bir docx özgün baytlarıyla döner. `selection` ve `sheet` iletileri belgede gelmez.
+- **Belgede bağlantılar:** sayfa bir bağlantıyı kendisi açmaz, uygulamaya `{ type: 'link', url }` iletisi gönderir (yalnız http, https, mailto, tel). Salt okunur belgede bağlantıya basmak/dokunmak yeter; düzenlenen belgede düz tıklama imleci koyar, bağlantı Ctrl (macOS'ta Cmd) + tıklama ile ya da bağlantı odaktayken Enter ile etkinleşir. Dokunmatik ekranda düzenlenen belgede dokunma imleci koyar; bağlantıların dokunarak izlenmesi gerekiyorsa belge `setReadOnly(true)` ile salt okunur yapılır.
 - **Base64 bellek maliyeti.** Dosya iki yönde de base64 dizgisi olarak taşınır: metin dosyadan üçte bir büyüktür ve yükleme/kaydetme sırasında dosyanın birkaç kopyası aynı anda bellekte durur (uygulamadaki baytlar, base64 metni, WebView'e geçirilen betik, sayfadaki dizgi, çözülmüş baytlar). Sayfanın kendi kodlama/çözme işlemi parça parça ve doğrusal sürede çalışır (20 MB için Node'da gidiş-dönüş ≈ 0,4 sn; tarayıcılarda 5 MB'lık dosya için yükleme ≈ 0,1–0,4 sn, kaydetme < 0,1 sn ölçüldü). Asıl maliyet platformun dizgiyi WebView'e geçirmesindedir ve gerçek cihazda ölçülmedi.
 - **Gerçek cihazda sınanmadı.** Özellikle şunlar doğrulanmayı bekliyor: iOS'ta odak yakınlaştırmasının gerçekten engellendiği, güvenli alan boşlukları, ekran klavyesi açıldığında yerleşim, çok büyük `runJavaScript` betiklerinin davranışı, Android'in eski WebView sürümleri.
 - `load` ve `save` için ileti boyutu sınırı yoktur (`url` ile getirmede 256 MB); bellek sınırı platformundur.

@@ -2,7 +2,7 @@
 
 > **Uyarı: bu örnek hiç derlenmedi ve hiç çalıştırılmadı.** Yazıldığı ortamda Flutter/Dart kurulu değildi. Kod `webview_flutter` 4.x arayüzüne (`WebViewController`, `addJavaScriptChannel`, `loadFlutterAsset`, `runJavaScript`) göre yazıldı; ilk derlemede küçük düzeltmeler gerekebilir. Emin olunmayan satırlar kodda `UNVERIFIED` diye işaretlidir. Köprü sayfasının kendisi tarayıcılarda (Chromium, Firefox, WebKit, mobil görünüm) otomatik testlerle sınandı; gerçek bir cihazdaki WebView'de sınanmadı.
 
-Örnek, BYM Office editörünü bir WebView içinde gösterir: xlsx dosyası seçilir, düzenlenir, kaydedilir. Editör uygulamanın içine gömülüdür; internet gerekmez.
+Örnek, BYM Office editörünü bir WebView içinde gösterir: bir Excel ya da Word dosyası (xlsx, docx; dönüştürülerek xls, doc, RTF) seçilir, düzenlenir, kaydedilir. Editör uygulamanın içine gömülüdür; internet gerekmez.
 
 ## Dosyalar
 
@@ -60,8 +60,30 @@ final Uint8List saved = await editor.save();
 
 await editor.undo();
 await editor.setReadOnly(true);
+
+// Word belgesi: docx düzenlenir; `toolbar: true` biçimlendirme araç çubuğunu gösterir.
+final belge = await editor.load(docxBytes, name: 'yazı.docx', toolbar: true);
+print(belge.isDocument);   // true; belge.sheets boştur
+
+// Eski biçimler (doc, RTF, xls): `convert: true` ile docx/xlsx'e çevrilip düzenlenir.
+final eski = await editor.load(docBytes, name: 'eski.doc', convert: true);
+print('${eski.convertedFrom} -> ${eski.format}');   // doc -> docx
+print(eski.warnings);                                // taşınamayanlar (İngilizce), boş olabilir
+final kayit = await editor.saveFile();               // kayit.bytes bir docx'tir; kayit.format == 'docx'
+
+// `convert` verilmezse doc/RTF/xls salt okunurdur: eski.readOnly == true,
+// ve `await editor.setReadOnly(false)` true (hâlâ salt okunur) döner.
+
+// Boş dosyayla başlama:
+await editor.loadBlank('docx', locale: 'tr');
+
+// Belgedeki bağlantılar: sayfa açmaz, uygulamaya bildirir.
+editor.onLink.listen((url) => print('bağlantı: $url'));
+
 editor.dispose();
 ```
+
+`onChanged` belge için de gelir; belgede `change.sheets` hep boştur. Dönüştürülen dosyada uygulama dosyanın adını ve türünü `format`'a göre güncellemelidir (`main.dart` adın sonundaki `.doc`/`.rtf`/`.xls` uzantısını değiştirir). Bu eklemeler de derlenmedi; `warnings` listesinin çözülmesi kodda `UNVERIFIED` işaretlidir.
 
 Her çağrı (`load`, `save`, `undo`, `redo`, `setReadOnly`, `setLocale`, `close`) iletiye bir `id` ekler ve aynı `id`'yi taşıyan yanıtı (`loaded`, `saved`, `done` ya da `error`) bekler. Yanıt 60 saniyede gelmezse (sayfanın hazır olmasını bekleme süresi dahil) `BymOfficeException('timeout', …)` fırlatılır. `dispose()` sayfaya `close` gönderir, JavaScript kanalını kaldırır ve bekleyen çağrıları `closed` koduyla sonlandırır; sonrasında yapılan çağrılar hemen hata verir. Sayfa yüklenince denetleyici bir `hello` gönderir; `ready` kanal kurulmadan önce gönderilip kaybolduysa sayfa onu yineler. Açılamayan bir dosya, o sırada açık olan dosyayı kapatmaz. Kullanıcı sekme değiştirince `onSheetChanged` akışı haber verir. Hata kodları: `unsupported`, `corrupt`, `load-failed`, `save-failed`, `bad-message`, `not-loaded`. Sözleşmenin tamamı `docs/webview-koprusu.md` dosyasındadır.
 

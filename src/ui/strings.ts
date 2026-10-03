@@ -103,6 +103,8 @@ export interface UiStrings {
   documentPasteTooLarge: string;
   /** A file was converted to be opened for editing; the formats as they are written ("doc", "docx"). */
   openedConverted(from: string, to: string): string;
+  /** A file could not be converted to be edited and is shown as it is, read-only. */
+  notConverted(from: string): string;
   pictureNotSupported: string;
   linkNotAllowed: string;
   /** Said when the caret enters another part of the document: `kind` is "body", "header", "footer", "footnote" or "endnote". */
@@ -193,6 +195,7 @@ export const STRINGS_EN: UiStrings = {
   tabLeaves: 'Press Tab to leave the editor',
   documentPasteTooLarge: 'The text on the clipboard is too long to paste',
   openedConverted: (from, to) => `This ${from} file was converted to ${to} to be edited; it is saved as ${to}`,
+  notConverted: (from) => `This ${from} file could not be converted to be edited; it is shown read-only`,
   pictureNotSupported: 'This picture cannot be inserted',
   linkNotAllowed: 'This address cannot be used as a link',
   editingStory: (kind) => (kind === 'header' ? 'Editing the header' : kind === 'footer' ? 'Editing the footer' : kind === 'footnote' ? 'Editing a footnote' : kind === 'endnote' ? 'Editing an endnote' : 'Editing the text'),
@@ -287,6 +290,7 @@ export const STRINGS_TR: UiStrings = {
   tabLeaves: 'Düzenleyiciden çıkmak için Sekme tuşuna basın',
   documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
   openedConverted: (from, to) => `Bu ${from} dosyası düzenlenebilmesi için ${to} biçimine çevrildi; ${to} olarak kaydedilir`,
+  notConverted: (from) => `Bu ${from} dosyası düzenlenebilecek biçime çevrilemedi; salt okunur gösteriliyor`,
   pictureNotSupported: 'Bu görsel eklenemiyor',
   linkNotAllowed: 'Bu adres bağlantı olarak kullanılamaz',
   editingStory: (kind) => (kind === 'header' ? 'Üstbilgi düzenleniyor' : kind === 'footer' ? 'Altbilgi düzenleniyor' : kind === 'footnote' ? 'Dipnot düzenleniyor' : kind === 'endnote' ? 'Sonnot düzenleniyor' : 'Metin düzenleniyor'),
@@ -300,4 +304,13 @@ export const STRINGS_TR: UiStrings = {
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */
 export function getUiStrings(tag: string | undefined): UiStrings {
   return typeof tag === 'string' && /^tr(?:[-_]|$)/i.test(tag) ? STRINGS_TR : STRINGS_EN;
+}
+
+/**
+ * The strings a view speaks for the `locale` it was given: those of a language
+ * tag, and for anything else (no locale, a locale object, which only changes
+ * formats) those of the browser's language.
+ */
+export function resolveUiStrings(locale: string | object | undefined): UiStrings {
+  return getUiStrings(typeof locale === 'string' ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
 }

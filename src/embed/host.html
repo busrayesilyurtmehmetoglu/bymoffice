@@ -124,50 +124,59 @@
           return;
         }
         show('empty');
+        // The bridge drives the view inside an editor; these three calls are passed on to the
+        // editor so that the shell around the view follows.
+        function withShell(editor) {
+          var view = editor.view;
+          var destroyView = view.destroy.bind(view);
+          var destroyed = false;
+          view.destroy = function () {
+            if (destroyed) return destroyView();
+            destroyed = true;
+            editor.destroy();
+          };
+          var setLocale = view.setLocale.bind(view);
+          var inLocale = false;
+          view.setLocale = function (locale) {
+            if (inLocale) return setLocale(locale);
+            inLocale = true;
+            try {
+              editor.setLocale(locale);
+            } finally {
+              inLocale = false;
+            }
+          };
+          var setReadOnly = view.setReadOnly.bind(view);
+          var inReadOnly = false;
+          view.setReadOnly = function (readOnly) {
+            if (inReadOnly) return setReadOnly(readOnly);
+            inReadOnly = true;
+            try {
+              editor.setReadOnly(readOnly);
+            } finally {
+              inReadOnly = false;
+            }
+          };
+          return view;
+        }
+        function sheetEditor(container, workbook, options) {
+          return withShell(new window.BymOffice.SpreadsheetEditor(container, workbook, options));
+        }
         var origins = document.querySelector('meta[name="bymoffice-parent-origins"]');
         window.BymOffice.installBridge({
           window: window,
           container: document.getElementById('editor'),
           open: window.BymOffice.open,
-          createView: function (container, workbook, options) {
-            // The full editor: toolbar, formula bar and status bar around the grid. The bridge
-            // drives the grid; these three calls are passed on so that the shell follows.
-            var editor = new window.BymOffice.SpreadsheetEditor(container, workbook, options);
-            var view = editor.view;
-            var destroyView = view.destroy.bind(view);
-            var destroyed = false;
-            view.destroy = function () {
-              if (destroyed) return destroyView();
-              destroyed = true;
-              editor.destroy();
-            };
-            var setLocale = view.setLocale.bind(view);
-            var inLocale = false;
-            view.setLocale = function (locale) {
-              if (inLocale) return setLocale(locale);
-              inLocale = true;
-              try {
-                editor.setLocale(locale);
-              } finally {
-                inLocale = false;
-              }
-            };
-            var setReadOnly = view.setReadOnly.bind(view);
-            var inReadOnly = false;
-            view.setReadOnly = function (readOnly) {
-              if (inReadOnly) return setReadOnly(readOnly);
-              inReadOnly = true;
-              try {
-                editor.setReadOnly(readOnly);
-              } finally {
-                inReadOnly = false;
-              }
-            };
-            return view;
-          },
-          // Documents are shown read-only, as pages.
+          // The spreadsheet editor: toolbar, formula bar and status bar around the grid, with and without `toolbar`.
+          createView: sheetEditor,
+          createEditor: sheetEditor,
+          // A document as pages; editable when it is a docx.
           createDocumentView: function (container, doc, options) {
             return new window.BymOffice.DocumentView(container, doc, options);
+          },
+          // A `load` with `toolbar: true`: the formatting toolbar above the pages.
+          createDocumentEditor: function (container, doc, options) {
+            return withShell(new window.BymOffice.DocumentEditor(container, doc, options));
           },
           version: '__BYM_VERSION__',
           parentOrigins: origins ? origins.getAttribute('content') : '',

@@ -79,6 +79,12 @@ export interface BodyContext extends PropsContext {
   /** Ids for generated drawings, unique in the document. */
   drawingIds: { next: number };
   /**
+   * Counts the generated drawings that lose something: `shapes` are written
+   * as plain rectangles without outline and fill, `groups` with their parts
+   * over the whole area of the group.
+   */
+  generated?: { shapes: number; groups: number };
+  /**
    * Content controls written so far. One wrapper written a second time (an
    * edit split what it wraps over two paragraphs) gives a second control,
    * which must not repeat the id of the first.
@@ -917,18 +923,21 @@ function generateDrawing(ctx: BodyContext, item: DrawingItem, out: string[], dep
   const parts = pictures.length + boxes.length;
   if (item.kind === 'group' || parts > 2 || (parts === 2 && !(pictures.length === 1 && boxes.length === 1))) {
     uri = NS_WPG;
+    if (ctx.generated) ctx.generated.groups++;
     graphic = `<wpg:wgp xmlns:wpg="${NS_WPG}"><wpg:cNvGrpSpPr/><wpg:grpSpPr>${transformText(item, width, height, true)}</wpg:grpSpPr>`;
     for (const part of pictures) graphic += picture(part.image, part.crop, false);
     for (const blocks of boxes) graphic += shape(blocks, undefined, false);
     graphic += '</wpg:wgp>';
   } else if (boxes.length) {
     uri = NS_WPS;
+    if (ctx.generated) ctx.generated.shapes++;
     graphic = shape(boxes[0], pictures.length ? pictures[0].image : undefined, true);
   } else if (pictures.length || item.kind === 'picture') {
     uri = ns.pic;
     graphic = picture(pictures.length ? pictures[0].image : undefined, pictures.length ? pictures[0].crop || item.crop : item.crop, true);
   } else {
     uri = NS_WPS;
+    if (ctx.generated) ctx.generated.shapes++;
     graphic = shape(undefined, undefined, true);
   }
 

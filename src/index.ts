@@ -2,13 +2,14 @@ import { CfbFile } from './cfb';
 import { readDoc } from './formats/doc/document';
 import { readRtf } from './formats/rtf/document';
 import { readDocx } from './formats/docx/document';
-import { buildDocx, emptyWriteReport, writeDocx } from './formats/docx/write';
+import { buildDocx, writeDocx } from './formats/docx/write';
+import { needsConversion, openConverted } from './formats/convert';
 import { documentPictures } from './model/doc/pictures';
 import type { DocModel } from './model/doc/types';
 import { readXls } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
 import { buildXlsx } from './formats/xlsx/build';
-import { getUiStrings } from './ui/strings';
+import { resolveUiStrings } from './ui/strings';
 import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
@@ -28,6 +29,7 @@ export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/wo
 export { readDocx } from './formats/docx/document';
 export { buildDocx, writeDocx, type DocxWriteReport } from './formats/docx/write';
 export { createBlank, type BlankOptions } from './formats/blank';
+export { convertForEditing, openConverted, type ConvertibleFile, type EditableConversion, type OpenedForEditing } from './formats/convert';
 export * as docOps from './ops/doc/index';
 export { readDoc } from './formats/doc/document';
 export { readRtf } from './formats/rtf/document';
@@ -248,8 +250,9 @@ export interface MountOptions extends SpreadsheetEditorOptions {
    * editing by converting them first: doc and RTF to docx, xls to xlsx. What
    * is mounted, edited and saved is then the converted file, and the result
    * says so in `conversion`; onNotice is told as well. Without it, and with
-   * `readOnly`, these files are shown as they are, read-only. Has no effect
-   * on docx and xlsx.
+   * `readOnly`, these files are shown as they are, read-only, and nothing
+   * turns editing on. A file whose conversion fails is shown the same way,
+   * and onNotice says so. Has no effect on docx and xlsx.
    */
   convert?: boolean;
   /** Documents: the zoom, 1 = 100%, or a mode that follows the container. Default: 100%, less when the page is wider than the container. */
@@ -268,7 +271,16 @@ export interface MountConversion {
   from: 'doc' | 'rtf' | 'xls';
   /** The format of the file that is mounted and that save() gives. */
   to: 'docx' | 'xlsx';
-  /** What the conversion could not carry over, as the writers report it; empty when nothing was lost that the model held. */
+  /**
+   * What the model held and the new file does not carry over, each with its
+   * count, in English: for a document, shapes written as plain rectangles,
+   * groups, pictures without data, characters XML cannot hold, links that
+   * are not followed and theme references (the last two only for models
+   * that hold them, which those read from doc and RTF do not); for a
+   * workbook, what buildXlsx() reports (chart and macro sheets, pictures it
+   * cannot read, ...). Empty when nothing was lost. What the reader never
+   * put into the model is not listed.
+   */
   warnings: string[];
 }
 
@@ -328,28 +340,24 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   }
   let file = await open(input);
   let conversion: MountConversion | undefined;
-  if (options.convert === true && options.readOnly !== true && (file.format === 'doc' || file.format === 'rtf' || file.format === 'xls')) {
+  /** Why a file that had to be converted was not: it is then shown as it is, read-only. */
+  let notConverted: string | undefined;
+  if (options.convert === true && options.readOnly !== true && needsConversion(file.format)) {
+    if (file.kind === 'document' && !file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
     // The model is written out as a new file of the format that can be saved, and that file is what is opened.
     const from = file.format;
-    let bytes: Uint8Array;
-    let warnings: string[];
-    if (file.kind === 'document') {
-      if (!file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
-      const report = emptyWriteReport();
-      bytes = await buildDocx(await file.document(), { report });
-      warnings = report.warnings;
-    } else {
-      const report = { parts: [], warnings: [] as string[] };
-      bytes = await buildXlsx(await file.workbook(), { report });
-      warnings = report.warnings;
-    }
-    file = await open(bytes);
-    conversion = { from, to: file.format as 'docx' | 'xlsx', warnings };
+    const opened = await openConverted(file, open);
+    if (opened.conversion) {
+      file = opened.file;
+      conversion = { from: opened.conversion.from, to: file.format as 'docx' | 'xlsx', warnings: opened.conversion.warnings };
+    } else if (opened.failed !== undefined) notConverted = from;
   }
   const converted = (): void => {
-    if (!conversion || !options.onNotice) return;
-    const strings = getUiStrings(typeof options.locale === 'string' ? options.locale : undefined);
-    options.onNotice({ message: strings.openedConverted(conversion.from, conversion.to), kind: 'info' });
+    if (!options.onNotice) return;
+    // In the language the views speak for the same option.
+    const strings = resolveUiStrings(options.locale);
+    if (conversion) options.onNotice({ message: strings.openedConverted(conversion.from, conversion.to), kind: 'info' });
+    else if (notConverted !== undefined) options.onNotice({ message: strings.notConverted(notConverted), kind: 'error' });
   };
   let save: () => Promise<Uint8Array>;
   const onKeyDown = (event: KeyboardEvent) => {
@@ -378,6 +386,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       onChange: options.onDocumentChange,
     });
     const view = editor.view;
+    if (file.format !== 'docx') {
+      // Nothing may turn editing on: saving gives the original bytes and the edits would be lost.
+      const lockView = view.setReadOnly.bind(view);
+      const lockEditor = editor.setReadOnly.bind(editor);
+      view.setReadOnly = () => lockView(true);
+      editor.setReadOnly = () => lockEditor(true);
+    }
     save = async () => {
       // A composition still under way belongs to the document that is written.
       view.commitEditing();

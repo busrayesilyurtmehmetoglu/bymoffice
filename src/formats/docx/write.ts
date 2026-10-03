@@ -41,6 +41,11 @@
 //     the link. (Field codes are text and are written as they are.)
 //   - Footnotes and endnotes get the two separator notes Word expects when
 //     the model has none.
+//   - A shape that is not a picture keeps its place, size and text and is
+//     written as a rectangle without outline and fill; the parts of a group
+//     lie over its whole area. A picture without data is an empty frame.
+//   - The report counts each of these in its warnings; characters XML cannot
+//     hold are counted in `droppedCharacters`.
 
 import {
   safeHyperlinkTarget,
@@ -591,6 +596,8 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
   const rootAttrs = generatedRootAttrs(strict);
   const shared: WriteCounters = { dropped: { count: 0 }, drawingIds: { next: 1 } };
   const counts = { copied: 0, written: 0 };
+  // What the new file does not carry over; the report says how much of each.
+  const lost = { shapes: 0, groups: 0, pictures: 0, links: 0, theme: false };
   const parts: [name: string, data: Uint8Array][] = [];
   const defaults = new Map<string, string>([
     ['rels', RELS_TYPE],
@@ -647,12 +654,14 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
   // A package without a theme: theme colours and fonts as the plain values they stand for.
   const color = (value: DocColor): DocColor => {
     if (value.theme === undefined) return value;
+    lost.theme = true;
     const resolved = resolveColor(doc, value);
     if (resolved !== undefined) return { rgb: resolved.slice(1).toUpperCase() };
     return value.auto ? { auto: true } : value;
   };
   const fonts = (value: RunFonts): RunFonts => {
     if (value.asciiTheme === undefined && value.hAnsiTheme === undefined && value.eastAsiaTheme === undefined && value.csTheme === undefined) return value;
+    lost.theme = true;
     const out: RunFonts = {};
     for (const slot of ['ascii', 'hAnsi', 'eastAsia', 'cs'] as const) {
       const name = resolveFont(doc, value, slot);
@@ -707,13 +716,18 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
     const ctx = createBodyContext(part, story.rootName === '' ? rootAttrs : story.rootAttrs, story.relationships, shared);
     ctx.color = color;
     ctx.fonts = fonts;
+    ctx.generated = lost;
     ctx.headerRef = (list, id) => headerIds.get(list + '\n' + id);
     ctx.image = (ref: ImageRef): string | undefined => {
       if (story.rootName !== '' && rels.has(ref.rId)) return ref.rId;
-      if (ref.target === undefined) return undefined;
-      if (ref.external) return rels.keyed('external\n' + ref.target, ns.rel + 'image', ref.target, true);
-      const media = mediaPart(ref.target);
-      return media === undefined ? undefined : rels.keyed('image\n' + media, ns.rel + 'image', relativeTarget(part, media), false);
+      if (ref.target !== undefined && ref.external) return rels.keyed('external\n' + ref.target, ns.rel + 'image', ref.target, true);
+      const media = ref.target === undefined ? undefined : mediaPart(ref.target);
+      // A picture whose bytes the model does not have: its frame is written, empty.
+      if (media === undefined) {
+        lost.pictures++;
+        return undefined;
+      }
+      return rels.keyed('image\n' + media, ns.rel + 'image', relativeTarget(part, media), false);
     };
     ctx.link = (wrapper: Extract<Wrapper, { kind: 'hyperlink' }>) => {
       if (story.rootName !== '' && wrapper.rId !== undefined && rels.has(wrapper.rId)) return { rId: wrapper.rId, anchor: wrapper.anchor };
@@ -722,7 +736,9 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
       if (safe !== undefined) return { anchor: wrapper.anchor !== undefined ? wrapper.anchor : safe.slice(1) };
       if (wrapper.anchor !== undefined) return { anchor: wrapper.anchor };
       // A link that leads nowhere the engine would follow: its text, without the link.
-      return wrapper.target === undefined && wrapper.rId === undefined ? {} : null;
+      if (wrapper.target === undefined && wrapper.rId === undefined) return {};
+      lost.links++;
+      return null;
     };
     return ctx;
   };
@@ -788,6 +804,11 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
   if (report) {
     report.writtenBlocks += counts.written;
     report.droppedCharacters += shared.dropped.count;
+    if (lost.shapes) warn(`${lost.shapes} shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over`);
+    if (lost.groups) warn(`${lost.groups} group(s) of shapes were written with every part over the whole area of the group, without outlines and fills`);
+    if (lost.pictures) warn(`${lost.pictures} picture(s) whose data is not available were written as empty frames`);
+    if (lost.links) warn(`${lost.links} link(s) with an address that is not followed were written as plain text`);
+    if (lost.theme) warn('The theme was not carried over: theme colours and theme fonts were written as the plain values they stand for');
     for (const name of zip.names()) report.parts.push('/' + name);
   }
   return zip.write();

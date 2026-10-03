@@ -207,6 +207,140 @@ test.describe('BymOffice.mount', () => {
     await expect(page.locator('#editor')).toBeEmpty();
   });
 
+  test('doc and RTF that are not converted cannot be made editable: nothing unlocks the view and the model stays as it is', async ({ page }) => {
+    const docBytes = Array.from(simpleDoc('First paragraph\rSecond paragraph\r').build());
+    const outcome = await page.evaluate(async (doc) => {
+      const api = (window as any).BymOffice;
+      const host = document.getElementById('editor')!;
+      const out: unknown[] = [];
+      for (const file of [new Uint8Array(doc), new TextEncoder().encode('{\\rtf1\\ansi Hello text\\par}')]) {
+        const mounted = await api.mount(host, { file, readOnly: false });
+        const before = api.documentText(mounted.document);
+        mounted.editor.setReadOnly(false);
+        mounted.view.setReadOnly(false);
+        mounted.view.setSelection({ story: 'body', path: [0], offset: 0 });
+        const typed = mounted.view.insertText('Lost ');
+        const saved = await mounted.save();
+        out.push([mounted.file.format, mounted.view.readOnly, typed, api.documentText(mounted.document) === before, mounted.view.isModified, saved.length === file.length]);
+        mounted.destroy();
+      }
+      // A docx is not locked.
+      const mounted = await api.mount(host, { file: await api.createBlank('docx'), readOnly: true });
+      mounted.editor.setReadOnly(false);
+      out.push([mounted.file.format, mounted.view.readOnly]);
+      mounted.destroy();
+      return out;
+    }, docBytes);
+    expect(outcome).toEqual([
+      ['doc', true, false, true, false, true],
+      ['rtf', true, false, true, false, true],
+      ['docx', false],
+    ]);
+  });
+
+  test('convert: what the new file does not carry over is in conversion.warnings; a file that loses nothing has none', async ({ page }) => {
+    const sheet = cat(number(0, 0, 41));
+    const charted = Array.from(xlsFile(workbookStream({ sheets: [{ name: 'Data', records: sheet }, { name: 'Chart1', type: 2 }] })));
+    const plain = Array.from(xlsFile(workbookStream({ sheets: [{ name: 'Data', records: sheet }] })));
+    const outcome = await page.evaluate(
+      async ([withChart, without]) => {
+        const api = (window as any).BymOffice;
+        const host = document.getElementById('editor')!;
+        const rtf = (body: string) => new TextEncoder().encode('{\\rtf1\\ansi ' + body + '\\par}');
+        const shape = '{\\shp{\\*\\shpinst\\shpleft0\\shptop0\\shpright2000\\shpbottom1000{\\sp{\\sn shapeType}{\\sv 3}}}}';
+        const out: Record<string, unknown> = {};
+        for (const [key, file] of [
+          ['chart', new Uint8Array(withChart)],
+          ['plain', new Uint8Array(without)],
+          ['shape', rtf('Before ' + shape + ' after')],
+          ['text', rtf('Only text')],
+        ] as [string, Uint8Array][]) {
+          const mounted = await api.mount(host, { file, convert: true });
+          out[key] = [mounted.conversion.to, mounted.conversion.warnings];
+          mounted.destroy();
+        }
+        return out;
+      },
+      [charted, plain],
+    );
+    expect(outcome).toEqual({
+      chart: ['xlsx', ['Sheet: the content of a chart sheet is not in the model; it is written as an empty worksheet']],
+      plain: ['xlsx', []],
+      shape: ['docx', ['1 shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over']],
+      text: ['docx', []],
+    });
+  });
+
+  test('convert: a picture goes into the docx and stays through an edit; xls with readOnly and xlsx are left alone; a converted xlsx locks and unlocks', async ({ page }) => {
+    const xlsBytes = Array.from(xlsFile(workbookStream({ sheets: [{ name: 'Old', records: cat(number(0, 0, 41)) }] })));
+    const outcome = await page.evaluate(async (xls) => {
+      const api = (window as any).BymOffice;
+      const host = document.getElementById('editor')!;
+      const out: Record<string, unknown> = {};
+      const picture =
+        '{\\pict\\pngblip\\picw10\\pich10\\picwgoal150\\pichgoal150 89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082}';
+      let mounted = await api.mount(host, { file: new TextEncoder().encode('{\\rtf1\\ansi Text ' + picture + ' here\\par}'), convert: true });
+      mounted.view.setSelection({ story: 'body', path: [0], offset: 0 });
+      mounted.view.insertText('Edited ');
+      const saved = await api.open(await mounted.save());
+      const media = saved.package.partNames().filter((name: string) => name.indexOf('/word/media/') === 0);
+      const bytes = media.length ? await saved.package.readPart(media[0]) : new Uint8Array(0);
+      out.picture = [saved.format, mounted.conversion.warnings, media.length, bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47, api.documentText(await saved.document()).indexOf('Edited Text') === 0];
+      mounted.destroy();
+
+      mounted = await api.mount(host, { file: new Uint8Array(xls), convert: true, readOnly: true });
+      out.xlsReadOnly = [mounted.file.format, mounted.conversion === undefined, mounted.view.readOnly];
+      mounted.editor.setReadOnly(false);
+      out.xlsStaysLocked = mounted.view.readOnly;
+      mounted.destroy();
+
+      const xlsx = await api.createBlank('xlsx');
+      mounted = await api.mount(host, { file: xlsx, convert: true });
+      out.xlsx = [mounted.file.format, mounted.conversion === undefined, mounted.view.readOnly];
+      mounted.destroy();
+
+      mounted = await api.mount(host, { file: new Uint8Array(xls), convert: true });
+      const states = [mounted.view.readOnly];
+      mounted.editor.setReadOnly(true);
+      states.push(mounted.view.readOnly);
+      mounted.view.setCellInput(0, 0, '5');
+      const locked = mounted.workbook.sheets[0].rows.get(0).cells[0].value;
+      mounted.editor.setReadOnly(false);
+      states.push(mounted.view.readOnly);
+      mounted.view.setCellInput(0, 0, '6');
+      out.converted = [states, locked, mounted.workbook.sheets[0].rows.get(0).cells[0].value];
+      mounted.destroy();
+      return out;
+    }, xlsBytes);
+    expect(outcome).toEqual({
+      picture: ['docx', [], 1, true, true],
+      xlsReadOnly: ['xls', true, true],
+      xlsStaysLocked: true,
+      xlsx: ['xlsx', true, false],
+      converted: [[false, true, false], 41, 6],
+    });
+  });
+
+  test('convert: the notice follows the locale as the views do: a locale object leaves the language to the browser', async ({ page }) => {
+    const notices = await page.evaluate(async () => {
+      const api = (window as any).BymOffice;
+      const host = document.getElementById('editor')!;
+      const out: string[] = [];
+      const file = () => new TextEncoder().encode('{\\rtf1\\ansi Text\\par}');
+      for (const locale of [undefined, api.LOCALE_TR, 'tr']) {
+        const mounted = await api.mount(host, { file: file(), convert: true, locale, onNotice: (notice: { message: string }) => out.push(notice.message) });
+        mounted.destroy();
+      }
+      return out;
+    });
+    // The browser of the tests speaks English: only the language tag makes the notice Turkish.
+    expect(notices).toEqual([
+      'This rtf file was converted to docx to be edited; it is saved as docx',
+      'This rtf file was converted to docx to be edited; it is saved as docx',
+      'Bu rtf dosyası düzenlenebilmesi için docx biçimine çevrildi; docx olarak kaydedilir',
+    ]);
+  });
+
   test('rejects files it cannot show and leaves the container empty', async ({ page }) => {
     const xls = Array.from(minimalCfb(new Uint8Array(9 * 512), new Uint8Array(10)));
     const outcome = await page.evaluate(async (input) => {
@@ -221,5 +355,28 @@ test.describe('BymOffice.mount', () => {
     // The compound file names a workbook stream that is not one: damaged, not unsupported.
     expect(outcome).toEqual(['Error', 'UnsupportedFileError']);
     await expect(page.locator('#editor')).toBeEmpty();
+  });
+});
+
+test.describe('BymOffice.mount in a browser that speaks Turkish', () => {
+  test.use({ locale: 'tr-TR' });
+
+  test('convert: without a locale, and with a locale object, the notice is in the language of the browser', async ({ page }) => {
+    await page.goto('/e2e/pages/mount.html');
+    const notices = await page.evaluate(async () => {
+      const api = (window as any).BymOffice;
+      const host = document.getElementById('editor')!;
+      const out: string[] = [navigator.language];
+      const file = () => new TextEncoder().encode('{\\rtf1\\ansi Text\\par}');
+      for (const locale of [undefined, api.LOCALE_EN, 'en']) {
+        const mounted = await api.mount(host, { file: file(), convert: true, locale, onNotice: (notice: { message: string }) => out.push(notice.message) });
+        // The view speaks the same language as the notice.
+        out.push(host.querySelector('.bym-doc')!.getAttribute('aria-label')!);
+        mounted.destroy();
+      }
+      return out;
+    });
+    const turkish = 'Bu rtf dosyası düzenlenebilmesi için docx biçimine çevrildi; docx olarak kaydedilir';
+    expect(notices).toEqual(['tr-TR', turkish, 'Belge', turkish, 'Belge', 'This rtf file was converted to docx to be edited; it is saved as docx', 'Document']);
   });
 });

@@ -12,7 +12,7 @@ import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMe
 import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
-import { getUiStrings, type UiStrings } from './strings';
+import { resolveUiStrings, type UiStrings } from './strings';
 import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
 import { clearRange, copyRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
 import {
@@ -244,9 +244,7 @@ const CELL_TEXT_MARGIN = 8;
 const DOUBLE_TAP_MS = 500;
 
 /** Language of the view's own words: the tag given as `locale`, else the browser's. */
-function resolveStrings(locale: string | FormatLocale | undefined): UiStrings {
-  return getUiStrings(typeof locale === 'string' ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
-}
+const resolveStrings = resolveUiStrings;
 
 // Cosmetic rules only; everything the layout depends on is set inline so the
 // view still works where a style element is not allowed.

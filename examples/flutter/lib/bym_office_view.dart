@@ -27,17 +27,57 @@ class BymOfficeSheet {
 
 /// The answer to a `load`.
 class BymOfficeDocument {
-  const BymOfficeDocument({required this.format, required this.sheets, required this.activeSheet});
+  const BymOfficeDocument({
+    required this.format,
+    required this.sheets,
+    required this.activeSheet,
+    this.isDocument = false,
+    this.readOnly = false,
+    this.convertedFrom,
+    this.warnings = const <String>[],
+  });
 
+  /// The format of the file that is shown and saved: "docx", "xlsx", "doc",
+  /// "xls" or "rtf". After a conversion this is the new format.
   final String format;
+
+  /// Empty for a document.
   final List<BymOfficeSheet> sheets;
   final int activeSheet;
+
+  /// True for a Word document (docx, doc, RTF), false for a workbook.
+  final bool isDocument;
+
+  /// True when the file is in a format that cannot be written (doc, RTF, xls
+  /// that were not converted): it stays read-only, whatever setReadOnly asks.
+  final bool readOnly;
+
+  /// The format the file had before `convert` turned it into [format]; null
+  /// when nothing was converted.
+  final String? convertedFrom;
+
+  /// What a conversion could not carry over, in English; for developers.
+  final List<String> warnings;
 }
 
-/// A `changed` message: the workbook was edited (or an edit was undone or redone).
+/// The answer to a `save`.
+class BymOfficeSavedFile {
+  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom});
+
+  final Uint8List bytes;
+
+  /// Set, with [convertedFrom], only for a file that was converted when it was
+  /// loaded: the bytes are a file of this format, not of the one that was given.
+  final String? format;
+  final String? convertedFrom;
+}
+
+/// A `changed` message: the workbook or the document was edited (or an edit
+/// was undone or redone).
 class BymOfficeChange {
   const BymOfficeChange({required this.sheets, required this.canUndo, required this.canRedo});
 
+  /// The sheets that changed; always empty for a document.
   final List<int> sheets;
   final bool canUndo;
   final bool canRedo;
@@ -105,6 +145,7 @@ class BymOfficeController {
   final StreamController<BymOfficeSelection> _selections = StreamController<BymOfficeSelection>.broadcast();
   final StreamController<BymOfficeSheetChange> _sheets = StreamController<BymOfficeSheetChange>.broadcast();
   final StreamController<BymOfficeException> _errors = StreamController<BymOfficeException>.broadcast();
+  final StreamController<String> _links = StreamController<String>.broadcast();
   int _nextId = 0;
   bool _disposed = false;
 
@@ -115,21 +156,58 @@ class BymOfficeController {
   Stream<BymOfficeSelection> get onSelection => _selections.stream;
   Stream<BymOfficeSheetChange> get onSheetChanged => _sheets.stream;
 
+  /// A link in a document was activated; the page never opens it itself.
+  Stream<String> get onLink => _links.stream;
+
   /// Every `error` message, including those that also fail a request.
   Stream<BymOfficeException> get onError => _errors.stream;
 
   /// Opens a file. If it cannot be opened, the file that was open stays open.
-  Future<BymOfficeDocument> load(Uint8List bytes, {String? name, String? locale, bool? readOnly, int? sheet}) async {
+  ///
+  /// [convert] opens doc, RTF and xls files for editing by converting them to
+  /// docx and xlsx: the answer then names the new format and the old one, and
+  /// what [save] returns is a file of the new format. [toolbar] shows a
+  /// document with the formatting toolbar above its pages.
+  Future<BymOfficeDocument> load(
+    Uint8List bytes, {
+    String? name,
+    String? locale,
+    bool? readOnly,
+    int? sheet,
+    bool? convert,
+    bool? toolbar,
+  }) async {
     _checkAlive();
     // Base64 of a large file takes a while; keep it off the UI thread.
     final String data = await compute(base64Encode, bytes);
+    return _load(<String, dynamic>{'data': data}, name: name, locale: locale, readOnly: readOnly, sheet: sheet, convert: convert, toolbar: toolbar);
+  }
+
+  /// Starts with a new, empty file instead of opening one. [kind] is "docx"
+  /// or "xlsx"; [locale] also chooses the paper size and the name of the sheet.
+  Future<BymOfficeDocument> loadBlank(String kind, {String? name, String? locale, bool? readOnly, bool? toolbar}) {
+    _checkAlive();
+    return _load(<String, dynamic>{'blank': kind}, name: name, locale: locale, readOnly: readOnly, toolbar: toolbar);
+  }
+
+  Future<BymOfficeDocument> _load(
+    Map<String, dynamic> source, {
+    String? name,
+    String? locale,
+    bool? readOnly,
+    int? sheet,
+    bool? convert,
+    bool? toolbar,
+  }) async {
     final Map<String, dynamic> answer = await _request(<String, dynamic>{
       'type': 'load',
-      'data': data,
+      ...source,
       if (name != null) 'name': name,
       if (locale != null) 'locale': locale,
       if (readOnly != null) 'readOnly': readOnly,
       if (sheet != null) 'sheet': sheet,
+      if (convert != null) 'convert': convert,
+      if (toolbar != null) 'toolbar': toolbar,
     });
     return BymOfficeDocument(
       format: answer['format'] as String,
@@ -141,17 +219,37 @@ class BymOfficeController {
                 kind: entry['kind'] as String,
               ))
           .toList(),
+      isDocument: answer['kind'] == 'document',
+      readOnly: answer['readOnly'] == true,
+      convertedFrom: answer['convertedFrom'] as String?,
+      // UNVERIFIED: the cast of a decoded JSON list of strings.
+      warnings: (answer['warnings'] as List<dynamic>? ?? const <dynamic>[]).map((dynamic entry) => entry.toString()).toList(),
     );
   }
 
   /// The file with every change made in the editor.
-  Future<Uint8List> save() async {
+  Future<Uint8List> save() async => (await saveFile()).bytes;
+
+  /// As [save], with the format of the bytes when the file was converted on loading.
+  Future<BymOfficeSavedFile> saveFile() async {
     final Map<String, dynamic> answer = await _request(<String, dynamic>{'type': 'save'});
-    return compute(base64Decode, answer['data'] as String);
+    return BymOfficeSavedFile(
+      bytes: await compute(base64Decode, answer['data'] as String),
+      format: answer['format'] as String?,
+      convertedFrom: answer['convertedFrom'] as String?,
+    );
   }
 
   // These complete when the page confirms the command with `done`.
-  Future<void> setReadOnly(bool readOnly) => _request(<String, dynamic>{'type': 'setReadOnly', 'readOnly': readOnly});
+
+  /// Completes with what holds afterwards: true when the file is read-only.
+  /// A doc, RTF or xls file that was not converted stays read-only whatever
+  /// is asked, so `setReadOnly(false)` completes with true for it.
+  Future<bool> setReadOnly(bool readOnly) async {
+    final Map<String, dynamic> answer = await _request(<String, dynamic>{'type': 'setReadOnly', 'readOnly': readOnly});
+    return readOnly || answer['readOnly'] == true;
+  }
+
   Future<void> setLocale(String locale) => _request(<String, dynamic>{'type': 'setLocale', 'locale': locale});
   Future<void> undo() => _request(<String, dynamic>{'type': 'undo'});
   Future<void> redo() => _request(<String, dynamic>{'type': 'redo'});
@@ -174,6 +272,7 @@ class BymOfficeController {
     _selections.close();
     _sheets.close();
     _errors.close();
+    _links.close();
   }
 
   void _checkAlive() {
@@ -249,6 +348,9 @@ class BymOfficeController {
         ));
       case 'sheet':
         _sheets.add(BymOfficeSheetChange(index: (message['index'] as num).toInt(), name: message['name'] as String? ?? ''));
+      case 'link':
+        final Object? url = message['url'];
+        if (url is String) _links.add(url);
       case 'error':
         final BymOfficeException error = BymOfficeException(message['code'] as String? ?? 'unknown', message['message'] as String? ?? '');
         _errors.add(error);

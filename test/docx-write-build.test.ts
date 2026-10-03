@@ -472,6 +472,46 @@ test('a model read from docx is built again: its pictures come from the given so
   assert.equal(built.result.headers.size, 1);
   assert.equal(JSON.stringify((await built.pkg.relationships('/word/document.xml')).map((rel) => rel.target)).indexOf('javascript'), -1);
   assert.ok(report.parts.indexOf('/word/media/image7.png') >= 0);
+  // What was not carried over is in the report: the link that became text, and the theme.
+  assert.deepEqual(report.warnings, [
+    '1 link(s) with an address that is not followed were written as plain text',
+    'The theme was not carried over: theme colours and theme fonts were written as the plain values they stand for',
+  ]);
+  assert.equal(report.droppedCharacters, 0);
+});
+
+test('the report counts what a new package does not carry over; a model that loses nothing gives no warning', async () => {
+  const link = (target: string, text: string): Paragraph => ({ type: 'paragraph', props: {}, children: [{ type: 'run', props: {}, content: [{ type: 'text', text }], wrap: { kind: 'hyperlink', target } }] });
+  const png = { rId: 'x', target: '/doc/media/image1.png' };
+  const gone = { rId: 'y', target: '/doc/media/gone.png' };
+  const media = (): DocModel['media'] => new Map([['/doc/media/image1.png', { bytes: PNG, type: 'image/png' }]]);
+  const picture: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'picture', width: 10, height: 20, image: png, images: [{ image: png }], xml: standIn() };
+
+  const clean = emptyWriteReport();
+  await build(model([para('Plain text'), inRun(picture), link('https://example.com/', 'web'), link('#Mark', 'inside')], { media: media() }), { report: clean });
+  assert.deepEqual(clean.warnings, []);
+  assert.equal(clean.droppedCharacters, 0);
+
+  const bare: DrawingItem = { type: 'drawing', placement: 'anchor', kind: 'shape', width: 10, height: 20, anchor: {}, xml: standIn() };
+  const box: DrawingItem = { type: 'drawing', placement: 'anchor', kind: 'shape', width: 10, height: 20, anchor: {}, textBoxes: [[para('in the box'), inRun(bare)]], xml: standIn() };
+  const group: DrawingItem = { type: 'drawing', placement: 'anchor', kind: 'group', width: 10, height: 20, anchor: {}, images: [{ image: png }], textBoxes: [[para('one')], [para('two')]], xml: standIn() };
+  const missing: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'picture', width: 10, height: 20, image: gone, images: [{ image: gone }], xml: standIn() };
+  const untargeted: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'picture', width: 10, height: 20, image: { rId: 'z' }, xml: standIn() };
+  const report = emptyWriteReport();
+  await build(
+    model([para('A\u0001B\u0002C'), inRun(bare, box, group, missing, untargeted, picture), link('javascript:alert(1)', 'script'), link('file:///etc/passwd', 'file'), link('https://example.com/', 'web')], {
+      media: media(),
+    }),
+    { report },
+  );
+  assert.deepEqual(report.warnings, [
+    // The bare shape twice (once inside the text box) and the text box itself.
+    '3 shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over',
+    '1 group(s) of shapes were written with every part over the whole area of the group, without outlines and fills',
+    '2 picture(s) whose data is not available were written as empty frames',
+    '2 link(s) with an address that is not followed were written as plain text',
+  ]);
+  assert.equal(report.droppedCharacters, 2);
 });
 
 test('a strict model is built with the strict namespaces', async () => {

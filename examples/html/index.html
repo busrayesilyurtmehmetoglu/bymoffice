@@ -200,6 +200,7 @@
         }
 
         status(text.loading);
+        var noticed = false;
         var source = fresh ? BymOffice.createBlank(fresh, { locale: lang }) : Promise.resolve(fileUrl);
         source
           .then(function (file) {
@@ -216,6 +217,7 @@
               onChange: changed,
               onDocumentChange: changed,
               onNotice: function (notice) {
+                noticed = true;
                 status(notice.message, notice.kind);
               },
               onError: function (error) {
@@ -226,8 +228,9 @@
           .then(function (result) {
             mounted = result;
             if (result.conversion) {
-              // "report.doc" is now a docx: the name says so, here and in a download.
-              name = name.replace(/\.[A-Za-z0-9]{1,5}$/, '') + '.' + result.conversion.to;
+              // "report.doc" is now a docx: the name says so, here and in a download. Only the extension of
+              // a format that is converted is taken off ("Report 2024.10" and "offer.v2" keep their ends).
+              name = name.replace(/\.(doc|rtf|xls)$/i, '') + '.' + result.conversion.to;
               document.getElementById('name').textContent = name;
               document.title = name;
             }
@@ -236,8 +239,8 @@
             if (!writable) readOnly = true;
             saveButton.hidden = readOnly;
             saveButton.addEventListener('click', save);
-            // The notice that the file was converted stays until something else is said.
-            if (!result.conversion) status('');
+            // What was said while the file was opened (it was converted, or could not be) stays until something else is said.
+            if (!noticed) status('');
             // For the console, and for tests of this page.
             window.bymEditor = result;
             tell('ready');

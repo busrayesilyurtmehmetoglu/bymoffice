@@ -3,11 +3,15 @@
 // platform (Flutter, Android, iOS, Windows, React Native, an iframe) uses the
 // same contract. Nothing here touches the DOM when the module is imported;
 // the window and the container are handed in.
+import { createBlank } from '../formats/blank';
+import { needsConversion, openConverted } from '../formats/convert';
 import { documentPictures } from '../model/doc/pictures';
 import type { OfficeFile } from '../index';
 import type { DocModel } from '../model/doc/types';
 import { cellName, rangeName, type Workbook } from '../model/sheet/types';
+import type { DocumentEditorOptions } from '../ui/doc-editor';
 import type { DocumentViewOptions } from '../ui/doc-view';
+import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 
 export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded';
@@ -15,10 +19,26 @@ export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
 export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
 
-/** What the bridge needs of a document view. */
+/**
+ * What the bridge needs of a document view. Only destroy() is required: a
+ * view without the editing members shows the document and nothing more, and
+ * the commands that need them are confirmed without an effect.
+ */
 export interface BridgeDocumentView {
   destroy(): void;
   setLocale?(locale: string): void;
+  /** Turns editing off or on. */
+  setReadOnly?(readOnly: boolean): void;
+  undo?(): unknown;
+  redo?(): unknown;
+  readonly canUndo?: boolean;
+  readonly canRedo?: boolean;
+  /** Ends what an input method is composing, so that it is part of the saved file. */
+  commitEditing?(): void;
+  /** Counts the changes made in the view: the same number means the same document. */
+  readonly changeCount?: number;
+  /** Says that the document as it is now has been saved. */
+  markSaved?(): void;
 }
 
 export interface BridgeHost {
@@ -33,6 +53,17 @@ export interface BridgeHost {
    * Without it documents are refused as unsupported.
    */
   createDocumentView?(container: HTMLElement, doc: DocModel, options: DocumentViewOptions): BridgeDocumentView;
+  /**
+   * Shows a workbook with the editor's shell around the grid (toolbar, formula
+   * bar, status bar), for a `load` with `toolbar: true`, and returns the grid.
+   * Without it such a load is shown with createView().
+   */
+  createEditor?(container: HTMLElement, workbook: Workbook, options: SpreadsheetEditorOptions): WorkbookView;
+  /**
+   * Shows a document with the formatting toolbar above the pages, for a `load`
+   * with `toolbar: true`. Without it such a load is shown with createDocumentView().
+   */
+  createDocumentEditor?(container: HTMLElement, doc: DocModel, options: DocumentEditorOptions): BridgeDocumentView;
   /**
    * Hands one message to the application. Returns false (or throws) when there
    * is no channel to send it on yet; the message is then kept and sent later.
@@ -246,6 +277,8 @@ interface Outgoing {
   json: string;
   /** Sheets of a waiting `changed`, which a later one takes over. */
   sheets?: number[];
+  /** Which of the files that were shown the message speaks of (see fileSerial). */
+  file: number;
 }
 
 /** The file that is shown: a workbook in `view`, or a document in `pages`. */
@@ -254,6 +287,10 @@ interface Shown {
   view: WorkbookView | undefined;
   pages: BridgeDocumentView | undefined;
   name: string | undefined;
+  /** The file cannot be written with changes (doc, RTF, xls as they are): it stays read-only whatever is asked. */
+  locked: boolean;
+  /** The format the file had before it was converted to be edited. */
+  convertedFrom: string | undefined;
 }
 
 /** The message handling of the bridge page, with everything it needs from the page handed in. */
@@ -282,6 +319,8 @@ export function createBridge(host: BridgeHost): Bridge {
   let retrying = false;
   let retries = 0;
 
+  /** Counts the files that were shown: a status message speaks of one of them and is never joined with one of another. */
+  let fileSerial = 0;
   let selectionDue: { sheet: number; range: string; active: string } | undefined;
   let selectionScheduled = false;
   let selectionSent = '';
@@ -326,7 +365,7 @@ export function createBridge(host: BridgeHost): Bridge {
     const type = message.type as string;
     if (isStatus(type)) {
       for (let i = pending.length - 1; i >= 0; i--) {
-        if (pending[i].type !== type) continue;
+        if (pending[i].type !== type || pending[i].file !== fileSerial) continue;
         const older = pending.splice(i, 1)[0];
         pendingChars -= older.json.length;
         // One `changed` stands for all that were waiting: it names every sheet they named.
@@ -337,7 +376,7 @@ export function createBridge(host: BridgeHost): Bridge {
         }
       }
     }
-    const entry: Outgoing = { type, id: message.id as string | undefined, json: JSON.stringify(message) };
+    const entry: Outgoing = { type, id: message.id as string | undefined, json: JSON.stringify(message), file: fileSerial };
     if (type === 'changed') entry.sheets = message.sheets as number[];
     pending.push(entry);
     pendingChars += entry.json.length;
@@ -348,7 +387,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (pending[i].type !== 'saved') continue;
       const json = JSON.stringify(errorMessage('save-failed', 'The saved file was given up: the application did not take it', pending[i].id));
       pendingChars += json.length - pending[i].json.length;
-      pending[i] = { type: 'error', id: pending[i].id, json };
+      pending[i] = { type: 'error', id: pending[i].id, json, file: pending[i].file };
     }
     if (!retrying && retries < MAX_RETRIES) {
       retrying = true;
@@ -383,6 +422,7 @@ export function createBridge(host: BridgeHost): Bridge {
     selectionDue = undefined;
     selectionSent = '';
     if (!shown) return;
+    fileSerial++;
     const view = shown.view || shown.pages;
     shown = undefined;
     if (view) view.destroy();
@@ -453,7 +493,13 @@ export function createBridge(host: BridgeHost): Bridge {
     const locale = field<string>(message, 'locale', 'string', false);
     const readOnly = field<boolean>(message, 'readOnly', 'boolean', false);
     const sheet = field<number>(message, 'sheet', 'number', false);
-    if ((data === undefined) === (url === undefined)) throw new BadMessage('"load" needs either "data" or "url"');
+    const blank = field<string>(message, 'blank', 'string', false);
+    const convert = field<boolean>(message, 'convert', 'boolean', false);
+    const toolbar = field<boolean>(message, 'toolbar', 'boolean', false);
+    if ((data === undefined ? 0 : 1) + (url === undefined ? 0 : 1) + (blank === undefined ? 0 : 1) !== 1) {
+      throw new BadMessage('"load" needs exactly one of "data", "url" and "blank"');
+    }
+    if (blank !== undefined && blank !== 'docx' && blank !== 'xlsx') throw new BadMessage('"blank" must be "docx" or "xlsx"');
     if (sheet !== undefined && (!Number.isInteger(sheet) || sheet < 0)) throw new BadMessage('"sheet" must be a sheet index');
     let address: string | undefined;
     if (url !== undefined) {
@@ -484,6 +530,15 @@ export function createBridge(host: BridgeHost): Bridge {
 
     if (overtaken()) return;
     if (!shown) setState('loading');
+    if (blank !== undefined) {
+      try {
+        bytes = await createBlank(blank as 'docx' | 'xlsx', locale === undefined ? {} : { locale });
+      } catch (error) {
+        if (overtaken()) return;
+        return refuse('load-failed', `Could not make the new file: ${errorText(error)}`);
+      }
+      if (overtaken()) return;
+    }
     if (bytes === undefined) {
       try {
         bytes = await fetchFile(address as string);
@@ -497,12 +552,33 @@ export function createBridge(host: BridgeHost): Bridge {
     let file: OfficeFile;
     let workbook: Workbook | undefined;
     let doc: DocModel | undefined;
+    let convertedFrom: string | undefined;
+    let warnings: string[] | undefined;
     try {
       file = await host.open(bytes);
       if (overtaken()) return;
+      const showable = (): void => {
+        if (file.kind === 'document' && (!file.document || !host.createDocumentView)) {
+          throw Object.assign(new Error('This kind of document cannot be shown'), { name: 'UnsupportedFileError' });
+        }
+      };
+      showable();
+      if (convert === true && readOnly !== true && needsConversion(file.format)) {
+        // The file is written out in the format that can be saved, and that file is what is shown.
+        const opened = await openConverted(file, host.open);
+        if (overtaken()) return;
+        if (opened.conversion) {
+          file = opened.file;
+          convertedFrom = opened.conversion.from;
+          warnings = opened.conversion.warnings;
+          showable();
+        } else if (opened.failed !== undefined) {
+          // Shown as it is, read-only: better than refusing a file that can be read.
+          warnings = [`The file could not be converted and is shown read-only: ${opened.failed}`];
+        }
+      }
       if (file.kind === 'document') {
-        if (!file.document || !host.createDocumentView) throw Object.assign(new Error('This kind of document cannot be shown'), { name: 'UnsupportedFileError' });
-        doc = await file.document();
+        doc = await (file.document as NonNullable<OfficeFile['document']>)();
       } else {
         workbook = await file.workbook();
         if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
@@ -512,11 +588,34 @@ export function createBridge(host: BridgeHost): Bridge {
       return refuse(error instanceof Error && error.name === 'UnsupportedFileError' ? 'unsupported' : 'corrupt', errorText(error));
     }
     if (overtaken()) return;
+    // Only docx and xlsx are written back with their changes; the other formats stay read-only until they are converted.
+    const locked = needsConversion(file.format);
+
+    const loaded = (activeSheet: number, sheets: unknown[], document: boolean) => {
+      const out: Message = { type: 'loaded' };
+      if (id !== undefined) out.id = id;
+      out.format = file.format;
+      if (document) out.kind = 'document';
+      out.sheets = sheets;
+      out.activeSheet = activeSheet;
+      // The file is shown read-only whatever was asked for, and `setReadOnly` will not change that.
+      if (locked) out.readOnly = true;
+      if (convertedFrom !== undefined) out.convertedFrom = convertedFrom;
+      if (warnings !== undefined) out.warnings = warnings;
+      send(out);
+    };
 
     if (doc) {
-      // A document is shown read-only: `readOnly` and `sheet` mean nothing for it, and it never sends `changed`.
-      const documentOptions: DocumentViewOptions = {
+      let pages: BridgeDocumentView | undefined;
+      const documentOptions: DocumentEditorOptions = {
         package: documentPictures(doc as DocModel, file.package),
+        readOnly: locked || readOnly === true,
+        // A document has no sheets: the message says that it changed and what can be undone.
+        onChange: () => {
+          // Nothing is said for a view that is not there yet or that was closed.
+          if (!pages || !shown || shown.pages !== pages) return;
+          send({ type: 'changed', sheets: [], canUndo: pages.canUndo === true, canRedo: pages.canRedo === true });
+        },
         // The page must not be replaced by what a link points to: the application decides what to do with it.
         onLinkClick: (target) => {
           send({ type: 'link', url: target });
@@ -524,24 +623,18 @@ export function createBridge(host: BridgeHost): Bridge {
         },
       };
       if (locale !== undefined) documentOptions.locale = locale;
+      const create = (toolbar === true && host.createDocumentEditor) || (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>);
       closeShown();
-      let pages: BridgeDocumentView;
       try {
-        pages = (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>)(host.container, doc, documentOptions);
+        pages = create.call(host, host.container, doc, documentOptions);
       } catch (error) {
         setState('error', 'corrupt');
         return fail('corrupt', errorText(error), id);
       }
-      shown = { file, view: undefined, pages, name };
+      shown = { file, view: undefined, pages, name, locked, convertedFrom };
       setLocale(locale);
       setState('open');
-      const answer: Message = { type: 'loaded' };
-      if (id !== undefined) answer.id = id;
-      answer.format = file.format;
-      answer.kind = 'document';
-      answer.sheets = [];
-      answer.activeSheet = 0;
-      send(answer);
+      loaded(0, [], true);
       return;
     }
     if (!workbook) return;
@@ -549,7 +642,7 @@ export function createBridge(host: BridgeHost): Bridge {
     if (sheet !== undefined && sheet >= workbook.sheets.length) return refuse('bad-message', `No sheet with index ${sheet}`);
 
     let view: WorkbookView | undefined;
-    const options: WorkbookViewOptions = {
+    const options: SpreadsheetEditorOptions = {
       onChange: (change) => {
         if (!view) return;
         send({ type: 'changed', sheets: change.sheets, canUndo: view.history.canUndo, canRedo: view.history.canRedo });
@@ -568,28 +661,25 @@ export function createBridge(host: BridgeHost): Bridge {
     };
     if (locale !== undefined) options.locale = locale;
     if (readOnly !== undefined) options.readOnly = readOnly;
-    if (file.format === 'xls') options.readOnly = true;
+    if (locked) options.readOnly = true;
     if (sheet !== undefined) options.sheet = sheet;
 
+    const createSheet = (toolbar === true && host.createEditor) || host.createView;
     closeShown();
     try {
-      view = host.createView(host.container, workbook, options);
+      view = createSheet.call(host, host.container, workbook, options);
     } catch (error) {
       setState('error', 'corrupt');
       return fail('corrupt', errorText(error), id);
     }
-    shown = { file, view, pages: undefined, name };
+    shown = { file, view, pages: undefined, name, locked, convertedFrom };
     setLocale(locale);
     setState('open');
-
-    const out: Message = { type: 'loaded' };
-    if (id !== undefined) out.id = id;
-    out.format = file.format;
-    out.sheets = workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind }));
-    out.activeSheet = view.activeSheet;
-    // The file is shown read-only whatever was asked for, and `setReadOnly` will not change that.
-    if (file.format === 'xls') out.readOnly = true;
-    send(out);
+    loaded(
+      view.activeSheet,
+      workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind })),
+      false,
+    );
   };
 
   const save = async (id: string | undefined) => {
@@ -599,7 +689,14 @@ export function createBridge(host: BridgeHost): Bridge {
     try {
       // A cell that is being edited is written first, as leaving it would do.
       if (current.view && current.view.isEditing) current.view.commitEditing();
-      data = base64Encode(await current.file.save());
+      const pages = current.pages;
+      // A composition still under way belongs to the document that is written.
+      if (pages && pages.commitEditing) pages.commitEditing();
+      const changes = pages ? pages.changeCount : undefined;
+      const bytes = await current.file.save();
+      // A change made while the file was written is not in these bytes.
+      if (pages && pages.markSaved && pages.changeCount === changes) pages.markSaved();
+      data = base64Encode(bytes);
     } catch (error) {
       return fail('save-failed', errorText(error), id);
     }
@@ -607,6 +704,11 @@ export function createBridge(host: BridgeHost): Bridge {
     if (id !== undefined) out.id = id;
     out.data = data;
     if (current.name !== undefined) out.name = current.name;
+    // The application gave another format than it gets back: the message says which.
+    if (current.convertedFrom !== undefined) {
+      out.format = current.file.format;
+      out.convertedFrom = current.convertedFrom;
+    }
     send(out);
   };
 
@@ -635,25 +737,25 @@ export function createBridge(host: BridgeHost): Bridge {
       const locale = type === 'setLocale' ? field<string>(fields, 'locale', 'string', true) : undefined;
       if (!shown) return fail('not-loaded', 'No file is open', id);
       const view = shown.view;
+      const pages = shown.pages;
       /** Set when the command was heard but could not have its effect: the answer says what holds instead. */
       let forced = false;
-      if (!view) {
-        // A document: nothing to edit, so only the language has an effect; the other commands are confirmed as done.
-        if (type === 'setLocale') {
-          if (shown.pages && shown.pages.setLocale) shown.pages.setLocale(locale as string);
-          setLocale(locale);
-        }
-      } else if (type === 'setReadOnly') {
-        // An xls file cannot be written yet, so it stays read-only whatever is asked.
-        forced = shown.file.format === 'xls' && readOnly === false;
-        view.setReadOnly(shown.file.format === 'xls' ? true : (readOnly as boolean));
-      }
-      else if (type === 'setLocale') {
-        view.setLocale(locale as string);
+      if (type === 'setReadOnly') {
+        // A file that cannot be written with changes (doc, RTF, xls) stays read-only whatever is asked.
+        forced = shown.locked && readOnly === false;
+        const value = shown.locked ? true : (readOnly as boolean);
+        if (view) view.setReadOnly(value);
+        else if (pages && pages.setReadOnly) pages.setReadOnly(value);
+      } else if (type === 'setLocale') {
+        if (view) view.setLocale(locale as string);
+        else if (pages && pages.setLocale) pages.setLocale(locale as string);
         setLocale(locale);
-      } else if (type === 'undo') view.undo();
-      else view.redo();
-      // The command is confirmed as before; a request to make an xls file editable also learns that it stays read-only.
+      } else if (type === 'undo') {
+        if (view) view.undo();
+        else if (pages && pages.undo) pages.undo();
+      } else if (view) view.redo();
+      else if (pages && pages.redo) pages.redo();
+      // The command is confirmed as before; a request to make a file editable that cannot be learns that it stays read-only.
       if (forced && id !== undefined) send({ type: 'done', id, command: type, readOnly: true });
       else done(type, id);
     } catch (error) {
@@ -727,6 +829,8 @@ export interface InstallBridgeOptions {
   open: BridgeHost['open'];
   createView: BridgeHost['createView'];
   createDocumentView?: BridgeHost['createDocumentView'];
+  createEditor?: BridgeHost['createEditor'];
+  createDocumentEditor?: BridgeHost['createDocumentEditor'];
   version: string;
   /**
    * Origins that may embed the page in an iframe and drive it with window
@@ -863,6 +967,8 @@ export function installBridge(options: InstallBridgeOptions): Bridge {
     open: options.open,
     createView: options.createView,
     createDocumentView: options.createDocumentView,
+    createEditor: options.createEditor,
+    createDocumentEditor: options.createDocumentEditor,
     version: options.version,
     post,
     baseUrl: win.location.href,

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { base64Decode, base64Encode, createBridge, isAllowedUrl, normalizeOrigin, resolveLoadUrl, type BridgeHost } from '../src/embed/bridge';
-import type { OfficeFile } from '../src/index';
+import { open as openFile, type OfficeFile } from '../src/index';
+import { openConverted } from '../src/formats/convert';
+import { simpleDoc } from './doc-binary-fixtures';
+import { cat, number, workbookStream, xlsFile } from './xls-fixtures';
 import type { WorkbookViewOptions } from '../src/ui/sheet-view';
 
 /** Deterministic bytes that do not repeat with a short period. */
@@ -849,11 +852,11 @@ function withDocument(f: Fake, canShow = true): FakeDocument {
   return state;
 }
 
-test('bridge: a document is shown read-only and answered with loaded', async () => {
+test('bridge: a docx is shown for editing and answered with loaded', async () => {
   const f = fake();
   const d = withDocument(f);
   const bridge = createBridge(f.host);
-  // `readOnly` and `sheet` mean nothing for a document and are not complained about.
+  // `sheet` means nothing for a document and is not complained about.
   await bridge.receive(JSON.stringify({ type: 'load', id: 'd1', data: DATA, name: 'a.docx', locale: 'tr', readOnly: false, sheet: 3 }));
   assert.deepEqual(f.sent[1], { type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
   assert.deepEqual(f.states, ['loading', 'open']);
@@ -862,6 +865,7 @@ test('bridge: a document is shown read-only and answered with loaded', async () 
   assert.equal(d.views[0].container, f.host.container);
   assert.equal(d.views[0].doc, d.model);
   assert.equal(d.views[0].options.locale, 'tr');
+  assert.equal(d.views[0].options.readOnly, false);
   // Pictures are read from the package of the file.
   assert.equal(d.views[0].options.package, d.file.package);
   // The spreadsheet view was never asked for.
@@ -881,7 +885,7 @@ test('bridge: a link in a document is reported to the application and never open
   assert.deepEqual(types(f), ['ready', 'loaded', 'link', 'link']);
 });
 
-test('bridge: save returns the bytes of a document; it never sends changed', async () => {
+test('bridge: save returns the bytes of a document; a document that is not edited never sends changed', async () => {
   const f = fake();
   withDocument(f);
   const bridge = createBridge(f.host);
@@ -895,7 +899,7 @@ test('bridge: save returns the bytes of a document; it never sends changed', asy
   assert.equal(types(f).indexOf('selection'), -1);
 });
 
-test('bridge: commands on a document are confirmed; only the language has an effect', async () => {
+test('bridge: commands on a document view that cannot edit are confirmed; only the language has an effect', async () => {
   const f = fake();
   const d = withDocument(f);
   const bridge = createBridge(f.host);
@@ -1065,4 +1069,442 @@ test('bridge: setReadOnly cannot make an xls file editable; the confirmation say
   await other.receive('{"type":"setReadOnly","readOnly":false,"id":"a"}');
   assert.deepEqual(g.calls, ['view', 'setReadOnly false']);
   assert.deepEqual(g.sent[g.sent.length - 1], { type: 'done', id: 'a', command: 'setReadOnly' });
+});
+
+// --------------------------------------------------------- editing a document
+
+interface EditableDocument extends FakeDocument {
+  /** What the view says about itself; the tests change it as an edit would. */
+  state: { canUndo: boolean; canRedo: boolean; changeCount: number; saved: number };
+  /** The options of the views made with the toolbar. */
+  editors: import('../src/ui/doc-editor').DocumentEditorOptions[];
+}
+
+/** Makes the fake host open a document of `format` in a view that can edit. */
+function withEditableDocument(f: Fake, format = 'docx'): EditableDocument {
+  const d = withDocument(f) as EditableDocument;
+  (d.file as { format: string }).format = format;
+  d.state = { canUndo: false, canRedo: false, changeCount: 0, saved: 0 };
+  d.editors = [];
+  const make = (kind: string) => (container: unknown, doc: unknown, options: any) => {
+    d.calls.push(kind);
+    if (d.viewError) throw d.viewError;
+    if (kind === 'editor') d.editors.push(options);
+    d.views.push({ container, doc, options });
+    return {
+      destroy: () => d.calls.push('destroy'),
+      setLocale: (locale: string) => d.calls.push(`setLocale ${locale}`),
+      setReadOnly: (value: boolean) => d.calls.push(`setReadOnly ${value}`),
+      undo: () => d.calls.push('undo'),
+      redo: () => d.calls.push('redo'),
+      commitEditing: () => d.calls.push('commit'),
+      markSaved: () => d.state.saved++,
+      get canUndo() {
+        return d.state.canUndo;
+      },
+      get canRedo() {
+        return d.state.canRedo;
+      },
+      get changeCount() {
+        return d.state.changeCount;
+      },
+    };
+  };
+  f.host.createDocumentView = make('view');
+  f.host.createDocumentEditor = make('editor');
+  return d;
+}
+
+test('bridge: a change of a document is reported like one of a workbook, with no sheets', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA });
+  assert.deepEqual(f.sent[1], { type: 'loaded', id: 'l', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+  assert.equal(d.views[0].options.readOnly, false);
+  d.state.canUndo = true;
+  d.views[0].options.onChange!();
+  d.state.canUndo = false;
+  d.state.canRedo = true;
+  d.views[0].options.onChange!();
+  assert.deepEqual(f.sent.slice(2), [
+    { type: 'changed', sheets: [], canUndo: true, canRedo: false },
+    { type: 'changed', sheets: [], canUndo: false, canRedo: true },
+  ]);
+  // Without a channel the newest one stands for those that waited.
+  f.channel = false;
+  d.views[0].options.onChange!();
+  d.state.canUndo = true;
+  d.views[0].options.onChange!();
+  f.channel = true;
+  f.runRetries();
+  assert.deepEqual(f.sent.slice(4), [{ type: 'changed', sheets: [], canUndo: true, canRedo: true }]);
+  // After the file was closed a late callback of the view says nothing.
+  await bridge.receive({ type: 'close' });
+  const count = f.sent.length;
+  d.views[0].options.onChange!();
+  assert.equal(f.sent.length, count);
+});
+
+test('bridge: undo, redo and setReadOnly reach a document; readOnly in the load opens it read-only', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, readOnly: true });
+  assert.equal(d.views[0].options.readOnly, true);
+  // A docx says nothing about being read-only: what the load asked for holds, as for an xlsx.
+  assert.equal('readOnly' in f.sent[1], false);
+  await bridge.receive({ type: 'setReadOnly', id: 'a', readOnly: false });
+  await bridge.receive({ type: 'undo', id: 'b' });
+  await bridge.receive({ type: 'redo' });
+  await bridge.receive({ type: 'setReadOnly', readOnly: true });
+  await bridge.receive({ type: 'setLocale', locale: 'tr' });
+  assert.deepEqual(d.calls, ['view', 'setReadOnly false', 'undo', 'redo', 'setReadOnly true', 'setLocale tr']);
+  assert.deepEqual(f.sent.slice(2), [
+    { type: 'done', id: 'a', command: 'setReadOnly' },
+    { type: 'done', id: 'b', command: 'undo' },
+  ]);
+});
+
+test('bridge: saving a document ends a composition first; a change made while it is written is not marked as saved', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, name: 'a.docx' });
+  await bridge.receive({ type: 'save', id: 's1' });
+  assert.deepEqual(d.calls, ['view', 'commit']);
+  assert.deepEqual(f.sent[2], { type: 'saved', id: 's1', data: 'AQID+g==', name: 'a.docx' });
+  assert.equal(d.state.saved, 1);
+
+  // The user types while the file is being written.
+  let release: ((bytes: Uint8Array) => void) | undefined;
+  f.saveResult = () => new Promise<Uint8Array>((resolve) => (release = resolve));
+  const saving = bridge.receive({ type: 'save', id: 's2' });
+  await settle();
+  d.state.changeCount++;
+  release!(new Uint8Array([9]));
+  await saving;
+  assert.equal(f.sent[3].type, 'saved');
+  assert.equal(d.state.saved, 1);
+
+  // A save that fails marks nothing either.
+  f.saveResult = () => Promise.reject(new Error('disk full'));
+  await bridge.receive({ type: 'save', id: 's3' });
+  assert.deepEqual(f.sent[4], { type: 'error', id: 's3', code: 'save-failed', message: 'disk full' });
+  assert.equal(d.state.saved, 1);
+});
+
+test('bridge: doc and RTF stay read-only whatever is asked, and loaded and done say so', async () => {
+  for (const format of ['doc', 'rtf']) {
+    const f = fake();
+    const d = withEditableDocument(f, format);
+    const bridge = createBridge(f.host);
+    await bridge.receive({ type: 'load', id: 'l', data: DATA, readOnly: false });
+    assert.equal(d.views[0].options.readOnly, true, format);
+    assert.deepEqual(f.sent[1], { type: 'loaded', id: 'l', format, kind: 'document', sheets: [], activeSheet: 0, readOnly: true });
+    await bridge.receive({ type: 'setReadOnly', id: 'a', readOnly: false });
+    await bridge.receive({ type: 'setReadOnly', readOnly: false });
+    await bridge.receive({ type: 'setReadOnly', id: 'b', readOnly: true });
+    // The view is told "read-only" every time, never "editable".
+    assert.deepEqual(d.calls, ['view', 'setReadOnly true', 'setReadOnly true', 'setReadOnly true']);
+    assert.deepEqual(f.sent.slice(2), [
+      { type: 'done', id: 'a', command: 'setReadOnly', readOnly: true },
+      { type: 'done', id: 'b', command: 'setReadOnly' },
+    ]);
+  }
+});
+
+// ------------------------------------------------- convert, blank and toolbar
+
+const RTF = new TextEncoder().encode('{\\rtf1\\ansi Hello {\\b rich} text\\par}');
+const docBytes = () => simpleDoc('First paragraph\rSecond paragraph\r').build();
+const xlsBytes = () => xlsFile(workbookStream({ sheets: [{ name: 'Old', records: cat(number(0, 0, 41)) }, { name: 'Chart1', type: 2 }] }));
+
+/** A host that opens files with the engine itself, in fake views that can edit. */
+function real(): { f: Fake; d: EditableDocument; opened: OfficeFile[] } {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const opened: OfficeFile[] = [];
+  f.host.open = async (bytes) => {
+    const file = await openFile(bytes);
+    opened.push(file);
+    return file;
+  };
+  return { f, d, opened };
+}
+
+test('bridge: convert opens doc, RTF and xls for editing as docx and xlsx; loaded and saved name both formats', async () => {
+  for (const [from, bytes, to] of [
+    ['rtf', RTF, 'docx'],
+    ['doc', docBytes(), 'docx'],
+    ['xls', xlsBytes(), 'xlsx'],
+  ] as const) {
+    const { f, d, opened } = real();
+    const bridge = createBridge(f.host);
+    await bridge.receive({ type: 'load', id: 'l', data: base64Encode(bytes), name: `old.${from}`, convert: true });
+    const loaded = f.sent[1];
+    assert.equal(loaded.type, 'loaded', `${from}: ${JSON.stringify(loaded)}`);
+    assert.equal(loaded.format, to, from);
+    assert.equal(loaded.convertedFrom, from);
+    assert.equal('readOnly' in loaded, false, from);
+    assert.ok(Array.isArray(loaded.warnings), from);
+    for (const warning of loaded.warnings) assert.equal(typeof warning, 'string');
+    // The file given and the file made from it.
+    assert.deepEqual(opened.map((file) => file.format), [from, to]);
+    if (to === 'docx') {
+      assert.equal(loaded.kind, 'document');
+      assert.equal(d.views[0].options.readOnly, false, from);
+      assert.deepEqual(loaded.warnings, [], from);
+    } else {
+      assert.deepEqual(loaded.sheets.map((sheet: { name: string }) => sheet.name), ['Old', 'Chart1']);
+      assert.equal(f.views[0].readOnly, undefined);
+      // The chart sheet is not in the model.
+      assert.equal(loaded.warnings.length, 1);
+      assert.match(loaded.warnings[0], /chart sheet/);
+    }
+    // It can be made read-only and editable again like any docx or xlsx.
+    await bridge.receive({ type: 'setReadOnly', id: 'r', readOnly: false });
+    assert.deepEqual(f.sent[2], { type: 'done', id: 'r', command: 'setReadOnly' });
+
+    await bridge.receive({ type: 'save', id: 's' });
+    const saved = f.sent[3];
+    assert.deepEqual({ ...saved, data: '' }, { type: 'saved', id: 's', data: '', name: `old.${from}`, format: to, convertedFrom: from });
+    assert.equal((await openFile(base64Decode(saved.data))).format, to);
+  }
+});
+
+test('bridge: convert does nothing for a read-only load and for files that need no conversion', async () => {
+  const { f, d, opened } = real();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'a', data: base64Encode(RTF), convert: true, readOnly: true });
+  assert.deepEqual(f.sent[1], { type: 'loaded', id: 'a', format: 'rtf', kind: 'document', sheets: [], activeSheet: 0, readOnly: true });
+  assert.equal(d.views[0].options.readOnly, true);
+  await bridge.receive({ type: 'load', id: 'b', data: base64Encode(RTF), convert: false });
+  assert.equal(f.sent[2].format, 'rtf');
+  await bridge.receive({ type: 'load', id: 'c', data: base64Encode(RTF) });
+  assert.equal(f.sent[3].format, 'rtf');
+  await bridge.receive({ type: 'save', id: 's' });
+  // The file as it came, and a message without the fields of a conversion.
+  assert.deepEqual(f.sent[4], { type: 'saved', id: 's', data: base64Encode(RTF) });
+
+  await bridge.receive({ type: 'load', id: 'd', blank: 'docx', convert: true });
+  assert.deepEqual(f.sent[5], { type: 'loaded', id: 'd', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+  assert.deepEqual(opened.map((file) => file.format), ['rtf', 'rtf', 'rtf', 'docx']);
+});
+
+test('bridge: a file that cannot be converted is shown as it is, read-only, and loaded says why', async () => {
+  const { f, d } = real();
+  const open = f.host.open;
+  let calls = 0;
+  f.host.open = (bytes) => (++calls === 2 ? Promise.reject(new Error('no room')) : open(bytes));
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: base64Encode(RTF), convert: true });
+  assert.deepEqual(f.sent[1], {
+    type: 'loaded',
+    id: 'l',
+    format: 'rtf',
+    kind: 'document',
+    sheets: [],
+    activeSheet: 0,
+    readOnly: true,
+    warnings: ['The file could not be converted and is shown read-only: no room'],
+  });
+  assert.equal(d.views[0].options.readOnly, true);
+  await bridge.receive({ type: 'setReadOnly', id: 'r', readOnly: false });
+  assert.deepEqual(f.sent[2], { type: 'done', id: 'r', command: 'setReadOnly', readOnly: true });
+  assert.deepEqual(f.states, ['loading', 'open']);
+});
+
+test('openConverted: converts what needs it, passes on what does not, and falls back when the new file cannot be read', async () => {
+  const docx = await openFile(await (await openFile(RTF)).saveAsDocx!());
+  assert.deepEqual(await openConverted(docx, openFile), { file: docx });
+
+  const rtf = await openFile(RTF);
+  const converted = await openConverted(rtf, openFile);
+  assert.equal(converted.file.format, 'docx');
+  assert.deepEqual(converted.conversion, { from: 'rtf', to: 'docx', warnings: [] });
+  assert.equal(converted.failed, undefined);
+
+  // The new file opens as something else, or its model cannot be read.
+  const wrong = await openConverted(rtf, async () => rtf);
+  assert.deepEqual(wrong, { file: rtf, failed: 'The converted file is not a docx file' });
+  const unreadable = await openConverted(rtf, async (bytes) => {
+    const file = await openFile(bytes);
+    return { ...file, document: () => Promise.reject(new Error('Invalid XML')) };
+  });
+  assert.deepEqual(unreadable, { file: rtf, failed: 'Invalid XML' });
+
+  // A file whose own model cannot be read is not something to fall back to.
+  const broken = { ...rtf, document: () => Promise.reject(new Error('Invalid RTF')) };
+  await assert.rejects(openConverted(broken, openFile), /Invalid RTF/);
+});
+
+test('bridge: a conversion that is overtaken shows nothing and answers its id', async () => {
+  const { f, d } = real();
+  const open = f.host.open;
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let calls = 0;
+  let reached: (() => void) | undefined;
+  const second = new Promise<void>((resolve) => (reached = resolve));
+  // The converted file is being opened when the application closes.
+  f.host.open = async (bytes) => {
+    if (++calls === 2) {
+      reached!();
+      await held;
+    }
+    return open(bytes);
+  };
+  const bridge = createBridge(f.host);
+  const first = bridge.receive({ type: 'load', id: 'slow', data: base64Encode(RTF), convert: true });
+  await second;
+  await bridge.receive({ type: 'close', id: 'c' });
+  release!();
+  await first;
+  assert.deepEqual(d.calls, []);
+  assert.deepEqual(
+    f.sent.slice(1).map((message) => [message.type, message.id, message.code]),
+    [
+      ['done', 'c', undefined],
+      ['error', 'slow', 'load-failed'],
+    ],
+  );
+  assert.deepEqual(f.states, ['loading', 'empty']);
+});
+
+test('bridge: blank starts with a new, empty docx or xlsx in the language of the load', async () => {
+  const { f, d, opened } = real();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'x', blank: 'xlsx', locale: 'tr', name: 'yeni.xlsx' });
+  assert.deepEqual(f.sent[1], { type: 'loaded', id: 'x', format: 'xlsx', sheets: [{ name: 'Sayfa1', state: 'visible', kind: 'worksheet' }], activeSheet: 0 });
+  assert.equal(f.views[0].locale, 'tr');
+  assert.equal(f.fetches.length, 0);
+  await bridge.receive({ type: 'load', id: 'e', blank: 'xlsx' });
+  assert.equal(f.sent[2].sheets[0].name, 'Sheet1');
+
+  await bridge.receive({ type: 'load', id: 'w', blank: 'docx' });
+  assert.deepEqual(f.sent[3], { type: 'loaded', id: 'w', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+  assert.equal(d.views[0].options.readOnly, false);
+  await bridge.receive({ type: 'load', blank: 'docx', readOnly: true });
+  assert.equal(d.views[1].options.readOnly, true);
+  assert.deepEqual(opened.map((file) => file.format), ['xlsx', 'xlsx', 'docx', 'docx']);
+  // The new file is saved like any other.
+  await bridge.receive({ type: 'save', id: 's' });
+  assert.equal((await openFile(base64Decode(f.sent[f.sent.length - 1].data))).format, 'docx');
+});
+
+test('bridge: a blank load that is overtaken shows nothing', async () => {
+  const { f } = real();
+  const bridge = createBridge(f.host);
+  const first = bridge.receive({ type: 'load', id: 'one', blank: 'xlsx' });
+  const second = bridge.receive({ type: 'load', id: 'two', blank: 'xlsx' });
+  await Promise.all([first, second]);
+  assert.deepEqual(
+    f.sent.slice(1).map((message) => [message.type, message.id, message.code]),
+    [
+      ['error', 'one', 'load-failed'],
+      ['loaded', 'two', undefined],
+    ],
+  );
+  assert.deepEqual(f.calls, ['view']);
+});
+
+test('bridge: the new fields of load are checked; exactly one of data, url and blank is needed', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  const bad = [
+    { type: 'load', blank: 'pdf' },
+    { type: 'load', blank: '' },
+    { type: 'load', blank: 5 },
+    { type: 'load', blank: true },
+    { type: 'load', blank: 'docx', data: DATA },
+    { type: 'load', blank: 'xlsx', url: 'a.xlsx' },
+    { type: 'load', blank: 'xlsx', url: 'a.xlsx', data: DATA },
+    { type: 'load', data: DATA, convert: 'yes' },
+    { type: 'load', data: DATA, convert: 1 },
+    { type: 'load', data: DATA, toolbar: 'true' },
+    { type: 'load', data: DATA, toolbar: 0 },
+    { type: 'load', data: DATA, toolbar: {} },
+  ];
+  for (const message of bad) await bridge.receive(message);
+  assert.equal(f.sent.length, bad.length + 1);
+  for (let i = 0; i < bad.length; i++) assert.equal(f.sent[i + 1].code, 'bad-message', JSON.stringify(bad[i]));
+  assert.equal(f.sent[1].message, '"blank" must be "docx" or "xlsx"');
+  assert.equal(f.sent[5].message, '"load" needs exactly one of "data", "url" and "blank"');
+  assert.equal(f.sent[8].message, '"convert" must be a boolean');
+  assert.equal(f.opened.length, 0);
+  assert.deepEqual(f.states, []);
+  // null counts as "not given", as for every other optional field.
+  await bridge.receive({ type: 'load', data: DATA, blank: null, convert: null, toolbar: null });
+  assert.equal(f.sent[f.sent.length - 1].type, 'loaded');
+});
+
+test('bridge: toolbar chooses the editor with its shell; without it, or on a host without one, the plain view is used', async () => {
+  const f = fake();
+  const editors: WorkbookViewOptions[] = [];
+  const createView = f.host.createView;
+  f.host.createEditor = (container, workbook, options) => {
+    editors.push(options);
+    f.calls.push('editor');
+    return createView(container, workbook, options);
+  };
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'load', data: DATA, toolbar: false });
+  assert.deepEqual(f.calls.filter((call) => call !== 'destroy'), ['view', 'view']);
+  await bridge.receive({ type: 'load', id: 't', data: DATA, toolbar: true, locale: 'tr', readOnly: true, sheet: 1 });
+  assert.deepEqual(f.calls.filter((call) => call !== 'destroy'), ['view', 'view', 'editor', 'view']);
+  assert.equal(editors.length, 1);
+  assert.deepEqual([editors[0].locale, editors[0].readOnly, editors[0].sheet], ['tr', true, 1]);
+  // The answer and the messages are the same in both modes.
+  assert.deepEqual(f.sent[3], { type: 'loaded', id: 't', format: 'xlsx', sheets: f.sent[1].sheets, activeSheet: 1 });
+  f.history.canUndo = true;
+  editors[0].onChange!({ sheets: [1] });
+  assert.deepEqual(f.sent[4], { type: 'changed', sheets: [1], canUndo: true, canRedo: false });
+  await bridge.receive({ type: 'undo', id: 'u' });
+  assert.equal(f.calls[f.calls.length - 1], 'undo');
+
+  // Documents.
+  const d = withEditableDocument(f);
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'load', data: DATA, toolbar: true });
+  assert.deepEqual(d.calls.filter((call) => call !== 'destroy'), ['view', 'editor']);
+  d.state.canUndo = true;
+  d.editors[0].onChange!();
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'changed', sheets: [], canUndo: true, canRedo: false });
+  await bridge.receive({ type: 'redo' });
+  assert.equal(d.calls[d.calls.length - 1], 'redo');
+
+  // A host that only has the plain views shows them, whatever is asked.
+  const g = fake();
+  const e = withDocument(g);
+  const plain = createBridge(g.host);
+  await plain.receive({ type: 'load', data: DATA, toolbar: true });
+  assert.deepEqual(e.calls, ['view']);
+  const h = fake();
+  await createBridge(h.host).receive({ type: 'load', data: DATA, toolbar: true });
+  assert.deepEqual(h.calls, ['view']);
+});
+
+test('review: a change waiting for a channel is not joined with the change of the next file', async () => {
+  const { f, d } = real();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'x', blank: 'xlsx' });
+  f.channel = false;
+  f.views[0].onChange!({ sheets: [0] });
+  await bridge.receive({ type: 'load', id: 'w', blank: 'docx' });
+  d.views[0].options.onChange!();
+  d.views[0].options.onChange!();
+  f.channel = true;
+  f.runRetries();
+  const late = f.sent.slice(2);
+  // The workbook's change, then the document: its changes name no sheet, and the two of them are one.
+  assert.deepEqual(
+    late.map((m) => [m.type, JSON.stringify(m.sheets)]),
+    [
+      ['changed', '[0]'],
+      ['loaded', '[]'],
+      ['changed', '[]'],
+    ],
+  );
 });
