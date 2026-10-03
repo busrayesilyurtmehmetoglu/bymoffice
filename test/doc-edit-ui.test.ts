@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DocLayout } from '../src/layout/doc/layout';
 import type { LayoutPage, LineMark } from '../src/layout/doc/types';
-import type { DocModel } from '../src/model/doc/types';
+import { paragraphText, type DocModel } from '../src/model/doc/types';
+import { applyDocOps, deleteRange, expandRangeForTables, orderRange, type DocPosition } from '../src/ops/doc/index';
 import { DocLines } from '../src/ui/doc-caret';
-import { hasCopyMark, sliceHtml, sliceOf } from '../src/ui/doc-clipboard';
+import { hasCopyMark, sliceHtml, cutLoses, sliceOf } from '../src/ui/doc-clipboard';
 import { DocInput, type InputChange, type InputContext, type InputHost } from '../src/ui/doc-input';
 import { fakeMeasurer, p, r, sectPr, STYLES, tbl, tc, tr, words } from './doc-layout-fixtures';
 import { readSpec } from './docx-fixtures';
@@ -356,4 +357,109 @@ test('a picture in a line: the mark knows where it is; a caret before it is on i
   const text = lines.hit(0, 40 + 60, 50)!;
   assert.deepEqual([text.place.offset, text.box], [2, undefined]);
   assert.equal(lines.hit(0, 40 + 76, 50)!.place.offset, 4);
+});
+
+const INLINE_PICTURE =
+  '<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="381000" cy="152400"/><wp:docPr id="1" name="P"/>' +
+  '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="x"/><pic:cNvPicPr/></pic:nvPicPr>' +
+  '<pic:blipFill><a:blip r:embed="rIdNone"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
+
+test('review: a cut is judged by what the deletion takes out of the document and the copy does not hold', async () => {
+  const at = (path: number[], offset: number, before?: boolean): DocPosition => (before ? { story: 'body', path, offset, before: true } : { story: 'body', path, offset });
+  const FIELD = '<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>' + r('7') + '<w:r><w:fldChar w:fldCharType="end"/></w:r>';
+  const doc = await readSpec({
+    styles: STYLES,
+    body:
+      p(r('ab') + INLINE_PICTURE + r('cd')) + // 0
+      p(r('note') + '<w:r><w:footnoteReference w:id="2"/></w:r>' + r(' after')) + // 1
+      p(r('page ') + FIELD + r(' of')) + // 2
+      p('plain text') + // 3
+      tbl(tr(tc('A1') + tc('B1')), [1200, 1200]) + // 4
+      p('end') + // 5
+      p(r('ab') + '<w:hyperlink r:id="rIdNone">' + r('link') + '</w:hyperlink>' + r('cd')) + // 6
+      p(r('ab') + '<w:fldSimple w:instr=" AUTHOR ">' + r('name') + '</w:fldSimple>' + r('cd')) + // 7
+      p(r('ab') + '<w:sdt><w:sdtPr/><w:sdtContent>' + r('ctl') + '</w:sdtContent></w:sdt>' + r('cd')) + // 8
+      p(r('ab') + '<w:ins w:id="1" w:author="a">' + r('ins') + '</w:ins>' + r('cd')) + // 9
+      p('<w:r><w:t>ab</w:t><w:softHyphen/><w:t>c</w:t><w:br w:type="page"/><w:t>d</w:t><w:tab/><w:t>e</w:t><w:br/><w:t>f</w:t></w:r>') + // 10
+      p(r('ab') + '<w:bookmarkStart w:id="5" w:name="mark"/>' + INLINE_PICTURE + '<w:bookmarkEnd w:id="5"/>' + r('cd')) + // 11
+      p(r('abc') + '<w:r><w:commentReference w:id="9"/></w:r>' + r('def')) + // 12
+      p(FIELD + r(' starts with a field')) + // 13
+      sectPr(),
+    footnotes: '<w:footnote w:id="2"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t> the note</w:t></w:r></w:p></w:footnote>',
+  });
+  const picture = JSON.stringify(doc.body.blocks);
+  const loses = (start: DocPosition, end: DocPosition, label: string): boolean => {
+    const result = cutLoses(doc, { anchor: start, focus: end }, sliceOf(doc, start, end));
+    // The document is as it was: the deletion that was tried is taken back.
+    assert.equal(JSON.stringify(doc.body.blocks), picture, label);
+    return result;
+  };
+  const kept = (start: DocPosition, end: DocPosition, label: string) => assert.equal(loses(start, end, label), false, label);
+  const lost = (start: DocPosition, end: DocPosition, label: string) => assert.equal(loses(start, end, label), true, label);
+  // Text alone is carried whole, also with a tab and a line break in it, and across paragraphs.
+  kept(at([3], 0), at([3], 10), 'text');
+  kept(at([3], 2), at([5], 0), 'paragraphs');
+  kept(at([10], 4), at([10], 8), 'a tab and a line break');
+  kept(at([0], 0), at([0], 2, true), 'up to the picture');
+  kept(at([0], 2), at([0], 4), 'from after the picture');
+  // A picture, alone as a press on it selects it or among text.
+  lost(at([0], 1), at([0], 3), 'a picture among text');
+  lost(at([0], 2, true), at([0], 2), 'a picture alone');
+  lost(at([0], 0), at([0], 2), 'to after the picture');
+  lost(at([0], 2, true), at([0], 4), 'from before the picture');
+  // A bookmark before the picture does not hide it from a range that begins there.
+  lost(at([11], 2), at([11], 4), 'a picture behind the start of a bookmark');
+  // A note reference, a field, and anything of them in a paragraph in between.
+  lost(at([1], 2), at([1], 6), 'a note reference');
+  kept(at([1], 0), at([1], 3), 'text before a note reference');
+  lost(at([2], 3), at([2], 8), 'a field');
+  lost(at([0], 3), at([3], 2), 'paragraphs with more than text');
+  // What a deletion leaves where it is can be cut around: a field the range ends before, a comment reference.
+  kept(at([2], 0), at([2], 5), 'text up to a field');
+  kept(at([12], 0), at([13], 0), 'to the start of a paragraph that begins with a field');
+  kept(at([12], 1), at([12], 5), 'text around a comment reference');
+  // Text that is more than its characters: a link, a simple field, a content control, a tracked insertion; a page break, a soft hyphen.
+  lost(at([6], 1), at([6], 7), 'a link');
+  lost(at([6], 3), at([6], 5), 'part of a link');
+  lost(at([7], 1), at([7], 7), 'a simple field');
+  lost(at([8], 1), at([8], 6), 'a content control');
+  lost(at([9], 1), at([9], 6), 'a tracked insertion');
+  lost(at([10], 1), at([10], 3), 'a soft hyphen');
+  lost(at([10], 3), at([10], 5), 'a page break');
+  // Without a copy with formatting only the plain text is on the clipboard: the same rules.
+  assert.equal(cutLoses(doc, { anchor: at([3], 0), focus: at([3], 4) }, undefined), false);
+  assert.equal(cutLoses(doc, { anchor: at([0], 1), focus: at([0], 3) }, undefined), true);
+  // A copy that does not hold what the deletion removes (the ends of the two do not agree).
+  assert.equal(cutLoses(doc, { anchor: at([3], 0), focus: at([3], 6) }, sliceOf(doc, at([3], 0), at([3], 4))), true);
+  // A range that is not one of the document is an error, as for every command.
+  assert.throws(() => cutLoses(doc, { anchor: at([3], 0), focus: at([40], 0) }, undefined), RangeError);
+});
+
+test('review: the copy of a selection that goes into a table holds the whole cells a cut removes', async () => {
+  const doc = await readSpec({ styles: STYLES, body: p('Before') + tbl(tr(tc('A1') + tc('B1')) + tr(tc('A2') + tc('B2')), [1200, 1200]) + p('After') + sectPr() });
+  const selection = { anchor: { story: 'body', path: [0], offset: 3 }, focus: { story: 'body', path: [1, 1, 0, 0], offset: 1 } };
+  const shown = orderRange(expandRangeForTables(doc, selection));
+  const slice = sliceOf(doc, shown.start, shown.end)!;
+  const copied = slice.paragraphs.map((paragraph) => paragraph.runs.map((run) => run.text).join(''));
+  // What the deletion takes out of the document is what the copy holds, to the last letter.
+  const before = ['Before', 'A1', 'B1', 'A2', 'B2', 'After'];
+  applyDocOps(doc, deleteRange(doc, selection).ops);
+  const after: string[] = [];
+  for (const block of doc.body.blocks) {
+    if (block.type === 'paragraph') after.push(paragraphText(block));
+    else if (block.type === 'table') for (const row of block.rows) for (const cell of row.cells) for (const inner of cell.blocks) if (inner.type === 'paragraph') after.push(paragraphText(inner));
+  }
+  assert.deepEqual(after, ['Bef', '', '', '', 'B2', 'After']);
+  const removed = before.join('').length - after.join('').length;
+  assert.equal(copied.join('').length, removed, JSON.stringify([copied, after]));
+  assert.deepEqual(copied, ['ore', 'A1', 'B1', 'A2']);
+});
+
+test('review: a carriage return in the text around the caret is mirrored as a space, never read back as the end of a paragraph', () => {
+  const { field, changes, edit } = harness({ before: 'ab\rcd', after: 'x\ry', selected: '', atStart: false, atEnd: false });
+  // A real field hands a carriage return back as a line feed: the mirror must hold nothing a field changes.
+  assert.equal(field.value, 'ab cdx y');
+  assert.equal(field.selectionStart, 5);
+  edit(5, 5, 'k');
+  assert.deepEqual(changes[0][0], { removeBefore: 0, removeAfter: 0, replaceSelection: false, text: 'k', caretBack: 0, composing: 0 });
 });

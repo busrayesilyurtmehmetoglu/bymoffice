@@ -268,7 +268,7 @@ export interface MountedDocument {
   view: DocumentView;
   /** The editor around the pages: the formatting toolbar. */
   editor: DocumentEditor;
-  /** The file as bytes; a document cannot be changed yet, so these are the bytes it was opened from. */
+  /** The file as bytes: a docx with the changes made in the editor; doc and RTF, which are read-only, as the bytes they were opened from. */
   save(): Promise<Uint8Array>;
   /** Removes the view from the container. */
   destroy(): void;
@@ -322,8 +322,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     save = async () => {
       // A composition still under way belongs to the document that is written.
       view.commitEditing();
+      const changes = view.changeCount;
       const bytes = await file.save();
-      view.markSaved();
+      // A change made while the file was written is not in these bytes.
+      if (view.changeCount === changes) view.markSaved();
       return bytes;
     };
     container.addEventListener('keydown', onKeyDown);

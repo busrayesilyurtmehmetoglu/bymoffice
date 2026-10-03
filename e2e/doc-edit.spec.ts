@@ -1120,6 +1120,190 @@ test.describe('document editor: pictures and tables in the selection', () => {
   });
 });
 
+test.describe('review: what a cut removes is what a paste brings back', () => {
+  const items = (page: Page) =>
+    page.evaluate(() =>
+      (window as any).__view.document.body.blocks[0].children
+        .flatMap((inline: any) => (inline.content || []).map((item: any) => (item.type === 'text' ? item.text : `<${item.type}>`)))
+        .join(''),
+    );
+  const notices = (page: Page) => page.evaluate(() => (window as any).__notices.map((n: any) => n.message) as string[]);
+  const withPicture = () => sample(p(r('ab') + picture(120, 60) + r('cd')) + p('next'), { rels: [['rIdImg', 'image', 'media/image1.png']], parts: [['word/media/image1.png', png(40, 20, RED, BLUE)]] });
+
+  test('a cut of a selection that goes into a table is pasted back whole', async ({ page }) => {
+    await mountEdit(page, await sample(p('Before') + tbl(tr(tc('A1') + tc('B1')) + tr(tc('A2') + tc('B2')), [3000, 3000]) + p('After')));
+    await laidOut(page);
+    await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 3 }, focus: { story: 'body', path: [1, 1, 0, 0], offset: 1 } }));
+    const cut = await clipboardEvent(page, 'cut');
+    expect(cut.text).toBe('ore\nA1\tB1\nA2');
+    expect(await paragraphs(page)).toEqual(['Bef', '\t', '\tB2', 'After']);
+    // The copy the editor kept is what went out of the document: no letter of the cells is missing from it.
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [2], offset: 0 }));
+    await clipboardEvent(page, 'paste', { text: cut.text, html: cut.html });
+    const text = (await paragraphs(page)).join('|');
+    expect(text).toContain('ore|A1|B1|A2After');
+    // One step back and the cut is undone as well.
+    await page.evaluate(() => {
+      (window as any).__view.undo();
+      (window as any).__view.undo();
+    });
+    expect(await paragraphs(page)).toEqual(['Before', 'A1\tB1', 'A2\tB2', 'After']);
+  });
+
+  test('a cut of a picture, alone or among text, leaves it in place and says so; the clipboard is not touched', async ({ page }) => {
+    await mountEdit(page, await withPicture());
+    await laidOut(page);
+    // The picture alone, as a press on it selects it.
+    await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 2, before: true }, focus: { story: 'body', path: [0], offset: 2 } }));
+    let cut = await clipboardEvent(page, 'cut', { text: 'what was there' });
+    expect(cut.prevented).toBe(true);
+    expect(cut.text).toBe('what was there');
+    expect(await items(page)).toBe('ab<drawing>cd');
+    expect(await notices(page)).toContain('The selection holds something that cannot be cut (a picture, a note, a field, a link); it was left in place');
+    // Text with the picture in it.
+    await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 1 }, focus: { story: 'body', path: [1], offset: 2 } }));
+    cut = await clipboardEvent(page, 'cut', { text: 'what was there' });
+    expect(cut.text).toBe('what was there');
+    expect(await items(page)).toBe('ab<drawing>cd');
+    expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
+    // Text beside it is cut as ever.
+    await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 2 }, focus: { story: 'body', path: [0], offset: 4 } }));
+    cut = await clipboardEvent(page, 'cut');
+    expect(cut.text).toBe('cd');
+    expect(await items(page)).toBe('ab<drawing>');
+  });
+
+  test('a cut without a clipboard to write removes nothing', async ({ page }) => {
+    await mountEdit(page, await threeParagraphs());
+    await laidOut(page);
+    await clickAt(page, [0], 0);
+    for (let i = 0; i < 6; i++) await page.keyboard.press('Shift+ArrowRight');
+    const before = await paragraphs(page);
+    await page.evaluate(() => {
+      const field = document.querySelector('#host .bym-doc-input')!;
+      field.dispatchEvent(new Event('cut', { bubbles: true, cancelable: true }));
+    });
+    expect(await paragraphs(page)).toEqual(before);
+    expect(await notices(page)).toContain('The clipboard cannot be written here; nothing was cut');
+  });
+
+  test('a cut of a link, whole or in part, leaves it in place', async ({ page }) => {
+    await mountEdit(page, await sample(p(r('ab') + '<w:hyperlink r:id="rIdLink">' + r('link') + '</w:hyperlink>' + r('cd')) + p('next'), { rels: [['rIdLink', 'hyperlink', 'https://example.com/', 'External']] }));
+    await laidOut(page);
+    for (const [from, to] of [[1, 7], [3, 5]]) {
+      await page.evaluate(([a, b]) => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: a }, focus: { story: 'body', path: [0], offset: b } }), [from, to]);
+      const cut = await clipboardEvent(page, 'cut', { text: 'what was there' });
+      expect(cut.text).toBe('what was there');
+    }
+    expect((await paragraphs(page))[0]).toBe('ablinkcd');
+    expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
+    // Copying it is not held back.
+    expect((await clipboardEvent(page, 'copy')).text).toBe('in');
+  });
+
+  test('a picture at the start or the end of a paragraph: the deletion that comes through the field takes the picture and joins nothing', async ({ page }) => {
+    const rels = { rels: [['rIdImg', 'image', 'media/image1.png']] as [string, string, string][], parts: [['word/media/image1.png', png(40, 20, RED, BLUE)]] as [string, Uint8Array][] };
+    await mountEdit(page, await sample(p('prev') + p(picture(120, 60) + r('cd')) + p(r('ab') + picture(120, 60)) + p('next'), rels));
+    await laidOut(page);
+    await clickAt(page, [0], 0);
+    // After the picture at the very start: the Backspace takes the line end out of the field.
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [1], offset: 0 }));
+    await page.evaluate(() => {
+      const field = document.querySelector('#host .bym-doc-input') as HTMLTextAreaElement;
+      const at = field.selectionStart;
+      field.setRangeText('', at - 1, at, 'end');
+      field.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+    });
+    expect(await paragraphs(page)).toEqual(['prev', 'cd', 'ab', 'next']);
+    // Before the picture at the very end: a Delete of the same kind.
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [2], offset: 2, before: true }));
+    await page.evaluate(() => {
+      const field = document.querySelector('#host .bym-doc-input') as HTMLTextAreaElement;
+      const at = field.selectionStart;
+      field.setRangeText('', at, at + 1, 'end');
+      field.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentForward', bubbles: true }));
+    });
+    expect(await paragraphs(page)).toEqual(['prev', 'cd', 'ab', 'next']);
+    const drawings = await page.evaluate(() => JSON.stringify((window as any).__view.document.body.blocks).split('"type":"drawing"').length - 1);
+    expect(drawings).toBe(0);
+  });
+
+  test('beside a picture, a deletion and a composition that come through the field do what the keys do', async ({ page }) => {
+    await mountEdit(page, await withPicture());
+    await laidOut(page);
+    // The caret after the picture: a Backspace that cannot be cancelled removes the picture, not the letter before it.
+    await clickAt(page, [1], 0);
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [0], offset: 2 }));
+    await page.evaluate(() => {
+      const field = document.querySelector('#host .bym-doc-input') as HTMLTextAreaElement;
+      const at = field.selectionStart;
+      field.setRangeText('', at - 1, at, 'end');
+      field.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+    });
+    expect(await items(page)).toBe('abcd');
+    await page.evaluate(() => (window as any).__view.undo());
+    expect(await items(page)).toBe('ab<drawing>cd');
+    // Before the picture, a Delete of the same kind.
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [0], offset: 2, before: true }));
+    await page.evaluate(() => {
+      const field = document.querySelector('#host .bym-doc-input') as HTMLTextAreaElement;
+      const at = field.selectionStart;
+      field.setRangeText('', at, at + 1, 'end');
+      field.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentForward', bubbles: true }));
+    });
+    expect(await items(page)).toBe('abcd');
+    await page.evaluate(() => (window as any).__view.undo());
+    // A composition before the picture stays before it when its text is replaced.
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [0], offset: 2, before: true }));
+    await compose(page, ['k', 'か'], 'か');
+    expect(await items(page)).toBe('abか<drawing>cd');
+    expect((await selection(page))!.focus).toEqual({ story: 'body', path: [0], offset: 3, before: true });
+  });
+
+  test('a paragraph with a carriage return in its text is not split by a keyboard that composes', async ({ page }) => {
+    await mountEdit(page, await sample('<w:p><w:r><w:t>ab&#13;cd</w:t></w:r></w:p>' + p('next')));
+    await laidOut(page);
+    const count = (await paragraphs(page)).length;
+    await clickAt(page, [1], 0);
+    await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [0], offset: 5 }));
+    await compose(page, ['k'], 'k', true);
+    const text = await page.evaluate(() => (window as any).BymOffice.paragraphText((window as any).__view.document.body.blocks[0]));
+    expect(text).toBe('ab\rcdk');
+    expect((await paragraphs(page)).length).toBe(count);
+  });
+
+  test('making the whole of a long document bold does not lay it all out in one go, and ends with the right pages', async ({ page }) => {
+    let body = '';
+    for (let i = 0; i < 1500; i++) body += p(`${i} ${SENTENCE}${SENTENCE}`);
+    await mountEdit(page, await sample(body));
+    await laidOut(page);
+    const pages = await page.evaluate(() => (window as any).__view.pageCount as number);
+    await clickAt(page, [0], 0);
+    const result = await page.evaluate(() => {
+      const view = (window as any).__view;
+      view.selectAll();
+      // What the view asks of the layout engine: a limit of time, so that the pages come in slices as when the document was opened.
+      const engine = view.engine;
+      const edited = engine.edited.bind(engine);
+      const budgets: unknown[] = [];
+      engine.edited = (budget: unknown) => {
+        budgets.push(budget);
+        return edited(budget);
+      };
+      const started = performance.now();
+      view.format({ bold: true });
+      return { ms: performance.now() - started, budgets };
+    });
+    expect(result.budgets.length).toBe(1);
+    expect((result.budgets[0] as { milliseconds: number }).milliseconds).toBeGreaterThan(0);
+    expect((result.budgets[0] as { milliseconds: number }).milliseconds).toBeLessThanOrEqual(200);
+    expect(result.ms).toBeLessThan(1500);
+    await laidOut(page);
+    expect(await page.evaluate(() => (window as any).__view.pageCount)).toBeGreaterThanOrEqual(pages);
+    expect(await page.evaluate(() => (window as any).__view.document.body.blocks.every((block: any) => block.type !== 'paragraph' || block.children.every((inline: any) => inline.type !== 'run' || (inline.props && inline.props.bold === true))))).toBe(true);
+  });
+});
+
 test.describe('document editor: focus, stories and places that cannot be edited', () => {
   test('Tab types in the editor; after Escape it leaves it, and that is announced', async ({ page }) => {
     await mountEdit(page, await threeParagraphs());
@@ -1502,5 +1686,29 @@ test.describe('saving an edited docx', () => {
       return { modified, afterSave, text: api.paragraphText(doc.body.blocks[0]) };
     });
     expect(result).toEqual({ modified: true, afterSave: false, text: 'Hello First paragraph' });
+  });
+
+  test('review: a change made while the file is being written is not taken as saved', async ({ page }) => {
+    await page.goto('/e2e/pages/doc-edit.html');
+    const result = await page.evaluate(async () => {
+      const api = (window as any).BymOffice;
+      const source = await api.open(new TextEncoder().encode('{\\rtf1\\ansi First paragraph\\par}'));
+      const host = document.createElement('div');
+      host.style.height = '400px';
+      document.body.appendChild(host);
+      const mounted = await api.mount(host, { file: await source.saveAsDocx() });
+      mounted.view.setSelection({ story: 'body', path: [0], offset: 0 });
+      mounted.view.insertText('Hello ');
+      const writing = mounted.save();
+      mounted.view.insertText('again ');
+      await writing;
+      const duringSave = mounted.view.isModified;
+      await mounted.save();
+      const afterSave = mounted.view.isModified;
+      mounted.destroy();
+      host.remove();
+      return { duringSave, afterSave };
+    });
+    expect(result).toEqual({ duringSave: true, afterSave: false });
   });
 });

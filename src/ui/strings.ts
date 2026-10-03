@@ -96,6 +96,8 @@ export interface UiStrings {
   /** Label of the field that takes what is typed. */
   documentEditor: string;
   cannotEditHere: string;
+  cannotCutObjects: string;
+  cannotWriteClipboard: string;
   /** Said after Escape: the next Tab moves the focus out of the editor instead of typing a tab. */
   tabLeaves: string;
   documentPasteTooLarge: string;
@@ -184,6 +186,8 @@ export const STRINGS_EN: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Chart' : kind === 'diagram' ? 'Diagram' : kind === 'object' ? 'Embedded object' : kind === 'picture' ? 'Picture' : 'Drawing'),
   documentEditor: 'Document editor',
   cannotEditHere: 'This part of the document cannot be edited',
+  cannotCutObjects: 'The selection holds something that cannot be cut (a picture, a note, a field, a link); it was left in place',
+  cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
   tabLeaves: 'Press Tab to leave the editor',
   documentPasteTooLarge: 'The text on the clipboard is too long to paste',
   pictureNotSupported: 'This picture cannot be inserted',
@@ -275,6 +279,8 @@ export const STRINGS_TR: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Grafik' : kind === 'diagram' ? 'Diyagram' : kind === 'object' ? 'Gömülü nesne' : kind === 'picture' ? 'Görsel' : 'Çizim'),
   documentEditor: 'Belge düzenleyici',
   cannotEditHere: 'Belgenin bu bölümü düzenlenemez',
+  cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (görsel, dipnot, alan, bağlantı); yerinde bırakıldı',
+  cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',
   tabLeaves: 'Düzenleyiciden çıkmak için Sekme tuşuna basın',
   documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
   pictureNotSupported: 'Bu görsel eklenemiyor',

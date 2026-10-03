@@ -124,6 +124,9 @@ export class DocInput {
       end = start + middle.length;
       this.selected = middle.length > 0;
     }
+    // A field gives a carriage return back as a line feed: the mirror would never agree with it, and the line feed
+    // would be read as the end of a paragraph. A space stands for it; the lengths stay the same.
+    if (value.indexOf('\r') >= 0) value = value.replace(/\r/g, ' ');
     this.value = value;
     this.start = start;
     this.end = end;

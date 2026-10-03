@@ -336,7 +336,8 @@ export class DocLayout {
    * the operations in ops/doc do): lays it out again from the page of the
    * first changed block. Pages before it stay as they are; paragraphs that
    * did not change keep their lines. Layout runs here as far as the changed
-   * blocks reach; call layout() for the rest, as after the constructor. When
+   * blocks reach, or as long as `budget` allows; call layout() for the rest,
+   * as after the constructor. When
    * the edit left the number of blocks alone and a later page begins exactly
    * as it began before, the pages from there on are kept as well.
    *
@@ -344,10 +345,21 @@ export class DocLayout {
    * the document counts (the items of a list, the notes), its sections, or
    * something besides the blocks of the body (a header, a note, a list
    * definition). Make a new DocLayout then; this one is of no use any more.
+   *
+   * With a budget the changed blocks may not all be laid out when this
+   * returns. Whether the engine could follow the edit is known only once they
+   * are: look at `broken` after every layout() until the changed blocks are
+   * through, and make a new DocLayout when it is set. An edit that comes
+   * before that is not followed.
    */
-  edited(): EditProgress | undefined {
+  edited(budget?: { milliseconds?: number }): EditProgress | undefined {
     const ctx = this.ctx;
     if (this.truncated || ctx.broken || this.options.maxPages !== undefined) return undefined;
+    if (this.expect) {
+      // The blocks of an earlier edit are still being checked: two edits cannot be told apart.
+      ctx.broken = true;
+      return undefined;
+    }
     if (!sameList(this.sides, sideParts(this.doc))) {
       ctx.broken = true;
       return undefined;
@@ -379,7 +391,8 @@ export class DocLayout {
       }
     }
     if (!this.done && dirty >= this.nextBlock) {
-      // Layout has not come that far yet.
+      // Layout has not come that far yet. Pages kept from before an earlier edit show these blocks as they were: they are laid out again.
+      this.old = undefined;
       this.sections = sections;
       return { from: this.pages.length, done: false, updated: [] };
     }
@@ -445,10 +458,20 @@ export class DocLayout {
     this.openPage(true);
     const end = first + inserted;
     // Bounded like layout(): every step places a band or ends a page.
+    const started = budget && budget.milliseconds !== undefined ? now() : 0;
+    let steps = 0;
+    let stopped = false;
     while (!this.done && !ctx.broken && (this.expect || this.table || this.nextBlock < end) && this.pages.length < MAX_PAGES) {
       if (!this.step()) break;
+      if (budget && budget.milliseconds !== undefined && (++steps & 15) === 0 && now() - started >= budget.milliseconds) {
+        stopped = true;
+        break;
+      }
     }
-    if (ctx.broken || this.expect) return undefined;
+    if (ctx.broken || (this.expect && (this.done || !stopped))) {
+      ctx.broken = true;
+      return undefined;
+    }
     return { from, done: this.done, updated: this.updated };
   }
 
@@ -594,9 +617,17 @@ export class DocLayout {
         break;
       }
       if (!this.step()) break;
+      // The blocks of an edit turned out to count differently from those they replaced: see edited().
+      if (this.ctx.broken) break;
       if (budget && budget.milliseconds !== undefined && (++steps & 15) === 0 && now() - started >= budget.milliseconds) break;
     }
+    if (this.expect && (this.done || this.pages.length >= MAX_PAGES)) this.ctx.broken = true;
     return { done: this.done, updated: this.updated };
+  }
+
+  /** The engine could not follow an edit (see edited()): its pages are not to be shown; make a new DocLayout. */
+  get broken(): boolean {
+    return this.ctx.broken;
   }
 
   // ------------------------------------------------------------------ feed

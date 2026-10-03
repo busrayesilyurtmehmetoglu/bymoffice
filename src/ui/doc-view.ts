@@ -22,7 +22,7 @@ import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
-import { hasCopyMark, sliceHtml, sliceOf, type DocSlice } from './doc-clipboard';
+import { hasCopyMark, sliceHtml, cutLoses, sliceOf, type DocSlice } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
 import { getUiStrings, type UiStrings } from './strings';
 
@@ -653,6 +653,7 @@ export class DocumentView {
   private lastDown = { time: 0, x: 0, y: 0, count: 0 };
   private dragPoint: { clientX: number; clientY: number } | undefined;
   private dragTimer: ReturnType<typeof setInterval> | undefined;
+  private changes = 0;
   /** The selection as it is shown, for the selection it was worked out for. */
   private expanded: { anchor: TextPosition; focus: TextPosition; range: DocRange } | undefined;
   private copyMark = '';
@@ -682,7 +683,7 @@ export class DocumentView {
     this.history = new ops.DocHistory<DocRange | undefined>(doc);
     this.painter = new CanvasTextMeasurer({ fonts: doc.fonts });
     this.measurer = options.measurer || this.painter;
-    // Pictures put in while editing are in the model; the others where the document was read from.
+    // Pictures put in while editing are in the model (a view may be made editable later); the others where the document was read from.
     const source = options.package;
     const pictures = {
       readPart: (part: string): Promise<Uint8Array> => {
@@ -691,7 +692,7 @@ export class DocumentView {
         return source ? source.readPart(part) : Promise.reject(new Error('No such picture'));
       },
     };
-    this.images = new ImageStore(source || this.editable ? pictures : undefined, coarse ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, this.onImageLoad);
+    this.images = new ImageStore(pictures, coarse ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, this.onImageLoad);
     // A document that cannot be laid out at all throws here, before anything is added to the container.
     this.engine = new DocLayout(doc, this.measurer, this.layoutOptions());
     this.pages = this.engine.pages;
@@ -1158,7 +1159,9 @@ export class DocumentView {
       this.update();
       return;
     }
-    this.afterLayout(progress);
+    // An edit whose blocks were still being laid out turned out to be one the engine cannot follow.
+    if (this.engine.broken) this.rebuild();
+    else this.afterLayout(progress);
     this.schedule();
   };
 
@@ -1234,8 +1237,10 @@ export class DocumentView {
   private follow(): void {
     const height = this.totalHeight();
     let progress: (LayoutProgress & { from: number }) | undefined;
+    const started = Date.now();
     try {
-      progress = this.failed ? undefined : this.engine.edited();
+      // A change of very many blocks (the whole document made bold) is laid out in slices like a document that is opened.
+      progress = this.failed ? undefined : this.engine.edited({ milliseconds: EDIT_LAYOUT_MS });
     } catch {
       progress = undefined;
     }
@@ -1247,7 +1252,6 @@ export class DocumentView {
       this.afterLayout(progress);
     }
     const range = this.range();
-    const started = Date.now();
     while (!this.done && !this.failed && range && !this.lines.lineOf(range.focus, 'start', this.caretPage) && Date.now() - started < EDIT_LAYOUT_MS) {
       let next: LayoutProgress;
       try {
@@ -1256,7 +1260,8 @@ export class DocumentView {
         this.layoutBroke();
         break;
       }
-      this.afterLayout(next);
+      if (this.engine.broken) this.rebuild();
+      else this.afterLayout(next);
     }
   }
 
@@ -1880,6 +1885,8 @@ export class DocumentView {
       this.selection = { anchor: position, focus: position };
       if (had) this.repaintAll();
     }
+    // A second press without the end of the first one (a pointer that was lost) must not leave a timer behind.
+    if (this.dragTimer !== undefined) clearInterval(this.dragTimer);
     this.dragging = true;
     window.addEventListener(this.pointerEvents ? 'pointermove' : 'mousemove', this.onPointerMove as EventListener);
     window.addEventListener(this.pointerEvents ? 'pointerup' : 'mouseup', this.onPointerUp);
@@ -1963,10 +1970,29 @@ export class DocumentView {
 
   private onCut = (event: ClipboardEvent): void => {
     if (this.destroyed) return;
+    const range = this.range();
+    if (this.editable && range && !ops.isCollapsed(range)) {
+      // What is removed must be on the clipboard: a cut that cannot put it there removes nothing.
+      let refused: string | undefined;
+      if (!event.clipboardData) refused = this.strings.cannotWriteClipboard;
+      else {
+        try {
+          if (cutLoses(this.document, range, this.selectionSlice())) refused = this.strings.cannotCutObjects;
+        } catch (error) {
+          event.preventDefault();
+          this.refuse(error);
+          return;
+        }
+      }
+      if (refused !== undefined) {
+        event.preventDefault();
+        this.notify(refused, 'info');
+        return;
+      }
+    }
     this.onCopy(event);
     // Nothing goes out of the field itself either way.
     event.preventDefault();
-    const range = this.range();
     if (!this.editable || !range || ops.isCollapsed(range)) return;
     this.perform((selection) => ops.deleteRange(this.document, selection));
   };
@@ -2385,6 +2411,11 @@ export class DocumentView {
     this.modified = false;
   }
 
+  /** Counts the changes made in the view, undo and redo included: the same number means the same document. */
+  get changeCount(): number {
+    return this.changes;
+  }
+
   get canUndo(): boolean {
     return this.editable && this.history.canUndo;
   }
@@ -2693,6 +2724,7 @@ export class DocumentView {
   /** The document was changed: the pages follow, the caret goes where the change left it. */
   private changed(selection: DocRange | undefined): void {
     this.modified = true;
+    this.changes++;
     if (selection) this.adopt(selection);
     this.affinity = 'start';
     this.targetX = undefined;
@@ -2794,17 +2826,31 @@ export class DocumentView {
         const joinAfter = to > length && change.text === '';
         from = Math.max(0, from);
         to = Math.min(length, to);
+        const paragraph = ops.resolvePosition(doc, at).paragraph;
         const place = (offset: number): DocPosition => {
           const position: DocPosition = { story: at.story, path: at.path.slice(), offset };
-          // Typed at a caret before a picture, the text goes before it.
-          if (at.before === true && offset === at.offset) position.before = true;
+          // Typed at a caret before a picture, the text goes before it: also the text that replaces what was
+          // composed there, whose start is where the picture comes to stand once the composed text is gone.
+          if (at.before === true && (offset === at.offset || !ops.hasAtomAt(paragraph, offset))) position.before = true;
           return position;
         };
-        if (to > from) {
+        // One character taken away next to a picture: the picture goes, as with the key, not the letter beyond it.
+        const single = change.text === '' && change.removeBefore + change.removeAfter === 1 && ops.hasAtomAt(paragraph, at.offset);
+        let picture = false;
+        if (single && change.removeBefore === 1 && at.before !== true) {
+          apply(ops.deleteBackward(doc, at));
+          picture = true;
+        } else if (single && change.removeAfter === 1 && at.before === true) {
+          apply(ops.deleteForward(doc, at));
+          picture = true;
+        } else if (to > from) {
           const span = { anchor: place(from), focus: place(to) };
           apply(change.text === '' ? ops.deleteRange(doc, span) : ops.insertText(doc, span, change.text, this.takeFormat()));
         } else if (change.text !== '') apply(ops.insertText(doc, place(from), change.text, this.takeFormat()));
-        if (joinBefore) apply(ops.deleteBackward(doc, place(0)));
+        // The picture was the one thing to go: the paragraph is not joined with its neighbour as well.
+        if (picture) {
+          // Nothing more.
+        } else if (joinBefore) apply(ops.deleteBackward(doc, place(0)));
         else if (joinAfter) apply(ops.deleteForward(doc, selection ? (selection as DocRange).focus : place(length)));
       }
     } catch (error) {
@@ -3088,6 +3134,8 @@ export class DocumentView {
     }
     this.selectionMoved(false);
     if (count !== 1) return;
+    // A second press without the end of the first one (a pointer that was lost) must not leave a timer behind.
+    if (this.dragTimer !== undefined) clearInterval(this.dragTimer);
     this.dragging = true;
     window.addEventListener(this.pointerEvents ? 'pointermove' : 'mousemove', this.onPointerMove as EventListener);
     window.addEventListener(this.pointerEvents ? 'pointerup' : 'mouseup', this.onPointerUp);
@@ -3322,7 +3370,9 @@ export class DocumentView {
         const end = ops.storyEnd(this.document, 'body');
         return start && end ? sliceOf(this.document, start, end) : undefined;
       }
-      const range = orderedRange(selection.anchor, selection.focus);
+      // What a deletion would remove is what the copy holds: whole cells where the selection goes into or out of a table.
+      const shown = this.shownRange() || selection;
+      const range = orderedRange(shown.anchor, shown.focus);
       if (!range) return undefined;
       if (range.cells) {
         const blocks = flowBlocks(this.document, range.start.story, range.start.path.slice(0, range.prefix));

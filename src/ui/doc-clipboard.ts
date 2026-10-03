@@ -6,8 +6,8 @@
 // from the clipboard is never parsed; it is only searched for the mark that
 // says the copy was made by this editor.
 
-import { findWrapper, paragraphText, type DocModel, type Paragraph } from '../model/doc/types';
-import { itemLength, paragraphsBetween, rangeFormat, resolvePosition, type DocPosition, type RunFormatPatch } from '../ops/doc/index';
+import { findWrapper, paragraphText, type Block, type DocModel, type Paragraph } from '../model/doc/types';
+import { applyDocOps, asRange, deleteRange, itemLength, paragraphsBetween, rangeFormat, resolvePosition, storyOf, type DocPosition, type DocRange, type RunFormatPatch } from '../ops/doc/index';
 
 /** Text in one formatting. A line break inside a paragraph is "\v", as insertText() takes it. */
 export interface SliceRun {
@@ -109,6 +109,93 @@ export function sliceOf(doc: DocModel, start: DocPosition, end: DocPosition): Do
   } catch {
     return undefined;
   }
+}
+
+/** What a story holds, counted: the length of its text, and everything in it that is more than text in some formatting. */
+interface Census {
+  text: number;
+  other: string;
+}
+
+/** Items a copy carries as characters of its text, and a hint of the layout that stands for nothing. */
+const AS_TEXT = new Set<string>(['text', 'tab', 'noBreakHyphen', 'lastRenderedPageBreak']);
+/** Inlines that are never removed with the text around them, or mean nothing by themselves. */
+const NO_CONTENT = new Set<string>(['proofError', 'empty']);
+
+function census(blocks: Block[]): Census {
+  const counts = new Map<string, number>();
+  const count = (key: string, by = 1): void => {
+    counts.set(key, (counts.get(key) || 0) + by);
+  };
+  let text = 0;
+  const walk = (list: Block[], depth: number): void => {
+    for (const block of list) {
+      if (block.type === 'table') {
+        if (depth < 64) for (const row of block.rows) for (const cell of row.cells) walk(cell.blocks, depth + 1);
+        continue;
+      }
+      if (block.type !== 'paragraph') continue;
+      text += paragraphText(block).length;
+      for (const inline of block.children) {
+        // Text inside a link, a field, a content control or a tracked change is more than its characters.
+        let wrapped = '';
+        for (let w = inline.wrap; w; w = w.parent) wrapped += w.kind + ' ';
+        if (inline.type !== 'run') {
+          if (!NO_CONTENT.has(inline.type)) count(inline.type);
+          if (inline.type === 'math' && wrapped !== '') count('in ' + wrapped, inline.text.length);
+          continue;
+        }
+        const code = inline.fieldCode;
+        for (let k = 0; k < inline.content.length; k++) {
+          const item = inline.content[k];
+          if (code === true || (code !== undefined && code[k])) {
+            count('code');
+            continue;
+          }
+          if (item.type === 'break') {
+            if (item.kind !== 'line') count('break ' + item.kind);
+          } else if (!AS_TEXT.has(item.type)) count(item.type);
+          if (wrapped !== '') count('in ' + wrapped, Math.max(1, itemLength(item)));
+        }
+      }
+    }
+  };
+  walk(blocks, 0);
+  const keys: string[] = [];
+  counts.forEach((_, key) => keys.push(key));
+  keys.sort();
+  return { text, other: keys.map((key) => `${key}=${counts.get(key)}`).join(';') };
+}
+
+/**
+ * Whether a cut of a range would take something out of the document that the
+ * copy of it (`slice`; undefined when only plain text is on the clipboard)
+ * does not hold: a picture, a note reference, a field, an equation, a link, a
+ * content control, a tracked change, a page break. The deletion itself is the
+ * judge: it is made, what the story holds is counted before and after, and it
+ * is taken back, so that nothing here has to know what a deletion removes.
+ * Throws the RangeError of a place that cannot be edited.
+ */
+export function cutLoses(doc: DocModel, range: DocRange, slice: DocSlice | undefined): boolean {
+  const story = asRange(range).focus.story;
+  const before = census(storyOf(doc, story).blocks);
+  const edit = deleteRange(doc, range);
+  if (edit.ops.length === 0) return false;
+  const inverse = applyDocOps(doc, edit.ops);
+  let after: Census;
+  try {
+    after = census(storyOf(doc, story).blocks);
+  } finally {
+    applyDocOps(doc, inverse);
+  }
+  if (after.other !== before.other) return true;
+  if (slice && !slice.table) {
+    // Every character that goes must be one the copy holds.
+    let carried = 0;
+    for (const paragraph of slice.paragraphs) for (const run of paragraph.runs) carried += run.text.length;
+    if (before.text - after.text !== carried) return true;
+  }
+  return false;
 }
 
 const ALIGN: { [name: string]: string } = { center: 'center', right: 'right', end: 'right', both: 'justify', distribute: 'justify' };

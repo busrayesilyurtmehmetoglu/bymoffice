@@ -15,6 +15,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - Hücreleri **Excel sayı biçimleriyle** gösterir: tarih, saat, para, yüzde, bilimsel, kesir ve özel biçim kodları; Türkçe ve İngilizce yerel ayar (`1.234,50 ₺` / `15.03.2024` ↔ `1,234.50` / `3/15/2024`).
 - Hücreleri **düzenler ve dosyaya kaydeder**: yazarak giriş, geri al/yinele, kopyala/kes/yapıştır, satır ve sütun ekle-sil. Formül metinleri, birleştirilmiş hücreler ve adlandırılmış aralıklar ekleme-silmeyle birlikte kayar.
 - **Editör arayüzü** sunar: araç çubuğu (geri al/yinele, yazı boyutu, kalın/italik/altı çizili/üstü çizili, yazı ve dolgu rengi, kenarlık, hizalama, metni kaydır, birleştir, sayı biçimi, satır/sütun), formül çubuğu ve ad kutusu, durum çubuğu (toplam/ortalama/sayı), sağ tık menüsü, sürükleyerek sütun/satır boyutlandırma. Türkçe ve İngilizce.
+- **Word belgelerini (docx) sayfa sayfa gösterir ve düzenler**: imleç ve seçim (fare, klavye, dokunmatik tutamaçlar), yazma ve silme, giriş yöntemleri (IME), geri al/yinele, kopyala/kes/yapıştır, biçimlendirme araç çubuğu (stil, font, boyut, kalın/italik/altı çizili, renk, hizalama, listeler, tablo, bağlantı, görsel); `save()` yalnız değişen blokları yeniden yazar.
 - **Eski Word dosyalarını (doc, Word 97–2003) salt okunur açar ve gösterir**: metin, karakter ve paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe hücreler), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, yer imleri, satır içi ve kayan resimler, metin kutuları. `file.document()` docx ile aynı `DocModel`'i verir; resimler pakette değil `model.media` içindedir (`BymOffice.documentPictures(model, file.package)` ikisini tek arayüzle sunar).
 - **RTF dosyalarını salt okunur açar ve gösterir** (`.doc` uzantısıyla kaydedilmiş RTF dahil; biçim içerikten tanınır): metin ve kod sayfaları (Türkçe 1254 dahil), karakter/paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, resimler, metin kutuları. Yarıda kesilmiş RTF hata vermez; okunabilen kısmı gösterilir.
 - **Eski Excel dosyalarını (xls, Excel 97–2003) salt okunur açar**: hücreler, stiller, birleştirmeler, sütun/satır ölçüleri, dondurulmuş bölmeler, köprüler, tanımlı adlar, formül metinleri ve dosyadaki sonuçları. `mount()` xls'i her zaman salt okunur kurar. Ayrıntı için `BymOffice.readXlsWithReport(file.cfb)` okunmayan kayıtları ve çevrilemeyen formülleri sayar. Excel 5/95 dosyaları da okunur ama gerçek dosyayla sınanmamıştır.
@@ -38,11 +39,11 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | RTF'te matematik, çerçeve yerleşimi, şekil dolgu/çizgileri, eski `\pn` listeleri, tablo stilleri, Uzak Doğu kod sayfaları; RTF'e yazma | Yok. RTF salt okunur açılır, `save()` özgün baytları verir |
 | doc düzenleme ve kaydetme; doc'ta EMF/WMF görseller, resim madde imleri, eski otomatik numaralar, yorum aralıkları | Yok. doc salt okunur açılır, `save()` özgün baytları verir |
 | xls düzenleme ve kaydetme, xls → xlsx dönüştürme; xls'te yorumlar, koşullu biçim, veri doğrulama, grafik/görsel; parola korumalı xls; Excel 4 ve öncesi | Yok. xls salt okunur açılır, `save()` özgün baytları verir |
-| docx düzenleme, belge içi bağlantılar, arama, dokunmatikte metin seçimi, sağdan sola yazı, heceleme, grafik/şekil ve vektör görsel (EMF/WMF/SVG) çizimi, belgeye gömülü fontlar | Yok. Çizilemeyen nesnelerin yerinde yer tutucu görünür |
+| Belge düzenlemede: görsel, dipnot başvurusu, alan, denklem, bağlantı, içerik denetimi ve izlenen değişikliklerin panoyla taşınması (kopyada yalnız metin ve biçimi gider; bunları, sayfa sonunu ya da yumuşak tireyi içeren seçim **kesilemez**, bildirimle yerinde bırakılır), tablonun tablo olarak kesilip yapıştırılması (aynı tablonun hücreleri dışında düz paragraflara döner; hücre seçiminde hücre içi biçim taşınmaz), dışarıdan gelen HTML'in biçimiyle yapıştırılması (yalnız metni alınır), değişiklik izleme ve yorum düzenleme, metin kutularının içini düzenleme | Yok |
+| Belgede: belge içi bağlantılar, arama, sağdan sola yazı, heceleme, grafik/şekil ve vektör görsel (EMF/WMF/SVG) çizimi, belgeye gömülü fontlar | Yok. Çizilemeyen nesnelerin yerinde yer tutucu görünür |
 | Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
-| `onSave` seçeneği; arayüz metinlerinin Türkçesi | Yok (görev 1.6); menü ve ekran okuyucu metinleri şimdilik İngilizce |
 | Sayı biçimlerinde: Türkçe ve İngilizce dışındaki diller, `*` ile doldurma, `_` boşluğunun gerçek genişliği, Hicri/Japon takvimleri, `[DBNum]` | Yok; `*` hiçbir şey yazmaz, `_x` tek boşluk olur |
-| Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx için yalnız okuma modeli var (`file.document()`); düzenleme ve modelden yazma yok |
+| Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx modeli `BymOffice.docOps` işlemleriyle düzenlenir ve `file.save()` ile dosyaya yazılır; doc ve RTF modeli yalnız `saveAsDocx()` ile docx olarak yazılır |
 | doc/xls yazma | Yok; `save()` özgün baytları döndürür |
 | Parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
 | Excel'de grafik ve pivot tablo gösterimi (yerinde yer tutucu görünür); görsel/şekil ekleme, taşıma, boyutlandırma; dikdörtgen, elips ve çizgi dışındaki şekil geometrileri; gradyan/desen dolgu, gölge; yorum ekleme/düzenleme | Yok; dosyada korunur |
@@ -119,7 +120,7 @@ await writeFile('copy.xlsx', await file.save());
 
 ### `mount(container, options): Promise<MountedView>`
 
-Bir xlsx dosyasını açar ve `container` içinde gösterir. Kapsayıcının bir boyutu olmalıdır (ör. `height: 600px`); görünüm onu doldurur ve boyutu değişince kendini uyarlar.
+Bir dosyayı açar ve `container` içinde gösterir: xlsx ve xls tablo düzenleyicide, docx, doc ve RTF belge düzenleyicide (aşağıda "Word belgesini gösterme ve düzenleme"). Kapsayıcının bir boyutu olmalıdır (ör. `height: 600px`); görünüm onu doldurur ve boyutu değişince kendini uyarlar.
 
 ```html
 <div id="editor" style="height: 600px"></div>
@@ -153,7 +154,7 @@ Bir xlsx dosyasını açar ve `container` içinde gösterir. Kapsayıcının bir
 | `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
 | `onSheetChange(sheetIndex)` | Gösterilen sayfa değişince çağrılır |
 
-xlsx dışındaki dosyalarda `UnsupportedFileError` ile reddeder ve kapsayıcıya bir şey eklemez.
+Tanınmayan ya da desteklenmeyen dosyalarda `UnsupportedFileError` ile reddeder ve kapsayıcıya bir şey eklemez.
 
 `mounted.editor` kabuğu (`SpreadsheetEditor`), `mounted.view` içindeki ızgarayı (`WorkbookView`) verir. Modeli zaten elinizde tutuyorsanız `new BymOffice.SpreadsheetEditor(container, workbook, options)` ile kabuklu, `new BymOffice.WorkbookView(container, workbook, options)` ile yalnız ızgarayı doğrudan kurabilirsiniz. `editor.setLocale(...)` ve `editor.setReadOnly(...)` kabuğu ve ızgarayı birlikte değiştirir; `editor.destroy()` hepsini kaldırır.
 
@@ -226,7 +227,7 @@ Doğrulama: her değişiklikte, gerçek dosyalardan oluşan bir havuzda "düzenl
 
 Değişen satırlar yeniden üretilirken şunlar o satırlarda korunmaz (dokunulmayan satırlarda korunur): `spans` ipucu, hücrelerin fonetik (furigana) metni, zengin metinde `outline`/`shadow` gibi nadir font ayrıntıları.
 
-### Word belgesi modeli (yalnız okuma)
+### Word belgesi modeli
 
 ```js
 const file = await BymOffice.open(bytes);          // file.format === 'docx'
@@ -243,23 +244,29 @@ for (const block of doc.body.blocks) {
 - **Kaydetme:** docx'te `file.save()` modelde düzenlenen blokları dosyaya yazar; düzenlenmeyen bloklar ve parçalar bayt bayt korunur (`BymOffice.writeDocx(pkg, doc)`). doc ve RTF kendi biçimlerine yazılamaz; `file.saveAsDocx()` modeli yeni bir docx olarak verir (`BymOffice.buildDocx(doc)`). Dönüştürmede şekillerin geometrisi/dolgusu ve tema bilgisi taşınmaz; `javascript:` gibi güvensiz bağlantılar düz metne çevrilir. Üretilen dosyalar yeniden okunarak ve şema sırası denetlenerek sınandı; Microsoft Word'de açılarak sınanmadı.
 - **Düzenleme işlemleri** (`BymOffice.docOps`): `insertText`, `deleteRange`, `splitParagraph`, `setRunFormat`, `setParaFormat`, `toggleList`, `insertTable`, `insertImage`, `insertHyperlink`… her biri `DocEdit` döndürür; `docOps.applyDocOps(doc, edit.ops)` uygular, `docOps.DocHistory` geri al/yinele sağlar.
 
-### Word belgesini gösterme (salt okunur)
+### Word belgesini gösterme ve düzenleme
 
 ```js
 const mounted = await BymOffice.mount(container, { file: docxBytes, locale: 'tr', zoom: 'fit-width' });
 if (mounted.kind === 'document') {
   mounted.view.goToPage(3);          // DocumentView
   console.log(mounted.view.pageCount);
+  mounted.view.insertText('Merhaba'); // imlecin olduğu yere
+  const bytes = await mounted.save(); // değişikliklerle birlikte docx
 }
 ```
 
-- `mount()` dönüşünde `kind` alanı vardır: `'spreadsheet'` (`workbook`, `view`, `editor`) ya da `'document'` (`document`, `view`). TypeScript'te `workbook`/`editor` için `kind` ile daraltın (0.x'te tip düzeyinde kırıcı değişiklik).
-- Seçenekler: `zoom` (sayı, `'fit-width'`, `'fit-page'`), `toolbar` (sayfa göstergesi ve yakınlaştırma çubuğu), `onPageChange(page, count)`, `onLinkClick(target)` (`false` dönerse bağlantı açılmaz; yalnız http, https, mailto, tel hedefleri bağlantı olur), `locale`, `onNotice`, `onSave`.
+- **docx varsayılan olarak düzenlenebilir açılır** (`readOnly: true` ile salt okunur); doc ve RTF her zaman salt okunurdur, çünkü kendi biçimlerine yazılamazlar (`file.saveAsDocx()` ile docx'e çevrilip yeniden açılabilirler). `mounted.save()` docx'te değişiklikleri içeren baytları verir ve belgeyi "kaydedildi" sayar (`view.isModified` → `false`); yazma sürerken yapılan değişiklik kaydedilmiş sayılmaz.
+- `mount()` dönüşünde `kind` alanı vardır: `'spreadsheet'` (`workbook`, `view`, `editor`) ya da `'document'` (`document`, `view`, `editor`: `DocumentEditor`, araç çubuğuyla kabuk). TypeScript'te `workbook`/`editor` için `kind` ile daraltın (0.x'te tip düzeyinde kırıcı değişiklik).
+- Seçenekler: `zoom` (sayı, `'fit-width'`, `'fit-page'`), `toolbar` (sayfa göstergesi ve yakınlaştırma çubuğu), `readOnly`, `onDocumentChange()` (belge her değiştiğinde, geri al ve yinele dahil), `onPageChange(page, count)`, `onLinkClick(target)` (`false` dönerse bağlantı açılmaz; yalnız http, https, mailto, tel hedefleri bağlantı olur), `locale`, `onNotice`, `onSave`.
 - `DocumentView`: `pageCount`, `currentPage`, `layoutDone`, `zoom`, `setZoom()`, `zoomIn()`, `zoomOut()`, `goToPage(n)`, `selectAll()`, `getSelectedText()`, `setLocale()`, `focus()`, `destroy()`.
+- `DocumentView` düzenleme üyeleri: `readOnly`, `setReadOnly()`, `isModified`, `markSaved()`, `changeCount`, `canUndo`, `canRedo`, `undo()`, `redo()`, `getSelection()`, `setSelection(konum ya da aralık)`, `insertText()`, `format({ bold, italic, font, size, color… })`, `toggleFormat('bold')`, `formatParagraph({ align, style… })`, `toggleList('bullet' | 'number')`, `indent(±1)`, `insertTable(satır, sütun)`, `insertRow()`, `deleteRow()`, `insertColumn()`, `deleteColumn()`, `insertPageBreak()`, `insertLink(adres)`, `insertPicture(bytes)`, `selectionFormat`, `inTable`, `commitEditing()`. Konum `{ story: 'body', path: [blok dizini…], offset }` biçimindedir.
+- **Pano:** kopyalanan metin düz metin ve (kaçışlanmış metinden üretilen) basit HTML olarak panoya konur; aynı düzenleyiciye yapıştırılınca biçimi korunur. Tabloya giren ya da tablodan çıkan seçim, silmenin kaldıracağı bütün hücreleri kapsar ve kopya da aynısını taşır. Kesmeden önce silmenin belgeden ne çıkaracağına bakılır: metin ve biçiminden fazlası gidecekse (görsel, dipnot başvurusu, alan, denklem, bağlantının ya da içerik denetiminin içindeki metin, izlenen ekleme, sayfa sonu, yumuşak tire) ya da panoya yazılamıyorsa **kesme yapılmaz** ve `onNotice` ile bildirilir (Delete/Backspace ile silinebilir). Silmenin yerinde bıraktıkları (yer imi, yorum işareti, seçimin yalnız ucuna değen alan) kesmeye engel değildir. Paragrafın liste üyeliği gibi paragraf biçimleri ve tablo yapısı kesilen metinle taşınmaz.
+- Çok sayıda bloğu değiştiren işlemde (ör. bütün belgeyi kalın yapmak) sayfalar açılıştaki gibi dilimler halinde yeniden dizilir; arayüz donmaz.
 - Tuşlar: Ctrl/Cmd ile `+`, `-`, `0` ve tekerlek yakınlaştırır (dokunmatikte iki parmak); PageUp/PageDown/Boşluk/Home/End/oklar gezdirir; fareyle sürükleyerek ya da Ctrl/Cmd+A ile seçilen metin Ctrl/Cmd+C ile kopyalanır.
 - Sayfalar aşamalı dizilir: ilk sayfalar hemen görünür, kalanı arka planda; binlerce sayfalık belgede yalnız ekrandaki sayfaların tuvali tutulur.
 - **Fontlar ve sayfalama:** metin cihazdaki fontlarla ölçülür. Belgenin fontu cihazda yoksa ölçüleri uyumlu açık fontlar denenir (Calibri→Carlito, Cambria→Caladea, Arial→Liberation Sans, Times New Roman→Liberation Serif, Courier New→Liberation Mono), sonra genel aile. Bu fontları sayfanıza `@font-face` ile eklerseniz kendiliğinden kullanılır. Font farklıysa satır ve sayfa kırılmaları Word'dekinden farklı olabilir; Word'le yan yana karşılaştırma yapılmamıştır.
-- Alt düzey: `BymOffice.createCanvasMeasurer({ fonts: doc.fonts })` → `new BymOffice.DocLayout(doc, measurer)` → `layout.layout({ pages: 5 })` → `BymOffice.renderPage(ctx, layout.pages[0], { scale })`.
+- Alt düzey: `BymOffice.createCanvasMeasurer({ fonts: doc.fonts })` → `new BymOffice.DocLayout(doc, measurer)` → `layout.layout({ pages: 5 })` → `BymOffice.renderPage(ctx, layout.pages[0], { scale })`. Model düzenlendikten sonra `layout.edited({ milliseconds })` yalnız değişen sayfadan itibaren yeniden dizer; `undefined` dönerse ya da sonraki `layout()` çağrılarından sonra `layout.broken` `true` olursa yeni bir `DocLayout` kurulur.
 
 ### Formüller
 
@@ -516,6 +523,7 @@ Sayfada yapabilecekleriniz:
 - Her dosya için biçimi, boyutu, açılış süresini ve "kaydet → yeniden aç" sonucunu görmek (yeşil: tüm parçalar aynı; sarı: desteklenmiyor ya da ikili biçim; kırmızı: hata ya da içerik değişti).
 - Parçaya ya da akışa tıklayıp içeriğini görmek (XML metin olarak, diğerleri onaltılık döküm).
 - xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler) ve **hücre düzenleme** (yazma, geri al/yinele, kopyala/yapıştır, satır/sütun ekle-sil; üstteki düğmeler ve "Salt okunur" seçimi); altında seçili aralık, etkin hücrenin görünen değeri, ham değeri ve formülü yazar. "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; indirilen dosyayı Excel'de açıp denetleyebilirsiniz. "Sayı ve tarih biçimi dili" seçimiyle Türkçe ve İngilizce gösterim arasında geçilir.
+- docx dosyalarında **belge görünümü**: sayfalar ve belge düzenleyici (yazma, seçim, biçimlendirme araç çubuğu, geri al/yinele, pano); doc ve RTF salt okunur gösterilir.
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.

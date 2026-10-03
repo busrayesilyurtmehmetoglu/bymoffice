@@ -332,3 +332,90 @@ test('edits that change what the document counts are refused, the others keep li
   follow(f, [], 'undo of typing');
   assert.equal(f.followed, before + 1);
 });
+
+test('review: an edit of very many blocks is followed within a budget of time; the rest comes with layout()', async () => {
+  let body = '';
+  for (let i = 0; i < 400; i++) body += p(words(22, 4, i * 30));
+  const doc = await readSpec({ styles: STYLES, body: body + sectPr() });
+  const history = new DocHistory<DocRange | undefined>(doc);
+  const engine = new DocLayout(doc, fakeMeasurer, OPTIONS);
+  engine.layout();
+  const count = engine.pages.length;
+  // Every paragraph is made bold: every block of the body is a new one.
+  history.applyEdit(setRunFormat(doc, { anchor: pos([0], 0), focus: pos([399], 5) }, { bold: true }), undefined);
+  const progress = engine.edited({ milliseconds: 0 });
+  assert.ok(progress, 'the edit is followed');
+  assert.equal(progress.from, 0);
+  assert.equal(progress.done, false);
+  // A few steps were taken, not the document.
+  assert.ok(engine.pages.length < count / 4, `${engine.pages.length} of ${count} pages were laid out in one call`);
+  let guard = 100000;
+  while (!engine.layout({ pages: 3 }).done && !engine.broken && guard-- > 0);
+  assert.equal(engine.broken, false);
+  assert.equal(picture(engine.pages), picture(fresh(doc, fakeMeasurer)));
+  // Without a budget all the changed blocks are laid out by the call, as before.
+  history.undo();
+  const whole = engine.edited();
+  assert.ok(whole && whole.done);
+  assert.equal(picture(engine.pages), picture(fresh(doc, fakeMeasurer)));
+});
+
+test('review: an edit that cannot be followed is found out while its blocks are laid out in slices, and a second edit before that is not followed', async () => {
+  const item = (text: string) => p(text, '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr>');
+  let body = '';
+  for (let i = 0; i < 300; i++) body += p(words(22, 4, i * 30));
+  body += item('first') + item('second') + p('end');
+  const make = async () => {
+    const doc = await readSpec({ styles: STYLES, numbering: NUMBERING, body: body + sectPr() });
+    const history = new DocHistory<DocRange | undefined>(doc);
+    const engine = new DocLayout(doc, fakeMeasurer, OPTIONS);
+    engine.layout();
+    return { doc, history, engine };
+  };
+  // Everything made bold and a list item added far down, before the engine is told: the numbers after it change.
+  const a = await make();
+  a.history.applyEdit(setRunFormat(a.doc, { anchor: pos([0], 0), focus: pos([302], 3) }, { bold: true }), undefined);
+  a.history.applyEdit(splitParagraph(a.doc, pos([300], 2)), undefined);
+  const progress = a.engine.edited({ milliseconds: 0 });
+  assert.ok(progress, 'not known yet');
+  assert.equal(a.engine.broken, false);
+  let guard = 100000;
+  while (!a.engine.layout({ pages: 3 }).done && !a.engine.broken && guard-- > 0);
+  assert.ok(guard > 0);
+  assert.equal(a.engine.broken, true, 'the engine says that its pages are not to be shown');
+  assert.equal(a.engine.edited(), undefined);
+  // The same without a budget is refused at once.
+  const b = await make();
+  b.history.applyEdit(setRunFormat(b.doc, { anchor: pos([0], 0), focus: pos([302], 3) }, { bold: true }), undefined);
+  b.history.applyEdit(splitParagraph(b.doc, pos([300], 2)), undefined);
+  assert.equal(b.engine.edited(), undefined);
+  // An edit that arrives while the blocks of the one before are still being laid out.
+  const c = await make();
+  c.history.applyEdit(setRunFormat(c.doc, { anchor: pos([0], 0), focus: pos([302], 3) }, { bold: true }), undefined);
+  assert.ok(c.engine.edited({ milliseconds: 0 }));
+  c.history.applyEdit(insertText(c.doc, pos([0], 0), 'x'), undefined);
+  assert.equal(c.engine.edited({ milliseconds: 0 }), undefined);
+  assert.equal(c.engine.broken, true);
+});
+
+test('review: an edit beyond what is laid out so far is shown even when pages from before an earlier edit were waiting to be kept', async () => {
+  for (const breakAt of [95, 97, 99, 101, 103]) {
+    let body = '';
+    for (let i = 0; i < 600; i++) body += p(words(22, 4, i * 30), i === breakAt ? '<w:pageBreakBefore/>' : '');
+    const doc = await readSpec({ styles: STYLES, body: body + sectPr() });
+    const history = new DocHistory<DocRange | undefined>(doc);
+    const engine = new DocLayout(doc, fakeMeasurer, OPTIONS);
+    engine.layout();
+    history.applyEdit(insertText(doc, pos([0], 0), words(40, 4, 7) + ' '), undefined);
+    assert.ok(engine.edited(), 'the first edit is followed');
+    engine.layout({ pages: 1 });
+    history.applyEdit(insertText(doc, pos([500], 0), 'ZZZZ '), undefined);
+    const progress = engine.edited();
+    let guard = 100000;
+    let current = engine;
+    if (!progress) current = new DocLayout(doc, fakeMeasurer, OPTIONS);
+    while (!current.layout({ pages: 3 }).done && guard-- > 0);
+    assert.equal(current.broken, false);
+    assert.equal(picture(current.pages), picture(fresh(doc, fakeMeasurer)), `page break before paragraph ${breakAt}`);
+  }
+});
