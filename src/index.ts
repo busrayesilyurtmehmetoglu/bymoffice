@@ -7,6 +7,7 @@ import { documentPictures } from './model/doc/pictures';
 import type { DocModel } from './model/doc/types';
 import { readXls } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
+import { buildXlsx } from './formats/xlsx/build';
 import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
@@ -39,6 +40,7 @@ export { FormulaParseError, parseFormula } from './calc/parse';
 export { FUNCTIONS } from './calc/functions/index';
 export { calcError, isError, type CalcError, type ErrorCode, type Scalar, type Value } from './calc/values';
 export { writeXlsx } from './formats/xlsx/write';
+export { buildXlsx, type BuildXlsxOptions, type XlsxBuildReport } from './formats/xlsx/build';
 export { History, applyOp, ensureCellFormat, ensureNumberFormat, type CellChange, type Op } from './ops/ops';
 export { clearRange, copyRange, editTextAt, pasteAt, setCellInput, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
 export { MAX_FILTER_VALUES, clearFilter, filterSummary, filterValues, setAutoFilter, setFilterColumn, type FilterCriterion, type FilterValue, type FilterValueList } from './ops/filter';
@@ -103,6 +105,12 @@ export interface OfficeFile {
    */
   saveAsDocx?(): Promise<Uint8Array>;
   /**
+   * The spreadsheet as an xlsx file. For an xlsx this is save(); for xls, which
+   * cannot be written, the model is written out as a new xlsx: what the model
+   * holds, not what the xls reader leaves out (charts, macros, print settings).
+   */
+  saveAsXlsx?(): Promise<Uint8Array>;
+  /**
    * The file as bytes. For xlsx, changes made to the model are written into
    * it; everything that was not changed keeps its original bytes.
    */
@@ -165,7 +173,7 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
         }
         return pkg.save();
       };
-      return { format: 'xlsx', kind: 'spreadsheet', ...base, save, workbook: () => (workbook ??= readXlsx(pkg)) };
+      return { format: 'xlsx', kind: 'spreadsheet', ...base, save, workbook: () => (workbook ??= readXlsx(pkg)), saveAsXlsx: save };
     }
     throw new UnsupportedFileError(`Unsupported OOXML document type: ${contentType || 'unknown'}`);
   }
@@ -199,7 +207,7 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
             throw error;
           }
         }));
-      return { format: 'xls', kind: 'spreadsheet', ...base, workbook };
+      return { format: 'xls', kind: 'spreadsheet', ...base, workbook, saveAsXlsx: async () => buildXlsx(await workbook()) };
     }
     if (cfb.has('EncryptedPackage')) throw new UnsupportedFileError('Password-protected files are not supported yet');
     throw new UnsupportedFileError('Compound file is not a Word or Excel document');

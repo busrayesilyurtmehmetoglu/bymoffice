@@ -13,7 +13,8 @@ import { readXls } from '../src/formats/xls/workbook';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { OpcPackage, UnsupportedFileError, applyOp, open, parseXml, serializeXml, type OfficeFile, type Workbook } from '../src/index';
+import { OpcPackage, UnsupportedFileError, applyOp, buildXlsx, open, parseXml, serializeXml, type OfficeFile, type Workbook, type XlsxBuildReport } from '../src/index';
+import { workbookDifference } from '../test/workbook-content';
 
 const EXTENSIONS = /\.(docx|docm|dotx|xlsx|xlsm|xltx|doc|xls|rtf)$/i;
 const SKIP_DIRS = new Set(['node_modules', 'vendor', '.git']);
@@ -30,6 +31,9 @@ function* walk(dir: string): Generator<string> {
 let sheets = 0;
 let cells = 0;
 let convertedFiles = 0;
+let convertedBooks = 0;
+/** What the builder said it could not write, by message, with the number of workbooks that had it. */
+const conversionNotes = new Map<string, number>();
 let rtfFiles = 0;
 let rtfBlocks = 0;
 let docFiles = 0;
@@ -178,6 +182,29 @@ async function checkConversion(file: OfficeFile, blocks: number): Promise<void> 
   convertedFiles++;
 }
 
+/**
+ * Every old workbook is written out as an xlsx, which must open and hold what the model held: the sheets
+ * with their names and states, every cell with its kind, value, formula and format, sizes, merged cells,
+ * links, names, comments and drawings (see workbookContent()).
+ */
+async function checkWorkbookConversion(workbook: Workbook): Promise<void> {
+  const report: XlsxBuildReport = { parts: [], warnings: [] };
+  const converted = await open(await buildXlsx(workbook, { report }));
+  if (converted.format !== 'xlsx') throw new Error('the converted file is not an xlsx');
+  const again = await converted.workbook();
+  const count = (book: Workbook) => book.sheets.reduce((sum, sheet) => sum + [...sheet.rows.values()].reduce((cells, row) => cells + row.cells.filter((cell) => cell.kind !== 'blank' || cell.formula).length, 0), 0);
+  if (again.sheets.length !== workbook.sheets.length) throw new Error(`converted to xlsx: ${again.sheets.length} sheets instead of ${workbook.sheets.length}`);
+  if (count(again) !== count(workbook)) throw new Error(`converted to xlsx: ${count(again)} cells instead of ${count(workbook)}`);
+  const difference = await workbookDifference(workbook, again);
+  // Where the difference is, not what: the content of a real file stays out of the output.
+  if (difference !== undefined) throw new Error(`converted to xlsx reads back differently at ${difference.replace(/: [\s\S]*$/, '')}`);
+  for (const warning of report.warnings) {
+    const kind = warning.replace(/ \(\d+ times\)$/, '').replace(/^Sheet "[\s\S]*?" was read/, 'Sheet was read');
+    conversionNotes.set(kind, (conversionNotes.get(kind) || 0) + 1);
+  }
+  convertedBooks++;
+}
+
 function checkCfb(file: OfficeFile): void {
   for (const entry of file.cfb!.entries) {
     if (entry.type !== 'stream') continue;
@@ -251,6 +278,7 @@ for (const root of roots) {
       } else {
         checkCfb(file);
         if (file.format === 'doc' && docFiles % 10 === 0) await checkConversion(file, (await file.document!()).body.blocks.length);
+        if (file.format === 'xls') await checkWorkbookConversion(await file.workbook());
       }
       passed[file.format] = (passed[file.format] ?? 0) + 1;
     } catch (error) {
@@ -263,6 +291,8 @@ for (const root of roots) {
 const total = Object.values(passed).reduce((sum, n) => sum + n, 0);
 console.log(`passed: ${total}`, passed);
 console.log(`converted to docx and read back: ${convertedFiles}`);
+console.log(`converted to xlsx and read back: ${convertedBooks}`);
+for (const [note, count] of conversionNotes) console.log(`  not carried over in ${count} workbook(s): ${note}`);
 console.log(`rtf model: ${rtfFiles} documents, ${rtfBlocks} blocks`);
 console.log(`doc model: ${docFiles} documents, ${docBlocksBinary} blocks`);
 console.log(`xls model: ${xlsBooks} workbooks, ${xlsSheets} sheets, ${xlsCells} cells`);

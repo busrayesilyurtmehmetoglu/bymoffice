@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { XLSX_PARTS, XLS_STREAMS, readPartsInNode, textFile, xls, xlsx } from './fixtures/files';
 import { formatAt, getCell, open as openInNode } from '../src/index';
 import { sampleWorkbook } from '../test/fixtures';
+import { cat, labelSst, number, sst, str16, workbookStream, xlsFile } from '../test/xls-fixtures';
 import { sampleDocx } from './fixtures/docx';
 import { expect, expectResponsive, test } from './helpers';
 
@@ -52,6 +53,30 @@ test.describe('demo page', () => {
     await expect(page.locator('#parts tr td:first-child')).toHaveText(XLS_STREAMS.map((stream) => stream.path));
     await expect(page.locator('#parts tr td:nth-child(2)')).toHaveText(XLS_STREAMS.map((stream) => String(stream.size)));
     await expect(page.locator('#save')).toBeEnabled();
+  });
+
+  test('"download as xlsx" turns an xls file into an xlsx that holds its cells', async ({ page }) => {
+    // Only an xls file can be converted.
+    await page.locator('#file').setInputFiles(upload('sample.xlsx', await xlsx()));
+    await expect(page.locator('#save')).toBeEnabled();
+    await expect(page.locator('#save-as-xlsx')).toBeHidden();
+
+    const stream = workbookStream({ tail: sst(str16('Merhaba')), sheets: [{ name: 'Veri', records: cat(labelSst(0, 0, 0), number(1, 0, 42.5)) }] });
+    await page.locator('#file').setInputFiles(upload('eski.XLS', xlsFile(stream)));
+    await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
+    await expect(page.locator('#save-as-xlsx')).toBeVisible();
+
+    const downloadPromise = page.waitForEvent('download', { timeout: 10_000 });
+    await page.locator('#save-as-xlsx').click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe('eski.xlsx');
+    expect(await download.failure()).toBeNull();
+    const converted = await openInNode(new Uint8Array(await readFile(await download.path())));
+    expect(converted.format).toBe('xlsx');
+    const workbook = await converted.workbook();
+    expect(workbook.sheets.map((sheet) => sheet.name)).toEqual(['Veri']);
+    expect([getCell(workbook.sheets[0], 0, 0)?.value, getCell(workbook.sheets[0], 1, 0)?.value]).toEqual(['Merhaba', 42.5]);
+    await expectResponsive(page);
   });
 
   test('shows an error for a plain text file and keeps working', async ({ page }) => {

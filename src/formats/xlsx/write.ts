@@ -120,7 +120,7 @@ export function encodeXstring(text: string): string {
 }
 
 /** Replaces what XML cannot carry with U+FFFD, for text that has no escape of its own (formulas, attributes). */
-function replaceUnwritable(text: string): string {
+export function replaceUnwritable(text: string): string {
   if (!NEEDS_CARE.test(text)) return text;
   let out = '';
   for (let i = 0; i < text.length; i++) {
@@ -135,18 +135,18 @@ function replaceUnwritable(text: string): string {
 const TEXT_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\r': '&#13;' };
 const ATTR_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '"': '&quot;', '\t': '&#9;', '\n': '&#10;', '\r': '&#13;' };
 
-function escapeText(text: string): string {
+export function escapeText(text: string): string {
   text = replaceUnwritable(text);
   return /[&<>\r]/.test(text) ? text.replace(/[&<>\r]/g, (ch) => TEXT_ESCAPES[ch]) : text;
 }
 
-function escapeAttr(text: string): string {
+export function escapeAttr(text: string): string {
   text = replaceUnwritable(text);
   return /[&<"\t\n\r]/.test(text) ? text.replace(/[&<"\t\n\r]/g, (ch) => ATTR_ESCAPES[ch]) : text;
 }
 
 /** Element text of an ST_Xstring value: "_xHHHH_" escapes first, then XML escapes. */
-function escapeXstring(text: string): string {
+export function escapeXstring(text: string): string {
   const encoded = encodeXstring(text);
   return /[&<>]/.test(encoded) ? encoded.replace(/[&<>]/g, (ch) => TEXT_ESCAPES[ch]) : encoded;
 }
@@ -221,7 +221,7 @@ function parseUint(text: string | undefined): number {
 
 // --- cells and rows --------------------------------------------------------------
 
-interface CellWriter {
+export interface CellWriter {
   /** Namespace prefix of the sheet's elements with its colon, usually empty. */
   prefix: string;
   shared: SharedString[];
@@ -232,6 +232,12 @@ interface CellWriter {
    * a table whose column names had to be made valid.
    */
   overrides?: Map<number, Map<number, Cell>>;
+  /**
+   * For a writer that makes the shared string table itself (a package built from the
+   * model alone): gives a text that has no entry yet the index of one. Without it such
+   * a text is written into the cell.
+   */
+  intern?(text: string, runs: RichRun[] | undefined): number;
 }
 
 /** Whether a position without a cell would take a format from its column. */
@@ -249,7 +255,7 @@ function columnLetters(col: number): string {
   return COLUMN_NAMES[col] || (COLUMN_NAMES[col] = columnName(col));
 }
 
-function colorAttrs(color: Color): string {
+export function colorAttrs(color: Color): string {
   let out = '';
   if (color.auto !== undefined) out += ` auto="${color.auto ? 1 : 0}"`;
   if (color.indexed !== undefined) out += ` indexed="${color.indexed}"`;
@@ -280,7 +286,7 @@ export function runPropertiesXml(font: Font, prefix = ''): string {
   return out === '' ? `<${prefix}rPr/>` : `<${prefix}rPr>${out}</${prefix}rPr>`;
 }
 
-function textElement(text: string, prefix: string): string {
+export function textElement(text: string, prefix: string): string {
   // Without the attribute a reader may trim the text or fold its line breaks.
   const preserve = /^\s|\s$|[\n\t]/.test(text) ? ' xml:space="preserve"' : '';
   return `<${prefix}t${preserve}>${escapeXstring(text)}</${prefix}t>`;
@@ -363,6 +369,9 @@ function cellXml(writer: CellWriter, cell: Cell, rowNumber: number, col: number,
         // Still the string it was read as: refer to the original, which keeps its phonetic text too.
         out += ' t="s"';
         body += `<${prefix}v>${si}</${prefix}v>`;
+      } else if (writer.intern) {
+        out += ' t="s"';
+        body += `<${prefix}v>${writer.intern(text, cell.runs)}</${prefix}v>`;
       } else {
         out += ' t="inlineStr"';
         body += inlineString(text, cell.runs, prefix);
@@ -381,7 +390,7 @@ function cellXml(writer: CellWriter, cell: Cell, rowNumber: number, col: number,
  * of its own. `row` is undefined for a row that only has cells the writer
  * itself supplies (see CellWriter.overrides).
  */
-function rowXml(writer: CellWriter, index: number, row: Row | undefined): string {
+export function rowXml(writer: CellWriter, index: number, row: Row | undefined): string {
   const prefix = writer.prefix;
   const rowNumber = index + 1;
   let cells = '';
@@ -963,6 +972,19 @@ function adjustRaw(raw: string, name: string, adjuster: Adjuster): string {
   }
 }
 
+/**
+ * A child element of a worksheet that the model does not keep up to date itself (a
+ * conditional format, the data validations) after the rows and columns moved in the
+ * workbook, by the rules a saved sheet follows: '' when nothing of it is left, the
+ * text itself when nothing in it moved. `own` are the edits of the sheet the element
+ * belongs to, `foreign` those of the other sheets.
+ */
+export function adjustSheetElement(raw: string, sheetName: string, own: StructuralEdit[], foreign: StructuralEdit[]): string {
+  if (own.length === 0 && foreign.length === 0) return raw;
+  const name = /^<([^\s/>]+)/.exec(raw);
+  return adjustRaw(raw, name ? name[1] : '', { sheetName, own, foreign, needles: nameNeedles(foreign), changed: false });
+}
+
 // --- regenerated parts of the sheet ---------------------------------------------------
 
 /** Children of CT_Worksheet in schema order. */
@@ -1045,7 +1067,7 @@ function originalColumns(raw: string | undefined, edits: StructuralEdit[]): Orig
   return out;
 }
 
-function colsXml(sheet: Sheet, prefix: string, originals: OriginalColumns[]): string {
+export function colsXml(sheet: Sheet, prefix: string, originals: OriginalColumns[]): string {
   let out = '';
   for (const range of sheet.columns) {
     if (range.min > range.max || range.min < 0 || range.min >= MAX_COLS) continue;
@@ -1135,7 +1157,7 @@ function sortStateXml(state: SortState, prefix: string): string {
 }
 
 /** The filter of the sheet from the model: its range, the criteria of its columns and how it was last sorted. */
-function autoFilterXml(sheet: Sheet, prefix: string): string {
+export function autoFilterXml(sheet: Sheet, prefix: string): string {
   const filter = sheet.autoFilter;
   if (!filter) return '';
   let out = `<${prefix}autoFilter ref="${rangeName(filter.range)}"`;
@@ -1147,7 +1169,7 @@ function autoFilterXml(sheet: Sheet, prefix: string): string {
   return inner === '' ? `${out}/>` : `${out}>${inner}</${prefix}autoFilter>`;
 }
 
-function mergeCellsXml(sheet: Sheet, prefix: string): string {
+export function mergeCellsXml(sheet: Sheet, prefix: string): string {
   if (sheet.merges.length === 0) return '';
   let out = `<${prefix}mergeCells count="${sheet.merges.length}">`;
   for (const range of sheet.merges) out += `<${prefix}mergeCell ref="${rangeName(range)}"/>`;
@@ -1435,7 +1457,7 @@ function insertInOrder(parent: XmlElement, child: XmlElement, order: string[]): 
   parent.children.splice(at, 0, child);
 }
 
-const STYLESHEET_ORDER = ['numFmts', 'fonts', 'fills', 'borders', 'cellStyleXfs', 'cellXfs', 'cellStyles', 'dxfs', 'tableStyles', 'colors', 'extLst'];
+export const STYLESHEET_ORDER = ['numFmts', 'fonts', 'fills', 'borders', 'cellStyleXfs', 'cellXfs', 'cellStyles', 'dxfs', 'tableStyles', 'colors', 'extLst'];
 
 function sameRecord(a: object | undefined, b: object | undefined): boolean {
   const left = (a || {}) as Record<string, unknown>;
@@ -1465,7 +1487,7 @@ function colorElement(name: string, color: Color): XmlElement {
 }
 
 /** <font> of the style sheet; children in the order CT_Font gives them. */
-function fontElement(font: Font, prefix: string): XmlElement {
+export function fontElement(font: Font, prefix: string): XmlElement {
   const children: XmlNode[] = [];
   const add = (local: string, val?: string) => children.push(element(prefix + local, val === undefined ? [] : [['val', val]]));
   if (font.bold) add('b');
@@ -1483,7 +1505,7 @@ function fontElement(font: Font, prefix: string): XmlElement {
   return element(`${prefix}font`, [], children);
 }
 
-function fillElement(fill: Fill, prefix: string): XmlElement {
+export function fillElement(fill: Fill, prefix: string): XmlElement {
   // A gradient is kept as it was read.
   if (fill.type === 'gradient') return element(`${prefix}fill`, [], [cloneElement(fill.raw)]);
   const children: XmlNode[] = [];
@@ -1492,7 +1514,7 @@ function fillElement(fill: Fill, prefix: string): XmlElement {
   return element(`${prefix}fill`, [], [element(`${prefix}patternFill`, [['patternType', fill.pattern]], children)]);
 }
 
-function borderElement(border: Border, prefix: string): XmlElement {
+export function borderElement(border: Border, prefix: string): XmlElement {
   const edge = (local: string, value: BorderEdge | undefined) =>
     value ? element(prefix + local, [['style', value.style]], value.color ? [colorElement(`${prefix}color`, value.color)] : []) : element(prefix + local);
   const attrs: Attrs = [];
@@ -1530,7 +1552,7 @@ function protectionElement(protection: Protection, prefix: string): XmlElement {
 }
 
 /** <xf> for a format that has no element in the file to start from. */
-function formatElement(format: CellFormat, prefix: string): XmlElement {
+export function formatElement(format: CellFormat, prefix: string): XmlElement {
   const attrs: Attrs = [
     ['numFmtId', String(format.numFmtId)],
     ['fontId', String(format.fontId)],

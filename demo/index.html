@@ -53,7 +53,7 @@
       <h1>BYM Office test arayüzü</h1>
       <p class="muted">
         xlsx dosyaları tablo düzenleyicide, docx dosyaları belge düzenleyicide açılır; doc ve xls için yalnız
-        kapsayıcı katmanı vardır (parçaları oku, kayıpsız yeniden kaydet). Dosyalar yalnız tarayıcınızda işlenir, hiçbir yere gönderilmez.
+        kapsayıcı katmanı vardır (parçaları oku, kayıpsız yeniden kaydet); xls dosyası "xlsx olarak indir" ile xlsx'e çevrilir. Dosyalar yalnız tarayıcınızda işlenir, hiçbir yere gönderilmez.
       </p>
 
       <section>
@@ -90,6 +90,7 @@
         <div id="detail" class="muted"></div>
         <div class="row">
           <button id="save" class="primary" disabled>Yeniden kaydet ve indir</button>
+          <button id="save-as-xlsx" hidden>xlsx olarak indir</button>
         </div>
         <div class="scroll" style="margin-top: 12px"><table id="parts"></table></div>
       </section>
@@ -141,6 +142,7 @@
       const parts = $('parts');
       const filesBody = $('files');
       const saveButton = $('save');
+      const convertButton = $('save-as-xlsx');
       const viewer = $('viewer');
       const viewerTitle = $('viewer-title');
 
@@ -381,6 +383,7 @@
         showPreview(record);
         parts.replaceChildren();
         saveButton.disabled = true;
+        convertButton.hidden = true;
         detail.textContent = '';
         viewerTitle.textContent = 'İçerik';
         viewer.textContent = 'Bir parçaya ya da akışa tıklayın.';
@@ -427,6 +430,8 @@
           }
         }
         saveButton.disabled = false;
+        // An xls file cannot be written as xls; its model can be written as a new xlsx.
+        convertButton.hidden = file.format !== 'xls';
       }
 
       async function handle(list) {
@@ -537,6 +542,20 @@
         link.download = selected.name;
         link.click();
         URL.revokeObjectURL(url);
+      });
+
+      convertButton.addEventListener('click', async () => {
+        if (!selected || !selected.file || !selected.file.saveAsXlsx) return;
+        try {
+          const url = URL.createObjectURL(new Blob([await selected.file.saveAsXlsx()]));
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = selected.name.replace(/\.xls$/i, '') + '.xlsx';
+          link.click();
+          URL.revokeObjectURL(url);
+        } catch (error) {
+          detail.textContent = `xlsx'e dönüştürülemedi: ${error.message}`;
+        }
       });
     </script>
   </body>

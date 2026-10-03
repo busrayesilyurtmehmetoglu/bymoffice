@@ -18,7 +18,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - **Word belgelerini (docx) sayfa sayfa gösterir ve düzenler**: imleç ve seçim (fare, klavye, dokunmatik tutamaçlar), yazma ve silme, giriş yöntemleri (IME), geri al/yinele, kopyala/kes/yapıştır, biçimlendirme araç çubuğu (stil, font, boyut, kalın/italik/altı çizili, renk, hizalama, listeler, tablo, bağlantı, görsel); `save()` yalnız değişen blokları yeniden yazar.
 - **Eski Word dosyalarını (doc, Word 97–2003) salt okunur açar ve gösterir**: metin, karakter ve paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe hücreler), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, yer imleri, satır içi ve kayan resimler, metin kutuları. `file.document()` docx ile aynı `DocModel`'i verir; resimler pakette değil `model.media` içindedir (`BymOffice.documentPictures(model, file.package)` ikisini tek arayüzle sunar).
 - **RTF dosyalarını salt okunur açar ve gösterir** (`.doc` uzantısıyla kaydedilmiş RTF dahil; biçim içerikten tanınır): metin ve kod sayfaları (Türkçe 1254 dahil), karakter/paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, resimler, metin kutuları. Yarıda kesilmiş RTF hata vermez; okunabilen kısmı gösterilir.
-- **Eski Excel dosyalarını (xls, Excel 97–2003) salt okunur açar**: hücreler, stiller, birleştirmeler, sütun/satır ölçüleri, dondurulmuş bölmeler, köprüler, tanımlı adlar, formül metinleri ve dosyadaki sonuçları. `mount()` xls'i her zaman salt okunur kurar. Ayrıntı için `BymOffice.readXlsWithReport(file.cfb)` okunmayan kayıtları ve çevrilemeyen formülleri sayar. Excel 5/95 dosyaları da okunur ama gerçek dosyayla sınanmamıştır.
+- **Eski Excel dosyalarını (xls, Excel 97–2003) salt okunur açar**: hücreler, stiller, birleştirmeler, sütun/satır ölçüleri, dondurulmuş bölmeler, köprüler, tanımlı adlar, formül metinleri ve dosyadaki sonuçları. `mount()` xls'i her zaman salt okunur kurar. **`file.saveAsXlsx()` xls'i xlsx olarak yazar** (aşağıda "xls dosyasını xlsx olarak kaydetme"). Ayrıntı için `BymOffice.readXlsWithReport(file.cfb)` okunmayan kayıtları ve çevrilemeyen formülleri sayar. Excel 5/95 dosyaları da okunur ama gerçek dosyayla sınanmamıştır.
 - **Excel sayfalarında görselleri, basit şekilleri/metin kutularını ve hücre yorumlarını gösterir** (xlsx ve xls): görseller (png, jpeg, gif, bmp, webp) çapalandıkları hücrelerde, satır/sütun eklenip silinince yazıcının dosyaya yazdığıyla aynı yere kayar; yorumlu hücrenin köşesinde kırmızı üçgen vardır ve üzerine gelince, hücre seçilince ya da dokununca yorum balonu açılır. Dış bağlantılı görseller yüklenmez; SVG/EMF/WMF yerinde yer tutucu görünür. Model: `sheet.drawings`, `sheet.comments`, `sheet.warnings`.
 - **Koşullu biçimleri gösterir**: hücre kuralları, formüllü kurallar, renk ölçekleri, veri çubukları, ikon kümeleri, ilk/son N, ortalama üstü/altı, yinelenen/benzersiz, metin ve tarih kuralları. Hücre düzenlenince ve geri alınınca güncellenir; kaydederken kurallar dosyada aynen korunur.
 - **Formülleri hesaplar**: 225 Excel fonksiyonu; bir hücre değişince yalnız ona bağlı formüller yeniden hesaplanır.
@@ -38,13 +38,13 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Word 95 ve öncesi, parola korumalı doc | Yok; `UnsupportedFileError` |
 | RTF'te matematik, çerçeve yerleşimi, şekil dolgu/çizgileri, eski `\pn` listeleri, tablo stilleri, Uzak Doğu kod sayfaları; RTF'e yazma | Yok. RTF salt okunur açılır, `save()` özgün baytları verir |
 | doc düzenleme ve kaydetme; doc'ta EMF/WMF görseller, resim madde imleri, eski otomatik numaralar, yorum aralıkları | Yok. doc salt okunur açılır, `save()` özgün baytları verir |
-| xls düzenleme ve kaydetme, xls → xlsx dönüştürme; xls'te yorumlar, koşullu biçim, veri doğrulama, grafik/görsel; parola korumalı xls; Excel 4 ve öncesi | Yok. xls salt okunur açılır, `save()` özgün baytları verir |
+| xls düzenleme ve xls olarak kaydetme; xls'te koşullu biçim, veri doğrulama, otomatik süzgeç ölçütleri, yazdırma ayarları, sayfa koruması, grafikler, form denetimleri, makrolar, dış çalışma kitabı yolları; parola korumalı xls; Excel 4 ve öncesi | Yok. xls salt okunur açılır, `save()` özgün baytları verir. Bunlar modele okunmadığı için `saveAsXlsx()` ile üretilen xlsx'te de bulunmaz |
 | Belge düzenlemede: görsel, dipnot başvurusu, alan, denklem, bağlantı, içerik denetimi ve izlenen değişikliklerin panoyla taşınması (kopyada yalnız metin ve biçimi gider; bunları, sayfa sonunu ya da yumuşak tireyi içeren seçim **kesilemez**, bildirimle yerinde bırakılır), tablonun tablo olarak kesilip yapıştırılması (aynı tablonun hücreleri dışında düz paragraflara döner; hücre seçiminde hücre içi biçim taşınmaz), dışarıdan gelen HTML'in biçimiyle yapıştırılması (yalnız metni alınır), değişiklik izleme ve yorum düzenleme, metin kutularının içini düzenleme | Yok |
 | Belgede: belge içi bağlantılar, arama, sağdan sola yazı, heceleme, grafik/şekil ve vektör görsel (EMF/WMF/SVG) çizimi, belgeye gömülü fontlar | Yok. Çizilemeyen nesnelerin yerinde yer tutucu görünür |
 | Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
 | Sayı biçimlerinde: Türkçe ve İngilizce dışındaki diller, `*` ile doldurma, `_` boşluğunun gerçek genişliği, Hicri/Japon takvimleri, `[DBNum]` | Yok; `*` hiçbir şey yazmaz, `_x` tek boşluk olur |
-| Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx modeli `BymOffice.docOps` işlemleriyle düzenlenir ve `file.save()` ile dosyaya yazılır; doc ve RTF modeli yalnız `saveAsDocx()` ile docx olarak yazılır |
-| doc/xls yazma | Yok; `save()` özgün baytları döndürür |
+| Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx modeli `BymOffice.docOps` işlemleriyle düzenlenir ve `file.save()` ile dosyaya yazılır; doc ve RTF modeli yalnız `saveAsDocx()` ile docx olarak, xls modeli yalnız `saveAsXlsx()` ile xlsx olarak yazılır |
+| doc/xls biçimine yazma | Yok; `save()` özgün baytları döndürür (`saveAsDocx()`/`saveAsXlsx()` yeni biçime çevirir) |
 | Parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
 | Excel'de grafik ve pivot tablo gösterimi (yerinde yer tutucu görünür); görsel/şekil ekleme, taşıma, boyutlandırma; dikdörtgen, elips ve çizgi dışındaki şekil geometrileri; gradyan/desen dolgu, gölge; yorum ekleme/düzenleme | Yok; dosyada korunur |
 | npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
@@ -227,6 +227,36 @@ Doğrulama: her değişiklikte, gerçek dosyalardan oluşan bir havuzda "düzenl
 
 Değişen satırlar yeniden üretilirken şunlar o satırlarda korunmaz (dokunulmayan satırlarda korunur): `spans` ipucu, hücrelerin fonetik (furigana) metni, zengin metinde `outline`/`shadow` gibi nadir font ayrıntıları.
 
+### xls dosyasını xlsx olarak kaydetme
+
+```js
+const file = await BymOffice.open(xlsBytes);      // format: 'xls'
+const xlsxBytes = await file.saveAsXlsx();        // yeni bir xlsx; file.save() özgün xls baytlarını vermeye devam eder
+```
+
+`saveAsXlsx()` xlsx'te `save()` ile aynıdır; xls'te tablo modelini **sıfırdan yeni bir pakete** yazar (`BymOffice.buildXlsx(workbook, { report })`). Aynı işlev kodla kurulmuş bir `Workbook` için de kullanılabilir. `mount()` davranışı değişmez: xls salt okunur gösterilir.
+
+Yazılanlar: sayfa adları, sırası ve durumu (gizli, çok gizli), etkin sayfa, 1904 tarih sistemi; hücre değerleri ve türleri; formül metinleri ile dosyadaki sonuçları (paylaşılan ve dizi formülleri, veri tabloları öyle kalır); stiller (yazı tipi, dolgu, kenarlık, hizalama, sayı biçimi, koruma, hücre stilleri, renk paleti, tema renkleri); zengin metin; birleştirmeler; sütun genişlikleri, satır yükseklikleri, gizli/özetlenmiş satır ve sütunlar; görünüm (dondurulmuş bölmeler, etkin hücre, yakınlaştırma, kılavuz çizgileri, sağdan sola, sekme rengi); köprüler; tanımlı adlar; yorumlar (yazar, zengin metin, kutunun yeri, hep görünür olması); görseller, şekiller ve metin kutuları, gruplar. Model bir xlsx'ten okunmuşsa koşullu biçimler, veri doğrulamaları ve otomatik süzgeç de yazılır.
+
+**Modelde bulunup** yeni dosyaya yazılamayan ya da değiştirilerek yazılan içerik `report.warnings` içinde türüne göre, kaç kez olduğuyla birlikte listelenir (aşağıdaki maddeler). Modelde **hiç bulunmayan** şeyler için uyarı çıkmaz: xls okuyucusunun okumadığı içerik ("Henüz olmayanlar" tablosu) ve bir xlsx'in modele alınmayan parçaları (yazdırma ayarları, sayfa koruması, belge özellikleri) sessizce yoktur; tek istisna, modelin varlığını bildiği tablo/pivot/form denetimi gibi sayfaya bağlı parçalardır, onlar uyarılır. Kodla kurulmuş geçersiz bir modelde biçimsel düzeltmeler (yinelenen sayfa kimliği, sınır dışı yakınlaştırma ya da özet düzeyi) uyarısız yapılır.
+
+```js
+const report = { parts: [], warnings: [] };
+const bytes = await BymOffice.buildXlsx(await file.workbook(), { report });
+// report.warnings: ['Drawing: a chart is not in the model and is left out', ...]
+```
+
+- **Grafik ve makro sayfaları** modelde içeriksizdir; adları ve sıraları korunsun diye **boş çalışma sayfası** olarak yazılır. Sayfadaki grafik, diyagram ve gömülü nesnelerin yer tutucuları yazılmaz.
+- **Baytları okunamayan görseller** (xls içindeki EMF/WMF) resimsiz çerçeve olarak yazılır.
+- **Hedefi olmayan köprüler** (okuyucunun tanımadığı türde bağlantı), değeri olmayan ya da olmayan bir sayfaya bağlı adlar, sayfa sınırı dışındaki hücre/birleştirme/yorumlar yazılmaz.
+- **Başka dosyaya başvuran formüller** metinleriyle (`[1]Sayfa1!A1`) ve son değerleriyle yazılır; xls okuyucusu dış dosyanın yolunu modele almadığı için bağlantının kendisi (`externalLink`) yazılmaz; böyle her formül ve tanımlı ad sayılarak uyarılır.
+- **Satır/sütun eklenip silinmiş model** (xlsx'ten okunup `applyOp` ile düzenlenmiş): yorumlar, koşullu biçimler, veri doğrulamaları ve çizim çapaları `save()`'in uyguladığı kurallarla kaydırılarak yazılır.
+- **Dosyanın ifade edemeyeceği değerler düzeltilir ve uyarılır:** tabloda olmayan biçim dizini (varsayılan biçim), ilk iki dolgu (`none`, `gray125` başa eklenir, dizinler kayar; uyarısız, çünkü biçimler aynı kalır), sonlu olmayan sayı (`#NUM!`), formül/hata/ad içindeki denetim karakterleri (U+FFFD), çakışan sütun aralıkları, geçersiz dizi formülü aralığı, metinsiz formül, aynı kapsamda ikinci ad, aynı hücrede ikinci köprü, gizli etkin sayfa (ilk görünür sayfa), satırın yazıcıya ait ya da başka ad alanından öznitelikleri. Köprü hedefindeki denetim karakterleri yüzde kodlamasıyla yazılır.
+- xlsx'ten okunmuş modellerde: 2010 uzantısına özgü koşullu biçim kuralları, renge/ikona göre süzgeç ölçütleri, konuşma biçimindeki yorumların yanıtları, hücre meta verisi (dinamik dizi) ve modelde hiç bulunmayan parçalar (tablolar, pivotlar, yazdırma ayarları) yazılmaz. Bir xlsx'i kaydetmek için `save()` kullanın; o hiçbir şeyi kaybetmez.
+- xls okuyucusunun modele almadığı her şey ("Henüz olmayanlar" tablosu) doğal olarak yeni dosyada da yoktur.
+
+Aynı model her zaman aynı baytları verir. Üretilen dosyalar yeniden okunarak (içerik karşılaştırması), şema sırası denetlenerek ve gerçek xls dosyalarıyla sınandı; **Microsoft Excel'de açılarak sınanmadı**.
+
 ### Word belgesi modeli
 
 ```js
@@ -337,7 +367,8 @@ interface OfficeFile {
   container: 'ooxml' | 'cfb';
   package?: OpcPackage; // docx/xlsx
   cfb?: CfbFile;        // doc/xls
-  workbook(): Promise<Workbook>; // tablo modeli; şimdilik yalnız xlsx
+  workbook(): Promise<Workbook>; // tablo modeli: xlsx ve xls
+  saveAsXlsx?(): Promise<Uint8Array>; // xlsx'te save() ile aynı; xls'te modelden yeni bir xlsx
   save(): Promise<Uint8Array>;
 }
 ```
@@ -525,6 +556,7 @@ Sayfada yapabilecekleriniz:
 - xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler) ve **hücre düzenleme** (yazma, geri al/yinele, kopyala/yapıştır, satır/sütun ekle-sil; üstteki düğmeler ve "Salt okunur" seçimi); altında seçili aralık, etkin hücrenin görünen değeri, ham değeri ve formülü yazar. "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; indirilen dosyayı Excel'de açıp denetleyebilirsiniz. "Sayı ve tarih biçimi dili" seçimiyle Türkçe ve İngilizce gösterim arasında geçilir.
 - docx dosyalarında **belge görünümü**: sayfalar ve belge düzenleyici (yazma, seçim, biçimlendirme araç çubuğu, geri al/yinele, pano); doc ve RTF salt okunur gösterilir.
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
+- Bir xls dosyası seçiliyken "xlsx olarak indir" ile `saveAsXlsx()` çıktısını indirmek.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
 
@@ -539,7 +571,7 @@ Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez.
 | `pnpm test` | Birim testleri |
 | `pnpm build` | `dist/` çıktıları |
 | `pnpm e2e` | Derler ve Playwright testlerini 5 tarayıcı profilinde çalıştırır |
-| `pnpm corpus <klasör> …` | Gerçek dosyalarda aç → kaydet → yeniden aç denetimi (`BYM_NO_NATIVE=1` ile motorun kendi sıkıştırma koduyla) |
+| `pnpm corpus <klasör> …` | Gerçek dosyalarda aç → kaydet → yeniden aç denetimi (`BYM_NO_NATIVE=1` ile motorun kendi sıkıştırma koduyla); her xls ayrıca xlsx'e çevrilip yeniden okunur ve iki model karşılaştırılır ("converted to xlsx and read back") |
 | `pnpm demo` | Derler ve test arayüzünü sunar |
 
 Tarayıcıların ilk kurulumu: `PLAYWRIGHT_SKIP_BROWSER_GC=1 pnpm exec playwright install chromium firefox webkit`.
