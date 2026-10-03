@@ -63,6 +63,8 @@
         </div>
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
+          <button id="blank-docx">Boş docx oluştur ve aç</button>
+          <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
           <button id="clear">Listeyi temizle</button>
           <label title="Eski iOS/Android WebView'lerde olduğu gibi tarayıcının yerleşik sıkıştırmasını kapatır; motorun kendi inflate/deflate kodu kullanılır.">
             <input type="checkbox" id="legacy" /> Eski cihaz kipi (yerleşik sıkıştırma kapalı)
@@ -531,6 +533,13 @@
         );
         await handle([{ name: 'ornek.xlsx', data: await zip.write() }]);
       });
+
+      // New, empty files as BymOffice.createBlank() makes them, in Turkish.
+      for (const kind of ['docx', 'xlsx']) {
+        $(`blank-${kind}`).addEventListener('click', async () => {
+          await handle([{ name: `yeni.${kind}`, data: await BymOffice.createBlank(kind, { locale: 'tr' }) }]);
+        });
+      }
 
       saveButton.addEventListener('click', async () => {
         if (!selected || !selected.file) return;

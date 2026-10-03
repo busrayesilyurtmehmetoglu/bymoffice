@@ -55,6 +55,14 @@ test.describe('demo page', () => {
     await expect(page.locator('#save')).toBeEnabled();
   });
 
+  test('"new docx" and "new xlsx" make empty files and open them', async ({ page }) => {
+    await page.locator('#blank-docx').click();
+    await expect(page.locator('#status')).toHaveText('Biçim: docx (ooxml)');
+    await page.locator('#blank-xlsx').click();
+    await expect(page.locator('#status')).toHaveText('Biçim: xlsx (ooxml)');
+    await expect(page.locator('#save')).toBeEnabled();
+  });
+
   test('"download as xlsx" turns an xls file into an xlsx that holds its cells', async ({ page }) => {
     // Only an xls file can be converted.
     await page.locator('#file').setInputFiles(upload('sample.xlsx', await xlsx()));

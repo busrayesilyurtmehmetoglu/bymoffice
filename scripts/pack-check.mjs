@@ -46,7 +46,7 @@ writeFileSync(
   join(consumer, 'use.mjs'),
   `import * as api from 'bymoffice';
 import { open } from 'bymoffice';
-for (const name of ['open', 'mount', 'buildXlsx', 'buildDocx', 'writeXlsx', 'writeDocx', 'DocumentEditor', 'SpreadsheetEditor', 'UnsupportedFileError']) {
+for (const name of ['open', 'mount', 'createBlank', 'buildXlsx', 'buildDocx', 'writeXlsx', 'writeDocx', 'DocumentEditor', 'SpreadsheetEditor', 'UnsupportedFileError']) {
   if (typeof api[name] !== 'function') throw new Error('missing export: ' + name);
 }
 const rtf = await open(new TextEncoder().encode('{\\\\rtf1\\\\ansi Hello from the package\\\\par}'));

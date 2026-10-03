@@ -232,6 +232,43 @@ Doğrulama: her değişiklikte, gerçek dosyalardan oluşan bir havuzda "düzenl
 
 Değişen satırlar yeniden üretilirken şunlar o satırlarda korunmaz (dokunulmayan satırlarda korunur): `spans` ipucu, hücrelerin fonetik (furigana) metni, zengin metinde `outline`/`shadow` gibi nadir font ayrıntıları.
 
+### Yeni (boş) dosya: `createBlank(kind, options?)`
+
+```js
+const docx = await BymOffice.createBlank('docx', { locale: 'tr' });  // Uint8Array
+const xlsx = await BymOffice.createBlank('xlsx', { locale: 'tr', sheetName: 'Bütçe' });
+const mounted = await BymOffice.mount(container, { file: docx, locale: 'tr' });
+```
+
+- `'docx'`: tek boş paragraflı belge; Normal, Başlık 1–3, Konu Başlığı (Title) ve Köprü stilleri; Calibri 11. `locale` bir dil etiketidir (`tr`, `tr-TR`, `en-GB`; büyük/küçük harf ve `_` fark etmez): Türkçe A4 ve Türkçe ayırıcılar, `en`/`en-US`/`en-CA` Letter, diğer bütün diller A4 verir; etiket değilse ya da verilmezse `en-GB` sayılır.
+- `'xlsx'`: tek boş sayfalı kitap; sayfa adı Türkçede `Sayfa1`, diğerlerinde `Sheet1`, ya da `sheetName` (1–31 karakter; `[ ] : * ? / \` ve denetim karakteri içeremez, yalnız boşluk olamaz, kesme işaretiyle başlayıp bitemez, `History` olamaz; aksi halde `RangeError`).
+- Aynı seçenekler her zaman aynı baytları verir. Başka bir tür istenirse `RangeError`.
+- Dosyalar yeniden okunarak ve bağımsız bir okuyucuyla (xlsx) açılarak sınandı; Microsoft Word/Excel'de açılarak sınanmadı.
+
+### Bir uygulamaya gömme: `examples/html/index.html`
+
+Sunucu tarafı ne olursa olsun (PHP, .NET, Node…) çalışan, çatı gerektirmeyen tek sayfa: dosyayı sitenin kendi adresinden alır, editörde gösterir, kaydedilince baytları `PUT` ile geri yollar. Sekmede ya da `<iframe>` içinde açılır:
+
+```
+examples/html/index.html?file=/files/42/download&save=/files/42&name=rapor.xlsx&lang=tr
+examples/html/index.html?file=/files/42/download&mode=view        salt okunur
+examples/html/index.html?new=docx&save=/files&name=yazi.docx      yeni, boş belge
+```
+
+| Parametre | İş |
+|---|---|
+| `file` | Dosyanın alınacağı adres (sayfayla aynı kökten olmalı) |
+| `save` | Kaydedilen baytların `PUT` ile yollanacağı adres (aynı kök); verilmezse "Kaydet" dosyayı indirir |
+| `mode` | `edit` (varsayılan) ya da `view` |
+| `lang` | `tr` ya da `en`: editörün ve yeni dosyanın dili |
+| `new` | `docx` ya da `xlsx`: dosya almak yerine boş dosyayla başlar |
+| `name` | Gösterilen ve indirmede kullanılan dosya adı |
+
+- Kaydet düğmesi ve Ctrl/Cmd+S aynı işi yapar. Dosya yoldayken yazılan şey "kaydedildi" sayılmaz: durum "Kaydedilmedi" kalır ve `saved` iletisi gitmez. Kaydedilmemiş değişiklik varken sayfadan çıkılırsa tarayıcı sorar. doc, xls ve RTF kendi biçimlerine yazılamadığı için salt okunur gösterilir ve Kaydet gizlenir.
+- `<iframe>` içindeyken sayfa üst sayfaya (yalnız aynı kökte) `{ source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message? }` iletileri yollar.
+- Başka kökten adresler reddedilir: sayfa yalnız kendi sitesinden dosya alır ve yalnız oraya yollar. Sunucunuz `PUT` isteğinde oturumu ve yetkiyi kendi denetlemelidir; CSRF belirteci gerekiyorsa `fetch` çağrısına başlık olarak ekleyin.
+- Sayfayı kendi projenize kopyalayıp `<script src>` adresini kendi sunucunuza ya da CDN'e çevirin. React ve Vue için ayrı örnek yoktur; `mount()` çağrısı bir `ref`'e bağlanmış kapsayıcıyla aynı şekilde kullanılır ve bileşen kaldırılırken `mounted.destroy()` çağrılır (bu kullanım sınanmadı).
+
 ### xls dosyasını xlsx olarak kaydetme
 
 ```js
@@ -563,6 +600,7 @@ Sayfada yapabilecekleriniz:
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
 - Bir xls dosyası seçiliyken "xlsx olarak indir" ile `saveAsXlsx()` çıktısını indirmek.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
+- "Boş docx oluştur ve aç" / "Boş xlsx oluştur ve aç" ile `createBlank()` çıktısını açmak.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
 
 Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez.

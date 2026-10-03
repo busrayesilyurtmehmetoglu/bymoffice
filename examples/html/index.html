@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office — editor page</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        font: 14px system-ui, -apple-system, 'Segoe UI', sans-serif;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      #bar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 6px 10px;
+        border-bottom: 1px solid #d0d7de;
+        background: #f6f8fa;
+      }
+      #name {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #status {
+        color: #57606a;
+      }
+      #status[data-kind='error'] {
+        color: #b42318;
+      }
+      button {
+        font: inherit;
+        padding: 4px 12px;
+      }
+      #editor {
+        flex: 1;
+        min-height: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      One page that shows a Word or Excel file in the editor and sends it back
+      when it is saved. An application opens it in a tab or in an <iframe>:
+
+        index.html?file=/files/42/download&save=/files/42&name=report.xlsx&lang=tr
+        index.html?file=/files/42/download&mode=view          read-only
+        index.html?new=docx&save=/files&name=letter.docx      a new, empty document
+
+      file   where the file is fetched from (same origin as this page)
+      save   where the saved bytes are sent with PUT (same origin); without it "Save" downloads the file
+      mode   "edit" (default) or "view"
+      lang   "tr" or "en": the language of the editor and of a new file
+      new    "docx" or "xlsx": start from an empty file instead of fetching one
+      name   the file name shown, and used for a download
+
+      Inside an <iframe> the page tells its parent what happens:
+        { source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message? }
+
+      In production load the script from your own server or from a CDN:
+        <script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js"></script>
+    -->
+    <div id="bar">
+      <span id="name"></span>
+      <span id="status" role="status"></span>
+      <button id="save" type="button" hidden>Save</button>
+    </div>
+    <div id="editor"></div>
+
+    <script src="../../dist/bymoffice.min.js"></script>
+    <script>
+      (function () {
+        'use strict';
+        var params = new URLSearchParams(location.search);
+        var lang = params.get('lang') === 'tr' ? 'tr' : 'en';
+        var readOnly = params.get('mode') === 'view';
+        var text = {
+          en: { save: 'Save', saving: 'Saving…', saved: 'Saved', changed: 'Not saved', loading: 'Loading…', failed: 'The file could not be saved', notHere: 'Only files of this site can be opened', nothing: 'No file was given' },
+          tr: { save: 'Kaydet', saving: 'Kaydediliyor…', saved: 'Kaydedildi', changed: 'Kaydedilmedi', loading: 'Yükleniyor…', failed: 'Dosya kaydedilemedi', notHere: 'Yalnız bu sitenin dosyaları açılabilir', nothing: 'Dosya verilmedi' },
+        }[lang];
+
+        var statusEl = document.getElementById('status');
+        var saveButton = document.getElementById('save');
+        saveButton.textContent = text.save;
+        document.documentElement.lang = lang;
+
+        function tell(type, message) {
+          // The parent page of an <iframe>, on the same site only.
+          if (window.parent !== window) window.parent.postMessage({ source: 'bymoffice', type: type, message: message }, location.origin);
+        }
+        function status(message, kind) {
+          // Text from a file or a server is shown as text, never as HTML.
+          statusEl.textContent = message;
+          statusEl.setAttribute('data-kind', kind || 'info');
+        }
+        function fail(message) {
+          status(message, 'error');
+          tell('error', message);
+        }
+        // Addresses come from the query string: only this site is fetched from and sent to.
+        function ownAddress(value) {
+          if (!value) return null;
+          try {
+            var url = new URL(value, location.href);
+            return url.origin === location.origin ? url.href : undefined;
+          } catch (error) {
+            return undefined;
+          }
+        }
+
+        var fresh = params.get('new');
+        var fileUrl = ownAddress(params.get('file'));
+        var saveUrl = ownAddress(params.get('save'));
+        if (fresh !== 'docx' && fresh !== 'xlsx') fresh = null;
+        // Without a name: the last part of the path the file comes from, not of its query.
+        var fetched = '';
+        try {
+          fetched = fileUrl ? decodeURIComponent(new URL(fileUrl).pathname.split('/').pop() || '') : '';
+        } catch (error) {
+          fetched = '';
+        }
+        var name = params.get('name') || (fresh ? 'new.' + fresh : fetched || 'file');
+        document.getElementById('name').textContent = name;
+        document.title = name;
+
+        if (fileUrl === undefined || saveUrl === undefined) return fail(text.notHere);
+        if (!fresh && !fileUrl) return fail(text.nothing);
+
+        var mounted;
+        var saving = false;
+        // Counts the changes, so that a save knows whether it holds the last of them.
+        var changes = 0;
+        var savedAt = 0;
+        function changed() {
+          changes++;
+          status(text.changed);
+          tell('changed');
+        }
+        // Leaving the page with changes the server does not have asks first.
+        window.addEventListener('beforeunload', function (event) {
+          if (!readOnly && changes !== savedAt) {
+            event.preventDefault();
+            event.returnValue = '';
+          }
+        });
+
+        function save() {
+          if (!mounted || saving || readOnly) return;
+          saving = true;
+          status(text.saving);
+          var holds = changes;
+          mounted
+            .save()
+            .then(function (bytes) {
+              if (!saveUrl) {
+                // No server to send it to: the browser downloads the file.
+                var link = document.createElement('a');
+                link.href = URL.createObjectURL(new Blob([bytes]));
+                link.download = name;
+                link.click();
+                setTimeout(function () {
+                  URL.revokeObjectURL(link.href);
+                }, 1000);
+                return;
+              }
+              return fetch(saveUrl, { method: 'PUT', body: bytes, headers: { 'Content-Type': 'application/octet-stream' }, credentials: 'same-origin' }).then(function (response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+              });
+            })
+            .then(function () {
+              savedAt = holds;
+              // What was typed while the file was on its way is not in it: the page still has something to save.
+              if (changes !== holds) return status(text.changed);
+              status(text.saved);
+              tell('saved');
+            })
+            .catch(function (error) {
+              fail(text.failed + ' (' + (error && error.message) + ')');
+            })
+            .then(function () {
+              saving = false;
+            });
+        }
+
+        status(text.loading);
+        var source = fresh ? BymOffice.createBlank(fresh, { locale: lang }) : Promise.resolve(fileUrl);
+        source
+          .then(function (file) {
+            return BymOffice.mount(document.getElementById('editor'), {
+              file: file,
+              locale: lang,
+              readOnly: readOnly,
+              onSave: function () {
+                // Ctrl+S / Cmd+S in the editor: the same as the button.
+                save();
+              },
+              // A workbook reports its changes through onChange, a document through onDocumentChange.
+              onChange: changed,
+              onDocumentChange: changed,
+              onNotice: function (notice) {
+                status(notice.message, notice.kind);
+              },
+              onError: function (error) {
+                fail(String((error && error.message) || error));
+              },
+            });
+          })
+          .then(function (result) {
+            mounted = result;
+            // Formats that cannot be written back (doc, xls, RTF) are shown read-only by the editor itself.
+            var writable = result.file.format === 'docx' || result.file.format === 'xlsx';
+            if (!writable) readOnly = true;
+            saveButton.hidden = readOnly;
+            saveButton.addEventListener('click', save);
+            status('');
+            // For the console, and for tests of this page.
+            window.bymEditor = result;
+            tell('ready');
+          })
+          .catch(function (error) {
+            fail(String((error && error.message) || error));
+          });
+      })();
+    </script>
+  </body>
+</html>

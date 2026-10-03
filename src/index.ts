@@ -26,6 +26,7 @@ export { readXlsx } from './formats/xlsx/workbook';
 export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
 export { readDocx } from './formats/docx/document';
 export { buildDocx, writeDocx, type DocxWriteReport } from './formats/docx/write';
+export { createBlank, type BlankOptions } from './formats/blank';
 export * as docOps from './ops/doc/index';
 export { readDoc } from './formats/doc/document';
 export { readRtf } from './formats/rtf/document';
