@@ -3,7 +3,7 @@
 //
 // The workbook is one stream of records: a "globals" substream (fonts, formats,
 // sheet list, shared strings, names) and one substream per sheet. Nothing is
-// written back: the model is for viewing, and for saving as xlsx later.
+// written back: the model is for viewing, and for saving as xlsx.
 
 import { relativeExtent, shiftFormula } from '../../calc/refs';
 import type { CfbFile } from '../../cfb';
@@ -29,11 +29,13 @@ import { isKnownCodepage } from './codepage';
 import { REC_MSODRAWING, REC_MSODRAWINGGROUP, REC_OBJ, REC_TXO, XlsPictures, XlsSheetArt } from './drawings';
 import { errorText, formulaText, releaseFormulaBytes, type FormulaContext, type XlsSupBook, type XlsXti } from './formula';
 import { readHyperlink, readHyperlinkTooltip } from './hyperlink';
+import { XlsPageSetup } from './page-setup';
 import {
   REC_ARRAY,
   REC_BLANK,
   REC_BOF,
   REC_BOOLERR,
+  REC_BOTTOMMARGIN,
   REC_BOUNDSHEET,
   REC_CODEPAGE,
   REC_COLINFO,
@@ -48,12 +50,19 @@ import {
   REC_EXTERNSHEET,
   REC_FILEPASS,
   REC_FONT,
+  REC_FOOTER,
   REC_FORMAT,
   REC_FORMULA,
+  REC_GRIDSET,
+  REC_HCENTER,
+  REC_HEADER,
+  REC_HEADERFOOTER,
   REC_HLINK,
   REC_HLINKTOOLTIP,
+  REC_HORIZONTALPAGEBREAKS,
   REC_LABEL,
   REC_LABELSST,
+  REC_LEFTMARGIN,
   REC_MERGECELLS,
   REC_MULBLANK,
   REC_MULRK,
@@ -62,11 +71,15 @@ import {
   REC_NUMBER,
   REC_PALETTE,
   REC_PANE,
+  REC_PRINTGRIDLINES,
+  REC_PRINTHEADERS,
+  REC_RIGHTMARGIN,
   REC_RK,
   REC_ROW,
   REC_RSTRING,
   REC_SCL,
   REC_SELECTION,
+  REC_SETUP,
   REC_SHRFMLA,
   REC_SST,
   REC_STANDARDWIDTH,
@@ -75,6 +88,11 @@ import {
   REC_SUPBOOK,
   REC_TABLE,
   REC_THEME,
+  REC_TOPMARGIN,
+  REC_USERSVIEWBEGIN,
+  REC_USERSVIEWEND,
+  REC_VCENTER,
+  REC_VERTICALPAGEBREAKS,
   REC_WINDOW1,
   REC_WINDOW2,
   REC_WSBOOL,
@@ -583,6 +601,9 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   /** Tooltips by the range of the link they belong to; a later one for the same range replaces the earlier. */
   const tooltips = new Map<string, string>();
   const rangeKey = (range: CellRange): string => range.top + ',' + range.left + ',' + range.bottom + ',' + range.right;
+  const page = new XlsPageSetup(stream, biff8, codepage);
+  /** Inside the records of a custom view, which has page settings of its own; they are not the sheet's. */
+  let customView = false;
 
   let p = start + 4 + recordLength(stream, start);
   let depth = 0;
@@ -935,7 +956,35 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
         continue;
       }
       case REC_WSBOOL:
-        if (length >= 2 && view.getUint16(d, true) & 0x0010 && sheet.kind === 'worksheet') sheet.kind = 'dialogsheet';
+        if (length >= 2) {
+          const flags = view.getUint16(d, true);
+          if (flags & 0x0010 && sheet.kind === 'worksheet') sheet.kind = 'dialogsheet';
+          // A custom view keeps its own copy, which is not the sheet's.
+          if (!customView) page.options(flags);
+        }
+        continue;
+      case REC_USERSVIEWBEGIN:
+      case REC_USERSVIEWEND:
+        customView = id === REC_USERSVIEWBEGIN;
+        count(report.skippedRecords, id);
+        continue;
+      case REC_LEFTMARGIN:
+      case REC_RIGHTMARGIN:
+      case REC_TOPMARGIN:
+      case REC_BOTTOMMARGIN:
+      case REC_HEADER:
+      case REC_FOOTER:
+      case REC_HCENTER:
+      case REC_VCENTER:
+      case REC_PRINTHEADERS:
+      case REC_PRINTGRIDLINES:
+      case REC_GRIDSET:
+      case REC_SETUP:
+      case REC_HORIZONTALPAGEBREAKS:
+      case REC_VERTICALPAGEBREAKS:
+      case REC_HEADERFOOTER:
+        // How the sheet is printed. One that says nothing the reader can use is counted with the records not read.
+        if (customView || !page.read(id, d - 4, length)) count(report.skippedRecords, id);
         continue;
       case REC_SHEETEXT:
         if (length >= 20) {
@@ -979,6 +1028,9 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
     if (floating.comments) sheet.comments = floating.comments;
     if (floating.warnings) sheet.warnings = floating.warnings;
   }
+
+  const pageSetup = page.finish();
+  if (pageSetup) sheet.pageSetup = pageSetup;
 
   // Formulas that belong to a group.
   for (let i = 0; i < linkedCells.length; i++) {

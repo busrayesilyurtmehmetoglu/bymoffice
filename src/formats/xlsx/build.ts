@@ -16,6 +16,7 @@
 //     as a frame without a picture.
 //   - Threaded comments are written as notes, without their replies.
 //   - Of conditional formats, what only the 2010 extension can say is left out.
+//   - Of the page setup, a value a file cannot state is left out.
 
 import { shiftFormula, type StructuralEdit } from '../../calc/refs';
 import { createSheetMetrics, type SheetMetrics } from '../../layout/sheet-metrics';
@@ -40,11 +41,13 @@ import {
   type DrawingShape,
   type DrawingText,
   type Fill,
+  type PageBreak,
   type RichRun,
   type Row,
   type SharedString,
   type Sheet,
   type SheetComment,
+  type SheetPageSetup,
   type StyleSheet,
   type Workbook,
 } from '../../model/sheet/types';
@@ -736,6 +739,151 @@ function portableFilter(filter: AutoFilter, notes: Notes): AutoFilter {
   return out;
 }
 
+// --------------------------------------------------------------- page setup
+
+/** The margins applications give a new sheet; they stand in for one the model states no length for. */
+const DEFAULT_MARGINS = { left: 0.7, right: 0.7, top: 0.75, bottom: 0.75, header: 0.3, footer: 0.3 };
+/** Page breaks in one direction that applications take. */
+const MAX_PAGE_BREAKS = 1026;
+
+const PAGE_ORIENTATIONS = ['default', 'portrait', 'landscape'];
+const PAGE_ORDERS = ['downThenOver', 'overThenDown'];
+const PAGE_COMMENTS = ['none', 'asDisplayed', 'atEnd'];
+const PAGE_ERRORS = ['displayed', 'blank', 'dash', 'NA'];
+const PAPER_MEASURE = /^[0-9]{1,9}(\.[0-9]{1,9})?(mm|cm|in|pt|pc|pi)$/;
+
+const isUint32 = (value: unknown): value is number => isIndex(value, 0x100000000);
+
+const BAD_PAGE_VALUE = 'Page setup: a value a file cannot state (a number out of range, a name that is none) is left out';
+
+/** The attributes of an element, each from a field of the model that is checked by `valid`; a field that fails is left out and noted. */
+function pageAttrs(source: object, fields: [name: string, valid: (value: unknown) => boolean][], notes: Notes): string {
+  let out = '';
+  for (const [name, valid] of fields) {
+    const value = (source as Record<string, unknown>)[name];
+    if (value === undefined) continue;
+    if (!valid(value)) notes.add(BAD_PAGE_VALUE);
+    else out += ` ${name}="${typeof value === 'boolean' ? (value ? '1' : '0') : escapeAttr(String(value))}"`;
+  }
+  return out;
+}
+
+const isFlag = (value: unknown) => typeof value === 'boolean';
+const oneOf = (names: string[]) => (value: unknown) => typeof value === 'string' && names.indexOf(value) >= 0;
+
+/** <rowBreaks> or <colBreaks>: the breaks inside the sheet, one per row or column, in order. */
+function pageBreaksXml(name: string, breaks: PageBreak[] | undefined, rows: boolean, notes: Notes): string {
+  if (!Array.isArray(breaks) || breaks.length === 0) return '';
+  const limit = rows ? MAX_ROWS : MAX_COLS;
+  const crossLimit = rows ? MAX_COLS : MAX_ROWS;
+  const seen = new Set<number>();
+  const kept: PageBreak[] = [];
+  for (const item of breaks) {
+    if (!item || !isIndex(item.at, limit) || item.at < 1 || !isIndex(item.min, crossLimit) || !isIndex(item.max, crossLimit) || item.min > item.max || seen.has(item.at)) {
+      notes.add('Page setup: a page break outside the sheet, or a second one at the same place, is left out');
+      continue;
+    }
+    seen.add(item.at);
+    kept.push(item);
+  }
+  if (kept.length === 0) return '';
+  if (kept.length > MAX_PAGE_BREAKS) notes.add(`Page setup: a sheet has more than ${MAX_PAGE_BREAKS} page breaks in one direction, which applications may refuse`);
+  kept.sort((a, b) => a.at - b.at);
+  let manual = 0;
+  let inner = '';
+  for (const item of kept) {
+    if (item.manual) manual++;
+    inner += `<brk id="${item.at}" min="${item.min}" max="${item.max}"${item.manual ? ' man="1"' : ''}${item.pivot ? ' pt="1"' : ''}/>`;
+  }
+  return `<${name} count="${kept.length}" manualBreakCount="${manual}">${inner}</${name}>`;
+}
+
+interface PageSetupXml {
+  /** <pageSetUpPr>, a child of <sheetPr>; '' when the model states nothing for it. */
+  properties: string;
+  /** <printOptions>, <pageMargins>, <pageSetup> and <headerFooter>, in the order of the schema. */
+  page: string;
+  rowBreaks: string;
+  colBreaks: string;
+}
+
+/** The elements that say how a sheet is printed. What the model states and a file cannot hold is noted. */
+function pageSetupXml(setup: SheetPageSetup, notes: Notes): PageSetupXml {
+  const properties = pageAttrs(setup, [['autoPageBreaks', isFlag], ['fitToPage', isFlag]], notes);
+  let page = '';
+
+  if (setup.print) {
+    page += `<printOptions${pageAttrs(setup.print, [['horizontalCentered', isFlag], ['verticalCentered', isFlag], ['headings', isFlag], ['gridLines', isFlag], ['gridLinesSet', isFlag]], notes)}/>`;
+  }
+
+  if (setup.margins) {
+    // The element has to state all six.
+    page += '<pageMargins';
+    for (const name of ['left', 'right', 'top', 'bottom', 'header', 'footer'] as const) {
+      let value = setup.margins[name];
+      if (!(typeof value === 'number' && value >= 0 && value < Infinity)) {
+        value = DEFAULT_MARGINS[name];
+        notes.add('Page setup: a margin that is no length is written as the default one');
+      }
+      page += ` ${name}="${value}"`;
+    }
+    page += '/>';
+  }
+
+  if (setup.page) {
+    const isMeasure = (value: unknown) => typeof value === 'string' && PAPER_MEASURE.test(value);
+    // "Use the first page number" without a number the file can state would number the pages from 1 by a
+    // setting nobody made: the two go together.
+    const settings = setup.page.useFirstPageNumber && !isUint32(setup.page.firstPageNumber) ? { ...setup.page, useFirstPageNumber: undefined } : setup.page;
+    page += `<pageSetup${pageAttrs(
+      settings,
+      [
+        ['paperSize', isUint32],
+        ['paperHeight', isMeasure],
+        ['paperWidth', isMeasure],
+        ['scale', (value) => isUint32(value) && value >= 10 && value <= 400],
+        ['firstPageNumber', isUint32],
+        ['fitToWidth', isUint32],
+        ['fitToHeight', isUint32],
+        ['pageOrder', oneOf(PAGE_ORDERS)],
+        ['orientation', oneOf(PAGE_ORIENTATIONS)],
+        ['usePrinterDefaults', isFlag],
+        ['blackAndWhite', isFlag],
+        ['draft', isFlag],
+        ['cellComments', oneOf(PAGE_COMMENTS)],
+        ['useFirstPageNumber', isFlag],
+        ['errors', oneOf(PAGE_ERRORS)],
+        ['horizontalDpi', isUint32],
+        ['verticalDpi', isUint32],
+        ['copies', isUint32],
+      ],
+      notes,
+    )}/>`;
+  }
+
+  const texts = setup.headerFooter;
+  if (texts) {
+    let inner = '';
+    for (const name of ['oddHeader', 'oddFooter', 'evenHeader', 'evenFooter', 'firstHeader', 'firstFooter'] as const) {
+      const text = texts[name];
+      if (text === undefined) continue;
+      if (typeof text !== 'string') notes.add(BAD_PAGE_VALUE);
+      // An empty text is none. What XML cannot carry is written as an escape, as in cell text.
+      // Spaces at either end are part of the text.
+      else if (text !== '') inner += `<${name}${/^\s|\s$/.test(text) ? ' xml:space="preserve"' : ''}>${escapeXstring(text)}</${name}>`;
+    }
+    const attrs = pageAttrs(texts, [['differentOddEven', isFlag], ['differentFirst', isFlag], ['scaleWithDoc', isFlag], ['alignWithMargins', isFlag]], notes);
+    page += inner === '' ? `<headerFooter${attrs}/>` : `<headerFooter${attrs}>${inner}</headerFooter>`;
+  }
+
+  return {
+    properties: properties === '' ? '' : `<pageSetUpPr${properties}/>`,
+    page,
+    rowBreaks: pageBreaksXml('rowBreaks', setup.rowBreaks, true, notes),
+    colBreaks: pageBreaksXml('colBreaks', setup.colBreaks, false, notes),
+  };
+}
+
 // ----------------------------------------------------------------- drawings
 
 const emu = (value: number) => Math.round(Math.min(Math.max(value, 0), MAX_EMU));
@@ -1145,7 +1293,9 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   const metricsOf = () => metrics || (metrics = createSheetMetrics(sheet));
 
   const parts: string[] = [`${XML_DECLARATION}<worksheet xmlns="${NS_MAIN}" xmlns:r="${NS_REL}">`];
-  if (sheet.tabColor) parts.push(`<sheetPr>${colorXml('tabColor', sheet.tabColor)}</sheetPr>`);
+  const pageSetup = sheet.pageSetup ? pageSetupXml(sheet.pageSetup, notes) : undefined;
+  const properties = (sheet.tabColor ? colorXml('tabColor', sheet.tabColor) : '') + (pageSetup ? pageSetup.properties : '');
+  if (properties !== '') parts.push(`<sheetPr>${properties}</sheetPr>`);
   // Filled in once the rows are written: the range of what was written.
   const dimensionAt = parts.length;
   parts.push('');
@@ -1271,6 +1421,13 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   }
   if (links !== '') parts.push(`<hyperlinks>${links}</hyperlinks>`);
 
+  if (pageSetup) {
+    parts.push(pageSetup.page);
+    // Like conditional formats, the breaks are kept as the file has them and follow the rows and columns moved since.
+    if (pageSetup.rowBreaks !== '') parts.push(adjustSheetElement(pageSetup.rowBreaks, sheet.name, own, foreign));
+    if (pageSetup.colBreaks !== '') parts.push(adjustSheetElement(pageSetup.colBreaks, sheet.name, own, foreign));
+  }
+
   if (sheet.drawings && sheet.drawings.length > 0) {
     const context: DrawingContext = { rels: new Rels(), media, embeds: new Map(), notes, nextId: 1 };
     const xml = drawingXml(sheet, metricsOf(), context);
@@ -1321,7 +1478,7 @@ function sheetIdsOf(sheets: Sheet[]): number[] {
 /**
  * Writes a workbook model as a new xlsx file: every sheet with its cells,
  * formulas and their stored results, formats, merged cells, sizes, panes,
- * links, comments and drawings, the defined names and the styles. Nothing of
+ * links, comments, drawings and page setup, the defined names and the styles. Nothing of
  * the file the model was read from is used, so a model read from an xls file
  * (or made in code) can be written. What the model holds and the file cannot
  * carry is listed in `options.report`.

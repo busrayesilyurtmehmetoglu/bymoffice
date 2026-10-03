@@ -2,7 +2,7 @@
 // one read back from a file written from it (buildXlsx). Two models with the
 // same content give the same text, whatever their table indexes are: formats
 // are compared by what they resolve to, shared formulas by the text each cell
-// has, pictures by their bytes.
+// has, pictures by their bytes. The page setup is compared field by field.
 //
 // The two sides are not treated alike. The model that was written is turned
 // into what the file is EXPECTED to read back as (`expected: true`): where the
@@ -27,8 +27,10 @@ import {
   type DrawingObject,
   type DrawingText,
   type DrawingTextRun,
+  type PageBreak,
   type Sheet,
   type SheetComment,
+  type SheetPageSetup,
   type StyleSheet,
   type Workbook,
 } from '../src/model/sheet/types';
@@ -233,6 +235,93 @@ function commentContent(comment: SheetComment, metrics: SheetMetrics, expected: 
   };
 }
 
+const isUint32 = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+const isFlag = (value: unknown) => typeof value === 'boolean';
+const oneOf = (...names: string[]) => (value: unknown) => typeof value === 'string' && names.includes(value);
+const isMeasure = (value: unknown) => typeof value === 'string' && /^[0-9]{1,9}(\.[0-9]{1,9})?(mm|cm|in|pt|pc|pi)$/.test(value);
+const isText = (value: unknown) => typeof value === 'string' && value !== '';
+
+/** The fields of a record a file can state, by the check each has to pass; the writer leaves the others out (with a warning). */
+function statable(source: object | undefined, fields: Record<string, (value: unknown) => boolean>): Record<string, unknown> | undefined {
+  if (!source) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [name, valid] of Object.entries(fields)) {
+    const value = (source as Record<string, unknown>)[name];
+    if (value !== undefined && valid(value)) out[name] = value;
+  }
+  return out;
+}
+
+function breaksContent(breaks: PageBreak[] | undefined, limit: number, crossLimit: number): unknown {
+  const seen = new Set<number>();
+  const inside = (value: number, end: number) => Number.isInteger(value) && value >= 0 && value < end;
+  const kept = (breaks || []).filter((item) => {
+    if (!item || !inside(item.at, limit) || item.at < 1 || !inside(item.min, crossLimit) || !inside(item.max, crossLimit) || item.min > item.max || seen.has(item.at)) return false;
+    seen.add(item.at);
+    return true;
+  });
+  kept.sort((a, b) => a.at - b.at);
+  return kept.length === 0 ? undefined : kept.map((item) => ({ at: item.at, min: item.min, max: item.max, manual: !!item.manual, pivot: item.pivot || undefined }));
+}
+
+/**
+ * How a sheet is printed. The model read back is taken as it is. Of the model that was written, what a file
+ * cannot state is left out as the writer leaves it out: a number out of range, a name that is none, an empty
+ * header, a break outside the sheet; a margin that is no length is the default one.
+ */
+function pageSetupContent(setup: SheetPageSetup | undefined, expected: boolean): unknown {
+  if (!setup || !expected) return setup;
+  const defaults: Record<string, number> = { left: 0.7, right: 0.7, top: 0.75, bottom: 0.75, header: 0.3, footer: 0.3 };
+  const margins: Record<string, number> = {};
+  for (const name of Object.keys(defaults)) {
+    const value = setup.margins ? (setup.margins as unknown as Record<string, unknown>)[name] : undefined;
+    margins[name] = typeof value === 'number' && value >= 0 && value < Infinity ? value : defaults[name];
+  }
+  const flags = statable(setup, { fitToPage: isFlag, autoPageBreaks: isFlag }) as Record<string, unknown>;
+  const out = {
+    ...flags,
+    margins: setup.margins ? margins : undefined,
+    page: statable(setup.page, {
+      paperSize: isUint32,
+      paperWidth: isMeasure,
+      paperHeight: isMeasure,
+      orientation: oneOf('default', 'portrait', 'landscape'),
+      scale: (value) => isUint32(value) && (value as number) >= 10 && (value as number) <= 400,
+      fitToWidth: isUint32,
+      fitToHeight: isUint32,
+      firstPageNumber: isUint32,
+      // Stated only together with a number the file can state.
+      useFirstPageNumber: (value) => isFlag(value) && (value !== true || isUint32(setup.page && setup.page.firstPageNumber)),
+      pageOrder: oneOf('downThenOver', 'overThenDown'),
+      blackAndWhite: isFlag,
+      draft: isFlag,
+      cellComments: oneOf('none', 'asDisplayed', 'atEnd'),
+      errors: oneOf('displayed', 'blank', 'dash', 'NA'),
+      horizontalDpi: isUint32,
+      verticalDpi: isUint32,
+      copies: isUint32,
+      usePrinterDefaults: isFlag,
+    }),
+    print: statable(setup.print, { horizontalCentered: isFlag, verticalCentered: isFlag, headings: isFlag, gridLines: isFlag, gridLinesSet: isFlag }),
+    headerFooter: statable(setup.headerFooter, {
+      oddHeader: isText,
+      oddFooter: isText,
+      evenHeader: isText,
+      evenFooter: isText,
+      firstHeader: isText,
+      firstFooter: isText,
+      differentOddEven: isFlag,
+      differentFirst: isFlag,
+      scaleWithDoc: isFlag,
+      alignWithMargins: isFlag,
+    }),
+    rowBreaks: breaksContent(setup.rowBreaks, MAX_ROWS, MAX_COLS),
+    colBreaks: breaksContent(setup.colBreaks, MAX_COLS, MAX_ROWS),
+  };
+  // A record that states nothing a file can hold is no record.
+  return Object.values(out).some((value) => value !== undefined) ? out : undefined;
+}
+
 function oneCell(ref: string | undefined): string | undefined {
   const range = ref === undefined ? undefined : parseRange(ref);
   return range ? cellName(range.top, range.left) : undefined;
@@ -303,6 +392,7 @@ function sheetContent(sheet: Sheet, format: (index: number | undefined) => strin
     autoFilter: sheet.autoFilter && { range: sheet.autoFilter.range, columns: sheet.autoFilter.columns.map((column) => ({ ...column, raw: undefined })) },
     drawings,
     comments: (sheet.comments || []).map((comment) => commentContent(comment, metrics, expected)),
+    pageSetup: pageSetupContent(sheet.pageSetup, expected),
   };
 }
 

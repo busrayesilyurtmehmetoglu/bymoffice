@@ -25,10 +25,15 @@ import {
   type FilterColumn,
   type FilterCondition,
   type FilterDateGroup,
+  type HeaderFooter,
   type Hyperlink,
+  type PageBreak,
+  type PageSettings,
+  type PrintOptions,
   type Row,
   type SharedString,
   type Sheet,
+  type SheetPageSetup,
   type SheetView,
   type SortCondition,
   type SortState,
@@ -207,6 +212,12 @@ function parseSheetPr(sc: XmlScanner, sheet: Sheet): void {
     if (sc.local === 'tabColor') {
       const color = parseColor(sc);
       if (color) sheet.tabColor = color;
+    } else if (sc.local === 'pageSetUpPr') {
+      const fit = parseFlag(sc.attr('fitToPage'));
+      if (fit !== undefined) pageSetupOf(sheet).fitToPage = fit;
+      const breaks = parseFlag(sc.attr('autoPageBreaks'));
+      if (breaks !== undefined) pageSetupOf(sheet).autoPageBreaks = breaks;
+      sc.skip();
     } else sc.skip();
   }
 }
@@ -972,6 +983,155 @@ function parseDataValidations(sc: XmlScanner, out: DataValidation[], extension: 
   });
 }
 
+// ---------------------------------------------------------------------------
+// Page setup
+//
+// A view for reading, like the conditional formats: the writer copies the source
+// elements, with the attributes the model has no field for (the relationship of the
+// printer settings among them). Of an element that is stated twice the first one counts.
+
+const pageSetupOf = (sheet: Sheet): SheetPageSetup => sheet.pageSetup || (sheet.pageSetup = {});
+
+/** An xsd:boolean, or undefined for an attribute that is missing or is none. */
+function parseFlag(text: string | undefined): boolean | undefined {
+  if (text === '1' || text === 'true') return true;
+  if (text === '0' || text === 'false') return false;
+  return undefined;
+}
+
+/** An xsd:unsignedInt, or -1. */
+function parseUint32(text: string | undefined): number {
+  if (text === undefined || text.length === 0 || text.length > 10) return -1;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 48 || c > 57) return -1;
+  }
+  const value = Number(text);
+  return value <= 0xffffffff ? value : -1;
+}
+
+/** The margins applications give a new sheet; they stand in for an attribute that is missing or is no margin. */
+const DEFAULT_MARGINS = { left: 0.7, right: 0.7, top: 0.75, bottom: 0.75, header: 0.3, footer: 0.3 };
+
+/** With a <pageMargins> open tag current. */
+function parsePageMargins(sc: XmlScanner): SheetPageSetup['margins'] {
+  const margins = { ...DEFAULT_MARGINS };
+  for (const name of ['left', 'right', 'top', 'bottom', 'header', 'footer'] as const) {
+    const value = parseFinite(sc.attr(name));
+    if (value !== undefined && value >= 0) margins[name] = value;
+  }
+  return margins;
+}
+
+/** A length with its unit, as the size of a paper without a code is stated ("210mm", "8.5in"). */
+const PAPER_MEASURE = /^[0-9]{1,9}(\.[0-9]{1,9})?(mm|cm|in|pt|pc|pi)$/;
+
+/** With a <pageSetup> open tag current. Attributes that hold no value of their type state nothing. */
+function parsePageSettings(sc: XmlScanner): PageSettings {
+  const page: PageSettings = {};
+  for (const [name, value] of sc.attrs()) {
+    switch (name) {
+      case 'paperSize':
+      case 'fitToWidth':
+      case 'fitToHeight':
+      case 'firstPageNumber':
+      case 'horizontalDpi':
+      case 'verticalDpi':
+      case 'copies': {
+        const number = parseUint32(value);
+        if (number >= 0) page[name] = number;
+        break;
+      }
+      case 'scale': {
+        const scale = parseUint32(value);
+        if (scale >= 10 && scale <= 400) page.scale = scale;
+        break;
+      }
+      case 'paperWidth':
+      case 'paperHeight':
+        if (PAPER_MEASURE.test(value)) page[name] = value;
+        break;
+      case 'orientation':
+        if (value === 'default' || value === 'portrait' || value === 'landscape') page.orientation = value;
+        break;
+      case 'pageOrder':
+        if (value === 'downThenOver' || value === 'overThenDown') page.pageOrder = value;
+        break;
+      case 'cellComments':
+        if (value === 'none' || value === 'asDisplayed' || value === 'atEnd') page.cellComments = value;
+        break;
+      case 'errors':
+        if (value === 'displayed' || value === 'blank' || value === 'dash' || value === 'NA') page.errors = value;
+        break;
+      case 'useFirstPageNumber':
+      case 'blackAndWhite':
+      case 'draft':
+      case 'usePrinterDefaults': {
+        const flag = parseFlag(value);
+        if (flag !== undefined) page[name] = flag;
+        break;
+      }
+    }
+  }
+  return page;
+}
+
+/** With a <printOptions> open tag current. */
+function parsePrintOptions(sc: XmlScanner): PrintOptions {
+  const print: PrintOptions = {};
+  for (const name of ['horizontalCentered', 'verticalCentered', 'headings', 'gridLines', 'gridLinesSet'] as const) {
+    const flag = parseFlag(sc.attr(name));
+    if (flag !== undefined) print[name] = flag;
+  }
+  return print;
+}
+
+/** With a <headerFooter> open tag current: reads the texts and consumes the element. */
+function parseHeaderFooter(sc: XmlScanner): HeaderFooter {
+  const out: HeaderFooter = {};
+  for (const name of ['differentOddEven', 'differentFirst', 'scaleWithDoc', 'alignWithMargins'] as const) {
+    const flag = parseFlag(sc.attr(name));
+    if (flag !== undefined) out[name] = flag;
+  }
+  eachChild(sc, () => {
+    const local = sc.local;
+    if (local !== 'oddHeader' && local !== 'oddFooter' && local !== 'evenHeader' && local !== 'evenFooter' && local !== 'firstHeader' && local !== 'firstFooter') return sc.skip();
+    // Like cell text, these may hold characters written as _xHHHH_. An empty one is none.
+    const text = decodeXstring(sc.readText());
+    if (text !== '' && out[local] === undefined) out[local] = text;
+  });
+  return out;
+}
+
+/**
+ * With a <rowBreaks> or <colBreaks> open tag current: reads the breaks and consumes the
+ * element. A break that is not inside the sheet, and a second one at the same place, is left out.
+ */
+function parsePageBreaks(sc: XmlScanner, rows: boolean): PageBreak[] {
+  const limit = rows ? MAX_ROWS : MAX_COLS;
+  const crossLimit = rows ? MAX_COLS : MAX_ROWS;
+  const breaks: PageBreak[] = [];
+  const seen = new Set<number>();
+  let sorted = true;
+  eachChild(sc, () => {
+    if (sc.local === 'brk') {
+      const at = parseUint(sc.attr('id'));
+      const min = Math.max(parseUint(sc.attr('min')), 0);
+      const max = Math.max(parseUint(sc.attr('max')), 0);
+      if (at >= 1 && at < limit && min <= max && max < crossLimit && !seen.has(at)) {
+        seen.add(at);
+        if (breaks.length > 0 && breaks[breaks.length - 1].at > at) sorted = false;
+        const item: PageBreak = { at, min, max, manual: parseBool(sc.attr('man'), false) };
+        if (parseBool(sc.attr('pt'), false)) item.pivot = true;
+        breaks.push(item);
+      }
+    }
+    sc.skip();
+  });
+  if (!sorted) breaks.sort((a, b) => a.at - b.at);
+  return breaks;
+}
+
 /**
  * With an open tag current: calls `visit` at the open tag of every child element and
  * consumes the element. `visit` has to consume the child it is called for (skip() does).
@@ -1108,8 +1268,37 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
         case 'extLst':
           parseSheetExtensions(sc, extended, validations);
           break;
+        case 'pageMargins':
+          if (!pageSetupOf(sheet).margins) pageSetupOf(sheet).margins = parsePageMargins(sc);
+          sc.skip();
+          break;
+        case 'pageSetup':
+          if (!pageSetupOf(sheet).page) pageSetupOf(sheet).page = parsePageSettings(sc);
+          sc.skip();
+          break;
+        case 'printOptions':
+          if (!pageSetupOf(sheet).print) pageSetupOf(sheet).print = parsePrintOptions(sc);
+          sc.skip();
+          break;
+        case 'headerFooter':
+          if (pageSetupOf(sheet).headerFooter) sc.skip();
+          else pageSetupOf(sheet).headerFooter = parseHeaderFooter(sc);
+          break;
+        case 'rowBreaks':
+        case 'colBreaks': {
+          const rows = sc.local === 'rowBreaks';
+          const setup = pageSetupOf(sheet);
+          if (rows ? setup.rowBreaks : setup.colBreaks) sc.skip();
+          else {
+            const breaks = parsePageBreaks(sc, rows);
+            // An element without a break says nothing.
+            if (breaks.length > 0) setup[rows ? 'rowBreaks' : 'colBreaks'] = breaks;
+            else if (Object.keys(setup).length === 0) delete sheet.pageSetup;
+          }
+          break;
+        }
         default:
-          // Drawings, page setup, ...: kept in the source part.
+          // Drawings, protection, ...: kept in the source part.
           sc.skip();
       }
     }

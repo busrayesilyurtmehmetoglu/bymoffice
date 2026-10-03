@@ -633,6 +633,135 @@ export interface SheetComment {
   box?: DrawingAnchor;
 }
 
+/** The margins of the printed page, in inches (<pageMargins>). `header` and `footer` are the distances of the header and the footer from the edge of the paper. */
+export interface PageMargins {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  header: number;
+  footer: number;
+}
+
+/**
+ * Paper, orientation and scaling of the printed page (<pageSetup>). A field is present when the
+ * file states it; a missing one has the default named with it.
+ */
+export interface PageSettings {
+  /** Paper size code (1 Letter, 5 Legal, 8 A3, 9 A4, 11 A5, ...). Default 1; with `usePrinterDefaults` the printer's paper. */
+  paperSize?: number;
+  /** Size of a paper that has no code, as a measure with its unit ("210mm"); replaces `paperSize`. */
+  paperWidth?: string;
+  paperHeight?: string;
+  /** "default" (the default) leaves the choice to the application, which prints upright. */
+  orientation?: 'default' | 'portrait' | 'landscape';
+  /** Percent, 10..400. Default 100. Not used while the sheet is fitted to pages (SheetPageSetup.fitToPage). */
+  scale?: number;
+  /** Pages the sheet is fitted to, across and down, while `fitToPage` is set; 0 is "as many as needed". Default 1. */
+  fitToWidth?: number;
+  fitToHeight?: number;
+  /** Number of the first page; counts only with `useFirstPageNumber`. Default 1. */
+  firstPageNumber?: number;
+  /** Default false: pages are numbered from 1. */
+  useFirstPageNumber?: boolean;
+  /** The order pages are printed and numbered in. Default "downThenOver". */
+  pageOrder?: 'downThenOver' | 'overThenDown';
+  /** Default false. */
+  blackAndWhite?: boolean;
+  /** Draft quality, without graphics. Default false. */
+  draft?: boolean;
+  /** Whether comments are printed, and where. Default "none". */
+  cellComments?: 'none' | 'asDisplayed' | 'atEnd';
+  /** What is printed for a cell that holds an error. Default "displayed". */
+  errors?: 'displayed' | 'blank' | 'dash' | 'NA';
+  /** Print resolution in dots per inch; values near 4,294,967,295 are the printer driver's quality levels (draft, low, medium, high). Default 600. */
+  horizontalDpi?: number;
+  verticalDpi?: number;
+  /** Default 1. */
+  copies?: number;
+  /** What the element does not state is the printer's own setting and not the default of the format. Default true. */
+  usePrinterDefaults?: boolean;
+}
+
+/** What is printed beside the cells, and where on the page (<printOptions>). Present when the file states it, like PageSettings. */
+export interface PrintOptions {
+  /** The cells are centred between the left and the right margin. Default false. */
+  horizontalCentered?: boolean;
+  /** The cells are centred between the top and the bottom margin. Default false. */
+  verticalCentered?: boolean;
+  /** Row numbers and column letters are printed. Default false. */
+  headings?: boolean;
+  /** Grid lines are printed; only together with `gridLinesSet`. Default false. */
+  gridLines?: boolean;
+  /** Default true. */
+  gridLinesSet?: boolean;
+}
+
+/**
+ * Headers and footers of the printed page (<headerFooter>). A text is in the code of the
+ * format: "&L", "&C" and "&R" start the left, centre and right section, "&P" is the page
+ * number, "&N" the page count, "&D" the date, "&T" the time, "&F" the file name, "&A" the
+ * sheet name, '&"font,style"' and "&12" set a font and a size, "&&" is an ampersand.
+ */
+export interface HeaderFooter {
+  /** Header and footer of every page, or of the odd pages only while `differentOddEven` is set. */
+  oddHeader?: string;
+  oddFooter?: string;
+  /** Used while `differentOddEven` is set. */
+  evenHeader?: string;
+  evenFooter?: string;
+  /** Used while `differentFirst` is set. */
+  firstHeader?: string;
+  firstFooter?: string;
+  /** Default false. */
+  differentOddEven?: boolean;
+  /** Default false. */
+  differentFirst?: boolean;
+  /** Headers and footers are scaled with the sheet. Default true. */
+  scaleWithDoc?: boolean;
+  /** Headers and footers start and end at the page margins. Default true. */
+  alignWithMargins?: boolean;
+}
+
+/** A page break (<brk>). */
+export interface PageBreak {
+  /**
+   * The first row (of rowBreaks) or column (of colBreaks) of the new page: the break is above
+   * that row, left of that column. Never 0.
+   */
+  at: number;
+  /** The columns (of a row break) or rows (of a column break) the break spans, first and last. */
+  min: number;
+  max: number;
+  /** Set by hand, not by the application while fitting pages. */
+  manual: boolean;
+  /** Made by a pivot table. */
+  pivot?: boolean;
+}
+
+/**
+ * How a sheet is printed: one member per element of a worksheet part (<pageMargins>,
+ * <pageSetup>, <printOptions>, <headerFooter>, <rowBreaks>, <colBreaks>, and <pageSetUpPr> of
+ * <sheetPr>). A view for reading, like conditional formats: a save of the file it was read
+ * from copies the source elements, and edits do not change it (structuralEdits are applied
+ * to the breaks where a new file is written). Print areas and print titles are defined
+ * names ("_xlnm.Print_Area", "_xlnm.Print_Titles"). Data of a printer driver is not held.
+ */
+export interface SheetPageSetup {
+  margins?: PageMargins;
+  page?: PageSettings;
+  print?: PrintOptions;
+  headerFooter?: HeaderFooter;
+  /** The sheet is scaled to `page.fitToWidth` by `page.fitToHeight` pages, not by `page.scale`. Default false. */
+  fitToPage?: boolean;
+  /** Automatic page breaks are shown on the sheet. Default true. */
+  autoPageBreaks?: boolean;
+  /** In ascending order, one per row. */
+  rowBreaks?: PageBreak[];
+  /** In ascending order, one per column. */
+  colBreaks?: PageBreak[];
+}
+
 /** Where the bytes of pictures come from; read only when a picture is first shown. */
 export interface WorkbookMedia {
   readPart(key: string): Promise<Uint8Array>;
@@ -680,6 +809,8 @@ export interface Sheet {
    * by edits: structuralEdits are applied where they are evaluated (see DataValidations).
    */
   dataValidations?: DataValidation[];
+  /** Margins, paper, scaling, headers and footers and page breaks of the printed sheet, as the file has them. */
+  pageSetup?: SheetPageSetup;
   /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */
   modified?: boolean;
   /**

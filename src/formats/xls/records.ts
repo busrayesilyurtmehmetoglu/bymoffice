@@ -6,12 +6,22 @@
 
 export const REC_FORMULA = 0x0006;
 export const REC_EOF = 0x000a;
+export const REC_HEADER = 0x0014;
+export const REC_FOOTER = 0x0015;
 export const REC_EXTERNSHEET = 0x0017;
 export const REC_NAME = 0x0018;
+export const REC_VERTICALPAGEBREAKS = 0x001a;
+export const REC_HORIZONTALPAGEBREAKS = 0x001b;
 export const REC_NOTE = 0x001c;
 export const REC_SELECTION = 0x001d;
 export const REC_DATEMODE = 0x0022;
 export const REC_EXTERNNAME = 0x0023;
+export const REC_LEFTMARGIN = 0x0026;
+export const REC_RIGHTMARGIN = 0x0027;
+export const REC_TOPMARGIN = 0x0028;
+export const REC_BOTTOMMARGIN = 0x0029;
+export const REC_PRINTHEADERS = 0x002a;
+export const REC_PRINTGRIDLINES = 0x002b;
 export const REC_FILEPASS = 0x002f;
 export const REC_FONT = 0x0031;
 export const REC_CONTINUE = 0x003c;
@@ -21,10 +31,14 @@ export const REC_CODEPAGE = 0x0042;
 export const REC_DEFCOLWIDTH = 0x0055;
 export const REC_COLINFO = 0x007d;
 export const REC_WSBOOL = 0x0081;
+export const REC_GRIDSET = 0x0082;
+export const REC_HCENTER = 0x0083;
+export const REC_VCENTER = 0x0084;
 export const REC_BOUNDSHEET = 0x0085;
 export const REC_PALETTE = 0x0092;
 export const REC_STANDARDWIDTH = 0x0099;
 export const REC_SCL = 0x00a0;
+export const REC_SETUP = 0x00a1;
 export const REC_MULRK = 0x00bd;
 export const REC_MULBLANK = 0x00be;
 export const REC_RSTRING = 0x00d6;
@@ -32,6 +46,8 @@ export const REC_XF = 0x00e0;
 export const REC_MERGECELLS = 0x00e5;
 export const REC_SST = 0x00fc;
 export const REC_LABELSST = 0x00fd;
+export const REC_USERSVIEWBEGIN = 0x01aa;
+export const REC_USERSVIEWEND = 0x01ab;
 export const REC_SUPBOOK = 0x01ae;
 export const REC_HLINK = 0x01b8;
 export const REC_DIMENSION = 0x0200;
@@ -54,6 +70,7 @@ export const REC_BOF = 0x0809;
 export const REC_XFEXT = 0x087d;
 export const REC_CONTINUEFRT12 = 0x087f;
 export const REC_THEME = 0x0896;
+export const REC_HEADERFOOTER = 0x089c;
 
 /** The file is an xls file, but of a kind this reader does not open (encrypted, older than BIFF5). */
 export class XlsUnsupportedError extends Error {
