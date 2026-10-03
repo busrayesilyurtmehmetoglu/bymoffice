@@ -70,7 +70,7 @@ export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 export { base64Decode, base64Encode, createBridge, installBridge, type Bridge, type BridgeDocumentView, type BridgeErrorCode, type BridgeHost, type BridgeState, type InstallBridgeOptions } from './embed/bridge';
 
 export { DocLayout } from './layout/doc/layout';
-export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, TextItem, TextMeasurer } from './layout/doc/types';
+export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, ShapeItem, TextItem, TextMeasurer } from './layout/doc/types';
 export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
@@ -273,7 +273,7 @@ export interface MountConversion {
   to: 'docx' | 'xlsx';
   /**
    * What the model held and the new file does not carry over, each with its
-   * count, in English: for a document, shapes written as plain rectangles,
+   * count, in English: for a document, shapes written as rectangles,
    * groups, pictures without data, characters XML cannot hold, links that
    * are not followed and theme references (the last two only for models
    * that hold them, which those read from doc and RTF do not); for a

@@ -107,6 +107,30 @@ export interface LineItem {
   style: string;
 }
 
+/**
+ * A shape: a geometry in the box (x, y, width, height), filled and outlined.
+ * A "line" runs from the top left to the bottom right corner of the box
+ * before it is flipped; a box of no height is a horizontal line.
+ */
+export interface ShapeItem {
+  type: 'shape';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  geometry: 'rect' | 'roundRect' | 'ellipse' | 'line';
+  /** For "roundRect": the radius of the corners, px. */
+  radius?: number;
+  /** "#RRGGBB"; not filled when missing. */
+  fill?: string;
+  /** The outline: thickness in px, and how it is broken up, by the name of a DrawingML dash ("dash", "sysDot", ...). */
+  stroke?: { color: string; width: number; dash?: string };
+  /** Clockwise rotation in degrees around the centre. */
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+}
+
 /** A picture. The painter loads the part and draws it; until it is loaded it draws a placeholder. */
 export interface ImageItem {
   type: 'image';
@@ -168,7 +192,7 @@ export interface LineMark {
   rotation?: number;
 }
 
-export type PageItem = TextItem | RectItem | LineItem | ImageItem | LineMark;
+export type PageItem = TextItem | RectItem | LineItem | ImageItem | ShapeItem | LineMark;
 
 /** One laid out page. Items are in painting order: what comes later is painted over what came before. */
 export interface LayoutPage {

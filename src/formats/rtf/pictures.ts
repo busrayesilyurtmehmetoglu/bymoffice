@@ -12,6 +12,7 @@
 // same bytes are kept once.
 
 import type { Block, DocMedia, DrawingAnchor, DrawingItem, DrawingPosition, ImageCrop, ImageRef } from '../../model/doc/types';
+import { officeArtLook } from '../../model/doc/shapes';
 import type { XmlElement } from '../../xml';
 import type { MediaStore } from '../doc/drawings';
 
@@ -547,8 +548,12 @@ function numberOf(text: string | undefined): number | undefined {
   return negative ? -value : value;
 }
 
-/** The anchored drawing a shape stands for. */
-export function shapeItem(shape: ShapeState): DrawingItem {
+/**
+ * The anchored drawing a shape stands for. `legacy` is a drawing object of
+ * Word 95, whose lines and fills are control words the reader does not read:
+ * it gets no look.
+ */
+export function shapeItem(shape: ShapeState, legacy = false): DrawingItem {
   const props = shape.props;
   const horizontal: DrawingPosition = { relativeFrom: shape.relativeH || 'column', offset: shape.left * TWIP };
   const vertical: DrawingPosition = { relativeFrom: shape.relativeV || 'paragraph', offset: shape.top * TWIP };
@@ -605,6 +610,28 @@ export function shapeItem(shape: ShapeState): DrawingItem {
 
   if (shape.group) item.kind = 'group';
   else if (shape.images.length && !shape.boxes.length) item.kind = 'picture';
+  else if (!shape.images.length && (numberOf(props.get('shapeType')) === 75 || props.has('pib'))) {
+    // A shape that is to show a picture the file does not have, or the reader does not keep: it is not a box
+    // filled in white. Without text it stays a picture, without an image.
+    if (!shape.boxes.length) item.kind = 'picture';
+  } else if (!legacy) {
+    const flag = (name: string): boolean | undefined => {
+      const value = numberOf(props.get(name));
+      return value === undefined ? undefined : value !== 0;
+    };
+    item.shape = officeArtLook({
+      type: numberOf(props.get('shapeType')),
+      fFilled: flag('fFilled'),
+      fillType: numberOf(props.get('fillType')),
+      fillColor: numberOf(props.get('fillColor')),
+      fillOpacity: numberOf(props.get('fillOpacity')),
+      fLine: flag('fLine'),
+      lineColor: numberOf(props.get('lineColor')),
+      lineWidth: numberOf(props.get('lineWidth')),
+      lineDashing: numberOf(props.get('lineDashing')),
+      adjust: numberOf(props.get('adjustValue')),
+    });
+  }
   item.width = (shape.sizeX !== undefined ? shape.sizeX : Math.max(0, shape.right - shape.left)) * TWIP;
   item.height = (shape.sizeY !== undefined ? shape.sizeY : Math.max(0, shape.bottom - shape.top)) * TWIP;
   item.anchor = anchor;

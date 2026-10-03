@@ -5,7 +5,7 @@
 // that are not finite paint nothing. Newer canvas features (letterSpacing)
 // are used where they exist and replaced by plain drawing where they do not.
 
-import type { ImageItem, LayoutFont, LayoutPage, LineItem, RectItem, TextItem } from '../layout/doc/types';
+import type { ImageItem, LayoutFont, LayoutPage, LineItem, RectItem, ShapeItem, TextItem } from '../layout/doc/types';
 import { docCssFont } from './doc-measure';
 
 /** A decoded picture and its size in its own pixels (which may be fewer than the file has). */
@@ -254,6 +254,102 @@ function drawRect(p: Painter, item: RectItem): void {
   const left = snapPoint(item.x, p.scale);
   const top = snapPoint(item.y, p.scale);
   p.ctx.fillRect(left, top, snapPoint(item.x + item.width, p.scale) - left, snapPoint(item.y + item.height, p.scale) - top);
+}
+
+/** The preset dashes of DrawingML, in units of the line thickness: a stroke, a gap, ... */
+const SHAPE_DASHES: { [name: string]: number[] } = {
+  sysDot: [1, 1],
+  sysDash: [3, 1],
+  sysDashDot: [3, 1, 1, 1],
+  sysDashDotDot: [3, 1, 1, 1, 1, 1],
+  dot: [1, 3],
+  dash: [4, 3],
+  lgDash: [8, 3],
+  dashDot: [4, 3, 1, 3],
+  lgDashDot: [8, 3, 1, 3],
+  lgDashDotDot: [8, 3, 1, 3, 1, 3],
+};
+
+/** How far the control points of a cubic curve lie from its ends for a quarter of a circle of radius 1. */
+const QUARTER = 0.5522847498;
+
+/** A shape: its outline as a path around the centre of its box, filled and then stroked. */
+function drawShape(p: Painter, item: ShapeItem): void {
+  const { x, y, width, height } = item;
+  if (!finite(x) || !finite(y) || !finite(width) || !finite(height) || width < 0 || height < 0) return;
+  const line = item.geometry === 'line';
+  if (line ? !(width > 0 || height > 0) : !(width > 0 && height > 0)) return;
+  const ctx = p.ctx;
+  const fill = !line && typeof item.fill === 'string' && COLOR.test(item.fill) ? item.fill : undefined;
+  const outline = item.stroke;
+  const thickness = outline && finite(outline.width) && outline.width > 0 ? Math.min(outline.width, 64) : 0;
+  if (fill === undefined && thickness === 0) return;
+  const color = outline ? safeColor(outline.color, '#000000') : '#000000';
+  let dash: number[] | undefined;
+  if (outline && typeof outline.dash === 'string' && Object.prototype.hasOwnProperty.call(SHAPE_DASHES, outline.dash)) {
+    const unit = Math.max(thickness, 1 / p.scale);
+    dash = SHAPE_DASHES[outline.dash].map((part) => part * unit);
+  }
+  const rotation = finite(item.rotation) ? item.rotation % 360 : 0;
+  const up = line && (item.flipH === true) !== (item.flipV === true);
+  if (line && rotation === 0 && (width === 0 || height === 0)) {
+    // A horizontal or vertical line is laid on whole canvas pixels, as borders are.
+    if (thickness > 0) stroke(p, x, y, x + width, y + height, thickness, color, dash);
+    return;
+  }
+  const w = width / 2;
+  const h = height / 2;
+  ctx.save();
+  try {
+    ctx.translate(x + w, y + h);
+    if (rotation !== 0) ctx.rotate((rotation * Math.PI) / 180);
+    ctx.beginPath();
+    if (line) {
+      ctx.moveTo(-w, up ? h : -h);
+      ctx.lineTo(w, up ? -h : h);
+    } else if (item.geometry === 'ellipse') {
+      ctx.moveTo(w, 0);
+      ctx.bezierCurveTo(w, h * QUARTER, w * QUARTER, h, 0, h);
+      ctx.bezierCurveTo(-w * QUARTER, h, -w, h * QUARTER, -w, 0);
+      ctx.bezierCurveTo(-w, -h * QUARTER, -w * QUARTER, -h, 0, -h);
+      ctx.bezierCurveTo(w * QUARTER, -h, w, -h * QUARTER, w, 0);
+      ctx.closePath();
+    } else {
+      const r = item.geometry === 'roundRect' && finite(item.radius) && item.radius > 0 ? Math.min(item.radius, w, h) : 0;
+      if (r > 0) {
+        const c = r * (1 - QUARTER);
+        ctx.moveTo(-w + r, -h);
+        ctx.lineTo(w - r, -h);
+        ctx.bezierCurveTo(w - c, -h, w, -h + c, w, -h + r);
+        ctx.lineTo(w, h - r);
+        ctx.bezierCurveTo(w, h - c, w - c, h, w - r, h);
+        ctx.lineTo(-w + r, h);
+        ctx.bezierCurveTo(-w + c, h, -w, h - c, -w, h - r);
+        ctx.lineTo(-w, -h + r);
+        ctx.bezierCurveTo(-w, -h + c, -w + c, -h, -w + r, -h);
+      } else {
+        ctx.moveTo(-w, -h);
+        ctx.lineTo(w, -h);
+        ctx.lineTo(w, h);
+        ctx.lineTo(-w, h);
+      }
+      ctx.closePath();
+    }
+    if (fill !== undefined) {
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
+    if (thickness > 0) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = Math.max(thickness, 1 / p.scale);
+      setDash(ctx, dash);
+      ctx.stroke();
+      setDash(ctx, undefined);
+    }
+  } finally {
+    ctx.restore();
+    forget(p);
+  }
 }
 
 function extent(p: Painter, font: LayoutFont): { ascent: number; descent: number } {
@@ -512,6 +608,7 @@ export function renderPage(ctx: CanvasRenderingContext2D, page: LayoutPage, opti
       else if (item.type === 'rect') drawRect(p, item);
       else if (item.type === 'line') drawLine(p, item);
       else if (item.type === 'image') drawImage(p, item);
+      else if (item.type === 'shape') drawShape(p, item);
     }
   } finally {
     ctx.restore();

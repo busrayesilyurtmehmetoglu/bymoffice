@@ -247,12 +247,15 @@ test.describe('BymOffice.mount', () => {
         const api = (window as any).BymOffice;
         const host = document.getElementById('editor')!;
         const rtf = (body: string) => new TextEncoder().encode('{\\rtf1\\ansi ' + body + '\\par}');
-        const shape = '{\\shp{\\*\\shpinst\\shpleft0\\shptop0\\shpright2000\\shpbottom1000{\\sp{\\sn shapeType}{\\sv 3}}}}';
+        // An ellipse is carried over with its outline and fill; an arrow (type 13) has a geometry the model does not hold.
+        const shapeOf = (type: number) => `{\\shp{\\*\\shpinst\\shpleft0\\shptop0\\shpright2000\\shpbottom1000{\\sp{\\sn shapeType}{\\sv ${type}}}}}`;
+        const shape = shapeOf(3);
         const out: Record<string, unknown> = {};
         for (const [key, file] of [
           ['chart', new Uint8Array(withChart)],
           ['plain', new Uint8Array(without)],
           ['shape', rtf('Before ' + shape + ' after')],
+          ['arrow', rtf('Before ' + shapeOf(13) + ' after')],
           ['text', rtf('Only text')],
         ] as [string, Uint8Array][]) {
           const mounted = await api.mount(host, { file, convert: true });
@@ -266,7 +269,8 @@ test.describe('BymOffice.mount', () => {
     expect(outcome).toEqual({
       chart: ['xlsx', ['Sheet: the content of a chart sheet is not in the model; it is written as an empty worksheet']],
       plain: ['xlsx', []],
-      shape: ['docx', ['1 shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over']],
+      shape: ['docx', []],
+      arrow: ['docx', ['1 shape(s) were written as rectangles: their geometry was not carried over']],
       text: ['docx', []],
     });
   });

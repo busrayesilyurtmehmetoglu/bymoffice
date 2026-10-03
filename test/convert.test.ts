@@ -28,9 +28,17 @@ test('convert: a document that loses nothing is converted without warnings', asy
   }
 });
 
-test('convert: shapes of an RTF document are counted in the warnings', async () => {
+test('convert: shapes of an RTF document are carried over; those whose look or geometry the reader does not know are counted in the warnings', async () => {
   const converted = await convertForEditing(await open(rtf(`Before ${SHAPE} between ${TEXT_BOX} after`)));
-  assert.deepEqual(converted!.warnings, ['2 shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over']);
+  assert.deepEqual(converted!.warnings, []);
+  // An arrow, and a drawing object of Word 95 (whose lines and fills are not read).
+  const arrow = SHAPE.replace('{\\sv 3}', '{\\sv 13}');
+  const old = '{\\*\\do\\dobxcolumn\\dobypara\\dptxbx{\\dptxbxtext Old\\par}\\dpx0\\dpy0\\dpxsize500\\dpysize500}';
+  const lossy = await convertForEditing(await open(rtf(`Before ${arrow} between ${old} and ${old} after`)));
+  assert.deepEqual(lossy!.warnings, [
+    '2 shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over',
+    '1 shape(s) were written as rectangles: their geometry was not carried over',
+  ]);
 });
 
 test('convert: characters a docx cannot hold and pictures without data are counted in the warnings', async () => {

@@ -738,6 +738,35 @@ export interface ImageRef {
   external?: boolean;
 }
 
+/** How the outline of a shape is broken up, by the names DrawingML gives its preset dashes. */
+export type ShapeDash = 'dash' | 'dot' | 'dashDot' | 'lgDash' | 'lgDashDot' | 'lgDashDotDot' | 'sysDash' | 'sysDot' | 'sysDashDot' | 'sysDashDotDot';
+
+/**
+ * What a shape looks like: its geometry, outline and fill. Rotation and
+ * flipping are in DrawingItem.transform; a "line" runs from the top left to
+ * the bottom right corner of the drawing before it is flipped.
+ */
+export interface ShapeLook {
+  /** "other" is a geometry the reader does not know: the shape is shown, and written, as the rectangle of its size. */
+  geometry: 'rect' | 'roundRect' | 'ellipse' | 'line' | 'other';
+  /** For "roundRect": the radius of the corners in 100000ths of the shorter side; 16667 when missing. */
+  corner?: number;
+  /** "RRGGBB"; a shape without it is not filled. */
+  fill?: string;
+  /** A shape without it has no outline. `width` in EMU; 0 is the thinnest line a device draws. */
+  line?: { color: string; width: number; dash?: ShapeDash };
+  /**
+   * What the file states of the shape and the look does not hold; each is
+   * counted when the shape is written to another format. "fill": a fill that
+   * is not a plain colour (a pattern, a texture, a picture, a gradient), which
+   * is not shown. "opacity": a fill that is partly transparent, which is
+   * shown opaque. "color": a colour that is an index into a palette, a scheme
+   * or the colours of the system; such a fill is not shown, such an outline
+   * is black.
+   */
+  lost?: ('fill' | 'opacity' | 'color')[];
+}
+
 export interface DrawingItem {
   type: 'drawing';
   placement: 'inline' | 'anchor';
@@ -763,6 +792,12 @@ export interface DrawingItem {
   crop?: ImageCrop;
   /** Contents of the text boxes inside the drawing. */
   textBoxes?: Block[][];
+  /**
+   * Geometry, outline and fill of a shape read from a doc or RTF file, where
+   * `xml` is only a stand-in. A drawing read from a docx has none: there
+   * they are in `xml`.
+   */
+  shape?: ShapeLook;
   /** The whole <w:drawing>, the source of truth for writing. */
   xml: XmlElement;
 }

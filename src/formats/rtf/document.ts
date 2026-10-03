@@ -1705,7 +1705,7 @@ export class RtfReader {
         const parent = this.stack[this.depth - 1];
         if (!parent || parent.dest !== D.D_NORMAL) return;
         const chp = parent.chp;
-        this.story.addItem(shapeItem(shape), this.runPropsFor(chp, parent.rtl, this.paraStyle()), this.fullRun(chp, parent.rtl), undefined);
+        this.story.addItem(shapeItem(shape, payload.legacy === true), this.runPropsFor(chp, parent.rtl, this.paraStyle()), this.fullRun(chp, parent.rtl), undefined);
         return;
       }
       case C_SHAPE_NAME: {

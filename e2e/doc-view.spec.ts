@@ -1,4 +1,6 @@
 import type { Page } from '@playwright/test';
+import { convertForEditing } from '../src/formats/convert';
+import { open } from '../src/index';
 import { p, r, tbl, tc, tr } from '../test/doc-layout-fixtures';
 import { buildDocx } from '../test/docx-fixtures';
 import { DOC_STYLES, docSection, docx, field, hugePicturesDocx, linesDocx, link, longDocx, longWordDocx, manyPagesDocx, picture, png, sampleDocx, textBoxRun } from './fixtures/docx';
@@ -1547,5 +1549,55 @@ test.describe('document view: review fixes', () => {
     expect(ink.second.height).toBeLessThan(25);
     // The text is still there for copying and for assistive technology.
     expect(await pageText(page, 1)).toContain('Vertical words');
+  });
+});
+
+test.describe('document view: shapes of doc and RTF files', () => {
+  test('a line, a framed text box and an ellipse of an RTF file are painted, and painted the same after conversion to docx', async ({ page }) => {
+    const sp = (name: string, value: number) => `{\\sp{\\sn ${name}}{\\sv ${value}}}`;
+    const shp = (rect: number[], props: string, text = '') =>
+      `{\\shp{\\*\\shpinst\\shpleft${rect[0]}\\shptop${rect[1]}\\shpright${rect[2]}\\shpbottom${rect[3]}\\shpbxcolumn\\shpbypara\\shpwr3${props}${text}}}`;
+    // Colours are blue, green, red from the highest byte down.
+    const RED = 220;
+    const GREEN = 200 << 8;
+    const BLUE = 220 << 16;
+    const source =
+      '{\\rtf1\\ansi\\paperw9000\\paperh6000\\margl600\\margr600\\margt600\\margb600 Shapes ' +
+      // A red line, 200 px long and 4 px thick.
+      shp([0, 600, 3000, 600], sp('shapeType', 20) + sp('lineColor', RED) + sp('lineWidth', 38100)) +
+      // A text box of 100 x 40 px, filled green, with a blue outline of 2 px.
+      shp([0, 900, 1500, 1500], sp('shapeType', 202) + sp('fillColor', GREEN) + sp('lineColor', BLUE) + sp('lineWidth', 19050), '{\\shptxt In\\par}') +
+      // A red ellipse of 100 x 40 px without an outline.
+      shp([3000, 900, 4500, 1500], sp('shapeType', 3) + sp('fillColor', RED) + sp('fLine', 0)) +
+      '\\par}';
+    const rtf = new TextEncoder().encode(source);
+    const converted = await convertForEditing(await open(rtf));
+    expect(converted!.warnings).toEqual([]);
+
+    const counts: { red: number; green: number; blue: number }[] = [];
+    for (const bytes of [rtf, converted!.bytes]) {
+      await mountDoc(page, bytes, { zoom: 1 });
+      await laidOut(page);
+      await expect.poll(async () => (await canvasStats(page, 1)).red).toBeGreaterThan(0);
+      const stats = await canvasStats(page, 1);
+      // Canvas pixels for one px of the page, squared.
+      const unit = (stats.width / PAGE_WIDTH) ** 2;
+      const red = stats.red / unit;
+      const green = stats.green / unit;
+      const blue = stats.blue / unit;
+      // The line (800 px) and the ellipse (pi * 50 * 20 = 3142 px): a rectangle in its place would give 4800.
+      expect(red).toBeGreaterThan(3500);
+      expect(red).toBeLessThan(4200);
+      // The fill inside the outline, less the text on it.
+      expect(green).toBeGreaterThan(2800);
+      expect(green).toBeLessThan(3900);
+      // The four sides of the outline.
+      expect(blue).toBeGreaterThan(400);
+      expect(blue).toBeLessThan(700);
+      // No placeholder stands for a shape.
+      expect(stats.grey).toBe(0);
+      counts.push({ red, green, blue });
+    }
+    for (const colour of ['red', 'green', 'blue'] as const) expect(Math.abs(counts[0][colour] - counts[1][colour])).toBeLessThanOrEqual(counts[0][colour] * 0.02);
   });
 });

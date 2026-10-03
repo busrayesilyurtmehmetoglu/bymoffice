@@ -597,7 +597,7 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
   const shared: WriteCounters = { dropped: { count: 0 }, drawingIds: { next: 1 } };
   const counts = { copied: 0, written: 0 };
   // What the new file does not carry over; the report says how much of each.
-  const lost = { shapes: 0, groups: 0, pictures: 0, links: 0, theme: false };
+  const lost = { shapes: 0, geometries: 0, groups: 0, pictures: 0, fills: 0, opacities: 0, colors: 0, links: 0, theme: false };
   const parts: [name: string, data: Uint8Array][] = [];
   const defaults = new Map<string, string>([
     ['rels', RELS_TYPE],
@@ -805,6 +805,10 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
     report.writtenBlocks += counts.written;
     report.droppedCharacters += shared.dropped.count;
     if (lost.shapes) warn(`${lost.shapes} shape(s) were written as plain rectangles: their outline, fill and geometry were not carried over`);
+    if (lost.geometries) warn(`${lost.geometries} shape(s) were written as rectangles: their geometry was not carried over`);
+    if (lost.fills) warn(`${lost.fills} shape(s) with a fill that is not a plain colour (a pattern, a picture, a gradient) were written without a fill`);
+    if (lost.opacities) warn(`${lost.opacities} shape(s) with a partly transparent fill were written with an opaque one`);
+    if (lost.colors) warn(`${lost.colors} shape(s) with a colour that is an index into a palette or a system colour were written without that colour: no fill, a black outline`);
     if (lost.groups) warn(`${lost.groups} group(s) of shapes were written with every part over the whole area of the group, without outlines and fills`);
     if (lost.pictures) warn(`${lost.pictures} picture(s) whose data is not available were written as empty frames`);
     if (lost.links) warn(`${lost.links} link(s) with an address that is not followed were written as plain text`);

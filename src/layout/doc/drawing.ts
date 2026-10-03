@@ -1,10 +1,10 @@
 // Drawings: what an inline or anchored drawing shows (a picture, the content
 // of its text boxes, or a placeholder) and where an anchored one goes.
 
-import type { Block, DrawingAnchor, DrawingItem, LegacyGraphicItem } from '../../model/doc/types';
+import type { Block, DrawingAnchor, DrawingItem, DrawingTransform, LegacyGraphicItem, ShapeDash, ShapeLook } from '../../model/doc/types';
 import type { XmlElement } from '../../xml';
 import { stackBands, type FieldValues, type FloatSpec, type LayoutContext, type StoryRef } from './context';
-import type { ImageItem, PageItem } from './types';
+import type { ImageItem, PageItem, ShapeItem } from './types';
 import { MAX_LAYOUT_DEPTH, MAX_PAGE_SIDE, MAX_TEXT_BOX_WORK, clamp, emu, finite } from './units';
 
 export interface BoxContent {
@@ -65,10 +65,13 @@ function childElement(el: XmlElement | undefined, local: string): XmlElement | u
   return undefined;
 }
 
-/** Fill and outline of the box a text box is drawn in. */
-interface BoxStyle {
+/** What a shape shows around its content, whichever format it was read from; lengths in px. */
+interface ShapeView {
+  geometry: 'rect' | 'roundRect' | 'ellipse' | 'line';
+  /** For "roundRect": the radius of the corners as a share of the shorter side. */
+  corner?: number;
   fill?: string;
-  line?: { color: string; width: number };
+  line?: { color: string; width: number; dash?: ShapeDash };
 }
 
 /** DrawingML names of theme colours -> the names resolveColor knows. */
@@ -167,39 +170,79 @@ function drawingColor(ctx: LayoutContext, el: XmlElement | undefined): string | 
   return out;
 }
 
-/** Shapes that are drawn as the rectangle of their size. */
-const BOX_SHAPES: { [prst: string]: true } = {
-  rect: true,
-  roundRect: true,
-  round1Rect: true,
-  round2SameRect: true,
-  round2DiagRect: true,
-  snip1Rect: true,
-  snip2SameRect: true,
-  snip2DiagRect: true,
-  snipRoundRect: true,
-  flowChartProcess: true,
-  flowChartAlternateProcess: true,
+/** The geometry a preset shape of DrawingML is drawn with; the ones that are not here are not drawn. */
+const PRESETS: { [prst: string]: ShapeView['geometry'] } = {
+  rect: 'rect',
+  round1Rect: 'rect',
+  round2SameRect: 'rect',
+  round2DiagRect: 'rect',
+  snip1Rect: 'rect',
+  snip2SameRect: 'rect',
+  snip2DiagRect: 'rect',
+  snipRoundRect: 'rect',
+  flowChartProcess: 'rect',
+  flowChartAlternateProcess: 'rect',
+  roundRect: 'roundRect',
+  ellipse: 'ellipse',
+  line: 'line',
+  straightConnector1: 'line',
+};
+
+const PRESET_DASHES: { [name: string]: true } = {
+  dash: true,
+  dot: true,
+  dashDot: true,
+  lgDash: true,
+  lgDashDot: true,
+  lgDashDotDot: true,
+  sysDash: true,
+  sysDot: true,
+  sysDashDot: true,
+  sysDashDotDot: true,
 };
 
 /** 0.75 pt, the outline of a shape that states a colour but no width; px. */
 const DEFAULT_OUTLINE = 1;
 const MAX_OUTLINE = 16;
+/** An outline of the width 0 is the thinnest line the device draws; the painter makes it one pixel of the canvas. px. */
+const HAIRLINE = 0.5;
+/** The corners of a rounded rectangle that states none: a sixth of its shorter side. */
+const DEFAULT_CORNER = 16667;
+
+const outlineWidth = (px: number): number => (px > 0 ? Math.min(px, MAX_OUTLINE) : HAIRLINE);
+
+const cornerShare = (value: number | undefined): number => clamp(finite(value === undefined ? DEFAULT_CORNER : value), 0, 50000) / 100000;
+
+/** A shape of DrawingML as it is drawn. */
+interface DrawingMlShape {
+  view: ShapeView;
+  /** It states a fill that is not shown: a gradient, a pattern, a picture. */
+  hiddenFill: boolean;
+  /** Its geometry is stated, as a preset. */
+  preset: boolean;
+}
 
 /**
- * Fill and outline of the shape of a DrawingML text box: what <wps:spPr>
- * states (<a:solidFill>, <a:ln>), and for what it leaves open the colours of
- * the shape style. Only a single shape whose geometry is a box is looked at;
- * gradients, patterns and pictures as fills are not shown.
+ * Geometry, fill and outline of the shape of a DrawingML drawing: what
+ * <wps:spPr> states (<a:prstGeom>, <a:solidFill>, <a:ln>), and for what it
+ * leaves open the colours of the shape style. The caller hands in a drawing
+ * that is one shape; gradients, patterns and pictures as fills are not shown.
+ * Undefined when there is no shape, or its geometry is one that is not drawn.
  */
-function shapeStyle(ctx: LayoutContext, xml: XmlElement): BoxStyle {
+function drawingMlShape(ctx: LayoutContext, xml: XmlElement): DrawingMlShape | undefined {
   const shape = findElement(xml, 'wsp', 0);
-  const out: BoxStyle = {};
-  if (!shape) return out;
+  if (!shape) return undefined;
   const props = childElement(shape, 'spPr');
   const geometry = childElement(props, 'prstGeom');
   const preset = geometry ? geometry.attrs.get('prst') : undefined;
-  if (preset !== undefined && !Object.prototype.hasOwnProperty.call(BOX_SHAPES, preset)) return out;
+  if (preset !== undefined && !Object.prototype.hasOwnProperty.call(PRESETS, preset)) return undefined;
+  const view: ShapeView = { geometry: preset === undefined ? 'rect' : PRESETS[preset] };
+  if (view.geometry === 'roundRect') {
+    // <a:avLst><a:gd name="adj" fmla="val 16667"/></a:avLst>
+    const guide = childElement(childElement(geometry, 'avLst'), 'gd');
+    const match = guide && guide.attrs.get('name') === 'adj' ? /^val (\d{1,6})$/.exec(guide.attrs.get('fmla') || '') : null;
+    view.corner = cornerShare(match ? Number(match[1]) : undefined);
+  }
   const style = childElement(shape, 'style');
   const styleColor = (name: string): string | undefined => {
     const ref = childElement(style, name);
@@ -213,29 +256,50 @@ function shapeStyle(ctx: LayoutContext, xml: XmlElement): BoxStyle {
     for (const node of holder.children) if (node.type === 'element') return drawingColor(ctx, node);
     return undefined;
   };
+  let hiddenFill = false;
   /** A fill stated among the children: a colour, null for a fill that shows nothing here, undefined when none is stated. */
-  const stated = (holder: XmlElement | undefined): string | null | undefined => {
+  const stated = (holder: XmlElement | undefined, own: boolean): string | null | undefined => {
     if (!holder) return undefined;
     for (const node of holder.children) {
       if (node.type !== 'element') continue;
       const local = localName(node.name);
       if (local === 'solidFill') return colorOf(node) || null;
-      if (local === 'noFill' || local === 'gradFill' || local === 'pattFill' || local === 'blipFill' || local === 'grpFill') return null;
+      if (local === 'noFill') return null;
+      if (local === 'gradFill' || local === 'pattFill' || local === 'blipFill' || local === 'grpFill') {
+        if (own) hiddenFill = true;
+        return null;
+      }
     }
     return undefined;
   };
-  const fill = stated(props);
+  const fill = stated(props, true);
   const fillColor = fill === undefined ? styleColor('fillRef') : fill;
-  if (fillColor) out.fill = fillColor;
+  if (fillColor && view.geometry !== 'line') view.fill = fillColor;
   const outline = childElement(props, 'ln');
-  const stroke = stated(outline);
+  const stroke = stated(outline, false);
   const strokeColor = stroke === undefined ? styleColor('lnRef') : stroke;
   if (strokeColor) {
     const text = outline ? outline.attrs.get('w') : undefined;
     const width = text !== undefined && /^\d{1,9}$/.test(text) ? emu(Number(text)) : DEFAULT_OUTLINE;
-    if (width > 0) out.line = { color: strokeColor, width: Math.min(width, MAX_OUTLINE) };
+    view.line = { color: strokeColor, width: outlineWidth(width) };
+    const dash = childElement(outline, 'prstDash');
+    const name = dash ? dash.attrs.get('val') : undefined;
+    if (name !== undefined && Object.prototype.hasOwnProperty.call(PRESET_DASHES, name)) view.line.dash = name as ShapeDash;
   }
-  return out;
+  return { view, hiddenFill, preset: preset !== undefined };
+}
+
+/** The look of a shape of a doc or RTF file as it is drawn; a geometry the reader does not know is drawn as a box. */
+function lookView(look: ShapeLook): ShapeView {
+  const view: ShapeView = { geometry: look.geometry === 'other' ? 'rect' : look.geometry };
+  if (view.geometry === 'roundRect') view.corner = cornerShare(look.corner);
+  if (typeof look.fill === 'string' && HEX6.test(look.fill) && view.geometry !== 'line') view.fill = '#' + look.fill.toUpperCase();
+  const line = look.line;
+  if (line && typeof line.color === 'string' && HEX6.test(line.color)) {
+    view.line = { color: '#' + line.color.toUpperCase(), width: outlineWidth(size(emu(line.width))) };
+    if (line.dash !== undefined && Object.prototype.hasOwnProperty.call(PRESET_DASHES, line.dash)) view.line.dash = line.dash;
+  }
+  return view;
 }
 
 /** A colour as VML writes it: "#rrggbb", "#rgb" or a name, at times followed by a palette index ("#4f81bd [3204]"). */
@@ -259,8 +323,8 @@ const vmlOff = (text: string | undefined): boolean => text === 'f' || text === '
  * black, 0.75 pt wide, unless it says otherwise; its default white fill is
  * not painted (white paper shows the same, and nothing behind it is covered).
  */
-function vmlStyle(shape: XmlElement | undefined): BoxStyle {
-  const out: BoxStyle = {};
+function vmlStyle(shape: XmlElement | undefined): ShapeView {
+  const out: ShapeView = { geometry: 'rect' };
   if (!shape) return out;
   const fillElement = childElement(shape, 'fill');
   const strokeElement = childElement(shape, 'stroke');
@@ -276,18 +340,63 @@ function vmlStyle(shape: XmlElement | undefined): BoxStyle {
   return out;
 }
 
-/** The fill of a box under its content and its outline over it. */
-function framed(style: BoxStyle, width: number, height: number, content: PageItem[], out: PageItem[]): void {
-  const visible = width > 0 && height > 0;
-  if (visible && style.fill !== undefined) out.push({ type: 'rect', x: 0, y: 0, width, height, fill: style.fill });
-  for (let i = 0; i < content.length; i++) out.push(content[i]);
-  if (visible && style.line) {
-    const { color, width: thickness } = style.line;
-    const side = (x1: number, y1: number, x2: number, y2: number) => out.push({ type: 'line', x1, y1, x2, y2, color, width: thickness, style: 'single' });
-    side(0, 0, width, 0);
-    side(0, height, width, height);
-    side(0, 0, 0, height);
-    side(width, 0, width, height);
+/**
+ * The fill of a shape under its content and its outline over it. A box with
+ * a solid outline is a filled rectangle and four lines; everything else is a
+ * shape the painter draws. A shape with content is not turned: its text
+ * would not turn with it.
+ */
+function framed(view: ShapeView | undefined, transform: DrawingTransform | undefined, width: number, height: number, content: PageItem[], out: PageItem[]): void {
+  const push = () => {
+    for (let i = 0; i < content.length; i++) out.push(content[i]);
+  };
+  if (!view) return push();
+  const line = view.geometry === 'line';
+  const visible = line ? width > 0 || height > 0 : width > 0 && height > 0;
+  const rotation = transform && transform.rotation && !content.length ? finite(transform.rotation / 60000) % 360 : 0;
+  if (!visible) return push();
+  if (view.geometry === 'rect' && !(view.line && view.line.dash) && rotation === 0) {
+    if (view.fill !== undefined) out.push({ type: 'rect', x: 0, y: 0, width, height, fill: view.fill });
+    push();
+    if (view.line) {
+      const { color, width: thickness } = view.line;
+      const side = (x1: number, y1: number, x2: number, y2: number) => out.push({ type: 'line', x1, y1, x2, y2, color, width: thickness, style: 'single' });
+      side(0, 0, width, 0);
+      side(0, height, width, height);
+      side(0, 0, 0, height);
+      side(width, 0, width, height);
+    }
+    return;
+  }
+  const shape = (): ShapeItem => {
+    const item: ShapeItem = { type: 'shape', x: 0, y: 0, width, height, geometry: view.geometry };
+    if (view.geometry === 'roundRect') item.radius = Math.min(width, height) * (view.corner === undefined ? DEFAULT_CORNER / 100000 : view.corner);
+    if (rotation !== 0) item.rotation = rotation;
+    if (line && transform) {
+      // Only a line looks different when it is mirrored.
+      if (transform.flipH) item.flipH = true;
+      if (transform.flipV) item.flipV = true;
+    }
+    return item;
+  };
+  if (!content.length) {
+    if (view.fill === undefined && !view.line) return;
+    const item = shape();
+    if (view.fill !== undefined) item.fill = view.fill;
+    if (view.line) item.stroke = { ...view.line };
+    out.push(item);
+    return;
+  }
+  if (view.fill !== undefined) {
+    const item = shape();
+    item.fill = view.fill;
+    out.push(item);
+  }
+  push();
+  if (view.line) {
+    const item = shape();
+    item.stroke = { ...view.line };
+    out.push(item);
   }
 }
 
@@ -391,17 +500,38 @@ export function drawingContent(
     }
     if (item.description !== undefined) image.alt = item.description;
     items.push(image);
-  } else if (!item.textBoxes) {
-    const placeholder: ImageItem = { type: 'image', x: 0, y: 0, width, height, placeholder: item.kind };
-    if (item.description !== undefined) placeholder.alt = item.description;
-    items.push(placeholder);
+  }
+  // What the shape looks like: a doc or RTF file states it in the model, a docx in its tree.
+  let view: ShapeView | undefined;
+  let drawn = false;
+  if (!item.image) {
+    if (item.shape) {
+      view = lookView(item.shape);
+      // As for a docx: a shape whose fill cannot be shown is a placeholder.
+      drawn = item.shape.geometry !== 'other' && !(item.shape.lost && item.shape.lost.indexOf('fill') >= 0);
+    } else if (item.kind === 'shape') {
+      // Only a drawing that is one shape: the first shape of a group or a canvas says nothing about the whole.
+      const found = drawingMlShape(ctx, item.xml);
+      if (found) {
+        view = found.view;
+        drawn = found.preset && !found.hiddenFill;
+      }
+    }
   }
   if (item.textBoxes) {
     const content: PageItem[] = [];
     const used = textBoxItems(ctx, item, item.textBoxes, width, bodyInsets(item.xml), story, path, depth, fields, content);
     // A box without a height of its own is as high as its text.
     if (height === 0) height = used;
-    framed(item.image ? {} : shapeStyle(ctx, item.xml), width, height, content, items);
+    framed(view, item.transform, width, height, content, items);
+  } else if (!item.image) {
+    // A shape without text is drawn as it is when all of it can be; a placeholder stands for the others.
+    if (view && drawn) framed(view, item.transform, width, height, [], items);
+    else {
+      const placeholder: ImageItem = { type: 'image', x: 0, y: 0, width, height, placeholder: item.kind };
+      if (item.description !== undefined) placeholder.alt = item.description;
+      items.push(placeholder);
+    }
   }
   return { width, height, items };
 }
@@ -473,7 +603,7 @@ export function legacyContent(
     const content: PageItem[] = [];
     const used = textBoxItems(ctx, item, item.textBoxes, width, DEFAULT_INSETS, story, path, depth, fields, content);
     if (height === 0) height = used;
-    framed(item.image ? {} : vmlStyle(shape), width, height, content, items);
+    framed(item.image ? undefined : vmlStyle(shape), undefined, width, height, content, items);
   }
   const out: LegacyContent = { width, height, items };
   if (style.get('position') === 'absolute') {

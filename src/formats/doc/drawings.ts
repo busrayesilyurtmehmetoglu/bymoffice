@@ -16,6 +16,7 @@
 
 import { inflateRaw } from '../../deflate';
 import type { Block, DocMedia, DrawingAnchor, DrawingItem, DrawingPosition, ImageCrop, ImageRef } from '../../model/doc/types';
+import { officeArtLook } from '../../model/doc/shapes';
 import type { XmlElement } from '../../xml';
 import { ansiText, i16, i32, u16, u32, u8 } from './bytes';
 
@@ -151,6 +152,18 @@ const P_TEXT_ID = 0x0080;
 const P_TEXT_LEFT = 0x0081;
 const P_CROP_TOP = 0x0100;
 const P_PICTURE = 0x0104;
+const P_ADJUST = 0x0147;
+const P_FILL_TYPE = 0x0180;
+const P_FILL_COLOR = 0x0181;
+const P_FILL_OPACITY = 0x0182;
+/** The kind of shape that shows a picture (msosptPictureFrame). */
+const SHAPE_PICTURE_FRAME = 75;
+/** Boolean properties come in groups: the low bits are the values, the bits sixteen above them say which values are stated. */
+const P_FILL_FLAGS = 0x01bf;
+const P_LINE_COLOR = 0x01c0;
+const P_LINE_WIDTH = 0x01cb;
+const P_LINE_DASHING = 0x01ce;
+const P_LINE_FLAGS = 0x01ff;
 const P_NAME = 0x0380;
 const P_DESCRIPTION = 0x0381;
 const P_WRAP_LEFT = 0x0384;
@@ -162,6 +175,8 @@ const P_GROUP_FLAGS = 0x03bf;
 
 export interface Shape {
   id: number;
+  /** The kind of shape (MSOSPT): 1 a rectangle, 3 an ellipse, 20 a line, 75 a picture, 202 a text box, ... */
+  type: number;
   group: boolean;
   flipH: boolean;
   flipV: boolean;
@@ -218,7 +233,7 @@ function readOptions(b: Uint8Array, record: ArtRecord, shape: Shape): void {
 }
 
 function readShape(b: Uint8Array, container: ArtRecord): Shape {
-  const shape: Shape = { id: 0, group: false, flipH: false, flipV: false, values: new Map(), texts: new Map(), children: [] };
+  const shape: Shape = { id: 0, type: 0, group: false, flipH: false, flipV: false, values: new Map(), texts: new Map(), children: [] };
   let p = container.start;
   // Each round takes at least the eight bytes of a header.
   while (p < container.end) {
@@ -226,6 +241,7 @@ function readShape(b: Uint8Array, container: ArtRecord): Shape {
     if (!record) break;
     if (record.type === RT_SP && record.end - record.start >= 8) {
       shape.id = u32(b, record.start);
+      shape.type = record.instance;
       const flags = u32(b, record.start + 4);
       shape.group = (flags & 0x01) !== 0;
       shape.flipH = (flags & 0x40) !== 0;
@@ -651,6 +667,10 @@ export function floatingDrawing(
       if (groupFlags & 0x20) anchor.behindDoc = true;
       else delete anchor.behindDoc;
     }
+    // UNSURE: for a rotation between 45 and 135 or between 225 and 315 degrees other readers of the format take
+    // the rectangle of the Spa to be that of the shape turned by a quarter, and swap its width and height. The
+    // specification read for this reader does not say so, and no file at hand has a rotated shape: the rectangle
+    // is taken as it is.
     const rotation = signed(values.get(P_ROTATION));
     if (rotation || shape.flipH || shape.flipV) {
       item.transform = {};
@@ -693,6 +713,29 @@ export function floatingDrawing(
     boxes = content.boxes;
     if (shape.group) kind = 'group';
     else if (images.length && !boxes.length) kind = 'picture';
+    else if (!images.length && (shape.type === SHAPE_PICTURE_FRAME || values.has(P_PICTURE))) {
+      // A shape that is to show a picture the file does not have, or the reader cannot read: it is not a box
+      // filled in white. Without text it stays a picture, without an image.
+      if (!boxes.length) kind = 'picture';
+    } else {
+      /** A flag of a group of boolean properties; undefined when the group does not state it. */
+      const flag = (id: number, bit: number): boolean | undefined => {
+        const flags = values.get(id);
+        return flags === undefined || !(flags & (bit << 16)) ? undefined : (flags & bit) !== 0;
+      };
+      item.shape = officeArtLook({
+        type: shape.type,
+        fFilled: flag(P_FILL_FLAGS, 0x10),
+        fillType: values.get(P_FILL_TYPE),
+        fillColor: values.get(P_FILL_COLOR),
+        fillOpacity: signed(values.get(P_FILL_OPACITY)),
+        fLine: flag(P_LINE_FLAGS, 0x08),
+        lineColor: values.get(P_LINE_COLOR),
+        lineWidth: values.get(P_LINE_WIDTH),
+        lineDashing: values.get(P_LINE_DASHING),
+        adjust: signed(values.get(P_ADJUST)),
+      });
+    }
 
     const cropSides = ['top', 'bottom', 'left', 'right'] as const;
     let crop: ImageCrop | undefined;

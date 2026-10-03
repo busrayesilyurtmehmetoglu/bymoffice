@@ -38,6 +38,7 @@ import type {
   Run,
   RunItem,
   RunProps,
+  ShapeLook,
   Table,
   TableCell,
   TableRow,
@@ -80,10 +81,14 @@ export interface BodyContext extends PropsContext {
   drawingIds: { next: number };
   /**
    * Counts the generated drawings that lose something: `shapes` are written
-   * as plain rectangles without outline and fill, `groups` with their parts
-   * over the whole area of the group.
+   * as plain rectangles without outline and fill (the model does not say what
+   * they look like), `geometries` as rectangles with their outline and fill
+   * (the reader does not know their geometry), `groups` with their parts over
+   * the whole area of the group, `pictures` as empty frames; `fills`,
+   * `opacities` and `colors` count the shapes whose look names that loss
+   * (ShapeLook.lost).
    */
-  generated?: { shapes: number; groups: number };
+  generated?: { shapes: number; geometries: number; groups: number; pictures: number; fills: number; opacities: number; colors: number };
   /**
    * Content controls written so far. One wrapper written a second time (an
    * edit split what it wraps over two paragraphs) gives a second control,
@@ -874,12 +879,38 @@ function transformText(item: DrawingItem, width: string, height: string, group: 
   return out + '</a:xfrm>';
 }
 
+const HEX_COLOR = /^[0-9A-Fa-f]{6}$/;
+const SHAPE_DASHES = ['dash', 'dot', 'dashDot', 'lgDash', 'lgDashDot', 'lgDashDotDot', 'sysDash', 'sysDot', 'sysDashDot', 'sysDashDotDot'];
+/** Widest outline DrawingML takes (ST_LineWidth), EMU. */
+const MAX_LINE_WIDTH = 20116800;
+
+/** <a:prstGeom> for the geometry of a look; a geometry the reader did not know is a rectangle. */
+function geometryText(look: ShapeLook | undefined): string {
+  if (look && look.geometry === 'roundRect') {
+    const corner = look.corner;
+    if (corner !== undefined && isFinite(corner) && corner >= 0 && corner <= 50000) return `<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val ${Math.round(corner)}"/></a:avLst></a:prstGeom>`;
+    return '<a:prstGeom prst="roundRect"><a:avLst/></a:prstGeom>';
+  }
+  const preset = look && (look.geometry === 'ellipse' || look.geometry === 'line') ? look.geometry : 'rect';
+  return `<a:prstGeom prst="${preset}"><a:avLst/></a:prstGeom>`;
+}
+
+/** <a:ln> for the outline of a look. */
+function outlineText(look: ShapeLook | undefined): string {
+  const line = look ? look.line : undefined;
+  if (!line || !HEX_COLOR.test(line.color)) return '<a:ln><a:noFill/></a:ln>';
+  const width = isFinite(line.width) && line.width >= 0 ? Math.min(Math.round(line.width), MAX_LINE_WIDTH) : 9525;
+  const dash = line.dash !== undefined && SHAPE_DASHES.indexOf(line.dash) >= 0 ? `<a:prstDash val="${line.dash}"/>` : '';
+  return `<a:ln w="${width}"><a:solidFill><a:srgbClr val="${line.color.toUpperCase()}"/></a:solidFill>${dash}</a:ln>`;
+}
+
 /**
  * A standard DrawingML drawing for an item that has no tree of its own: a
- * picture, a text box, or a group of them. What the model does not know of a
- * shape (its outline and fill, the place of each part of a group) is not
- * invented: text boxes are written without outline and fill, the parts of a
- * group over its whole area.
+ * picture, a shape, a text box, or a group of them. A shape is written with
+ * the geometry, outline and fill of its look. What the model does not know
+ * (the look of a shape that has none, the place of each part of a group) is
+ * not invented: such a shape is written without outline and fill, the parts
+ * of a group over its whole area.
  */
 function generateDrawing(ctx: BodyContext, item: DrawingItem, out: string[], depth: number): void {
   if (depth > MAX_WRITE_DEPTH) throw new Error(`Cannot write the document: content is nested deeper than ${MAX_WRITE_DEPTH} levels`);
@@ -905,11 +936,26 @@ function generateDrawing(ctx: BodyContext, item: DrawingItem, out: string[], dep
     `<pic:spPr>${outer ? transformText(item, width, height, false) : `<a:xfrm><a:off x="0" y="0"/><a:ext cx="${width}" cy="${height}"/></a:xfrm>`}` +
     '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic>';
   const shape = (blocks: Block[] | undefined, fill: ImageRef | undefined, outer: boolean): string => {
-    let text = `<wps:wsp xmlns:wps="${NS_WPS}"><wps:cNvSpPr${blocks ? ' txBox="1"' : ''}/><wps:spPr>`;
+    // The look is that of the drawing itself; the parts of a group have none in the model.
+    const look = outer ? item.shape : undefined;
+    const connector = !blocks && !!look && look.geometry === 'line';
+    let text = `<wps:wsp xmlns:wps="${NS_WPS}">${connector ? '<wps:cNvCnPr/>' : `<wps:cNvSpPr${blocks ? ' txBox="1"' : ''}/>`}<wps:spPr>`;
     text += outer ? transformText(item, width, height, false) : `<a:xfrm><a:off x="0" y="0"/><a:ext cx="${width}" cy="${height}"/></a:xfrm>`;
-    text += '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>';
-    text += fill ? `<a:blipFill>${blipText(ctx, ns, fill)}<a:stretch><a:fillRect/></a:stretch></a:blipFill>` : '<a:noFill/>';
-    text += '<a:ln><a:noFill/></a:ln></wps:spPr>';
+    text += geometryText(look);
+    if (fill) text += `<a:blipFill>${blipText(ctx, ns, fill)}<a:stretch><a:fillRect/></a:stretch></a:blipFill>`;
+    else if (look && look.fill !== undefined && HEX_COLOR.test(look.fill) && look.geometry !== 'line') text += `<a:solidFill><a:srgbClr val="${look.fill.toUpperCase()}"/></a:solidFill>`;
+    else text += '<a:noFill/>';
+    text += outlineText(look) + '</wps:spPr>';
+    if (ctx.generated && outer) {
+      if (!look) ctx.generated.shapes++;
+      else {
+        if (look.geometry === 'other') ctx.generated.geometries++;
+        const lost = look.lost;
+        if (lost && lost.indexOf('fill') >= 0) ctx.generated.fills++;
+        if (lost && lost.indexOf('opacity') >= 0) ctx.generated.opacities++;
+        if (lost && lost.indexOf('color') >= 0) ctx.generated.colors++;
+      }
+    }
     if (blocks) {
       const inner: string[] = [];
       writeBlocks(ctx, blocks, inner, depth + 1);
@@ -930,14 +976,14 @@ function generateDrawing(ctx: BodyContext, item: DrawingItem, out: string[], dep
     graphic += '</wpg:wgp>';
   } else if (boxes.length) {
     uri = NS_WPS;
-    if (ctx.generated) ctx.generated.shapes++;
     graphic = shape(boxes[0], pictures.length ? pictures[0].image : undefined, true);
   } else if (pictures.length || item.kind === 'picture') {
     uri = ns.pic;
+    // A picture the reader found no image for.
+    if (!pictures.length && ctx.generated) ctx.generated.pictures++;
     graphic = picture(pictures.length ? pictures[0].image : undefined, pictures.length ? pictures[0].crop || item.crop : item.crop, true);
   } else {
     uri = NS_WPS;
-    if (ctx.generated) ctx.generated.shapes++;
     graphic = shape(undefined, undefined, true);
   }
 
