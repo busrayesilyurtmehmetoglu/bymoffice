@@ -1083,7 +1083,7 @@ test.describe('BymOffice.mount with a document', () => {
     await page.goto('/e2e/pages/mount.html');
   });
 
-  test('shows a docx from bytes, read-only, and saves it as it was', async ({ page }) => {
+  test('shows a docx from bytes in the editor, and saves it as it was when nothing was changed', async ({ page }) => {
     const input = await sampleDocx();
     const result = await page.evaluate(async (bytes) => {
       const api = (window as any).BymOffice;
@@ -1110,7 +1110,7 @@ test.describe('BymOffice.mount with a document', () => {
     }, Array.from(input));
     expect(result.kind).toBe('document');
     expect(result.format).toBe('docx');
-    expect(result.keys).toEqual(['destroy', 'document', 'file', 'kind', 'save', 'view']);
+    expect(result.keys).toEqual(['destroy', 'document', 'editor', 'file', 'kind', 'save', 'view']);
     expect(result.blocks).toBe(true);
     expect(result.isView).toBe(true);
     expect(result.saved).toEqual(Array.from(input));

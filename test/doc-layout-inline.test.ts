@@ -71,7 +71,10 @@ test('doc layout: East Asian text breaks between any two characters, but not bef
 
 test('doc layout: a soft hyphen shows only where the line breaks at it', async () => {
   const broken = await lay(p(a(30) + '\u00ad' + a(15, 'b')));
-  assert.deepEqual(at(broken.pages[0]), [a(30) + '-@40,52.8', a(15, 'b') + '@40,68.8']);
+  // The hyphen is an item of its own, without a source: it is not in the text of the paragraph.
+  assert.deepEqual(at(broken.pages[0]), [a(30) + '@40,52.8', '-@280,52.8', a(15, 'b') + '@40,68.8']);
+  assert.equal(texts(broken.pages[0])[1].source, undefined);
+  assert.deepEqual(texts(broken.pages[0])[2].source, { story: 'body', path: [0], offset: 31 });
   const whole = await lay(p('aaaa\u00adbbbb') + p(r('cccc') + '<w:r><w:softHyphen/></w:r>' + r('dddd')));
   assert.equal(
     texts(whole.pages[0])

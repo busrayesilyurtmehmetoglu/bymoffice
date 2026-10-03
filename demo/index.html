@@ -52,7 +52,7 @@
     <main>
       <h1>BYM Office test arayüzü</h1>
       <p class="muted">
-        xlsx dosyaları tablo düzenleyicide, docx dosyaları salt okunur belge görüntüleyicide açılır; doc ve xls için yalnız
+        xlsx dosyaları tablo düzenleyicide, docx dosyaları belge düzenleyicide açılır; doc ve xls için yalnız
         kapsayıcı katmanı vardır (parçaları oku, kayıpsız yeniden kaydet). Dosyalar yalnız tarayıcınızda işlenir, hiçbir yere gönderilmez.
       </p>
 
@@ -120,8 +120,10 @@
         <div id="doc"></div>
         <p class="muted" id="doc-info" style="margin: 10px 0 0"></p>
         <p class="muted">
-          Belge salt okunurdur. Üst çubuktan ya da Ctrl/Cmd ile birlikte + / − / 0 tuşlarıyla (ve Ctrl/Cmd + tekerlekle, dokunmatikte iki parmakla) yakınlaştırın;
-          PageUp / PageDown / Home / End ile gezinin. Fareyle sürükleyerek metin seçin, Ctrl/Cmd+A tümünü seçer, Ctrl/Cmd+C kopyalar. Köprülere tıklanınca yeni sekmede açılır.
+          Sayfaya tıklayıp yazın: Enter yeni paragraf, Shift+Enter satır sonu, Ctrl/Cmd+Enter sayfa sonu; Ctrl/Cmd+B/I/U, Ctrl/Cmd+E/L/R/J hizalama,
+          Ctrl/Cmd+K bağlantı, Ctrl/Cmd+Z / Y geri al ve yinele; tabloda Tab sonraki hücreye geçer. Üstbilgiye çift tıklayınca o düzenlenir. Esc'ten sonra Tab düzenleyiciden çıkar.
+          Üst çubuktan ya da Ctrl/Cmd ile birlikte + / − / 0 tuşlarıyla yakınlaştırın. Köprüler Ctrl/Cmd+tık ile yeni sekmede açılır.
+          Düzenlemeler henüz dosyaya kaydedilmiyor olabilir (kaydetme bağlantısı ayrı bir görev).
         </p>
       </section>
 
@@ -266,6 +268,7 @@
       let editor = null;
       let view = null;
       let docView = null;
+      let docEditor = null;
       let changes = 0;
 
       async function showDocument(record) {
@@ -279,9 +282,10 @@
           const ms = performance.now() - started;
           if (selected !== record) return;
           const painted = performance.now();
-          docView = new BymOffice.DocumentView($('doc'), model, {
-            package: record.file.package,
+          docEditor = new BymOffice.DocumentEditor($('doc'), model, {
+            package: BymOffice.documentPictures(model, record.file.package),
             locale: 'tr',
+            readOnly: false,
             onPageChange: (page, count) => {
               $('doc-info').textContent = `Sayfa ${page} / ${count}${docView && !docView.layoutDone ? ' (sayfalar hazırlanıyor)' : ''} · yakınlaştırma %${Math.round((docView ? docView.zoom : 1) * 100)}`;
             },
@@ -289,6 +293,7 @@
               $('doc-note').textContent = notice.message;
             },
           });
+          docView = docEditor.view;
           window.__docView = docView;
           $('doc-note').textContent = `Model ${ms.toFixed(1)} ms'de okundu, ilk sayfalar ${(performance.now() - painted).toFixed(1)} ms'de çizildi.`;
         } catch (error) {
@@ -324,7 +329,8 @@
       async function showPreview(record) {
         const section = $('preview-section');
         if (editor) editor.destroy();
-        if (docView) docView.destroy();
+        if (docEditor) docEditor.destroy();
+        docEditor = null;
         editor = null;
         view = null;
         docView = null;

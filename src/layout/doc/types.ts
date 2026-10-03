@@ -134,7 +134,41 @@ export interface ImageItem {
   flipV?: boolean;
 }
 
-export type PageItem = TextItem | RectItem | LineItem | ImageItem;
+/**
+ * Where a line of a paragraph lies. Nothing is painted for it: an editor
+ * finds the place of a caret and the line under a pointer with it, also where
+ * a line holds no text. Only made with DocLayoutOptions.lineMarks.
+ */
+export interface LineMark {
+  type: 'mark';
+  /** Left edge of the content of the line (where its first character is, or would be) and top of the line. */
+  x: number;
+  y: number;
+  /** Extent of the content, trailing spaces left out, and height of the line. */
+  width: number;
+  height: number;
+  /** Baseline, from the top of the line. */
+  baseline: number;
+  /** Ascent and descent of the font a caret in an empty line has. */
+  ascent: number;
+  descent: number;
+  /** The paragraph (as TextItem.source) and the offset of the first character of the line. */
+  source: { story: string; path: number[]; offset: number };
+  /** Offsets the line covers; the line that ends the paragraph also takes a caret after them. */
+  length: number;
+  last: boolean;
+  /**
+   * Pictures and drawings in the line: where they are (from x of the mark) and
+   * the offset of the paragraph they sit at. They take no offset of their own:
+   * a caret stands before or after them at that offset.
+   */
+  boxes?: { dx: number; width: number; offset: number }[];
+  /** As for text items: a copy of a header row, and a line of text turned in a table cell. */
+  repeat?: true;
+  rotation?: number;
+}
+
+export type PageItem = TextItem | RectItem | LineItem | ImageItem | LineMark;
 
 /** One laid out page. Items are in painting order: what comes later is painted over what came before. */
 export interface LayoutPage {
@@ -159,6 +193,8 @@ export interface DocLayoutOptions {
    * is reached are drawn empty. A host with little memory may lower it.
    */
   maxTextBoxWork?: number;
+  /** Adds a LineMark for every line of every paragraph to the items of the pages. */
+  lineMarks?: boolean;
 }
 
 /** How much one call of DocLayout.layout() may do; without a budget it runs to the end. */

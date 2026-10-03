@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: document editor</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      /* Fixed size on desktop; narrower screens get the full width. */
+      #host {
+        width: 800px;
+        max-width: 100%;
+        height: 560px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Text fields: every browser has them in the Tab order (Safari leaves buttons out). -->
+    <input id="before" type="text" aria-label="before" />
+    <div id="host"></div>
+    <input id="after" type="text" aria-label="after" />
+    <p id="state">loading</p>
+    <script>
+      // Counts what is added to and removed from the window and the document, and the timers that
+      // are running, so that a test can see that destroy() leaves nothing behind.
+      (function () {
+        var counts = { listeners: 0, timers: 0, intervals: 0, frames: 0 };
+        window.__counts = counts;
+        var targets = [window, document];
+        if (window.visualViewport) targets.push(window.visualViewport);
+        targets.forEach(function (target) {
+          var add = target.addEventListener;
+          var remove = target.removeEventListener;
+          var held = [];
+          target.addEventListener = function (type, listener, options) {
+            var capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+            var known = held.some(function (entry) {
+              return entry.type === type && entry.listener === listener && entry.capture === capture;
+            });
+            if (!known && listener) {
+              held.push({ type: type, listener: listener, capture: capture });
+              counts.listeners++;
+            }
+            return add.call(target, type, listener, options);
+          };
+          target.removeEventListener = function (type, listener, options) {
+            var capture = typeof options === 'boolean' ? options : !!(options && options.capture);
+            for (var i = 0; i < held.length; i++) {
+              if (held[i].type === type && held[i].listener === listener && held[i].capture === capture) {
+                held.splice(i, 1);
+                counts.listeners--;
+                break;
+              }
+            }
+            return remove.call(target, type, listener, options);
+          };
+        });
+        var timers = new Set();
+        var setT = window.setTimeout;
+        var clearT = window.clearTimeout;
+        window.setTimeout = function (callback, delay) {
+          var args = Array.prototype.slice.call(arguments, 2);
+          var id = setT.call(window, function () {
+            timers.delete(id);
+            counts.timers = timers.size;
+            if (typeof callback === 'function') callback.apply(null, args);
+          }, delay);
+          timers.add(id);
+          counts.timers = timers.size;
+          return id;
+        };
+        window.clearTimeout = function (id) {
+          timers.delete(id);
+          counts.timers = timers.size;
+          return clearT.call(window, id);
+        };
+        var intervals = new Set();
+        var setI = window.setInterval;
+        var clearI = window.clearInterval;
+        window.setInterval = function () {
+          var id = setI.apply(window, arguments);
+          intervals.add(id);
+          counts.intervals = intervals.size;
+          return id;
+        };
+        window.clearInterval = function (id) {
+          intervals.delete(id);
+          counts.intervals = intervals.size;
+          return clearI.call(window, id);
+        };
+        var frames = new Set();
+        var raf = window.requestAnimationFrame;
+        var caf = window.cancelAnimationFrame;
+        window.requestAnimationFrame = function (callback) {
+          var id = raf.call(window, function (time) {
+            frames.delete(id);
+            counts.frames = frames.size;
+            callback(time);
+          });
+          frames.add(id);
+          counts.frames = frames.size;
+          return id;
+        };
+        window.cancelAnimationFrame = function (id) {
+          frames.delete(id);
+          counts.frames = frames.size;
+          return caf.call(window, id);
+        };
+      })();
+    </script>
+    <script src="/dist/bymoffice.min.js"></script>
+    <script>
+      window.__changes = 0;
+      window.__selections = [];
+      window.__notices = [];
+      window.__saved = [];
+      window.__opened = [];
+      // Nothing may really be opened from a test; what would have been is recorded.
+      window.open = function (url, target, features) {
+        window.__opened.push({ url: String(url), target: target, features: features });
+        return null;
+      };
+      // Opens a document from bytes in the editor (BymOffice.mount) inside #host. Resolves once it is shown.
+      // options.shadow: 'open' | 'closed' builds it inside a shadow root; options.transform: a CSS transform
+      // for the host; options.readOnly, options.locale, options.zoom, options.toolbar as mount() takes them.
+      window.__mountEdit = async function (bytes, options) {
+        options = options || {};
+        if (window.__mounted) window.__mounted.destroy();
+        window.__mounted = null;
+        window.__view = null;
+        window.__changes = 0;
+        window.__selections.length = 0;
+        window.__notices.length = 0;
+        window.__saved.length = 0;
+        var host = document.getElementById('host');
+        host.style.transform = options.transform || '';
+        host.style.transformOrigin = '0 0';
+        var container = host;
+        if (window.__shadowHost) window.__shadowHost.remove();
+        window.__shadow = null;
+        if (options.shadow) {
+          var shadowHost = document.createElement('div');
+          shadowHost.id = 'shadow-host';
+          shadowHost.style.cssText = 'width:100%;height:100%';
+          host.appendChild(shadowHost);
+          window.__shadowHost = shadowHost;
+          window.__shadow = shadowHost.attachShadow({ mode: options.shadow });
+          container = document.createElement('div');
+          container.style.cssText = 'width:100%;height:100%';
+          window.__shadow.appendChild(container);
+        }
+        window.__container = container;
+        var mounted = await BymOffice.mount(container, {
+          file: new Uint8Array(bytes),
+          readOnly: options.readOnly,
+          locale: options.locale,
+          zoom: options.zoom,
+          toolbar: options.toolbar,
+          onNotice: function (notice) {
+            window.__notices.push({ message: notice.message, kind: notice.kind });
+          },
+          onDocumentChange: function () {
+            window.__changes++;
+          },
+          onSave: function (saved) {
+            window.__saved.push(saved.length);
+          },
+        });
+        window.__mounted = mounted;
+        window.__view = mounted.view;
+        return true;
+      };
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>

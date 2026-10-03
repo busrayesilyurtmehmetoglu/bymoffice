@@ -60,6 +60,33 @@ export interface EditorStrings {
   /** The line about the selected numbers; every argument is already formatted. */
   summary(sum: string, average: string, count: string): string;
   actionFailed: string;
+  // The document editor.
+  paragraphStyle: string;
+  /** Name of the default paragraph style when the document gives it none. */
+  normalStyle: string;
+  fontName: string;
+  highlightColor: string;
+  noHighlight: string;
+  alignJustify: string;
+  bulletList: string;
+  numberedList: string;
+  decreaseIndent: string;
+  increaseIndent: string;
+  insertTable: string;
+  /** A table size in the grid that inserts one: "3 x 2 table". */
+  tableSize(rows: number, columns: number): string;
+  tableRowsColumns: string;
+  insertRowAbove: string;
+  insertRowBelow: string;
+  insertColumnLeft: string;
+  insertColumnRight: string;
+  deleteRow: string;
+  deleteColumn: string;
+  insertPicture: string;
+  insertLink: string;
+  linkAddress: string;
+  applyLink: string;
+  pageBreak: string;
 }
 
 /**
@@ -137,6 +164,30 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   readOnly: 'Read-only',
   summary: (sum, average, count) => `Sum: ${sum} · Average: ${average} · Count: ${count}`,
   actionFailed: 'The action could not be completed',
+  paragraphStyle: 'Paragraph style',
+  normalStyle: 'Normal',
+  fontName: 'Font',
+  highlightColor: 'Highlight colour',
+  noHighlight: 'No highlight',
+  alignJustify: 'Justify',
+  bulletList: 'Bulleted list',
+  numberedList: 'Numbered list',
+  decreaseIndent: 'Decrease indent',
+  increaseIndent: 'Increase indent',
+  insertTable: 'Insert table',
+  tableSize: (rows, columns) => `${rows} x ${columns} table`,
+  tableRowsColumns: 'Table rows and columns',
+  insertRowAbove: 'Insert row above',
+  insertRowBelow: 'Insert row below',
+  insertColumnLeft: 'Insert column left',
+  insertColumnRight: 'Insert column right',
+  deleteRow: 'Delete row',
+  deleteColumn: 'Delete column',
+  insertPicture: 'Insert picture',
+  insertLink: 'Insert link',
+  linkAddress: 'Address',
+  applyLink: 'Apply',
+  pageBreak: 'Page break',
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -198,6 +249,30 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   readOnly: 'Salt okunur',
   summary: (sum, average, count) => `Toplam: ${sum} · Ortalama: ${average} · Sayı: ${count}`,
   actionFailed: 'İşlem tamamlanamadı',
+  paragraphStyle: 'Paragraf stili',
+  normalStyle: 'Normal',
+  fontName: 'Yazı tipi',
+  highlightColor: 'Vurgu rengi',
+  noHighlight: 'Vurgu yok',
+  alignJustify: 'İki yana yasla',
+  bulletList: 'Madde imli liste',
+  numberedList: 'Numaralı liste',
+  decreaseIndent: 'Girintiyi azalt',
+  increaseIndent: 'Girintiyi artır',
+  insertTable: 'Tablo ekle',
+  tableSize: (rows, columns) => `${rows} x ${columns} tablo`,
+  tableRowsColumns: 'Tablo satır ve sütunları',
+  insertRowAbove: 'Üste satır ekle',
+  insertRowBelow: 'Alta satır ekle',
+  insertColumnLeft: 'Sola sütun ekle',
+  insertColumnRight: 'Sağa sütun ekle',
+  deleteRow: 'Satırı sil',
+  deleteColumn: 'Sütunu sil',
+  insertPicture: 'Görsel ekle',
+  insertLink: 'Bağlantı ekle',
+  linkAddress: 'Adres',
+  applyLink: 'Uygula',
+  pageBreak: 'Sayfa sonu',
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

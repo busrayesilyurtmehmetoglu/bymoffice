@@ -11,7 +11,8 @@ import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
 import type { WorkbookView } from './ui/sheet-view';
-import { DocumentView, type DocumentZoom } from './ui/doc-view';
+import type { DocumentView, DocumentZoom } from './ui/doc-view';
+import { DocumentEditor } from './ui/doc-editor';
 import { OpcPackage } from './opc';
 
 export { CfbFile, type CfbEntry } from './cfb';
@@ -67,6 +68,12 @@ export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont
 export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
+export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
+export { DocToolbar, type DocShellHost } from './ui/doc-toolbar';
+export { DocLines, type Affinity, type CaretBox, type PageLine, type Place } from './ui/doc-caret';
+export { sliceHtml, sliceOf, type DocSlice } from './ui/doc-clipboard';
+export type { LineMark } from './layout/doc/types';
+export type { EditProgress } from './layout/doc/layout';
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
 
@@ -232,6 +239,8 @@ export interface MountOptions extends SpreadsheetEditorOptions {
   onPageChange?(page: number, pageCount: number): void;
   /** Documents: called when a hyperlink is activated; return false to keep the view from opening it in a new window. */
   onLinkClick?(target: string): boolean | void;
+  /** Documents: called after every change made in the editor, undo and redo included. */
+  onDocumentChange?(): void;
 }
 
 export interface MountedSpreadsheet {
@@ -255,8 +264,10 @@ export interface MountedDocument {
   kind: 'document';
   file: OfficeFile;
   document: DocModel;
-  /** The pages: zoom, navigation, selection. Documents are shown read-only. */
+  /** The pages: zoom, navigation, the caret and the selection, editing, undo and redo. */
   view: DocumentView;
+  /** The editor around the pages: the formatting toolbar. */
+  editor: DocumentEditor;
   /** The file as bytes; a document cannot be changed yet, so these are the bytes it was opened from. */
   save(): Promise<Uint8Array>;
   /** Removes the view from the container. */
@@ -269,7 +280,8 @@ export type MountedView = MountedSpreadsheet | MountedDocument;
 /**
  * Opens a file and shows it inside `container`, which must have a size: a
  * spreadsheet (xlsx) in the editor, with a toolbar, a formula bar and a status
- * bar unless the options turn them off; a document (docx) read-only, as pages.
+ * bar unless the options turn them off; a document as pages, a docx in the
+ * document editor (unless `readOnly` is set), doc and RTF read-only.
  * Other formats reject with UnsupportedFileError.
  */
 export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
@@ -293,22 +305,33 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   if (file.kind === 'document') {
     if (!file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
     const model = await file.document();
-    const view = new DocumentView(container, model, {
+    const editor = new DocumentEditor(container, model, {
       package: documentPictures(model, file.package),
       locale: options.locale,
       zoom: options.zoom,
       toolbar: options.toolbar,
+      // Only a docx is written back with its changes; the other formats are shown read-only until they can be saved.
+      readOnly: file.format !== 'docx' || options.readOnly === true,
+      partTaken: file.package ? (part: string) => (file.package as OpcPackage).hasPart(part) : undefined,
       onPageChange: options.onPageChange,
       onNotice: options.onNotice,
       onLinkClick: options.onLinkClick,
+      onChange: options.onDocumentChange,
     });
-    save = () => file.save();
+    const view = editor.view;
+    save = async () => {
+      // A composition still under way belongs to the document that is written.
+      view.commitEditing();
+      const bytes = await file.save();
+      view.markSaved();
+      return bytes;
+    };
     container.addEventListener('keydown', onKeyDown);
     const destroy = () => {
       container.removeEventListener('keydown', onKeyDown);
-      view.destroy();
+      editor.destroy();
     };
-    return { kind: 'document', file, document: model, view, save, destroy };
+    return { kind: 'document', file, document: model, view, editor, save, destroy };
   }
 
   const workbook = await file.workbook();

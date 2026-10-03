@@ -14,7 +14,7 @@
 
 import type { Block, DocModel, DrawingAnchor, DrawingPosition, HeaderFooterKind, SectionProps, Story, Table } from '../../model/doc/types';
 import { getPrep, layoutBlocks, paragraphEnv } from './blocks';
-import { bandsHeight, LayoutContext, shifted, type Band, type FieldTextItem, type FieldValues, type FloatSpec, type StoryRef } from './context';
+import { bandsHeight, LayoutContext, shifted, type Band, type FieldTextItem, type FieldValues, type FloatSpec, type PrepSession, type StateEvent, type StoryRef } from './context';
 import { floatExclusion, floatPosition, type FloatFrame, type Rect, type WrapSide } from './drawing';
 import { inheritedPart, findSections, pageBorderItems, pageGeometry, type PageGeometry, type SectionInfo } from './page';
 import { paragraphBands, type WrapEnv } from './paragraph';
@@ -128,6 +128,122 @@ interface TotalsRecord {
   build: PageBuild;
 }
 
+/**
+ * The state of the engine where a page begins: enough to lay the document
+ * out again from that page on. Kept for every page that does not begin in the
+ * middle of a table that is still being fed.
+ */
+interface PageMark {
+  nextBlock: number;
+  feedSection: number;
+  endnotesQueued: boolean;
+  section: number;
+  afterBreak: boolean;
+  emptyColumns: number;
+  /** Bands waiting to be placed. */
+  queue: QueueItem[];
+  carry: Band[];
+  sectionStarted: boolean[];
+  sectionPages: number[];
+  /** Lengths of the lists of fields that show a total. */
+  totalItems: number;
+  totalPages: number;
+}
+
+/** Everything that changes while the engine runs, as it was when an edit came. */
+interface LiveState {
+  done: boolean;
+  queue: QueueItem[];
+  head: number;
+  nextBlock: number;
+  table: TableLayout | undefined;
+  tableSession: PrepSession | undefined;
+  feedSection: number;
+  endnotesQueued: boolean;
+  section: number;
+  build: PageBuild | undefined;
+  column: Column | undefined;
+  fields: FieldValues;
+  carry: Band[];
+  emptyColumns: number;
+  afterBreak: boolean;
+  sectionStarted: boolean[];
+  sectionPages: number[];
+  regionBands: Band[] | undefined;
+  regionBodyStart: number;
+  regionTotalsStart: number;
+}
+
+/**
+ * The pages an edit made stale, kept while the document is laid out again
+ * from the page of the edit: as soon as a page begins in the state it began
+ * in before, the old pages from there on are the new ones.
+ */
+interface OldLayout {
+  /** Index of the first page laid out again. */
+  from: number;
+  /** First block after the ones the edit changed. */
+  end: number;
+  /** Pages and marks from `from` on. */
+  pages: LayoutPage[];
+  marks: (PageMark | undefined)[];
+  live: LiveState;
+  /** Lengths of the lists of totals at `from`, and what the lists held after that. */
+  itemsBase: number;
+  pagesBase: number;
+  totalItems: { page: number; item: FieldTextItem }[];
+  totalPages: TotalsRecord[];
+}
+
+/** What DocLayout.edited() did. */
+export interface EditProgress extends LayoutProgress {
+  /** Index of the first page that was laid out again; the number of pages when none was. */
+  from: number;
+}
+
+/**
+ * What the layout of the body depends on besides the blocks of the body, as
+ * a list of objects: the blocks of the headers and footers, the notes, the
+ * list definitions. The operations of ops/doc put new objects where they
+ * change one of these, so two lists that hold the same objects mean nothing
+ * of it changed.
+ */
+function sideParts(doc: DocModel): unknown[] {
+  const out: unknown[] = [doc.body.section, doc.styles, doc.settings];
+  const stories = (map: Map<string, Story>) =>
+    map.forEach((story, id) => {
+      out.push(id, story.blocks.length);
+      for (let i = 0; i < story.blocks.length; i++) out.push(story.blocks[i]);
+    });
+  stories(doc.headers);
+  stories(doc.footers);
+  if (doc.footnotes) doc.footnotes.items.forEach((note) => out.push(note));
+  out.push(null);
+  if (doc.endnotes) doc.endnotes.items.forEach((note) => out.push(note));
+  out.push(null);
+  doc.numbering.abstracts.forEach((value) => out.push(value));
+  doc.numbering.nums.forEach((value) => out.push(value));
+  return out;
+}
+
+const sameList = <T>(a: T[], b: T[]): boolean => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+const sameCounts = (a: number[], b: number[]): boolean => {
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) if ((a[i] || 0) !== (b[i] || 0)) return false;
+  return true;
+};
+
+const sameFlags = (a: boolean[], b: boolean[]): boolean => {
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) if (!!a[i] !== !!b[i]) return false;
+  return true;
+};
+
 const BODY: StoryRef = { id: 'body', main: true };
 /** Share of a column footnotes carried over from the page before may take. */
 const CARRIED_NOTES_SHARE = 0.75;
@@ -148,7 +264,17 @@ export class DocLayout {
   private readonly doc: DocModel;
   private readonly ctx: LayoutContext;
   private readonly options: DocLayoutOptions;
-  private readonly sections: SectionInfo[];
+  private sections: SectionInfo[];
+  /** The blocks of the body as they were when they were last looked at: an edit is found by comparing. */
+  private blocks: Block[];
+  /** See sideParts(). */
+  private sides: unknown[];
+  /** State at the start of every page, by page index. */
+  private marks: (PageMark | undefined)[] = [];
+  private old: OldLayout | undefined;
+  /** Blocks [from, to) take the place of blocks that gave these events. */
+  private expect: { from: number; to: number; events: StateEvent[]; at: number } | undefined;
+  private tableSession: PrepSession | undefined;
 
   private done = false;
   /** Bands waiting to be placed, from `head` on. */
@@ -200,7 +326,249 @@ export class DocLayout {
     this.ctx = new LayoutContext(doc, measurer, options);
     this.ctx.layoutBlocks = layoutBlocks;
     this.sections = findSections(doc);
+    this.blocks = doc.body.blocks.slice();
+    this.sides = sideParts(doc);
     this.setGrid();
+  }
+
+  /**
+   * The body of the document was edited (blocks replaced by new objects, as
+   * the operations in ops/doc do): lays it out again from the page of the
+   * first changed block. Pages before it stay as they are; paragraphs that
+   * did not change keep their lines. Layout runs here as far as the changed
+   * blocks reach; call layout() for the rest, as after the constructor. When
+   * the edit left the number of blocks alone and a later page begins exactly
+   * as it began before, the pages from there on are kept as well.
+   *
+   * Returns undefined when the engine cannot follow the edit: it changed what
+   * the document counts (the items of a list, the notes), its sections, or
+   * something besides the blocks of the body (a header, a note, a list
+   * definition). Make a new DocLayout then; this one is of no use any more.
+   */
+  edited(): EditProgress | undefined {
+    const ctx = this.ctx;
+    if (this.truncated || ctx.broken || this.options.maxPages !== undefined) return undefined;
+    if (!sameList(this.sides, sideParts(this.doc))) {
+      ctx.broken = true;
+      return undefined;
+    }
+    const before = this.blocks;
+    const blocks = this.doc.body.blocks;
+    const shared = Math.min(before.length, blocks.length);
+    let first = 0;
+    while (first < shared && before[first] === blocks[first]) first++;
+    let tail = 0;
+    while (tail < shared - first && before[before.length - 1 - tail] === blocks[blocks.length - 1 - tail]) tail++;
+    const removed = before.length - first - tail;
+    const inserted = blocks.length - first - tail;
+    this.updated = [];
+    if (removed === 0 && inserted === 0) return { from: this.pages.length, done: this.done, updated: [] };
+    this.blocks = blocks.slice();
+
+    const sections = findSections(this.doc);
+    if (sections.length !== this.sections.length) return undefined;
+    for (let i = 0; i < sections.length; i++) if (sections[i].props !== this.sections[i].props) return undefined;
+
+    // The paragraph before the change looks at what follows it (its borders, its spacing): it is laid out again too.
+    let dirty = first;
+    for (let i = first - 1, tries = 0; i >= 0 && tries < 16; i--, tries++) {
+      const type = blocks[i].type;
+      if (type === 'paragraph' || type === 'table') {
+        dirty = i;
+        break;
+      }
+    }
+    if (!this.done && dirty >= this.nextBlock) {
+      // Layout has not come that far yet.
+      this.sections = sections;
+      return { from: this.pages.length, done: false, updated: [] };
+    }
+    // Every changed block must have been turned into bands in full: its events are what the new ones get.
+    if (first + removed > this.nextBlock - (this.table ? 1 : 0)) return undefined;
+    const events: StateEvent[] = [];
+    for (let i = first; i < first + removed; i++) {
+      const own = ctx.blockEvents.get(before[i]);
+      if (!own) return undefined;
+      for (let k = 0; k < own.length; k++) events.push(own[k]);
+    }
+
+    let from = -1;
+    for (let i = Math.min(this.marks.length, this.pages.length + 1) - 1; i >= 0; i--) {
+      const mark = this.marks[i];
+      if (mark && mark.nextBlock <= dirty) {
+        from = i;
+        break;
+      }
+    }
+    if (from < 0) return undefined;
+    const mark = this.marks[from] as PageMark;
+
+    this.old =
+      inserted === removed && from < this.pages.length
+        ? {
+            from,
+            end: first + inserted,
+            pages: this.pages.slice(from),
+            marks: this.marks.slice(from, this.pages.length),
+            live: this.live(),
+            itemsBase: mark.totalItems,
+            pagesBase: mark.totalPages,
+            totalItems: this.totalItems.slice(mark.totalItems),
+            totalPages: this.totalPages.slice(mark.totalPages),
+          }
+        : undefined;
+    this.pages.length = from;
+    this.marks.length = from;
+    this.totalItems.length = mark.totalItems;
+    this.totalPages.length = mark.totalPages;
+    this.done = false;
+    this.queue = mark.queue.slice();
+    this.head = 0;
+    this.nextBlock = mark.nextBlock;
+    this.table = undefined;
+    this.tableSession = undefined;
+    this.feedSection = mark.feedSection;
+    this.endnotesQueued = mark.endnotesQueued;
+    this.section = mark.section;
+    this.build = undefined;
+    this.column = undefined;
+    this.carry = mark.carry.slice();
+    this.emptyColumns = mark.emptyColumns;
+    this.afterBreak = mark.afterBreak;
+    this.sectionStarted = mark.sectionStarted.slice();
+    this.sectionPages = mark.sectionPages.slice();
+    this.balancing = false;
+    this.sections = sections;
+    this.setGrid();
+    this.expect = { from: first, to: first + inserted, events, at: 0 };
+    this.handed = from;
+    this.openPage(true);
+    const end = first + inserted;
+    // Bounded like layout(): every step places a band or ends a page.
+    while (!this.done && !ctx.broken && (this.expect || this.table || this.nextBlock < end) && this.pages.length < MAX_PAGES) {
+      if (!this.step()) break;
+    }
+    if (ctx.broken || this.expect) return undefined;
+    return { from, done: this.done, updated: this.updated };
+  }
+
+  private live(): LiveState {
+    return {
+      done: this.done,
+      queue: this.queue,
+      head: this.head,
+      nextBlock: this.nextBlock,
+      table: this.table,
+      tableSession: this.tableSession,
+      feedSection: this.feedSection,
+      endnotesQueued: this.endnotesQueued,
+      section: this.section,
+      build: this.build,
+      column: this.column,
+      fields: this.fields,
+      carry: this.carry,
+      emptyColumns: this.emptyColumns,
+      afterBreak: this.afterBreak,
+      sectionStarted: this.sectionStarted,
+      sectionPages: this.sectionPages,
+      regionBands: this.regionBands,
+      regionBodyStart: this.regionBodyStart,
+      regionTotalsStart: this.regionTotalsStart,
+    };
+  }
+
+  /**
+   * At the start of a page while the document is laid out again after an
+   * edit: when everything that decides the rest of the layout is as it was
+   * when the old page of the same index began, the old pages from here on are
+   * taken back and the engine goes on where it was before the edit.
+   */
+  private resume(): boolean {
+    const old = this.old;
+    if (!old) return false;
+    const index = this.pages.length;
+    const k = index - old.from;
+    if (k >= old.pages.length) {
+      // More pages than before: nothing of the old layout can come back.
+      this.old = undefined;
+      return false;
+    }
+    const mark = k > 0 ? old.marks[k] : undefined;
+    if (!mark || this.expect || this.table || this.balancing || this.nextBlock < old.end) return false;
+    if (
+      mark.nextBlock !== this.nextBlock ||
+      mark.feedSection !== this.feedSection ||
+      mark.endnotesQueued !== this.endnotesQueued ||
+      mark.section !== this.section ||
+      mark.afterBreak !== this.afterBreak ||
+      mark.emptyColumns !== this.emptyColumns ||
+      this.pages[index - 1].number !== old.pages[k - 1].number ||
+      mark.queue.length !== this.queue.length - this.head ||
+      !sameList(mark.carry, this.carry) ||
+      !sameFlags(mark.sectionStarted, this.sectionStarted) ||
+      !sameCounts(mark.sectionPages, this.sectionPages)
+    ) {
+      return false;
+    }
+    for (let i = 0; i < mark.queue.length; i++) if (mark.queue[i] !== this.queue[this.head + i]) return false;
+    // The block that comes next looks at the one before it, which must not be one of the changed ones.
+    const blocks = this.doc.body.blocks;
+    for (let i = this.nextBlock - 1, tries = 0; i >= 0 && tries < 16; i--, tries++) {
+      if (i < old.end) return false;
+      const type = blocks[i].type;
+      if (type === 'paragraph' || type === 'table') break;
+    }
+
+    this.old = undefined;
+    const items = this.totalItems.length;
+    const pages = this.totalPages.length;
+    let goneItems = 0;
+    for (const entry of old.totalItems) {
+      if (entry.page >= index) this.totalItems.push(entry);
+      else goneItems++;
+    }
+    let gonePages = 0;
+    for (const record of old.totalPages) {
+      if (record.index >= index) this.totalPages.push(record);
+      else gonePages++;
+    }
+    // The lists are shorter or longer before this page than they were: what counts from their start moves along.
+    const shiftItems = items - (old.itemsBase + goneItems);
+    const shiftPages = pages - (old.pagesBase + gonePages);
+    for (let j = k; j < old.pages.length; j++) {
+      this.pages.push(old.pages[j]);
+      const kept = old.marks[j];
+      if (kept && (shiftItems || shiftPages)) {
+        kept.totalItems += shiftItems;
+        kept.totalPages += shiftPages;
+      }
+      this.marks[index + j - k] = kept;
+    }
+    const live = old.live;
+    this.done = live.done;
+    this.queue = live.queue;
+    this.head = live.head;
+    this.nextBlock = live.nextBlock;
+    this.table = live.table;
+    this.tableSession = live.tableSession;
+    this.feedSection = live.feedSection;
+    this.endnotesQueued = live.endnotesQueued;
+    this.section = live.section;
+    this.build = live.build;
+    this.column = live.column;
+    this.fields = live.fields;
+    this.carry = live.carry;
+    this.emptyColumns = live.emptyColumns;
+    this.afterBreak = live.afterBreak;
+    this.sectionStarted = live.sectionStarted;
+    this.sectionPages = live.sectionPages;
+    this.regionBands = live.regionBands;
+    this.regionBodyStart = live.regionBodyStart;
+    this.regionTotalsStart = live.regionTotalsStart + shiftItems;
+    this.setGrid();
+    // The number of pages is what it was: only the pages laid out again have totals to fill in.
+    if (this.done) this.fillTotals(old.itemsBase, items, old.pagesBase, pages);
+    return true;
   }
 
   /**
@@ -244,16 +612,57 @@ export class DocLayout {
     const blocks = this.doc.body.blocks;
     this.queue.length = 0;
     this.head = 0;
+    const ctx = this.ctx;
     while (this.table) {
       // More rows of the table that is under way.
-      const bands = this.table.next(TABLE_STEP_ROWS);
-      if (this.table.done) this.table = undefined;
+      ctx.session = this.tableSession;
+      let bands: Band[];
+      try {
+        bands = this.table.next(TABLE_STEP_ROWS);
+      } finally {
+        ctx.session = undefined;
+      }
+      if (this.table.done) {
+        this.table = undefined;
+        this.tableSession = undefined;
+      }
       for (let i = 0; i < bands.length; i++) this.queue.push(bands[i]);
       if (this.queue.length) return true;
     }
-    while (this.nextBlock < blocks.length) {
-      const index = this.nextBlock++;
-      const bands = this.blockBands(blocks, index);
+    for (;;) {
+      const expect = this.expect;
+      if (expect && this.nextBlock >= expect.to) {
+        // The changed blocks are all laid out: they must have taken every value the old ones had.
+        if (expect.at !== expect.events.length) ctx.broken = true;
+        this.expect = undefined;
+      }
+      if (this.nextBlock >= blocks.length) break;
+      // The block is counted as fed only once it is: a page that begins while it is prepared begins before it.
+      const index = this.nextBlock;
+      const block = blocks[index];
+      // Headers and footers of a page that begins here are not part of the block.
+      this.needColumn();
+      const known = ctx.blockEvents.get(block);
+      const cursor = expect && index >= expect.from && index < expect.to ? expect : undefined;
+      let session: PrepSession | undefined;
+      if (!known) session = { record: [], seen: new Set(), expect: cursor };
+      else if (cursor) {
+        // A block that was laid out before (an edit undone): its values must be the ones expected here.
+        ctx.session = { record: [], seen: new Set(), expect: cursor };
+        ctx.replay(known);
+      }
+      ctx.session = session;
+      let bands: Band[];
+      try {
+        bands = this.blockBands(blocks, index);
+      } finally {
+        ctx.session = undefined;
+      }
+      if (session) {
+        ctx.blockEvents.set(block, session.record);
+        if (this.table) this.tableSession = session;
+      }
+      this.nextBlock = index + 1;
       for (let i = 0; i < bands.length; i++) this.queue.push(bands[i]);
       if (index + 1 === this.sections[this.feedSection].end && this.feedSection < this.sections.length - 1) {
         this.feedSection++;
@@ -262,8 +671,8 @@ export class DocLayout {
       if (this.queue.length) return true;
     }
     if (!this.endnotesQueued) {
-      this.endnotesQueued = true;
       this.queueEndnotes();
+      this.endnotesQueued = true;
       if (this.queue.length) return true;
     }
     return false;
@@ -366,6 +775,7 @@ export class DocLayout {
 
   /** Places one band or follows one section mark; false when the document is done. */
   private step(): boolean {
+    if (this.done) return false;
     if (this.head >= this.queue.length && !this.fill()) {
       this.finish();
       return false;
@@ -391,7 +801,7 @@ export class DocLayout {
     // Lines of footnotes that found no room on the pages of the text take pages of their own: nothing of a note is dropped.
     while (this.carry.length && !this.truncated && this.pages.length < MAX_PAGES) {
       const left = this.carry.length;
-      this.openPage();
+      this.openPage(true);
       this.closeColumn();
       this.closePage();
       if (this.carry.length >= left) break;
@@ -401,7 +811,7 @@ export class DocLayout {
   }
 
   private needColumn(): Column {
-    if (!this.build) this.openPage();
+    if (!this.build) this.openPage(true);
     return this.column!;
   }
 
@@ -836,8 +1246,29 @@ export class DocLayout {
 
   // ------------------------------------------------------------------ pages
 
-  /** Starts a page of the current section. */
-  private openPage(): void {
+  /**
+   * Starts a page of the current section. `direct`: the caller goes on with
+   * the page at once, so the old pages are not looked at here (see resume()).
+   */
+  private openPage(direct = false): void {
+    if (!direct && this.old && this.resume()) return;
+    this.marks[this.pages.length] =
+      this.table || this.balancing
+        ? undefined
+        : {
+            nextBlock: this.nextBlock,
+            feedSection: this.feedSection,
+            endnotesQueued: this.endnotesQueued,
+            section: this.section,
+            afterBreak: this.afterBreak,
+            emptyColumns: this.emptyColumns,
+            queue: this.queue.slice(this.head),
+            carry: this.carry.slice(),
+            sectionStarted: this.sectionStarted.slice(),
+            sectionPages: this.sectionPages.slice(),
+            totalItems: this.totalItems.length,
+            totalPages: this.totalPages.length,
+          };
     const index = this.section;
     const section = this.sections[index];
     const props = section.props;
@@ -1014,10 +1445,11 @@ export class DocLayout {
   }
 
   /** The totals are known: the fields that show them get their text. */
-  private fillTotals(): void {
+  private fillTotals(itemFrom = 0, itemTo = this.totalItems.length, pageFrom = 0, pageTo = this.totalPages.length): void {
     const total = this.pages.length;
     const changed = new Set<number>();
-    for (const entry of this.totalItems) {
+    for (let i = itemFrom; i < itemTo; i++) {
+      const entry = this.totalItems[i];
       const page = this.pages[entry.page];
       if (!page) continue;
       const item = entry.item;
@@ -1027,7 +1459,8 @@ export class DocLayout {
       this.setText(item, text);
       changed.add(entry.page);
     }
-    for (const record of this.totalPages) {
+    for (let i = pageFrom; i < pageTo; i++) {
+      const record = this.totalPages[i];
       const page = this.pages[record.index];
       const build = record.build;
       const values: FieldValues = { page: page.number, numPages: total, sectionPages: this.sectionPages[page.section] || 1 };
@@ -1042,8 +1475,7 @@ export class DocLayout {
       page.items = this.compose(build);
       changed.add(record.index);
     }
-    this.totalItems = [];
-    this.totalPages = [];
+    // The lists stay: after an edit the totals may be different, and the pages before it show them too.
     changed.forEach((index) => {
       if (index < this.handed) this.updated.push(index);
     });
@@ -1187,5 +1619,5 @@ function replaceIn(queue: QueueItem[], at: number, remove: number, items: QueueI
 }
 
 function asRepeat(item: PageItem): PageItem {
-  return item.type === 'text' ? { ...item, repeat: true } : item;
+  return item.type === 'text' || item.type === 'mark' ? { ...item, repeat: true } : item;
 }

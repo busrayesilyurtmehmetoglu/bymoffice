@@ -92,6 +92,24 @@ export interface UiStrings {
   documentLayoutFailed: string;
   /** What stands in a placeholder: `kind` is "picture", "chart", "diagram", "shape", "vml", "object", ... */
   placeholder(kind: string): string;
+  // Editing a document.
+  /** Label of the field that takes what is typed. */
+  documentEditor: string;
+  cannotEditHere: string;
+  /** Said after Escape: the next Tab moves the focus out of the editor instead of typing a tab. */
+  tabLeaves: string;
+  documentPasteTooLarge: string;
+  pictureNotSupported: string;
+  linkNotAllowed: string;
+  /** Said when the caret enters another part of the document: `kind` is "body", "header", "footer", "footnote" or "endnote". */
+  editingStory(kind: string): string;
+  /** Said for an empty line and for a space the caret passes. */
+  blankLine: string;
+  space: string;
+  endOfDocument: string;
+  /** The bubble over a selection made by touch, and its button that selects the whole text. */
+  selectionTools: string;
+  selectWholeText: string;
 }
 
 const rows = (count: number) => (count === 1 ? 'row' : `${count} rows`);
@@ -164,6 +182,18 @@ export const STRINGS_EN: UiStrings = {
   documentTooLong: 'The document is too long: only its first pages are shown',
   documentLayoutFailed: 'The document could not be laid out completely',
   placeholder: (kind) => (kind === 'chart' ? 'Chart' : kind === 'diagram' ? 'Diagram' : kind === 'object' ? 'Embedded object' : kind === 'picture' ? 'Picture' : 'Drawing'),
+  documentEditor: 'Document editor',
+  cannotEditHere: 'This part of the document cannot be edited',
+  tabLeaves: 'Press Tab to leave the editor',
+  documentPasteTooLarge: 'The text on the clipboard is too long to paste',
+  pictureNotSupported: 'This picture cannot be inserted',
+  linkNotAllowed: 'This address cannot be used as a link',
+  editingStory: (kind) => (kind === 'header' ? 'Editing the header' : kind === 'footer' ? 'Editing the footer' : kind === 'footnote' ? 'Editing a footnote' : kind === 'endnote' ? 'Editing an endnote' : 'Editing the text'),
+  blankLine: 'blank',
+  space: 'space',
+  endOfDocument: 'End of the document',
+  selectionTools: 'Selection',
+  selectWholeText: 'Select all',
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -243,6 +273,18 @@ export const STRINGS_TR: UiStrings = {
   documentTooLong: 'Belge çok uzun: yalnız ilk sayfaları gösteriliyor',
   documentLayoutFailed: 'Belgenin tamamı sayfalara yerleştirilemedi',
   placeholder: (kind) => (kind === 'chart' ? 'Grafik' : kind === 'diagram' ? 'Diyagram' : kind === 'object' ? 'Gömülü nesne' : kind === 'picture' ? 'Görsel' : 'Çizim'),
+  documentEditor: 'Belge düzenleyici',
+  cannotEditHere: 'Belgenin bu bölümü düzenlenemez',
+  tabLeaves: 'Düzenleyiciden çıkmak için Sekme tuşuna basın',
+  documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
+  pictureNotSupported: 'Bu görsel eklenemiyor',
+  linkNotAllowed: 'Bu adres bağlantı olarak kullanılamaz',
+  editingStory: (kind) => (kind === 'header' ? 'Üstbilgi düzenleniyor' : kind === 'footer' ? 'Altbilgi düzenleniyor' : kind === 'footnote' ? 'Dipnot düzenleniyor' : kind === 'endnote' ? 'Sonnot düzenleniyor' : 'Metin düzenleniyor'),
+  blankLine: 'boş',
+  space: 'boşluk',
+  endOfDocument: 'Belgenin sonu',
+  selectionTools: 'Seçim',
+  selectWholeText: 'Tümünü seç',
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

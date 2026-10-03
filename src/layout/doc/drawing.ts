@@ -322,6 +322,10 @@ function blocksWeight(blocks: Block[], depth: number): number {
  * of a document together are laid out only up to a limit; the ones after it stay empty.
  */
 function takesBox(ctx: LayoutContext, blocks: Block[], owner: object): boolean {
+  return ctx.boxEvent(blocks, owner, () => decideBox(ctx, blocks, owner));
+}
+
+function decideBox(ctx: LayoutContext, blocks: Block[], owner: object): boolean {
   const first = ctx.boxOwners.get(blocks);
   if (first === undefined) ctx.boxOwners.set(blocks, owner);
   else if (first !== owner) return false;

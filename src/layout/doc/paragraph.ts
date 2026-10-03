@@ -9,7 +9,7 @@ import { pushShifted } from './context';
 import { breakLine, type Line, type Piece } from './line-break';
 import { borderRoom, type ParaPrep } from './prep';
 import { LEADER } from './symbols';
-import type { PageItem } from './types';
+import type { LineMark, PageItem } from './types';
 import { EPSILON, MAX_PARAGRAPH_LINES } from './units';
 
 /** What a paragraph is laid out in, beyond its width. */
@@ -40,6 +40,17 @@ export interface WrapEnv {
    * to move down to that y instead.
    */
   free(top: number, bottom: number): { left: number; right: number }[] | number;
+}
+
+/** Offset in paragraphText() of the place (atom, character) of a prepared paragraph: of the first atom from there on that has one. */
+function offsetAt(prep: ParaPrep, atom: number, ch: number): number {
+  const atoms = prep.atoms;
+  for (let i = atom; i < atoms.length; i++) {
+    const a = atoms[i];
+    if (a.t === 'break' || a.offset < 0) continue;
+    return a.offset + (i === atom ? ch : 0);
+  }
+  return prep.length;
 }
 
 /** Right edge for a line that takes all that is left of its paragraph, px. */
@@ -386,6 +397,48 @@ export function paragraphBands(
       }
     }
     lineItems(ctx, prep, line, top, box.baseline, justified, items);
+    if (ctx.options.lineMarks) {
+      // Where the text of the line is; an empty line has its place by the alignment of the paragraph.
+      let from = Infinity;
+      let to = -Infinity;
+      for (let i = 0; i < line.pieces.length; i++) {
+        const piece = line.pieces[i];
+        if (piece.label || (piece.kind !== 'box' && piece.offset < 0)) continue;
+        if (piece.x < from) from = piece.x;
+        const right = piece.x + piece.width - (i === line.pieces.length - 1 ? piece.trail : 0);
+        if (right > to) to = right;
+      }
+      if (from === Infinity) {
+        // After a list number, where there is one.
+        let start = x0;
+        for (let i = 0; i < line.pieces.length; i++) start = Math.max(start, line.pieces[i].x + line.pieces[i].width);
+        from = line.pieces.length ? start : prep.align === 'center' ? (x0 + x1) / 2 : prep.align === 'right' ? x1 : x0;
+        to = from;
+      }
+      const start = offsetAt(prep, atom, ch);
+      const end = line.last ? prep.length : offsetAt(prep, line.atom, line.ch);
+      const m = ctx.metrics(line.pieces.length === 0 && line.brkFont ? line.brkFont : prep.mark.font);
+      let boxes: { dx: number; width: number; offset: number }[] | undefined;
+      for (let i = 0; i < line.pieces.length; i++) {
+        const piece = line.pieces[i];
+        if (piece.kind === 'box' && piece.offset >= 0) (boxes || (boxes = [])).push({ dx: piece.x - from, width: piece.width, offset: piece.offset });
+      }
+      const mark: LineMark = {
+        type: 'mark',
+        x: from,
+        y: top,
+        width: Math.max(0, to - from),
+        height: box.height,
+        baseline: box.baseline,
+        ascent: m.ascent,
+        descent: m.descent,
+        source: { story: prep.story, path: prep.path, offset: start },
+        length: Math.max(0, end - start),
+        last: line.last,
+      };
+      if (boxes) mark.boxes = boxes;
+      items.push(mark);
+    }
 
     const ref: ParaRef = { prep, atom, ch, width, env };
     if (wrap) ref.slot = { page: wrap.page, column: wrap.column, y: slot };

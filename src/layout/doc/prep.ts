@@ -18,7 +18,7 @@ import {
   type RunItem,
   type Wrapper,
 } from '../../model/doc/types';
-import { raisedStyle, type Band, type BorderLine, type CellWhere, type FieldValues, type FloatSpec, type LayoutContext, type RunStyle, type StoryRef } from './context';
+import { raisedStyle, type Band, type BorderLine, type CellWhere, type FieldValues, type FloatSpec, type LayoutContext, type RunStyle, type StateEvent, type StoryRef } from './context';
 import { drawingContent, legacyContent, makeFloat } from './drawing';
 import { isLiveField, mapSymbols, mayHoldSymbols, parseFieldCode, symbolFont, type LiveField } from './symbols';
 import type { LayoutFont, PageItem } from './types';
@@ -144,6 +144,12 @@ export interface ParaPrep {
   cache?: { key: string; bands: Band[] };
   /** Content widths for automatic table layout, computed on demand. */
   widths?: { min: number; max: number };
+  /** Length of paragraphText() of the paragraph. */
+  length: number;
+  /** Drawings in the paragraph: what they show carries paths that begin with the path of the paragraph. */
+  drawings?: number;
+  /** What preparing the paragraph took from the state of the document (see StateEvent); missing when nothing. */
+  events?: StateEvent[];
 }
 
 // Classes of characters for line breaking; a practical subset of UAX #14.
@@ -204,9 +210,26 @@ function breakBetween(prev: number, cur: number): boolean {
   return cur === ID || cur === OP;
 }
 
+/**
+ * Capitals of text set in capitals. A character whose capital is longer than
+ * it ("ß" -> "SS", "ﬁ" -> "FI") stays as it is: what follows it would
+ * otherwise show at offsets of the paragraph that are not its own.
+ */
 function upper(text: string, dotted: boolean): string {
   if (dotted) text = text.replace(/i/g, 'İ');
-  return text.toUpperCase();
+  const capitals = text.toUpperCase();
+  // No capital is shorter than its letter: the same length means every letter has a capital of its own length.
+  if (capitals.length === text.length) return capitals;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const pair = code >= 0xd800 && code <= 0xdbff && i + 1 < text.length;
+    const char = pair ? text.slice(i, i + 2) : text.charAt(i);
+    if (pair) i++;
+    const capital = char.toUpperCase();
+    out += capital.length === char.length ? capital : char;
+  }
+  return out;
 }
 
 const isLower = (char: string) => char.toUpperCase() !== char;
@@ -474,6 +497,7 @@ function noteMark(args: PrepArgs, walk: Walk, kind: 'footnote' | 'endnote', id: 
     numbers.set(id, number);
     if (kind === 'endnote') ctx.endnoteOrder.push(id);
   }
+  ctx.noteEvent(kind === 'footnote' ? 'f' : 'e', id);
   const raised = raisedStyle(ctx, style);
   if (custom) {
     // The mark is text of the run itself; the note still belongs to this place.
@@ -773,6 +797,7 @@ export function prepareParagraph(
     pageBreakBefore: props.pageBreakBefore === true,
     contextual: props.contextualSpacing === true,
     live: false,
+    length: 0,
   };
   if (props.tabs) {
     for (const tab of props.tabs) {
@@ -798,7 +823,7 @@ export function prepareParagraph(
     const numberProps = definition ? resolveNumberRunProps(ctx.doc, para.props, definition, where ? where.context : undefined) : undefined;
     let lang = numberProps && numberProps.lang ? numberProps.lang.val : undefined;
     if (lang === undefined && ctx.doc.settings.themeFontLang) lang = ctx.doc.settings.themeFontLang.val;
-    const label = (story.main ? ctx.counters : ctx.sideCounters).next(numbering.numId, level, lang);
+    const label = ctx.nextNumber(story.main, numbering.numId, level, lang);
     if (label) {
       const style = ctx.makeStyle(numberProps && label.level === definition ? numberProps : resolveNumberRunProps(ctx.doc, para.props, label.level, where ? where.context : undefined));
       let text = label.text;
@@ -821,7 +846,9 @@ export function prepareParagraph(
   walkInlines({ ctx, para, story, path, where, depth, fields, markStyle: mark }, walk, para.children);
   prep.atoms = builder.atoms;
   prep.live = builder.live;
+  prep.length = walk.offset;
   if (walk.floats.length) prep.floats = walk.floats;
+  if (walk.drawings) prep.drawings = walk.drawings;
   return prep;
 }
 

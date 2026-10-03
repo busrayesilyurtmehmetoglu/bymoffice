@@ -11,7 +11,7 @@ import {
   tableConditions,
   type TableContext,
 } from '../../formats/docx/resolve';
-import { NumberingCounters } from '../../formats/docx/numbering';
+import { NumberingCounters, type NumberLabel } from '../../formats/docx/numbering';
 import type { Block, Border, CellProps, DocColor, DocModel, DrawingAnchor, ParaProps, RunProps, Shading, Table, TableProps } from '../../model/doc/types';
 import type { ParaEnv } from './paragraph';
 import type { ParaPrep } from './prep';
@@ -125,6 +125,38 @@ export interface FieldTextItem extends TextItem {
   fieldFormat?: string;
 }
 
+/**
+ * What preparing a paragraph took from the state the whole document shares:
+ * a number of a list, the number of a note, the text of a box. The events of
+ * a block are kept with it, so that a block that takes its place after an
+ * edit can be given the same values without counting through the document
+ * again (see DocLayout.edited).
+ */
+export type StateEvent =
+  | { k: 'n'; main: boolean; numId: number; level: number; lang: string | undefined; label: NumberLabel | undefined }
+  | { k: 'f' | 'e'; id: number }
+  | { k: 'b'; blocks: Block[]; took: boolean };
+
+/** Events that are handed out again instead of being computed, in order. */
+export interface StateCursor {
+  events: StateEvent[];
+  at: number;
+}
+
+/** Open while a block of the body is turned into bands: collects its events. */
+export interface PrepSession {
+  record: StateEvent[];
+  /** Paragraphs whose events are in the record already. */
+  seen: Set<object>;
+  expect?: StateCursor;
+}
+
+const sameEvent = (a: StateEvent, b: StateEvent): boolean => {
+  if (a.k === 'n') return b.k === 'n' && a.label === b.label && a.main === b.main && a.numId === b.numId && a.level === b.level && a.lang === b.lang;
+  if (a.k === 'b') return b.k === 'b' && a.blocks === b.blocks && a.took === b.took;
+  return a.k === b.k && a.id === (b as { id: number }).id;
+};
+
 // -------------------------------------------------------------------- styles
 
 export interface BorderLine {
@@ -230,6 +262,16 @@ export class LayoutContext {
   readonly boxWeights = new WeakMap<Block[], number>();
   /** What laying out text boxes has cost so far (see DocLayoutOptions.maxTextBoxWork). */
   boxWork = 0;
+  /** Set while a block of the body is prepared (see PrepSession). */
+  session: PrepSession | undefined;
+  /** The events each block of the body gave when it was first turned into bands. */
+  readonly blockEvents = new WeakMap<Block, StateEvent[]>();
+  /**
+   * An edit changed what the document counts (the items of a list, the notes,
+   * the text boxes): values handed out before no longer hold, and the layout
+   * has to be made again from the start.
+   */
+  broken = false;
 
   private fonts = new Map<string, FontEntry>();
   private byFont = new Map<LayoutFont, FontEntry>();
@@ -248,6 +290,73 @@ export class LayoutContext {
     this.compatMode = mode >= 11 && mode <= 99 ? mode : 12;
     this.counters = new NumberingCounters(doc.numbering, doc.styles);
     this.sideCounters = new NumberingCounters(doc.numbering, doc.styles);
+  }
+
+  /** The next event to hand out again when it is the one asked for; otherwise the document counts differently now. */
+  private expected(match: (event: StateEvent) => boolean): StateEvent | undefined {
+    const session = this.session;
+    const expect = session && session.expect;
+    if (!session || !expect) return undefined;
+    const event = expect.events[expect.at];
+    if (event && match(event)) {
+      expect.at++;
+      session.record.push(event);
+      return event;
+    }
+    this.broken = true;
+    return undefined;
+  }
+
+  /** The number of a numbered paragraph: counted, or the one the block it replaces had. */
+  nextNumber(main: boolean, numId: number, level: number, lang: string | undefined): NumberLabel | undefined {
+    const session = this.session;
+    if (session && session.expect) {
+      const event = this.expected((e) => e.k === 'n' && e.main === main && e.numId === numId && e.level === level && e.lang === lang);
+      return event && event.k === 'n' ? event.label : undefined;
+    }
+    const label = (main ? this.counters : this.sideCounters).next(numId, level, lang);
+    if (session) session.record.push({ k: 'n', main, numId, level, lang, label });
+    return label;
+  }
+
+  /** Notes down that a paragraph refers to a note. */
+  noteEvent(kind: 'f' | 'e', id: number): void {
+    const session = this.session;
+    if (!session) return;
+    if (session.expect) this.expected((e) => e.k === kind && e.id === id);
+    else session.record.push({ k: kind, id });
+  }
+
+  /** Whether a drawing gets the text of a box: decided by `decide`, or as it was decided for the block this one replaces. */
+  boxEvent(blocks: Block[], owner: object, decide: () => boolean): boolean {
+    const session = this.session;
+    if (session && session.expect) {
+      const event = this.expected((e) => e.k === 'b' && e.blocks === blocks);
+      const took = event !== undefined && event.k === 'b' && event.took;
+      if (took) this.boxOwners.set(blocks, owner);
+      return took;
+    }
+    const took = decide();
+    if (session) session.record.push({ k: 'b', blocks, took });
+    return took;
+  }
+
+  /** Events of something prepared before, met again in the open session. */
+  replay(events: StateEvent[]): void {
+    const session = this.session;
+    if (!session) return;
+    const expect = session.expect;
+    for (let i = 0; i < events.length; i++) {
+      if (expect) {
+        const event = expect.events[expect.at];
+        if (!event || !sameEvent(event, events[i])) {
+          this.broken = true;
+          return;
+        }
+        expect.at++;
+      }
+      session.record.push(events[i]);
+    }
   }
 
   /** The family text is measured and painted with: the fallback when the host does not have the one asked for. */

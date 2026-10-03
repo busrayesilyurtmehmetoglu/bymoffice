@@ -3,7 +3,7 @@
 // block, uses as well.
 
 import type { Block, ParaProps, Paragraph } from '../../model/doc/types';
-import type { Band, CellWhere, FieldValues, LayoutContext, StoryRef } from './context';
+import type { Band, CellWhere, FieldValues, LayoutContext, PrepSession, StoryRef } from './context';
 import { paragraphBands, type ParaEnv } from './paragraph';
 import { isAutoSpace, isHiddenParagraph, paragraphSpace, prepareParagraph, type ParaPrep } from './prep';
 import { tableBands } from './table';
@@ -14,6 +14,10 @@ const PREPS = new WeakMap<LayoutContext, WeakMap<Paragraph, ParaPrep>>();
  * The prepared form of a paragraph, made on first use. Numbered paragraphs
  * take their number then, so paragraphs have to be asked for in document
  * order the first time.
+ *
+ * A paragraph that was prepared before and has moved since (blocks were added
+ * or removed before it) keeps its prepared form: the path in it, which every
+ * text item of the paragraph shares, is brought up to date in place.
  */
 export function getPrep(
   ctx: LayoutContext,
@@ -27,7 +31,44 @@ export function getPrep(
   let preps = PREPS.get(ctx);
   if (!preps) PREPS.set(ctx, (preps = new WeakMap()));
   let prep = preps.get(para);
-  if (!prep) preps.set(para, (prep = prepareParagraph(ctx, para, story, path, where, depth, fields)));
+  const session = ctx.session;
+  if (prep) {
+    const own = prep.path;
+    let same = own.length === path.length;
+    for (let i = 0; same && i < own.length; i++) same = own[i] === path[i];
+    if (!same) {
+      // In place only where nothing else holds the path: what a drawing shows is kept by the paragraph of the drawing,
+      // which may be an older one that this paragraph was also shown by.
+      if (own.length === path.length && !prep.drawings && path.indexOf(-1) < 0) {
+        for (let i = 0; i < own.length; i++) own[i] = path[i];
+      } else {
+        // What its drawings show has paths of its own: prepared again, with the numbers it had.
+        const events = prep.events || [];
+        const inner: PrepSession = { record: [], seen: new Set(), expect: { events, at: 0 } };
+        ctx.session = inner;
+        try {
+          prep = prepareParagraph(ctx, para, story, path, where, depth, fields);
+        } finally {
+          ctx.session = session;
+        }
+        if ((inner.expect as { at: number }).at !== events.length) ctx.broken = true;
+        if (inner.record.length) prep.events = inner.record;
+        preps.set(para, prep);
+      }
+    }
+    if (session && !session.seen.has(para)) {
+      session.seen.add(para);
+      if (prep.events) ctx.replay(prep.events);
+    }
+    return prep;
+  }
+  const start = session ? session.record.length : 0;
+  prep = prepareParagraph(ctx, para, story, path, where, depth, fields);
+  if (session) {
+    session.seen.add(para);
+    if (session.record.length > start) prep.events = session.record.slice(start);
+  }
+  preps.set(para, prep);
   return prep;
 }
 

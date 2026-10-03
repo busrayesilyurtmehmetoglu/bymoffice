@@ -408,9 +408,10 @@ export function breakLine(
     const before = atoms[i - 1];
     const tail = pieces[pieces.length - 1];
     if (before.t === 'text' && before.shy && tail.kind === 'text' && tail.spaces === 0) {
-      tail.text += '-';
-      tail.width += ctx.width(tail.font, '-') * tail.style.scale;
-      x = tail.x + tail.width;
+      // The hyphen is not in the text of the paragraph: a piece of its own, without a place in the text.
+      const width = ctx.width(tail.font, '-') * tail.style.scale;
+      pieces.push({ kind: 'text', x: tail.x + tail.width, width, trail: 0, spaces: 0, text: '-', font: tail.font, style: tail.style, offset: -1 });
+      x = tail.x + tail.width + width;
     }
   }
   line.free = Math.min(free, pieces.length);

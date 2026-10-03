@@ -1,5 +1,8 @@
-// The document view: shows a Word document read-only, as a strip of pages
-// that scrolls vertically. Pages are laid out in slices so that the first
+// The document view: shows a Word document as a strip of pages that scrolls
+// vertically, read-only or, with `readOnly: false`, as an editor: a caret, a
+// selection, typing (see doc-input.ts), the clipboard, undo and redo. Every
+// change goes through the commands of ops/doc and its history; the layout
+// follows an edit from the page it is on (DocLayout.edited). Pages are laid out in slices so that the first
 // ones appear at once, and only the pages in sight (and one more on each
 // side) have a canvas, so a document of thousands of pages costs no more
 // memory on screen than one of three.
@@ -11,11 +14,16 @@
 // Nothing in this module touches the DOM at import time.
 
 import { DocLayout } from '../layout/doc/layout';
-import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, TextItem, TextMeasurer } from '../layout/doc/types';
+import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
+import * as ops from '../ops/doc/index';
+import type { DocEdit, DocPosition, DocRange, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
 import { findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
 import { renderPage } from '../render/doc';
-import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
+import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
+import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
+import { hasCopyMark, sliceHtml, sliceOf, type DocSlice } from './doc-clipboard';
+import { DocInput, type InputChange, type InputContext } from './doc-input';
 import { getUiStrings, type UiStrings } from './strings';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
@@ -49,6 +57,24 @@ export interface DocumentViewOptions {
   measurer?: TextMeasurer;
   /** Passed to the layout engine. */
   layout?: DocLayoutOptions;
+  /**
+   * False makes the view an editor: a caret, typing, the clipboard, undo and
+   * redo. Default true: the document is shown read-only, with a selection
+   * that can be copied.
+   */
+  readOnly?: boolean;
+  /** Called after every change of the document made in the view, undo and redo included. */
+  onChange?(): void;
+  /** Called when the caret or the selection moves; undefined when nothing is selected. */
+  onSelectionChange?(selection: DocRange | undefined): void;
+  /** Called for Ctrl+K (Cmd+K): the shell around the view asks for the address of a link. */
+  onLinkShortcut?(): void;
+  /**
+   * Whether the package the document was read from has a part of this name
+   * ("/word/media/image3.png"): a picture put in gets a name of its own.
+   * Without it, `package.hasPart` is asked when the package has one.
+   */
+  partTaken?(part: string): boolean;
 }
 
 export interface DocumentViewState {
@@ -97,6 +123,24 @@ const MAX_FONT_RELAYOUTS = 12;
 const MAX_LINKS_PER_PAGE = 2000;
 const MAX_TEXT_DEPTH = 64;
 const SELECTION_FILL = 'rgba(26, 115, 232, 0.28)';
+/** Text of the paragraph the field for typing mirrors before and after the caret (see doc-input.ts). */
+const CONTEXT_BEFORE = 80;
+const CONTEXT_AFTER = 40;
+/** Longest text taken from the clipboard, in characters, and largest picture, in bytes. */
+const MAX_PASTE_TEXT = 5000000;
+const MAX_PICTURE_BYTES = 20000000;
+/** How long an edit may lay out pages before the screen is brought up to date; the rest follows in slices. */
+const EDIT_LAYOUT_MS = 120;
+/** Two presses this close in time and place are a double click. */
+const CLICK_MS = 500;
+const CLICK_DISTANCE = 5;
+const LONG_PRESS_MS = 500;
+/** A drag this close to the top or bottom of the pages scrolls them. */
+const DRAG_SCROLL_EDGE = 24;
+const CARET_MARGIN = 8;
+const EMU_PER_PX = 9525;
+/** A selection over more blocks of the body than this is too large to look at as a whole for the toolbar or to read out. */
+const MAX_LOOKED_AT_BLOCKS = 400;
 
 // Cosmetic rules only; what the layout depends on is set inline.
 const STYLE_TEXT =
@@ -121,7 +165,16 @@ const STYLE_TEXT =
   '.bym-doc-link{cursor:pointer;outline:none}' +
   '.bym-doc-link:focus{outline:2px solid #1a7f45;outline-offset:1px}' +
   '.bym-doc-link:focus:not(:focus-visible){outline:none}' +
-  '.bym-doc-note{color:#5f6368;font-size:14px}';
+  '.bym-doc-note{color:#5f6368;font-size:14px}' +
+  // The caret: two animations with the same frames, so that changing the name starts the blinking anew.
+  '@keyframes bym-doc-blink-a{0%{opacity:1}50%{opacity:0}}@keyframes bym-doc-blink-b{0%{opacity:1}50%{opacity:0}}' +
+  '.bym-doc-caret{background:#000;animation:bym-doc-blink-a 1.06s step-end infinite}' +
+  '.bym-doc-caret.bym-doc-caret-b{animation-name:bym-doc-blink-b}' +
+  '@media (prefers-reduced-motion:reduce){.bym-doc-caret,.bym-doc-caret.bym-doc-caret-b{animation:none}}' +
+  '.bym-doc-compose{background:#1a73e8}' +
+  '.bym-doc-handle{background:#1a73e8;border-radius:0 50% 50% 50%;touch-action:none}' +
+  '.bym-doc-handle-start{border-radius:50% 0 50% 50%}' +
+  '.bym-doc-bubble{background:#fff;border:1px solid #dadce0;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#202124}';
 
 /** One style element per document or shadow root, shared by the views in it. */
 const styleUsers = new WeakMap<Node, { element: HTMLStyleElement; count: number }>();
@@ -153,6 +206,22 @@ function releaseStyle(host: Node): void {
 const HIDDEN = 'position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);border:0';
 
 const clamp = (value: number, low: number, high: number): number => (value < low ? low : value > high ? high : value);
+
+const isApple = (): boolean => typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+const copyPosition = (position: DocPosition): DocPosition => {
+  const copy: DocPosition = { story: position.story, path: position.path.slice(), offset: position.offset };
+  if (position.before === true) copy.before = true;
+  return copy;
+};
+
+/** "header" of "header:rId7". */
+const storyKind = (story: string): string => (story.indexOf(':') < 0 ? story : story.slice(0, story.indexOf(':')));
+
+/** Lines of the text itself: not those in a text box, whose text cannot be edited. */
+const outsideBoxes = (mark: LineMark): boolean => mark.source.path.indexOf(-1) < 0;
 
 const coarsePointer = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia('(pointer:coarse)').matches;
 
@@ -222,6 +291,8 @@ interface TextPosition {
   story: string;
   path: number[];
   offset: number;
+  /** Before what shows without width at the offset (a picture): see DocPosition.before. */
+  before?: true;
 }
 
 /**
@@ -250,7 +321,8 @@ function comparePaths(a: number[], b: number[]): number {
   return a.length - b.length;
 }
 
-const comparePositions = (a: TextPosition, b: TextPosition): number => comparePaths(a.path, b.path) || a.offset - b.offset;
+const comparePositions = (a: TextPosition, b: TextPosition): number =>
+  comparePaths(a.path, b.path) || a.offset - b.offset || (a.before === true ? 0 : 1) - (b.before === true ? 0 : 1);
 
 /** A selection put in order. */
 interface TextRange {
@@ -551,6 +623,52 @@ export class DocumentView {
   private pinch: { distance: number; zoom: number } | undefined;
   private gestureZoom = 0;
 
+  /** Undo and redo of what was changed in the view. */
+  readonly history: ops.DocHistory<DocRange | undefined>;
+  private editable = false;
+  private readonly lines: DocLines;
+  private readonly typing: DocInput;
+  private readonly caret: HTMLDivElement;
+  private readonly underline: HTMLDivElement;
+  private handles: HTMLDivElement[] = [];
+  private bubble: HTMLDivElement | undefined;
+  private modified = false;
+  private focused = false;
+  /** Which line a caret on the border between two lines is shown on. */
+  private affinity: Affinity = 'start';
+  /** The x the caret keeps while it moves up and down, px of the page. */
+  private targetX: number | undefined;
+  /** The story the caret is in: the body, or a header, footer or note entered with a double click. */
+  private story = 'body';
+  /** Formatting chosen at a caret, for what is typed next. */
+  private pendingFormat: RunFormatPatch | undefined;
+  /** Page the caret was last seen on: where it is looked for first. */
+  private caretPage = 0;
+  private blink = false;
+  private hadRange = false;
+  /** Characters before the caret that an input method is still composing. */
+  private composed = 0;
+  /** Escape was pressed: the next Tab leaves the editor. */
+  private escaped = false;
+  private lastDown = { time: 0, x: 0, y: 0, count: 0 };
+  private dragPoint: { clientX: number; clientY: number } | undefined;
+  private dragTimer: ReturnType<typeof setInterval> | undefined;
+  /** The selection as it is shown, for the selection it was worked out for. */
+  private expanded: { anchor: TextPosition; focus: TextPosition; range: DocRange } | undefined;
+  private copyMark = '';
+  private copied: { text: string; slice: DocSlice } | undefined;
+  /** Height the strip keeps while pages that were there before an edit are laid out again, screen px. */
+  private hold = 0;
+  private steps = 0;
+  /** A finger is down: where, and the timer of a long press. */
+  private press: { x: number; y: number; timer: ReturnType<typeof setTimeout> | undefined; long: boolean; moved: boolean } | undefined;
+  private lastTouch = 0;
+  /** The selection was made by touch: it has handles and a bubble. */
+  private touchSelection = false;
+  private handleFixed: DocPosition | undefined;
+  private inputPlace = '';
+  private viewport: { addEventListener(type: string, listener: () => void): void; removeEventListener(type: string, listener: () => void): void } | undefined;
+
   constructor(container: HTMLElement, doc: DocModel, options: DocumentViewOptions = {}) {
     this.container = container;
     this.document = doc;
@@ -560,12 +678,24 @@ export class DocumentView {
     const coarse = coarsePointer();
     this.maxCanvasPixels = coarse ? MAX_CANVAS_PIXELS_COARSE : MAX_CANVAS_PIXELS;
 
+    this.editable = options.readOnly === false;
+    this.history = new ops.DocHistory<DocRange | undefined>(doc);
     this.painter = new CanvasTextMeasurer({ fonts: doc.fonts });
     this.measurer = options.measurer || this.painter;
-    this.images = new ImageStore(options.package, coarse ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, this.onImageLoad);
+    // Pictures put in while editing are in the model; the others where the document was read from.
+    const source = options.package;
+    const pictures = {
+      readPart: (part: string): Promise<Uint8Array> => {
+        const own = doc.media && doc.media.get(part);
+        if (own) return Promise.resolve(own.bytes);
+        return source ? source.readPart(part) : Promise.reject(new Error('No such picture'));
+      },
+    };
+    this.images = new ImageStore(source || this.editable ? pictures : undefined, coarse ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, this.onImageLoad);
     // A document that cannot be laid out at all throws here, before anything is added to the container.
-    this.engine = new DocLayout(doc, this.measurer, options.layout);
+    this.engine = new DocLayout(doc, this.measurer, this.layoutOptions());
     this.pages = this.engine.pages;
+    this.lines = new DocLines(() => this.pages, this.measurer);
 
     const root = document.createElement('div');
     root.className = 'bym-doc';
@@ -636,12 +766,48 @@ export class DocumentView {
     live.setAttribute('aria-atomic', 'true');
     live.style.cssText = HIDDEN + ';white-space:nowrap';
 
+    const caret = document.createElement('div');
+    caret.className = 'bym-doc-caret';
+    caret.setAttribute('aria-hidden', 'true');
+    caret.style.cssText = 'position:absolute;z-index:1;width:2px;min-width:1px;margin:0 0 0 -1px;padding:0;border:0;pointer-events:none';
+    const underline = document.createElement('div');
+    underline.className = 'bym-doc-compose';
+    underline.setAttribute('aria-hidden', 'true');
+    underline.style.cssText = 'position:absolute;z-index:1;height:1px;margin:0;padding:0;border:0;pointer-events:none';
+
     this.root = root;
     this.scroller = scroller;
     this.strip = strip;
     this.note = note;
     this.input = input;
     this.live = live;
+    this.caret = caret;
+    this.underline = underline;
+    this.typing = new DocInput(input, {
+      context: () => this.inputContext(),
+      change: (change, composition) => this.inputChange(change, composition),
+      type: (text) => {
+        this.typeText(text);
+      },
+      remove: (direction, unit) => this.removeText(direction, unit),
+      paragraph: () => this.enter('paragraph'),
+      undo: () => {
+        this.undo();
+      },
+      redo: () => {
+        this.redo();
+      },
+      compositionStart: () => {
+        this.history.seal();
+        this.composed = 0;
+      },
+      compositionEnd: () => {
+        this.history.seal();
+        this.composed = 0;
+        this.schedule();
+      },
+    });
+    this.applyInputMode();
 
     scroller.appendChild(strip);
     root.appendChild(input);
@@ -740,6 +906,17 @@ export class DocumentView {
   /** Selects the whole document; copying then yields its text. */
   selectAll(): void {
     if (this.destroyed) return;
+    if (this.editable) {
+      // A range of the story the caret is in: what is typed next takes its place.
+      const start = this.storyEdge(-1);
+      const end = this.storyEdge(1);
+      if (!start || !end) return;
+      this.typing.commit();
+      this.selection = { anchor: start, focus: end };
+      this.affinity = 'start';
+      this.selectionMoved(false);
+      return;
+    }
     this.selection = 'all';
     this.repaintAll();
   }
@@ -747,7 +924,12 @@ export class DocumentView {
   clearSelection(): void {
     if (this.destroyed || this.selection === undefined) return;
     this.selection = undefined;
+    this.hideTouchTools();
     this.repaintAll();
+    if (this.editable) {
+      this.typing.sync();
+      if (this.options.onSelectionChange) this.options.onSelectionChange(undefined);
+    }
   }
 
   /** The selected text: what a copy puts on the clipboard. Empty when nothing is selected. */
@@ -755,8 +937,30 @@ export class DocumentView {
     const selection = this.selection;
     if (selection === undefined) return '';
     if (selection === 'all') return documentText(this.document);
-    const range = orderedRange(selection.anchor, selection.focus);
+    const shown = this.shownRange();
+    const range = shown ? orderedRange(shown.anchor, shown.focus) : undefined;
     return range ? rangeTextOf(this.document, range) : '';
+  }
+
+  /**
+   * The selection as the pages show it. In an editor a selection that goes
+   * into or out of a table covers whole cells: what a deletion would remove
+   * (see expandRangeForTables of ops/doc).
+   */
+  private shownRange(): DocRange | undefined {
+    const selection = this.selection;
+    if (selection === undefined || selection === 'all') return undefined;
+    if (!this.editable || ops.samePosition(selection.anchor, selection.focus)) return selection;
+    const cached = this.expanded;
+    if (cached && cached.anchor === selection.anchor && cached.focus === selection.focus) return cached.range;
+    let range: DocRange = selection;
+    try {
+      range = ops.expandRangeForTables(this.document, selection);
+    } catch {
+      range = selection;
+    }
+    this.expanded = { anchor: selection.anchor, focus: selection.focus, range };
+    return range;
   }
 
   /** Changes the language of the view's own words. */
@@ -764,7 +968,7 @@ export class DocumentView {
     if (this.destroyed) return;
     this.strings = resolveStrings(locale);
     this.root.setAttribute('aria-label', this.strings.document);
-    this.input.setAttribute('aria-label', this.strings.document);
+    this.applyInputMode();
     this.slots.forEach((slot) => {
       slot.element.setAttribute('aria-label', this.strings.page(slot.index + 1));
       // Placeholders carry words.
@@ -786,9 +990,11 @@ export class DocumentView {
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
     this.layoutTimer = undefined;
     this.painter.clear();
-    this.selection = undefined;
+    // Places in the text are places of the model: an editor keeps its caret.
+    if (!this.editable) this.selection = undefined;
+    this.hold = 0;
     this.unmountAll();
-    this.engine = new DocLayout(this.document, this.measurer, this.options.layout);
+    this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
     this.pages = this.engine.pages;
     this.offsets = [0];
     this.done = false;
@@ -831,6 +1037,8 @@ export class DocumentView {
     if (this.fontTimer !== undefined) clearTimeout(this.fontTimer);
     this.layoutTimer = this.fontTimer = undefined;
     this.endDrag();
+    this.endPress();
+    this.typing.destroy();
     this.unlisten();
     this.unmountAll();
     this.images.destroy();
@@ -865,7 +1073,16 @@ export class DocumentView {
     }
     root.addEventListener('keydown', this.onKeyDown);
     root.addEventListener('copy', this.onCopy);
+    root.addEventListener('cut', this.onCut);
+    root.addEventListener('paste', this.onPaste);
     root.addEventListener('mousedown', this.onRootMouseDown);
+    strip.addEventListener('contextmenu', this.onContextMenu);
+    const viewport = (window as { visualViewport?: DocumentView['viewport'] }).visualViewport;
+    if (viewport && typeof viewport.addEventListener === 'function') {
+      this.viewport = viewport;
+      viewport.addEventListener('resize', this.onViewportChange);
+      viewport.addEventListener('scroll', this.onViewportChange);
+    }
     input.addEventListener('focus', this.onFocus);
     input.addEventListener('blur', this.onBlur);
     strip.addEventListener('click', this.onStripClick);
@@ -894,7 +1111,15 @@ export class DocumentView {
     scroller.removeEventListener('gesturechange', this.onGestureChange);
     root.removeEventListener('keydown', this.onKeyDown);
     root.removeEventListener('copy', this.onCopy);
+    root.removeEventListener('cut', this.onCut);
+    root.removeEventListener('paste', this.onPaste);
     root.removeEventListener('mousedown', this.onRootMouseDown);
+    strip.removeEventListener('contextmenu', this.onContextMenu);
+    if (this.viewport) {
+      this.viewport.removeEventListener('resize', this.onViewportChange);
+      this.viewport.removeEventListener('scroll', this.onViewportChange);
+      this.viewport = undefined;
+    }
     input.removeEventListener('focus', this.onFocus);
     input.removeEventListener('blur', this.onBlur);
     strip.removeEventListener('click', this.onStripClick);
@@ -942,6 +1167,15 @@ export class DocumentView {
     const pages = this.pages;
     const before = this.offsets.length - 1;
     for (let i = before; i < pages.length; i++) this.offsets.push(this.offsets[i] + this.pageHeight(i));
+    // Pages that were laid out again after an edit may still have a canvas from before.
+    if (this.slots.size > 0) {
+      this.slots.forEach((slot) => {
+        if (slot.index >= before && slot.index < pages.length) {
+          slot.dirty = true;
+          this.describe(slot);
+        }
+      });
+    }
     for (let i = 0; i < progress.updated.length; i++) {
       const slot = this.slots.get(progress.updated[i]);
       if (slot) {
@@ -950,6 +1184,7 @@ export class DocumentView {
       }
     }
     this.done = progress.done;
+    if (this.done) this.hold = 0;
     if (this.engine.truncated && !this.truncationSaid) {
       this.truncationSaid = true;
       this.notify(this.strings.documentTooLong, 'info');
@@ -962,7 +1197,67 @@ export class DocumentView {
       this.pendingPage = undefined;
       this.scrollToPage(target);
     }
-    if (!this.done) this.layoutTimer = setTimeout(this.runLayout, 0);
+    if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
+    this.layoutTimer = this.done ? undefined : setTimeout(this.runLayout, 0);
+  }
+
+  private layoutOptions(): DocLayoutOptions | undefined {
+    // The marks of the lines are what a caret is placed by; a view that only shows the document does without them.
+    return this.editable ? { ...this.options.layout, lineMarks: true } : this.options.layout;
+  }
+
+  /** A new layout of the whole document that keeps what is on screen until its pages arrive: after an edit the engine cannot follow. */
+  private rebuild(): void {
+    if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
+    this.layoutTimer = undefined;
+    let progress: LayoutProgress;
+    try {
+      this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
+      this.pages = this.engine.pages;
+      this.offsets = [0];
+      this.done = false;
+      this.failed = false;
+      progress = this.engine.layout({ milliseconds: FIRST_SLICE_MS });
+    } catch {
+      this.layoutBroke();
+      return;
+    }
+    this.afterLayout(progress);
+  }
+
+  private layoutBroke(): void {
+    this.failed = true;
+    this.notify(this.strings.documentLayoutFailed, 'error');
+  }
+
+  /** Brings the pages up to date after the document was changed, at least as far as the caret. */
+  private follow(): void {
+    const height = this.totalHeight();
+    let progress: (LayoutProgress & { from: number }) | undefined;
+    try {
+      progress = this.failed ? undefined : this.engine.edited();
+    } catch {
+      progress = undefined;
+    }
+    // Pages after the edit come back in slices: the strip keeps its height until then, so that nothing jumps.
+    if (height > this.hold) this.hold = height;
+    if (!progress) this.rebuild();
+    else {
+      if (progress.from < this.offsets.length - 1) this.offsets.length = progress.from + 1;
+      this.afterLayout(progress);
+    }
+    const range = this.range();
+    const started = Date.now();
+    while (!this.done && !this.failed && range && !this.lines.lineOf(range.focus, 'start', this.caretPage) && Date.now() - started < EDIT_LAYOUT_MS) {
+      let next: LayoutProgress;
+      try {
+        next = this.engine.layout({ pages: 2 });
+      } catch {
+        this.layoutBroke();
+        break;
+      }
+      this.afterLayout(next);
+    }
   }
 
   private onFontsLoaded = (): void => {
@@ -994,7 +1289,8 @@ export class DocumentView {
 
   private totalHeight(): number {
     const count = this.pages.length;
-    return PAD * 2 + this.offsets[count] * this.scale + Math.max(0, count - 1) * GAP;
+    const height = PAD * 2 + this.offsets[count] * this.scale + Math.max(0, count - 1) * GAP;
+    return !this.done && this.hold > height ? this.hold : height;
   }
 
   private extent(): number {
@@ -1113,6 +1409,7 @@ export class DocumentView {
     }
     const oldWidth = this.stripWidth();
     const across = oldWidth > 0 ? (this.scroller.scrollLeft + anchorX) / oldWidth : 0.5;
+    this.hold = 0;
     this.scale = next;
     this.sizeStrip();
     if (count > 0) this.setVirtualY(this.pageTop(page) + share * this.pageHeight(page) * next + outside - anchorY);
@@ -1184,6 +1481,7 @@ export class DocumentView {
       if (slot.dirty) this.paint(slot);
     });
 
+    this.placeCaret();
     this.updateBar();
     const page = this.currentPage;
     if (page !== this.reportedPage || count !== this.reportedCount) {
@@ -1191,7 +1489,8 @@ export class DocumentView {
       this.reportedPage = page;
       this.reportedCount = count;
       // The live region follows the page in view, not the count that grows while the layout runs.
-      if (turned && page > 0) this.live.textContent = this.strings.pageOf(page, count);
+      // An editor says where the caret is instead: every page turn while typing would be too much.
+      if (turned && page > 0 && !(this.editable && this.focused)) this.live.textContent = this.strings.pageOf(page, count);
       if (this.options.onPageChange) this.options.onPageChange(page, count);
     }
   }
@@ -1508,12 +1807,26 @@ export class DocumentView {
   private paintSelection(context: CanvasRenderingContext2D, pageIndex: number, scale: number): void {
     const selection = this.selection;
     if (selection === undefined) return;
-    const range = selection === 'all' ? undefined : orderedRange(selection.anchor, selection.focus);
+    const shown = this.shownRange();
+    const range = selection === 'all' || !shown ? undefined : orderedRange(shown.anchor, shown.focus);
     if (selection !== 'all' && !range) return;
     const items = this.pages[pageIndex].items;
     context.save();
     context.scale(scale, scale);
     context.fillStyle = SELECTION_FILL;
+    if (this.editable && range && !range.cells) {
+      // Pictures in the line take no offset of their own: one is selected when the selection runs from before it to after it.
+      const lines = this.lines.linesOf(pageIndex);
+      for (let i = 0; i < lines.length; i++) {
+        const mark = lines[i].mark;
+        if (!mark.boxes || !sameFlow(mark.source, range.start)) continue;
+        for (const box of mark.boxes) {
+          const before: TextPosition = { story: mark.source.story, path: mark.source.path, offset: box.offset, before: true };
+          const after: TextPosition = { story: mark.source.story, path: mark.source.path, offset: box.offset };
+          if (comparePositions(range.start, before) <= 0 && comparePositions(after, range.end) <= 0) context.fillRect(mark.x + box.dx, mark.y, box.width, mark.height);
+        }
+      }
+    }
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.type !== 'text' || !(item.width > 0) || item.rotation !== undefined) continue;
@@ -1546,6 +1859,12 @@ export class DocumentView {
     this.dragMoved = false;
     // A finger scrolls; only a mouse or a pen selects.
     if ('pointerType' in event && event.pointerType === 'touch') return;
+    // The mouse events a browser makes up after a tap are not presses of a mouse.
+    if (Date.now() - this.lastTouch < 800) return;
+    if (this.editable) {
+      this.editPointerDown(event);
+      return;
+    }
     const selection = this.selection;
     const extend = event.shiftKey && selection !== undefined && selection !== 'all';
     // A selection stays in the flow of text it began in: the body, one header, one note, one text box.
@@ -1571,6 +1890,11 @@ export class DocumentView {
     if (!this.dragging || this.destroyed) return;
     const selection = this.selection;
     if (!selection || selection === 'all') return;
+    if (this.editable) {
+      this.dragPoint = { clientX: event.clientX, clientY: event.clientY };
+      this.dragTo(this.dragPoint);
+      return;
+    }
     const position = this.positionFromEvent(event, selection.anchor);
     if (!position) return;
     if (comparePositions(selection.anchor, position) !== 0) this.dragMoved = true;
@@ -1582,6 +1906,9 @@ export class DocumentView {
   };
 
   private endDrag(): void {
+    if (this.dragTimer !== undefined) clearInterval(this.dragTimer);
+    this.dragTimer = undefined;
+    this.dragPoint = undefined;
     if (!this.dragging) return;
     this.dragging = false;
     window.removeEventListener('pointermove', this.onPointerMove as EventListener);
@@ -1593,6 +1920,11 @@ export class DocumentView {
 
   private onDoubleClick = (event: MouseEvent): void => {
     if (this.destroyed) return;
+    if (this.editable) {
+      // A mouse was counted when it was pressed; this is the second tap of a finger.
+      if (Date.now() - this.lastDown.time > CLICK_MS * 2) this.selectWordAt(event, false);
+      return;
+    }
     const hit = this.hitFromEvent(event);
     if (!hit) return;
     const text = hit.item.text;
@@ -1616,6 +1948,53 @@ export class DocumentView {
     }
     event.preventDefault();
     data.setData('text/plain', text);
+    // The same as simple HTML, made here from escaped text, with a mark by which a paste into this view knows its own copy.
+    const slice = this.selectionSlice();
+    this.copied = undefined;
+    if (!slice) return;
+    this.copyMark = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    this.copied = { text, slice };
+    try {
+      data.setData('text/html', sliceHtml(slice, this.copyMark));
+    } catch {
+      // Plain text is on the clipboard then.
+    }
+  };
+
+  private onCut = (event: ClipboardEvent): void => {
+    if (this.destroyed) return;
+    this.onCopy(event);
+    // Nothing goes out of the field itself either way.
+    event.preventDefault();
+    const range = this.range();
+    if (!this.editable || !range || ops.isCollapsed(range)) return;
+    this.perform((selection) => ops.deleteRange(this.document, selection));
+  };
+
+  private onPaste = (event: ClipboardEvent): void => {
+    if (this.destroyed) return;
+    event.preventDefault();
+    const data = event.clipboardData;
+    if (!this.editable || !data || !this.range()) return;
+    this.typing.commit();
+    let text = '';
+    let html = '';
+    try {
+      text = data.getData('text/plain') || '';
+      html = data.getData('text/html') || '';
+    } catch {
+      // Nothing to read.
+    }
+    if (text === '') {
+      const picture = this.clipboardPicture(data);
+      if (picture) {
+        this.readPicture(picture);
+        return;
+      }
+    }
+    // The copy made here is pasted with its formatting; HTML from elsewhere is never parsed: its text is what is pasted.
+    if (this.copied && hasCopyMark(html, this.copyMark)) this.pasteSlice(this.copied.slice);
+    else this.pasteText(text);
   };
 
   // ----------------------------------------------------------------- links
@@ -1642,6 +2021,15 @@ export class DocumentView {
 
   private onStripClick = (event: MouseEvent): void => {
     if (this.destroyed || this.dragMoved) return;
+    if (this.editable) {
+      // A tap of a finger puts the caret there; a link is followed with Ctrl (Cmd) held, as in Word.
+      if (Date.now() - this.lastTouch < 800) {
+        if (this.press && this.press.long) return;
+        this.tapAt(event);
+        return;
+      }
+      if (!(event.ctrlKey || event.metaKey)) return;
+    }
     const target = this.linkOf(event.target);
     if (target === undefined) return;
     event.preventDefault();
@@ -1665,6 +2053,7 @@ export class DocumentView {
         return;
       }
     }
+    if (this.editable && this.editKey(event)) return;
     if (event.altKey) return;
     if (command) {
       if (key === 'a' || key === 'A') this.selectAll();
@@ -1712,6 +2101,9 @@ export class DocumentView {
         if (this.selection === undefined) return;
         this.clearSelection();
         break;
+      case 'Backspace':
+        // Some browsers go back a page for it when the focus is not in a field that can be edited.
+        break;
       default:
         // Tab among them: the focus moves on, out of the view.
         return;
@@ -1733,6 +2125,17 @@ export class DocumentView {
   private onFocus = (): void => {
     if (this.destroyed) return;
     if (!this.quietFocus) this.root.classList.add('bym-doc-focus');
+    this.focused = true;
+    if (this.editable) {
+      // The caret is where it was left; a view that never had one gets it at the start of the text.
+      if (this.selection === undefined) {
+        const start = this.storyEdge(-1);
+        if (start) this.selection = { anchor: start, focus: copyPosition(start) };
+      }
+      this.typing.sync();
+      this.schedule();
+      return;
+    }
     try {
       this.input.select();
     } catch {
@@ -1742,6 +2145,13 @@ export class DocumentView {
 
   private onBlur = (): void => {
     this.root.classList.remove('bym-doc-focus');
+    this.focused = false;
+    if (!this.editable || this.destroyed) return;
+    // What an input method was composing stays as text; the caret is hidden until the focus comes back.
+    this.typing.commit();
+    this.history.seal();
+    this.escaped = false;
+    this.schedule();
   };
 
   private onScrollerFocus = (): void => {
@@ -1850,6 +2260,20 @@ export class DocumentView {
   };
 
   private onTouchStart = (event: TouchEvent): void => {
+    this.lastTouch = Date.now();
+    this.endPress();
+    if (!this.destroyed && this.editable && event.touches.length === 1) {
+      const touch = event.touches[0];
+      const press: NonNullable<DocumentView['press']> = { x: touch.clientX, y: touch.clientY, timer: undefined, long: false, moved: false };
+      // A finger that stays where it is selects the word under it.
+      press.timer = setTimeout(() => {
+        press.timer = undefined;
+        if (this.destroyed || this.press !== press || press.moved) return;
+        press.long = true;
+        this.selectWordAt({ clientX: press.x, clientY: press.y }, true);
+      }, LONG_PRESS_MS);
+      this.press = press;
+    }
     if (this.destroyed || event.touches.length !== 2) {
       this.pinch = undefined;
       return;
@@ -1861,6 +2285,16 @@ export class DocumentView {
   };
 
   private onTouchMove = (event: TouchEvent): void => {
+    this.lastTouch = Date.now();
+    const press = this.press;
+    if (press && event.touches.length > 0) {
+      const touch = event.touches[0];
+      if (Math.abs(touch.clientX - press.x) > 10 || Math.abs(touch.clientY - press.y) > 10) {
+        press.moved = true;
+        if (press.timer !== undefined) clearTimeout(press.timer);
+        press.timer = undefined;
+      }
+    }
     const pinch = this.pinch;
     if (this.destroyed || !pinch || event.touches.length !== 2) return;
     if (event.cancelable) event.preventDefault();
@@ -1872,7 +2306,31 @@ export class DocumentView {
   };
 
   private onTouchEnd = (event: TouchEvent): void => {
+    this.lastTouch = Date.now();
+    const press = this.press;
+    if (press && press.timer !== undefined) {
+      clearTimeout(press.timer);
+      press.timer = undefined;
+    }
     if (event.touches.length < 2) this.pinch = undefined;
+  };
+
+  private endPress(): void {
+    const press = this.press;
+    if (press && press.timer !== undefined) clearTimeout(press.timer);
+    this.press = undefined;
+  }
+
+  /** The menu a browser opens for a long press would cover the selection the press made. */
+  private onContextMenu = (event: Event): void => {
+    if (this.editable && Date.now() - this.lastTouch < 1500) event.preventDefault();
+  };
+
+  private onViewportChange = (): void => {
+    // The keyboard of a phone came or went: the caret stays in what is left of the view.
+    if (this.destroyed || !this.editable || !this.focused) return;
+    this.reveal();
+    this.schedule();
   };
 
   private onGestureStart = (event: Event): void => {
@@ -1892,6 +2350,1373 @@ export class DocumentView {
       typeof gesture.clientY === 'number' ? gesture.clientY : rect.top + rect.height / 2,
     );
   };
+
+  // --------------------------------------------------------------- editing
+
+  /** Whether the document can only be read. */
+  get readOnly(): boolean {
+    return !this.editable;
+  }
+
+  /** Turns editing on or off. The pages are laid out again when it is turned on for the first time. */
+  setReadOnly(readOnly: boolean): void {
+    if (this.destroyed || this.editable === !readOnly) return;
+    this.typing.commit();
+    this.history.seal();
+    this.hideTouchTools();
+    this.editable = !readOnly;
+    this.pendingFormat = undefined;
+    this.applyInputMode();
+    if (this.editable) {
+      // A caret needs the marks of the lines, which a view that only shows the document does not have.
+      this.selection = undefined;
+      this.relayout();
+    } else this.schedule();
+    this.typing.sync();
+  }
+
+  /** Whether the document was changed in the view since it was made or markSaved() was called. */
+  get isModified(): boolean {
+    return this.modified;
+  }
+
+  /** Says that the document as it is now has been saved. */
+  markSaved(): void {
+    this.modified = false;
+  }
+
+  get canUndo(): boolean {
+    return this.editable && this.history.canUndo;
+  }
+
+  get canRedo(): boolean {
+    return this.editable && this.history.canRedo;
+  }
+
+  /** Undoes the last change; the caret goes back to where it was before it. */
+  undo(): boolean {
+    if (!this.editable || this.destroyed) return false;
+    this.typing.commit();
+    const step = this.history.undo();
+    if (!step) return false;
+    this.afterHistory(step.meta);
+    return true;
+  }
+
+  redo(): boolean {
+    if (!this.editable || this.destroyed) return false;
+    this.typing.commit();
+    const step = this.history.redo();
+    if (!step) return false;
+    this.afterHistory(step.meta);
+    return true;
+  }
+
+  /** The caret (a range whose ends are the same place) or the selection; undefined when there is none or everything is selected in a read-only view. */
+  getSelection(): DocRange | undefined {
+    const range = this.range();
+    return range ? { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) } : undefined;
+  }
+
+  /** Puts the caret at a position or selects a range. Throws RangeError for a place the document does not have. */
+  setSelection(selection: DocRange | DocPosition | undefined): void {
+    if (this.destroyed) return;
+    if (selection === undefined) {
+      this.clearSelection();
+      return;
+    }
+    const range = ops.asRange(selection);
+    ops.resolvePosition(this.document, range.anchor);
+    ops.resolvePosition(this.document, range.focus);
+    if (!ops.samePosition(range.anchor, range.focus)) ops.comparePositions(range.anchor, range.focus);
+    this.typing.commit();
+    this.history.seal();
+    this.selection = { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) };
+    this.story = range.focus.story;
+    this.affinity = 'start';
+    this.targetX = undefined;
+    this.pendingFormat = undefined;
+    this.selectionMoved(true);
+  }
+
+  /** Types text at the caret, or over the selection: "\n" ends a paragraph, "\t" is a tab. False when nothing was changed. */
+  insertText(text: string): boolean {
+    if (typeof text !== 'string' || text === '') return false;
+    return this.perform((range) => ops.insertText(this.document, range, text, this.takeFormat()), true);
+  }
+
+  /** Character formatting for the selection, or at a caret for what is typed next. */
+  format(patch: RunFormatPatch): boolean {
+    const range = this.range();
+    if (!this.editable || !range) return false;
+    if (ops.isCollapsed(range)) {
+      // An empty paragraph takes the formatting on its mark, which is where its text will take it from.
+      let empty = false;
+      try {
+        empty = ops.resolvePosition(this.document, range.focus).length === 0;
+      } catch {
+        empty = false;
+      }
+      if (empty && this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true)) return true;
+      // Checked now, so that a patch that is not valid is refused here and not at the next key.
+      try {
+        ops.patchRunProps({}, patch);
+      } catch (error) {
+        this.refuse(error);
+        return false;
+      }
+      this.pendingFormat = { ...this.pendingFormat, ...patch };
+      this.announceSelection();
+      return true;
+    }
+    return this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true);
+  }
+
+  /** Turns bold, italic, underline or strikethrough on, or off when all of the selection has it. */
+  toggleFormat(key: ToggleKey): boolean {
+    const range = this.range();
+    if (!this.editable || !range) return false;
+    if (ops.isCollapsed(range)) {
+      const now = this.selectionFormat;
+      return this.format({ [key]: !(now && now[key] === true) });
+    }
+    return this.perform((selection) => ops.toggleRunFormat(this.document, selection, key), true);
+  }
+
+  /** Paragraph formatting (alignment, style, spacing ...) for every paragraph the selection touches. */
+  formatParagraph(patch: ParaFormatPatch): boolean {
+    return this.perform((range) => ops.setParaFormat(this.document, range, patch), true);
+  }
+
+  /** Makes the paragraphs of the selection items of a list, or takes them out of it. */
+  toggleList(kind: 'bullet' | 'number'): boolean {
+    return this.perform((range) => ops.toggleList(this.document, range, kind), true);
+  }
+
+  /** One level deeper (1) or less deep (-1): list items change their level, other paragraphs their indent. */
+  indent(delta: number): boolean {
+    return this.perform((range) => ops.indentList(this.document, range, delta), true);
+  }
+
+  insertTable(rows: number, columns: number): boolean {
+    return this.perform((range) => ops.insertTable(this.document, this.caretOf(range), rows, columns), true);
+  }
+
+  insertRow(where: 'above' | 'below'): boolean {
+    return this.perform((range) => ops.insertRow(this.document, range.focus, where), true);
+  }
+
+  deleteRow(): boolean {
+    return this.perform((range) => ops.deleteRow(this.document, range.focus), true);
+  }
+
+  insertColumn(side: 'left' | 'right'): boolean {
+    return this.perform((range) => ops.insertColumn(this.document, range.focus, side), true);
+  }
+
+  deleteColumn(): boolean {
+    return this.perform((range) => ops.deleteColumn(this.document, range.focus), true);
+  }
+
+  insertPageBreak(): boolean {
+    return this.perform((range) => ops.insertPageBreak(this.document, this.caretOf(range)), true);
+  }
+
+  /**
+   * Makes the selected text a link to `target`; at a caret the address itself
+   * becomes the text. Only http, https, mailto and tel addresses and "#name"
+   * (a bookmark) are taken.
+   */
+  insertLink(target: string): boolean {
+    const safe = safeHyperlinkTarget(target);
+    if (safe === undefined || safe === '' || safe === '#') {
+      this.notify(this.strings.linkNotAllowed, 'error');
+      return false;
+    }
+    return this.perform((range) => ops.insertHyperlink(this.document, range, safe), true);
+  }
+
+  /**
+   * Inserts a picture (PNG, JPEG, GIF or BMP bytes) at the caret, in line with
+   * the text, no wider than the text is. What the bytes are is read from the
+   * bytes themselves.
+   */
+  insertPicture(bytes: Uint8Array, description?: string): boolean {
+    const range = this.range();
+    if (!this.editable || !range) return false;
+    const type = bytes instanceof Uint8Array && bytes.length <= MAX_PICTURE_BYTES ? sniffImageType(bytes) : undefined;
+    const size = type !== undefined && /^image\/(png|jpeg|gif|bmp|webp)$/.test(type) ? declaredImageSize(bytes, type) : undefined;
+    if (!type || !size || !(size.width > 0) || !(size.height > 0) || size.width > 100000 || size.height > 100000) {
+      this.notify(this.strings.pictureNotSupported, 'error');
+      return false;
+    }
+    let width = size.width;
+    let height = size.height;
+    const room = this.textRoom(range.focus);
+    if (width > room.width) {
+      height = (height * room.width) / width;
+      width = room.width;
+    }
+    if (height > room.height) {
+      width = (width * room.height) / height;
+      height = room.height;
+    }
+    const image: ops.NewImage = { bytes, type, width: Math.max(1, Math.round(width * EMU_PER_PX)), height: Math.max(1, Math.round(height * EMU_PER_PX)) };
+    if (description !== undefined) image.description = description;
+    // The name of the new part must not be one the package has already, though the model does not know it.
+    const source = this.options.package as { hasPart?(part: string): boolean } | undefined;
+    const taken = this.options.partTaken || (source && typeof source.hasPart === 'function' ? (part: string) => (source.hasPart as (part: string) => boolean)(part) : undefined);
+    return this.perform((selection) => ops.insertImage(this.document, this.caretOf(selection), image, taken ? { taken } : undefined), true);
+  }
+
+  /** The formatting in effect for the selection, with what was chosen at a caret for the text typed next; undefined without a selection. */
+  get selectionFormat(): RangeFormat | undefined {
+    const range = this.range();
+    if (!range) return undefined;
+    let format: RangeFormat;
+    try {
+      // Of a very large selection the formatting where it starts: going through all of it at every move would hold the page up.
+      format = ops.rangeFormat(this.document, this.isLarge(range) ? ops.orderRange(range).start : range);
+    } catch {
+      return undefined;
+    }
+    const pending = this.pendingFormat;
+    if (pending && ops.isCollapsed(range)) {
+      const out = format as unknown as { [key: string]: unknown };
+      const keys: (keyof RunFormatPatch)[] = ['bold', 'italic', 'strike', 'font', 'size', 'highlight', 'vertAlign'];
+      for (const key of keys) if (pending[key] !== undefined && pending[key] !== null) out[key] = pending[key];
+      if (pending.underline !== undefined && pending.underline !== null) out.underline = pending.underline !== false;
+      if (typeof pending.color === 'string') out.color = pending.color;
+    }
+    return format;
+  }
+
+  /** Whether the caret is in a table cell. */
+  get inTable(): boolean {
+    const range = this.range();
+    return range !== undefined && range.focus.path.length >= 4 && range.focus.path.indexOf(-1) < 0;
+  }
+
+  /** Ends what an input method is composing: the text it has typed so far stays in the document. Call before saving. */
+  commitEditing(): void {
+    if (this.destroyed) return;
+    this.typing.commit();
+    this.history.seal();
+  }
+
+  /** The selection as a range of the model; undefined for "everything" in a read-only view and without a selection. */
+  private range(): DocRange | undefined {
+    const selection = this.selection;
+    return selection === undefined || selection === 'all' ? undefined : selection;
+  }
+
+  /** Where something is put in: the caret, or the start of the selection. */
+  private caretOf(range: DocRange): DocPosition {
+    return ops.isCollapsed(range) ? range.focus : ops.orderRange(range).start;
+  }
+
+  private takeFormat(): RunFormatPatch | undefined {
+    const format = this.pendingFormat;
+    this.pendingFormat = undefined;
+    return format;
+  }
+
+  private applyInputMode(): void {
+    const input = this.input;
+    input.readOnly = !this.editable;
+    input.setAttribute('aria-label', this.editable ? this.strings.documentEditor : this.strings.document);
+    if (this.editable) {
+      input.setAttribute('role', 'textbox');
+      input.setAttribute('aria-multiline', 'true');
+      input.setAttribute('inputmode', 'text');
+      // Text smaller than 16 px makes iOS zoom the page when the field takes the focus.
+      input.style.fontSize = '16px';
+    } else {
+      input.removeAttribute('role');
+      input.removeAttribute('aria-multiline');
+      input.setAttribute('inputmode', 'none');
+      input.style.fontSize = '';
+    }
+  }
+
+  /** A place that cannot be edited is not an error of the program: said, and nothing happens. */
+  private refuse(error: unknown): void {
+    if (!(error instanceof RangeError)) throw error;
+    this.notify(this.strings.cannotEditHere, 'info');
+  }
+
+  /** First (-1) or last (1) place of the story the caret is in. */
+  private storyEdge(direction: 1 | -1): DocPosition | undefined {
+    try {
+      return (direction === 1 ? ops.storyEnd(this.document, this.story) : ops.storyStart(this.document, this.story)) || undefined;
+    } catch {
+      this.story = 'body';
+      return (direction === 1 ? ops.storyEnd(this.document, 'body') : ops.storyStart(this.document, 'body')) || undefined;
+    }
+  }
+
+  /**
+   * Runs a command on the selection and applies what it returns as one step
+   * of the history. `seal`: the step is not joined with typing before or
+   * after it.
+   */
+  private perform(make: (range: DocRange) => DocEdit, seal = false): boolean {
+    if (!this.editable || this.destroyed) return false;
+    this.typing.commit();
+    const range = this.range();
+    if (!range) return false;
+    if (seal) this.history.seal();
+    let edit: DocEdit;
+    try {
+      edit = make(range);
+      if (edit.ops.length > 0) this.history.applyEdit(edit, { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) });
+    } catch (error) {
+      this.refuse(error);
+      return false;
+    }
+    if (seal) this.history.seal();
+    if (edit.ops.length === 0) {
+      // Nothing to change, but the command may have moved the caret.
+      this.adopt(edit.selection);
+      this.selectionMoved(true);
+      return false;
+    }
+    this.changed(edit.selection);
+    return true;
+  }
+
+  private adopt(selection: DocRange): void {
+    this.selection = { anchor: copyPosition(selection.anchor), focus: copyPosition(selection.focus) };
+    this.story = selection.focus.story;
+  }
+
+  /** The document was changed: the pages follow, the caret goes where the change left it. */
+  private changed(selection: DocRange | undefined): void {
+    this.modified = true;
+    if (selection) this.adopt(selection);
+    this.affinity = 'start';
+    this.targetX = undefined;
+    this.follow();
+    this.selectionMoved(true);
+    if (this.options.onChange) this.options.onChange();
+  }
+
+  private afterHistory(meta: DocRange | undefined): void {
+    this.pendingFormat = undefined;
+    let selection: DocRange | undefined;
+    if (meta) {
+      try {
+        ops.resolvePosition(this.document, meta.anchor);
+        ops.resolvePosition(this.document, meta.focus);
+        selection = meta;
+      } catch {
+        selection = undefined;
+      }
+    }
+    if (!selection) {
+      const start = this.storyEdge(-1);
+      if (start) selection = ops.collapsed(start);
+    }
+    this.changed(selection);
+  }
+
+  /** The caret or the selection moved: the screen, the field for typing and the host are told. */
+  private selectionMoved(reveal: boolean): void {
+    const range = this.range();
+    const wide = range !== undefined && !ops.samePosition(range.anchor, range.focus);
+    // Only a selection is painted on the pages; a caret is an element of its own.
+    if (wide || this.hadRange) this.repaintAll();
+    this.hadRange = wide;
+    if (!wide) this.hideTouchTools();
+    this.escaped = false;
+    this.blink = !this.blink;
+    this.typing.sync();
+    if (reveal) this.reveal();
+    this.schedule();
+    if (this.options.onSelectionChange) this.options.onSelectionChange(this.getSelection());
+  }
+
+  // ------------------------------------------------------------------ typing
+
+  /** What the field for typing mirrors: the text of the paragraph around the caret. */
+  private inputContext(): InputContext | undefined {
+    const range = this.range();
+    if (!this.editable || !range) return undefined;
+    try {
+      let start = range.anchor;
+      let end = range.focus;
+      const wide = !ops.samePosition(start, end);
+      if (wide) {
+        const ordered = ops.orderRange(range);
+        start = ordered.start;
+        end = ordered.end;
+      }
+      const first = paragraphText(ops.resolvePosition(this.document, start).paragraph);
+      const last = wide ? paragraphText(ops.resolvePosition(this.document, end).paragraph) : first;
+      let from = Math.max(0, start.offset - CONTEXT_BEFORE);
+      if (from > 0 && isLowSurrogate(first.charCodeAt(from))) from++;
+      let to = Math.min(last.length, end.offset + CONTEXT_AFTER);
+      if (to < last.length && isLowSurrogate(last.charCodeAt(to))) to--;
+      // The selected text itself is not mirrored: one character stands for all of it.
+      return { before: first.slice(from, start.offset), after: last.slice(end.offset, Math.max(to, end.offset)), selected: wide ? ' ' : '', atStart: from === 0, atEnd: to === last.length };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A change the browser made in the field (an input method, a correction) is made in the document. */
+  private inputChange(change: InputChange, composition: string | undefined): void {
+    const range = this.range();
+    if (!this.editable || !range) return;
+    const doc = this.document;
+    const before = { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) };
+    let selection: DocRange | undefined;
+    let any = false;
+    const apply = (edit: DocEdit): void => {
+      if (edit.ops.length > 0) {
+        // The steps of one composition are one step of the history.
+        this.history.apply(edit.ops, before, edit.selection, composition !== undefined ? composition : edit.mergeKey);
+        if (composition === undefined && edit.seal) this.history.seal();
+        any = true;
+      }
+      selection = edit.selection;
+    };
+    try {
+      if (!ops.isCollapsed(range)) {
+        if (change.replaceSelection) apply(change.text === '' ? ops.deleteRange(doc, range) : ops.insertText(doc, range, change.text, this.takeFormat()));
+      } else {
+        const at = range.focus;
+        const length = ops.resolvePosition(doc, at).length;
+        let from = at.offset - change.removeBefore;
+        let to = at.offset + change.removeAfter;
+        // One character more than the paragraph has stands for its boundary.
+        const joinBefore = from < 0 && change.text === '';
+        const joinAfter = to > length && change.text === '';
+        from = Math.max(0, from);
+        to = Math.min(length, to);
+        const place = (offset: number): DocPosition => {
+          const position: DocPosition = { story: at.story, path: at.path.slice(), offset };
+          // Typed at a caret before a picture, the text goes before it.
+          if (at.before === true && offset === at.offset) position.before = true;
+          return position;
+        };
+        if (to > from) {
+          const span = { anchor: place(from), focus: place(to) };
+          apply(change.text === '' ? ops.deleteRange(doc, span) : ops.insertText(doc, span, change.text, this.takeFormat()));
+        } else if (change.text !== '') apply(ops.insertText(doc, place(from), change.text, this.takeFormat()));
+        if (joinBefore) apply(ops.deleteBackward(doc, place(0)));
+        else if (joinAfter) apply(ops.deleteForward(doc, selection ? (selection as DocRange).focus : place(length)));
+      }
+    } catch (error) {
+      this.refuse(error);
+    }
+    let caret = selection as DocRange | undefined;
+    // An input method may leave its caret inside what it is composing.
+    if (caret && change.caretBack > 0 && change.text.indexOf('\n') < 0 && caret.focus.offset >= change.caretBack) {
+      caret = ops.collapsed({ story: caret.focus.story, path: caret.focus.path.slice(), offset: caret.focus.offset - change.caretBack });
+    }
+    this.composed = composition !== undefined ? Math.max(0, change.composing - change.caretBack) : 0;
+    if (any) this.changed(caret);
+    else if (caret) {
+      this.adopt(caret);
+      this.selectionMoved(true);
+    }
+  }
+
+  private typeText(text: string): boolean {
+    // Typing is joined into one step of the history by the command itself.
+    return this.perform((range) => ops.insertText(this.document, range, text, this.takeFormat()));
+  }
+
+  private removeText(direction: 1 | -1, unit: 'char' | 'word' | 'line'): void {
+    this.perform((range) => {
+      const doc = this.document;
+      if (!ops.isCollapsed(range)) return ops.deleteRange(doc, range);
+      if (unit === 'line') {
+        // To the start or the end of the line the caret is on.
+        const at = this.lines.lineOf(range.focus, this.affinity, this.caretPage);
+        const edge = at ? (direction === -1 ? at.line.mark.source.offset : lineEnd(at.line)) : range.focus.offset;
+        if (edge === range.focus.offset) return direction === -1 ? ops.deleteBackward(doc, range.focus) : ops.deleteForward(doc, range.focus);
+        return ops.deleteRange(doc, { anchor: range.focus, focus: { story: range.focus.story, path: range.focus.path.slice(), offset: edge } });
+      }
+      return direction === -1 ? ops.deleteBackward(doc, range.focus, unit) : ops.deleteForward(doc, range.focus, unit);
+    });
+  }
+
+  /** Enter (a new paragraph), Shift+Enter (a line break) and Ctrl+Enter (a page break). */
+  private enter(kind: 'paragraph' | 'line' | 'page'): void {
+    this.perform((range) => {
+      const doc = this.document;
+      if (kind === 'line') return ops.insertText(doc, range, '\v', this.takeFormat());
+      if (kind === 'page') return ops.insertPageBreak(doc, this.caretOf(range));
+      return ops.isCollapsed(range) ? ops.splitParagraph(doc, range.focus) : ops.insertText(doc, range, '\n');
+    }, true);
+  }
+
+  /** Tab: the next cell in a table (a new row after the last one), a deeper level in a list, a tab character elsewhere. */
+  private tab(back: boolean): void {
+    const range = this.range();
+    if (!range) return;
+    const doc = this.document;
+    const path = range.focus.path;
+    const story = range.focus.story;
+    if (this.inTable) {
+      try {
+        const tablePath = path.slice(0, -3);
+        const table = ops.containerBlocks(doc, story, tablePath.slice(0, -1))[tablePath[tablePath.length - 1]];
+        if (!table || table.type !== 'table') return;
+        let row = path[path.length - 3];
+        let cell = path[path.length - 2] + (back ? -1 : 1);
+        if (cell < 0) {
+          row--;
+          if (row < 0) return;
+          cell = table.rows[row].cells.length - 1;
+        } else if (cell >= table.rows[row].cells.length) {
+          row++;
+          cell = 0;
+          if (row >= table.rows.length) {
+            // Past the last cell: the table gets a row, as in Word, and the caret goes into its first cell.
+            if (!this.perform((selection) => ops.insertRow(doc, selection.focus, 'below'), true)) return;
+            const grown = ops.containerBlocks(doc, story, tablePath.slice(0, -1))[tablePath[tablePath.length - 1]];
+            const cell = grown && grown.type === 'table' && grown.rows[row] ? grown.rows[row].cells[0] : undefined;
+            const first = cell ? ops.paragraphIn(cell.blocks, tablePath.concat([row, 0]), 0, 1) : undefined;
+            if (first) this.setSelection({ story, path: first, offset: 0 });
+            return;
+          }
+        }
+        const blocks = table.rows[row].cells[cell].blocks;
+        const base = tablePath.concat([row, cell]);
+        const first = ops.paragraphIn(blocks, base, 0, 1);
+        const last = ops.paragraphIn(blocks, base, blocks.length - 1, -1);
+        if (!first || !last) return;
+        // The content of the cell is selected: typing replaces it.
+        const end = ops.resolvePosition(doc, { story, path: last, offset: 0 }).length;
+        this.setSelection({ anchor: { story, path: first, offset: 0 }, focus: { story, path: last, offset: end } });
+      } catch (error) {
+        this.refuse(error);
+      }
+      return;
+    }
+    const format = this.selectionFormat;
+    if (format && format.list !== undefined && format.list !== 'none') this.indent(back ? -1 : 1);
+    else if (!back) this.typeText('\t');
+  }
+
+  // --------------------------------------------------------------- the caret
+
+  /** Shows the caret where it is, when the view has the focus, and keeps the field for typing beside it. */
+  private placeCaret(): void {
+    const range = this.range();
+    const caret = this.caret;
+    const underline = this.underline;
+    let box: CaretBox | undefined;
+    if (this.editable && range) box = this.lines.caret(range.focus, this.affinity, this.caretPage);
+    if (box) this.caretPage = box.page;
+    const slot = box ? this.slots.get(box.page) : undefined;
+    const shown = box !== undefined && slot !== undefined && this.focused && range !== undefined && ops.samePosition(range.anchor, range.focus);
+    let composing = false;
+    if (shown && box && slot) {
+      const width = this.pageWidth(box.page);
+      const height = this.pageHeight(box.page);
+      caret.style.left = `${(box.x / width) * 100}%`;
+      caret.style.top = `${(box.top / height) * 100}%`;
+      caret.style.height = `${(box.height / height) * 100}%`;
+      // Another animation with the same frames: the caret shows at once after every move.
+      const name = this.blink ? 'bym-doc-caret bym-doc-caret-b' : 'bym-doc-caret';
+      if (caret.className !== name) caret.className = name;
+      if (caret.parentNode !== slot.element) slot.element.appendChild(caret);
+      if (this.composed > 0 && range && range.focus.offset >= this.composed) {
+        // What an input method is composing is underlined, as far as it is on the line of the caret.
+        const start = this.lines.caret({ story: range.focus.story, path: range.focus.path, offset: range.focus.offset - this.composed }, 'start', box.page);
+        if (start && start.page === box.page && Math.abs(start.top - box.top) < 1 && box.x > start.x) {
+          underline.style.left = `${(start.x / width) * 100}%`;
+          underline.style.width = `${((box.x - start.x) / width) * 100}%`;
+          underline.style.top = `${((box.top + box.height) / height) * 100}%`;
+          if (underline.parentNode !== slot.element) slot.element.appendChild(underline);
+          composing = true;
+        }
+      }
+    } else if (caret.parentNode) caret.parentNode.removeChild(caret);
+    if (!composing && underline.parentNode) underline.parentNode.removeChild(underline);
+    if (box && slot && this.editable) this.placeInput(box, slot);
+    this.placeTouchTools();
+  }
+
+  /** A point of a page in px of the view's root, whatever transforms lie on the view. */
+  private rootPoint(slot: Slot, x: number, y: number): { x: number; y: number } {
+    const root = this.root.getBoundingClientRect();
+    const page = slot.element.getBoundingClientRect();
+    const sx = root.width > 0 && this.root.offsetWidth > 0 ? this.root.offsetWidth / root.width : 1;
+    const sy = root.height > 0 && this.root.offsetHeight > 0 ? this.root.offsetHeight / root.height : 1;
+    return {
+      x: (page.left - root.left + (x / this.pageWidth(slot.index)) * page.width) * sx,
+      y: (page.top - root.top + (y / this.pageHeight(slot.index)) * page.height) * sy,
+    };
+  }
+
+  /** The field for typing sits at the caret: an input method opens its window there, and a phone scrolls there for its keyboard. */
+  private placeInput(box: CaretBox, slot: Slot): void {
+    const key = `${box.page}:${box.x}:${box.top}:${slot.left}:${slot.top}:${this.scale}:${this.scroller.scrollLeft}:${this.scroller.scrollTop}`;
+    if (key === this.inputPlace) return;
+    this.inputPlace = key;
+    const point = this.rootPoint(slot, box.x, box.top);
+    const style = this.input.style;
+    style.left = `${clamp(point.x, 0, Math.max(0, this.root.clientWidth - 2))}px`;
+    style.top = `${clamp(point.y, 0, Math.max(0, this.root.clientHeight - 2))}px`;
+  }
+
+  /** Part of the visible area a keyboard on screen covers, px of the view. */
+  private keyboardOverlap(): number {
+    const viewport = this.viewport as { offsetTop?: number; height?: number } | undefined;
+    if (!viewport || typeof viewport.height !== 'number') return 0;
+    const rect = this.scroller.getBoundingClientRect();
+    const hidden = rect.bottom - ((viewport.offsetTop || 0) + viewport.height);
+    if (!(hidden > 0) || !(rect.height > 0)) return 0;
+    return Math.min(Math.max(0, this.height - 40), hidden * (this.scroller.offsetHeight / rect.height));
+  }
+
+  /** Scrolls the caret into what is seen of the pages. */
+  private reveal(): void {
+    const range = this.range();
+    if (!range) return;
+    const box = this.lines.caret(range.focus, this.affinity, this.caretPage);
+    if (!box) return;
+    this.caretPage = box.page;
+    this.sizeStrip();
+    const top = this.pageTop(box.page) + box.top * this.scale;
+    const bottom = top + box.height * this.scale;
+    const visible = Math.max(40, this.height - this.keyboardOverlap());
+    const y = this.virtualY();
+    if (top - CARET_MARGIN < y) this.setVirtualY(top - CARET_MARGIN);
+    else if (bottom + CARET_MARGIN > y + visible) this.setVirtualY(bottom + CARET_MARGIN - visible);
+    const width = this.pageWidth(box.page) * this.scale;
+    const x = Math.max(PAD, (this.stripWidth() - width) / 2) + box.x * this.scale;
+    const left = this.scroller.scrollLeft;
+    if (x - CARET_MARGIN < left) this.scroller.scrollLeft = Math.max(0, x - CARET_MARGIN);
+    else if (x + CARET_MARGIN > left + this.width) this.scroller.scrollLeft = x + CARET_MARGIN - this.width;
+  }
+
+  /** A place found on a page as a position of the model: inside its paragraph, not inside a character, and before a line break that ends its line. */
+  private settle(place: DocPosition, affinity: Affinity): { position: DocPosition; affinity: Affinity } | undefined {
+    try {
+      const at = ops.resolvePosition(this.document, { story: place.story, path: place.path, offset: 0 });
+      const text = paragraphText(at.paragraph);
+      let offset = ops.snapOffset(text, clamp(place.offset, 0, at.length));
+      let side = affinity;
+      if (side === 'end' && offset > 0 && text.charCodeAt(offset - 1) === 0x0a) {
+        offset--;
+        side = 'start';
+      }
+      const position: DocPosition = { story: place.story, path: place.path.slice(), offset };
+      if (place.before === true && offset === place.offset) position.before = true;
+      return { position, affinity: side };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The place of a story nearest to a point of the window. */
+  private placeAt(point: { clientX: number; clientY: number }, story: string): { position: DocPosition; affinity: Affinity; page: number; box: boolean } | undefined {
+    const at = this.pagePoint(point.clientX, point.clientY);
+    if (!at) return undefined;
+    const hit = this.lines.hit(at.page, at.x, at.y, (mark) => mark.source.story === story && outsideBoxes(mark));
+    const settled = hit ? this.settle(hit.place, hit.affinity) : undefined;
+    return settled && hit ? { position: settled.position, affinity: settled.affinity, page: at.page, box: hit.box === true } : undefined;
+  }
+
+  /**
+   * The story a double click is in: the one whose line is under the pointer.
+   * That is how the caret gets into a header, a footer or a note, and back
+   * into the text.
+   */
+  private storyAt(point: { clientX: number; clientY: number }): string {
+    const at = this.pagePoint(point.clientX, point.clientY);
+    const line = at ? this.lines.lineAt(at.page, at.x, at.y, outsideBoxes) : undefined;
+    if (!at || !line) return this.story;
+    const mark = line.mark;
+    return at.y >= mark.y - 4 && at.y <= mark.y + mark.height + 4 ? mark.source.story : this.story;
+  }
+
+  private enterStory(story: string): void {
+    if (story === this.story) return;
+    this.story = story;
+    this.live.textContent = this.strings.editingStory(storyKind(story));
+  }
+
+  private editPointerDown(event: PointerEvent | MouseEvent): void {
+    const now = Date.now();
+    const down = this.lastDown;
+    const again = now - down.time < CLICK_MS && Math.abs(event.clientX - down.x) < CLICK_DISTANCE && Math.abs(event.clientY - down.y) < CLICK_DISTANCE;
+    // A fourth press in a row still selects the paragraph.
+    const count = again ? Math.min(down.count + 1, 3) : 1;
+    this.lastDown = { time: now, x: event.clientX, y: event.clientY, count };
+    this.typing.commit();
+    this.history.seal();
+    this.pendingFormat = undefined;
+    this.touchSelection = false;
+    let story = count === 2 ? this.storyAt(event) : this.story;
+    let hit = this.placeAt(event, story);
+    if (!hit && story !== 'body') {
+      // The page shows nothing of that story: back to the text.
+      story = 'body';
+      hit = this.placeAt(event, story);
+    }
+    if (!hit) return;
+    this.enterStory(story);
+    const range = this.range();
+    this.caretPage = hit.page;
+    this.targetX = undefined;
+    if (count === 2) this.selectWord(hit.position);
+    else if (count === 3) {
+      const length = ops.resolvePosition(this.document, hit.position).length;
+      this.selection = { anchor: { ...hit.position, offset: 0 }, focus: { ...hit.position, path: hit.position.path.slice(), offset: length } };
+      this.affinity = 'start';
+    } else if (event.shiftKey && range && range.anchor.story === story) {
+      this.selection = { anchor: range.anchor, focus: hit.position };
+      this.affinity = hit.affinity;
+    } else if (hit.box) {
+      // A press on a picture selects it: from before it to after it. Typing replaces it, Delete removes it.
+      const after = copyPosition(hit.position);
+      delete after.before;
+      this.selection = { anchor: { ...after, path: after.path.slice(), before: true }, focus: after };
+      this.affinity = 'start';
+      this.selectionMoved(false);
+      return;
+    } else {
+      this.selection = { anchor: hit.position, focus: copyPosition(hit.position) };
+      this.affinity = hit.affinity;
+    }
+    this.selectionMoved(false);
+    if (count !== 1) return;
+    this.dragging = true;
+    window.addEventListener(this.pointerEvents ? 'pointermove' : 'mousemove', this.onPointerMove as EventListener);
+    window.addEventListener(this.pointerEvents ? 'pointerup' : 'mouseup', this.onPointerUp);
+    if (this.pointerEvents) window.addEventListener('pointercancel', this.onPointerUp);
+    // While the pointer is held near the top or the bottom, the pages scroll and the selection follows.
+    this.dragTimer = setInterval(this.onDragTick, 50);
+  }
+
+  private selectWord(position: DocPosition): void {
+    const text = paragraphText(ops.resolvePosition(this.document, position).paragraph);
+    const [start, end] = ops.wordAt(text, position.offset);
+    this.selection = { anchor: { ...position, offset: start }, focus: { story: position.story, path: position.path.slice(), offset: end } };
+    this.affinity = 'start';
+  }
+
+  /** Selects the word at a point: a double tap, or (`tools`) a long press, which also brings the handles and the bubble. */
+  private selectWordAt(point: { clientX: number; clientY: number }, tools: boolean): void {
+    const story = this.storyAt(point);
+    const hit = this.placeAt(point, story) || this.placeAt(point, 'body');
+    if (!hit) return;
+    this.typing.commit();
+    this.history.seal();
+    this.enterStory(hit.position.story);
+    this.caretPage = hit.page;
+    this.selectWord(hit.position);
+    this.touchSelection = tools;
+    this.selectionMoved(false);
+  }
+
+  /** A tap puts the caret there and, in the field that now has the focus, brings the keyboard. */
+  private tapAt(point: { clientX: number; clientY: number }): void {
+    const hit = this.placeAt(point, this.story) || this.placeAt(point, 'body');
+    if (!hit) return;
+    this.typing.commit();
+    this.history.seal();
+    this.pendingFormat = undefined;
+    this.enterStory(hit.position.story);
+    this.caretPage = hit.page;
+    this.targetX = undefined;
+    this.touchSelection = false;
+    this.selection = { anchor: hit.position, focus: copyPosition(hit.position) };
+    this.affinity = hit.affinity;
+    this.focusInput(true);
+    this.selectionMoved(true);
+  }
+
+  private dragTo(point: { clientX: number; clientY: number }): void {
+    const range = this.range();
+    if (!range) return;
+    const hit = this.placeAt(point, range.anchor.story);
+    if (!hit) return;
+    if (!ops.samePosition(range.anchor, hit.position)) this.dragMoved = true;
+    if (ops.samePosition(range.focus, hit.position) && this.affinity === hit.affinity) return;
+    this.selection = { anchor: range.anchor, focus: hit.position };
+    this.affinity = hit.affinity;
+    this.caretPage = hit.page;
+    this.selectionMoved(false);
+  }
+
+  private onDragTick = (): void => {
+    const point = this.dragPoint;
+    if (!this.dragging || !point || this.destroyed) return;
+    const rect = this.scroller.getBoundingClientRect();
+    const above = rect.top + DRAG_SCROLL_EDGE - point.clientY;
+    const below = point.clientY - (rect.bottom - DRAG_SCROLL_EDGE);
+    if (!(above > 0) && !(below > 0)) return;
+    // Faster the further out the pointer is.
+    const step = clamp((above > 0 ? above : below) * 0.6, 6, 80);
+    this.setVirtualY(this.virtualY() + (above > 0 ? -step : step));
+    this.update();
+    this.dragTo(point);
+  };
+
+  // ------------------------------------------------------------ touch tools
+
+  private hideTouchTools(): void {
+    this.touchSelection = false;
+    this.handleFixed = undefined;
+  }
+
+  /** The handles at the ends of a selection made by touch, and the bubble with what can be done with it. */
+  private placeTouchTools(): void {
+    const range = this.range();
+    const shown = this.editable && this.touchSelection && range !== undefined && !ops.samePosition(range.anchor, range.focus);
+    if (!shown || !range) {
+      for (const handle of this.handles) if (handle.parentNode) handle.parentNode.removeChild(handle);
+      if (this.bubble && this.bubble.parentNode) this.bubble.parentNode.removeChild(this.bubble);
+      return;
+    }
+    if (this.handles.length === 0) this.buildTouchTools();
+    const ordered = ops.orderRange(range);
+    const ends = [ordered.start, ordered.end];
+    let top: { x: number; y: number } | undefined;
+    for (let i = 0; i < 2; i++) {
+      const handle = this.handles[i];
+      const box = this.lines.caret(ends[i], i === 0 ? 'start' : 'end', this.caretPage);
+      const slot = box ? this.slots.get(box.page) : undefined;
+      if (!box || !slot) {
+        if (handle.parentNode) handle.parentNode.removeChild(handle);
+        continue;
+      }
+      // In the strip, not in the page: an element that is moved to another parent while a finger is on it loses the finger.
+      const x = slot.left + box.x * this.scale;
+      const y = slot.top + (box.top + box.height) * this.scale;
+      handle.style.left = `${x - (i === 0 ? 22 : 0)}px`;
+      handle.style.top = `${y}px`;
+      if (handle.parentNode !== this.strip) this.strip.appendChild(handle);
+      if (i === 0) top = this.rootPoint(slot, box.x, box.top);
+    }
+    const bubble = this.bubble;
+    if (!bubble) return;
+    if (!top || this.handleFixed) {
+      if (bubble.parentNode) bubble.parentNode.removeChild(bubble);
+      return;
+    }
+    if (bubble.parentNode !== this.root) this.root.appendChild(bubble);
+    const width = bubble.offsetWidth;
+    const height = bubble.offsetHeight;
+    bubble.style.left = `${clamp(top.x - width / 2, 4, Math.max(4, this.root.clientWidth - width - 4))}px`;
+    bubble.style.top = `${clamp(top.y - height - 10, 4, Math.max(4, this.root.clientHeight - height - 4))}px`;
+  }
+
+  private buildTouchTools(): void {
+    for (let i = 0; i < 2; i++) {
+      const handle = document.createElement('div');
+      handle.className = i === 0 ? 'bym-doc-handle bym-doc-handle-start' : 'bym-doc-handle';
+      handle.setAttribute('aria-hidden', 'true');
+      handle.style.cssText = 'position:absolute;z-index:3;width:22px;height:22px;margin:0;padding:0;border:0;box-sizing:border-box';
+      const start = (event: Event) => {
+        const range = this.range();
+        if (!range) return;
+        if (event.cancelable) event.preventDefault();
+        event.stopPropagation();
+        const ordered = ops.orderRange(range);
+        // The other end stays where it is while this one is moved.
+        this.handleFixed = copyPosition(i === 0 ? ordered.end : ordered.start);
+      };
+      const move = (event: TouchEvent) => {
+        const fixed = this.handleFixed;
+        const touch = event.touches[0];
+        if (!fixed || !touch) return;
+        if (event.cancelable) event.preventDefault();
+        // The finger is below the line it points at.
+        const hit = this.placeAt({ clientX: touch.clientX, clientY: touch.clientY - 22 }, fixed.story);
+        if (!hit || ops.samePosition(hit.position, fixed)) return;
+        this.selection = { anchor: fixed, focus: hit.position };
+        this.caretPage = hit.page;
+        this.touchSelection = true;
+        this.selectionMoved(false);
+        this.touchSelection = true;
+      };
+      const end = () => {
+        this.handleFixed = undefined;
+        this.schedule();
+      };
+      handle.addEventListener('touchstart', start, { passive: false });
+      handle.addEventListener('touchmove', move as EventListener, { passive: false });
+      handle.addEventListener('touchend', end);
+      handle.addEventListener('touchcancel', end);
+      // Nothing under the handle takes the press.
+      handle.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      this.handles.push(handle);
+    }
+    const bubble = document.createElement('div');
+    bubble.className = 'bym-doc-bubble';
+    bubble.setAttribute('role', 'toolbar');
+    bubble.setAttribute('aria-label', this.strings.selectionTools);
+    bubble.style.cssText = 'position:absolute;z-index:4;display:flex;box-sizing:border-box;padding:2px;white-space:nowrap';
+    const add = (name: string, label: string, action: () => void) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'bym-doc-btn bym-doc-bubble-' + name;
+      button.textContent = label;
+      button.addEventListener('mousedown', (event) => event.preventDefault());
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (!this.destroyed) action();
+      });
+      bubble.appendChild(button);
+    };
+    const command = (name: 'copy' | 'cut') => () => {
+      this.focusInput(true);
+      this.typing.sync();
+      let done = false;
+      try {
+        // In the press of a button: the copy and cut events of the view do the work.
+        done = document.execCommand(name);
+      } catch {
+        done = false;
+      }
+      if (!done) this.notify(this.strings.pasteWithKeyboard, 'info');
+      this.touchSelection = false;
+      this.schedule();
+    };
+    add('cut', this.strings.cut, command('cut'));
+    add('copy', this.strings.copy, command('copy'));
+    add('paste', this.strings.paste, () => {
+      const clipboard = (navigator as { clipboard?: { readText?(): Promise<string> } }).clipboard;
+      if (!clipboard || typeof clipboard.readText !== 'function') {
+        this.notify(this.strings.pasteWithKeyboard, 'info');
+        return;
+      }
+      clipboard.readText().then(
+        (text) => {
+          if (!this.destroyed) this.pasteText(text);
+        },
+        () => {
+          if (!this.destroyed) this.notify(this.strings.pasteWithKeyboard, 'info');
+        },
+      );
+    });
+    add('all', this.strings.selectWholeText, () => {
+      this.selectAll();
+      this.touchSelection = true;
+      this.schedule();
+    });
+    this.bubble = bubble;
+  }
+
+  // ------------------------------------------------------------ the clipboard
+
+  /** The selection as the editor keeps a copy of it: formatted paragraphs, or the cells of a table. */
+  private selectionSlice(): DocSlice | undefined {
+    const selection = this.selection;
+    if (selection === undefined) return undefined;
+    try {
+      if (selection === 'all') {
+        const start = ops.storyStart(this.document, 'body');
+        const end = ops.storyEnd(this.document, 'body');
+        return start && end ? sliceOf(this.document, start, end) : undefined;
+      }
+      const range = orderedRange(selection.anchor, selection.focus);
+      if (!range) return undefined;
+      if (range.cells) {
+        const blocks = flowBlocks(this.document, range.start.story, range.start.path.slice(0, range.prefix));
+        const table = blocks ? tableAt(blocks, range.cells.table.slice(range.prefix)) : undefined;
+        if (!table) return undefined;
+        const rows: string[][] = [];
+        for (let r = range.cells.row; r <= range.cells.lastRow && r < table.rows.length; r++) {
+          const row: string[] = [];
+          for (let c = range.cells.cell; c <= range.cells.lastCell && c < table.rows[r].cells.length; c++) {
+            const inner: string[] = [];
+            blocksText(table.rows[r].cells[c].blocks, inner, 1);
+            row.push(inner.join('\n'));
+          }
+          rows.push(row);
+        }
+        return { paragraphs: [], table: rows };
+      }
+      return sliceOf(this.document, range.start, range.end);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private pasteText(text: string): void {
+    if (typeof text !== 'string' || text === '') return;
+    if (text.length > MAX_PASTE_TEXT) {
+      this.notify(this.strings.documentPasteTooLarge, 'error');
+      return;
+    }
+    this.perform((range) => ops.insertText(this.document, range, text), true);
+  }
+
+  /** Pastes a copy made in this view: its text with the formatting it had, as one step of the history. */
+  private pasteSlice(slice: DocSlice): void {
+    const range = this.range();
+    if (!this.editable || !range) return;
+    const doc = this.document;
+    const before = { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) };
+    const key = 'paste:' + ++this.steps;
+    this.history.seal();
+    let at: DocRange = range;
+    let any = false;
+    const apply = (edit: DocEdit): void => {
+      if (edit.ops.length > 0) {
+        this.history.apply(edit.ops, before, edit.selection, key);
+        any = true;
+      }
+      at = edit.selection;
+    };
+    try {
+      if (!ops.isCollapsed(at)) apply(ops.deleteRange(doc, at));
+      if (slice.table) {
+        const rows = slice.table.length;
+        let columns = 1;
+        for (const row of slice.table) columns = Math.max(columns, row.length);
+        apply(ops.insertTable(doc, at.focus, rows, columns));
+        // The caret is in the first cell of the new table.
+        const first = at.focus;
+        const table = first.path.slice(0, -3);
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < slice.table[r].length; c++) {
+            if (slice.table[r][c] !== '') apply(ops.insertText(doc, { story: first.story, path: table.concat([r, c, 0]), offset: 0 }, slice.table[r][c]));
+          }
+        }
+      } else {
+        const ended: { path: number[]; align?: string; style?: string }[] = [];
+        for (let i = 0; i < slice.paragraphs.length; i++) {
+          const paragraph = slice.paragraphs[i];
+          for (const run of paragraph.runs) if (run.text !== '') apply(ops.insertText(doc, at.focus, run.text, run.format));
+          if (i < slice.paragraphs.length - 1) {
+            ended.push({ path: at.focus.path.slice(), align: paragraph.align, style: paragraph.style });
+            apply(ops.insertText(doc, at.focus, '\n'));
+          }
+        }
+        const caret = at;
+        // The paragraphs whose end was copied get the alignment and the style they had.
+        for (const entry of ended) {
+          const patch: ParaFormatPatch = {};
+          if (entry.align !== undefined) patch.align = entry.align;
+          if (entry.style !== undefined && this.document.styles.styles.has(entry.style)) patch.style = entry.style;
+          if (patch.align !== undefined || patch.style !== undefined) apply(ops.setParaFormat(doc, { story: caret.focus.story, path: entry.path, offset: 0 }, patch));
+        }
+        at = caret;
+      }
+    } catch (error) {
+      this.refuse(error);
+    }
+    this.history.seal();
+    if (any) this.changed(ops.collapsed(at.focus));
+  }
+
+  /** A picture among what is on the clipboard: PNG or JPEG. */
+  private clipboardPicture(data: DataTransfer): Blob | undefined {
+    const wanted = /^image\/(png|jpeg)$/;
+    const items = data.items;
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].kind !== 'file' || !wanted.test(items[i].type)) continue;
+        const file = items[i].getAsFile();
+        if (file) return file;
+      }
+    }
+    const files = data.files;
+    if (files) for (let i = 0; i < files.length; i++) if (wanted.test(files[i].type)) return files[i];
+    return undefined;
+  }
+
+  private readPicture(file: Blob): void {
+    if (file.size > MAX_PICTURE_BYTES) {
+      this.notify(this.strings.pictureNotSupported, 'error');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      // What the bytes are is found out from the bytes, not from what the clipboard says.
+      if (!this.destroyed && reader.result instanceof ArrayBuffer) this.insertPicture(new Uint8Array(reader.result));
+    };
+    reader.onerror = () => {
+      if (!this.destroyed) this.notify(this.strings.pictureNotSupported, 'error');
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  /** Room a picture has where a position is, px: the text area of the page, or a share of it inside a table. */
+  private textRoom(position: DocPosition): { width: number; height: number } {
+    const doc = this.document;
+    let section = doc.body.section;
+    if (position.story === 'body') {
+      const blocks = doc.body.blocks;
+      for (let i = position.path[0]; i >= 0 && i < blocks.length; i++) {
+        const block = blocks[i];
+        if (block.type === 'paragraph' && block.props.section) {
+          section = block.props.section;
+          break;
+        }
+      }
+    }
+    const page = (section && section.page) || {};
+    const margins = (section && section.margins) || {};
+    const px = (value: number | undefined, fallback: number) => (typeof value === 'number' && value > 0 && value < 500000 ? value : fallback) / 15;
+    let width = px(page.width, 12240) - px(margins.left, 1440) - px(margins.right, 1440);
+    const height = px(page.height, 15840) - px(margins.top, 1440) - px(margins.bottom, 1440);
+    if (position.path.length >= 4) {
+      try {
+        const tablePath = position.path.slice(0, -3);
+        const table = ops.containerBlocks(doc, position.story, tablePath.slice(0, -1))[tablePath[tablePath.length - 1]];
+        if (table && table.type === 'table') width /= Math.max(1, table.rows[position.path[position.path.length - 3]].cells.length);
+      } catch {
+        // The whole width then.
+      }
+    }
+    return { width: clamp(width, 24, 2000), height: clamp(height * 0.9, 24, 3000) };
+  }
+
+  // ---------------------------------------------------------- keys of an editor
+
+  /** Moves the focus end of the selection to a place; without `extend` the caret is put there. */
+  private moveTo(position: DocPosition, affinity: Affinity, extend: boolean, keepX: boolean): void {
+    const range = this.range();
+    this.history.seal();
+    this.pendingFormat = undefined;
+    this.touchSelection = false;
+    this.selection = { anchor: extend && range ? range.anchor : copyPosition(position), focus: position };
+    this.affinity = affinity;
+    if (!keepX) this.targetX = undefined;
+    this.selectionMoved(true);
+  }
+
+  /** One line up or down, or a screen (`pages`), keeping the x the caret had when the moving began. */
+  private moveVertically(direction: 1 | -1, extend: boolean, screen: boolean): void {
+    const range = this.range();
+    if (!range) return;
+    const box = this.lines.caret(range.focus, this.affinity, this.caretPage);
+    if (!box) return;
+    const x = this.targetX !== undefined ? this.targetX : box.x;
+    const accept = (mark: LineMark) => mark.source.story === range.focus.story && outsideBoxes(mark);
+    let line: PageLine | undefined;
+    if (screen) {
+      // The line a screen away, as far as the pages laid out reach.
+      const distance = Math.max(LINE_SCROLL, this.height - LINE_SCROLL) / this.scale;
+      let y = this.offsets[box.page] + box.top + direction * distance;
+      y = clamp(y, 0, Math.max(0, this.offsets[this.pages.length] - 1));
+      let page = box.page;
+      while (page > 0 && this.offsets[page] > y) page--;
+      while (page < this.pages.length - 1 && this.offsets[page + 1] <= y) page++;
+      line = this.lines.lineAt(page, x, y - this.offsets[page], accept);
+      if (line === box.line) line = undefined;
+    }
+    if (!line) {
+      const next = this.lines.vertical(box, direction, x, accept);
+      line = next ? next.line : undefined;
+    }
+    let target: { position: DocPosition; affinity: Affinity } | undefined;
+    if (line) {
+      const found = this.lines.placeAt(line, x);
+      target = this.settle(found.place, found.affinity);
+    } else {
+      // No line further on: the very start or end of the text.
+      const edge = this.storyEdge(direction);
+      if (edge) target = { position: edge, affinity: 'start' };
+    }
+    if (!target) return;
+    this.targetX = x;
+    this.moveTo(target.position, target.affinity, extend, true);
+    this.announceCaret('line');
+  }
+
+  /** Start (-1) or end (1) of the line the caret is on. */
+  private moveToLineEdge(direction: 1 | -1, extend: boolean): void {
+    const range = this.range();
+    if (!range) return;
+    const at = this.lines.lineOf(range.focus, this.affinity, this.caretPage);
+    if (!at) return;
+    const source = at.line.mark.source;
+    const offset = direction === -1 ? source.offset : lineEnd(at.line);
+    const settled = this.settle({ story: source.story, path: source.path, offset }, direction === 1 && !at.line.mark.last ? 'end' : 'start');
+    if (!settled) return;
+    this.moveTo(settled.position, settled.affinity, extend, false);
+    this.announceCaret('line');
+  }
+
+  private moveBy(unit: 'char' | 'word' | 'paragraph' | 'story', direction: 1 | -1, extend: boolean): void {
+    const range = this.range();
+    if (!range) return;
+    let target: DocPosition;
+    try {
+      if (!extend && unit === 'char' && !ops.samePosition(range.anchor, range.focus)) {
+        // Left and right leave a selection at its start and at its end.
+        const ordered = ops.orderRange(range);
+        target = copyPosition(direction === -1 ? ordered.start : ordered.end);
+      } else target = ops.movePosition(this.document, range.focus, unit, direction);
+    } catch {
+      return;
+    }
+    this.moveTo(target, 'start', extend, false);
+    this.announceCaret(unit === 'char' ? 'char' : unit === 'word' ? 'word' : 'line');
+  }
+
+  /** Whether a selection spans more of the body than is looked at as a whole. */
+  private isLarge(range: DocRange): boolean {
+    return Math.abs(range.anchor.path[0] - range.focus.path[0]) > MAX_LOOKED_AT_BLOCKS;
+  }
+
+  /** Says where the caret is now, briefly: the character or the word after it, or its line. */
+  private announceCaret(unit: 'char' | 'word' | 'line'): void {
+    const range = this.range();
+    if (!range) return;
+    try {
+      if (!ops.samePosition(range.anchor, range.focus)) {
+        if (this.isLarge(range)) return;
+        const text = this.getSelectedText();
+        this.live.textContent = this.strings.selected(text.length > 80 ? text.slice(0, 80) + '…' : text);
+        return;
+      }
+      const at = ops.resolvePosition(this.document, range.focus);
+      const text = paragraphText(at.paragraph);
+      let said: string;
+      if (unit === 'line') {
+        const line = this.lines.lineOf(range.focus, this.affinity, this.caretPage);
+        said = line ? text.slice(line.line.mark.source.offset, lineEnd(line.line)) : text;
+      } else if (at.offset >= text.length) said = '';
+      else if (unit === 'word') {
+        const [start, end] = ops.wordAt(text, at.offset);
+        said = text.slice(Math.max(start, at.offset), end);
+      } else said = text.slice(at.offset, ops.nextCharOffset(text, at.offset));
+      if (said === ' ' || said === ' ') said = this.strings.space;
+      else if (said.replace(/\s+/g, '') === '') said = this.strings.blankLine;
+      this.live.textContent = said.length > 200 ? said.slice(0, 200) + '…' : said;
+    } catch {
+      // Nothing to say.
+    }
+  }
+
+  private announceSelection(): void {
+    if (this.options.onSelectionChange) this.options.onSelectionChange(this.getSelection());
+  }
+
+  /** The keys of an editor. True when the key was one of them. */
+  private editKey(event: KeyboardEvent): boolean {
+    // 229: the key went to an input method, also where isComposing is not reported.
+    if (event.isComposing || event.keyCode === 229) return true;
+    const key = event.key;
+    const apple = isApple();
+    // AltGr (Ctrl+Alt) types characters; it is not a command.
+    const command = (event.ctrlKey || event.metaKey) && !event.altKey;
+    const word = apple ? event.altKey && !event.metaKey : event.ctrlKey && !event.altKey;
+    const shift = event.shiftKey;
+    const done = (): true => {
+      event.preventDefault();
+      return true;
+    };
+    if (key !== 'Tab' && key !== 'Escape' && key !== 'Shift' && key !== 'Control' && key !== 'Alt' && key !== 'Meta') this.escaped = false;
+    if (!this.range()) {
+      // No caret yet: the first key that needs one puts it at the start of the text.
+      const start = this.storyEdge(-1);
+      if (!start) return false;
+      this.selection = { anchor: start, focus: copyPosition(start) };
+    }
+    switch (key) {
+      case 'ArrowLeft':
+      case 'ArrowRight': {
+        const direction = key === 'ArrowLeft' ? -1 : 1;
+        if (apple && event.metaKey) this.moveToLineEdge(direction, shift);
+        else this.moveBy(word ? 'word' : 'char', direction, shift);
+        return done();
+      }
+      case 'ArrowUp':
+      case 'ArrowDown': {
+        const direction = key === 'ArrowUp' ? -1 : 1;
+        if (apple && event.metaKey) this.moveBy('story', direction, shift);
+        else if (word) this.moveBy('paragraph', direction, shift);
+        else this.moveVertically(direction, shift, false);
+        return done();
+      }
+      case 'Home':
+      case 'End': {
+        const direction = key === 'Home' ? -1 : 1;
+        if (event.ctrlKey || event.metaKey) this.moveBy('story', direction, shift);
+        else this.moveToLineEdge(direction, shift);
+        return done();
+      }
+      case 'PageUp':
+      case 'PageDown':
+        this.moveVertically(key === 'PageUp' ? -1 : 1, shift, true);
+        return done();
+      case 'Enter':
+        this.enter(command ? 'page' : shift ? 'line' : 'paragraph');
+        return done();
+      case 'Backspace':
+        this.removeText(-1, apple && event.metaKey ? 'line' : word ? 'word' : 'char');
+        return done();
+      case 'Delete':
+        this.removeText(1, word ? 'word' : 'char');
+        return done();
+      case 'Tab':
+        if (command || event.altKey) return false;
+        // After Escape the key is the browser's again: the focus moves on, out of the editor.
+        if (this.escaped) {
+          this.escaped = false;
+          return true;
+        }
+        this.tab(shift);
+        return done();
+      case 'Escape': {
+        const range = this.range();
+        if (range && !ops.samePosition(range.anchor, range.focus)) this.moveTo(copyPosition(range.focus), this.affinity, false, false);
+        this.escaped = true;
+        this.live.textContent = this.strings.tabLeaves;
+        return done();
+      }
+      default:
+    }
+    if (!command) return key.length === 1 || key === 'Dead' || key === 'Process' || key === 'Unidentified';
+    switch (key.toLowerCase()) {
+      case 'a':
+        this.selectAll();
+        return done();
+      case 'z':
+        if (shift) this.redo();
+        else this.undo();
+        return done();
+      case 'y':
+        this.redo();
+        return done();
+      case 'b':
+        this.toggleFormat('bold');
+        return done();
+      case 'i':
+        this.toggleFormat('italic');
+        return done();
+      case 'u':
+        this.toggleFormat('underline');
+        return done();
+      case 'e':
+        this.formatParagraph({ align: 'center' });
+        return done();
+      case 'l':
+        this.formatParagraph({ align: 'left' });
+        return done();
+      case 'r':
+        this.formatParagraph({ align: 'right' });
+        return done();
+      case 'j':
+        this.formatParagraph({ align: 'both' });
+        return done();
+      case 'k':
+        if (!this.options.onLinkShortcut) return false;
+        this.options.onLinkShortcut();
+        return done();
+      default:
+        // Zoom, save, copy and paste: the view's other keys and the browser's.
+        return false;
+    }
+  }
 
   private notify(message: string, kind: 'error' | 'info'): void {
     this.live.textContent = message;

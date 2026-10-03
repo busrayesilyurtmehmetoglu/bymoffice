@@ -64,6 +64,36 @@ const ICONS: { [name in IconName]: Shape[] } = {
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
 };
 
+/** Icons only the document editor has; the others it shares with the spreadsheet editor. */
+export type DocIconName =
+  | 'highlight'
+  | 'alignJustify'
+  | 'bulletList'
+  | 'numberedList'
+  | 'decreaseIndent'
+  | 'increaseIndent'
+  | 'insertTable'
+  | 'insertPicture'
+  | 'insertLink'
+  | 'pageBreak';
+
+const DOC_ICONS: { [name in DocIconName]: Shape[] } = {
+  highlight: [path('m14.5 4 4.5 4.5-7.5 7.5H7v-4.5z'), path('M12.5 6 17 10.5'), bar],
+  alignJustify: [path('M4 6h16 M4 10h16 M4 14h16 M4 18h16')],
+  bulletList: [path('M9 6h11 M9 12h11 M9 18h11'), path('M4.5 6h.01 M4.5 12h.01 M4.5 18h.01', { 'stroke-width': '2.75' })],
+  numberedList: [path('M10 6h10 M10 12h10 M10 18h10'), path('M4 5l1.5-1v4 M4 8h3', { 'stroke-width': '1.25' }), path('M4 14.5c0-1.5 2.8-1.5 2.8 0 0 1-2.8 2-2.8 3.5h3', { 'stroke-width': '1.25' })],
+  decreaseIndent: [path('M4 5h16 M11 10h9 M11 14h9 M4 19h16'), path('m7.5 9.5-3 2.5 3 2.5')],
+  increaseIndent: [path('M4 5h16 M11 10h9 M11 14h9 M4 19h16'), path('m4.5 9.5 3 2.5-3 2.5')],
+  insertTable: [path('M4 5h16v14H4z M4 10h16 M4 14.5h16 M9.5 5v14 M14.5 5v14')],
+  insertPicture: [path('M4 5h16v14H4z'), path('m4 16 4.5-4.5 4 4 2.5-2.5 5 5'), path('M15.5 9.5h.01', { 'stroke-width': '2.75' })],
+  insertLink: [path('M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1'), path('M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1')],
+  pageBreak: [path('M6 3v5h12V3 M6 21v-5h12v5'), path('M3 12h2 M8 12h2 M14 12h2 M19 12h2')],
+};
+
+export function createDocIcon(name: DocIconName): SVGSVGElement {
+  return build(DOC_ICONS[name]);
+}
+
 function build(shapes: Shape[]): SVGSVGElement {
   const svg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
   const attrs: { [name: string]: string } = {
