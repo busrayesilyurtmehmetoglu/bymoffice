@@ -1,6 +1,6 @@
 # BYM Office
 
-Word ve Excel dosyalarını (docx, xlsx, doc, xls) tarayıcıda açıp düzenlemek için sıfırdan yazılan motor.
+Word ve Excel dosyalarını (docx, xlsx, doc, xls, RTF) tarayıcıda açıp düzenlemek için sıfırdan yazılan motor.
 Tek bir `.js` dosyası olarak dağıtılır, çalışma zamanı bağımlılığı yoktur; aynı kod Node üzerinde sunucuda da çalışır.
 
 ## Kullanım
@@ -16,7 +16,7 @@ Tek bir `.js` dosyası olarak dağıtılır, çalışma zamanı bağımlılığ�
 
 ES modülü olarak: `import { open } from './bymoffice.esm.js'`.
 
-Ayrıntılı anlatım, API ve test arayüzü: [geliştirici kullanım kılavuzu](docs/kullanim-kilavuzu.md).
+Ayrıntılı anlatım, API ve test arayüzü: [geliştirici kullanım kılavuzu](docs/kullanim-kilavuzu.md). Sürüm notları: [CHANGELOG.md](CHANGELOG.md).
 
 ## Komutlar
 

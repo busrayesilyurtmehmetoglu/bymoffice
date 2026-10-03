@@ -65,7 +65,12 @@ pnpm build
 |---|---|
 | `dist/bymoffice.min.js` | `<script>` ile; global `BymOffice` nesnesini tanımlar |
 | `dist/bymoffice.esm.js` | ES modülü (`import`) |
-| `dist/types/index.d.ts` | TypeScript tipleri |
+| `dist/types/index.d.ts` | TypeScript tipleri (`moduleResolution` `bundler`, `node16` ve `nodenext` ile çözülür) |
+| `dist/bymoffice.webview.html` | WebView'ler için tek dosyalık köprü sayfası (pakette `bymoffice/webview.html`) |
+
+Paket yalnız ES modülü ve `<script>` olarak dağıtılır; ayrı bir CommonJS çıktısı yoktur (`require()` yalnız ES modülünü yükleyebilen Node sürümlerinde çalışır). Çalışma zamanı bağımlılığı yoktur.
+
+`pnpm pack:check` (derlemeden sonra) paketi yayımlanacağı haliyle sınar: arşivi üretir, boş bir projeye kurar, oradan ES modülü olarak kullanır, tipleri üç çözümleme kipiyle derler ve `<script>` dosyasının global `BymOffice`'i tanımladığına bakar. `pnpm verify` bunu da çalıştırır.
 
 Yayımlandığında kurulum şöyle olacak (şimdilik çalışmaz):
 
@@ -570,6 +575,7 @@ Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez.
 | `pnpm typecheck` | Tip denetimi |
 | `pnpm test` | Birim testleri |
 | `pnpm build` | `dist/` çıktıları |
+| `pnpm pack:check` | Paketi arşivleyip boş bir projeye kurar ve oradan kullanır (ES modülü, tipler, `<script>`); önce `pnpm build` gerekir |
 | `pnpm e2e` | Derler ve Playwright testlerini 5 tarayıcı profilinde çalıştırır |
 | `pnpm corpus <klasör> …` | Gerçek dosyalarda aç → kaydet → yeniden aç denetimi (`BYM_NO_NATIVE=1` ile motorun kendi sıkıştırma koduyla); her xls ayrıca xlsx'e çevrilip yeniden okunur ve iki model karşılaştırılır ("converted to xlsx and read back") |
 | `pnpm demo` | Derler ve test arayüzünü sunar |

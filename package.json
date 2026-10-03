@@ -4,21 +4,46 @@
   "private": true,
   "description": "Word and Excel viewer/editor engine, embeddable from a CDN",
   "type": "module",
+  "keywords": [
+    "docx",
+    "xlsx",
+    "doc",
+    "xls",
+    "rtf",
+    "word",
+    "excel",
+    "spreadsheet",
+    "document",
+    "editor",
+    "viewer"
+  ],
   "main": "dist/bymoffice.esm.js",
   "module": "dist/bymoffice.esm.js",
   "types": "dist/types/index.d.ts",
   "unpkg": "dist/bymoffice.min.js",
   "jsdelivr": "dist/bymoffice.min.js",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/bymoffice.esm.js",
+      "default": "./dist/bymoffice.esm.js"
+    },
+    "./webview.html": "./dist/bymoffice.webview.html",
+    "./dist/*": "./dist/*",
+    "./package.json": "./package.json"
+  },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "node scripts/build.mjs && tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs && tsc -p tsconfig.json && node scripts/fix-types.mjs",
+    "pack:check": "node scripts/pack-check.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test --test-timeout=180000 test/*.test.ts",
     "corpus": "tsx scripts/corpus.ts",
     "corpus:baseline": "tsx scripts/corpus.ts --local",
-    "verify": "pnpm typecheck && pnpm test && pnpm e2e && pnpm corpus:baseline && BYM_NO_NATIVE=1 pnpm corpus:baseline",
+    "verify": "pnpm typecheck && pnpm test && pnpm e2e && pnpm pack:check && pnpm corpus:baseline && BYM_NO_NATIVE=1 pnpm corpus:baseline",
     "demo": "pnpm build && E2E_PORT=4318 node e2e/server.mjs",
     "e2e": "pnpm build && playwright test"
   },
