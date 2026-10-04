@@ -7,6 +7,9 @@ export default defineConfig({
   testDir: 'e2e',
   testMatch: '*.spec.ts',
   fullyParallel: true,
+  // Every worker is a whole browser. The default (half the cores) has exhausted
+  // the memory of a development machine, so the number is fixed and small.
+  workers: Number(process.env.E2E_WORKERS ?? 3),
   forbidOnly: !!process.env.CI,
   // A flaky test is a bug to investigate, never something to retry away.
   retries: 0,

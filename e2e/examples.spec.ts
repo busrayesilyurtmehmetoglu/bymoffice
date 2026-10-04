@@ -239,6 +239,41 @@ test.describe('example page: a file of the site in the editor', () => {
     expect([plain.type, plain.format, 'convertedFrom' in plain]).toEqual(['ready', 'rtf', false]);
   });
 
+  test('Print: a document is printed with the button, in view mode too; under the print medium only its pages show; a workbook has no button', async ({ page }) => {
+    for (const query of ['new=docx&lang=tr', 'new=docx&mode=view']) {
+      await page.goto(`${PAGE}?${query}`);
+      await ready(page);
+      await expect(page.locator('#print')).toBeVisible();
+      await expect(page.locator('#print')).toHaveText(query.includes('tr') ? 'Yazdır' : 'Print');
+      // No dialog is opened from a test: the call is recorded, and the "dialog" stays open.
+      await page.evaluate(() => {
+        (window as any).__prints = 0;
+        window.print = () => void (window as any).__prints++;
+      });
+      await page.locator('#print').click();
+      await expect.poll(() => page.evaluate(() => (window as any).__prints)).toBe(1);
+      await expect(page.locator('body > .bym-print img')).toHaveCount(1);
+      // The page lays its body out as a column of full height: none of that reaches the paper.
+      await page.emulateMedia({ media: 'print' });
+      await expect(page.locator('.bym-print img')).toBeVisible();
+      await expect(page.locator('#bar')).toBeHidden();
+      await expect(page.locator('#editor')).toBeHidden();
+      const box = await page.evaluate(() => {
+        const rect = document.querySelector('.bym-print-sheet')!.getBoundingClientRect();
+        return [rect.left, rect.top, getComputedStyle(document.body).display];
+      });
+      expect(box).toEqual([0, 0, 'block']);
+      await page.emulateMedia({ media: 'screen' });
+      await expect(page.locator('#bar')).toBeVisible();
+      await page.evaluate(() => void window.dispatchEvent(new Event('afterprint')));
+      await expect(page.locator('.bym-print')).toHaveCount(0);
+      expect(await page.evaluate(() => (window as any).bymEditor.view.printing)).toBe(false);
+    }
+    await page.goto(`${PAGE}?new=xlsx`);
+    await ready(page);
+    await expect(page.locator('#print')).toBeHidden();
+  });
+
   test('addresses of another site are refused, and so is a page without a file', async ({ page }) => {
     await page.goto(`${PAGE}?file=https://example.com/a.docx`);
     await expect(page.locator('#status')).toHaveText('Only files of this site can be opened');

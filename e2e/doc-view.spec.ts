@@ -621,7 +621,8 @@ test.describe('document view', () => {
     }
     expect(seen[seen.length - 1]).toBe('after');
     expect(seen.filter((name) => name === 'bym-doc-input' || name === 'bym-doc-link')).toEqual(['bym-doc-input', 'bym-doc-link']);
-    expect(seen.length).toBeLessThanOrEqual(7);
+    // One stop more since the bar has a Print button.
+    expect(seen.length).toBeLessThanOrEqual(8);
 
     // And back out the other way.
     const back: string[] = [];
@@ -1112,7 +1113,7 @@ test.describe('BymOffice.mount with a document', () => {
     }, Array.from(input));
     expect(result.kind).toBe('document');
     expect(result.format).toBe('docx');
-    expect(result.keys).toEqual(['destroy', 'document', 'editor', 'file', 'kind', 'save', 'view']);
+    expect(result.keys).toEqual(['destroy', 'document', 'editor', 'file', 'kind', 'print', 'save', 'view']);
     expect(result.blocks).toBe(true);
     expect(result.isView).toBe(true);
     expect(result.saved).toEqual(Array.from(input));

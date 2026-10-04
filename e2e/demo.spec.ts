@@ -208,6 +208,9 @@ test.describe('demo page', () => {
     await expect(page.locator('#preview-section')).toBeHidden();
     await expect(page.locator('#doc .bym-doc')).toHaveCount(1);
     await expect(page.locator('#doc .bym-doc-pages')).toHaveText('Sayfa 1 / 3');
+    // The bar of the document view has the Print button.
+    await expect(page.locator('#doc .bym-doc-print')).toBeVisible();
+    await expect(page.locator('#doc .bym-doc-print')).toHaveAttribute('aria-label', 'Yazdır');
     await expect(page.locator('#doc-info')).toContainText('Sayfa 1 / 3');
     await expect(page.locator('#doc-note')).toContainText('Model');
     await expect(page.locator('#doc canvas').first()).toBeVisible();

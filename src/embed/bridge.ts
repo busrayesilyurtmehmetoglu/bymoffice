@@ -14,7 +14,7 @@ import type { DocumentViewOptions } from '../ui/doc-view';
 import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 
-export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded';
+export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded' | 'print-unavailable' | 'print-failed';
 
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
 export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
@@ -39,6 +39,11 @@ export interface BridgeDocumentView {
   readonly changeCount?: number;
   /** Says that the document as it is now has been saved. */
   markSaved?(): void;
+  /**
+   * Prints the document through the window's print dialog; resolves when the
+   * dialog was closed. An error with `code: 'unavailable'` says that the window cannot print.
+   */
+  print?(options?: { dpi?: number }): Promise<unknown>;
 }
 
 export interface BridgeHost {
@@ -712,6 +717,30 @@ export function createBridge(host: BridgeHost): Bridge {
     send(out);
   };
 
+  /**
+   * Starts printing the document and answers when the dialog was closed. The
+   * messages after it do not wait for that: a dialog can stay open for long.
+   */
+  const print = (message: Message, id: string | undefined) => {
+    const dpi = field<number>(message, 'dpi', 'number', false);
+    if (dpi !== undefined && !(dpi > 0 && dpi < Infinity)) throw new BadMessage('"dpi" must be a positive number');
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const pages = shown.pages;
+    if (!pages || !pages.print) {
+      return fail('print-unavailable', shown.view ? 'Printing a spreadsheet is not supported yet' : 'This view cannot print', id);
+    }
+    let job: Promise<unknown>;
+    try {
+      job = Promise.resolve(pages.print(dpi === undefined ? undefined : { dpi }));
+    } catch (error) {
+      job = Promise.reject(error);
+    }
+    job.then(
+      () => done('print', id),
+      (error) => fail(error && (error as { code?: unknown }).code === 'unavailable' ? 'print-unavailable' : 'print-failed', errorText(error), id),
+    );
+  };
+
   /** The id of a message; it is read first so that every later complaint can carry it. */
   const idOf = (fields: Message): string | undefined => {
     if (typeof fields.id === 'string') return fields.id;
@@ -730,6 +759,7 @@ export function createBridge(host: BridgeHost): Bridge {
 
       if (type === 'load') return await load(fields, id, mine);
       if (type === 'save') return await save(id);
+      if (type === 'print') return print(fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
       }

@@ -73,6 +73,8 @@
     <div id="bar">
       <span id="name"></span>
       <span id="status" role="status"></span>
+      <!-- Documents only: opens the browser's print dialog, which can also save a PDF. -->
+      <button id="print" type="button" hidden>Print</button>
       <button id="save" type="button" hidden>Save</button>
     </div>
     <div id="editor"></div>
@@ -85,13 +87,15 @@
         var lang = params.get('lang') === 'tr' ? 'tr' : 'en';
         var readOnly = params.get('mode') === 'view';
         var text = {
-          en: { save: 'Save', saving: 'Saving…', saved: 'Saved', changed: 'Not saved', loading: 'Loading…', failed: 'The file could not be saved', notHere: 'Only files of this site can be opened', nothing: 'No file was given' },
-          tr: { save: 'Kaydet', saving: 'Kaydediliyor…', saved: 'Kaydedildi', changed: 'Kaydedilmedi', loading: 'Yükleniyor…', failed: 'Dosya kaydedilemedi', notHere: 'Yalnız bu sitenin dosyaları açılabilir', nothing: 'Dosya verilmedi' },
+          en: { print: 'Print', save: 'Save', saving: 'Saving…', saved: 'Saved', changed: 'Not saved', loading: 'Loading…', failed: 'The file could not be saved', notHere: 'Only files of this site can be opened', nothing: 'No file was given' },
+          tr: { print: 'Yazdır', save: 'Kaydet', saving: 'Kaydediliyor…', saved: 'Kaydedildi', changed: 'Kaydedilmedi', loading: 'Yükleniyor…', failed: 'Dosya kaydedilemedi', notHere: 'Yalnız bu sitenin dosyaları açılabilir', nothing: 'Dosya verilmedi' },
         }[lang];
 
         var statusEl = document.getElementById('status');
         var saveButton = document.getElementById('save');
         saveButton.textContent = text.save;
+        var printButton = document.getElementById('print');
+        printButton.textContent = text.print;
         document.documentElement.lang = lang;
 
         function tell(type, message) {
@@ -239,6 +243,13 @@
             if (!writable) readOnly = true;
             saveButton.hidden = readOnly;
             saveButton.addEventListener('click', save);
+            // A document can be printed, read-only or not; printing a workbook is not there yet.
+            printButton.hidden = result.kind !== 'document';
+            printButton.addEventListener('click', function () {
+              if (result.kind !== 'document') return;
+              // The editor says by itself (onNotice) what goes wrong; the promise ends when the dialog is closed.
+              result.print().catch(function () {});
+            });
             // What was said while the file was opened (it was converted, or could not be) stays until something else is said.
             if (!noticed) status('');
             // For the console, and for tests of this page.

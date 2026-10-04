@@ -16,6 +16,7 @@ import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
 import type { WorkbookView } from './ui/sheet-view';
 import type { DocumentView, DocumentZoom } from './ui/doc-view';
 import { DocumentEditor } from './ui/doc-editor';
+import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import { OpcPackage } from './opc';
 
 export { CfbFile, type CfbEntry } from './cfb';
@@ -75,6 +76,7 @@ export { renderPage, type PageImage, type RenderPageOptions } from './render/doc
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
+export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
 export { DocToolbar, type DocShellHost } from './ui/doc-toolbar';
 export { DocLines, type Affinity, type CaretBox, type PageLine, type Place } from './ui/doc-caret';
 export { sliceHtml, sliceOf, type DocSlice } from './ui/doc-clipboard';
@@ -317,6 +319,11 @@ export interface MountedDocument {
   editor: DocumentEditor;
   /** The file as bytes: a docx with the changes made in the editor; doc and RTF, which are read-only, as the bytes they were opened from. */
   save(): Promise<Uint8Array>;
+  /**
+   * Prints the document through the print dialog of the browser (which can
+   * also save it as a PDF): see DocumentView.print(). Resolves when the dialog was closed.
+   */
+  print(options?: DocumentPrintOptions): Promise<DocumentPrintResult>;
   /** Removes the view from the container. */
   destroy(): void;
 }
@@ -408,7 +415,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       editor.destroy();
     };
     converted();
-    return conversion ? { kind: 'document', file, conversion, document: model, view, editor, save, destroy } : { kind: 'document', file, document: model, view, editor, save, destroy };
+    const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
+    return conversion
+      ? { kind: 'document', file, conversion, document: model, view, editor, save, print, destroy }
+      : { kind: 'document', file, document: model, view, editor, save, print, destroy };
   }
 
   const workbook = await file.workbook();

@@ -1508,3 +1508,69 @@ test('review: a change waiting for a channel is not joined with the change of th
     ],
   );
 });
+
+test('bridge: print starts the print job of a document and answers when its dialog was closed; other messages do not wait', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  const jobs: { options: unknown; resolve(): void; reject(error: unknown): void }[] = [];
+  const view = d.views[0];
+  const make = f.host.createDocumentView!;
+  // The view of the next load can print.
+  f.host.createDocumentView = (container, doc, options) => {
+    const pages = make.call(f.host, container, doc, options);
+    pages.print = (printOptions) => new Promise<void>((resolve, reject) => jobs.push({ options: printOptions, resolve, reject }));
+    return pages;
+  };
+  // A view without print(): the page says that it cannot.
+  assert.ok(view);
+  await bridge.receive({ type: 'print', id: 'p0' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'p0', code: 'print-unavailable', message: 'This view cannot print' });
+
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'print', id: 'p1' });
+  await bridge.receive({ type: 'print', id: 'p2', dpi: 150 });
+  assert.deepEqual(
+    jobs.map((job) => job.options),
+    [undefined, { dpi: 150 }],
+  );
+  // The dialog is still open: no answer yet, and the next message is handled all the same.
+  const before = f.sent.length;
+  await bridge.receive({ type: 'undo', id: 'u' });
+  assert.deepEqual(f.sent.slice(before), [{ type: 'done', id: 'u', command: 'undo' }]);
+  jobs[0].resolve();
+  jobs[1].reject(Object.assign(new Error('The window has no print()'), { code: 'unavailable' }));
+  await settle();
+  assert.deepEqual(f.sent.slice(before + 1), [
+    { type: 'done', id: 'p1', command: 'print' },
+    { type: 'error', id: 'p2', code: 'print-unavailable', message: 'The window has no print()' },
+  ]);
+  // Any other failure, and one that is thrown at once.
+  await bridge.receive({ type: 'print', id: 'p3' });
+  jobs[2].reject(new Error('Page 2 could not be painted'));
+  await settle();
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'p3', code: 'print-failed', message: 'Page 2 could not be painted' });
+  // Without an id a print that succeeds is silent, like every command.
+  const count = f.sent.length;
+  await bridge.receive({ type: 'print' });
+  jobs[3].resolve();
+  await settle();
+  assert.equal(f.sent.length, count);
+});
+
+test('bridge: print is refused without a file, for a workbook and with a wrong dpi', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'print', id: 'a' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'a', code: 'not-loaded', message: 'No file is open' });
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'print', id: 'b' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'b', code: 'print-unavailable', message: 'Printing a spreadsheet is not supported yet' });
+  for (const dpi of [0, -5, '200', true]) {
+    await bridge.receive({ type: 'print', id: 'c', dpi });
+    assert.equal(f.sent[f.sent.length - 1].code, 'bad-message', String(dpi));
+  }
+  // The workbook is still there.
+  assert.equal(f.calls.includes('destroy'), false);
+});

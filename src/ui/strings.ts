@@ -116,6 +116,17 @@ export interface UiStrings {
   /** The bubble over a selection made by touch, and its button that selects the whole text. */
   selectionTools: string;
   selectWholeText: string;
+  // Printing a document.
+  print: string;
+  /** Said when the pages are being prepared for the print dialog. */
+  printPreparing: string;
+  /** Said when the print dialog was closed; replaces `printPreparing`. */
+  printClosed: string;
+  /** Shown in the bar while they are: "Preparing to print… 3 / 12". */
+  printProgress(done: number, total: number): string;
+  printNotAvailable: string;
+  printTooLong: string;
+  printFailed: string;
 }
 
 const rows = (count: number) => (count === 1 ? 'row' : `${count} rows`);
@@ -204,6 +215,13 @@ export const STRINGS_EN: UiStrings = {
   endOfDocument: 'End of the document',
   selectionTools: 'Selection',
   selectWholeText: 'Select all',
+  print: 'Print',
+  printPreparing: 'Preparing to print\u2026',
+  printClosed: 'The print dialog was closed',
+  printProgress: (done, total) => `Preparing to print\u2026 ${done} / ${total}`,
+  printNotAvailable: 'Printing is not available here',
+  printTooLong: 'The document is too long to print at once',
+  printFailed: 'The document could not be printed',
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -299,6 +317,13 @@ export const STRINGS_TR: UiStrings = {
   endOfDocument: 'Belgenin sonu',
   selectionTools: 'Seçim',
   selectWholeText: 'Tümünü seç',
+  print: 'Yazdır',
+  printPreparing: 'Yazdırmaya hazırlanıyor\u2026',
+  printClosed: 'Yazdırma penceresi kapandı',
+  printProgress: (done, total) => `Yazdırmaya hazırlanıyor\u2026 ${done} / ${total}`,
+  printNotAvailable: 'Burada yazdırma kullanılamıyor',
+  printTooLong: 'Belge bir kerede yazdırılamayacak kadar uzun',
+  printFailed: 'Belge yazdırılamadı',
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

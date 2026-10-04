@@ -200,6 +200,11 @@ export class ImageStore {
     return image;
   }
 
+  /** Whether a picture is being decoded or waits its turn: until then a 'pending' status may still change. */
+  get busy(): boolean {
+    return this.loading > 0 || this.queue.length > 0;
+  }
+
   /**
    * Whether a picture that get() gave nothing for will ever come: 'failed' for one that
    * cannot be shown (not a raster picture, too large, damaged), 'pending' otherwise.

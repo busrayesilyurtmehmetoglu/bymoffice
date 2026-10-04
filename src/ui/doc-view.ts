@@ -24,6 +24,22 @@ import { CanvasTextMeasurer } from '../render/doc-measure';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
 import { hasCopyMark, sliceHtml, cutLoses, sliceOf, type DocSlice } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
+import {
+  DocumentPrintError,
+  PrintFrame,
+  canvasPicture,
+  openPrintDialog,
+  planPrint,
+  printLimits,
+  MAX_PRINT_PAGES,
+  revokePicture,
+  supportsNamedPages,
+  type DocumentPrintOptions,
+  type DocumentPrintResult,
+  type PrintDialog,
+  type PrintLimits,
+  type PrintPlan,
+} from './doc-print';
 import { resolveUiStrings, type UiStrings } from './strings';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
@@ -141,6 +157,10 @@ const CARET_MARGIN = 8;
 const EMU_PER_PX = 9525;
 /** A selection over more blocks of the body than this is too large to look at as a whole for the toolbar or to read out. */
 const MAX_LOOKED_AT_BLOCKS = 400;
+/** How often the pages are prepared for printing anew because the document changed meanwhile. */
+const MAX_PRINT_RESTARTS = 3;
+/** How long one page waits for its pictures before it is printed with placeholders. */
+const PRINT_PICTURES_MS = 30000;
 
 // Cosmetic rules only; what the layout depends on is set inline.
 const STYLE_TEXT =
@@ -547,6 +567,19 @@ function sameSource(a: TextItem, b: TextItem): boolean {
   return true;
 }
 
+/** One call of print(): what it holds while it runs. */
+interface PrintJob {
+  promise: Promise<DocumentPrintResult>;
+  frame?: PrintFrame;
+  store?: ImageStore;
+  /** Set once the pages are ready and the dialog was asked for. */
+  dialog?: PrintDialog;
+  /** Pages ready so far, while they are prepared. */
+  progress?: { done: number; total: number };
+}
+
+const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 interface Slot {
   index: number;
   element: HTMLDivElement;
@@ -576,11 +609,16 @@ export class DocumentView {
   private readonly zoomInButton: HTMLButtonElement | undefined;
   private readonly zoomButton: HTMLButtonElement | undefined;
   private readonly fitButton: HTMLButtonElement | undefined;
+  private readonly printButton: HTMLButtonElement | undefined;
   private readonly pagesLabel: HTMLSpanElement | undefined;
   private readonly styleHost: Node;
   private readonly painter: CanvasTextMeasurer;
   private readonly measurer: TextMeasurer;
   private readonly images: ImageStore;
+  private readonly pictures: { readPart(part: string): Promise<Uint8Array> };
+  private printJob: PrintJob | undefined;
+  /** Counts the times the pages were laid out anew: pages prepared for printing before are out of date. */
+  private layoutEpoch = 0;
   private readonly pointerEvents: boolean;
   private readonly maxCanvasPixels: number;
   private strings: UiStrings;
@@ -690,6 +728,7 @@ export class DocumentView {
         return source ? source.readPart(part) : Promise.reject(new Error('No such picture'));
       },
     };
+    this.pictures = pictures;
     this.images = new ImageStore(pictures, coarse ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, this.onImageLoad);
     // A document that cannot be laid out at all throws here, before anything is added to the container.
     this.engine = new DocLayout(doc, this.measurer, this.layoutOptions());
@@ -714,6 +753,7 @@ export class DocumentView {
       this.zoomButton.style.minWidth = '52px';
       this.zoomInButton = this.button(bar, 'bym-doc-zoom-in', icon(['M6 12h12', 'M12 6v12']));
       this.fitButton = this.button(bar, 'bym-doc-fit', icon(['M4 5v14', 'M20 5v14', 'M8 12h8', 'm10 9-2.5 3 2.5 3', 'm14 9 2.5 3-2.5 3']));
+      this.printButton = this.button(bar, 'bym-doc-print', icon(['M7 8V4h10v4', 'M7 17H5a1 1 0 0 1-1-1v-6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1h-2', 'M7 14h10v6H7z']));
       const pagesLabel = document.createElement('span');
       pagesLabel.className = 'bym-doc-pages';
       pagesLabel.style.cssText = 'flex:1 1 0;min-width:0;margin:0 4px 0 12px;overflow:hidden;text-overflow:ellipsis;text-align:right';
@@ -989,6 +1029,7 @@ export class DocumentView {
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
     this.layoutTimer = undefined;
     this.painter.clear();
+    this.layoutEpoch++;
     // Places in the text are places of the model: an editor keeps its caret.
     if (!this.editable) this.selection = undefined;
     this.hold = 0;
@@ -1041,8 +1082,222 @@ export class DocumentView {
     this.unlisten();
     this.unmountAll();
     this.images.destroy();
+    // A print job under way ends here: its pages leave the document at once.
+    if (this.printJob) this.endPrint(this.printJob);
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);
+  }
+
+  // -------------------------------------------------------------- printing
+
+  /** Whether print() is at work: its pages are being prepared or its dialog is open. */
+  get printing(): boolean {
+    return this.printJob !== undefined;
+  }
+
+  /**
+   * Prints the document: lays out what is not laid out yet, paints every
+   * page at the resolution of a printer, and opens the print dialog of the
+   * window the view is in, with paper of the size of the pages. The pages are
+   * prepared one per turn, so the page stays responsive, and the document
+   * can be read on meanwhile; when it is changed, they are prepared anew.
+   *
+   * Resolves when the dialog was closed (whether the user printed or
+   * cancelled cannot be told). A call while the pages of an earlier one are
+   * being prepared gets the promise of that call and opens no second dialog.
+   * Rejects with a DocumentPrintError: where the window cannot print, for a
+   * document beyond the limits, and when the view is destroyed meanwhile;
+   * with a RangeError for a `dpi` that is no positive number.
+   */
+  print(options: DocumentPrintOptions = {}): Promise<DocumentPrintResult> {
+    if (this.destroyed) return Promise.reject(new DocumentPrintError('cancelled', 'The view was destroyed'));
+    // A wrong option is refused before any work is done, whatever else is under way.
+    try {
+      planPrint([DEFAULT_PAGE], options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const previous = this.printJob;
+    if (previous) {
+      if (!previous.dialog) return previous.promise;
+      // print() came back and nothing said that the dialog was closed: a new call says so.
+      previous.dialog.finish();
+    }
+    const job = {} as PrintJob;
+    const nothing = () => undefined;
+    const turn: Promise<unknown> = previous ? previous.promise.then(nothing, nothing) : Promise.resolve();
+    job.promise = turn
+      .then(() => this.runPrint(job, options))
+      .then(
+        (result) => {
+          this.endPrint(job);
+          return result;
+        },
+        (error) => {
+          this.endPrint(job);
+          this.printFailed(error);
+          throw error;
+        },
+      );
+    this.printJob = job;
+    this.updateBar();
+    return job.promise;
+  }
+
+  private async runPrint(job: PrintJob, options: DocumentPrintOptions): Promise<DocumentPrintResult> {
+    const cancelled = () => new DocumentPrintError('cancelled', 'Printing was cancelled: the view was destroyed');
+    if (this.destroyed) throw cancelled();
+    // The window of the document the view is in: inside a frame, the frame is what is printed.
+    const doc = this.container.ownerDocument || document;
+    const win = doc.defaultView;
+    if (!win || typeof win.print !== 'function') throw new DocumentPrintError('unavailable', 'Printing is not available here: the window has no print()');
+    this.notify(this.strings.printPreparing, 'info');
+    const limits = printLimits(coarsePointer());
+    const urls = (win as unknown as { URL?: typeof URL }).URL || URL;
+    let plan: PrintPlan;
+    for (let attempt = 0; ; attempt++) {
+      // The rest of the document is laid out by the view's own slices.
+      while (!this.done && !this.failed) {
+        // A document beyond the limit is refused as soon as it is known to be, not after all of it was laid out.
+        if (this.pages.length > MAX_PRINT_PAGES) break;
+        await sleep(30);
+        if (this.destroyed) throw cancelled();
+      }
+      // Pages up to where the layout gave up are not the document: nothing is printed rather than a part of it.
+      if (this.failed) throw new DocumentPrintError('failed', 'The document could not be laid out to its end, so it is not printed');
+      const sizes: { width: number; height: number }[] = [];
+      for (let i = 0; i < this.pages.length; i++) sizes.push({ width: this.pageWidth(i), height: this.pageHeight(i) });
+      plan = planPrint(sizes, options, limits);
+      const frame = new PrintFrame(doc, plan, supportsNamedPages(win as unknown as { CSS?: { supports?(property: string, value: string): boolean } }), (url) => revokePicture(url, urls));
+      const store = new ImageStore(this.pictures, this.images.budget, () => undefined);
+      job.frame = frame;
+      job.store = store;
+      job.progress = { done: 0, total: plan.pages.length };
+      this.updateBar();
+      const complete = await this.paintForPrint(job, plan, frame, store, limits, doc, urls);
+      store.destroy();
+      job.store = undefined;
+      if (this.destroyed) throw cancelled();
+      if (complete) break;
+      // The document changed under the pages: they are prepared again from the start.
+      frame.dispose();
+      job.frame = undefined;
+      if (attempt >= MAX_PRINT_RESTARTS) throw new DocumentPrintError('failed', 'The document kept changing while it was prepared for printing');
+    }
+    job.progress = undefined;
+    const dialog = openPrintDialog(win as unknown as Parameters<typeof openPrintDialog>[0]);
+    job.dialog = dialog;
+    this.updateBar();
+    await dialog.closed;
+    // Takes the place of "preparing": whether anything was printed cannot be told.
+    if (!this.destroyed) this.notify(this.strings.printClosed, 'info');
+    return { pages: plan.pages.length, dpi: plan.dpi };
+  }
+
+  /** Paints the pages of a plan and adds them to the frame; false when the pages were laid out anew meanwhile. */
+  private async paintForPrint(
+    job: PrintJob,
+    plan: PrintPlan,
+    frame: PrintFrame,
+    store: ImageStore,
+    limits: PrintLimits,
+    doc: Document,
+    urls: { createObjectURL(blob: Blob): string; revokeObjectURL(url: string): void },
+  ): Promise<boolean> {
+    const epoch = this.layoutEpoch;
+    const stale = () => this.destroyed || this.layoutEpoch !== epoch || !(this.done || this.failed);
+    // One canvas for all pages: a page is held as pixels only while it is painted.
+    const canvas = doc.createElement('canvas');
+    const win = doc.defaultView;
+    const nextFrame = win && typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
+    let bytes = 0;
+    try {
+      for (let i = 0; i < plan.pages.length; i++) {
+        if (stale()) return false;
+        const page = this.pages[i];
+        const planned = plan.pages[i];
+        if (!page) return false;
+        if (canvas.width !== planned.pixelWidth) canvas.width = planned.pixelWidth;
+        if (canvas.height !== planned.pixelHeight) canvas.height = planned.pixelHeight;
+        const context = canvas.getContext('2d');
+        if (!context) throw new DocumentPrintError('failed', 'No canvas to paint the pages on');
+        const paint = () => {
+          context.setTransform(1, 0, 0, 1, 0, 0);
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, planned.pixelWidth, planned.pixelHeight);
+          renderPage(context, page, {
+            scale: planned.pixelWidth / planned.width,
+            images: store,
+            cssFont: this.painter.cssFont,
+            metrics: this.metricsOf,
+            placeholderLabel: this.placeholderLabel,
+          });
+        };
+        // Pictures of the pages before this one may make room for those of this one.
+        store.pass++;
+        try {
+          paint();
+          if (this.picturesPending(page, store)) {
+            // Painting asked for the pictures; once they are decoded the page is painted with them.
+            const deadline = Date.now() + PRINT_PICTURES_MS;
+            while (store.busy && Date.now() < deadline) {
+              await sleep(20);
+              if (stale()) return false;
+            }
+            paint();
+          }
+        } catch (error) {
+          if (error instanceof DocumentPrintError) throw error;
+          throw new DocumentPrintError('failed', `Page ${i + 1} could not be painted`);
+        }
+        const picture = await canvasPicture(canvas, urls, nextFrame);
+        bytes += picture.bytes;
+        if (stale() || bytes > limits.maxBytes) {
+          revokePicture(picture.url, urls);
+          if (this.destroyed || !(bytes > limits.maxBytes)) return false;
+          throw new DocumentPrintError('too-long', 'The pages of the document take too much memory to print at once');
+        }
+        await frame.add(picture.url, this.strings.page(i + 1));
+        job.progress = { done: i + 1, total: plan.pages.length };
+        this.updateBar();
+      }
+      return !stale();
+    } finally {
+      // Give the backing store back right away.
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }
+
+  private picturesPending(page: LayoutPage, store: ImageStore): boolean {
+    const items = page.items;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type === 'image' && item.part !== undefined && item.placeholder === undefined && store.status(item.part) === 'pending') return true;
+    }
+    return false;
+  }
+
+  /** Takes what a print job holds out of the document. Safe to call twice. */
+  private endPrint(job: PrintJob): void {
+    if (job.frame) job.frame.dispose();
+    if (job.store) job.store.destroy();
+    if (job.dialog) job.dialog.finish();
+    job.frame = undefined;
+    job.store = undefined;
+    job.progress = undefined;
+    if (this.printJob !== job) return;
+    this.printJob = undefined;
+    if (!this.destroyed) this.updateBar();
+  }
+
+  private printFailed(error: unknown): void {
+    // A wrong option is the caller's to hear about, not the user's; so is the end of a view.
+    if (this.destroyed || error instanceof RangeError) return;
+    const code = error instanceof DocumentPrintError ? error.code : 'failed';
+    if (code === 'cancelled') return;
+    const strings = this.strings;
+    this.notify(code === 'unavailable' ? strings.printNotAvailable : code === 'too-long' ? strings.printTooLong : strings.printFailed, 'error');
   }
 
   // ---------------------------------------------------------------- set-up
@@ -1211,6 +1466,7 @@ export class DocumentView {
   private rebuild(): void {
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
     this.layoutTimer = undefined;
+    this.layoutEpoch++;
     let progress: LayoutProgress;
     try {
       this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
@@ -1233,6 +1489,7 @@ export class DocumentView {
 
   /** Brings the pages up to date after the document was changed, at least as far as the caret. */
   private follow(): void {
+    this.layoutEpoch++;
     const height = this.totalHeight();
     let progress: (LayoutProgress & { from: number }) | undefined;
     const started = Date.now();
@@ -1519,10 +1776,23 @@ export class DocumentView {
       this.fitButton.setAttribute('aria-pressed', this.mode === 'fit-width' ? 'true' : 'false');
       if (this.bar) this.bar.setAttribute('aria-label', strings.documentTools);
     }
+    const job = this.printJob;
+    if (this.printButton) {
+      const text = strings.print;
+      if (this.printButton.getAttribute('aria-label') !== text) {
+        this.printButton.setAttribute('aria-label', text);
+        this.printButton.title = text;
+      }
+      const busy = job && !job.dialog ? 'true' : 'false';
+      if (this.printButton.getAttribute('aria-busy') !== busy) this.printButton.setAttribute('aria-busy', busy);
+    }
     if (this.pagesLabel) {
       const count = this.pages.length;
+      const preparing = job && !job.dialog ? job.progress : undefined;
       // "+": more pages are on their way.
-      const text = count === 0 ? (this.done || this.failed ? '' : strings.preparingPages) : strings.pageOf(this.currentPage, count) + (this.done || this.failed ? '' : '+');
+      const text = preparing
+        ? strings.printProgress(preparing.done, preparing.total)
+        : count === 0 ? (this.done || this.failed ? '' : strings.preparingPages) : strings.pageOf(this.currentPage, count) + (this.done || this.failed ? '' : '+');
       if (this.pagesLabel.textContent !== text) this.pagesLabel.textContent = text;
     }
   }
@@ -2065,10 +2335,16 @@ export class DocumentView {
   private onKeyDown = (event: KeyboardEvent): void => {
     if (this.destroyed || event.defaultPrevented) return;
     const target = event.target as Element | null;
-    // Keys on the buttons of the bar are theirs.
-    if (this.bar && target && this.bar.contains(target)) return;
     const command = event.ctrlKey || event.metaKey;
     const key = event.key;
+    // Ctrl+P, on the buttons of the bar too: the browser would print the host page with a part of the document in it.
+    if (command && !event.altKey && !event.shiftKey && (key === 'p' || key === 'P')) {
+      event.preventDefault();
+      this.print().catch(() => undefined);
+      return;
+    }
+    // The other keys on the buttons of the bar are theirs.
+    if (this.bar && target && this.bar.contains(target)) return;
     if (!command && !event.altKey && (key === 'Enter' || key === ' ')) {
       const link = this.linkOf(target);
       if (link !== undefined) {
@@ -2207,6 +2483,7 @@ export class DocumentView {
     else if (button === this.zoomInButton) this.zoomIn();
     else if (button === this.zoomButton) this.setZoom(1);
     else if (button === this.fitButton) this.setZoom('fit-width');
+    else if (button === this.printButton) this.print().catch(() => undefined);
     // After a press with a pointer the keys belong to the document again; a key press leaves the focus on the button.
     if (event.detail > 0) this.focusInput(true);
   };

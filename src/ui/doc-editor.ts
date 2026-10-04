@@ -8,6 +8,7 @@
 import type { DocModel } from '../model/doc/types';
 import type { DocRange } from '../ops/doc/index';
 import { DocToolbar, type DocShellHost } from './doc-toolbar';
+import type { DocumentPrintOptions, DocumentPrintResult } from './doc-print';
 import { DocumentView, type DocumentViewOptions } from './doc-view';
 import { getEditorStrings, type EditorStrings } from './editor-strings';
 
@@ -174,7 +175,13 @@ export class DocumentEditor {
       throw error;
     }
     window.addEventListener('resize', this.onResize);
+    root.addEventListener('keydown', this.onKeyDown);
     this.sync();
+  }
+
+  /** Prints the document: see DocumentView.print(). */
+  print(options?: DocumentPrintOptions): Promise<DocumentPrintResult> {
+    return this.view.print(options);
   }
 
   /** Changes the language of every label. */
@@ -202,6 +209,7 @@ export class DocumentEditor {
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     window.removeEventListener('resize', this.onResize);
+    this.root.removeEventListener('keydown', this.onKeyDown);
     if (this.toolbar) this.toolbar.destroy();
     this.view.destroy();
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
@@ -233,6 +241,14 @@ export class DocumentEditor {
     if (this.toolbar.element.style.display !== display) this.toolbar.element.style.display = display;
     this.toolbar.update();
   }
+
+  /** Ctrl+P on the toolbar prints the document as it does in the pages (which handle it themselves). */
+  private onKeyDown = (event: KeyboardEvent): void => {
+    if (this.destroyed || event.defaultPrevented || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+    if (event.key !== 'p' && event.key !== 'P') return;
+    event.preventDefault();
+    this.view.print().catch(() => undefined);
+  };
 
   private onResize = (): void => {
     if (this.toolbar) this.toolbar.closePopover();
