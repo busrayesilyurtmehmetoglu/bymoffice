@@ -7,6 +7,7 @@ import type { BorderPreset } from '../ops/format';
 export type IconName =
   | 'undo'
   | 'redo'
+  | 'print'
   | 'bold'
   | 'italic'
   | 'underline'
@@ -36,6 +37,8 @@ const bar: Shape = ['rect', { class: ICON_BAR_CLASS, x: '3.5', y: '18', width: '
 const ICONS: { [name in IconName]: Shape[] } = {
   undo: [path('M9 14 4 9l5-5'), path('M4 9h10a6 6 0 0 1 0 12h-3')],
   redo: [path('m15 14 5-5-5-5'), path('M20 9H10a6 6 0 0 0 0 12h3')],
+  // The printer of the document bar.
+  print: [path('M7 8V4h10v4'), path('M7 17H5a1 1 0 0 1-1-1v-6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1h-2'), path('M7 14h10v6H7z')],
   bold: [path('M7 5h6a3.5 3.5 0 0 1 0 7H7z M7 12h7a3.5 3.5 0 0 1 0 7H7z', { 'stroke-width': '2.25' })],
   italic: [path('M10 5h7 M7 19h7 M14 5l-4 14')],
   underline: [path('M7 4v7a5 5 0 0 0 10 0V4 M5 20h14')],

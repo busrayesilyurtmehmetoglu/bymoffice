@@ -6,6 +6,9 @@ export interface EditorStrings {
   toolbar: string;
   undo: string;
   redo: string;
+  print: string;
+  /** Shown in the status bar while the pages are prepared: "Preparing to print… 3 / 12". */
+  printProgress(done: number, total: number): string;
   fontSize: string;
   bold: string;
   italic: string;
@@ -113,6 +116,8 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   toolbar: 'Formatting',
   undo: 'Undo',
   redo: 'Redo',
+  print: 'Print',
+  printProgress: (done, total) => `Preparing to print\u2026 ${done} / ${total}`,
   fontSize: 'Font size',
   bold: 'Bold',
   italic: 'Italic',
@@ -197,6 +202,8 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   toolbar: 'Biçimlendirme',
   undo: 'Geri al',
   redo: 'Yinele',
+  print: 'Yazdır',
+  printProgress: (done, total) => `Yazdırmaya hazırlanıyor\u2026 ${done} / ${total}`,
   fontSize: 'Yazı tipi boyutu',
   bold: 'Kalın',
   italic: 'İtalik',

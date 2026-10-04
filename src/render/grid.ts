@@ -292,6 +292,9 @@ interface Frame {
   drawings: GridDrawingSource | undefined;
   comments: GridCommentSource | undefined;
   dpr: number;
+  /** Grid lines are drawn, and how wide: on screen as the sheet says and one pixel, on paper as its print options say and thinner. */
+  gridLines: boolean;
+  gridLineWidth: number;
 }
 
 /** Draws the whole scene. The canvas backing store is layout.width*dpr by layout.height*dpr. */
@@ -332,6 +335,8 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: scene.comments && typeof scene.comments.has === 'function' ? scene.comments : undefined,
     dpr,
+    gridLines: sheet.view.showGridLines !== false,
+    gridLineWidth: 1,
   };
   if (frame.conditional && frame.conditional.begin) frame.conditional.begin();
 
@@ -344,6 +349,159 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
   }
   drawHeaders(frame, views);
   drawFrozenLines(frame);
+}
+
+/** Rows or columns from `first` to `last`, both included. */
+export interface GridBand {
+  first: number;
+  last: number;
+}
+
+/** Width of a grid line on paper, in pixels of the sheet: a hairline. */
+const PRINT_GRID_LINE = 0.5;
+/** Paper has no colours of its own: black on white. */
+const PRINT_THEME: GridTheme = {
+  ...DEFAULT_GRID_THEME,
+  background: '#FFFFFF',
+  gridLine: '#000000',
+  headerBackground: '#FFFFFF',
+  headerText: '#000000',
+  headerBorder: '#000000',
+};
+
+/**
+ * The cells of one printed page. `rows` and `cols` hold one or two bands each:
+ * with two, the first is a print title that is repeated on the page and the
+ * second the page's own cells; they are laid out one after the other.
+ */
+export interface GridPrintScene {
+  workbook: Workbook;
+  sheet: Sheet;
+  /** Row and column sizes; with `headings`, headerWidth and headerHeight are the room of the row numbers and column letters. */
+  metrics: SheetMetrics;
+  rows: GridBand[];
+  cols: GridBand[];
+  /** Row numbers and column letters are printed. */
+  headings: boolean;
+  /** Grid lines are printed, whatever the sheet shows on screen. */
+  gridLines: boolean;
+  locale?: FormatLocale;
+  conditional?: ConditionalSource;
+  drawings?: GridDrawingSource;
+  /** Pixels of the canvas per pixel of the sheet, for the pictures. */
+  scale: number;
+}
+
+/**
+ * Draws cells for paper with the code that draws them on screen, without
+ * what belongs to the screen only: no selection, no filter buttons, no
+ * comment marks, no marks of the editor. The transform of the context is
+ * left as it is: the block starts at its origin, in pixels of the sheet, and
+ * the caller scales it and puts it in place. Nothing is cleared first.
+ */
+export function renderGridPrint(ctx: CanvasRenderingContext2D, scene: GridPrintScene): void {
+  const { sheet } = scene;
+  const source = scene.metrics;
+  const headerWidth = scene.headings && source.headerWidth > 0 ? source.headerWidth : 0;
+  const headerHeight = scene.headings && source.headerHeight > 0 ? source.headerHeight : 0;
+  const metrics: SheetMetrics = { rows: source.rows, cols: source.cols, headerWidth, headerHeight };
+  const bandsOf = (bands: GridBand[], axis: AxisMetrics, start: number): { band: GridBand; pos: number; size: number }[] => {
+    const out: { band: GridBand; pos: number; size: number }[] = [];
+    let pos = start;
+    // A title and the cells of the page: never more than two.
+    for (let i = 0; i < bands.length && out.length < 2; i++) {
+      const first = Math.max(Math.floor(bands[i].first), 0);
+      const last = Math.min(Math.floor(bands[i].last), axis.count - 1);
+      if (!(first <= last)) continue;
+      const size = axis.offset(last + 1) - axis.offset(first);
+      if (!(size > 0)) continue;
+      out.push({ band: { first, last }, pos, size });
+      pos += size;
+    }
+    return out;
+  };
+  const cols = bandsOf(scene.cols, metrics.cols, headerWidth);
+  const rows = bandsOf(scene.rows, metrics.rows, headerHeight);
+  if (cols.length === 0 || rows.length === 0) return;
+  const width = cols[cols.length - 1].pos + cols[cols.length - 1].size;
+  const height = rows[rows.length - 1].pos + rows[rows.length - 1].size;
+  const layout: GridLayout = { metrics, width, height, frozenRows: 0, frozenCols: 0, frozenWidth: 0, frozenHeight: 0, scrollX: 0, scrollY: 0 };
+
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1;
+  ctx.setLineDash(NO_DASH);
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  // One pane per pair of bands; a title band stands where a frozen pane does on screen.
+  const panes: { pane: GridPane; colOrigin: number; rowOrigin: number }[] = [];
+  for (let r = 0; r < rows.length; r++) {
+    for (let c = 0; c < cols.length; c++) {
+      panes.push({
+        pane: {
+          rect: { x: cols[c].pos, y: rows[r].pos, width: cols[c].size, height: rows[r].size },
+          firstRow: rows[r].band.first,
+          lastRow: rows[r].band.last,
+          firstCol: cols[c].band.first,
+          lastCol: cols[c].band.last,
+          frozenRows: r < rows.length - 1,
+          frozenCols: c < cols.length - 1,
+        },
+        colOrigin: cols[c].pos - metrics.cols.offset(cols[c].band.first),
+        rowOrigin: rows[r].pos - metrics.rows.offset(rows[r].band.first),
+      });
+    }
+  }
+  const scale = scene.scale > 0 && Number.isFinite(scene.scale) ? scene.scale : 1;
+  const frame: Frame = {
+    ctx,
+    painter: new TextPainter(ctx),
+    sheet,
+    styles: scene.workbook.styles,
+    layout,
+    theme: PRINT_THEME,
+    selection: undefined,
+    merges: visibleMerges(
+      sheet,
+      panes.map((entry) => entry.pane),
+    ),
+    styleCache: new Map(),
+    textStyleCache: new Map(),
+    format: { locale: scene.locale, date1904: scene.workbook.date1904 === true },
+    colorStyleCache: new Map(),
+    conditional: scene.conditional && typeof scene.conditional.resolve === 'function' ? scene.conditional : undefined,
+    conditionalStyles: new Map(),
+    filter: undefined,
+    dropdown: undefined,
+    cellMark: undefined,
+    drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
+    comments: undefined,
+    dpr: scale,
+    gridLines: scene.gridLines === true,
+    gridLineWidth: PRINT_GRID_LINE,
+  };
+  if (frame.conditional && frame.conditional.begin) frame.conditional.begin();
+
+  const views: PaneView[] = [];
+  for (let i = 0; i < panes.length; i++) {
+    const view = paneViewAt(frame, panes[i].pane, panes[i].colOrigin, panes[i].rowOrigin);
+    if (!view) continue;
+    views.push(view);
+    drawPane(frame, view);
+  }
+  if (frame.gridLines) {
+    // On screen the headers close the cells at the top and on the left; on paper a line does.
+    ctx.strokeStyle = PRINT_THEME.gridLine;
+    ctx.lineWidth = PRINT_GRID_LINE;
+    ctx.beginPath();
+    ctx.moveTo(headerWidth + PRINT_GRID_LINE / 2, headerHeight);
+    ctx.lineTo(headerWidth + PRINT_GRID_LINE / 2, height);
+    ctx.moveTo(headerWidth, headerHeight + PRINT_GRID_LINE / 2);
+    ctx.lineTo(width, headerHeight + PRINT_GRID_LINE / 2);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+  drawHeaders(frame, views);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,8 +583,14 @@ function lowerBound(list: number[], value: number): number {
 function paneView(frame: Frame, pane: GridPane): PaneView | undefined {
   const { layout } = frame;
   const metrics = layout.metrics;
-  const cols = visibleAxis(metrics.cols, pane.firstCol, pane.lastCol, metrics.headerWidth - (pane.frozenCols ? 0 : layout.scrollX));
-  const rows = visibleAxis(metrics.rows, pane.firstRow, pane.lastRow, metrics.headerHeight - (pane.frozenRows ? 0 : layout.scrollY));
+  return paneViewAt(frame, pane, metrics.headerWidth - (pane.frozenCols ? 0 : layout.scrollX), metrics.headerHeight - (pane.frozenRows ? 0 : layout.scrollY));
+}
+
+/** A pane whose column 0 and row 0 would be at (colOrigin, rowOrigin) on the canvas. */
+function paneViewAt(frame: Frame, pane: GridPane, colOrigin: number, rowOrigin: number): PaneView | undefined {
+  const metrics = frame.layout.metrics;
+  const cols = visibleAxis(metrics.cols, pane.firstCol, pane.lastCol, colOrigin);
+  const rows = visibleAxis(metrics.rows, pane.firstRow, pane.lastRow, rowOrigin);
   if (cols.index.length === 0 || rows.index.length === 0) return undefined;
 
   // A merge is laid out in the coordinates of the pane that draws it, so a
@@ -642,11 +806,11 @@ function drawPane(frame: Frame, view: PaneView): void {
   ctx.clip();
   frame.painter.invalidate();
 
-  const showGridLines = sheet.view.showGridLines !== false;
+  const showGridLines = frame.gridLines;
   if (showGridLines) {
     // Each line is the last pixel of its row or column. Fills are painted over them afterwards.
     ctx.strokeStyle = theme.gridLine;
-    ctx.lineWidth = 1;
+    ctx.lineWidth = frame.gridLineWidth;
     ctx.beginPath();
     for (let ci = 0; ci < colCount; ci++) {
       const x = cols.pos[ci] + cols.size[ci] - 0.5;

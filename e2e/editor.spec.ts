@@ -215,7 +215,7 @@ test.describe('layout', () => {
         viewport: document.documentElement.clientWidth,
       };
     });
-    expect(facts.buttons).toBe(18);
+    expect(facts.buttons).toBe(19);
     expect(facts.sizes).toEqual([facts.coarse ? '40x40' : '32x32']);
     expect(facts.scrolls).toBe(true);
     expect(facts.scrolled).toBe(true);
@@ -634,16 +634,19 @@ test.describe('keyboard and focus', () => {
         return out;
       });
     const focused = () => page.evaluate(() => (document.activeElement ? document.activeElement.getAttribute('data-command') || document.activeElement.className : ''));
-    // Undo and redo have nothing to do yet, so the first button that can take the focus is Bold.
-    expect(await stops()).toEqual(['bym-tb-select bym-tb-size', 'bold', 'bym-tb-select bym-tb-format']);
+    // Undo and redo have nothing to do yet, so the first button that can take the focus is Print.
+    expect(await stops()).toEqual(['print', 'bym-tb-select bym-tb-size', 'bym-tb-select bym-tb-format']);
 
     await command(page, 'bold').focus();
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('italic');
     expect(await stops()).toEqual(['bym-tb-select bym-tb-size', 'italic', 'bym-tb-select bym-tb-format']);
     await page.keyboard.press('ArrowLeft');
-    await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('bold');
+    // Print is the only button before the font size list that can do something now; the arrows stop there.
+    await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('ArrowLeft');
+    expect(await focused()).toBe('print');
     await page.keyboard.press('End');
     expect(await focused()).toBe('rowsColumns');
     await page.keyboard.press('ArrowRight');
@@ -657,6 +660,9 @@ test.describe('keyboard and focus', () => {
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('merge');
     await page.keyboard.press('Home');
+    expect(await focused()).toBe('print');
+    // The font size list lies between these two buttons.
+    await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('bold');
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('italic');
@@ -688,10 +694,10 @@ test.describe('keyboard and focus', () => {
       await page.keyboard.press('Shift+Tab');
       order.push(await page.evaluate(() => document.activeElement!.getAttribute('data-command') || document.activeElement!.id || document.activeElement!.className));
     }
-    // The buttons are one stop (the first that can do something: nothing to undo yet); each list is its own.
-    expect(order).toEqual(['bym-formula-input', 'bym-namebox', 'bym-tb-select bym-tb-format', 'bold', 'bym-tb-select bym-tb-size', 'before']);
+    // The buttons are one stop (the first that can do something: nothing to undo yet, so Print); each list is its own.
+    expect(order).toEqual(['bym-formula-input', 'bym-namebox', 'bym-tb-select bym-tb-format', 'bym-tb-select bym-tb-size', 'print', 'before']);
     await page.keyboard.press('Tab');
-    expect(await focused()).toBe('bym-tb-select bym-tb-size');
+    expect(await focused()).toBe('bym-tb-btn');
   });
 
   test('a menu opened with the keyboard is walked with the arrows; Escape closes it and gives the focus back to its button', async ({ page }) => {
@@ -1031,8 +1037,9 @@ test.describe('read-only', () => {
   test('disables every editing control, locks the formula bar and says so', async ({ page }) => {
     await mount(page, await editorWorkbook(), { readOnly: true });
     const controls = page.locator('#host .bym-toolbar button, #host .bym-toolbar select');
-    await expect(controls).toHaveCount(20);
-    expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).length)).toBe(0);
+    await expect(controls).toHaveCount(21);
+    // Printing changes nothing: its button is the one control that stays on.
+    expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).map((control) => control.getAttribute('data-command')))).toEqual(['print']);
     await expect(page.locator('#host .bym-formula-input')).toHaveAttribute('readonly', '');
     const badge = page.locator('#host .bym-status-badge');
     await expect(badge).toBeVisible();

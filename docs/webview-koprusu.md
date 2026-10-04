@@ -63,7 +63,7 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 | `setReadOnly` | `readOnly` (boolean); isteğe bağlı `id` | Salt okunur kipini açar/kapatır (tablo ve belge). Yazılamayan biçimlerde (dönüştürülmemiş doc, RTF, xls) düzenleme açılamaz: yanıt `readOnly: true` taşır |
 | `setLocale` | `locale` (ör. `"tr"`, `"en"`); isteğe bağlı `id` | Sayı/tarih biçimlerinin, görünüm metinlerinin ve sayfanın kendi yazılarının dilini değiştirir |
 | `undo`, `redo` | isteğe bağlı `id` | Geri al, yinele (tablo ve belge). Bir şey değişirse `changed` gelir |
-| `print` | isteğe bağlı `id`, `dpi` (sayı, varsayılan 200) | Açık **belgeyi** yazdırır: sayfaları hazırlar ve sayfanın `window.print()`'ini çağırır. Yanıt: yazdırma penceresi kapanınca `done`, yapılamazsa `error` (aşağıda "Yazdırma") |
+| `print` | isteğe bağlı `id`, `dpi` (sayı, varsayılan 200), `sheets` (`"active"` varsayılan / `"all"`; yalnız tabloda) | Açık belgeyi ya da tabloyu yazdırır: sayfaları hazırlar ve sayfanın `window.print()`'ini çağırır. Yanıt: yazdırma penceresi kapanınca `done`, yapılamazsa `error` (aşağıda "Yazdırma") |
 | `close` | isteğe bağlı `id` | Dosyayı kapatır, süren yüklemeyi iptal eder, boş duruma döner. Dosya yokken de hata vermez |
 | `hello` | — | Sayfa `ready`'yi yeniden gönderir |
 
@@ -79,7 +79,8 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 
 Yazdırma (`print`):
 
-- Yalnız belgede (docx, doc, RTF; salt okunur da olur) çalışır; `DocumentView.print()` ile aynı koddur (ayrıntı ve sınırlar: [kullanım kılavuzu](kullanim-kilavuzu.md), "Belgeyi yazdırma"). Tablo açıkken `error` / `print-unavailable` döner.
+- Belgede (docx, doc, RTF) ve tabloda (xlsx, xls) çalışır, salt okunur dosyada da; `DocumentView.print()` / `WorkbookView.print()` ile aynı koddur (ayrıntı ve sınırlar: [kullanım kılavuzu](kullanim-kilavuzu.md), "Belgeyi yazdırma" ve "Tabloyu yazdırma").
+- **Tabloda** `sheets: "active"` (varsayılan) gösterilen sayfayı, `"all"` görünür bütün çalışma sayfalarını yazdırır; başka bir değer, belge açıkken de, `bad-message` döner (belgede geçerli değerler yok sayılır). `load` iletisindeki `name`, üstbilgi/altbilgideki `&F` (dosya adı) olarak kullanılır. Yazdırılacak hiçbir şey yoksa (boş sayfa) ya da sayfa sınırların ötesinde uzunsa `error` / `print-failed` döner.
 - `print` **sırayı tutmaz**: sayfalar hazırlanırken ve pencere açıkken sonraki iletiler işlenir. `id` verilmişse yanıt, yazdırma penceresi kapandığında gelir: `{ "type": "done", "id": …, "command": "print" }`. Kullanıcının yazdırdığı mı vazgeçtiği mi ayırt edilemez. Sayfalar hazırlanırken gelen ikinci `print` aynı işe katılır (ikinci pencere açılmaz; iki `id` de yanıtlanır).
 - Sayfalar hazırlanırken dosya kapatılır ya da değiştirilirse (`close`, yeni `load`) iş `error` / `print-failed` ile biter.
 - **WebView'lerde `window.print()`:** pencerede `print` işlevi hiç yoksa `error` / `print-unavailable` döner. Android `WebView` ve `WKWebView` ise çoğunlukla işlevi tanımlar ama **hiçbir şey yapmaz**; sayfa bunu ayırt edemez. Bu platformlarda uygulama, `print` göndermeden önce sayfaya kendi `window.print` işlevini yerleştirmelidir: işlev yerel yazdırmayı başlatır (Android: `webView.createPrintDocumentAdapter()` + `PrintManager`; iOS: `UIPrintInteractionController` ile `webView.viewPrintFormatter()`), yerel yazdırma bittiğinde sayfada `window.dispatchEvent(new Event('afterprint'))` çalıştırır. Yerel yazdırma WebView'in içeriğini yazdırma ortamı kurallarıyla basar; o sırada sayfada yalnız hazırlanmış belge sayfaları görünür. `afterprint` gelmezse iş, kullanıcının sayfaya ilk dokunuşunda ya da en geç 5 dakikada biter ve `done` o zaman gönderilir. Bu akış gerçek cihazda **denenmedi**.
@@ -133,8 +134,8 @@ Yazdırma (`print`):
 |---|---|
 | `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), `data`/`url`/`blank`'ten birden fazlası ya da hiçbiri, `"docx"`/`"xlsx"` dışında bir `blank`, olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
 | `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale`, `print` gönderildi ama açık dosya yok |
-| `print-unavailable` | `print` gönderildi ama yazdırılamıyor: pencerede `print()` yok, ya da açık dosya bir tablo (tablo yazdırma henüz yok) |
-| `print-failed` | Yazdırma başlatılamadı ya da yarıda kaldı: belge sınırların ötesinde uzun, bir sayfa çizilemedi, `print()` hata fırlattı, ya da sayfalar hazırlanırken dosya kapatıldı |
+| `print-unavailable` | `print` gönderildi ama yazdırılamıyor: pencerede `print()` yok (ya da sayfayı barındıran uygulamanın verdiği görünüm yazdıramıyor) |
+| `print-failed` | Yazdırma başlatılamadı ya da yarıda kaldı: belge ya da tablo sınırların ötesinde uzun, tabloda yazdırılacak bir şey yok, bir sayfa çizilemedi, `print()` hata fırlattı, ya da sayfalar hazırlanırken dosya kapatıldı |
 | `unsupported` | Dosya gösterilemeyen bir türde (Word 95 ve öncesi, parola korumalı, Office dosyası olmayan içerik, boş içerik) |
 | `corrupt` | Dosya xlsx gibi başlıyor ama okunamıyor (kesik, bozuk) |
 | `load-failed` | `url` getirilemedi (ağ hatası, HTTP hata kodu, zaman aşımı, boyut sınırı, içerik güvenliği ilkesi engeli) ya da yükleme bir `close` / yeni `load` ile iptal edildi |
@@ -318,5 +319,5 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 - **Base64 bellek maliyeti.** Dosya iki yönde de base64 dizgisi olarak taşınır: metin dosyadan üçte bir büyüktür ve yükleme/kaydetme sırasında dosyanın birkaç kopyası aynı anda bellekte durur (uygulamadaki baytlar, base64 metni, WebView'e geçirilen betik, sayfadaki dizgi, çözülmüş baytlar). Sayfanın kendi kodlama/çözme işlemi parça parça ve doğrusal sürede çalışır (20 MB için Node'da gidiş-dönüş ≈ 0,4 sn; tarayıcılarda 5 MB'lık dosya için yükleme ≈ 0,1–0,4 sn, kaydetme < 0,1 sn ölçüldü). Asıl maliyet platformun dizgiyi WebView'e geçirmesindedir ve gerçek cihazda ölçülmedi.
 - **Gerçek cihazda sınanmadı.** Özellikle şunlar doğrulanmayı bekliyor: iOS'ta odak yakınlaştırmasının gerçekten engellendiği, güvenli alan boşlukları, ekran klavyesi açıldığında yerleşim, çok büyük `runJavaScript` betiklerinin davranışı, Android'in eski WebView sürümleri.
 - `load` ve `save` için ileti boyutu sınırı yoktur (`url` ile getirmede 256 MB); bellek sınırı platformundur.
-- **Yazdırma yalnız belgede** ve sayfanın `window.print()`'i üzerinden yapılır; WebView'lerde uygulamanın bu işlevi yerel yazdırmaya bağlaması gerekir (Bölüm 3, "Yazdırma"). Sayfalar görüntü olarak basılır (PDF'te metin seçilemez).
+- **Yazdırma** (belge ve tablo) sayfanın `window.print()`'i üzerinden yapılır; WebView'lerde uygulamanın bu işlevi yerel yazdırmaya bağlaması gerekir (Bölüm 3, "Yazdırma"). Sayfalar görüntü olarak basılır (PDF'te metin seçilemez).
 - Aynı anda tek dosya açıktır.

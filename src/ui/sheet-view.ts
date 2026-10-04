@@ -46,6 +46,22 @@ import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../re
 import { SheetDrawings } from '../render/sheet-drawings';
 import { cssFont } from '../render/text';
 import { ContextMenu, type MenuItem } from './context-menu';
+import {
+  DocumentPrintError,
+  MAX_PRINT_PAGES,
+  PrintFrame,
+  canvasPicture,
+  openPrintDialog,
+  planPrint,
+  printLimits,
+  revokePicture,
+  supportsNamedPages,
+  type DocumentPrintResult,
+  type PrintDialog,
+  type PrintLimits,
+  type PrintPlan,
+} from './doc-print';
+import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
 import { FilterMenu, ListMenu } from './filter-menu';
 
 export interface WorkbookViewOptions {
@@ -78,6 +94,11 @@ export interface WorkbookViewOptions {
    * the focus left the cell editor.
    */
   focusScope?: HTMLElement;
+  /**
+   * Called while print() prepares its pages, with how many of them are ready,
+   * and with undefined once that is over: the dialog is open, or the job ended.
+   */
+  onPrintProgress?(progress: { done: number; total: number } | undefined): void;
 }
 
 /**
@@ -342,6 +363,28 @@ const clamp = (value: number, min: number, max: number) => Math.min(Math.max(val
 
 const coarsePointer = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia('(pointer:coarse)').matches;
 
+/** How often the pages are prepared for printing anew because the workbook changed meanwhile. */
+const MAX_PRINT_RESTARTS = 3;
+/** How long one page waits for its pictures and its conditional formats before it is printed as it is. */
+const PRINT_PAGE_WAIT_MS = 30000;
+/** A sheet of A4: stands for the pages while only the options of print() are checked. */
+const PRINT_CHECK_PAGE = { width: 794, height: 1123 };
+
+const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** How long printing waits for a calculation under way before it goes on with what is there. */
+const PRINT_CALC_MS = 30000;
+
+/** One call of print(): what it holds while it runs. */
+interface PrintJob {
+  promise: Promise<DocumentPrintResult>;
+  frame?: PrintFrame;
+  /** Decoded pictures of the pages that are being painted. */
+  store?: ImageStore;
+  /** Set once print() of the window was called. */
+  dialog?: PrintDialog;
+  progress?: { done: number; total: number };
+}
+
 /** Largest size of the box that shows a comment beside its cell, in pixels; longer text scrolls. */
 const COMMENT_MAX_WIDTH = 280;
 const COMMENT_MAX_HEIGHT = 240;
@@ -580,6 +623,11 @@ export class WorkbookView {
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
+  private printJob: PrintJob | undefined;
+  /** Counts the changes of the workbook and of how it is shown: pages prepared for printing before are out of date. */
+  private printEpoch = 0;
+  /** Language tag the paper of a sheet without one is chosen by. */
+  private languageTag: string | undefined;
 
   constructor(container: HTMLElement, workbook: Workbook, options: WorkbookViewOptions = {}) {
     if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
@@ -588,6 +636,7 @@ export class WorkbookView {
     this.options = options;
     this.locale = resolveLocale(options.locale);
     this.strings = resolveStrings(options.locale);
+    this.languageTag = typeof options.locale === 'string' ? options.locale : typeof navigator !== 'undefined' ? navigator.language : undefined;
     this.locked = options.readOnly === true;
     this.history = new History<HistoryMark>(workbook);
     this.sheetIndex = this.initialSheet();
@@ -797,7 +846,11 @@ export class WorkbookView {
     this.locale = resolveLocale(locale);
     this.validation.forEach((rules) => rules.setLocale(this.locale));
     // The view's own words follow a language tag; a locale object only changes formats.
-    if (typeof locale === 'string') this.strings = resolveStrings(locale);
+    if (typeof locale === 'string') {
+      this.strings = resolveStrings(locale);
+      this.languageTag = locale;
+    }
+    this.printEpoch++;
     this.drawings.forEach((layer) => layer.setLabels(this.drawingLabels()));
     this.root.setAttribute('aria-label', this.strings.spreadsheet);
     this.input.setAttribute('aria-label', this.strings.cellEditor);
@@ -820,6 +873,8 @@ export class WorkbookView {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    // A print job under way ends here: its pages leave the document at once.
+    if (this.printJob) this.endPrint(this.printJob);
     if (this.calcTimer !== undefined) clearTimeout(this.calcTimer);
     if (this.missingTimer !== undefined) clearTimeout(this.missingTimer);
     if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer);
@@ -874,6 +929,261 @@ export class WorkbookView {
     // Give the backing store back right away; some browsers keep it until collection otherwise.
     canvas.width = 0;
     canvas.height = 0;
+  }
+
+  // -------------------------------------------------------------- printing
+
+  /** Whether print() is at work: its pages are being prepared or its dialog is open. */
+  get printing(): boolean {
+    return this.printJob !== undefined;
+  }
+
+  /**
+   * Prints the sheet that is shown, or with `sheets: 'all'` every visible
+   * worksheet: lays the cells out on pages by the page setup of each sheet
+   * (paper, margins, scale or fit to pages, print area and titles, page
+   * breaks, header and footer), paints every page at the resolution of a
+   * printer, and opens the print dialog of the window the view is in. The
+   * pages are prepared one per turn, so the page stays responsive; when the
+   * workbook is changed meanwhile, they are prepared anew. What belongs to
+   * the screen is not printed: the selection, filter buttons, comments.
+   *
+   * Resolves when the dialog was closed (whether the user printed or
+   * cancelled cannot be told). A call while the pages of an earlier one are
+   * being prepared gets the promise of that call and opens no second dialog.
+   * Rejects with a DocumentPrintError: 'unavailable' where the window cannot
+   * print, 'empty' when there is nothing to print, 'too-long' beyond the
+   * limits, 'cancelled' when the view is destroyed meanwhile; with a
+   * RangeError for a `dpi` that is no positive number or a `sheets` that is
+   * neither 'active' nor 'all'.
+   */
+  print(options: SheetPrintOptions = {}): Promise<DocumentPrintResult> {
+    if (this.destroyed) return Promise.reject(new DocumentPrintError('cancelled', 'The view was destroyed'));
+    // A wrong option is refused before any work is done, whatever else is under way.
+    try {
+      planPrint([PRINT_CHECK_PAGE], options);
+      if (options.sheets !== undefined && options.sheets !== 'active' && options.sheets !== 'all') throw new RangeError('"sheets" must be "active" or "all"');
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const previous = this.printJob;
+    if (previous) {
+      if (!previous.dialog) return previous.promise;
+      // print() came back and nothing said that the dialog was closed: a new call says so.
+      previous.dialog.finish();
+    }
+    const job = {} as PrintJob;
+    const nothing = () => undefined;
+    const turn: Promise<unknown> = previous ? previous.promise.then(nothing, nothing) : Promise.resolve();
+    job.promise = turn
+      .then(() => this.runPrint(job, options))
+      .then(
+        (result) => {
+          this.endPrint(job);
+          return result;
+        },
+        (error) => {
+          this.endPrint(job);
+          this.printFailed(error);
+          throw error;
+        },
+      );
+    this.printJob = job;
+    return job.promise;
+  }
+
+  private setPrintProgress(job: PrintJob, progress: { done: number; total: number } | undefined): void {
+    job.progress = progress;
+    if (this.printJob === job && !this.destroyed && this.options.onPrintProgress) this.options.onPrintProgress(progress ? { done: progress.done, total: progress.total } : undefined);
+  }
+
+  private async runPrint(job: PrintJob, options: SheetPrintOptions): Promise<DocumentPrintResult> {
+    const cancelled = () => new DocumentPrintError('cancelled', 'Printing was cancelled: the view was destroyed');
+    if (this.destroyed) throw cancelled();
+    // The window of the document the view is in: inside a frame, the frame is what is printed.
+    const doc = this.container.ownerDocument || document;
+    const win = doc.defaultView;
+    if (!win || typeof win.print !== 'function') throw new DocumentPrintError('unavailable', 'Printing is not available here: the window has no print()');
+    // What is being typed is part of what is printed, as leaving the cell would make it.
+    if (this.edit) this.commitEditing();
+    this.notify(this.strings.printPreparing, 'info');
+    this.setPrintProgress(job, { done: 0, total: 0 });
+    const limits = printLimits(coarsePointer());
+    const urls = (win as unknown as { URL?: typeof URL }).URL || URL;
+    let plan: PrintPlan;
+    for (let attempt = 0; ; attempt++) {
+      // A calculation still under way writes cells turn after turn; the pages wait for its end
+      // rather than start anew at each of its turns. One that does not end is printed as it stands.
+      const waitUntil = Date.now() + PRINT_CALC_MS;
+      while (this.engine && this.engine.incomplete && Date.now() < waitUntil) {
+        await sleep(30);
+        if (this.destroyed) throw new DocumentPrintError('cancelled', 'Printing was cancelled: the view was destroyed');
+      }
+      const epoch = this.printEpoch;
+      const media = this.workbook.media;
+      // Pictures of its own: those of the view are sized for the screen and come and go with it.
+      const store = media && typeof media.readPart === 'function' ? new ImageStore(media, coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => undefined) : undefined;
+      job.store = store;
+      const layers = new Map<Sheet, SheetDrawings | undefined>();
+      const metricsOf = new Map<Sheet, SheetMetrics>();
+      const layerOf = (sheet: Sheet): SheetDrawings | undefined => {
+        if (!layers.has(sheet)) {
+          // Comments are not printed, so their boxes are left out of the layer.
+          layers.set(sheet, sheet.drawings && sheet.drawings.length > 0 ? new SheetDrawings(sheet, { images: store, labels: this.drawingLabels(), notes: false }) : undefined);
+        }
+        return layers.get(sheet);
+      };
+      const sheets: number[] = [];
+      if (options.sheets === 'all') {
+        for (let i = 0; i < this.workbook.sheets.length; i++) if (this.workbook.sheets[i].state === 'visible') sheets.push(i);
+      } else sheets.push(this.sheetIndex);
+      const pages: SheetJobPlan = planSheetPages(this.workbook, sheets, {
+        defaultPaper: defaultPaperFor(this.languageTag),
+        maxPages: MAX_PRINT_PAGES,
+        metrics: (sheet) => {
+          let metrics = metricsOf.get(sheet);
+          if (!metrics) {
+            metrics = createSheetMetrics(sheet);
+            metricsOf.set(sheet, metrics);
+          }
+          return metrics;
+        },
+        drawings: (sheet, _index, metrics) => {
+          const layer = layerOf(sheet);
+          return layer ? layer.rects(metrics) : undefined;
+        },
+      });
+      plan = planPrint(
+        pages.pages.map((entry) => entry.layout.paper),
+        options,
+        limits,
+      );
+      const frame = new PrintFrame(doc, plan, supportsNamedPages(win as unknown as { CSS?: { supports?(property: string, value: string): boolean } }), (url) => revokePicture(url, urls));
+      job.frame = frame;
+      this.setPrintProgress(job, { done: 0, total: plan.pages.length });
+      const complete = await this.paintForPrint(job, epoch, pages, plan, frame, store, limits, doc, urls, options, (sheet) => metricsOf.get(sheet) as SheetMetrics, layerOf);
+      if (store) store.destroy();
+      job.store = undefined;
+      if (this.destroyed) throw cancelled();
+      if (complete) break;
+      // The workbook changed under the pages: they are prepared again from the start.
+      frame.dispose();
+      job.frame = undefined;
+      if (attempt >= MAX_PRINT_RESTARTS) throw new DocumentPrintError('failed', 'The workbook kept changing while it was prepared for printing');
+    }
+    this.setPrintProgress(job, undefined);
+    const dialog = openPrintDialog(win as unknown as Parameters<typeof openPrintDialog>[0]);
+    job.dialog = dialog;
+    await dialog.closed;
+    // Takes the place of "preparing": whether anything was printed cannot be told.
+    if (!this.destroyed) this.notify(this.strings.printClosed, 'info');
+    return { pages: plan.pages.length, dpi: plan.dpi };
+  }
+
+  /** Paints the pages of a plan and adds them to the frame; false when the workbook was changed meanwhile. */
+  private async paintForPrint(
+    job: PrintJob,
+    epoch: number,
+    pages: SheetJobPlan,
+    plan: PrintPlan,
+    frame: PrintFrame,
+    store: ImageStore | undefined,
+    limits: PrintLimits,
+    doc: Document,
+    urls: { createObjectURL(blob: Blob): string; revokeObjectURL(url: string): void },
+    options: SheetPrintOptions,
+    metricsOf: (sheet: Sheet) => SheetMetrics,
+    layerOf: (sheet: Sheet) => SheetDrawings | undefined,
+  ): Promise<boolean> {
+    const stale = () => this.destroyed || this.printEpoch !== epoch;
+    // One canvas for all pages: a page is held as pixels only while it is painted.
+    const canvas = doc.createElement('canvas');
+    const win = doc.defaultView;
+    const nextFrame = win && typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
+    const now = new Date();
+    let bytes = 0;
+    try {
+      for (let i = 0; i < plan.pages.length; i++) {
+        if (stale()) return false;
+        const entry = pages.pages[i];
+        const planned = plan.pages[i];
+        const sheet = this.workbook.sheets[entry.sheet];
+        if (!sheet) return false;
+        if (canvas.width !== planned.pixelWidth) canvas.width = planned.pixelWidth;
+        if (canvas.height !== planned.pixelHeight) canvas.height = planned.pixelHeight;
+        const context = canvas.getContext('2d');
+        if (!context) throw new DocumentPrintError('failed', 'No canvas to paint the pages on');
+        const conditional = this.conditionalOf(sheet);
+        const paint = () =>
+          paintSheetPage(context, {
+            workbook: this.workbook,
+            job: entry,
+            total: pages.pages.length,
+            metrics: metricsOf(sheet),
+            pixelWidth: planned.pixelWidth,
+            locale: this.locale,
+            conditional,
+            drawings: layerOf(sheet),
+            fileName: options.fileName,
+            now,
+          });
+        // Pictures of the pages before this one may make room for those of this one.
+        if (store) store.pass++;
+        try {
+          paint();
+          // Painting asked for the pictures and started the rules whose formulas take long; once both are there the page is painted with them.
+          const deadline = Date.now() + PRINT_PAGE_WAIT_MS;
+          while (((store && store.busy) || (conditional && conditional.pending)) && Date.now() < deadline) {
+            await sleep(20);
+            if (stale()) return false;
+            paint();
+          }
+        } catch (error) {
+          if (error instanceof DocumentPrintError) throw error;
+          throw new DocumentPrintError('failed', `Page ${i + 1} could not be painted`);
+        }
+        const picture = await canvasPicture(canvas, urls, nextFrame);
+        bytes += picture.bytes;
+        if (stale() || bytes > limits.maxBytes) {
+          revokePicture(picture.url, urls);
+          if (this.destroyed || !(bytes > limits.maxBytes)) return false;
+          throw new DocumentPrintError('too-long', 'The pages of the workbook take too much memory to print at once');
+        }
+        await frame.add(picture.url, this.strings.page(i + 1));
+        this.setPrintProgress(job, { done: i + 1, total: plan.pages.length });
+      }
+      return !stale();
+    } finally {
+      // Give the backing store back right away.
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+  }
+
+  /** Takes what a print job holds out of the document. Safe to call twice. */
+  private endPrint(job: PrintJob): void {
+    if (job.frame) job.frame.dispose();
+    if (job.store) job.store.destroy();
+    if (job.dialog) job.dialog.finish();
+    job.frame = undefined;
+    job.store = undefined;
+    const reported = job.progress !== undefined;
+    job.progress = undefined;
+    if (this.printJob !== job) return;
+    if (reported && !this.destroyed && this.options.onPrintProgress) this.options.onPrintProgress(undefined);
+    this.printJob = undefined;
+  }
+
+  private printFailed(error: unknown): void {
+    // A wrong option is the caller's to hear about, not the user's; so is the end of a view.
+    if (this.destroyed || error instanceof RangeError) return;
+    const code = error instanceof DocumentPrintError ? error.code : 'failed';
+    if (code === 'cancelled') return;
+    const strings = this.strings;
+    this.notify(
+      code === 'unavailable' ? strings.printNotAvailable : code === 'too-long' ? strings.printSheetTooLong : code === 'empty' ? strings.printNothing : strings.printSheetFailed,
+      'error',
+    );
   }
 
   // ---------------------------------------------------------------- sheets
@@ -1670,6 +1980,7 @@ export class WorkbookView {
         this.engine = engine;
         this.marksDirty = true;
         engine.recalculate(missing);
+        this.printEpoch++;
         if (engine.incomplete) this.continueCalculation();
         this.conditional.forEach((formats) => formats.invalidate());
         this.schedule();
@@ -1975,6 +2286,12 @@ export class WorkbookView {
       this.endDrag();
       event.preventDefault();
       event.stopPropagation();
+      return;
+    }
+    // Ctrl+P, while a cell is edited too: the browser would print the host page with a part of the grid in it.
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === 'p' || event.key === 'P')) {
+      event.preventDefault();
+      this.print().catch(() => undefined);
       return;
     }
     if (this.edit) {
@@ -2654,6 +2971,7 @@ export class WorkbookView {
       }
       this.conditional.forEach((formats) => formats.invalidate());
       this.schedule();
+      if (sheets.length > 0) this.printEpoch++;
       if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
     }, 0);
   }
@@ -2672,6 +2990,7 @@ export class WorkbookView {
     this.marksDirty = true;
     this.conditional.forEach((formats) => formats.invalidate());
     this.schedule();
+    if (sheets.length > 0) this.printEpoch++;
     if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
   }
 
@@ -2745,6 +3064,7 @@ export class WorkbookView {
 
   /** Everything that has to follow a change of the model. */
   private afterChange(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): void {
+    this.printEpoch++;
     // A rule may read any cell of any sheet.
     this.conditional.forEach((formats) => formats.invalidate());
     this.cellInfo = undefined;

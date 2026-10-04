@@ -12,6 +12,7 @@ import { cellName, rangeName, type Workbook } from '../model/sheet/types';
 import type { DocumentEditorOptions } from '../ui/doc-editor';
 import type { DocumentViewOptions } from '../ui/doc-view';
 import type { SpreadsheetEditorOptions } from '../ui/editor';
+import type { SheetPrintOptions } from '../ui/sheet-print';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 
 export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded' | 'print-unavailable' | 'print-failed';
@@ -718,20 +719,30 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
-   * Starts printing the document and answers when the dialog was closed. The
-   * messages after it do not wait for that: a dialog can stay open for long.
+   * Starts printing the document or the workbook and answers when the dialog
+   * was closed. The messages after it do not wait for that: a dialog can stay
+   * open for long.
    */
   const print = (message: Message, id: string | undefined) => {
     const dpi = field<number>(message, 'dpi', 'number', false);
     if (dpi !== undefined && !(dpi > 0 && dpi < Infinity)) throw new BadMessage('"dpi" must be a positive number');
+    const sheets = field<string>(message, 'sheets', 'string', false);
+    if (sheets !== undefined && sheets !== 'active' && sheets !== 'all') throw new BadMessage('"sheets" must be "active" or "all"');
     if (!shown) return fail('not-loaded', 'No file is open', id);
     const pages = shown.pages;
-    if (!pages || !pages.print) {
-      return fail('print-unavailable', shown.view ? 'Printing a spreadsheet is not supported yet' : 'This view cannot print', id);
-    }
+    const view = shown.view;
+    if (pages ? !pages.print : !view || typeof view.print !== 'function') return fail('print-unavailable', 'This view cannot print', id);
     let job: Promise<unknown>;
     try {
-      job = Promise.resolve(pages.print(dpi === undefined ? undefined : { dpi }));
+      if (pages && pages.print) job = Promise.resolve(pages.print(dpi === undefined ? undefined : { dpi }));
+      else {
+        // Of a workbook: the sheet that is shown unless all are asked for; the name of the file is what "&F" in a header stands for.
+        const options: SheetPrintOptions = {};
+        if (dpi !== undefined) options.dpi = dpi;
+        if (sheets !== undefined) options.sheets = sheets as 'active' | 'all';
+        if (shown.name !== undefined) options.fileName = shown.name;
+        job = Promise.resolve((view as WorkbookView).print(options));
+      }
     } catch (error) {
       job = Promise.reject(error);
     }

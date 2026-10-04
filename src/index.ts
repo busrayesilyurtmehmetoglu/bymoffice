@@ -17,6 +17,7 @@ import type { WorkbookView } from './ui/sheet-view';
 import type { DocumentView, DocumentZoom } from './ui/doc-view';
 import { DocumentEditor } from './ui/doc-editor';
 import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
+import type { SheetPrintOptions } from './ui/sheet-print';
 import { OpcPackage } from './opc';
 
 export { CfbFile, type CfbEntry } from './cfb';
@@ -54,7 +55,7 @@ export { parseCellInput, cellEditText, type ParsedInput, type InputOptions } fro
 export { formulaFromLocal, formulaToLocal } from './edit/formula-locale';
 export { parseTsv, toTsv } from './edit/clipboard';
 export { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from './calc/refs';
-export { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridScene, type GridSelection, type GridTheme } from './render/grid';
+export { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, renderGridPrint, type GridBand, type GridFilter, type GridPrintScene, type GridScene, type GridSelection, type GridTheme } from './render/grid';
 export type { GridCommentSource, GridDrawingSource } from './render/grid';
 export { SheetDrawings, adjustCommentCell, adjustDrawingAnchor, anchorRect, type DrawingTarget, type PlacedComment, type SheetDrawingLabels, type SheetDrawingsOptions } from './render/sheet-drawings';
 export type { DecodedImage } from './render/images';
@@ -77,6 +78,30 @@ export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasur
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
 export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
+export { defaultPaperFor, headerFooterFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPagePaint, type SheetPlanOptions, type SheetPrintOptions } from './ui/sheet-print';
+export {
+  DEFAULT_PAGE_MARGINS,
+  MAX_SHEET_PAGES,
+  SheetPagesError,
+  paginateSheet,
+  paperSize,
+  printRanges,
+  usedRange,
+  type PrintBand,
+  type SheetPagesOptions,
+  type SheetPrintLayout,
+  type SheetPrintPage,
+} from './layout/sheet-pages';
+export {
+  headerFooterLines,
+  parseHeaderFooter,
+  type HeaderFooterField,
+  type HeaderFooterFormat,
+  type HeaderFooterPiece,
+  type HeaderFooterRun,
+  type HeaderFooterSections,
+  type HeaderFooterValues,
+} from './layout/header-footer';
 export { DocToolbar, type DocShellHost } from './ui/doc-toolbar';
 export { DocLines, type Affinity, type CaretBox, type PageLine, type Place } from './ui/doc-caret';
 export { sliceHtml, sliceOf, type DocSlice } from './ui/doc-clipboard';
@@ -302,6 +327,12 @@ export interface MountedSpreadsheet {
    * being edited is written first, as leaving it would do.
    */
   save(): Promise<Uint8Array>;
+  /**
+   * Prints the sheet that is shown, or every visible sheet, through the
+   * print dialog of the browser (which can also save a PDF): see
+   * WorkbookView.print(). Resolves when the dialog was closed.
+   */
+  print(options?: SheetPrintOptions): Promise<DocumentPrintResult>;
   /** Removes the view from the container. */
   destroy(): void;
 }
@@ -442,5 +473,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     editor.destroy();
   };
   converted();
-  return conversion ? { kind: 'spreadsheet', file, conversion, workbook, view, editor, save, destroy } : { kind: 'spreadsheet', file, workbook, view, editor, save, destroy };
+  const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);
+  return conversion
+    ? { kind: 'spreadsheet', file, conversion, workbook, view, editor, save, print, destroy }
+    : { kind: 'spreadsheet', file, workbook, view, editor, save, print, destroy };
 }

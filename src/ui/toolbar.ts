@@ -125,6 +125,8 @@ export class Toolbar {
 
     this.addButton('undo', () => host.view.undo());
     this.addButton('redo', () => host.view.redo());
+    // Works in a read-only view as well; what goes wrong is said by the view.
+    this.addButton('print', () => void host.view.print().catch(() => undefined)).setAttribute('aria-busy', 'false');
     this.addSeparator();
     this.sizeSelect = this.addSelect('bym-tb-size');
     this.addSeparator();
@@ -211,6 +213,13 @@ export class Toolbar {
     this.keepTabStop();
   }
 
+  /** Marks the Print button as busy while the pages of a print job are prepared. */
+  setPrinting(busy: boolean): void {
+    const button = this.buttons.print;
+    const value = busy ? 'true' : 'false';
+    if (button && button.getAttribute('aria-busy') !== value) button.setAttribute('aria-busy', value);
+  }
+
   closePopover(): void {
     if (this.popover) this.popover.close('owner');
   }
@@ -285,6 +294,8 @@ export class Toolbar {
     const labels: { [key in ButtonKey]: string } = {
       undo: withShortcut(s.undo, 'Z'),
       redo: withShortcut(s.redo, 'Y'),
+      // The same label as the button of the document bar.
+      print: s.print,
       bold: withShortcut(s.bold, 'B'),
       italic: withShortcut(s.italic, 'I'),
       underline: withShortcut(s.underline, 'U'),

@@ -73,7 +73,7 @@
     <div id="bar">
       <span id="name"></span>
       <span id="status" role="status"></span>
-      <!-- Documents only: opens the browser's print dialog, which can also save a PDF. -->
+      <!-- Opens the browser's print dialog, which can also save a PDF. -->
       <button id="print" type="button" hidden>Print</button>
       <button id="save" type="button" hidden>Save</button>
     </div>
@@ -243,12 +243,13 @@
             if (!writable) readOnly = true;
             saveButton.hidden = readOnly;
             saveButton.addEventListener('click', save);
-            // A document can be printed, read-only or not; printing a workbook is not there yet.
-            printButton.hidden = result.kind !== 'document';
+            // Documents and workbooks can be printed, read-only or not.
+            printButton.hidden = false;
             printButton.addEventListener('click', function () {
-              if (result.kind !== 'document') return;
               // The editor says by itself (onNotice) what goes wrong; the promise ends when the dialog is closed.
-              result.print().catch(function () {});
+              // A workbook: the sheet that is shown; the name of the file is what "&F" in a header stands for.
+              var job = result.kind === 'document' ? result.print() : result.print({ fileName: name });
+              job.catch(function () {});
             });
             // What was said while the file was opened (it was converted, or could not be) stays until something else is said.
             if (!noticed) status('');

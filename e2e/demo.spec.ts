@@ -180,6 +180,9 @@ test.describe('demo page', () => {
       return colours.size;
     });
     expect(painted).toBeGreaterThan(3);
+    // The toolbar of the editor has the Print button.
+    await expect(page.locator('#grid [data-command="print"]')).toBeVisible();
+    await expect(page.locator('#grid [data-command="print"]')).toHaveAttribute('aria-label', 'Yazdır');
 
     await page.locator('#grid .bym-tabs button', { hasText: 'Grafik' }).click();
     await expect(page.locator('#preview-note')).toContainText('Grafik: chartsheet');

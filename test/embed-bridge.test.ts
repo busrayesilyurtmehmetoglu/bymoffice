@@ -1559,18 +1559,71 @@ test('bridge: print starts the print job of a document and answers when its dial
   assert.equal(f.sent.length, count);
 });
 
-test('bridge: print is refused without a file, for a workbook and with a wrong dpi', async () => {
+test('bridge: print is refused without a file, by a view that cannot print and with a wrong dpi or a wrong choice of sheets', async () => {
   const f = fake();
   const bridge = createBridge(f.host);
   await bridge.receive({ type: 'print', id: 'a' });
   assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'a', code: 'not-loaded', message: 'No file is open' });
   await bridge.receive({ type: 'load', data: DATA });
+  // The view of this host has no print().
   await bridge.receive({ type: 'print', id: 'b' });
-  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'b', code: 'print-unavailable', message: 'Printing a spreadsheet is not supported yet' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'b', code: 'print-unavailable', message: 'This view cannot print' });
   for (const dpi of [0, -5, '200', true]) {
     await bridge.receive({ type: 'print', id: 'c', dpi });
     assert.equal(f.sent[f.sent.length - 1].code, 'bad-message', String(dpi));
   }
+  for (const sheets of ['', 'visible', 0, true, ['all']]) {
+    await bridge.receive({ type: 'print', id: 'd', sheets });
+    assert.equal(f.sent[f.sent.length - 1].code, 'bad-message', String(sheets));
+  }
   // The workbook is still there.
   assert.equal(f.calls.includes('destroy'), false);
+});
+
+test('bridge: print of a workbook hands dpi, the choice of sheets and the name of the file to the view', async () => {
+  const f = fake();
+  const jobs: { options: unknown; resolve(): void; reject(error: unknown): void }[] = [];
+  const make = f.host.createView;
+  f.host.createView = (container, workbook, options) => {
+    const view = make.call(f.host, container, workbook, options);
+    view.print = ((printOptions: unknown) => new Promise<void>((resolve, reject) => jobs.push({ options: printOptions, resolve, reject }))) as unknown as typeof view.print;
+    return view;
+  };
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, name: 'Budget 2026.xlsx' });
+  await bridge.receive({ type: 'print', id: 'p1' });
+  await bridge.receive({ type: 'print', id: 'p2', dpi: 150, sheets: 'all' });
+  await bridge.receive({ type: 'print', id: 'p3', sheets: 'active' });
+  assert.deepEqual(
+    jobs.map((job) => job.options),
+    [{ fileName: 'Budget 2026.xlsx' }, { dpi: 150, sheets: 'all', fileName: 'Budget 2026.xlsx' }, { sheets: 'active', fileName: 'Budget 2026.xlsx' }],
+  );
+  // The answers come when the jobs end, each with its id; other messages do not wait.
+  const before = f.sent.length;
+  await bridge.receive({ type: 'undo', id: 'u' });
+  jobs[0].resolve();
+  jobs[1].reject(Object.assign(new Error('There is nothing to print'), { code: 'empty' }));
+  jobs[2].reject(Object.assign(new Error('The window has no print()'), { code: 'unavailable' }));
+  await settle();
+  assert.deepEqual(f.sent.slice(before), [
+    { type: 'done', id: 'u', command: 'undo' },
+    { type: 'done', id: 'p1', command: 'print' },
+    { type: 'error', id: 'p2', code: 'print-failed', message: 'There is nothing to print' },
+    { type: 'error', id: 'p3', code: 'print-unavailable', message: 'The window has no print()' },
+  ]);
+  // A file without a name: no file name is handed on. A print() that throws is a failure like any other.
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'print' });
+  assert.deepEqual(jobs[3].options, {});
+  f.host.createView = (container, workbook, options) => {
+    const view = make.call(f.host, container, workbook, options);
+    view.print = (() => {
+      throw new RangeError('The print resolution must be a positive number of dots per inch');
+    }) as unknown as typeof view.print;
+    return view;
+  };
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'print', id: 'p4' });
+  await settle();
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'p4', code: 'print-failed', message: 'The print resolution must be a positive number of dots per inch' });
 });

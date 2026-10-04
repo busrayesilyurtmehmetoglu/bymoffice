@@ -274,6 +274,8 @@ export interface SheetDrawingsOptions {
   images?: { get(part: string, width?: number, height?: number): DecodedImage | undefined; status?(part: string): 'pending' | 'ready' | 'failed' };
   /** Words shown inside placeholders. */
   labels?: Partial<SheetDrawingLabels>;
+  /** False leaves the boxes of comments that are always shown out of the layer: on paper comments are not printed. Default true. */
+  notes?: boolean;
 }
 
 /** Where the layer is drawn: a clip rectangle on the canvas and the canvas position of the top-left corner of cell A1. */
@@ -319,6 +321,7 @@ export class SheetDrawings {
   private readonly sheet: Sheet;
   private readonly images: SheetDrawingsOptions['images'];
   private labels: SheetDrawingLabels;
+  private readonly notes: boolean;
 
   private drawingsSeen: SheetDrawing[] | undefined;
   private commentsSeen: SheetComment[] | undefined;
@@ -340,6 +343,7 @@ export class SheetDrawings {
     this.sheet = sheet;
     this.images = options.images && typeof options.images.get === 'function' ? options.images : undefined;
     this.labels = { ...DEFAULT_LABELS, ...(options.labels || {}) };
+    this.notes = options.notes !== false;
   }
 
   /** True when the sheet has nothing for this layer; a view then leaves it out of its frames. */
@@ -438,7 +442,7 @@ export class SheetDrawings {
     }
     // The boxes of comments that are always shown lie above the drawings.
     const edits = this.sheet.structuralEdits;
-    for (let i = 0; i < this.placedComments.length; i++) {
+    for (let i = 0; this.notes && i < this.placedComments.length; i++) {
       const { row, col, comment } = this.placedComments[i];
       if (!comment.visible) continue;
       let rect: Rect;

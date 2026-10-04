@@ -239,7 +239,7 @@ test.describe('example page: a file of the site in the editor', () => {
     expect([plain.type, plain.format, 'convertedFrom' in plain]).toEqual(['ready', 'rtf', false]);
   });
 
-  test('Print: a document is printed with the button, in view mode too; under the print medium only its pages show; a workbook has no button', async ({ page }) => {
+  test('Print: a document is printed with the button, in view mode too; under the print medium only its pages show; a workbook is printed as well', async ({ page }) => {
     for (const query of ['new=docx&lang=tr', 'new=docx&mode=view']) {
       await page.goto(`${PAGE}?${query}`);
       await ready(page);
@@ -269,9 +269,34 @@ test.describe('example page: a file of the site in the editor', () => {
       await expect(page.locator('.bym-print')).toHaveCount(0);
       expect(await page.evaluate(() => (window as any).bymEditor.view.printing)).toBe(false);
     }
-    await page.goto(`${PAGE}?new=xlsx`);
-    await ready(page);
-    await expect(page.locator('#print')).toBeHidden();
+    // A workbook: an empty one has nothing to print and says so; with a cell in use it is printed, in view mode too.
+    for (const query of ['new=xlsx', 'new=xlsx&mode=view']) {
+      await page.goto(`${PAGE}?${query}`);
+      await ready(page);
+      await expect(page.locator('#print')).toBeVisible();
+      await page.evaluate(() => {
+        (window as any).__prints = 0;
+        window.print = () => void (window as any).__prints++;
+      });
+      await page.locator('#print').click();
+      await expect(page.locator('#status')).toHaveText('There is nothing to print');
+      expect(await page.evaluate(() => (window as any).__prints)).toBe(0);
+      await page.evaluate(() => {
+        const workbook = (window as any).bymEditor.workbook;
+        const row = { customHeight: false, hidden: false, outlineLevel: 0, collapsed: false, cells: [{ kind: 'number', value: 42, style: 0 }] };
+        workbook.sheets[0].rows.set(0, row);
+      });
+      await page.locator('#print').click();
+      await expect.poll(() => page.evaluate(() => (window as any).__prints)).toBe(1);
+      await expect(page.locator('body > .bym-print img')).toHaveCount(1);
+      await page.emulateMedia({ media: 'print' });
+      await expect(page.locator('.bym-print img')).toBeVisible();
+      await expect(page.locator('#editor')).toBeHidden();
+      await page.emulateMedia({ media: 'screen' });
+      await page.evaluate(() => void window.dispatchEvent(new Event('afterprint')));
+      await expect(page.locator('.bym-print')).toHaveCount(0);
+      expect(await page.evaluate(() => (window as any).bymEditor.view.printing)).toBe(false);
+    }
   });
 
   test('addresses of another site are refused, and so is a page without a file', async ({ page }) => {

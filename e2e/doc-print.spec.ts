@@ -837,7 +837,7 @@ test.describe('printing through the WebView bridge', () => {
     await expectCleanedUp(page, 3);
   });
 
-  test('print is answered with an error where it cannot be done: no print() in the window, a workbook, a closed file', async ({ page }) => {
+  test('print is answered with an error where it cannot be done: no print() in the window, a closed file, a wrong option', async ({ page }) => {
     const { buildXlsx, worksheetXml } = await import('../test/fixtures');
     await startBridge(page);
     await send(page, { type: 'print', id: 'none' });
@@ -857,12 +857,10 @@ test.describe('printing through the WebView bridge', () => {
     expect(await answer(page, 'p2')).toMatchObject({ type: 'error', id: 'p2', code: 'print-failed' });
     expect(await printCalls(page)).toEqual([]);
     await expectCleanedUp(page);
-    // A workbook.
+    // A workbook is printed as well (sheet-print.spec.ts); a wrong option is refused for it too.
     const workbook = await buildXlsx({ sheets: [{ name: 'S', xml: worksheetXml('<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>') }] });
     await send(page, { type: 'load', id: 'x', data: base64(workbook) });
     await answer(page, 'x');
-    await send(page, { type: 'print', id: 'p3' });
-    expect(await answer(page, 'p3')).toMatchObject({ type: 'error', id: 'p3', code: 'print-unavailable' });
     await send(page, { type: 'print', id: 'p4', dpi: 'high' });
     expect(await answer(page, 'p4')).toMatchObject({ type: 'error', id: 'p4', code: 'bad-message' });
   });

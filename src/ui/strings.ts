@@ -127,6 +127,11 @@ export interface UiStrings {
   printNotAvailable: string;
   printTooLong: string;
   printFailed: string;
+  // Printing a workbook.
+  printSheetTooLong: string;
+  printSheetFailed: string;
+  /** Said when the sheets that were to be printed hold nothing. */
+  printNothing: string;
 }
 
 const rows = (count: number) => (count === 1 ? 'row' : `${count} rows`);
@@ -222,6 +227,9 @@ export const STRINGS_EN: UiStrings = {
   printNotAvailable: 'Printing is not available here',
   printTooLong: 'The document is too long to print at once',
   printFailed: 'The document could not be printed',
+  printSheetTooLong: 'The sheet is too long to print at once',
+  printSheetFailed: 'The sheet could not be printed',
+  printNothing: 'There is nothing to print',
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -324,6 +332,9 @@ export const STRINGS_TR: UiStrings = {
   printNotAvailable: 'Burada yazdırma kullanılamıyor',
   printTooLong: 'Belge bir kerede yazdırılamayacak kadar uzun',
   printFailed: 'Belge yazdırılamadı',
+  printSheetTooLong: 'Sayfa bir kerede yazdırılamayacak kadar uzun',
+  printSheetFailed: 'Sayfa yazdırılamadı',
+  printNothing: 'Yazdırılacak bir şey yok',
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

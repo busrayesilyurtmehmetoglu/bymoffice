@@ -10,6 +10,8 @@ import type { CellRange, Sheet, Workbook } from '../model/sheet/types';
 import type { GridSelection } from '../render/grid';
 import { getEditorStrings, type EditorStrings } from './editor-strings';
 import { FormulaBar } from './formula-bar';
+import type { DocumentPrintResult } from './doc-print';
+import type { SheetPrintOptions } from './sheet-print';
 import { WorkbookView, type WorkbookViewOptions } from './sheet-view';
 import { StatusBar } from './status-bar';
 import { Toolbar, type ShellHost } from './toolbar';
@@ -163,6 +165,8 @@ export class SpreadsheetEditor {
   private locale: FormatLocale;
   /** What a command or the view last had to say; it stays until the selection moves on. */
   private notice = '';
+  /** What the status bar shows while the pages of a print job are prepared. */
+  private printProgress = '';
   private frame = 0;
   private destroyed = false;
 
@@ -237,6 +241,13 @@ export class SpreadsheetEditor {
         this.refresh();
         if (options.onEditingChange) options.onEditingChange(state);
       },
+      onPrintProgress: (progress) => {
+        if (this.toolbar) this.toolbar.setPrinting(progress !== undefined);
+        this.printProgress = progress && progress.total > 0 ? this.strings.printProgress(progress.done, progress.total) : '';
+        // In the status bar only: assistive technology heard that printing is being prepared, and hears when it is over.
+        if (this.statusBar && this.view) this.statusBar.showMessage(this.printProgress || this.notice || this.view.statusText);
+        if (options.onPrintProgress) options.onPrintProgress(progress);
+      },
     };
     try {
       this.view = new WorkbookView(gridHost, workbook, viewOptions);
@@ -252,7 +263,13 @@ export class SpreadsheetEditor {
     }
 
     window.addEventListener('resize', this.onResize);
+    root.addEventListener('keydown', this.onKeyDown);
     this.sync();
+  }
+
+  /** Prints the workbook: see WorkbookView.print(). */
+  print(options?: SheetPrintOptions): Promise<DocumentPrintResult> {
+    return this.view.print(options);
   }
 
   /** Changes the language of number and date formats and, for a language tag, of every label. */
@@ -284,6 +301,7 @@ export class SpreadsheetEditor {
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     window.removeEventListener('resize', this.onResize);
+    this.root.removeEventListener('keydown', this.onKeyDown);
     if (this.toolbar) this.toolbar.destroy();
     if (this.formulaBar) this.formulaBar.destroy();
     if (this.statusBar) this.statusBar.destroy();
@@ -327,11 +345,19 @@ export class SpreadsheetEditor {
     if (this.formulaBar) this.formulaBar.update(single);
     if (this.statusBar) {
       // With nothing else to say: what the view knows about the active cell and the filter of the sheet.
-      this.statusBar.showMessage(this.notice || view.statusText);
+      this.statusBar.showMessage(this.printProgress || this.notice || view.statusText);
       this.statusBar.setReadOnly(view.readOnly);
       this.statusBar.showSummary(sheet, selection.range, single, this.locale);
     }
   }
+
+  /** Ctrl+P in the toolbar and the formula bar prints the workbook as it does in the grid (which handles it itself). */
+  private onKeyDown = (event: KeyboardEvent): void => {
+    if (this.destroyed || event.defaultPrevented || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+    if (event.key !== 'p' && event.key !== 'P') return;
+    event.preventDefault();
+    this.view.print().catch(() => undefined);
+  };
 
   private onResize = (): void => {
     if (this.toolbar) this.toolbar.closePopover();
