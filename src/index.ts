@@ -5,7 +5,7 @@ import { readDocx } from './formats/docx/document';
 import { buildDocx, writeDocx } from './formats/docx/write';
 import { needsConversion, openConverted } from './formats/convert';
 import { documentPictures } from './model/doc/pictures';
-import type { DocModel } from './model/doc/types';
+import { hasPermissionRanges, type DocModel } from './model/doc/types';
 import { readXls } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
 import { buildXlsx } from './formats/xlsx/build';
@@ -36,7 +36,7 @@ export * as docOps from './ops/doc/index';
 export { readDoc } from './formats/doc/document';
 export { readRtf } from './formats/rtf/document';
 export { documentPictures } from './model/doc/pictures';
-export { inFieldCode, paragraphText, rawOf, safeHyperlinkTarget, type DocModel } from './model/doc/types';
+export { enforcedProtection, hasPermissionRanges, inFieldCode, paragraphText, rawOf, safeHyperlinkTarget, tracksChanges, type DocModel, type DocProtection } from './model/doc/types';
 export { NumberingCounters } from './formats/docx/numbering';
 export { resolveNumberRunProps, resolveParaProps, resolveRunProps } from './formats/docx/resolve';
 export { CalcEngine, type CalcEngineOptions } from './calc/engine';
@@ -73,6 +73,7 @@ export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 export { base64Decode, base64Encode, createBridge, installBridge, type Bridge, type BridgeDocumentView, type BridgeErrorCode, type BridgeHost, type BridgeState, type InstallBridgeOptions } from './embed/bridge';
 
 export { DocLayout } from './layout/doc/layout';
+export { revisionColor } from './layout/doc/prep';
 export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, ShapeItem, TextItem, TextMeasurer } from './layout/doc/types';
 export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
@@ -291,6 +292,33 @@ export interface MountOptions extends SpreadsheetEditorOptions {
   onLinkClick?(target: string): boolean | void;
   /** Documents: called after every change made in the editor, undo and redo included. */
   onDocumentChange?(): void;
+  /**
+   * Documents: tracks the changes made in the editor although the document
+   * does not ask for it. A document that asks for it (its "track changes"
+   * setting, or a protection that allows only tracked changes) is always
+   * edited with tracked changes; false does not turn that off.
+   */
+  trackChanges?: boolean;
+  /** Documents: who is editing, the author the tracked changes name. Default "Author". */
+  author?: string;
+  /** Documents: the clock tracked changes take their date from (tests). Default: the system's. */
+  now?(): Date;
+}
+
+/** What the protection of a mounted document enforces. */
+export interface MountProtection {
+  /**
+   * "readOnly", "comments" or "forms": the document is shown read-only and
+   * nothing turns editing on (comments and form fields cannot be edited
+   * here either). "trackedChanges": the document can be edited, and every
+   * change is tracked.
+   */
+  edit: 'readOnly' | 'comments' | 'forms' | 'trackedChanges';
+  /**
+   * The document marks ranges that its protection leaves open for editing
+   * (w:permStart). They are not honoured: the whole document is read-only.
+   */
+  exceptions: boolean;
 }
 
 /** A file that mount() converted to open it for editing. */
@@ -344,6 +372,10 @@ export interface MountedDocument {
   file: OfficeFile;
   /** Set when the file was converted to be opened for editing (see MountOptions.convert). */
   conversion?: MountConversion;
+  /** Set when the document enforces a protection; onNotice is told once when that keeps it read-only. */
+  protection?: MountProtection;
+  /** Set (true) when the changes made in the editor are tracked: the document asks for it, or MountOptions.trackChanges did. */
+  trackChanges?: boolean;
   document: DocModel;
   /** The pages: zoom, navigation, the caret and the selection, editing, undo and redo. */
   view: DocumentView;
@@ -423,6 +455,9 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       onNotice: options.onNotice,
       onLinkClick: options.onLinkClick,
       onChange: options.onDocumentChange,
+      trackChanges: options.trackChanges,
+      author: options.author,
+      now: options.now,
     });
     const view = editor.view;
     if (file.format !== 'docx') {
@@ -448,9 +483,12 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     };
     converted();
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
-    return conversion
-      ? { kind: 'document', file, conversion, document: model, view, editor, save, print, destroy }
-      : { kind: 'document', file, document: model, view, editor, save, print, destroy };
+    const mounted: MountedDocument = { kind: 'document', file, document: model, view, editor, save, print, destroy };
+    if (conversion) mounted.conversion = conversion;
+    if (view.trackingChanges) mounted.trackChanges = true;
+    const enforced = view.protection;
+    if (enforced) mounted.protection = { edit: enforced, exceptions: hasPermissionRanges(model) };
+    return mounted;
   }
 
   const workbook = await file.workbook();

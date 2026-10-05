@@ -2,8 +2,9 @@
 // returns the operations that make the change and the selection it leaves;
 // nothing is changed until the caller applies them (see DocHistory).
 
-import { paragraphText, EMPTY_PARA_PROPS, type Block, type CellProps, type DocModel, type ParaProps, type Paragraph, type RunItem, type Table, type TableCell, type TableRow } from '../../model/doc/types';
+import { paragraphText, EMPTY_PARA_PROPS, type Block, type CellProps, type DocModel, type ParaProps, type Paragraph, type RunItem, type RunProps, type Table, type TableCell, type TableRow, type Wrapper } from '../../model/doc/types';
 import { buildEdit, tableContextOf, type DocEdit, type DocEditOptions, type Draft } from './draft';
+import { TRACK_UNSUPPORTED, afterCut, insertionLike, insertionWrap, isDeletedMark, isOwnMark, strikePieces, withFreshChanges, withMarkFlagsOf, withMarkRevision, withPlainMark, type Tracking } from './track';
 import { inList, patchRunProps, withoutNumbering, type RunFormatPatch } from './format';
 import {
   atomFollows,
@@ -279,6 +280,7 @@ export function deleteSpan(draft: Draft, start: DocPosition, end: DocPosition): 
   if (inTextBox(start.path) || inTextBox(end.path)) bad('The content of a text box cannot be edited');
   if (comparePositions(start, end) > 0) bad('The range is the wrong way round');
   const sideOfStart = start.before === true;
+  if (draft.track) return sided(doc, strikeSpan(draft, draft.track, start, end), sideOfStart);
 
   const { depth, level } = parting(start, end);
   if (depth === start.path.length && depth === end.path.length) {
@@ -407,18 +409,102 @@ export function deleteSpan(draft: Draft, start: DocPosition, end: DocPosition): 
 }
 
 /**
+ * deleteSpan() where changes are tracked. What the range holds stays, as
+ * tracked deletions, and so do its paragraphs: the mark of each paragraph
+ * the range runs past says that it was deleted. What the author of the
+ * change had put in as a tracked insertion goes for good, text and paragraph
+ * marks alike. A range that takes cells of a table, or a table, is refused:
+ * deleting those is a change of the table that is not tracked yet.
+ */
+function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocPosition): DocPosition {
+  const doc = draft.doc;
+  const story = start.story;
+  const a = resolvePosition(doc, start);
+  const { depth, level } = parting(start, end);
+  if (depth === start.path.length && depth === end.path.length) {
+    const pieces = flatten(a.paragraph);
+    const from = startIndex(pieces, start);
+    const to = caretIndex(pieces, end);
+    const offset = offsetOf(pieces, from);
+    const struck = strikePieces(track, pieces, from, to);
+    if (struck.changed) draft.setParagraph(story, start.path, paragraphWith(a.paragraph, rebuild(struck.pieces)));
+    return { story, path: start.path.slice(), offset };
+  }
+  if (depth % 3 !== 0 || start.path.length !== level + 1 || end.path.length !== level + 1) bad(TRACK_UNSUPPORTED);
+  const container = start.path.slice(0, level);
+  const blocks = containerBlocks(doc, story, container);
+  const first = start.path[level];
+  const last = end.path[level];
+  for (let i = first + 1; i < last; i++) if (blocks[i].type === 'table') bad(TRACK_UNSUPPORTED);
+
+  const out: Block[] = [];
+  /** Blocks without content that follow a paragraph whose mark went for good: they follow the paragraph it joined. */
+  let loose: Block[] = [];
+  /** The paragraphs joined so far to the one being read: the first of them, and their pieces. */
+  let open: { first: Paragraph; pieces: Piece[] } | undefined;
+  let caretOffset = 0;
+  let any = false;
+  for (let i = first; i <= last; i++) {
+    const block = blocks[i];
+    if (block.type !== 'paragraph') {
+      (open ? loose : out).push(block);
+      continue;
+    }
+    const pieces = flatten(block);
+    let from = 0;
+    let to = pieces.length;
+    if (i === first) {
+      from = startIndex(pieces, start);
+      caretOffset = offsetOf(pieces, from);
+      to = pieces.length;
+    }
+    if (i === last) to = caretIndex(pieces, end);
+    const struck = strikePieces(track, pieces, from, to);
+    let changed = struck.changed;
+    let content = struck.pieces;
+    if (open) {
+      content = open.pieces.concat(afterCut(open.pieces, content, track));
+      changed = true;
+    }
+    if (i < last && isOwnMark(block.props, track)) {
+      // The mark was a tracked insertion of this author: it goes, and the next paragraph continues this one.
+      open = { first: open ? open.first : block, pieces: content };
+      any = true;
+      continue;
+    }
+    let props = block.props;
+    // The mark that stays is the mark of this paragraph, whatever the paragraphs joined to it said of theirs.
+    if (open) props = withMarkFlagsOf(joinedProps(open.first, block), block.props);
+    if (i < last && !isDeletedMark(props)) {
+      props = withMarkRevision(props, 'deleted', track.revision());
+      changed = true;
+    }
+    if (changed) {
+      any = true;
+      out.push(paragraphWith(open ? open.first : block, rebuild(content), props));
+    } else out.push(block);
+    appendBlocks(out, loose);
+    loose = [];
+    open = undefined;
+  }
+  if (any) draft.replace(story, container, first, last - first + 1, out);
+  return { story, path: start.path.slice(), offset: caretOffset };
+}
+
+/**
  * Deletes the content of a range. The selection left is a caret where the
  * range began. A range that crosses the border of a table deletes what
  * expandRangeForTables() returns for it.
  */
-export function deleteRange(doc: DocModel, range: DocRange, _options?: DocEditOptions): DocEdit {
+export function deleteRange(doc: DocModel, range: DocRange, options?: DocEditOptions): DocEdit {
   const at = asRange(range);
-  return buildEdit(doc, (draft) => {
+  const build = (draft: Draft) => {
     const { start, end } = orderRange(at);
     resolvePosition(doc, start);
     resolvePosition(doc, end);
     return samePosition(start, end) ? start : deleteSpan(draft, start, end);
-  });
+  };
+  return buildEdit(doc, build, options, true);
 }
 
 /** Most paragraphs one insertion makes: a paste beyond this is refused rather than left half done. */
@@ -435,11 +521,12 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
   const inherited = inheritedProps(pieces, index, paragraph.props.markProps);
   const props = format ? patchRunProps(inherited, format, doc) : inherited;
   const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
-  const group = groupFor(pieces, index, props, wrap);
   const lines = text.split('\n');
   if (lines.length > MAX_INSERTED_PARAGRAPHS) bad('The text has too many paragraphs');
   const story = position.story;
   const side = position.before === true;
+  if (draft.track) return sided(doc, insertTracked(draft, draft.track, position, paragraph, pieces, index, lines, props, wrap), side);
+  const group = groupFor(pieces, index, props, wrap);
   const head = pieces.slice(0, index);
   appendPieces(head, textPieces(lines[0], props, wrap, group));
   if (lines.length === 1) {
@@ -462,6 +549,45 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
 }
 
 /**
+ * insertAt() where changes are tracked: the text goes into a tracked
+ * insertion (the one of the same author beside it, when there is one), and
+ * the mark of every paragraph the text ends says that it was inserted. In
+ * the file the mark that is new is the one of the first half of a paragraph
+ * that was cut, so that is where it is said.
+ */
+function insertTracked(draft: Draft, track: Tracking, position: DocPosition, paragraph: Paragraph, source: Piece[], index: number, lines: string[], props: RunProps, base: Wrapper | undefined): DocPosition {
+  const story = position.story;
+  const offset = offsetOf(source, index);
+  const placed = insertionWrap(track, source, index, base);
+  const pieces = placed.pieces;
+  const wrap = placed.wrap;
+  const head = pieces.slice(0, index);
+  appendPieces(head, textPieces(lines[0], props, wrap, groupFor(pieces, index, props, wrap)));
+  if (lines.length === 1) {
+    // A deletion or a move the text went into the middle of is two elements now: the second gets an id of its own.
+    appendPieces(head, afterCut(pieces.slice(0, index), pieces.slice(index), track, wrap));
+    draft.setParagraph(story, position.path, paragraphWith(paragraph, rebuild(head)));
+    return { story, path: position.path.slice(), offset: offset + lines[0].length };
+  }
+  const inner = withPlainMark(withoutSection(paragraph.props));
+  const ended = (): ParaProps => withMarkRevision(withFreshChanges(inner, track), 'inserted', track.revision());
+  const out: Block[] = [paragraphWith(paragraph, rebuild(head), ended())];
+  for (let i = 1; i < lines.length - 1; i++) {
+    const made = lines[i] === '' ? [] : textPieces(lines[i], props, insertionLike(track, wrap), {});
+    out.push(paragraphWith(paragraph, rebuild(made), ended(), false));
+  }
+  const lastLine = lines[lines.length - 1];
+  const tail = lastLine === '' ? [] : textPieces(lastLine, props, insertionLike(track, wrap), {});
+  // What follows the caret is in other elements now than what is before it.
+  appendPieces(tail, afterCut(head, pieces.slice(index), track));
+  out.push(paragraphWith(paragraph, rebuild(tail), paragraph.props, false));
+  const container = position.path.slice(0, -1);
+  const blockIndex = position.path[position.path.length - 1];
+  draft.replace(story, container, blockIndex, 1, out);
+  return { story, path: container.concat([blockIndex + lines.length - 1]), offset: lastLine.length };
+}
+
+/**
  * Types or pastes text at a position, or over a range (whose content goes
  * first). "\n" ends a paragraph, a tab character becomes a tab and a vertical
  * tab ("\v", Shift+Enter) a line break. The text takes the formatting of the
@@ -470,12 +596,12 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
  * beside a hyperlink takes); `format` is laid over that (the "bold is on" of
  * a caret that has no text yet).
  */
-export function insertText(doc: DocModel, at: DocPosition | DocRange, text: string, format?: RunFormatPatch, _options?: DocEditOptions): DocEdit {
+export function insertText(doc: DocModel, at: DocPosition | DocRange, text: string, format?: RunFormatPatch, options?: DocEditOptions): DocEdit {
   if (typeof text !== 'string') bad('The text to insert must be a string');
   const range = asRange(at);
   const clean = cleanText(text);
   const pending = format === null ? undefined : format;
-  return buildEdit(doc, (draft) => {
+  const build = (draft: Draft) => {
     const { start, end } = orderRange(range);
     resolvePosition(doc, start);
     resolvePosition(doc, end);
@@ -489,7 +615,8 @@ export function insertText(doc: DocModel, at: DocPosition | DocRange, text: stri
     if (!typing || nextCharOffset(clean, 0) !== clean.length || clean === '\n' || clean === '\t' || clean === '\v') return { selection };
     const space = clean === ' ' || clean === ' ';
     return { selection, mergeKey: 'type:' + start.story + ':' + start.path.join(','), seal: space };
-  });
+  };
+  return buildEdit(doc, build, options, true);
 }
 
 /** Joins the paragraph at `second` of a list of blocks onto the one at `first`; what lies between them (marks, kept XML) follows the joined paragraph. */
@@ -506,12 +633,45 @@ function joinParagraphs(draft: Draft, story: string, container: number[], first:
 }
 
 /**
+ * joinParagraphs() where changes are tracked. The two paragraphs stay two:
+ * the mark of the first says that it was deleted. A mark this author had
+ * inserted as a tracked change goes for good instead, and the paragraphs are
+ * joined. The caret is left where the deletion went: at the end of the
+ * first paragraph for Backspace, at the start of the second for Delete, also
+ * when the mark was deleted already.
+ */
+function strikeMark(draft: Draft, track: Tracking, story: string, container: number[], first: number, second: number, forward: boolean): DocPosition {
+  const blocks = containerBlocks(draft.doc, story, container);
+  const a = blocks[first] as Paragraph;
+  const b = blocks[second] as Paragraph;
+  const length = paragraphLength(a);
+  if (isOwnMark(a.props, track)) {
+    const head = flatten(a);
+    const pieces = head.concat(afterCut(head, flatten(b), track));
+    const out: Block[] = [paragraphWith(a, rebuild(pieces), withMarkFlagsOf(joinedProps(a, b), b.props))];
+    for (let i = first + 1; i < second; i++) out.push(blocks[i]);
+    draft.replace(story, container, first, second - first + 1, out);
+    return { story, path: container.concat([first]), offset: length };
+  }
+  if (!isDeletedMark(a.props)) draft.setParagraph(story, container.concat([first]), paragraphWith(a, a.children, withMarkRevision(a.props, 'deleted', track.revision())));
+  return forward ? { story, path: container.concat([second]), offset: 0 } : { story, path: container.concat([first]), offset: length };
+}
+
+/**
  * Removes the pieces [from, to) of a paragraph and returns the caret that
  * leaves. The pieces of `hints` go too when anything is removed: the stale
  * hints Backspace or Delete passed on its way to what it takes.
  */
 function removeFrom(draft: Draft, position: DocPosition, paragraph: Paragraph, pieces: Piece[], from: number, to: number, hints: Set<Piece>): DocPosition {
   const offset = offsetOf(pieces, from);
+  if (draft.track) {
+    const struck = strikePieces(draft.track, pieces, from, to);
+    if (struck.changed) {
+      const kept = hints.size ? struck.pieces.filter((piece) => !hints.has(piece)) : struck.pieces;
+      draft.setParagraph(position.story, position.path, paragraphWith(paragraph, rebuild(kept)));
+    }
+    return { story: position.story, path: position.path.slice(), offset };
+  }
   let left = removePieces(pieces, from, to);
   if (left.length !== pieces.length) {
     if (hints.size) left = left.filter((piece) => !hints.has(piece));
@@ -556,9 +716,9 @@ const checkUnit = (unit: unknown): void => {
  * else the paragraph joins the one before it. Nothing happens at the start of
  * a table cell or of the story, and after a table.
  */
-export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char' | 'word' = 'char', _options?: DocEditOptions): DocEdit {
+export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char' | 'word' = 'char', options?: DocEditOptions): DocEdit {
   checkUnit(unit);
-  return buildEdit(doc, (draft) => {
+  const build = (draft: Draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     const paragraph = at.paragraph;
@@ -580,6 +740,13 @@ export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char
       const from = boundary(pieces, begin, 'before');
       const to = boundary(pieces, end, 'after');
       return sided(doc, removeFrom(draft, position, paragraph, pieces, from, to, hints), side);
+    }
+    const track = draft.track;
+    if (track) {
+      // Leaving a list and taking back an indent are changes of formatting, which are not tracked: the mark before is deleted.
+      const previous = neighbour(at.blocks, at.index, -1);
+      if (previous < 0 || at.blocks[previous].type !== 'paragraph') return position;
+      return sided(doc, strikeMark(draft, track, position.story, at.container, previous, at.index, false), side);
     }
     const where = tableContextOf(doc, position.story, position.path);
     if (inList(doc, paragraph.props, where)) {
@@ -606,7 +773,8 @@ export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char
     const before = neighbour(at.blocks, at.index, -1);
     if (before < 0 || at.blocks[before].type !== 'paragraph') return position;
     return sided(doc, joinParagraphs(draft, position.story, at.container, before, at.index), side);
-  });
+  };
+  return buildEdit(doc, build, options, true);
 }
 
 /**
@@ -616,9 +784,9 @@ export function deleteBackward(doc: DocModel, position: DocPosition, unit: 'char
  * at the end of a table cell or of the story, and before a table. The caret
  * stays at the offset it had.
  */
-export function deleteForward(doc: DocModel, position: DocPosition, unit: 'char' | 'word' = 'char', _options?: DocEditOptions): DocEdit {
+export function deleteForward(doc: DocModel, position: DocPosition, unit: 'char' | 'word' = 'char', options?: DocEditOptions): DocEdit {
   checkUnit(unit);
-  return buildEdit(doc, (draft) => {
+  const build = (draft: Draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     const paragraph = at.paragraph;
@@ -644,8 +812,10 @@ export function deleteForward(doc: DocModel, position: DocPosition, unit: 'char'
     }
     const after = neighbour(at.blocks, at.index, 1);
     if (after < 0 || at.blocks[after].type !== 'paragraph') return position;
+    if (draft.track) return strikeMark(draft, draft.track, position.story, at.container, at.index, after, true);
     return sided(doc, joinParagraphs(draft, position.story, at.container, at.index, after), side);
-  });
+  };
+  return buildEdit(doc, build, options, true);
 }
 
 /**
@@ -660,11 +830,26 @@ export function deleteForward(doc: DocModel, position: DocPosition, unit: 'char'
  * this is Word's behaviour as documented and observed for headings; it was
  * not compared with Word for every kind of direct formatting (borders, tabs).
  */
-export function splitParagraph(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
-  return buildEdit(doc, (draft) => {
+export function splitParagraph(doc: DocModel, position: DocPosition, options?: DocEditOptions): DocEdit {
+  const build = (draft: Draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     const paragraph = at.paragraph;
+    const track = draft.track;
+    if (track) {
+      // Leaving a list and taking the style that follows a heading are changes of formatting, which are not
+      // tracked: both halves keep what the paragraph had, and the mark of the first says that it was inserted.
+      const all = flatten(paragraph);
+      const cut = caretIndex(all, position);
+      const list = position.path.slice(0, -1);
+      const nth = position.path[position.path.length - 1];
+      const head = all.slice(0, cut);
+      draft.replace(position.story, list, nth, 1, [
+        paragraphWith(paragraph, rebuild(head), withMarkRevision(withFreshChanges(withPlainMark(withoutSection(paragraph.props)), track), 'inserted', track.revision())),
+        paragraphWith(paragraph, rebuild(afterCut(head, all.slice(cut), track)), paragraph.props, false),
+      ]);
+      return sided(doc, { story: position.story, path: list.concat([nth + 1]), offset: 0 }, position.before === true);
+    }
     const where = tableContextOf(doc, position.story, position.path);
     if (at.length === 0 && inList(doc, paragraph.props, where)) {
       draft.setParagraph(position.story, position.path, paragraphWith(paragraph, paragraph.children, withoutNumbering(doc, paragraph.props, where)));
@@ -693,7 +878,8 @@ export function splitParagraph(doc: DocModel, position: DocPosition, _options?: 
       paragraphWith(paragraph, rebuild(pieces.slice(index)), second, false),
     ]);
     return sided(doc, { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 }, position.before === true);
-  });
+  };
+  return buildEdit(doc, build, options, true);
 }
 
 const PAGE_BREAK_ITEM: RunItem = Object.freeze({ type: 'break' as const, kind: 'page' as const });
@@ -704,26 +890,35 @@ const PAGE_BREAK_ITEM: RunItem = Object.freeze({ type: 'break' as const, kind: '
  * Refused inside a table cell. UNSURE: Word does not put a page break into a
  * cell; it splits the table at the row instead, which is not done here.
  */
-export function insertPageBreak(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
-  return buildEdit(doc, (draft) => {
+export function insertPageBreak(doc: DocModel, position: DocPosition, options?: DocEditOptions): DocEdit {
+  const build = (draft: Draft) => {
     const at = resolvePosition(doc, position);
     if (inTextBox(position.path)) bad('The content of a text box cannot be edited');
     if (position.path.length > 1) bad('A page break cannot be put into a table cell');
     const paragraph = at.paragraph;
-    const pieces = flatten(paragraph);
+    let pieces = flatten(paragraph);
     const index = caretIndex(pieces, position);
     const props = inheritedProps(pieces, index, paragraph.props.markProps);
-    const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+    let wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+    const track = draft.track;
+    if (track) {
+      // The break is a tracked insertion, and so is the mark of the paragraph it ends.
+      const placed = insertionWrap(track, pieces, index, wrap);
+      pieces = placed.pieces;
+      wrap = placed.wrap;
+    }
     const head = pieces.slice(0, index);
     head.push(itemPiece(PAGE_BREAK_ITEM, props, wrap, groupFor(pieces, index, props, wrap)));
     const container = position.path.slice(0, -1);
     const blockIndex = position.path[position.path.length - 1];
+    const firstProps = withoutSection(paragraph.props);
     draft.replace(position.story, container, blockIndex, 1, [
-      paragraphWith(paragraph, rebuild(head), withoutSection(paragraph.props)),
-      paragraphWith(paragraph, rebuild(pieces.slice(index)), paragraph.props, false),
+      paragraphWith(paragraph, rebuild(head), track ? withMarkRevision(withFreshChanges(withPlainMark(firstProps), track), 'inserted', track.revision()) : firstProps),
+      paragraphWith(paragraph, rebuild(track ? afterCut(head, pieces.slice(index), track) : pieces.slice(index)), paragraph.props, false),
     ]);
     return sided(doc, { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 }, position.before === true);
-  });
+  };
+  return buildEdit(doc, build, options, true);
 }
 
 /**
@@ -778,11 +973,13 @@ export function placeBlock(draft: Draft, position: DocPosition, block: Block): n
 }
 
 /** Inserts a block (a paragraph, a table) at a position; see placeBlock. The caret goes to the start of the block, or of what follows it when it holds no paragraph. */
-export function insertBlock(doc: DocModel, position: DocPosition, block: Block, _options?: DocEditOptions): DocEdit {
-  return buildEdit(doc, (draft) => {
+export function insertBlock(doc: DocModel, position: DocPosition, block: Block, options?: DocEditOptions): DocEdit {
+  const build = (draft: Draft) => {
     const index = placeBlock(draft, position, block);
     const container = position.path.slice(0, -1);
     const path = paragraphIn(containerBlocks(doc, position.story, container), container, index, 1);
     return path ? { story: position.story, path, offset: 0 } : position;
-  });
+  };
+  // A block put in whole is not made a tracked insertion yet: refused where changes are tracked.
+  return buildEdit(doc, build, options);
 }

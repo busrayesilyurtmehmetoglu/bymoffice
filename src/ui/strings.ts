@@ -96,6 +96,12 @@ export interface UiStrings {
   /** Label of the field that takes what is typed. */
   documentEditor: string;
   cannotEditHere: string;
+  /** Said when a change is refused because the document tracks its changes and this kind of change cannot be tracked yet. */
+  cannotTrackChange: string;
+  /** Said once for a document whose protection keeps it read-only; `kind` is "readOnly", "comments" or "forms". */
+  protectedDocument(kind: string): string;
+  /** Said after a copy was pasted as text alone because changes are tracked. */
+  pastedAsText: string;
   cannotCutObjects: string;
   cannotWriteClipboard: string;
   /** A copy made in an editor of the page does not fit where it is pasted. */
@@ -239,6 +245,14 @@ export const STRINGS_EN: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Chart' : kind === 'diagram' ? 'Diagram' : kind === 'object' ? 'Embedded object' : kind === 'picture' ? 'Picture' : 'Drawing'),
   documentEditor: 'Document editor',
   cannotEditHere: 'This part of the document cannot be edited',
+  cannotTrackChange: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed',
+  protectedDocument: (kind) =>
+    kind === 'comments'
+      ? 'This document is protected: only comments are allowed. It is shown read-only'
+      : kind === 'forms'
+        ? 'This document is protected: only its form fields may be filled in. It is shown read-only'
+        : 'This document is protected against changes. It is shown read-only',
+  pastedAsText: 'Changes are tracked in this document: the copy was pasted as text, without its formatting and pictures',
   cannotCutObjects: 'The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place',
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
   cannotPasteHere: 'What was copied cannot be pasted here',
@@ -365,6 +379,14 @@ export const STRINGS_TR: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Grafik' : kind === 'diagram' ? 'Diyagram' : kind === 'object' ? 'Gömülü nesne' : kind === 'picture' ? 'Görsel' : 'Çizim'),
   documentEditor: 'Belge düzenleyici',
   cannotEditHere: 'Belgenin bu bölümü düzenlenemez',
+  cannotTrackChange: 'Bu belgede değişiklikler izleniyor ve bu tür değişiklik henüz izlenemiyor; hiçbir şey değiştirilmedi',
+  protectedDocument: (kind) =>
+    kind === 'comments'
+      ? 'Bu belge korumalı: yalnız yorum eklenebilir. Salt okunur gösteriliyor'
+      : kind === 'forms'
+        ? 'Bu belge korumalı: yalnız form alanları doldurulabilir. Salt okunur gösteriliyor'
+        : 'Bu belge değişikliğe karşı korumalı. Salt okunur gösteriliyor',
+  pastedAsText: 'Bu belgede değişiklikler izleniyor: kopya biçimi ve görselleri olmadan, metin olarak yapıştırıldı',
   cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (dipnot, denklem, metin kutusu, içerik denetimi, izlenen değişiklik); yerinde bırakıldı',
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',
   cannotPasteHere: 'Kopyalanan içerik buraya yapıştırılamıyor',

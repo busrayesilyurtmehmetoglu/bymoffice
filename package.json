@@ -2,6 +2,7 @@
   "name": "bymoffice",
   "version": "0.0.1",
   "private": true,
+  "license": "MIT",
   "description": "Word and Excel viewer/editor engine, embeddable from a CDN",
   "type": "module",
   "keywords": [
@@ -34,7 +35,8 @@
   },
   "files": [
     "dist",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.json && node scripts/fix-types.mjs",

@@ -166,7 +166,7 @@ export function insertRow(doc: DocModel, position: DocPosition, where: 'above' |
     rows.splice(at, 0, row);
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows)]);
     return cellStart(doc, site, at, site.cell);
-  });
+  }, _options);
 }
 
 /** What removed rows or cells leave behind (see harvestBlocks): inlines for a paragraph that stays, and blocks without content. */
@@ -287,7 +287,7 @@ export function deleteRow(doc: DocModel, position: DocPosition, _options?: DocEd
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows)]);
     const row = Math.min(site.row, rows.length - 1);
     return cellStart(doc, site, row, Math.min(site.cell, rows[row].cells.length - 1));
-  });
+  }, _options);
 }
 
 function widened(props: TableProps, by: number): TableProps {
@@ -355,7 +355,7 @@ export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' 
     }
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows, grid, widened(table.props, width))]);
     return cellStart(doc, site, site.row, side === 'left' ? site.cell : site.cell + 1);
-  });
+  }, _options);
 }
 
 /**
@@ -436,7 +436,7 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows, grid, widened(table.props, -widthOf(start, end)))]);
     const row = caretRow >= 0 ? caretRow : Math.min(site.row, rows.length - 1);
     return cellStart(doc, site, row, Math.min(site.cell, rows[row].cells.length - 1));
-  });
+  }, _options);
 }
 
 const SINGLE: Border = Object.freeze({ style: 'single', size: 4, space: 0, color: Object.freeze({ auto: true }) });
@@ -492,7 +492,7 @@ export function insertTable(doc: DocModel, position: DocPosition, rows: number, 
     }
     const index = placeBlock(draft, position, { type: 'table', props, grid, rows: list });
     return { story: position.story, path: position.path.slice(0, -1).concat([index, 0, 0, 0]), offset: 0 };
-  });
+  }, _options);
 }
 
 // ------------------------------------------------------------------ hyperlinks
@@ -611,7 +611,7 @@ export function insertHyperlink(doc: DocModel, range: DocRange, address: string,
     const last = offsetOf(pieces, to);
     draft.setParagraph(story, start.path, paragraphWith(paragraph, rebuild(pieces)));
     return { anchor: { story, path: start.path.slice(), offset: first }, focus: { story, path: start.path.slice(), offset: last } };
-  });
+  }, _options);
 }
 
 // -------------------------------------------------------------------- pictures
@@ -859,5 +859,5 @@ export function insertImage(doc: DocModel, position: DocPosition, image: NewImag
     pieces.splice(index, 0, itemPiece(item, props, wrap, groupFor(pieces, index, props, wrap)));
     draft.setParagraph(story, position.path, paragraphWith(paragraph, rebuild(pieces)));
     return { story, path: position.path.slice(), offset: offsetOf(pieces, index) };
-  });
+  }, options);
 }

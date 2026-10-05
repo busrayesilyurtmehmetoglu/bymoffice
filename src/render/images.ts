@@ -222,7 +222,8 @@ export class ImageStore {
     });
     this.entries.clear();
     this.queue.length = 0;
-    for (let i = 0; i < this.urls.length; i++) URL.revokeObjectURL(this.urls[i]);
+    // A picture that is still being decoded keeps its address until the decode ends (see decode): taking it
+    // away under the image element is a failed load, which browsers report on the console.
     this.urls.length = 0;
     this.total = 0;
   }
@@ -369,14 +370,18 @@ export class ImageStore {
       const finish = (ok: boolean) => {
         element.onload = element.onerror = null;
         const index = this.urls.indexOf(url);
-        if (index >= 0) {
-          // The decoded picture stays usable after its address is given back.
-          this.urls.splice(index, 1);
-          URL.revokeObjectURL(url);
-        }
+        if (index >= 0) this.urls.splice(index, 1);
+        // The decoded picture stays usable after its address is given back; a store that was destroyed
+        // meanwhile gives it back here too.
+        URL.revokeObjectURL(url);
         const release = () => {
           element.removeAttribute('src');
         };
+        if (this.destroyed) {
+          release();
+          resolve(null);
+          return;
+        }
         resolve(ok ? this.fitted(element, element.naturalWidth, element.naturalHeight, release, target, limit) : null);
       };
       element.onload = () => finish(true);

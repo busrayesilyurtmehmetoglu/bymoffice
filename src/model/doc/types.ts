@@ -1148,6 +1148,10 @@ export interface DocSettings {
   mirrorMargins: boolean;
   autoHyphenation: boolean;
   trackRevisions: boolean;
+  /** <w:documentProtection>: what the document allows to be edited. Absent when the file states none. */
+  protection?: DocProtection;
+  /** <w:writeProtection> as read: a recommendation to open the document read-only. Kept, never applied. */
+  writeProtection?: XmlElement;
   /** Theme colour name ("bg1", "t1", "accent1", ...) -> scheme slot ("lt1", "dk1", ...). */
   colorMap: Map<string, string>;
   themeFontLang?: Language;
@@ -1155,6 +1159,23 @@ export interface DocSettings {
   compat: Map<string, boolean>;
   /** <w:compatSetting> values by name ("compatibilityMode" -> "15"). */
   compatSettings: Map<string, string>;
+}
+
+/** <w:documentProtection>. The engine neither checks the password nor removes the protection. */
+export interface DocProtection {
+  /**
+   * w:edit as written: "readOnly", "comments", "trackedChanges", "forms",
+   * "none", or whatever else a file says; "" when the file gives none.
+   */
+  edit: string;
+  /** w:enforcement: the protection applies. A protection that is not enforced is only kept. */
+  enforced: boolean;
+  /**
+   * The element as read from a docx, with the attributes of the password
+   * hash: what a writer puts back. A protection read from a doc or RTF file
+   * has none, and is written without a password.
+   */
+  xml?: XmlElement;
 }
 
 export interface FontInfo {
@@ -1254,6 +1275,61 @@ export function defaultSettings(): DocSettings {
     compat: new Map(),
     compatSettings: new Map(),
   };
+}
+
+/**
+ * What an enforced protection of the document restricts editing to; undefined
+ * when nothing is enforced, and for a protection that states no kind of
+ * editing (one that only restricts formatting). An enforced protection of a
+ * kind that is not known counts as "readOnly", the strictest.
+ */
+export function enforcedProtection(doc: { settings: DocSettings }): 'readOnly' | 'comments' | 'forms' | 'trackedChanges' | undefined {
+  const protection = doc.settings ? doc.settings.protection : undefined;
+  if (!protection || !protection.enforced) return undefined;
+  const edit = protection.edit;
+  // Without w:edit the protection restricts formatting only, which restricts nothing here.
+  if (edit === 'none' || edit === '') return undefined;
+  return edit === 'comments' || edit === 'forms' || edit === 'trackedChanges' ? edit : 'readOnly';
+}
+
+/** Does the document ask for its changes to be tracked: by its own setting, or by a protection that allows nothing else. */
+export function tracksChanges(doc: { settings: DocSettings }): boolean {
+  return (doc.settings !== undefined && doc.settings.trackRevisions === true) || enforcedProtection(doc) === 'trackedChanges';
+}
+
+function blocksHavePermissions(blocks: Block[], depth: number): boolean {
+  if (depth > 64) return false;
+  for (const block of blocks) {
+    if (block.type === 'mark') {
+      if (block.mark.type === 'permStart') return true;
+    } else if (block.type === 'paragraph') {
+      for (const inline of block.children) if (inline.type === 'permStart') return true;
+    } else if (block.type === 'table') {
+      for (const row of block.rows) for (const cell of row.cells) if (blocksHavePermissions(cell.blocks, depth + 1)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Does the document mark ranges that its protection leaves open for editing
+ * (<w:permStart>). The source text of each part answers for a document read
+ * from a docx; the model is searched for the others.
+ */
+export function hasPermissionRanges(doc: DocModel): boolean {
+  const stories: { source: string; blocks?: Block[]; items?: Map<number, { blocks: Block[] }> }[] = [doc.body];
+  doc.headers.forEach((story) => stories.push(story));
+  doc.footers.forEach((story) => stories.push(story));
+  for (const collection of [doc.footnotes, doc.endnotes, doc.comments]) if (collection) stories.push(collection);
+  for (const story of stories) {
+    if (story.source) {
+      if (story.source.indexOf(':permStart') >= 0 || story.source.indexOf('<permStart') >= 0) return true;
+      continue;
+    }
+    if (story.blocks && blocksHavePermissions(story.blocks, 0)) return true;
+    if (story.items) for (const item of story.items.values()) if (blocksHavePermissions(item.blocks, 0)) return true;
+  }
+  return false;
 }
 
 /** The wrapper of the given kind around an item, innermost first; undefined when there is none. */

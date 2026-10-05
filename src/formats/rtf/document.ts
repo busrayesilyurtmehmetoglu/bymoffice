@@ -2150,6 +2150,12 @@ export class RtfReader {
     settings.mirrorMargins = dop.mirrorMargins;
     settings.autoHyphenation = dop.autoHyphenation;
     settings.trackRevisions = dop.trackRevisions;
+    // "\enforceprot1" applies the protection "\protlevel" (or an older word) names; "\enforceprot0" keeps it without
+    // applying it. A file that does not say either way is protected when it uses one of the older words, as files
+    // written before "\enforceprot" existed do; a level alone protects nothing. UNSURE: from the RTF specification
+    // (1.9.1), not compared with files Word protected.
+    const kind = dop.enforceProtection === undefined ? dop.protection : dop.protectionLevel || dop.protection;
+    if (kind !== undefined) settings.protection = { edit: kind, enforced: dop.enforceProtection !== false };
     if (this.store.media.size) model.media = this.store.media;
     return model;
   }

@@ -494,6 +494,12 @@ const DOCUMENT_WORDS = [
   'hyphauto',
   'revisions',
   'pgnstart',
+  'formprot',
+  'revprot',
+  'annotprot',
+  'readprot',
+  'enforceprot',
+  'protlevel',
 ];
 for (const word of DOCUMENT_WORDS) {
   WORDS.set(word, (r, param, hasParam, name) => {

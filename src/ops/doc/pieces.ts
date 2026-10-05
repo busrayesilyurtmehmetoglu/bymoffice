@@ -549,7 +549,8 @@ function joinTexts(items: RunItem[], codes: boolean[] | undefined): { items: Run
   return out ? { items: out, codes: flags } : { items, codes };
 }
 
-function makeRun(pieces: Piece[], from: number, to: number): Run {
+/** The run the item pieces [from, to) make: the run they came from when nothing happened to it. */
+export function makeRun(pieces: Piece[], from: number, to: number): Run {
   const first = pieces[from];
   const origin = (first.group as Run).type === 'run' ? (first.group as Run) : undefined;
   if (origin && to - from === origin.content.length && origin.props === first.props && origin.wrap === first.wrap) {

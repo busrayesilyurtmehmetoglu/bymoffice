@@ -13,7 +13,7 @@ import {
 } from '../../model/doc/types';
 import { localName, type XmlDocument, type XmlElement } from '../../xml';
 import { parseThemeColors } from '../xlsx/styles';
-import { anyAttr, attr, kindOf, onOff, relAttr, utwipsAttr, type PartContext } from './common';
+import { anyAttr, attr, boolAttr, kindOf, onOff, relAttr, utwipsAttr, type PartContext } from './common';
 
 /** More fonts than this in a font table is not a genuine file. */
 export const MAX_FONTS = 20000;
@@ -111,6 +111,16 @@ export function parseSettings(ctx: PartContext, root: XmlElement | undefined): D
         if (value !== undefined) settings[kind] = value;
         break;
       }
+      case 'documentProtection': {
+        // The first one counts; the part itself is never rewritten, so nothing of a second one is lost.
+        if (settings.protection) break;
+        const edit = attr(ctx, node, 'edit');
+        settings.protection = { edit: edit === undefined ? '' : edit, enforced: boolAttr(ctx, node, 'enforcement') === true, xml: node };
+        break;
+      }
+      case 'writeProtection':
+        if (!settings.writeProtection) settings.writeProtection = node;
+        break;
       case 'themeFontLang': {
         settings.themeFontLang = {};
         for (const name of ['val', 'eastAsia', 'bidi'] as const) {

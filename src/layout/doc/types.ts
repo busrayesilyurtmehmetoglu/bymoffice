@@ -50,6 +50,12 @@ export interface TextItem {
   color: string;
   underline?: { color: string; style: string };
   strike?: boolean | 'double';
+  /**
+   * The text was deleted (or moved away) by a tracked change: it is shown,
+   * struck through, and is no part of the text of the document (it has no
+   * `source`). Whoever reads the page as text leaves it out.
+   */
+  deleted?: true;
   /** Background behind the text (highlight or run shading), "#RRGGBB". */
   highlight?: string;
   /** Target of a hyperlink, already passed through safeHyperlinkTarget. */

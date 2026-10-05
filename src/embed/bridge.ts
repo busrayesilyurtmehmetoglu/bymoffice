@@ -7,7 +7,7 @@ import { createBlank } from '../formats/blank';
 import { needsConversion, openConverted } from '../formats/convert';
 import { documentPictures } from '../model/doc/pictures';
 import type { OfficeFile } from '../index';
-import type { DocModel } from '../model/doc/types';
+import { enforcedProtection, hasPermissionRanges, tracksChanges, type DocModel } from '../model/doc/types';
 import { cellName, rangeName, type Workbook } from '../model/sheet/types';
 import type { DocumentEditorOptions } from '../ui/doc-editor';
 import type { DocumentViewOptions } from '../ui/doc-view';
@@ -551,6 +551,9 @@ export function createBridge(host: BridgeHost): Bridge {
     const blank = field<string>(message, 'blank', 'string', false);
     const convert = field<boolean>(message, 'convert', 'boolean', false);
     const toolbar = field<boolean>(message, 'toolbar', 'boolean', false);
+    const author = field<string>(message, 'author', 'string', false);
+    const trackChanges = field<boolean>(message, 'trackChanges', 'boolean', false);
+    if (author !== undefined && author.length > 255) throw new BadMessage('"author" is too long');
     if ((data === undefined ? 0 : 1) + (url === undefined ? 0 : 1) + (blank === undefined ? 0 : 1) !== 1) {
       throw new BadMessage('"load" needs exactly one of "data", "url" and "blank"');
     }
@@ -643,8 +646,10 @@ export function createBridge(host: BridgeHost): Bridge {
       return refuse(error instanceof Error && error.name === 'UnsupportedFileError' ? 'unsupported' : 'corrupt', errorText(error));
     }
     if (overtaken()) return;
+    // What the document enforces: a protection for comments or forms allows no editing here, as the read-only one.
+    const protection = doc ? enforcedProtection(doc) : undefined;
     // Only docx and xlsx are written back with their changes; the other formats stay read-only until they are converted.
-    const locked = needsConversion(file.format);
+    const locked = needsConversion(file.format) || (protection !== undefined && protection !== 'trackedChanges');
 
     const loaded = (activeSheet: number, sheets: unknown[], document: boolean) => {
       const out: Message = { type: 'loaded' };
@@ -657,6 +662,12 @@ export function createBridge(host: BridgeHost): Bridge {
       if (locked) out.readOnly = true;
       if (convertedFrom !== undefined) out.convertedFrom = convertedFrom;
       if (warnings !== undefined) out.warnings = warnings;
+      if (doc) {
+        // Why the document is read-only, or that its changes are tracked.
+        if (protection !== undefined) out.protection = protection;
+        if (protection !== undefined && hasPermissionRanges(doc)) out.protectionExceptions = true;
+        if (!locked && (trackChanges === true || tracksChanges(doc))) out.trackChanges = true;
+      }
       send(out);
     };
 
@@ -678,6 +689,8 @@ export function createBridge(host: BridgeHost): Bridge {
         },
       };
       if (locale !== undefined) documentOptions.locale = locale;
+      if (author !== undefined) documentOptions.author = author;
+      if (trackChanges === true) documentOptions.trackChanges = true;
       const create = (toolbar === true && host.createDocumentEditor) || (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>);
       closeShown();
       try {

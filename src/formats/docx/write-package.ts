@@ -742,13 +742,45 @@ export function docDefaultsText(ctx: BodyContext, styles: DocStyles): string {
 
 const COMPAT_URI = 'http://schemas.microsoft.com/office/word';
 
+/**
+ * <w:documentProtection> for a new package. The element a docx was read with
+ * goes back with every attribute it names by the prefix of the element (the
+ * password hash among them); a protection without one (read from a doc or RTF
+ * file) is written as its kind and whether it is enforced, without a password.
+ */
+function protectionElement(ctx: BodyContext, settings: DocModel['settings']): XmlElement | undefined {
+  const protection = settings.protection;
+  if (!protection) return undefined;
+  if (protection.xml) return keptAttrs(ctx, 'documentProtection', protection.xml);
+  const attrs: [string, string][] = [];
+  if (protection.edit !== '') attrs.push(['edit', protection.edit]);
+  attrs.push(['enforcement', protection.enforced ? '1' : '0']);
+  return wEl(ctx, 'documentProtection', attrs);
+}
+
+/** An element of the settings with the attributes it was read with, those it names by its own prefix. */
+function keptAttrs(ctx: BodyContext, local: string, xml: XmlElement): XmlElement {
+  const attrs: [string, string][] = [];
+  const colon = xml.name.indexOf(':');
+  const prefix = colon < 0 ? '' : xml.name.slice(0, colon + 1);
+  xml.attrs.forEach((value, name) => {
+    const at = name.indexOf(':');
+    // An attribute of another namespace has no declaration in the new part.
+    if (at < 0 || name.slice(0, at + 1) === prefix) attrs.push([name.slice(at + 1), value]);
+  });
+  return wEl(ctx, local, attrs);
+}
+
 /** Inner XML of <w:settings> for a new package. Notes that are separators are listed, as Word does. */
 export function settingsText(ctx: BodyContext, doc: DocModel): string {
   const s = doc.settings;
   const out: XmlElement[] = [];
   // In the order of CT_Settings.
+  if (s.writeProtection) out.push(keptAttrs(ctx, 'writeProtection', s.writeProtection));
   if (s.mirrorMargins) out.push(wEl(ctx, 'mirrorMargins'));
   if (s.trackRevisions) out.push(wEl(ctx, 'trackRevisions'));
+  const protection = protectionElement(ctx, s);
+  if (protection) out.push(protection);
   out.push(wEl(ctx, 'defaultTabStop', [['val', s.defaultTabStop]]));
   if (s.autoHyphenation) out.push(wEl(ctx, 'autoHyphenation'));
   if (s.evenAndOddHeaders) out.push(wEl(ctx, 'evenAndOddHeaders'));

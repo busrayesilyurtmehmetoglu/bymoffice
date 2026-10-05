@@ -17,7 +17,7 @@ import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
 import * as ops from '../ops/doc/index';
 import type { DocEdit, DocPosition, DocRange, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
-import { findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
+import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
 import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
@@ -91,6 +91,17 @@ export interface DocumentViewOptions {
    * Without it, `package.hasPart` is asked when the package has one.
    */
   partTaken?(part: string): boolean;
+  /**
+   * Tracks the changes made in the view although the document does not ask
+   * for it. A document that asks for it (its "track changes" setting, or a
+   * protection that allows only tracked changes) is always edited with
+   * tracked changes; false does not turn that off.
+   */
+  trackChanges?: boolean;
+  /** Who is editing: the author tracked changes name. Default "Author". */
+  author?: string;
+  /** The clock tracked changes take their date from (tests). Default: the system's. */
+  now?(): Date;
 }
 
 export interface DocumentViewState {
@@ -703,6 +714,10 @@ export class DocumentView {
   private handleFixed: DocPosition | undefined;
   private inputPlace = '';
   private viewport: { addEventListener(type: string, listener: () => void): void; removeEventListener(type: string, listener: () => void): void } | undefined;
+  /** The protection of the document that keeps the view read-only, whatever is asked of it. */
+  private readonly lock: 'readOnly' | 'comments' | 'forms' | undefined;
+  /** The user was told why the document cannot be edited. */
+  private lockTold = false;
 
   constructor(container: HTMLElement, doc: DocModel, options: DocumentViewOptions = {}) {
     this.container = container;
@@ -713,7 +728,11 @@ export class DocumentView {
     const coarse = coarsePointer();
     this.maxCanvasPixels = coarse ? MAX_CANVAS_PIXELS_COARSE : MAX_CANVAS_PIXELS;
 
-    this.editable = options.readOnly === false;
+    // A protection that allows comments or form fields only is one that allows no editing here: the view has neither.
+    const protection = enforcedProtection(doc);
+    this.lock = protection !== undefined && protection !== 'trackedChanges' ? protection : undefined;
+    this.editable = options.readOnly === false && this.lock === undefined;
+    ops.setTracking(doc, { force: options.trackChanges === true, author: typeof options.author === 'string' ? options.author : undefined, now: typeof options.now === 'function' ? options.now : undefined });
     this.history = new ops.DocHistory<DocRange | undefined>(doc);
     this.painter = new CanvasTextMeasurer({ fonts: doc.fonts });
     this.measurer = options.measurer || this.painter;
@@ -871,6 +890,8 @@ export class DocumentView {
       this.destroy();
       throw error;
     }
+    // Editing was asked for and the protection of the document does not allow it.
+    if (options.readOnly === false) this.tellLock();
   }
 
   // ---------------------------------------------------------------- public
@@ -1869,7 +1890,8 @@ export class DocumentView {
     const items = page.items;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      if (item.type !== 'text') continue;
+      // Text a tracked change deleted is on the page, struck through, but it is not text of the document.
+      if (item.type !== 'text' || item.deleted) continue;
       if (previous && Math.abs(item.y - lineY) > 0.5 && !(previous.source && sameSource(previous, item) && line.length > 0 && /\s$/.test(line))) {
         // A new line on the page is a new line of text, except inside a paragraph that just wrapped.
         lines.push(line);
@@ -2278,7 +2300,9 @@ export class DocumentView {
       else {
         try {
           slice = this.selectionSlice();
-          if (cutLoses(this.document, range, slice)) refused = this.strings.cannotCutObjects;
+          // A tracked deletion takes nothing out of the document but text the same author typed, which the
+          // clipboard holds as text: there is nothing more the clipboard has to hold for it.
+          if (!this.trackingChanges && cutLoses(this.document, range, slice)) refused = this.strings.cannotCutObjects;
         } catch (error) {
           event.preventDefault();
           this.refuse(error);
@@ -2296,7 +2320,7 @@ export class DocumentView {
     // Nothing goes out of the field itself either way.
     event.preventDefault();
     if (!deleting || !range) return;
-    if (written !== 'rich' && slice) {
+    if (written !== 'rich' && slice && !this.trackingChanges) {
       // The mark of the copy did not reach the clipboard: what a paste gets is the text, so the cut is judged as one of text.
       let loses = true;
       try {
@@ -2705,9 +2729,39 @@ export class DocumentView {
     return !this.editable;
   }
 
-  /** Turns editing on or off. The pages are laid out again when it is turned on for the first time. */
+  /**
+   * What the protection of the document enforces: "readOnly", "comments" or
+   * "forms" (the view is read-only and stays so), "trackedChanges" (every
+   * change is tracked); undefined for a document that enforces none.
+   */
+  get protection(): 'readOnly' | 'comments' | 'forms' | 'trackedChanges' | undefined {
+    return enforcedProtection(this.document);
+  }
+
+  /** Whether the changes made in the view are tracked: the document asks for it, or the options of the view do. */
+  get trackingChanges(): boolean {
+    return ops.isTracking(this.document);
+  }
+
+  /** Says, once, why the document cannot be edited. */
+  private tellLock(): void {
+    if (this.lockTold || this.lock === undefined) return;
+    this.lockTold = true;
+    this.notify(this.strings.protectedDocument(this.lock), 'info');
+  }
+
+  /**
+   * Turns editing on or off. The pages are laid out again when it is turned
+   * on for the first time. A document whose protection allows no editing
+   * stays read-only (see `protection`).
+   */
   setReadOnly(readOnly: boolean): void {
-    if (this.destroyed || this.editable === !readOnly) return;
+    if (this.destroyed) return;
+    if (!readOnly && this.lock !== undefined) {
+      this.tellLock();
+      return;
+    }
+    if (this.editable === !readOnly) return;
     this.typing.commit();
     this.history.seal();
     this.hideTouchTools();
@@ -2809,7 +2863,8 @@ export class DocumentView {
       } catch {
         empty = false;
       }
-      if (empty && this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true)) return true;
+      // Where changes are tracked the mark is left alone (its formatting cannot be tracked yet): the text typed next takes the formatting.
+      if (empty && !this.trackingChanges && this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true)) return true;
       // Checked now, so that a patch that is not valid is refused here and not at the next key.
       try {
         ops.patchRunProps({}, patch);
@@ -2994,7 +3049,7 @@ export class DocumentView {
   /** A place that cannot be edited is not an error of the program: said, and nothing happens. */
   private refuse(error: unknown): void {
     if (!(error instanceof RangeError)) throw error;
-    this.notify(this.strings.cannotEditHere, 'info');
+    this.notify(error.message === ops.TRACK_UNSUPPORTED ? this.strings.cannotTrackChange : this.strings.cannotEditHere, 'info');
   }
 
   /** First (-1) or last (1) place of the story the caret is in. */
@@ -3754,6 +3809,13 @@ export class DocumentView {
    * the document it came from is pasted once they are there.
    */
   private pasteCopy(copy: StoredCopy, waited: boolean): void {
+    if (this.trackingChanges) {
+      // Formatting, pictures and tables are not made tracked insertions yet: the text of the copy is, and the user is told.
+      if (!this.editable || !this.range() || copy.text === '') return;
+      this.pasteText(copy.text);
+      this.notify(this.strings.pastedAsText, 'info');
+      return;
+    }
     const asked = this.range();
     const fragment = copy.slice.fragment;
     if (!fragment) {

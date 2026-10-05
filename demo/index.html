@@ -121,7 +121,14 @@
 
       <section id="doc-section" hidden>
         <h2>Belge görünümü</h2>
+        <div class="row" style="margin: 0 0 10px">
+          <label title="İzlenen değişikliklerde (w:ins / w:del) yazar adı olarak yazılır. Belge izleme istiyorsa (ayarı açık ya da 'yalnız izlenen değişiklik' korumalı) düzenlemeler bu adla izlenir.">Yazar adı (izlenen değişiklikler için)
+            <input type="text" id="doc-author" value="Deneme Kullanıcısı" maxlength="255" />
+          </label>
+          <span class="muted">Ad, bir sonraki dosya açılışında geçerli olur.</span>
+        </div>
         <p class="muted" id="doc-note"></p>
+        <p class="muted" id="doc-state"></p>
         <div id="doc"></div>
         <p class="muted" id="doc-info" style="margin: 10px 0 0"></p>
         <p class="muted">
@@ -281,6 +288,7 @@
         const section = $('doc-section');
         section.hidden = false;
         $('doc-note').textContent = '';
+        $('doc-state').textContent = '';
         $('doc-info').textContent = '';
         try {
           const started = performance.now();
@@ -292,6 +300,7 @@
             package: BymOffice.documentPictures(model, record.file.package),
             locale: 'tr',
             readOnly: false,
+            author: $('doc-author').value,
             onPageChange: (page, count) => {
               $('doc-info').textContent = `Sayfa ${page} / ${count}${docView && !docView.layoutDone ? ' (sayfalar hazırlanıyor)' : ''} · yakınlaştırma %${Math.round((docView ? docView.zoom : 1) * 100)}`;
             },
@@ -302,6 +311,14 @@
           docView = docEditor.view;
           window.__docView = docView;
           $('doc-note').textContent = `Model ${ms.toFixed(1)} ms'de okundu, ilk sayfalar ${(performance.now() - painted).toFixed(1)} ms'de çizildi.`;
+          // What the document enforces, and whether the edits made here are tracked.
+          const protection = docView.protection;
+          const kinds = { readOnly: 'değişikliğe karşı korumalı', comments: 'yalnız yoruma açık', forms: 'yalnız form doldurmaya açık', trackedChanges: 'yalnız izlenen değişikliğe açık' };
+          $('doc-state').textContent =
+            (protection ? `Belge koruması: ${kinds[protection]}${docView.readOnly ? ' (salt okunur gösteriliyor)' : ''}. ` : '') +
+            (!docView.readOnly && docView.trackingChanges
+              ? 'Değişiklikler izleniyor: yazılan altı çizili, silinen üstü çizili görünür; biçim, liste, tablo, görsel ve bağlantı değişiklikleri reddedilir.'
+              : '');
         } catch (error) {
           $('doc-note').textContent = `Belge gösterilemedi: ${error.message}`;
         }

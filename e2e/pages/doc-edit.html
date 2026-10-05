@@ -127,7 +127,8 @@
       };
       // Opens a document from bytes in the editor (BymOffice.mount) inside #host. Resolves once it is shown.
       // options.shadow: 'open' | 'closed' builds it inside a shadow root; options.transform: a CSS transform
-      // for the host; options.readOnly, options.locale, options.zoom, options.toolbar as mount() takes them.
+      // for the host; options.readOnly, options.locale, options.zoom, options.toolbar, options.trackChanges and
+      // options.author as mount() takes them; options.now: the moment (ISO text) the clock of the editor shows.
       window.__mountEdit = async function (bytes, options) {
         options = options || {};
         if (window.__mounted) window.__mounted.destroy();
@@ -161,6 +162,14 @@
           locale: options.locale,
           zoom: options.zoom,
           toolbar: options.toolbar,
+          trackChanges: options.trackChanges,
+          author: options.author,
+          // A fixed clock: the date tracked changes get.
+          now: options.now
+            ? function () {
+                return new Date(options.now);
+              }
+            : undefined,
           onNotice: function (notice) {
             window.__notices.push({ message: notice.message, kind: notice.kind });
           },

@@ -773,6 +773,8 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
     for (const style of doc.styles.styles.values()) text += treeText(ctx, styleElement(ctx, style));
     return text;
   });
+  // The password of a protection is only carried over with the element a docx was read with.
+  if (doc.settings.protection && doc.settings.protection.enforced && !doc.settings.protection.xml) warn('The document protection is carried over without its password');
   support('settings.xml', 'settings', 'settings', (ctx) => settingsText(ctx, footnotes === doc.footnotes && endnotes === doc.endnotes ? doc : { ...doc, footnotes, endnotes }));
   if (doc.fonts.size) support('fontTable.xml', 'fonts', 'fontTable', (ctx) => fontTableText(ctx, doc.fonts));
   if (doc.numbering.abstracts.size || doc.numbering.nums.size) {

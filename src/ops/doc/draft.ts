@@ -8,6 +8,7 @@ import type { Block, DocModel, Paragraph, RunItem, Story, Table, TableCell, Wrap
 import { applyDocOp, checkSplice, splicedBlocks, type DocOp } from './ops';
 import { READ_ONLY } from './pieces';
 import { collapsed, inTextBox, storyOf, type DocPosition, type DocRange } from './position';
+import { TRACK_UNSUPPORTED, trackingFor, type TrackOptions, type Tracking } from './track';
 
 export { tableContextOf } from './position';
 
@@ -21,13 +22,14 @@ export interface DocEdit {
   seal?: boolean;
 }
 
-export interface DocEditOptions {
-  /**
-   * Reserved. Documents that track changes (DocSettings.trackRevisions) are
-   * edited directly for now: no revision marks are made, whatever this says.
-   */
-  trackChanges?: boolean;
-}
+/**
+ * How a command tracks its changes. A document that asks for it
+ * (DocSettings.trackRevisions, or a protection that allows only tracked
+ * changes) is always edited with tracked changes; `trackChanges` does the
+ * same for any other document. A command that cannot make its change as a
+ * tracked one throws RangeError(TRACK_UNSUPPORTED) and changes nothing.
+ */
+export type DocEditOptions = TrackOptions;
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -108,7 +110,13 @@ export class Draft {
   private readonly unreferenced = new Set<string>();
   private readonly hasNotes: boolean;
 
-  constructor(readonly doc: DocModel) {
+  /**
+   * @param track Set when the changes of the command are tracked: what it puts in and takes out are revisions.
+   */
+  constructor(
+    readonly doc: DocModel,
+    readonly track?: Tracking,
+  ) {
     let notes = false;
     for (const collection of [doc.footnotes, doc.endnotes]) {
       if (!collection || notes) continue;
@@ -318,9 +326,17 @@ export class Draft {
   }
 }
 
-/** Runs a command on a draft and returns its operations; the document is as before when this returns or throws. */
-export function buildEdit(doc: DocModel, command: (draft: Draft) => DocRange | DocPosition | Omit<DocEdit, 'ops'>): DocEdit {
-  const draft = new Draft(doc);
+/**
+ * Runs a command on a draft and returns its operations; the document is as
+ * before when this returns or throws. `tracks` says that the command makes
+ * its changes as revisions when the draft tracks (Draft.track); a command
+ * that does not say so is refused where changes are tracked, so that nothing
+ * is changed without a trace.
+ */
+export function buildEdit(doc: DocModel, command: (draft: Draft) => DocRange | DocPosition | Omit<DocEdit, 'ops'>, options?: DocEditOptions, tracks = false): DocEdit {
+  const tracking = trackingFor(doc, options);
+  if (tracking && !tracks) bad(TRACK_UNSUPPORTED);
+  const draft = new Draft(doc, tracking);
   try {
     const result = command(draft);
     draft.finish();

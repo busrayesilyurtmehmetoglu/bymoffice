@@ -178,6 +178,8 @@ export interface RunStyle {
   color: string;
   underline?: { color: string; style: string };
   strike?: boolean | 'double';
+  /** The text was deleted by a tracked change: it is shown, and is no part of the text. */
+  deleted?: boolean;
   highlight?: string;
   /** Baseline shift, px, positive upwards. */
   shift: number;

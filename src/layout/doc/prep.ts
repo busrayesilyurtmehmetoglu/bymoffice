@@ -454,6 +454,64 @@ function hiddenByRevision(wrap: Wrapper | undefined): boolean {
   return false;
 }
 
+/** Colours for the authors of tracked changes: dark enough to read as text on white. */
+const REVISION_COLORS = ['#C0392B', '#1F6FB2', '#1E8449', '#8E44AD', '#B9770E', '#117A8B', '#AD1457', '#5D6D7E'];
+/** No more of a name than this decides its colour. */
+const MAX_AUTHOR_HASHED = 256;
+
+/** The colour the tracked changes of an author are shown in: one of a few, by a hash of the name. */
+export function revisionColor(author: string | undefined): string {
+  let hash = 2166136261;
+  if (author !== undefined) {
+    for (let i = 0; i < author.length && i < MAX_AUTHOR_HASHED; i++) hash = Math.imul(hash ^ author.charCodeAt(i), 16777619);
+  }
+  return REVISION_COLORS[(hash >>> 0) % REVISION_COLORS.length];
+}
+
+/** The tracked change that decides how an inline shows: a deletion or move away anywhere around it, else the innermost insertion or move in. */
+function revisionOf(wrap: Wrapper | undefined): { gone: boolean; author: string | undefined } | undefined {
+  let shown: { gone: boolean; author: string | undefined } | undefined;
+  for (let w = wrap; w; w = w.parent) {
+    if (w.kind === 'del' || w.kind === 'moveFrom') return { gone: true, author: w.author };
+    if (!shown && (w.kind === 'ins' || w.kind === 'moveTo')) shown = { gone: false, author: w.author };
+  }
+  return shown;
+}
+
+const REVISION_STYLES = new WeakMap<RunStyle, Map<string, RunStyle>>();
+
+/** A run style as a tracked change shows it: struck through when it was deleted, underlined when it was inserted, in the colour of the author. */
+function revisionStyle(style: RunStyle, gone: boolean, author: string | undefined): RunStyle {
+  const color = revisionColor(author);
+  const key = (gone ? 'd' : 'i') + color;
+  let known = REVISION_STYLES.get(style);
+  if (!known) REVISION_STYLES.set(style, (known = new Map()));
+  let out = known.get(key);
+  if (!out) {
+    out = gone ? { ...style, color, strike: style.strike === 'double' ? 'double' : true, deleted: true } : { ...style, color, underline: { color, style: 'single' } };
+    if (gone && out.underline) out.underline = { color, style: out.underline.style };
+    known.set(key, out);
+  }
+  return out;
+}
+
+/**
+ * Shows the text of a run that a tracked change deleted. It has no place in
+ * the text (no offsets), so nothing of it can be selected or changed; fields,
+ * drawings and note marks in it are not shown.
+ */
+function walkDeleted(walk: Walk, run: Run, style: RunStyle): void {
+  if (run.fieldCode === true || walk.skip || walk.simple) return;
+  const builder = walk.builder;
+  for (let i = 0; i < run.content.length; i++) {
+    if (inFieldCode(run, i)) continue;
+    const item = run.content[i];
+    if (item.type === 'text' || item.type === 'deletedText') builder.text(item.text, style, -1, undefined);
+    else if (item.type === 'tab') builder.tab(style, -1, undefined);
+    else if (item.type === 'noBreakHyphen') builder.text('\u2011', style, -1, undefined);
+  }
+}
+
 interface Walk {
   builder: Builder;
   /** Index in the children of the paragraph of the inline being walked. */
@@ -689,7 +747,14 @@ function walkInlines(args: PrepArgs, walk: Walk, children: Inline[]): void {
     walk.inline = at;
     if (inline.type !== 'run' && inline.type !== 'math') continue;
     const wrap = inline.wrap;
-    if (wrap && hiddenByRevision(wrap)) continue;
+    const revision = wrap ? revisionOf(wrap) : undefined;
+    if (revision && revision.gone) {
+      // Shown, struck through, but not part of the text: it takes no offsets.
+      if (inline.type === 'math') {
+        if (!walk.skip && !walk.simple) walk.builder.text(inline.text, revisionStyle(args.markStyle, true, revision.author), -1, undefined);
+      } else walkDeleted(walk, inline, revisionStyle(ctx.runStyle(para.props, inline.props, where), true, revision.author));
+      continue;
+    }
     let link = wrap ? wrapperLink(wrap) : undefined;
     const simple = wrap ? findWrapper(inline, 'simpleField') : undefined;
     if (simple !== walk.simpleSeen) {
@@ -710,7 +775,7 @@ function walkInlines(args: PrepArgs, walk: Walk, children: Inline[]): void {
       for (let k = walk.fields.length - 1; k >= 0 && link === undefined; k--) link = walk.fields[k];
     }
     if (inline.type === 'math') {
-      if (!walk.skip && !walk.simple) walk.builder.text(inline.text, args.markStyle, walk.offset, link);
+      if (!walk.skip && !walk.simple) walk.builder.text(inline.text, revision ? revisionStyle(args.markStyle, false, revision.author) : args.markStyle, walk.offset, link);
       walk.offset += inline.text.length;
       continue;
     }
@@ -720,7 +785,8 @@ function walkInlines(args: PrepArgs, walk: Walk, children: Inline[]): void {
       for (const item of inline.content) if (item.type === 'fieldChar') any = true;
       if (!any) continue;
     }
-    walkItems(args, walk, inline, inline.content, ctx.runStyle(para.props, inline.props, where), link);
+    const style = ctx.runStyle(para.props, inline.props, where);
+    walkItems(args, walk, inline, inline.content, revision ? revisionStyle(style, false, revision.author) : style, link);
   }
 }
 

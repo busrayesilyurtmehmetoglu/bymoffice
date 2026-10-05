@@ -1351,7 +1351,7 @@ export function insertFragment(doc: DocModel, at: DocPosition | DocRange, fragme
     const caret = samePosition(start, end) ? start : deleteSpan(draft, start, end);
     if (fragment.blocks.length === 0) return caret;
     return place(draft, caret, fragment, options);
-  });
+  }, options);
 }
 
 function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options: InsertFragmentOptions | undefined): DocPosition {

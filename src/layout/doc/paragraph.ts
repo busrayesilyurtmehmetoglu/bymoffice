@@ -220,6 +220,7 @@ function lineItems(ctx: LayoutContext, prep: ParaPrep, line: Line, top: number, 
     const item: FieldTextItem = { type: 'text', x, y, width, text, font: piece.font, color: style.color };
     if (style.underline) item.underline = style.underline;
     if (style.strike) item.strike = style.strike;
+    if (style.deleted) item.deleted = true;
     if (style.highlight !== undefined) item.highlight = style.highlight;
     if (piece.link !== undefined) item.link = piece.link;
     if (style.spacing !== 0) item.letterSpacing = style.spacing;

@@ -288,6 +288,13 @@ class DocReader {
     settings.autoHyphenation = (u8(b, at + 5) & 0x10) !== 0;
     settings.trackRevisions = (u8(b, at + 5) & 0x80) !== 0;
     settings.mirrorMargins = (u8(b, at + 6) & 0x20) !== 0;
+    // DopBase: fProtEnabled says that the document is protected; fLockRev and fLockAtn say for what (tracked changes,
+    // comments; neither: form fields). The lock bits without fProtEnabled are kept and not applied, so that no
+    // document is locked on the word of one bit. UNSURE: not compared with files Word protected; a read-only
+    // protection is in a later part of the Dop and is not read.
+    const enabled = (u8(b, at + 7) & 0x02) !== 0;
+    const lock = (u8(b, at + 7) & 0x40) !== 0 ? 'trackedChanges' : (u8(b, at + 6) & 0x10) !== 0 ? 'comments' : enabled ? 'forms' : undefined;
+    if (lock !== undefined) settings.protection = { edit: lock, enforced: enabled };
     const tab = u16(b, at + 10);
     if (tab > 0 && tab <= 31680) settings.defaultTabStop = tab;
     return settings;

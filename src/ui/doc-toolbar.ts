@@ -231,9 +231,16 @@ export class DocToolbar {
       'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak',
     ];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
+    // Where changes are tracked, what cannot be made a tracked change yet is not offered: the formatting of
+    // paragraphs, lists, tables, pictures and links. Character formatting stays, for the text typed next.
+    const tracked = editable && view.trackingChanges;
+    if (tracked) {
+      const untracked: ButtonKey[] = ['alignLeft', 'alignCenter', 'alignRight', 'alignJustify', 'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'insertTable', 'insertPicture', 'insertLink'];
+      for (let i = 0; i < untracked.length; i++) this.setDisabled(untracked[i], true);
+    }
     // Rows and columns are those of the table the caret is in.
-    this.setDisabled('rowsColumns', !editable || !view.inTable);
-    this.styleSelect.disabled = !editable;
+    this.setDisabled('rowsColumns', !editable || tracked || !view.inTable);
+    this.styleSelect.disabled = !editable || tracked;
     this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;
     if (!editable) this.closePopover();

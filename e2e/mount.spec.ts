@@ -282,7 +282,7 @@ test.describe('BymOffice.mount', () => {
       const host = document.getElementById('editor')!;
       const out: Record<string, unknown> = {};
       const picture =
-        '{\\pict\\pngblip\\picw10\\pich10\\picwgoal150\\pichgoal150 89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000001e221bc330000000049454e44ae426082}';
+        '{\\pict\\pngblip\\picw10\\pich10\\picwgoal150\\pichgoal150 89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000b49444154789c6360000200000500017a5eab3f0000000049454e44ae426082}';
       let mounted = await api.mount(host, { file: new TextEncoder().encode('{\\rtf1\\ansi Text ' + picture + ' here\\par}'), convert: true });
       mounted.view.setSelection({ story: 'body', path: [0], offset: 0 });
       mounted.view.insertText('Edited ');

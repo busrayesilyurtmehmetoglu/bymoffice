@@ -27,6 +27,12 @@ export interface Dop {
   trackRevisions: boolean;
   /** "\pgnstart": the number of the first page. */
   pageStart: number;
+  /** What the document is protected for by the older words ("\formprot", "\revprot", "\annotprot", "\readprot"). */
+  protection?: 'forms' | 'trackedChanges' | 'comments' | 'readOnly';
+  /** "\protlevel": what an enforced protection is for. Alone it protects nothing. */
+  protectionLevel?: 'forms' | 'trackedChanges' | 'comments' | 'readOnly';
+  /** "\enforceprot": whether the protection applies; undefined when the file does not say. */
+  enforceProtection?: boolean;
 }
 
 export function defaultDop(): Dop {
@@ -98,6 +104,27 @@ export function dopWord(dop: Dop, word: string, param: number, hasParam: boolean
     case 'pgnstart':
       dop.pageStart = param;
       return true;
+    case 'formprot':
+      dop.protection = 'forms';
+      return true;
+    case 'revprot':
+      dop.protection = 'trackedChanges';
+      return true;
+    case 'annotprot':
+      dop.protection = 'comments';
+      return true;
+    case 'readprot':
+      dop.protection = 'readOnly';
+      return true;
+    case 'enforceprot':
+      dop.enforceProtection = on;
+      return true;
+    case 'protlevel': {
+      // The kind as newer writers state it, beside the older words above.
+      const level = (['trackedChanges', 'comments', 'forms', 'readOnly'] as const)[param];
+      if (hasParam && level !== undefined) dop.protectionLevel = level;
+      return true;
+    }
   }
   return false;
 }
