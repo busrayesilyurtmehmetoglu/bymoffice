@@ -22,7 +22,7 @@ import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
-import { hasCopyMark, sliceHtml, cutLoses, sliceOf, type DocSlice } from './doc-clipboard';
+import { cutLoses, fragmentOfRange, setCopyMedia, sliceHtml, sliceOf, storeCopy, storedCopy, type DocSlice, type StoredCopy } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
 import {
   DocumentPrintError,
@@ -692,8 +692,6 @@ export class DocumentView {
   private changes = 0;
   /** The selection as it is shown, for the selection it was worked out for. */
   private expanded: { anchor: TextPosition; focus: TextPosition; range: DocRange } | undefined;
-  private copyMark = '';
-  private copied: { text: string; slice: DocSlice } | undefined;
   /** Height the strip keeps while pages that were there before an edit are laid out again, screen px. */
   private hold = 0;
   private steps = 0;
@@ -2213,39 +2211,74 @@ export class DocumentView {
   };
 
   private onCopy = (event: ClipboardEvent): void => {
+    this.copyTo(event, this.selectionSlice());
+  };
+
+  /**
+   * Puts the selection on the clipboard: its text, and HTML made of that text
+   * with the mark of the copy the page keeps. Says what the clipboard holds
+   * afterwards: the mark of the copy ("rich"), the text alone ("plain"), or
+   * nothing of the selection ("none": there was nothing to put there).
+   */
+  private copyTo(event: ClipboardEvent, slice: DocSlice | undefined, cut = false): 'rich' | 'plain' | 'none' {
     const data = event.clipboardData;
-    if (this.destroyed || !data) return;
+    if (this.destroyed || !data) return 'none';
     const text = this.getSelectedText();
-    if (text === '') {
+    // A picture alone is a copy without text.
+    const fragment = slice ? slice.fragment : undefined;
+    if (text === '' && !(fragment && ops.fragmentHasContent(fragment))) {
       // The blank the input holds for the sake of this event must not replace what is on the clipboard.
       if (event.target === this.input) event.preventDefault();
-      return;
+      return 'none';
     }
     event.preventDefault();
     data.setData('text/plain', text);
-    // The same as simple HTML, made here from escaped text, with a mark by which a paste into this view knows its own copy.
-    const slice = this.selectionSlice();
-    this.copied = undefined;
-    if (!slice) return;
-    this.copyMark = Math.random().toString(36).slice(2) + Date.now().toString(36);
-    this.copied = { text, slice };
+    if (!slice) return 'plain';
+    // The same as simple HTML, made here from escaped text, with a mark by which a paste into an editor of this page knows the copy.
+    const copy = storeCopy(text, slice, cut);
     try {
-      data.setData('text/html', sliceHtml(slice, this.copyMark));
+      data.setData('text/html', sliceHtml(slice, copy.mark));
     } catch {
-      // Plain text is on the clipboard then.
+      // Plain text is on the clipboard then: no paste will ask for the copy.
+      return 'plain';
     }
-  };
+    this.readCopyMedia(copy);
+    return 'rich';
+  }
+
+  /** Reads the pictures of a copy that the model does not hold: another document needs their bytes to take the copy. */
+  private readCopyMedia(copy: StoredCopy): void {
+    const fragment = copy.slice.fragment;
+    if (!fragment) return;
+    const reads: Promise<void>[] = [];
+    fragment.media.forEach((media, name) => {
+      if (media.bytes) return;
+      reads.push(
+        this.pictures.readPart(name).then(
+          (bytes) => {
+            if (bytes instanceof Uint8Array && bytes.length <= MAX_PICTURE_BYTES) setCopyMedia(copy, name, bytes, sniffImageType(bytes));
+          },
+          () => undefined,
+        ),
+      );
+    });
+    if (reads.length) copy.ready = Promise.all(reads).then(() => undefined);
+  }
 
   private onCut = (event: ClipboardEvent): void => {
     if (this.destroyed) return;
     const range = this.range();
+    let slice: DocSlice | undefined;
+    let computed = false;
     if (this.editable && range && !ops.isCollapsed(range)) {
       // What is removed must be on the clipboard: a cut that cannot put it there removes nothing.
       let refused: string | undefined;
+      computed = true;
       if (!event.clipboardData) refused = this.strings.cannotWriteClipboard;
       else {
         try {
-          if (cutLoses(this.document, range, this.selectionSlice())) refused = this.strings.cannotCutObjects;
+          slice = this.selectionSlice();
+          if (cutLoses(this.document, range, slice)) refused = this.strings.cannotCutObjects;
         } catch (error) {
           event.preventDefault();
           this.refuse(error);
@@ -2258,10 +2291,24 @@ export class DocumentView {
         return;
       }
     }
-    this.onCopy(event);
+    const deleting = this.editable && range !== undefined && !ops.isCollapsed(range);
+    const written = this.copyTo(event, computed ? slice : this.selectionSlice(), deleting);
     // Nothing goes out of the field itself either way.
     event.preventDefault();
-    if (!this.editable || !range || ops.isCollapsed(range)) return;
+    if (!deleting || !range) return;
+    if (written !== 'rich' && slice) {
+      // The mark of the copy did not reach the clipboard: what a paste gets is the text, so the cut is judged as one of text.
+      let loses = true;
+      try {
+        loses = cutLoses(this.document, range, undefined);
+      } catch {
+        loses = true;
+      }
+      if (loses) {
+        this.notify(this.strings.cannotWriteClipboard, 'info');
+        return;
+      }
+    }
     this.perform((selection) => ops.deleteRange(this.document, selection));
   };
 
@@ -2279,17 +2326,16 @@ export class DocumentView {
     } catch {
       // Nothing to read.
     }
-    if (text === '') {
-      const picture = this.clipboardPicture(data);
-      if (picture) {
-        this.readPicture(picture);
-        return;
-      }
-    }
-    // The copy made here is pasted with its formatting; HTML from elsewhere is never parsed: its text is what is pasted.
-    if (this.copied && hasCopyMark(html, this.copyMark)) this.pasteSlice(this.copied.slice);
-    else this.pasteText(text);
+    this.pasteClipboard(text, html, text === '' ? this.clipboardPicture(data) : undefined);
   };
+
+  /** Pastes what the clipboard holds: a copy made on this page as it was, a picture, or text. HTML from elsewhere is never parsed: its text is what is pasted. */
+  private pasteClipboard(text: string, html: string, picture: Blob | undefined): void {
+    const copy = storedCopy(html, text);
+    if (copy) this.pasteCopy(copy, false);
+    else if (picture) this.readPicture(picture);
+    else this.pasteText(text);
+  }
 
   // ----------------------------------------------------------------- links
 
@@ -3611,19 +3657,37 @@ export class DocumentView {
     add('cut', this.strings.cut, command('cut'));
     add('copy', this.strings.copy, command('copy'));
     add('paste', this.strings.paste, () => {
-      const clipboard = (navigator as { clipboard?: { readText?(): Promise<string> } }).clipboard;
-      if (!clipboard || typeof clipboard.readText !== 'function') {
-        this.notify(this.strings.pasteWithKeyboard, 'info');
-        return;
+      interface Item {
+        types: readonly string[];
+        getType(type: string): Promise<Blob>;
       }
-      clipboard.readText().then(
-        (text) => {
-          if (!this.destroyed) this.pasteText(text);
-        },
-        () => {
-          if (!this.destroyed) this.notify(this.strings.pasteWithKeyboard, 'info');
-        },
-      );
+      const clipboard = (navigator as { clipboard?: { readText?(): Promise<string>; read?(): Promise<Item[]> } }).clipboard;
+      const failed = () => {
+        if (!this.destroyed) this.notify(this.strings.pasteWithKeyboard, 'info');
+      };
+      const plain = () => {
+        if (!clipboard || typeof clipboard.readText !== 'function') return failed();
+        clipboard.readText().then((text) => {
+          if (this.destroyed) return;
+          // Without text there may be a copy of a picture the page keeps: only the keys can tell.
+          if (text === '') failed();
+          else this.pasteText(text);
+        }, failed);
+      };
+      if (!clipboard || typeof clipboard.read !== 'function' || typeof Blob === 'undefined' || typeof Blob.prototype.text !== 'function') return plain();
+      // With its HTML, so that a copy made on this page is known by its mark.
+      const part = (items: Item[], type: string): Promise<string> => {
+        for (const item of items) if (item.types.indexOf(type) >= 0) return item.getType(type).then((blob) => blob.text());
+        return Promise.resolve('');
+      };
+      clipboard
+        .read()
+        .then((items) => Promise.all([part(items, 'text/plain'), part(items, 'text/html')]))
+        .then(([text, html]) => {
+          if (this.destroyed) return;
+          if (text === '' && !storedCopy(html, text)) failed();
+          else this.pasteClipboard(text, html, undefined);
+        }, plain);
     });
     add('all', this.strings.selectWholeText, () => {
       this.selectAll();
@@ -3635,7 +3699,7 @@ export class DocumentView {
 
   // ------------------------------------------------------------ the clipboard
 
-  /** The selection as the editor keeps a copy of it: formatted paragraphs, or the cells of a table. */
+  /** The selection as the editor keeps a copy of it: its content, and its text as formatted paragraphs or as the cells of a table. */
   private selectionSlice(): DocSlice | undefined {
     const selection = this.selection;
     if (selection === undefined) return undefined;
@@ -3663,7 +3727,10 @@ export class DocumentView {
           }
           rows.push(row);
         }
-        return { paragraphs: [], table: rows };
+        const slice: DocSlice = { paragraphs: [], table: rows };
+        const fragment = fragmentOfRange(this.document, range.start, range.end);
+        if (fragment) slice.fragment = fragment;
+        return slice;
       }
       return sliceOf(this.document, range.start, range.end);
     } catch {
@@ -3680,7 +3747,79 @@ export class DocumentView {
     this.perform((range) => ops.insertText(this.document, range, text), true);
   }
 
-  /** Pastes a copy made in this view: its text with the formatting it had, as one step of the history. */
+  /**
+   * Pastes a copy made on this page as one step of the history: with its
+   * pictures, links, fields and tables when it holds them, else its text with
+   * the formatting it had. A copy whose pictures are still being read from
+   * the document it came from is pasted once they are there.
+   */
+  private pasteCopy(copy: StoredCopy, waited: boolean): void {
+    const asked = this.range();
+    const fragment = copy.slice.fragment;
+    if (!fragment) {
+      this.pasteSlice(copy.slice);
+      return;
+    }
+    if (!this.editable || !this.range()) return;
+    if (fragment.textLength > MAX_PASTE_TEXT) {
+      this.notify(this.strings.documentPasteTooLarge, 'error');
+      return;
+    }
+    let needs: string[];
+    try {
+      needs = ops.fragmentNeeds(this.document, fragment);
+    } catch (error) {
+      this.refuse(error);
+      return;
+    }
+    if (needs.length) {
+      if (!waited && copy.ready && asked) {
+        // The paste is for this place in this state of the document: if either is another one when the pictures are
+        // there, pasting would put the copy where nobody asked for it, or over a selection made since.
+        const at = { anchor: copyPosition(asked.anchor), focus: copyPosition(asked.focus) };
+        const changes = this.changes;
+        this.notify(this.strings.pasteWaiting, 'info');
+        copy.ready.then(() => {
+          if (this.destroyed) return;
+          const now = this.range();
+          let same = this.editable && this.changes === changes && now !== undefined;
+          try {
+            same = same && now !== undefined && ops.samePosition(now.anchor, at.anchor) && ops.samePosition(now.focus, at.focus);
+          } catch {
+            same = false;
+          }
+          if (same) this.pasteCopy(copy, true);
+          else this.notify(this.strings.pasteInterrupted, 'info');
+        });
+      } else this.notify(this.strings.cannotPasteHere, 'info');
+      return;
+    }
+    // The name of a new part must not be one the package has already, though the model does not know it.
+    const source = this.options.package as { hasPart?(part: string): boolean } | undefined;
+    const taken = this.options.partTaken || (source && typeof source.hasPart === 'function' ? (part: string) => (source.hasPart as (part: string) => boolean)(part) : undefined);
+    this.typing.commit();
+    const range = this.range();
+    if (!range) return;
+    this.history.seal();
+    let edit: DocEdit;
+    try {
+      const options: ops.InsertFragmentOptions = {};
+      if (taken) options.taken = taken;
+      // A cut that comes back to where it was gives the paragraph it ended in its formatting again.
+      if (copy.cut) options.moved = true;
+      edit = ops.insertFragment(this.document, range, fragment, options);
+      if (edit.ops.length > 0) this.history.applyEdit(edit, { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) });
+    } catch (error) {
+      // A copy that does not fit here (another kind of document, tables too deep) is not an error of the program.
+      if (!(error instanceof RangeError)) throw error;
+      this.notify(this.strings.cannotPasteHere, 'info');
+      return;
+    }
+    this.history.seal();
+    if (edit.ops.length > 0) this.changed(edit.selection);
+  }
+
+  /** Pastes the text of a copy with the formatting it had, as one step of the history. */
   private pasteSlice(slice: DocSlice): void {
     const range = this.range();
     if (!this.editable || !range) return;

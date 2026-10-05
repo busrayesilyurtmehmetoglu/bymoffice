@@ -6,6 +6,7 @@
 
 import {
   emptyDocStyles,
+  setPartNamespaces,
   type DocStyle,
   type DocStyles,
   type ExtraXml,
@@ -96,6 +97,7 @@ function readStyle(ctx: PartContext, el: XmlElement): DocStyle | undefined {
 export function parseDocStyles(ctx: PartContext, root: XmlElement | undefined): DocStyles {
   const sheet = emptyDocStyles();
   if (!root) return sheet;
+  setPartNamespaces(sheet, Array.from(root.attrs).filter(([name]) => name === 'xmlns' || name.indexOf('xmlns:') === 0));
   let count = 0;
   for (const node of root.children) {
     if (node.type !== 'element') continue;

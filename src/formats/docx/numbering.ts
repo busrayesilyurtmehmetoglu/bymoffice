@@ -6,7 +6,7 @@
 // override levels or their start values. An abstract definition may instead
 // point to a numbering style, whose own numbering holds the levels.
 
-import type { AbstractNum, DocStyles, ExtraXml, NumInstance, NumLevel, Numbering } from '../../model/doc/types';
+import { setPartNamespaces, type AbstractNum, type DocStyles, type ExtraXml, type NumInstance, type NumLevel, type Numbering } from '../../model/doc/types';
 import type { XmlElement } from '../../xml';
 import { attr, childOfKind, intAttr, kindOf, onOff, pushExtra, type PartContext } from './common';
 import { readParaProps, readRunProps } from './props';
@@ -105,6 +105,7 @@ function readLevel(ctx: PartContext, el: XmlElement): NumLevel | undefined {
 export function parseNumbering(ctx: PartContext, root: XmlElement | undefined): Numbering {
   const numbering = emptyNumbering();
   if (!root) return numbering;
+  setPartNamespaces(numbering, Array.from(root.attrs).filter(([name]) => name === 'xmlns' || name.indexOf('xmlns:') === 0));
   let count = 0;
   for (const node of root.children) {
     if (node.type !== 'element') continue;

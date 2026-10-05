@@ -402,30 +402,32 @@ test('review: a cut is judged by what the deletion takes out of the document and
   kept(at([10], 4), at([10], 8), 'a tab and a line break');
   kept(at([0], 0), at([0], 2, true), 'up to the picture');
   kept(at([0], 2), at([0], 4), 'from after the picture');
-  // A picture, alone as a press on it selects it or among text.
+  // A picture the copy cannot carry (its relationship is missing), alone as a press on it selects it or among text.
+  // Pictures, links and fields a copy does carry: see doc-clipboard.test.ts.
   lost(at([0], 1), at([0], 3), 'a picture among text');
   lost(at([0], 2, true), at([0], 2), 'a picture alone');
   lost(at([0], 0), at([0], 2), 'to after the picture');
   lost(at([0], 2, true), at([0], 4), 'from before the picture');
   // A bookmark before the picture does not hide it from a range that begins there.
   lost(at([11], 2), at([11], 4), 'a picture behind the start of a bookmark');
-  // A note reference, a field, and anything of them in a paragraph in between.
+  // A note reference, and one in a paragraph in between; a field is carried whole.
   lost(at([1], 2), at([1], 6), 'a note reference');
   kept(at([1], 0), at([1], 3), 'text before a note reference');
-  lost(at([2], 3), at([2], 8), 'a field');
+  kept(at([2], 3), at([2], 8), 'a field');
   lost(at([0], 3), at([3], 2), 'paragraphs with more than text');
   // What a deletion leaves where it is can be cut around: a field the range ends before, a comment reference.
   kept(at([2], 0), at([2], 5), 'text up to a field');
   kept(at([12], 0), at([13], 0), 'to the start of a paragraph that begins with a field');
   kept(at([12], 1), at([12], 5), 'text around a comment reference');
-  // Text that is more than its characters: a link, a simple field, a content control, a tracked insertion; a page break, a soft hyphen.
-  lost(at([6], 1), at([6], 7), 'a link');
-  lost(at([6], 3), at([6], 5), 'part of a link');
-  lost(at([7], 1), at([7], 7), 'a simple field');
+  // Text that is more than its characters. The copy carries a link, a simple field, a page break and a soft hyphen;
+  // it does not carry a content control or a tracked insertion.
+  kept(at([6], 1), at([6], 7), 'a link');
+  kept(at([6], 3), at([6], 5), 'part of a link');
+  kept(at([7], 1), at([7], 7), 'a simple field');
   lost(at([8], 1), at([8], 6), 'a content control');
   lost(at([9], 1), at([9], 6), 'a tracked insertion');
-  lost(at([10], 1), at([10], 3), 'a soft hyphen');
-  lost(at([10], 3), at([10], 5), 'a page break');
+  kept(at([10], 1), at([10], 3), 'a soft hyphen');
+  kept(at([10], 3), at([10], 5), 'a page break');
   // Without a copy with formatting only the plain text is on the clipboard: the same rules.
   assert.equal(cutLoses(doc, { anchor: at([3], 0), focus: at([3], 4) }, undefined), false);
   assert.equal(cutLoses(doc, { anchor: at([0], 1), focus: at([0], 3) }, undefined), true);

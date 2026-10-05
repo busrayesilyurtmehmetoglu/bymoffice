@@ -58,7 +58,7 @@ function sided(doc: DocModel, position: DocPosition, before: boolean): DocPositi
 }
 
 /** Paragraph properties without the section break: of the two halves of a paragraph only the second ends the section. */
-function withoutSection(props: ParaProps): ParaProps {
+export function withoutSection(props: ParaProps): ParaProps {
   if (props.section === undefined) return props;
   const out = { ...props };
   delete out.section;
@@ -73,7 +73,7 @@ function withoutSection(props: ParaProps): ParaProps {
  * empty. That is the rule here. The section break of the second paragraph
  * always stays: it is the end of the joined paragraph.
  */
-function joinedProps(first: Paragraph, last: Paragraph): ParaProps {
+export function joinedProps(first: Paragraph, last: Paragraph): ParaProps {
   if (paragraphLength(first) === 0) return last.props;
   const section = last.props.section;
   const base = withoutSection(first.props);
@@ -152,7 +152,7 @@ function appendPieces(target: Piece[], pieces: Piece[]): void {
 const samePath = (a: number[] | undefined, b: number[]): boolean => a !== undefined && a.length === b.length && a.every((value, i) => value === b[i]);
 
 /** Which cells of a table a range between two of its cells takes: all of them from the first to the last in one row, a rectangle of the grid over several rows. */
-function cellsBetween(table: Table, r1: number, c1: number, r2: number, c2: number): (row: number, cell: number) => boolean {
+export function cellsBetween(table: Table, r1: number, c1: number, r2: number, c2: number): (row: number, cell: number) => boolean {
   if (r1 === r2) return (r, c) => r === r1 && c >= c1 && c <= c2;
   const first = cellSpan(table.rows[r1], c1);
   const last = cellSpan(table.rows[r2], c2);
@@ -166,7 +166,7 @@ function cellsBetween(table: Table, r1: number, c1: number, r2: number, c2: numb
 }
 
 /** How far the paths of two positions agree, and the level of blocks at which they part. */
-function parting(start: DocPosition, end: DocPosition): { depth: number; level: number } {
+export function parting(start: DocPosition, end: DocPosition): { depth: number; level: number } {
   let depth = 0;
   while (depth < start.path.length && depth < end.path.length && start.path[depth] === end.path[depth]) depth++;
   return { depth, level: depth - (depth % 3) };
@@ -241,7 +241,7 @@ export function expandRangeForTables(doc: DocModel, range: DocRange): DocRange {
 }
 
 /** What kind of content block comes next before (step -1) or after (1) a block of a list; blocks without content are passed over. */
-function neighbour(blocks: Block[], index: number, step: 1 | -1): number {
+export function neighbour(blocks: Block[], index: number, step: 1 | -1): number {
   for (let i = index + step, tries = 0; i >= 0 && i < blocks.length && tries < 64; i += step, tries++) {
     if (blocks[i].type === 'paragraph' || blocks[i].type === 'table') return i;
   }

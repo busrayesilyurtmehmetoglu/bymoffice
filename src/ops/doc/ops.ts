@@ -9,7 +9,7 @@
 // back by reference, source spans and all, and restores `modified`, so that
 // "edit, undo, save" writes the bytes that were read.
 
-import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, Note, NumInstance, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
+import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, DocStyles, Note, NumInstance, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
 import { storyOf, type StoryHandle } from './position';
 
 /** `modified` flag to set after an operation: true when missing, null to remove the flag. */
@@ -49,7 +49,14 @@ export type DocOp =
   /** Puts back the whole relationship table of the part a story is in: what undoes setRelationship. */
   | { type: 'setRelationships'; story: string; relationships: Map<string, DocRelationship> }
   /** Adds, replaces or (null) removes a picture of DocModel.media; `dropMap` also removes the map itself once it is empty. */
-  | { type: 'setMedia'; name: string; media: DocMedia | null; dropMap?: boolean };
+  | { type: 'setMedia'; name: string; media: DocMedia | null; dropMap?: boolean }
+  /**
+   * Puts another table of styles in the place of DocModel.styles: how styles
+   * are added (a paste from another document brings its own). The table is
+   * never changed in place, so that what depends on the styles (the layout)
+   * sees a new object.
+   */
+  | { type: 'setStyles'; styles: DocStyles };
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -216,6 +223,13 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
       const before = host.relationships;
       host.relationships = op.relationships;
       return { type: 'setRelationships', story: op.story, relationships: before };
+    }
+    case 'setStyles': {
+      const next = op.styles;
+      if (!next || typeof next !== 'object' || !(next.styles instanceof Map) || !next.defaults || !next.defaultIds) return bad('A table of styles is needed');
+      const before = doc.styles;
+      doc.styles = next;
+      return { type: 'setStyles', styles: before };
     }
     case 'setMedia': {
       if (typeof op.name !== 'string' || op.name === '') return bad('A picture needs a name');

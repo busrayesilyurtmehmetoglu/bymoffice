@@ -60,7 +60,7 @@ const MAX_NEW_CELLS = 100000;
 const spanOf = (props: CellProps): number => (props.gridSpan !== undefined && props.gridSpan > 1 ? props.gridSpan : 1);
 
 /** Grid columns of the cells of a row, as [start, end) each. */
-function rowSpans(row: TableRow): [number, number][] {
+export function rowSpans(row: TableRow): [number, number][] {
   const out: [number, number][] = [];
   let at = row.props.gridBefore || 0;
   for (const cell of row.cells) {
@@ -501,7 +501,7 @@ const REL_BASE = 'http://schemas.openxmlformats.org/officeDocument/2006/relation
 const REL_BASE_STRICT = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
 
 /** An id no relationship of the part has yet. */
-function freeRelId(relationships: Map<string, unknown>): string {
+export function freeRelId(relationships: Map<string, unknown>): string {
   let next = 1;
   relationships.forEach((_value, id) => {
     const match = /^rId(\d{1,9})$/.exec(id);
@@ -671,7 +671,7 @@ const DRAWING_NS_STRICT = {
 const el = (name: string, attrs: [string, string][], children: XmlNode[] = []): XmlElement => ({ type: 'element', name, attrs: new Map(attrs), children });
 
 /** What the document has in use that a new picture must not take: names of media parts and ids of drawings. */
-interface Taken {
+export interface Taken {
   /** Highest N among the parts named ".../media/imageN.*". */
   image: number;
   /** Names of parts the relationships and DocModel.media refer to, in lower case. */
@@ -685,7 +685,7 @@ interface Taken {
  * into the trees kept of drawings, legacy pictures and alternate content,
  * for the names and ids in use.
  */
-function takenByDocument(doc: DocModel): Taken {
+export function takenByDocument(doc: DocModel): Taken {
   const taken: Taken = { image: 0, parts: new Set<string>(), drawing: 0 };
   const part = (name: string | null | undefined) => {
     if (!name) return;

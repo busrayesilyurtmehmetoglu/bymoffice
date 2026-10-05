@@ -1209,6 +1209,23 @@ export interface DocModel {
   unknown: Map<string, number>;
 }
 
+const PART_NAMESPACES = new WeakMap<object, AttrList>();
+
+/**
+ * Remembers the namespace declarations of the root of the part a style sheet
+ * or the numbering was read from ("xmlns:w14", ...): what the prefixes in the
+ * kept trees of the definitions stand for. Kept beside the model, not in it:
+ * it says nothing about the document, only about how one file spelt it.
+ */
+export function setPartNamespaces(of: DocStyles | Numbering, declarations: AttrList): void {
+  PART_NAMESPACES.set(of, declarations);
+}
+
+/** The declarations setPartNamespaces() was given; undefined for definitions that were not read from a part. */
+export function partNamespaces(of: DocStyles | Numbering): AttrList | undefined {
+  return PART_NAMESPACES.get(of);
+}
+
 export const EMPTY_RUN_PROPS: RunProps = Object.freeze({});
 export const EMPTY_PARA_PROPS: ParaProps = Object.freeze({});
 

@@ -1140,8 +1140,8 @@ test.describe('review: what a cut removes is what a paste brings back', () => {
     // The copy the editor kept is what went out of the document: no letter of the cells is missing from it.
     await page.evaluate(() => (window as any).__view.setSelection({ story: 'body', path: [2], offset: 0 }));
     await clipboardEvent(page, 'paste', { text: cut.text, html: cut.html });
-    const text = (await paragraphs(page)).join('|');
-    expect(text).toContain('ore|A1|B1|A2After');
+    // The cells come back as the rows of a table, after the text that was before them.
+    expect(await paragraphs(page)).toEqual(['Bef', '\t', '\tB2', 'ore', 'A1\tB1', 'A2\t', 'After']);
     // One step back and the cut is undone as well.
     await page.evaluate(() => {
       (window as any).__view.undo();
@@ -1150,21 +1150,35 @@ test.describe('review: what a cut removes is what a paste brings back', () => {
     expect(await paragraphs(page)).toEqual(['Before', 'A1\tB1', 'A2\tB2', 'After']);
   });
 
-  test('a cut of a picture, alone or among text, leaves it in place and says so; the clipboard is not touched', async ({ page }) => {
+  test('a cut of a picture, alone or among text, takes it out and a paste puts it back; one the copy cannot carry stays, with a word about it', async ({ page }) => {
     await mountEdit(page, await withPicture());
     await laidOut(page);
     // The picture alone, as a press on it selects it.
     await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 2, before: true }, focus: { story: 'body', path: [0], offset: 2 } }));
     let cut = await clipboardEvent(page, 'cut', { text: 'what was there' });
     expect(cut.prevented).toBe(true);
-    expect(cut.text).toBe('what was there');
+    expect(cut.text).toBe('');
+    expect(await items(page)).toBe('abcd');
+    expect(await notices(page)).toEqual([]);
+    await clipboardEvent(page, 'paste', { text: cut.text, html: cut.html });
     expect(await items(page)).toBe('ab<drawing>cd');
-    expect(await notices(page)).toContain('The selection holds something that cannot be cut (a picture, a note, a field, a link); it was left in place');
-    // Text with the picture in it.
+    // Text with the picture in it, to the next paragraph.
     await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 1 }, focus: { story: 'body', path: [1], offset: 2 } }));
+    cut = await clipboardEvent(page, 'cut');
+    expect(cut.text).toBe('bcd\nne');
+    expect(await items(page)).toBe('axt');
+    await clipboardEvent(page, 'paste', { text: cut.text, html: cut.html });
+    expect(await items(page)).toBe('ab<drawing>cd');
+    expect(await paragraphs(page)).toEqual(['abcd', 'next']);
+
+    // A picture whose relationship is missing cannot be made again elsewhere: it is left in place.
+    await mountEdit(page, await sample(p(r('ab') + picture(120, 60, 'rIdGone') + r('cd')) + p('next')));
+    await laidOut(page);
+    await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 1 }, focus: { story: 'body', path: [0], offset: 3 } }));
     cut = await clipboardEvent(page, 'cut', { text: 'what was there' });
     expect(cut.text).toBe('what was there');
     expect(await items(page)).toBe('ab<drawing>cd');
+    expect(await notices(page)).toContain('The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place');
     expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
     // Text beside it is cut as ever.
     await page.evaluate(() => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: 2 }, focus: { story: 'body', path: [0], offset: 4 } }));
@@ -1187,18 +1201,28 @@ test.describe('review: what a cut removes is what a paste brings back', () => {
     expect(await notices(page)).toContain('The clipboard cannot be written here; nothing was cut');
   });
 
-  test('a cut of a link, whole or in part, leaves it in place', async ({ page }) => {
+  test('a cut of a link, whole or in part, takes the text with its link; a paste brings both back', async ({ page }) => {
     await mountEdit(page, await sample(p(r('ab') + '<w:hyperlink r:id="rIdLink">' + r('link') + '</w:hyperlink>' + r('cd')) + p('next'), { rels: [['rIdLink', 'hyperlink', 'https://example.com/', 'External']] }));
     await laidOut(page);
-    for (const [from, to] of [[1, 7], [3, 5]]) {
+    const linked = () =>
+      page.evaluate(() =>
+        (window as any).__view.document.body.blocks[0].children
+          .filter((inline: any) => inline.type === 'run' && inline.wrap && inline.wrap.kind === 'hyperlink')
+          .map((inline: any) => inline.content.map((item: any) => item.text).join('') + '>' + inline.wrap.target)
+          .join('|'),
+      );
+    for (const [from, to, text, rest] of [[1, 7, 'blinkc', ''], [3, 5, 'in', 'lk>https://example.com/']] as [number, number, string, string][]) {
       await page.evaluate(([a, b]) => (window as any).__view.setSelection({ anchor: { story: 'body', path: [0], offset: a }, focus: { story: 'body', path: [0], offset: b } }), [from, to]);
-      const cut = await clipboardEvent(page, 'cut', { text: 'what was there' });
-      expect(cut.text).toBe('what was there');
+      const cut = await clipboardEvent(page, 'cut');
+      expect(cut.text).toBe(text);
+      expect(await linked()).toBe(rest);
+      await clipboardEvent(page, 'paste', { text: cut.text, html: cut.html });
+      expect((await paragraphs(page))[0]).toBe('ablinkcd');
     }
-    expect((await paragraphs(page))[0]).toBe('ablinkcd');
-    expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
-    // Copying it is not held back.
-    expect((await clipboardEvent(page, 'copy')).text).toBe('in');
+    // Every piece of the text is a link to the same address still.
+    expect(await linked()).toMatch(/^(l|li|lin|link|in|nk|k|i|n)(>https:\/\/example\.com\/\|?)/);
+    expect((await linked()).replace(/>https:\/\/example\.com\//g, '').replace(/\|/g, '')).toBe('link');
+    expect(await notices(page)).toEqual([]);
   });
 
   test('a picture at the start or the end of a paragraph: the deletion that comes through the field takes the picture and joins nothing', async ({ page }) => {

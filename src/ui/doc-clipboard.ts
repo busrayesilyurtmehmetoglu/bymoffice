@@ -1,13 +1,33 @@
 // What a copy of a part of a document puts on the clipboard, and what the
-// editor keeps of it to paste it back with its formatting.
+// editor keeps of it to paste it back as it was.
 //
 // The HTML is built here, piece by piece, from text that is escaped: nothing
 // of a document reaches the clipboard as markup of its own. HTML that comes
 // from the clipboard is never parsed; it is only searched for the mark that
-// says the copy was made by this editor.
+// says the copy was made by an editor of this page.
+//
+// The copy itself (pictures, links, fields, tables: a DocFragment) never
+// leaves the page. It is kept here, for every editor of the page, under the
+// mark its HTML carries; a paste whose HTML has the mark and whose text is
+// the text of that copy gets the copy, any other paste the plain text of the
+// clipboard. Only the last few copies are kept, up to a number of bytes.
 
-import { findWrapper, paragraphText, type Block, type DocModel, type Paragraph } from '../model/doc/types';
-import { applyDocOps, asRange, deleteRange, itemLength, paragraphsBetween, rangeFormat, resolvePosition, storyOf, type DocPosition, type DocRange, type RunFormatPatch } from '../ops/doc/index';
+import { findWrapper, paragraphText, type Block, type DocModel, type Paragraph, type ParaProps, type Wrapper } from '../model/doc/types';
+import {
+  applyDocOps,
+  asRange,
+  deleteRange,
+  fragmentOf,
+  itemLength,
+  paragraphsBetween,
+  rangeFormat,
+  resolvePosition,
+  storyOf,
+  type DocFragment,
+  type DocPosition,
+  type DocRange,
+  type RunFormatPatch,
+} from '../ops/doc/index';
 
 /** Text in one formatting. A line break inside a paragraph is "\v", as insertText() takes it. */
 export interface SliceRun {
@@ -22,11 +42,18 @@ export interface SliceParagraph {
   style?: string;
 }
 
-/** A part of a document as the editor pastes it back: paragraphs of formatted text. The last one is without its end. */
+/**
+ * A part of a document as a copy. `paragraphs` (the last one without its end)
+ * and `table` are its text in its formatting: what the HTML on the clipboard
+ * is made of. `fragment` is the copy the editor pastes: the content itself,
+ * with its pictures, links, fields and tables. A slice without one is pasted
+ * as formatted text.
+ */
 export interface DocSlice {
   paragraphs: SliceParagraph[];
-  /** The cells of a table that were selected, by row: pasted as a table. */
+  /** The cells of a table that were selected, by row. */
   table?: string[][];
+  fragment?: DocFragment;
 }
 
 /** A copy larger than this is kept as plain text only. */
@@ -105,22 +132,59 @@ export function sliceOf(doc: DocModel, start: DocPosition, end: DocPosition): Do
       }
       paragraphs.push(paragraph);
     }
-    return { paragraphs };
+    const slice: DocSlice = { paragraphs };
+    const fragment = fragmentOfRange(doc, start, end);
+    if (fragment) slice.fragment = fragment;
+    return slice;
   } catch {
     return undefined;
   }
 }
 
-/** What a story holds, counted: the length of its text, and everything in it that is more than text in some formatting. */
-interface Census {
-  text: number;
-  other: string;
+/** The copy of a range as the editor pastes it; undefined when it is too large to keep or cannot be read. */
+export function fragmentOfRange(doc: DocModel, start: DocPosition, end: DocPosition): DocFragment | undefined {
+  try {
+    return fragmentOf(doc, { anchor: start, focus: end });
+  } catch {
+    return undefined;
+  }
 }
 
-/** Items a copy carries as characters of its text, and a hint of the layout that stands for nothing. */
-const AS_TEXT = new Set<string>(['text', 'tab', 'noBreakHyphen', 'lastRenderedPageBreak']);
+/** What blocks hold, counted: the length of their text, and everything in them that is more than text in some formatting. */
+interface Census {
+  text: number;
+  other: Map<string, number>;
+}
+
+/** Items a copy carries as characters of its text. */
+const AS_TEXT = new Set<string>(['text', 'tab', 'noBreakHyphen']);
 /** Inlines that are never removed with the text around them, or mean nothing by themselves. */
 const NO_CONTENT = new Set<string>(['proofError', 'empty']);
+
+const chain = (wrap: Wrapper | undefined): string => {
+  let out = '';
+  for (let w = wrap; w; w = w.parent) out += w.kind + ' ';
+  return out;
+};
+
+/** A number for each bag of paragraph properties, so that bags can be counted like everything else. Bags are never changed in place. */
+const PROPS_IDS = new WeakMap<ParaProps, number>();
+let propsIds = 0;
+
+/** The key paragraph properties are counted under; undefined for properties that state nothing. */
+function propsKey(props: ParaProps): string | undefined {
+  let stated = false;
+  for (const key in props) {
+    if (Object.prototype.hasOwnProperty.call(props, key)) {
+      stated = true;
+      break;
+    }
+  }
+  if (!stated) return undefined;
+  let id = PROPS_IDS.get(props);
+  if (id === undefined) PROPS_IDS.set(props, (id = ++propsIds));
+  return 'paragraph properties ' + id;
+}
 
 function census(blocks: Block[]): Census {
   const counts = new Map<string, number>();
@@ -130,16 +194,29 @@ function census(blocks: Block[]): Census {
   let text = 0;
   const walk = (list: Block[], depth: number): void => {
     for (const block of list) {
+      // A block in a content control or another wrapper of blocks is more than the block.
+      if (block.wrap && (block.type === 'paragraph' || block.type === 'table')) count('block in ' + chain(block.wrap));
       if (block.type === 'table') {
-        if (depth < 64) for (const row of block.rows) for (const cell of row.cells) walk(cell.blocks, depth + 1);
+        count('table');
+        for (const row of block.rows) {
+          count('row');
+          if (row.wrap) count('row in ' + chain(row.wrap));
+          for (const cell of row.cells) {
+            if (cell.wrap) count('cell in ' + chain(cell.wrap));
+            if (depth < 64) walk(cell.blocks, depth + 1);
+          }
+        }
         continue;
       }
       if (block.type !== 'paragraph') continue;
       text += paragraphText(block).length;
+      if (block.props.section) count('section');
+      // The formatting of a paragraph (its style, its list, its kept properties) goes with its end.
+      const formatted = propsKey(block.props);
+      if (formatted !== undefined) count(formatted);
       for (const inline of block.children) {
         // Text inside a link, a field, a content control or a tracked change is more than its characters.
-        let wrapped = '';
-        for (let w = inline.wrap; w; w = w.parent) wrapped += w.kind + ' ';
+        const wrapped = chain(inline.wrap);
         if (inline.type !== 'run') {
           if (!NO_CONTENT.has(inline.type)) count(inline.type);
           if (inline.type === 'math' && wrapped !== '') count('in ' + wrapped, inline.text.length);
@@ -152,6 +229,8 @@ function census(blocks: Block[]): Census {
             count('code');
             continue;
           }
+          // A hint of the last layout stands for nothing.
+          if (item.type === 'lastRenderedPageBreak') continue;
           if (item.type === 'break') {
             if (item.kind !== 'line') count('break ' + item.kind);
           } else if (!AS_TEXT.has(item.type)) count(item.type);
@@ -161,20 +240,23 @@ function census(blocks: Block[]): Census {
     }
   };
   walk(blocks, 0);
-  const keys: string[] = [];
-  counts.forEach((_, key) => keys.push(key));
-  keys.sort();
-  return { text, other: keys.map((key) => `${key}=${counts.get(key)}`).join(';') };
+  return { text, other: counts };
 }
 
 /**
  * Whether a cut of a range would take something out of the document that the
- * copy of it (`slice`; undefined when only plain text is on the clipboard)
- * does not hold: a picture, a note reference, a field, an equation, a link, a
- * content control, a tracked change, a page break. The deletion itself is the
- * judge: it is made, what the story holds is counted before and after, and it
- * is taken back, so that nothing here has to know what a deletion removes.
- * Throws the RangeError of a place that cannot be edited.
+ * copy of it does not hold (`slice`; undefined when only plain text is on the
+ * clipboard): a note reference, an equation, a content control, a tracked
+ * change, a drawing with text, and whatever else a copy does not carry (see
+ * fragmentOf of ops/doc). The formatting of paragraphs counts: a deletion
+ * that joins two paragraphs keeps the formatting of one of them, and the copy
+ * has to hold that of the other (a copy that is plain text holds none, so a
+ * cut over the end of a formatted paragraph needs a copy that is more). The deletion itself is the judge: it is made, what
+ * the story holds is counted before and after, and it is taken back, so that
+ * nothing here has to know what a deletion removes. What went is then looked
+ * for in the copy, kind by kind: the copy has to hold at least as much of
+ * each, and all of the text. Throws the RangeError of a place that cannot be
+ * edited.
  */
 export function cutLoses(doc: DocModel, range: DocRange, slice: DocSlice | undefined): boolean {
   const story = asRange(range).focus.story;
@@ -188,13 +270,19 @@ export function cutLoses(doc: DocModel, range: DocRange, slice: DocSlice | undef
   } finally {
     applyDocOps(doc, inverse);
   }
-  if (after.other !== before.other) return true;
-  if (slice && !slice.table) {
-    // Every character that goes must be one the copy holds.
-    let carried = 0;
-    for (const paragraph of slice.paragraphs) for (const run of paragraph.runs) carried += run.text.length;
-    if (before.text - after.text !== carried) return true;
-  }
+  const fragment = slice ? slice.fragment : undefined;
+  const carried: Census = fragment ? census(fragment.blocks) : { text: 0, other: new Map() };
+  // Of the paragraph a range ends in the copy holds the formatting too, beside the blocks.
+  const ending = fragment && fragment.endProps ? propsKey(fragment.endProps) : undefined;
+  if (ending !== undefined) carried.other.set(ending, (carried.other.get(ending) || 0) + 1);
+  if (!fragment && slice && !slice.table) for (const paragraph of slice.paragraphs) for (const run of paragraph.runs) carried.text += run.text.length;
+  let lost = false;
+  before.other.forEach((had, key) => {
+    if (had - (after.other.get(key) || 0) > (carried.other.get(key) || 0)) lost = true;
+  });
+  if (lost) return true;
+  // Every character that goes must be one the copy holds.
+  if (slice && (fragment || !slice.table) && before.text - after.text > carried.text) return true;
   return false;
 }
 
@@ -243,4 +331,117 @@ export function sliceHtml(slice: DocSlice, mark: string): string {
 /** Whether HTML from the clipboard carries the mark of a copy. The HTML is searched, never parsed. */
 export function hasCopyMark(html: string | undefined, mark: string): boolean {
   return typeof html === 'string' && mark !== '' && html.indexOf(`data-bym-doc-copy="${mark}"`) >= 0;
+}
+
+// ------------------------------------------------------- the copies of the page
+
+/** A copy an editor of the page made, as it is kept for a paste. */
+export interface StoredCopy {
+  /** What the HTML on the clipboard carries of it. */
+  mark: string;
+  /** The plain text that went on the clipboard with it. */
+  text: string;
+  slice: DocSlice;
+  /** Bytes the copy is counted with: its text, its blocks, its pictures. */
+  bytes: number;
+  /** Resolves when the pictures of the copy that were still being read have their bytes (or will not get them). */
+  ready?: Promise<void>;
+  /** The copy was made by a cut: see InsertFragmentOptions.moved. */
+  cut?: boolean;
+  /** The copy held more than the page keeps: its pictures were dropped, and none is taken for it any more. */
+  full?: boolean;
+}
+
+/** How many copies the page keeps, and how many bytes they may hold together (pictures included). */
+export const MAX_STORED_COPIES = 8;
+export const MAX_STORED_BYTES = 64 * 1024 * 1024;
+
+/** Newest last. */
+let copies: StoredCopy[] = [];
+let sequence = 0;
+
+const normalText = (text: string): string => text.replace(/\r\n?/g, '\n');
+
+function sizeOf(text: string, slice: DocSlice): number {
+  let bytes = 256 + text.length * 2;
+  const fragment = slice.fragment;
+  if (fragment) {
+    bytes += fragment.textLength * 4 + fragment.blocks.length * 128;
+    fragment.media.forEach((media) => (bytes += media.bytes ? media.bytes.length : 0));
+  }
+  return bytes;
+}
+
+/** Drops the oldest copies while there are too many or they hold too much; a newest copy that is too large alone loses its pictures, then its fragment. */
+function trim(): void {
+  let total = 0;
+  for (const copy of copies) total += copy.bytes;
+  while (copies.length > 1 && (copies.length > MAX_STORED_COPIES || total > MAX_STORED_BYTES)) total -= (copies.shift() as StoredCopy).bytes;
+  const last = copies[0];
+  if (last && copies.length === 1 && last.bytes > MAX_STORED_BYTES && last.slice.fragment) {
+    const fragment = last.slice.fragment;
+    // Without the bytes the copy can still be pasted into the document it came from.
+    fragment.media.forEach((media) => delete media.bytes);
+    last.full = true;
+    last.bytes = sizeOf(last.text, last.slice);
+    if (last.bytes > MAX_STORED_BYTES) {
+      last.slice = { paragraphs: [] };
+      last.bytes = 256 + last.text.length * 2;
+    }
+  }
+}
+
+/** Keeps a copy for the editors of the page and returns it; its mark is new and made of letters and digits only. */
+export function storeCopy(text: string, slice: DocSlice, cut = false): StoredCopy {
+  const mark = Math.random().toString(36).slice(2) + Date.now().toString(36) + (++sequence).toString(36);
+  const copy: StoredCopy = { mark, text: normalText(text), slice, bytes: sizeOf(text, slice) };
+  if (cut) copy.cut = true;
+  copies.push(copy);
+  trim();
+  return copy;
+}
+
+/** Hands a picture that was read for a copy to it: the bytes count against what the page keeps. */
+export function setCopyMedia(copy: StoredCopy, name: string, bytes: Uint8Array, type?: string): void {
+  const fragment = copy.slice.fragment;
+  const media = fragment ? fragment.media.get(name) : undefined;
+  if (!media || media.bytes || copy.full || copies.indexOf(copy) < 0) return;
+  // A picture that does not fit is not kept (see trim): the copy can then be pasted only where the picture already is.
+  media.bytes = bytes;
+  if (type !== undefined) media.type = type;
+  copy.bytes += bytes.length;
+  trim();
+}
+
+/** The mark in HTML from the clipboard; undefined when it has none. The HTML is searched, never parsed. */
+export function copyMarkOf(html: string | undefined): string | undefined {
+  if (typeof html !== 'string') return undefined;
+  const key = 'data-bym-doc-copy="';
+  const at = html.indexOf(key);
+  if (at < 0) return undefined;
+  const end = html.indexOf('"', at + key.length);
+  const mark = end < 0 ? '' : html.slice(at + key.length, end);
+  return /^[a-z0-9]{1,64}$/.test(mark) ? mark : undefined;
+}
+
+/** The copy a paste is one of: the HTML carries its mark and the plain text is its text. */
+export function storedCopy(html: string | undefined, text: string): StoredCopy | undefined {
+  const mark = copyMarkOf(html);
+  if (mark === undefined) return undefined;
+  for (let i = copies.length - 1; i >= 0; i--) {
+    if (copies[i].mark === mark) return copies[i].text === normalText(text) ? copies[i] : undefined;
+  }
+  return undefined;
+}
+
+/** How many copies the page keeps right now and how many bytes they count. */
+export function storedCopies(): { count: number; bytes: number } {
+  let bytes = 0;
+  for (const copy of copies) bytes += copy.bytes;
+  return { count: copies.length, bytes };
+}
+
+/** Forgets every copy. */
+export function clearStoredCopies(): void {
+  copies = [];
 }

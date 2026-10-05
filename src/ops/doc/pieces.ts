@@ -277,7 +277,7 @@ export const isStaleHint = (piece: Piece): boolean =>
   !piece.frozen && (piece.item !== undefined ? !piece.code && piece.item.type === 'lastRenderedPageBreak' : (piece.inline as Inline).type === 'proofError');
 
 /** Part of the skeleton of a field: its marks and its code. */
-const isStructural = (piece: Piece): boolean => piece.item !== undefined && (piece.code || piece.item.type === 'fieldChar' || piece.item.type === 'instrText');
+export const isStructural = (piece: Piece): boolean => piece.item !== undefined && (piece.code || piece.item.type === 'fieldChar' || piece.item.type === 'instrText');
 
 /** A wrapper chain without the wrapper `gone`; wrappers inside it are copied, once each. */
 function withoutWrapper(wrap: Wrapper | undefined, gone: Wrapper, memo: Map<Wrapper, Wrapper | undefined>): Wrapper | undefined {
@@ -300,6 +300,42 @@ function withoutWrapper(wrap: Wrapper | undefined, gone: Wrapper, memo: Map<Wrap
  */
 export function removePieces(pieces: Piece[], from: number, to: number): Piece[] {
   if (from >= to) return pieces;
+  const flags = removedPieces(pieces, from, to);
+  const out: Piece[] = [];
+  const links = new Set<Wrapper>();
+  for (let q = 0; q < pieces.length; q++) {
+    const piece = pieces[q];
+    if (!flags[q]) {
+      out.push(piece);
+      continue;
+    }
+    for (let w = piece.wrap; w; w = w.parent) if (w.kind === 'hyperlink') links.add(w);
+  }
+  links.forEach((link) => {
+    let used = false;
+    for (const piece of out) {
+      if ((piece.len > 0 || isAtom(piece)) && chainHas(piece.wrap, (w) => w === link)) used = true;
+    }
+    if (used) return;
+    const memo = new Map<Wrapper, Wrapper | undefined>();
+    for (let q = 0; q < out.length; q++) {
+      if (chainHas(out[q].wrap, (w) => w === link)) out[q] = { ...out[q], wrap: withoutWrapper(out[q].wrap, link, memo) };
+    }
+  });
+  return out;
+}
+
+/**
+ * Which pieces a removal of [from, to) takes, a flag for each: the judgement
+ * removePieces() makes, for those who have to know what goes (the copy a cut
+ * puts on the clipboard holds exactly these).
+ */
+export function removedPieces(pieces: Piece[], from: number, to: number): boolean[] {
+  const flags: boolean[] = [];
+  if (from >= to) {
+    for (let q = 0; q < pieces.length; q++) flags.push(false);
+    return flags;
+  }
   const { pairs, owner } = fieldPairs(pieces);
   const doomed: boolean[] = [];
   for (const pair of pairs) {
@@ -319,29 +355,11 @@ export function removePieces(pieces: Piece[], from: number, to: number): Piece[]
     }
     doomed.push(gone);
   }
-  const out: Piece[] = [];
-  const links = new Set<Wrapper>();
   for (let q = 0; q < pieces.length; q++) {
     const piece = pieces[q];
-    const removed = isStructural(piece) ? owner[q] >= 0 && doomed[owner[q]] && !piece.frozen : q >= from && q < to && isRemovable(piece);
-    if (!removed) {
-      out.push(piece);
-      continue;
-    }
-    for (let w = piece.wrap; w; w = w.parent) if (w.kind === 'hyperlink') links.add(w);
+    flags.push(isStructural(piece) ? owner[q] >= 0 && doomed[owner[q]] && !piece.frozen : q >= from && q < to && isRemovable(piece));
   }
-  links.forEach((link) => {
-    let used = false;
-    for (const piece of out) {
-      if ((piece.len > 0 || isAtom(piece)) && chainHas(piece.wrap, (w) => w === link)) used = true;
-    }
-    if (used) return;
-    const memo = new Map<Wrapper, Wrapper | undefined>();
-    for (let q = 0; q < out.length; q++) {
-      if (chainHas(out[q].wrap, (w) => w === link)) out[q] = { ...out[q], wrap: withoutWrapper(out[q].wrap, link, memo) };
-    }
-  });
-  return out;
+  return flags;
 }
 
 /** Characters XML cannot hold: they are dropped from typed and pasted text. */
@@ -629,7 +647,7 @@ const loosePiece = (inline: Inline): Piece => ({ inline, props: EMPTY_RUN_PROPS,
  * between two rows), as the mark it is. Other kept children of a table belong
  * to its structure and go with it.
  */
-function looseMark(extra: ExtraXml): Inline | undefined {
+export function looseMark(extra: ExtraXml): Inline | undefined {
   const el = extra.el;
   const type = localName(el.name);
   if (extra.partial || extra.index < 0 || !RANGE_MARK_NAMES.has(type)) return undefined;

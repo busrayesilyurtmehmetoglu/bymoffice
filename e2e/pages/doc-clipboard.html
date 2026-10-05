@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: the clipboard between two document editors</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      .host {
+        width: 700px;
+        max-width: 100%;
+        height: 280px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="host-a" class="host"></div>
+    <div id="host-b" class="host"></div>
+    <p id="state">loading</p>
+    <script src="/dist/bymoffice.min.js"></script>
+    <script>
+      window.__mounted = {};
+      window.__views = {};
+      window.__notices = [];
+      // Opens a document from bytes in an editor inside #host-a or #host-b. Resolves once it is shown.
+      window.__mountEditor = async function (name, bytes) {
+        if (window.__mounted[name]) window.__mounted[name].destroy();
+        var mounted = await BymOffice.mount(document.getElementById('host-' + name), {
+          file: new Uint8Array(bytes),
+          readOnly: false,
+          toolbar: false,
+          onNotice: function (notice) {
+            window.__notices.push({ editor: name, message: notice.message, kind: notice.kind });
+          },
+        });
+        window.__mounted[name] = mounted;
+        window.__views[name] = mounted.view;
+        return true;
+      };
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>

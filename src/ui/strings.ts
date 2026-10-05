@@ -98,6 +98,12 @@ export interface UiStrings {
   cannotEditHere: string;
   cannotCutObjects: string;
   cannotWriteClipboard: string;
+  /** A copy made in an editor of the page does not fit where it is pasted. */
+  cannotPasteHere: string;
+  /** A paste waits for the pictures of the copy to be read from the document they are in. */
+  pasteWaiting: string;
+  /** The caret moved or the document changed while a paste was waiting: it was not made. */
+  pasteInterrupted: string;
   /** Said after Escape: the next Tab moves the focus out of the editor instead of typing a tab. */
   tabLeaves: string;
   documentPasteTooLarge: string;
@@ -206,8 +212,11 @@ export const STRINGS_EN: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Chart' : kind === 'diagram' ? 'Diagram' : kind === 'object' ? 'Embedded object' : kind === 'picture' ? 'Picture' : 'Drawing'),
   documentEditor: 'Document editor',
   cannotEditHere: 'This part of the document cannot be edited',
-  cannotCutObjects: 'The selection holds something that cannot be cut (a picture, a note, a field, a link); it was left in place',
+  cannotCutObjects: 'The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place',
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
+  cannotPasteHere: 'What was copied cannot be pasted here',
+  pasteWaiting: 'Reading the pictures of the copy; it is pasted when they are there',
+  pasteInterrupted: 'The selection or the document changed while the pictures of the copy were read; nothing was pasted',
   tabLeaves: 'Press Tab to leave the editor',
   documentPasteTooLarge: 'The text on the clipboard is too long to paste',
   openedConverted: (from, to) => `This ${from} file was converted to ${to} to be edited; it is saved as ${to}`,
@@ -311,8 +320,11 @@ export const STRINGS_TR: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Grafik' : kind === 'diagram' ? 'Diyagram' : kind === 'object' ? 'Gömülü nesne' : kind === 'picture' ? 'Görsel' : 'Çizim'),
   documentEditor: 'Belge düzenleyici',
   cannotEditHere: 'Belgenin bu bölümü düzenlenemez',
-  cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (görsel, dipnot, alan, bağlantı); yerinde bırakıldı',
+  cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (dipnot, denklem, metin kutusu, içerik denetimi, izlenen değişiklik); yerinde bırakıldı',
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',
+  cannotPasteHere: 'Kopyalanan içerik buraya yapıştırılamıyor',
+  pasteWaiting: 'Kopyanın görselleri okunuyor; okununca yapıştırılacak',
+  pasteInterrupted: 'Kopyanın görselleri okunurken seçim ya da belge değişti; hiçbir şey yapıştırılmadı',
   tabLeaves: 'Düzenleyiciden çıkmak için Sekme tuşuna basın',
   documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
   openedConverted: (from, to) => `Bu ${from} dosyası düzenlenebilmesi için ${to} biçimine çevrildi; ${to} olarak kaydedilir`,
