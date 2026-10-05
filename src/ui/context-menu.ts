@@ -11,6 +11,14 @@ export interface MenuItem {
   separator?: boolean;
   /** Shown but not available: it cannot be pressed and the arrow keys pass over it. */
   disabled?: boolean;
+  /** Said beside the item when the pointer rests on it: why it is not available, say. */
+  title?: string;
+  /**
+   * For an item that is not available: says why. With it the item can be reached with the
+   * keys and pressed (it is marked aria-disabled instead of being switched off), and
+   * pressing it runs this instead of the action; the menu stays open.
+   */
+  explain?(): void;
 }
 
 export class ContextMenu {
@@ -62,8 +70,10 @@ export class ContextMenu {
         // Reached with the arrow keys, not with Tab.
         button.tabIndex = -1;
         button.textContent = item.label;
+        if (item.title) button.title = item.title;
         if (item.disabled) {
-          button.disabled = true;
+          // Switched off, the button could not be reached, and neither could its reason.
+          if (!item.explain) button.disabled = true;
           button.setAttribute('aria-disabled', 'true');
         }
         node = button;
@@ -134,12 +144,18 @@ export class ContextMenu {
     return item !== undefined && !item.separator && !item.disabled;
   }
 
+  /** An item the arrow keys stop at: one that is available, or one that says why it is not. */
+  private reachable(index: number): boolean {
+    const item = this.items[index];
+    return item !== undefined && !item.separator && (!item.disabled || item.explain !== undefined);
+  }
+
   /** The next available item from `index` in a direction, going round; -1 when there is none. */
   private step(index: number, direction: number): number {
     const count = this.items.length;
     for (let n = 1; n <= count; n++) {
       const next = (((index + direction * n) % count) + count) % count;
-      if (this.usable(next)) return next;
+      if (this.reachable(next)) return next;
     }
     return -1;
   }
@@ -148,7 +164,11 @@ export class ContextMenu {
     if (!this.armed) return;
     for (let i = 0; i < this.nodes.length; i++) {
       if (this.nodes[i].contains(event.target as Node)) {
-        if (!this.usable(i)) return;
+        if (!this.usable(i)) {
+          const explain = this.items[i].explain;
+          if (explain) explain();
+          return;
+        }
         const action = this.items[i].action;
         this.close();
         if (action) action();

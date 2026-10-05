@@ -138,6 +138,29 @@ export interface UiStrings {
   printSheetFailed: string;
   /** Said when the sheets that were to be printed hold nothing. */
   printNothing: string;
+  // The sheet tabs.
+  /** Label of the button beside the tabs that adds a sheet after the last one. */
+  addSheet: string;
+  /** Items of the menu of a tab. */
+  insertSheet: string;
+  renameSheet: string;
+  deleteSheet: string;
+  /** Label of the field a sheet is renamed in. */
+  sheetName: string;
+  /** Said after a sheet was deleted. */
+  sheetDeleted(name: string): string;
+  // What the operations on sheets refuse to do.
+  badSheetName: string;
+  sheetNameTaken(name: string): string;
+  cannotDeleteLastSheet: string;
+  /** A chart sheet or a sheet of another kind that is only kept. */
+  sheetKindFixed(action: 'rename' | 'delete'): string;
+  /** `what` names the content in the way: chart, pivotTable, table, form controls. */
+  sheetBlockedBy(action: 'rename' | 'delete', what: string): string;
+  /** `where` is the cell or the name whose formula cannot be read. */
+  sheetFormulaUnread(action: 'rename' | 'delete', where: string): string;
+  /** Two sheets whose names differ only by the case of their letters: the sheets of such a workbook are not changed. */
+  sheetNamesClash(first: string, second: string): string;
 }
 
 const rows = (count: number) => (count === 1 ? 'row' : `${count} rows`);
@@ -239,6 +262,22 @@ export const STRINGS_EN: UiStrings = {
   printSheetTooLong: 'The sheet is too long to print at once',
   printSheetFailed: 'The sheet could not be printed',
   printNothing: 'There is nothing to print',
+  addSheet: 'Add sheet',
+  insertSheet: 'Insert sheet',
+  renameSheet: 'Rename',
+  deleteSheet: 'Delete',
+  sheetName: 'Sheet name',
+  sheetDeleted: (name) => `Sheet ${name} was deleted. Undo brings it back.`,
+  badSheetName: 'A sheet name has 1 to 31 characters, none of [ ] : * ? / \\, no apostrophe at its start or end, and is not "History"',
+  sheetNameTaken: (name) => `Another sheet is already named "${name}"`,
+  cannotDeleteLastSheet: 'The last visible sheet cannot be deleted',
+  sheetKindFixed: (action) => `This kind of sheet cannot be ${action === 'rename' ? 'renamed' : 'deleted'} yet`,
+  sheetBlockedBy: (action, what) =>
+    what === 'table'
+      ? `A sheet with a table cannot be ${action === 'rename' ? 'renamed' : 'deleted'} yet`
+      : `Sheets cannot be ${action === 'rename' ? 'renamed' : 'deleted'} yet in a workbook with ${what === 'pivotTable' ? 'a pivot table' : what === 'chart' ? 'a chart' : what}`,
+  sheetFormulaUnread: (action, where) => `The sheet cannot be ${action === 'rename' ? 'renamed' : 'deleted'}: the formula of ${where} cannot be read`,
+  sheetNamesClash: (first, second) => `The sheets of this workbook cannot be changed: "${first}" and "${second}" differ only by case`,
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -347,6 +386,22 @@ export const STRINGS_TR: UiStrings = {
   printSheetTooLong: 'Sayfa bir kerede yazdırılamayacak kadar uzun',
   printSheetFailed: 'Sayfa yazdırılamadı',
   printNothing: 'Yazdırılacak bir şey yok',
+  addSheet: 'Sayfa ekle',
+  insertSheet: 'Sayfa ekle',
+  renameSheet: 'Yeniden adlandır',
+  deleteSheet: 'Sil',
+  sheetName: 'Sayfa adı',
+  sheetDeleted: (name) => `${name} sayfası silindi. Geri al ile geri gelir.`,
+  badSheetName: 'Sayfa adı 1-31 karakter olmalı; [ ] : * ? / \\ içeremez, kesme işaretiyle başlayıp bitemez ve "History" olamaz',
+  sheetNameTaken: (name) => `"${name}" adında başka bir sayfa var`,
+  cannotDeleteLastSheet: 'Görünen son sayfa silinemez',
+  sheetKindFixed: (action) => `Bu tür sayfalar henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : 'silinemiyor'}`,
+  sheetBlockedBy: (action, what) =>
+    what === 'table'
+      ? `Tablo içeren sayfa henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : 'silinemiyor'}`
+      : `${what === 'pivotTable' ? 'Pivot tablo' : what === 'chart' ? 'Grafik' : what === 'form controls' ? 'Form denetimi' : what} içeren çalışma kitabında sayfalar henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : 'silinemiyor'}`,
+  sheetFormulaUnread: (action, where) => `Sayfa ${action === 'rename' ? 'yeniden adlandırılamadı' : 'silinemedi'}: ${where} formülü okunamıyor`,
+  sheetNamesClash: (first, second) => `Bu çalışma kitabının sayfaları değiştirilemiyor: "${first}" ve "${second}" adları yalnız harf büyüklüğüyle ayrılıyor`,
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

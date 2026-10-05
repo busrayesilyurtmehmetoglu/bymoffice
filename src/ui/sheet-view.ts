@@ -40,6 +40,7 @@ import {
   setFilterColumn,
 } from '../ops/filter';
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
+import { canDeleteSheet, canRenameSheet, defaultSheetName, deleteSheet as deleteSheetOps, insertSheet as insertSheetOps, renameSheet as renameSheetOps } from '../ops/sheets';
 import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
@@ -63,6 +64,7 @@ import {
 } from './doc-print';
 import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
 import { FilterMenu, ListMenu } from './filter-menu';
+import { allSheets, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
 
 export interface WorkbookViewOptions {
   /**
@@ -120,6 +122,17 @@ export interface HistoryMark {
   cells?: { sheet: number; row: number; col: number }[];
   /** Sheets on which the step hid or showed rows (by hand, by a filter): SUBTOTAL and AGGREGATE read that. */
   rows?: number[];
+  /**
+   * The step changed the list of sheets: one was inserted, deleted or renamed. The indexes of
+   * the mark are those of the list the step leads to (as every mark's are): `sheet` is the
+   * sheet shown then, and `sheets` are all of them.
+   */
+  sheetOp?: SheetOpKind;
+  /**
+   * With a sheet deleted: the cells of other sheets whose formulas read it and were rewritten,
+   * by their sheets (indexes differ before and after the step). Missing when there are too many.
+   */
+  sheetCells?: { sheet: Sheet; row: number; col: number }[];
 }
 
 /** Longest a recalculation holds the page before it leaves the rest for the next turn. */
@@ -241,7 +254,7 @@ const MARK_COLORS: { [kind: string]: string } = { file: '#E8710A', circular: '#D
 
 /** What is known about the active cell beyond its content: worked out once per selection and change. */
 interface CellInfo {
-  sheet: number;
+  sheet: Sheet;
   row: number;
   col: number;
   /** The cell offers a list to choose from. */
@@ -263,6 +276,11 @@ const AUTO_FIT_ROWS = 2000;
 /** Space the grid leaves around the text of a cell, both sides together. */
 const CELL_TEXT_MARGIN = 8;
 const DOUBLE_TAP_MS = 500;
+/** Width of the button that adds a sheet, for a mouse and for a finger. */
+const ADD_SHEET_WIDTH = 36;
+const ADD_SHEET_WIDTH_COARSE = 44;
+/** Longest name a sheet can have, in UTF-16 units as the field counts them. */
+const MAX_SHEET_NAME = 31;
 
 /** Language of the view's own words: the tag given as `locale`, else the browser's. */
 const resolveStrings = resolveUiStrings;
@@ -280,7 +298,8 @@ const STYLE_TEXT =
   'max-width:none;max-height:none;margin:0;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;line-height:1.2;' +
   'text-align:left;padding:8px 16px;white-space:nowrap;cursor:pointer}' +
   '.bym-menu-item:hover,.bym-menu-item:focus{background:#e8eaed;outline:none}' +
-  '.bym-menu-item:disabled{color:#9aa0a6;background:transparent;cursor:default}' +
+  '.bym-menu-item:disabled,.bym-menu-item[aria-disabled="true"]{color:#9aa0a6;background:transparent;cursor:default}' +
+  '.bym-menu-item[aria-disabled="true"]:focus{outline:1px dotted #9aa0a6;outline-offset:-3px}' +
   '.bym-menu-separator{height:1px;margin:4px 0;background:#dadce0}' +
   '.bym-resize-guide{background:#1a7f45}' +
   // What drops down from a cell: the menu of a filter button and the list of a data validation.
@@ -326,11 +345,24 @@ const STYLE_TEXT =
   '.bym-tabs{background:#f1f3f4;border-top:1px solid #dadce0}' +
   '.bym-tab{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;width:auto;height:auto;min-width:0;' +
   'max-width:none;max-height:none;margin:0;border:0;border-right:1px solid #dadce0;border-radius:0;' +
-  'background:transparent;color:#444746;font:inherit;line-height:1.2;padding:0 14px;min-height:32px;white-space:nowrap;cursor:pointer}' +
+  'background:transparent;color:#444746;font:inherit;line-height:1.2;padding:0 14px;min-height:32px;white-space:nowrap;cursor:pointer;' +
+  // A finger that rests on a tab opens its menu, not the browser's selection or its preview; two quick taps are two taps.
+  '-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:manipulation}' +
   // A finger needs more to hit than a mouse pointer.
   '@media (pointer:coarse){.bym-tab{min-height:40px}}' +
   '.bym-tab:hover{background:#e8eaed}' +
   '.bym-tab[aria-selected="true"]{background:#fff;color:#1a7f45;font-weight:600}' +
+  '.bym-tab-add{-webkit-appearance:none;appearance:none;display:block;float:none;box-sizing:border-box;min-width:0;min-height:0;max-width:none;max-height:none;' +
+  'margin:0;padding:0;border:0;border-top:1px solid #dadce0;border-right:1px solid #dadce0;border-radius:0;background:#f1f3f4;color:#444746;' +
+  'font:inherit;font-size:18px;line-height:1;text-align:center;cursor:pointer}' +
+  '.bym-tab-add:hover{background:#e8eaed}' +
+  '.bym-tab-add:focus{outline:2px solid #1a7f45;outline-offset:-2px}' +
+  '.bym-tab-add:focus:not(:focus-visible){outline:none}' +
+  '.bym-tab-input{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;height:auto;min-width:0;max-width:none;max-height:none;' +
+  'margin:0;padding:0 8px;border:2px solid #1a7f45;border-radius:0;outline:none;background:#fff;color:#202124;font:inherit;line-height:1.2;min-height:32px}' +
+  '.bym-tab-input[aria-invalid="true"]{border-color:#d93025}' +
+  // Text smaller than 16 px makes iOS zoom the page when a field takes the focus.
+  '@media (pointer:coarse){.bym-tab-input{min-height:40px;font-size:16px}}' +
   '.bym-note{color:#5f6368;font-size:14px}';
 
 /** One style element per document or shadow root, shared by the views in it. */
@@ -538,6 +570,8 @@ export class WorkbookView {
   private readonly canvas: HTMLCanvasElement;
   private readonly spacer: HTMLDivElement;
   private readonly tabs: HTMLDivElement;
+  /** The button beside the tabs that adds a sheet. */
+  private readonly addButton: HTMLButtonElement;
   private readonly note: HTMLDivElement;
   private readonly live: HTMLDivElement;
   /**
@@ -549,8 +583,24 @@ export class WorkbookView {
   private readonly styleHost: Node;
   private readonly pointerEvents: boolean;
 
-  private readonly states: (SheetState | undefined)[] = [];
+  /**
+   * What is remembered for each sheet, by the sheet itself: indexes move when a sheet is
+   * inserted or deleted, and a deleted sheet that undo brings back is the same object.
+   */
+  private readonly states = new Map<Sheet, SheetState>();
   private sheetIndex: number;
+  /** The sheet at `sheetIndex` when it was last shown: tells a change of the list of sheets under the view. */
+  private shown: Sheet;
+  /** The field a sheet is being renamed in, in the place of its tab. */
+  private renaming: { sheet: Sheet; tab: HTMLElement; input: HTMLInputElement; box: HTMLElement; busy: boolean } | undefined;
+  /** The sheet whose tab was pressed while a name was being typed: shown once the field has closed. */
+  private renameTarget: Sheet | undefined;
+  /** A finger resting on a tab: a long press opens the menu of the tab. */
+  private tabPress: { pointerId: number; x: number; y: number; sheet: Sheet; scroll: number } | undefined;
+  private tabPressTimer = 0;
+  private lastTabTap: { time: number; sheet: Sheet } | undefined;
+  /** The click that follows the long press that opened the menu of a tab is not a tap on the tab. */
+  private swallowTabClick = false;
 
   /** Canvas size in CSS pixels and the ratio of its backing store to it. */
   private width = 0;
@@ -588,13 +638,13 @@ export class WorkbookView {
   /** The comment of a cell, shown beside it while the cell is pointed at or active. */
   private commentBox: HTMLDivElement | undefined;
   /** The cell whose comment the box shows now. */
-  private commentShown: { sheet: number; row: number; col: number; comment: SheetComment } | undefined;
+  private commentShown: { sheet: Sheet; row: number; col: number; comment: SheetComment } | undefined;
   /** The cell the mouse pointer is over, while it carries a comment. */
   private hoverComment: CellPos | undefined;
   /** Sheets about which it was said that some of their drawings or comments are not shown. */
   private warned = new WeakSet<Sheet>();
   /** The comment of this cell was put away with Escape; it stays away until another cell is active. */
-  private commentDismissed: { sheet: number; row: number; col: number } | undefined;
+  private commentDismissed: { sheet: Sheet; row: number; col: number } | undefined;
   /**
    * Formula cells the engine has something to say about, per sheet, by row * MAX_COLS + column:
    * "file" (not calculated here, the value of the file is shown), "circular", "stale".
@@ -606,7 +656,7 @@ export class WorkbookView {
   private copied: CopiedRange | undefined;
   private longPressTimer = 0;
   /** The cell the last tap selected, for telling a double tap: the second tap has to select the same cell. */
-  private lastTap: { time: number; sheet: number; row: number; col: number } | undefined;
+  private lastTap: { time: number; sheet: Sheet; row: number; col: number } | undefined;
   /** Names the last copy on the clipboard, so that a paste can tell this view's own cells from any other text. */
   private copyId = '';
   private committing = false;
@@ -640,6 +690,7 @@ export class WorkbookView {
     this.locked = options.readOnly === true;
     this.history = new History<HistoryMark>(workbook);
     this.sheetIndex = this.initialSheet();
+    this.shown = workbook.sheets[this.sheetIndex];
     this.pointerEvents = 'PointerEvent' in window;
 
     const root = document.createElement('div');
@@ -676,6 +727,13 @@ export class WorkbookView {
     tabs.setAttribute('role', 'tablist');
     tabs.style.cssText = 'position:relative;display:flex;flex:none;overflow-x:auto;overflow-y:hidden';
 
+    // Beside the tabs, not among them: the tab list holds tabs only, and stays in place while they scroll.
+    const addButton = document.createElement('button');
+    addButton.type = 'button';
+    addButton.className = 'bym-tab-add';
+    addButton.textContent = '+';
+    addButton.style.cssText = 'position:absolute;z-index:1;left:0;bottom:0';
+
     const live = document.createElement('div');
     live.className = 'bym-live';
     live.setAttribute('aria-live', 'polite');
@@ -705,6 +763,7 @@ export class WorkbookView {
     this.canvas = canvas;
     this.spacer = spacer;
     this.tabs = tabs;
+    this.addButton = addButton;
     this.note = note;
     this.live = live;
 
@@ -714,11 +773,13 @@ export class WorkbookView {
     root.appendChild(scroller);
     root.appendChild(input);
     root.appendChild(note);
+    root.appendChild(addButton);
     root.appendChild(tabs);
     root.appendChild(live);
 
     this.styleHost = acquireStyle(container);
     container.appendChild(root);
+    this.placeAddButton();
 
     scroller.addEventListener('scroll', this.onScroll, { passive: true });
     input.addEventListener('keydown', this.onKeyDown);
@@ -734,6 +795,15 @@ export class WorkbookView {
     // Panning and pinching stay with the browser; its double-tap zoom would swallow the double tap that edits.
     canvas.style.touchAction = 'manipulation';
     tabs.addEventListener('click', this.onTabClick);
+    tabs.addEventListener('keydown', this.onTabKeyDown);
+    tabs.addEventListener('contextmenu', this.onTabContextMenu);
+    if (this.pointerEvents) {
+      tabs.addEventListener('pointerdown', this.onTabPointerDown);
+      tabs.addEventListener('pointermove', this.onTabPointerMove);
+      tabs.addEventListener('pointerup', this.onTabPointerEnd);
+      tabs.addEventListener('pointercancel', this.onTabPointerEnd);
+    }
+    addButton.addEventListener('click', this.onAddClick);
     root.addEventListener('mousedown', this.onRootMouseDown);
     root.addEventListener('focusout', this.onFocusOut);
     if (options.focusScope) options.focusScope.addEventListener('focusout', this.onFocusOut);
@@ -780,12 +850,15 @@ export class WorkbookView {
     if (this.destroyed || index === this.sheetIndex) return;
     // What is being typed belongs to the sheet that is being left.
     if (this.edit) this.commitEditing();
+    // So does a name that is being typed for it.
+    this.finishRename(true, true);
     this.closeMenu();
     this.endDrag();
     this.endTouch();
     this.lastTap = undefined;
     this.hoverComment = undefined;
     this.sheetIndex = index;
+    this.shown = this.workbook.sheets[index];
     this.showSheet();
     this.schedule();
     if (this.options.onSheetChange) this.options.onSheetChange(index);
@@ -854,6 +927,8 @@ export class WorkbookView {
     this.drawings.forEach((layer) => layer.setLabels(this.drawingLabels()));
     this.root.setAttribute('aria-label', this.strings.spreadsheet);
     this.input.setAttribute('aria-label', this.strings.cellEditor);
+    this.placeAddButton();
+    if (this.renaming) this.renaming.input.setAttribute('aria-label', this.strings.sheetName);
     this.showSheet();
     this.render();
     this.announce();
@@ -880,7 +955,9 @@ export class WorkbookView {
     if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer);
     this.endDrag();
     this.endTouch();
+    this.clearTabPress();
     this.edit = undefined;
+    this.renaming = undefined;
     this.closeMenu();
     const input = this.input;
     input.removeEventListener('keydown', this.onKeyDown);
@@ -901,6 +978,13 @@ export class WorkbookView {
     window.removeEventListener('resize', this.onResize);
     this.scroller.removeEventListener('scroll', this.onScroll);
     this.tabs.removeEventListener('click', this.onTabClick);
+    this.tabs.removeEventListener('keydown', this.onTabKeyDown);
+    this.tabs.removeEventListener('contextmenu', this.onTabContextMenu);
+    this.tabs.removeEventListener('pointerdown', this.onTabPointerDown);
+    this.tabs.removeEventListener('pointermove', this.onTabPointerMove);
+    this.tabs.removeEventListener('pointerup', this.onTabPointerEnd);
+    this.tabs.removeEventListener('pointercancel', this.onTabPointerEnd);
+    this.addButton.removeEventListener('click', this.onAddClick);
     this.root.removeEventListener('mousedown', this.onRootMouseDown);
     this.root.removeEventListener('focusout', this.onFocusOut);
     if (this.options.focusScope) this.options.focusScope.removeEventListener('focusout', this.onFocusOut);
@@ -1202,10 +1286,15 @@ export class WorkbookView {
   }
 
   private state(): SheetState {
-    let state = this.states[this.sheetIndex];
+    return this.stateOf(this.workbook.sheets[this.sheetIndex] || this.shown);
+  }
+
+  /** What is remembered for a sheet, made when it is first asked for. */
+  private stateOf(sheet: Sheet): SheetState {
+    let state = this.states.get(sheet);
     if (!state) {
-      state = this.createState(this.workbook.sheets[this.sheetIndex]);
-      this.states[this.sheetIndex] = state;
+      state = this.createState(sheet);
+      this.states.set(sheet, state);
     }
     return state;
   }
@@ -1253,6 +1342,8 @@ export class WorkbookView {
     let selected: HTMLElement | undefined;
     for (let i = 0; i < tabs.length; i++) {
       const tab = tabs[i] as HTMLElement;
+      // The field a sheet is renamed in stands among the tabs and is none.
+      if (!tab.hasAttribute('data-sheet')) continue;
       const on = tab.getAttribute('data-sheet') === String(this.sheetIndex);
       tab.setAttribute('aria-selected', on ? 'true' : 'false');
       if (on) selected = tab;
@@ -1310,14 +1401,594 @@ export class WorkbookView {
     }
   }
 
-  private onTabClick = (event: MouseEvent): void => {
-    let node = event.target as HTMLElement | null;
-    while (node && node !== this.tabs && !node.hasAttribute('data-sheet')) node = node.parentElement;
-    if (!node || node === this.tabs) return;
+  /** The index of the sheet whose tab an event was on; -1 when it was on none. */
+  private tabSheetOf(target: EventTarget | null): number {
+    let node = target as HTMLElement | null;
+    while (node && node !== this.tabs && !(typeof node.hasAttribute === 'function' && node.hasAttribute('data-sheet'))) node = node.parentElement;
+    if (!node || node === this.tabs) return -1;
     const index = Number(node.getAttribute('data-sheet'));
-    // A pointer click hands the keyboard back to the cells; a tab chosen with the keyboard keeps the focus.
-    if (event.detail > 0) this.focusInput(true);
+    return Number.isInteger(index) && index >= 0 && index < this.workbook.sheets.length ? index : -1;
+  }
+
+  /** The tab of a sheet; undefined for a sheet without one (a hidden sheet). */
+  private tabOf(index: number): HTMLElement | undefined {
+    const tabs = this.tabs.children;
+    for (let i = 0; i < tabs.length; i++) if (tabs[i].getAttribute('data-sheet') === String(index)) return tabs[i] as HTMLElement;
+    return undefined;
+  }
+
+  /** A point of the window as a point of the view's root, where menus are placed. */
+  private rootPoint(clientX: number, clientY: number): { x: number; y: number } {
+    const rect = this.root.getBoundingClientRect();
+    const scaleX = rect.width > 0 ? this.root.offsetWidth / rect.width : 1;
+    const scaleY = rect.height > 0 ? this.root.offsetHeight / rect.height : 1;
+    return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
+  }
+
+  /** Sizes the button that adds a sheet to the strip of the tabs, and takes it away in a read-only view. */
+  private placeAddButton(): void {
+    const button = this.addButton;
+    const width = this.locked ? 0 : coarsePointer() ? ADD_SHEET_WIDTH_COARSE : ADD_SHEET_WIDTH;
+    button.style.display = this.locked ? 'none' : 'block';
+    button.style.width = `${width}px`;
+    button.setAttribute('aria-label', this.strings.addSheet);
+    button.title = this.strings.addSheet;
+    // The tabs begin where the button ends, so that none is ever under it.
+    this.tabs.style.marginLeft = `${width}px`;
+    button.style.height = `${this.tabs.offsetHeight}px`;
+  }
+
+  /**
+   * Builds the tabs again after the list of sheets changed. Returns whether the keyboard
+   * focus was on the strip (a tab, the field a sheet is renamed in), which the caller gives back to it.
+   */
+  private rebuildTabs(): boolean {
+    const root = this.tabs.getRootNode() as Document | ShadowRoot;
+    const focused = root.activeElement;
+    const within = focused !== null && this.tabs.contains(focused);
+    // A name that was being typed goes with its tab. Forgotten first: taking the field away may report that it lost the focus.
+    this.renaming = undefined;
+    this.clearTabPress();
+    while (this.tabs.firstChild) this.tabs.removeChild(this.tabs.firstChild);
+    this.buildTabs();
+    this.placeAddButton();
+    return within;
+  }
+
+  /**
+   * Brings the view in line with a list of sheets that changed under it (a sheet was
+   * inserted, deleted or renamed, or that was undone): the tabs, and the sheet that is shown,
+   * which is the one at `show`.
+   */
+  private syncSheets(show: number, kind: SheetOpKind): void {
+    const sheets = this.workbook.sheets;
+    const index = Number.isInteger(show) && show >= 0 && show < sheets.length ? show : Math.max(sheetToShow(sheets, this.sheetIndex), 0);
+    const moved = index !== this.sheetIndex || sheets[index] !== this.shown;
+    this.lastTap = undefined;
+    this.lastTabTap = undefined;
+    this.hoverComment = undefined;
+    // The marks are kept by the index of their sheet.
+    this.marksDirty = true;
+    // What was copied holds formulas that name sheets as they were: a paste takes the text instead.
+    this.copied = undefined;
+    this.copyId = '';
+    this.sheetIndex = index;
+    this.shown = sheets[index];
+    if (kind === 'rename') {
+      // The same tabs under other names: a press that is under way on one of them still finds it.
+      const tabs = this.tabs.children;
+      for (let i = 0; i < tabs.length; i++) {
+        const at = this.tabSheetOf(tabs[i]);
+        if (at >= 0 && tabs[i].textContent !== sheets[at].name) tabs[i].textContent = sheets[at].name;
+      }
+      this.placeAddButton();
+      this.showSheet();
+    } else {
+      const within = this.rebuildTabs();
+      this.showSheet();
+      if (within) {
+        const tab = this.tabOf(index);
+        if (tab) tab.focus({ preventScroll: true });
+        else this.focusInput(true);
+      }
+    }
+    if (moved && this.options.onSheetChange) this.options.onSheetChange(index);
+  }
+
+  /**
+   * The formulas after the list of sheets changed: see recalculateForSheets(). `cells` are
+   * the rewritten cells of a deleted sheet's readers, and `list` the sheets by whose
+   * indexes the engine is told about them.
+   */
+  private recalculateSheets(kind: SheetListChange['kind'], cells: HistoryMark['sheetCells'], list: Sheet[], unsure: boolean): void {
+    this.marksDirty = true;
+    if (this.options.calculate === false) return;
+    try {
+      // Without an engine nothing was calculated here yet; only a sheet that went with readers gives a reason to start.
+      if (!this.engine && (kind === 'names' || (cells !== undefined && cells.length === 0 && !unsure))) return;
+      if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      const engine = this.engine;
+      let addresses: { sheet: number; row: number; col: number }[] | undefined;
+      if (cells) {
+        addresses = [];
+        for (let i = 0; i < cells.length; i++) {
+          const sheet = list.indexOf(cells[i].sheet);
+          if (sheet >= 0) addresses.push({ sheet, row: cells[i].row, col: cells[i].col });
+        }
+      }
+      recalculateForSheets(engine, { kind, cells: addresses, unsure });
+      if (engine.incomplete) this.continueCalculation();
+    } catch (error) {
+      this.engine = undefined;
+    }
+  }
+
+  /**
+   * Applies an operation on the list of sheets as one undo step and brings the view up to
+   * date. `index` is the sheet the operation is about. An operation that throws leaves the
+   * workbook and the view as they were.
+   */
+  private applySheetOps(kind: SheetOpKind, ops: Op[], index: number): void {
+    this.closeMenu();
+    this.endDrag();
+    this.endTouch();
+    // A calculation under way is finished first: the graph it works on does not outlive the step.
+    if (this.engine && this.engine.incomplete) this.finishCalculation(this.engine);
+    const sheets = this.workbook.sheets;
+    const names = this.workbook.definedNames;
+    if (kind === 'delete') this.buildGraph();
+    const shown = this.state().sheet;
+    // Undoing shows the sheet the step was about when it has a tab: the one that comes back. Else the one shown now.
+    const back = kind === 'delete' && sheets[index].state === 'visible';
+    const from = back ? this.stateOf(sheets[index]) : this.state();
+    const before: HistoryMark = {
+      sheet: back ? index : this.sheetIndex,
+      active: { ...from.active },
+      range: { ...from.range },
+      sheets: allSheets(sheets.length),
+      structural: false,
+      sheetOp: kind,
+    };
+    const done: HistoryMark = { ...before };
+    const inverse = this.history.apply(ops, before, done);
+    const now = this.workbook.sheets;
+    // A new sheet is shown; a sheet that stays is still shown, wherever it is now; else the nearest one with a tab.
+    let show = kind === 'insert' ? index : now.indexOf(shown);
+    if (show < 0 || show >= now.length) show = Math.max(sheetToShow(now, index), 0);
+    const to = this.stateOf(now[show]);
+    done.sheet = show;
+    done.active = { ...to.active };
+    done.range = { ...to.range };
+    done.sheets = allSheets(now.length);
+    let cells: HistoryMark['sheetCells'];
+    if (kind === 'delete') {
+      // What the step rewrote is what its inverse puts back.
+      cells = [];
+      for (let i = 0; cells && i < inverse.length; i++) {
+        const op = inverse[i];
+        if (op.type !== 'restoreSheets') continue;
+        for (let k = 0; cells && k < op.state.cells.length; k++) {
+          const entry = op.state.cells[k];
+          if (cells.length + entry.cells.length > MAX_RECALC_CELLS) cells = undefined;
+          else for (let c = 0; c < entry.cells.length; c++) cells.push({ sheet: entry.sheet, row: entry.cells[c].row, col: entry.cells[c].col });
+        }
+      }
+      before.sheetCells = cells;
+      done.sheetCells = cells;
+    }
+    // The engine still has the sheets of before: a sheet that went is told by their indexes.
+    this.recalculateSheets(kind === 'delete' ? 'gone' : 'names', cells, sheets, kind === 'delete' && names !== this.workbook.definedNames);
+    this.syncSheets(show, kind);
+    this.afterChange(done.sheets.slice(), false);
+  }
+
+  /**
+   * Builds the dependency graph when there is none, before a sheet is deleted: only an engine
+   * that knows the formulas of before sees which of them the step rewrites.
+   */
+  private buildGraph(): void {
+    if (this.options.calculate === false) return;
+    try {
+      if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      if (this.engine.graphReady) return;
+      this.marksDirty = true;
+      this.engine.recalculate([]);
+      if (this.engine.incomplete) this.finishCalculation(this.engine);
+    } catch (error) {
+      this.engine = undefined;
+    }
+  }
+
+  /**
+   * Adds an empty worksheet as sheet number `at` (after the last one when left out) and
+   * shows it: one undo step. `name` is its name; without one it gets the next free default
+   * name of the view's language ("Sheet1", "Sayfa1"). Returns the index of the new sheet,
+   * -1 in a read-only view. Throws RangeError for an index outside the list and for a name
+   * a sheet cannot have or another sheet has.
+   */
+  insertSheet(at?: number, name?: string): number {
+    if (this.destroyed || this.locked) return -1;
+    this.commitEditing();
+    this.finishRename(true, true);
+    const index = at === undefined ? this.workbook.sheets.length : at;
+    const ops = insertSheetOps(this.workbook, index, { name: name === undefined ? defaultSheetName(this.workbook, this.languageTag) : String(name) });
+    this.applySheetOps('insert', ops, index);
+    return index;
+  }
+
+  /**
+   * Renames a sheet: one undo step. Formulas, defined names and links that name the sheet
+   * are written with the new name; no value changes. Returns false when nothing was done
+   * (a read-only view, the name the sheet has). Throws RangeError for a name a sheet cannot
+   * have or another sheet has, and for a sheet that cannot be renamed (see canRenameSheet()).
+   */
+  renameSheet(index: number, name: string): boolean {
+    if (this.destroyed || this.locked) return false;
+    this.commitEditing();
+    // A name being typed in the tab gives way to this one.
+    this.closeRename(false);
+    const ops = renameSheetOps(this.workbook, index, String(name));
+    if (ops.length === 0) return false;
+    this.applySheetOps('rename', ops, index);
+    return true;
+  }
+
+  /**
+   * Deletes a sheet: one undo step, without asking. What other sheets read from it becomes
+   * #REF!. When it was the sheet shown, the next sheet with a tab is (the one before for the
+   * last). Returns false in a read-only view. Throws RangeError for a sheet that cannot be
+   * deleted (see canDeleteSheet()): the last visible one, say.
+   */
+  deleteSheet(index: number): boolean {
+    if (this.destroyed || this.locked) return false;
+    this.commitEditing();
+    this.finishRename(true, true);
+    const ops = deleteSheetOps(this.workbook, index);
+    const name = this.workbook.sheets[index].name;
+    this.applySheetOps('delete', ops, index);
+    // After what is said about the cell that is active now.
+    this.notifyLater(this.strings.sheetDeleted(name));
+    return true;
+  }
+
+  /**
+   * Opens the field a sheet is renamed in, in the place of its tab, and shows the sheet.
+   * Enter or leaving the field renames, Escape gives up. Returns false when there is no
+   * field (a read-only view, a hidden sheet). Throws RangeError for a sheet that cannot be renamed.
+   */
+  startRename(index: number): boolean {
+    if (this.destroyed || this.locked) return false;
+    const sheet = this.workbook.sheets[index];
+    if (!sheet) throw new RangeError(`No sheet with index ${index}`);
+    if (this.renaming && this.renaming.sheet === sheet) return true;
+    // A sheet without a tab has no place for the field; nothing else happens either.
+    if (sheet.state !== 'visible') return false;
+    this.finishRename(true, true);
+    const problem = canRenameSheet(this.workbook, index);
+    if (problem) throw new RangeError(problem);
+    this.commitEditing();
+    this.closeMenu();
+    if (index !== this.sheetIndex) this.setActiveSheet(index);
+    const tab = this.tabOf(index);
+    if (!tab) return false;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'bym-tab-input';
+    input.maxLength = MAX_SHEET_NAME;
+    input.setAttribute('aria-label', this.strings.sheetName);
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('autocapitalize', 'off');
+    input.spellcheck = false;
+    // The name of a sheet comes from the file: it is only ever the value of the field.
+    input.value = sheet.name;
+    input.style.width = `${Math.max(tab.offsetWidth + 24, 96)}px`;
+    tab.style.display = 'none';
+    // The tab list holds tabs: the field stands in it inside an element that is nothing to assistive technology.
+    const box = document.createElement('div');
+    box.className = 'bym-tab-edit';
+    box.setAttribute('role', 'none');
+    box.style.cssText = 'display:block;flex:none';
+    box.appendChild(input);
+    this.tabs.insertBefore(box, tab);
+    input.addEventListener('keydown', this.onRenameKey);
+    input.addEventListener('input', this.onRenameInput);
+    input.addEventListener('blur', this.onRenameBlur);
+    this.renaming = { sheet, tab, input, box, busy: false };
+    input.focus({ preventScroll: true });
+    input.select();
+    const left = box.offsetLeft;
+    const right = left + box.offsetWidth;
+    if (left < this.tabs.scrollLeft) this.tabs.scrollLeft = left;
+    else if (right > this.tabs.scrollLeft + this.tabs.clientWidth) this.tabs.scrollLeft = right - this.tabs.clientWidth;
+    return true;
+  }
+
+  /** Whether a sheet is being renamed in its tab. */
+  get isRenaming(): boolean {
+    return this.renaming !== undefined;
+  }
+
+  /**
+   * Ends renaming in the tab. With `apply` the sheet takes the name in the field; a name it
+   * cannot take is said, and the field stays open with it - unless the field is being left
+   * (`leaving`: the focus went elsewhere, another sheet is shown), where the sheet keeps its name.
+   */
+  private finishRename(apply: boolean, leaving = false): void {
+    const renaming = this.renaming;
+    if (!renaming || renaming.busy) return;
+    const { sheet, input } = renaming;
+    const focused = (input.getRootNode() as Document | ShadowRoot).activeElement === input;
+    const index = this.workbook.sheets.indexOf(sheet);
+    if (apply && index >= 0 && input.value !== sheet.name) {
+      renaming.busy = true;
+      try {
+        this.applySheetOps('rename', renameSheetOps(this.workbook, index, input.value), index);
+        renaming.busy = false;
+        this.closeRename(!leaving && focused);
+        return;
+      } catch (error) {
+        renaming.busy = false;
+        const message = this.localizeError(error);
+        if (!leaving) {
+          input.setAttribute('aria-invalid', 'true');
+          input.title = message;
+          input.select();
+          this.notify(message, 'error');
+          return;
+        }
+        this.closeRename(false);
+        this.notify(message, 'error');
+        return;
+      }
+    }
+    this.closeRename(!leaving && focused);
+  }
+
+  /** Takes the field away and shows the tab again, with the focus when asked to. */
+  private closeRename(focusTab: boolean): void {
+    const renaming = this.renaming;
+    if (!renaming) return;
+    // Forgotten first: taking the field away may report that it lost the focus.
+    this.renaming = undefined;
+    const { input, tab, box } = renaming;
+    input.removeEventListener('keydown', this.onRenameKey);
+    input.removeEventListener('input', this.onRenameInput);
+    input.removeEventListener('blur', this.onRenameBlur);
+    if (box.parentNode) box.parentNode.removeChild(box);
+    tab.style.display = '';
+    if (focusTab) tab.focus({ preventScroll: true });
+  }
+
+  private onRenameKey = (event: KeyboardEvent): void => {
+    // The keys of the field are its own (Ctrl+Z undoes what was typed in it): none reaches the shortcuts around it.
+    event.stopPropagation();
+    // Enter that confirms an input method's candidate is not Enter for the name.
+    if (this.destroyed || event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      this.finishRename(true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      this.finishRename(false);
+    } else if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === 'p' || event.key === 'P')) {
+      // As in the grid: the browser would print the host page.
+      event.preventDefault();
+      this.print().catch(() => undefined);
+    }
+  };
+
+  private onRenameInput = (event: Event): void => {
+    const input = event.target as HTMLInputElement;
+    if (!input.hasAttribute('aria-invalid')) return;
+    // Another name is being typed: what was said about the last one no longer holds.
+    input.removeAttribute('aria-invalid');
+    input.title = '';
+  };
+
+  private onRenameBlur = (event: FocusEvent): void => {
+    const renaming = this.renaming;
+    if (this.destroyed || !renaming || renaming.input !== event.target) return;
+    const target = this.renameTarget;
+    this.renameTarget = undefined;
+    this.finishRename(true, true);
+    // The press that took the focus away was on a tab. The tabs moved when the field closed, so the click
+    // that follows may land on another one, or on none: the sheet that was pressed is shown here instead.
+    const index = target ? this.workbook.sheets.indexOf(target) : -1;
+    if (index < 0 || this.renaming) return;
+    this.swallowTabClick = true;
     this.attempt(() => this.setActiveSheet(index));
+  };
+
+  /**
+   * Opens the menu of a tab at a point of the root: a sheet after this one, another name,
+   * deleting. The tab is chosen first, as a click would. What cannot be done is shown but
+   * not available, and says why. Returns false when no menu was opened (a read-only view).
+   */
+  private openTabMenu(index: number, x: number, y: number, keyboard: boolean): boolean {
+    if (this.destroyed || this.locked) return false;
+    const sheet = this.workbook.sheets[index];
+    if (!sheet) return false;
+    this.finishRename(true, true);
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    if (index !== this.sheetIndex) this.setActiveSheet(index);
+    const strings = this.strings;
+    const renameProblem = canRenameSheet(this.workbook, index);
+    const deleteProblem = canDeleteSheet(this.workbook, index);
+    // The menu closes before an item acts, but the list of sheets is looked at again all the same.
+    const at = () => this.workbook.sheets.indexOf(sheet);
+    const items: MenuItem[] = [
+      {
+        label: strings.insertSheet,
+        action: () =>
+          this.attempt(() => {
+            if (at() >= 0) this.insertSheet(at() + 1);
+          }),
+      },
+      {
+        label: strings.renameSheet,
+        disabled: renameProblem !== undefined,
+        title: renameProblem === undefined ? undefined : this.localizeError(renameProblem),
+        explain: renameProblem === undefined ? undefined : () => this.notify(this.localizeError(renameProblem), 'error'),
+        action: () =>
+          this.attempt(() => {
+            if (at() >= 0) this.startRename(at());
+          }),
+      },
+      {
+        label: strings.deleteSheet,
+        disabled: deleteProblem !== undefined,
+        title: deleteProblem === undefined ? undefined : this.localizeError(deleteProblem),
+        explain: deleteProblem === undefined ? undefined : () => this.notify(this.localizeError(deleteProblem), 'error'),
+        action: () =>
+          this.attempt(() => {
+            if (at() >= 0) this.deleteSheet(at());
+          }),
+      },
+    ];
+    this.menu = new ContextMenu(
+      this.root,
+      items,
+      x,
+      y,
+      () => {
+        this.menu = undefined;
+        if (this.destroyed) return;
+        // Opened from the keyboard on a tab: back to that tab. Otherwise to the cells.
+        const tab = keyboard && at() >= 0 ? this.tabOf(at()) : undefined;
+        if (tab) tab.focus({ preventScroll: true });
+        else this.focusInput(true);
+      },
+      // Opened under a finger that is still down.
+      this.tabPress !== undefined,
+    );
+    return true;
+  }
+
+  private onTabClick = (event: MouseEvent): void => {
+    if (this.destroyed) return;
+    const index = this.tabSheetOf(event.target);
+    if (index < 0) return;
+    // Lifting the finger of a long press is not a tap on the tab, and neither is the click after a press that
+    // was dealt with when the field of a name closed. A tab chosen with a key is never either.
+    const lifted = this.swallowTabClick && event.detail > 0;
+    this.swallowTabClick = false;
+    if (lifted) return;
+    // From here on the click itself says which tab was pressed.
+    this.renameTarget = undefined;
+    const sheet = this.workbook.sheets[index];
+    const pointer = event.detail > 0;
+    // A pointer click hands the keyboard back to the cells; a tab chosen with the keyboard keeps the focus.
+    if (pointer) this.focusInput(true);
+    // A double click, or two taps of a finger, on the same tab renames the sheet. The clicks are counted here:
+    // the count of the browser goes on after the second, and a finger has none everywhere.
+    const last = this.lastTabTap;
+    const twice = pointer && !this.locked && last !== undefined && last.sheet === sheet && event.timeStamp - last.time < DOUBLE_TAP_MS;
+    this.lastTabTap = pointer && !twice ? { time: event.timeStamp, sheet } : undefined;
+    this.attempt(() => {
+      if (twice) this.startRename(index);
+      else this.setActiveSheet(index);
+    });
+  };
+
+  private onTabKeyDown = (event: KeyboardEvent): void => {
+    if (this.destroyed || this.locked || event.defaultPrevented) return;
+    const target = event.target as HTMLElement | null;
+    // Only the keys of a tab: the field a sheet is renamed in keeps its own.
+    if (!target || !target.classList || !target.classList.contains('bym-tab')) return;
+    const index = this.tabSheetOf(target);
+    if (index < 0) return;
+    if (event.key === 'F2' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+      event.preventDefault();
+      this.attempt(() => {
+        this.startRename(index);
+      });
+    } else if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey)) {
+      event.preventDefault();
+      const rect = target.getBoundingClientRect();
+      const point = this.rootPoint(rect.left, rect.top);
+      this.attempt(() => {
+        this.openTabMenu(index, point.x, point.y, true);
+      });
+    }
+  };
+
+  private onTabContextMenu = (event: MouseEvent): void => {
+    // A read-only view has no menu of its own; the browser's is left alone.
+    if (this.destroyed || this.locked) return;
+    const index = this.tabSheetOf(event.target);
+    if (index < 0) return;
+    event.preventDefault();
+    // The long press or the key that this event follows opened the menu already.
+    if (this.menu) return;
+    const tab = this.tabOf(index);
+    const rect = tab ? tab.getBoundingClientRect() : undefined;
+    // From the keyboard the event carries no place of its own.
+    const inside = rect !== undefined && event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+    const point = inside || !rect ? this.rootPoint(event.clientX, event.clientY) : this.rootPoint(rect.left, rect.top);
+    const held = this.tabPress !== undefined;
+    this.clearTabPressTimer();
+    this.attempt(() => {
+      if (this.openTabMenu(index, point.x, point.y, !inside) && held) this.swallowTabClick = true;
+    });
+  };
+
+  private onTabPointerDown = (event: PointerEvent): void => {
+    this.clearTabPress();
+    this.swallowTabClick = false;
+    this.renameTarget = undefined;
+    if (this.destroyed || this.locked) return;
+    const index = this.tabSheetOf(event.target);
+    if (index < 0) return;
+    // A name is being typed: the field closes when this press takes the focus, and the tabs move under the pointer.
+    if (this.renaming) this.renameTarget = this.workbook.sheets[index];
+    if (event.pointerType !== 'touch') return;
+    this.tabPress = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, sheet: this.workbook.sheets[index], scroll: this.tabs.scrollLeft };
+    this.tabPressTimer = window.setTimeout(this.onTabLongPress, LONG_PRESS_MS);
+  };
+
+  private onTabPointerMove = (event: PointerEvent): void => {
+    const press = this.tabPress;
+    if (!press || press.pointerId !== event.pointerId) return;
+    // A finger that moves scrolls the tabs.
+    if (Math.abs(event.clientX - press.x) > TAP_SLOP || Math.abs(event.clientY - press.y) > TAP_SLOP) this.clearTabPress();
+  };
+
+  private onTabPointerEnd = (event: PointerEvent): void => {
+    const press = this.tabPress;
+    if (press && press.pointerId === event.pointerId) this.clearTabPress();
+  };
+
+  private onTabLongPress = (): void => {
+    this.tabPressTimer = 0;
+    const press = this.tabPress;
+    if (this.destroyed || !press || this.menu || this.tabs.scrollLeft !== press.scroll) return;
+    const index = this.workbook.sheets.indexOf(press.sheet);
+    if (index < 0) return;
+    const point = this.rootPoint(press.x, press.y);
+    this.attempt(() => {
+      if (this.openTabMenu(index, point.x, point.y, false)) this.swallowTabClick = true;
+    });
+  };
+
+  private clearTabPressTimer(): void {
+    if (this.tabPressTimer) window.clearTimeout(this.tabPressTimer);
+    this.tabPressTimer = 0;
+  }
+
+  private clearTabPress(): void {
+    this.clearTabPressTimer();
+    this.tabPress = undefined;
+  }
+
+  private onAddClick = (event: MouseEvent): void => {
+    if (this.destroyed || this.locked) return;
+    this.attempt(() => {
+      this.insertSheet();
+    });
+    // A pointer click hands the keyboard to the cells of the new sheet; a key leaves the focus on the button.
+    if (event.detail > 0) this.focusInput(true);
   };
 
   // ------------------------------------------------------- size and scroll
@@ -1345,7 +2016,10 @@ export class WorkbookView {
   }
 
   private onResize = (): void => {
-    if (this.destroyed || !this.measure()) return;
+    if (this.destroyed) return;
+    // The strip of the tabs is higher while it shows a scroll bar.
+    this.placeAddButton();
+    if (!this.measure()) return;
     const state = this.state();
     this.growExtent(state.scrollX, state.scrollY);
     this.commitScroll();
@@ -1630,7 +2304,7 @@ export class WorkbookView {
       if (!target) {
         const dismissed = this.commentDismissed;
         const active = this.commentOf(state.active.row, state.active.col);
-        if (active && !(dismissed && dismissed.sheet === this.sheetIndex && dismissed.row === active.row && dismissed.col === active.col)) target = active;
+        if (active && !(dismissed && dismissed.sheet === state.sheet && dismissed.row === active.row && dismissed.col === active.col)) target = active;
       }
       // A box that is always shown is drawn on the sheet already.
       if (target && target.comment.visible) target = undefined;
@@ -1668,7 +2342,7 @@ export class WorkbookView {
       box.setAttribute('aria-label', this.strings.comment);
       box.scrollTop = 0;
     }
-    this.commentShown = { sheet: this.sheetIndex, row: target.row, col: target.col, comment: target.comment };
+    this.commentShown = { sheet: state.sheet, row: target.row, col: target.col, comment: target.comment };
     // Inside the view whatever the text is: long words break, long text scrolls.
     box.style.maxWidth = `${Math.max(Math.min(COMMENT_MAX_WIDTH, this.width - 8), 0)}px`;
     box.style.maxHeight = `${Math.max(Math.min(COMMENT_MAX_HEIGHT, this.height - 8), 0)}px`;
@@ -1741,8 +2415,8 @@ export class WorkbookView {
     const state = this.state();
     const { row, col } = state.active;
     let info = this.cellInfo;
-    if (info && info.sheet === this.sheetIndex && info.row === row && info.col === col) return info;
-    info = { sheet: this.sheetIndex, row, col, list: false, prompt: undefined };
+    if (info && info.sheet === state.sheet && info.row === row && info.col === col) return info;
+    info = { sheet: state.sheet, row, col, list: false, prompt: undefined };
     const rules = state.sheet.kind === 'worksheet' ? this.validationOf(state.sheet) : undefined;
     if (rules) {
       try {
@@ -1790,7 +2464,6 @@ export class WorkbookView {
     const y = clamp(cell.y, 0, Math.max(this.height - 1, 0));
     const anchor = { x, y, width: clamp(cell.x + cell.width - x, 0, this.width - x), height: clamp(cell.y + cell.height - y, 0, this.height - y) };
     const shown = cellDisplayText(this.workbook, getCell(sheet, row, col), this.locale);
-    const sheetIndex = this.sheetIndex;
     this.panel = new ListMenu({
       parent: this.root,
       anchor,
@@ -1801,7 +2474,8 @@ export class WorkbookView {
       openedByTouch: touch,
       onChoose: (index) =>
         this.attempt(() => {
-          if (this.sheetIndex === sheetIndex) this.applyOps(setCellInput(this.workbook, sheetIndex, row, col, list.items[index], { locale: this.locale }));
+          // The list belongs to the sheet it was opened on, wherever that sheet is by now.
+          if (this.state().sheet === sheet) this.applyOps(setCellInput(this.workbook, this.sheetIndex, row, col, list.items[index], { locale: this.locale }));
         }),
       onClose: () => this.panelClosed(),
     });
@@ -2630,7 +3304,7 @@ export class WorkbookView {
     if (message === 'Cannot sort a range that contains merged cells') return strings.cannotSortMerged;
     if ((match = /^Cannot sort through the array formula in (.+)$/.exec(message))) return strings.cannotSortArray(match[1]);
     if ((match = /^Cannot (sort|filter) in a sheet with (.+): not supported yet$/.exec(message))) return strings.sortNotSupportedWith(match[1] as 'sort' | 'filter', match[2]);
-    return strings.actionFailed;
+    return sheetErrorText(message, strings) || strings.actionFailed;
   }
 
   /** Says something to the user: in the live region, and to the host page if it listens. */
@@ -2784,11 +3458,13 @@ export class WorkbookView {
     if (this.destroyed || next === this.locked) return;
     if (next) {
       this.commitEditing();
+      this.finishRename(true, true);
       this.closeMenu();
     }
     this.locked = next;
     this.input.readOnly = next;
     this.cellInfo = undefined;
+    this.placeAddButton();
     this.schedule();
   }
 
@@ -3052,9 +3728,25 @@ export class WorkbookView {
       return true;
     }
     this.closeMenu();
+    // A name being typed for a sheet is given up, as a cell being edited is.
+    if (this.renaming) {
+      this.finishRename(false);
+      return true;
+    }
+    const listBefore = this.workbook.sheets;
+    const namesBefore = this.workbook.definedNames;
     const step = redo ? this.history.redo() : this.history.undo();
     if (!step) return false;
     const meta = step.meta;
+    if (meta.sheetOp) {
+      // A sheet with readers goes when its deletion is done again and comes back when that is undone.
+      const kind = meta.sheetOp !== 'delete' ? 'names' : redo ? 'gone' : 'back';
+      this.recalculateSheets(kind, meta.sheetCells, kind === 'gone' ? listBefore : this.workbook.sheets, kind !== 'names' && namesBefore !== this.workbook.definedNames);
+      this.syncSheets(meta.sheet, meta.sheetOp);
+      // Each sheet has kept its selection and its scroll position; nothing is brought into view.
+      this.afterChange(allSheets(this.workbook.sheets.length), false);
+      return true;
+    }
     if (meta.sheet !== this.sheetIndex && meta.sheet >= 0 && meta.sheet < this.workbook.sheets.length) this.setActiveSheet(meta.sheet);
     const sheets = meta.sheets.slice();
     this.addSheets(sheets, this.recalculate(meta.cells, meta.rows));
@@ -3075,7 +3767,8 @@ export class WorkbookView {
       this.commentDismissed = undefined;
       // Row heights, column widths and hidden runs moved; the merged ranges are indexed again on their own.
       for (let i = 0; i < sheets.length; i++) {
-        const state = this.states[sheets[i]];
+        const sheet = this.workbook.sheets[sheets[i]];
+        const state = sheet ? this.states.get(sheet) : undefined;
         if (state) state.metrics = createSheetMetrics(state.sheet);
       }
     }
@@ -3305,7 +3998,7 @@ export class WorkbookView {
   private onRootMouseDown = (event: MouseEvent): void => {
     const target = event.target as Element | null;
     if (this.destroyed || !target || target === this.input || this.scroller.contains(target)) return;
-    if (typeof target.closest === 'function' && target.closest('button, .bym-menu')) return;
+    if (typeof target.closest === 'function' && target.closest('button, input, .bym-menu')) return;
     event.preventDefault();
     this.focusInput(true);
   };
@@ -3891,12 +4584,12 @@ export class WorkbookView {
       // A second tap that selects the same cell (or the same merged cell) edits it; two quick taps on neighbours do not.
       const last = this.lastTap;
       const active = this.state().active;
-      this.lastTap = mode === 'cell' ? { time: event.timeStamp, sheet: this.sheetIndex, row: active.row, col: active.col } : undefined;
+      this.lastTap = mode === 'cell' ? { time: event.timeStamp, sheet: this.state().sheet, row: active.row, col: active.col } : undefined;
       if (
         mode === 'cell' &&
         last &&
         event.timeStamp - last.time < DOUBLE_TAP_MS &&
-        last.sheet === this.sheetIndex &&
+        last.sheet === this.state().sheet &&
         last.row === active.row &&
         last.col === active.col
       ) {

@@ -3,7 +3,7 @@
 // application gives its users when they ask for a new file instead of
 // opening one.
 
-import { createSheet, emptyStyleSheet, type Workbook } from '../model/sheet/types';
+import { checkSheetName, createSheet, emptyStyleSheet, type Workbook } from '../model/sheet/types';
 import { ZipArchive } from '../zip';
 import { buildXlsx } from './xlsx/build';
 
@@ -50,28 +50,6 @@ function languageOf(locale: string | undefined): string {
 
 /** Turkish, whatever the region: the names and the separators of the language. */
 const isTurkish = (language: string): boolean => language === 'tr' || language.slice(0, 3) === 'tr-';
-
-/**
- * What a sheet may be called: 1 to 31 characters that are not all spaces,
- * none of []:*?/\ and no control character, no apostrophe at either end,
- * not "History" (which Excel keeps for itself), and only characters an XML
- * file can hold.
- */
-function checkSheetName(name: string): string {
-  const ok =
-    typeof name === 'string' &&
-    name.length >= 1 &&
-    name.length <= 31 &&
-    name.trim() !== '' &&
-    !/[[\]:*?/\\\u0000-\u001f\ufffe\uffff]/.test(name) &&
-    // A surrogate without its other half.
-    !/[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(name) &&
-    name.charAt(0) !== "'" &&
-    name.charAt(name.length - 1) !== "'" &&
-    name.toLowerCase() !== 'history';
-  if (!ok) throw new RangeError('A sheet name has 1 to 31 characters, none of [ ] : * ? / \\ and no control character, no apostrophe at its start or end, and is not "History"');
-  return name;
-}
 
 const heading = (level: number, size: number, before: number): string =>
   `<w:style w:type="paragraph" w:styleId="Heading${level}"><w:name w:val="heading ${level}"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/>` +

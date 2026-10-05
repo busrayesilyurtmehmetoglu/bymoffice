@@ -6,7 +6,7 @@
 // The scanner never throws and never backtracks over more than one token: text it cannot make
 // sense of (an unclosed quote or bracket) is returned untouched from that point on.
 
-import { MAX_COLS, MAX_ROWS, columnName, type CellRange } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, columnName, foldSheetName, parseCellRef, type CellRange, type SheetNameMap } from '../model/sheet/types';
 
 export interface StructuralEdit {
   kind: 'insert' | 'delete';
@@ -241,14 +241,6 @@ function readBody(s: string, p: number): Body {
       absC2: w1.absCol,
     },
   };
-}
-
-/**
- * Sheet names compare without regard to case. The four Turkish letters I, İ, ı, i count as
- * one, without relying on locale data: "İ" lower-cases to "i" plus a combining dot (U+0307).
- */
-function foldSheetName(name: string): string {
-  return String(name).toLowerCase().replace(/\u0307/g, '').replace(/\u0131/g, 'i');
 }
 
 function sameSheets(a: string[], b: string[]): boolean {
@@ -678,4 +670,151 @@ export function adjustReferenceText(text: string, defaultSheetName: string, edit
   }
   if (dropped) return kept.join(' ');
   return copied === 0 ? text : out + text.slice(copied);
+}
+
+// ---------------------------------------------------------------------------
+// Sheet names
+
+/**
+ * A sheet name as it is written before "!": as it stands when it is made of ASCII letters,
+ * digits and "_" only, does not start with a digit and cannot be taken for a cell ("A1",
+ * "R1C1"), a row or a column ("R", "C") or a truth value; in apostrophes otherwise, an
+ * apostrophe of the name doubled. Quoting more than Excel would is always valid.
+ */
+export function quoteSheetName(name: string): string {
+  return needsQuotes(name) ? `'${String(name).replace(/'/g, "''")}'` : name;
+}
+
+function needsQuotes(name: string): boolean {
+  return !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || !!parseCellRef(name) || /^(?:R\d*)?(?:C\d*)?$/i.test(name) || /^(?:TRUE|FALSE)$/i.test(name);
+}
+
+/** The prefix of a reference to a sheet, or to a run of sheets (a 3D reference), with its "!". */
+function sheetPrefix(names: string[]): string {
+  if (!names.some(needsQuotes)) return `${names.join(':')}!`;
+  return `'${names.map((name) => name.replace(/'/g, "''")).join(':')}'!`;
+}
+
+/** The new text of an item that names sheets, undefined to keep it as written. */
+function mapItem(s: string, item: Item, sheets: string[], map: SheetNameMap): string | undefined {
+  let next: string[] = [];
+  let changed = false;
+  let gone = false;
+  for (let k = 0; k < sheets.length; k++) {
+    const name = map(sheets[k]);
+    // UNSURE: Excel leaves "#REF!A1" for a reference to a deleted sheet; the plain error is
+    // what every reader of formulas here understands.
+    if (name === null) gone = true;
+    if (name === null || name === undefined || name === sheets[k]) next.push(sheets[k]);
+    else {
+      next.push(String(name));
+      changed = true;
+    }
+  }
+  if (gone) {
+    // A 3D reference that loses an end goes on from the sheet that stood beside it, inside the
+    // run: the next sheet for the first end, the one before for the last. A run of one sheet
+    // is a plain reference; a run with no sheet left is the error.
+    // UNSURE: a run written with its ends in reverse order ("Sheet4:Sheet2!A1", which Excel
+    // does not write) is read as running forward and becomes the error when an end is deleted.
+    // Hidden sheets are sheets like any other here, as they are in a run.
+    const runs = map.runs;
+    if (sheets.length !== 2 || !runs) return REF_ERROR;
+    const first = map(sheets[0]) === null ? runs.neighbour(sheets[0], 1) : next[0];
+    const last = map(sheets[1]) === null ? runs.neighbour(sheets[1], -1) : next[1];
+    if (first === undefined || last === undefined) return REF_ERROR;
+    const from = runs.index(first);
+    const to = runs.index(last);
+    if (from < 0 || to < 0 || from > to) return REF_ERROR;
+    next = from === to ? [first] : [first, last];
+    changed = true;
+  }
+  if (!changed) return undefined;
+  const prefix = sheetPrefix(next);
+  const ref = item.ref;
+  if (ref && ref.mid !== undefined) {
+    // "Sheet1!A1:Sheet1!B2": the name is written again before the second corner.
+    const colon = s.indexOf(':', item.bodyStart);
+    return prefix + s.slice(item.bodyStart, colon + 1) + prefix + s.slice(colon + 1 + ref.mid.length, item.end);
+  }
+  return prefix + s.slice(item.bodyStart, item.end);
+}
+
+/** `complete` is false when the scan stopped before the end and what it left may name a sheet. */
+function mapSheets(s: string, map: SheetNameMap | undefined): { text: string; complete: boolean } {
+  // No prefix without a "!".
+  if (s.indexOf('!') < 0) return { text: s, complete: true };
+  const n = s.length;
+  let out = '';
+  let copied = 0;
+  let i = 0;
+  let stopped = false;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 34) {
+      const q = skipQuoted(s, i, '"');
+      if (q < 0) {
+        stopped = true;
+        break;
+      }
+      i = q;
+    } else if (c === 35) {
+      i = skipError(s, i);
+    } else if (c === 39 || c === 91 || isWordChar(c)) {
+      const item = readItem(s, i);
+      if (!item) {
+        stopped = true;
+        break;
+      }
+      let end = item.end;
+      if (map && item.sheets && !item.external) {
+        const replacement = mapItem(s, item, item.sheets, map);
+        if (replacement !== undefined) {
+          out += s.slice(copied, item.start) + replacement;
+          if (replacement === REF_ERROR) {
+            // The error stands for the whole reference: an error constant in the place of the
+            // cell ("Sheet2!#REF!", left by deleted rows) and the mark of a spilled range
+            // ("Sheet2!A1#") are part of it.
+            if (end === item.bodyStart && s.charCodeAt(end) === 35) end = skipError(s, end);
+            else if (item.ref && s.charCodeAt(end) === 35) end++;
+          }
+          copied = end;
+        }
+      }
+      i = end;
+    } else {
+      i++;
+    }
+  }
+  return { text: copied === 0 ? s : out + s.slice(copied), complete: !stopped || s.indexOf('!', i) < 0 };
+}
+
+/**
+ * Gives the sheets a formula names other names, all in one pass over the text: `map` is asked
+ * for every sheet name as it is written (without its apostrophes) and answers with the new
+ * name, with null for a sheet that is gone, or with undefined to leave the name alone.
+ *
+ * - A new name replaces the prefix, quoted where it has to be; both ends of a 3D reference
+ *   ("Sheet1:Sheet3!A1") are asked for, and so is the name of "Sheet1!SomeName". A prefix
+ *   none of whose names changes keeps its own spelling, quotes and case included.
+ * - A sheet that is gone takes the whole reference with it: "Sheet2!A1:B2" becomes "#REF!".
+ * - References into other workbooks ("[1]Sheet1!A1", "'C:\dir\[book.xlsx]Sheet1'!A1"), text
+ *   in double quotes and structured references are never touched.
+ *
+ * The text is a formula without its "=", a defined name's value or the location of a link.
+ * Like every scanner here it never throws: from an unclosed quote or bracket on, the text is
+ * returned as it is (see formulaNamesSheetsUnread()).
+ */
+export function renameSheetsInFormula(text: string, map: SheetNameMap): string {
+  if (typeof text !== 'string') return toText(text);
+  return mapSheets(text, map).text;
+}
+
+/**
+ * True for a formula that renameSheetsInFormula() cannot read to its end (an unclosed quote
+ * or bracket) and whose unread rest may name a sheet (it holds a "!"). Such a formula would be
+ * left naming a sheet by its old name; who renames or deletes sheets refuses to, or reports it.
+ */
+export function formulaNamesSheetsUnread(text: string): boolean {
+  return typeof text === 'string' && !mapSheets(text, undefined).complete;
 }

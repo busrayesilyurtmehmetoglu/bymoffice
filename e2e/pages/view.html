@@ -71,6 +71,8 @@
         window.__notices = [];
         const file = await BymOffice.open(new Uint8Array(bytes));
         const workbook = await file.workbook();
+        // For saving what the view changed.
+        window.__file = file;
         window.__view = new BymOffice.WorkbookView(
           container,
           workbook,

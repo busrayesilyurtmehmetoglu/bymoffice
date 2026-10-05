@@ -1607,6 +1607,9 @@ test.describe('keyboard: focus, extending and edge cases', () => {
     await focusGrid(page);
     const focused = () => page.evaluate(() => (document.activeElement ? document.activeElement.id || document.activeElement.textContent : ''));
 
+    // The button that adds a sheet comes before the tabs, as it does on the screen.
+    await page.keyboard.press('Tab');
+    await expect(page.locator('.bym-tab-add')).toBeFocused();
     await page.keyboard.press('Tab');
     expect(await focused()).toBe('Data');
     await page.keyboard.press('Tab');

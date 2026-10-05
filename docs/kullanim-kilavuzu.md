@@ -35,7 +35,11 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 |---|---|
 | Formüllerde: dinamik dizi taşması, `LET`/`LAMBDA`, tablo başvuruları (`Tablo[Sütun]`), başka dosyaya ve 3B (`Sayfa1:Sayfa3!A1`) başvurular, `;` ile argüman ayırma | Yok. Böyle bir formül içeren hücre dosyadaki son değerini korur ya da `#REF!`/`#NAME?` verir; formül metni kaydederken bozulmaz |
 | Tablo ya da form denetimi içeren sayfalarda, ve içinde grafik ya da pivot tablo bulunan çalışma kitaplarında satır/sütun ekleme-silme | Reddedilir (bu içeriklerin başvuruları henüz kaydırılmıyor; sessizce bozulmasınlar diye); hücre düzenleme ve biçimlendirme serbesttir. Resim ve yorum içeren sayfalarda serbesttir |
-| Sayfa ekleme, silme, yeniden adlandırma; yazı tipi adı seçimi; dikey hizalama düğmeleri; koşullu biçim ve veri doğrulama KURALI ekleme/değiştirme | Yok |
+| Yazı tipi adı seçimi; dikey hizalama düğmeleri; koşullu biçim ve veri doğrulama KURALI ekleme/değiştirme | Yok |
+| Sayfalarda: taşıma/sıra değiştirme, gizleme/gösterme, kopyalama, sekme rengi değiştirme | Yok (ekleme, silme ve yeniden adlandırma var; bkz. "Sayfa ekleme, silme, yeniden adlandırma") |
+| İçinde grafik, pivot tablo ya da form denetimi bulunan çalışma kitabında sayfa silme ve yeniden adlandırma; tablo içeren sayfayı silme; grafik sayfasını silme ve yeniden adlandırma; adları yalnız harf büyüklüğüyle ayrılan iki sayfası (`IL` / `İL`) olan kitapta her sayfa işlemi (ekleme dahil) | Reddedilir (bu içerikler sayfaları adıyla anar ve henüz yeniden yazılmıyor); menüde öğe devre dışı görünür. Sayfa **ekleme** her zaman serbesttir |
+| WebView köprüsünde sayfa listesini bildiren ileti ve sayfa ekle/sil/yeniden adlandır komutları | Yok. Sekme şeridi köprüde de çalışır, ama `loaded` iletisindeki sayfa listesi sonradan güncellenmez ve yeniden adlandırma bildirilmez; `changed.sheets` ve `sheet.index` işlemden sonraki dizinlerdir |
+| Yeniden adlandırmada ve silmede çizimlerin (şekil, görsel) iç bağlantılarındaki sayfa adlarının güncellenmesi | Yok; bu bağlantılar eski adı taşımaya devam eder. Formüller, tanımlı adlar, hücre bağlantıları, koşullu biçim ve doğrulama formülleri, tablo sütun formülleri güncellenir |
 | Renge ve ikona göre süzme, tablo içi süzgeç, yorumlu ya da tablolu sayfada sıralama, uyarı türü doğrulamada onay penceresi, Türkçe hata adları (`#YOK`) | Yok. Uygulanamayan süzgeç ölçütleri dosyada korunur |
 | Koşullu biçimde: kural ekleme/değiştirme arayüzü, Excel'in özgün ikon görselleri (basit vektör ikonlar çizilir), kuraldaki yazı tipi adı/boyutu ve desenli/gradyan dolgu | Yok. `calculate: false` iken formüllü kurallar uygulanmaz |
 | Word 95 ve öncesi, parola korumalı doc | Yok; `UnsupportedFileError` |
@@ -184,6 +188,7 @@ Izgaranın (`mounted.view`) üyeleri:
 | `startEditing(text?)`, `commitEditing()`, `cancelEditing()`, `isEditing` | Hücre editörünü programla açar, yazar, kapatır |
 | `clearSelection()` | Seçili aralığın içeriğini siler, biçimi korur |
 | `undo()`, `redo()`, `history.canUndo`, `history.canRedo` | Geri al ve yinele; seçim ve sayfa da geri döner |
+| `insertSheet(at?, name?)`, `renameSheet(index, name)`, `deleteSheet(index)`, `startRename(index)`, `isRenaming` | Sayfa ekler, yeniden adlandırır, siler; sekmede ad alanını açar. Aşağıda "Sayfa ekleme, silme, yeniden adlandırma" |
 | `copy()`, `cut()`, `paste(text, html?)` | Pano işlemlerinin çekirdeği; `copy()` `{ text, html, … }` döndürür. `paste`'e yalnız metin verilirse dışarıdan gelmiş sayılır; kendi kopyanızı biçim ve formülleriyle yapıştırmak için `copy()`'nin `html`'ini de verin |
 | `readOnly`, `setReadOnly(readOnly)` | Salt okunur kipini görünümü yeniden kurmadan değiştirir; geri alma geçmişi korunur |
 | `insertRows(at, count)`, `deleteRows(at, count)`, `insertColumns(at, count)`, `deleteColumns(at, count)` | Satır ve sütun ekler ya da siler (0 tabanlı). Yapılamazsa `RangeError` fırlatır |
@@ -207,7 +212,8 @@ Kullanıcı etkileşimi:
 - **Sağ tık menüsü** (dokunmatikte uzun basma): kes, kopyala, yapıştır, içeriği temizle, satır/sütun ekle-sil. Menüden "Yapıştır" tarayıcı izni ister ve her zaman düz metin yapıştırır; biçim ve formülleriyle yapıştırmak için Ctrl/Cmd+V kullanın.
 - **Boyutlandırma:** sütun ya da satır başlığının kenarını sürükleyin (Esc vazgeçer); kenara çift tıklamak sütunu içeriğine sığdırır. Sıfıra sürüklemek gizler.
 - **Satır ve sütun:** satır ya da sütun başlığına sağ tıklayın (dokunmatikte uzun basın); açılan menüden ekleyin ya da silin. Tam satır ya da sütun seçiliyken Ctrl/Cmd+`+` ekler, Ctrl/Cmd+`-` siler.
-- **Klavye** (önce görünüme tıklayın ya da Tab ile odaklanın): oklar, Shift+oklar, Ctrl/Cmd+oklar (veri bloğunun kenarı), Home, Ctrl+Home, Ctrl+End, PageUp/PageDown, Enter/Shift+Enter, Ctrl+A; sayfa değiştirmek için Alt+PageDown/PageUp (Ctrl+PageDown/PageUp da çalışır, ama bazı tarayıcılar onu kendine ayırır). Tab ve Shift+Tab hücre değiştirmez: odağı ızgaradan sayfadaki sonraki/önceki öğeye taşır, böylece klavye kullanıcıları görünümde hapsolmaz. Sayfa sekmeleri Tab ile odaklanıp Enter ya da Boşluk ile seçilir.
+- **Sayfalar:** sekmelerin solundaki **+** düğmesi sona yeni sayfa ekler ve onu gösterir. Sekmeye sağ tıklamak (dokunmatikte uzun basmak; klavyede odaktaki sekmede Shift+F10 ya da Menü tuşu) menüyü açar: "Sayfa ekle" (o sekmenin sağına), "Yeniden adlandır", "Sil". Sekmeye çift tıklamak/çift dokunmak ya da odaktaki sekmede F2 adı yerinde düzenletir: Enter ya da alandan çıkmak uygular, Esc vazgeçer. Silmede onay sorulmaz; Ctrl/Cmd+Z geri getirir. Salt okunur görünümde düğme, menü ve ad alanı yoktur. Ayrıntı aşağıda.
+- **Klavye** (önce görünüme tıklayın ya da Tab ile odaklanın): oklar, Shift+oklar, Ctrl/Cmd+oklar (veri bloğunun kenarı), Home, Ctrl+Home, Ctrl+End, PageUp/PageDown, Enter/Shift+Enter, Ctrl+A; sayfa değiştirmek için Alt+PageDown/PageUp (Ctrl+PageDown/PageUp da çalışır, ama bazı tarayıcılar onu kendine ayırır). Tab ve Shift+Tab hücre değiştirmez: odağı ızgaradan sayfadaki sonraki/önceki öğeye taşır, böylece klavye kullanıcıları görünümde hapsolmaz. Sayfa sekmeleri Tab ile odaklanıp Enter ya da Boşluk ile seçilir; Tab sırası: ızgara → **+** düğmesi → sekmeler.
 
 Bilinmesi gerekenler:
 
@@ -525,6 +531,61 @@ Hatalar:
 
 - `UnsupportedFileError`: girdi Word/Excel dosyası değil ya da henüz desteklenmeyen bir tür (parola korumalı, Word 95 ve öncesi).
 - `Error`: dosya bozuk (iletisi `Corrupt ZIP archive: …`, `Corrupt ZIP entry …` vb. ile başlar).
+
+### Sayfa ekleme, silme, yeniden adlandırma
+
+Tablo görünümünün sekme şeridinden ya da programla yapılır; her biri **tek geri alma adımıdır** ve `save()` ile dosyaya yazılır (ek bir çağrı gerekmez).
+
+```js
+const view = mounted.view;                 // WorkbookView
+const index = view.insertSheet();          // sona ekler, yeni sayfayı gösterir; dizinini döndürür ("Sayfa1" / "Sheet1")
+view.insertSheet(0, 'Özet');               // en başa, adıyla
+view.renameSheet(index, 'Satışlar 2026');  // true; ad zaten buysa false
+view.deleteSheet(0);                       // true; onay sormaz
+view.undo();                               // silinen sayfa seçimi ve kaydırma konumuyla geri gelir
+view.startRename(view.activeSheet);        // sekmede ad alanını açar (kullanıcı yazar)
+```
+
+| Üye | İş |
+|---|---|
+| `insertSheet(at?, name?)` | `at` dizinine (verilmezse sona) boş bir çalışma sayfası ekler ve **onu gösterir**. Ad verilmezse görünümün dilindeki ilk boş varsayılan ad kullanılır (`tr` → `Sayfa1`, diğerleri `Sheet1`). Yeni dizini döndürür; salt okunur görünümde `-1` |
+| `renameSheet(index, name)` | Sayfanın adını değiştirir. Değişiklik yapıldıysa `true`; ad aynıysa ya da görünüm salt okunursa `false` |
+| `deleteSheet(index)` | Sayfayı siler. Gösterilen sayfa silindiyse sağındaki ilk görünür sayfa (sondaysa solundaki) gösterilir. Salt okunurda `false` |
+| `startRename(index)`, `isRenaming` | Sekmenin yerinde ad alanını açar (sayfa önce gösterilir); alan açık mı. Gizli sayfada (sekmesi yoktur; gösterilen sayfa değişmez) ve salt okunurda `false` döner |
+
+Davranış:
+
+- **Arayüz:** `+` düğmesi (`.bym-tab-add`), sekme menüsü (`.bym-menu`) ve ad alanı (`.bym-tab-input`, en çok 31 karakter, mevcut ad seçili gelir). Ad alanında Enter ya da odağın alandan çıkması uygular, Esc vazgeçer; giriş yöntemi (IME) bileşimi sürerken Enter adı uygulamaz; alandaki tuşlar ızgaranın kısayollarına ulaşmaz (Ctrl/Cmd+Z alanın kendi geri almasıdır). Geçersiz ya da başka sayfada kullanılan bir ad Enter ile uygulanmak istenirse alan açık kalır, `aria-invalid` işaretlenir ve neden `onNotice` (`kind: 'error'`) ile ve canlı bölgede bildirilir. Odak alandan böyle bir adla çıkarsa sayfa eski adını korur ve neden yine bildirilir. Ad yazılırken başka bir sekmeye basmak adı uygular ve o sekmeyi gösterir; Tab ile çıkınca odak sıradaki sekmeye geçer. Alan, sekme listesinin (`role="tablist"`) içinde `role="none"` taşıyan bir sarmalayıcıda (`.bym-tab-edit`) durur. Menüde yapılamayan öğe `aria-disabled="true"` taşır ama ok tuşlarıyla ulaşılabilir; Enter ya da dokunma işlemi yapmaz, nedenini bildirir (menü açık kalır).
+- **Geçerli ad:** 1–31 karakter; `[ ] : * ? / \` ve denetim karakteri içermez, kesme işaretiyle (`'`) başlamaz/bitmez, `History` değildir ve (büyük/küçük harf ayrımı olmadan) başka bir sayfanın adı değildir. Baştaki/sondaki boşluklar atılmaz.
+- **Formüller:** yeniden adlandırmada sayfayı anan formüller, tanımlı adlar ve kitap içi hücre bağlantıları **yeni adla yazılır** (gerekirse tırnaklanarak: `'Satışlar 2026'!A3`); hiçbir değer değişmez ve hiçbir formül yeniden hesaplanmaz (`RAND()` gibi her hesapta değişenler de). **Ekleme** de hiçbir şeyi hesaplamaz: boş bir sayfa hiçbir değeri değiştirmez, dosyadaki sonuçlar olduğu gibi kalır; "ekle → geri al → kaydet" özgün dosyayı bayt bayt verir. Sayfa eklenmeden önce yazılmış `=Yeni!A1` gibi bir formül, sayfa eklendiği anda değil, okuduğu bir hücre ilk değiştiğinde yeniden hesaplanır. **Silmede** o sayfayı okuyan başvurular `#REF!` olur (Excel `#REF!A1` yazar; burada başvurunun tamamı `#REF!` olur), sayfaya yerel tanımlı adlar sayfayla birlikte gider; bir 3B başvurunun (`Sayfa1:Sayfa3!A1`) ucu silinirse uç aralığın içindeki komşu sayfaya çekilir, tek sayfa kalırsa düz başvuru olur. Koşullu biçim ve doğrulama formülleri ile tablo sütun formülleri de aynı kurallarla izler; yalnız formülü böyle değişen hücreler ve onları okuyan formüller yeniden hesaplanır, kitabın geri kalanı dosyadaki değerini korur. Şu durumlarda silme (ve geri alınması) bütün formülleri yeniden hesaplar ve dosyadaki sonuçların yerini hesaplananlar alır: silme tanımlı bir adı değiştirdiyse, o sırada süren bir hesap bitirilemediyse, 100.000'den çok hücre değiştiyse ya da bağımlılık grafiği kurulamadıysa. Geri alma hepsini eski haline getirir. Sayfa işleminden sonra formül işaretleri (hücre köşesindeki "burada hesaplanamıyor" işareti) bir sonraki hesaba dek görünmez.
+- **Geri al/yinele:** silme geri alınınca aynı sayfa, seçimi ve kaydırma konumuyla geri gelir ve gösterilir (gizli bir sayfa geri gelince gösterilen sayfa değişmez); ekleme geri alınınca eklemeden önce gösterilen sayfaya dönülür. Diğer sayfaların seçimi ve kaydırması sayfa dizinleri kaysa da kendi sayfasında kalır.
+- **Pano:** sayfa listesi her değiştiğinde (işlem, geri al, yinele) görünümün kendi kopyası unutulur; ardından yapılan yapıştırma, eski sayfa adını taşıyan formülleri değil panodaki düz metni (görünen değerleri) yazar.
+- **Olaylar:** her işlemden (ve geri al/yinele'den) sonra `onChange({ sheets })` kitabın o andaki **bütün** sayfa dizinleriyle çağrılır; gösterilen sayfa ya da onun dizini değiştiyse `onSheetChange(index)` yeni dizinle çağrılır (yalnız ad değiştiyse çağrılmaz). Önceden elinizde tuttuğunuz dizinler ekleme/silmeden sonra kaymış olabilir; sayfa listesini `view.workbook.sheets`'ten yeniden okuyun.
+- **Retler:** yapılamayan işlem programda `RangeError` fırlatır; arayüzde aynı neden görünümün dilinde bildirilir (`view.localizeError(error)`), menüde ilgili öğe devre dışıdır ve nedeni `title` olarak taşır. Reddedilenler: geçersiz ya da kullanılan ad; görünür son sayfayı silmek; içinde grafik, pivot tablo ya da form denetimi bulunan kitapta silme/yeniden adlandırma; adları yalnız harf büyüklüğüyle ayrılan iki sayfası olan kitapta her sayfa işlemi; tablo içeren sayfayı silmek; grafik sayfasını silmek/yeniden adlandırmak; sayfa adı içerebilecek bir formül sonuna dek okunamıyorsa (kapanmamış tırnak) silme/yeniden adlandırma. Reddedilen işlem modeli değiştirmez.
+- **Kaydetme:** yeni sayfa pakete kendi parçasıyla (`/xl/worksheets/sheetN.xml`, ilk boş numara) eklenir; silinen sayfanın parçası ve yalnız onun kullandığı parçalar (ilişkileri, çizimi, yorumları, yazıcı ayarı, başka hiçbir yerde kullanılmayan görselleri) paketten çıkar; yeniden adlandırma `workbook.xml`'e ve değişen formüllerin sayfalarına yazılır. Dokunulmayan sayfaların parçaları bayt bayt aynı kalır. Her şey geri alınıp kaydedilirse dosya geldiği sayfalarla yazılır.
+- **Salt okunur:** `readOnly: true` görünümde ve dönüştürülmemiş xls'te `+` düğmesi gizlidir, sekme menüsü açılmaz (tarayıcının kendi menüsü engellenmez), çift tıklama ve F2 ad alanını açmaz, yöntemler hiçbir şey yapmaz.
+- **WebView köprüsü:** köprüde sekme şeridi aynı biçimde çalışır; sayfa işlemleri için ayrı bir köprü komutu yoktur. `changed` iletisinin `sheets` alanı işlemden sonraki dizinleri taşır; `loaded` iletisindeki sayfa listesi sonradan güncellenmez (yeniden adlandırma ayrıca bildirilmez).
+
+Görünüm olmadan, model üzerinde (Node'da da) aynı işlemler `Op` üreten işlevlerle yapılır; işlemler bir `History` üzerinden uygulanır:
+
+```js
+const history = new BymOffice.History(workbook);
+history.apply(BymOffice.insertSheet(workbook, workbook.sheets.length, { locale: 'tr' }), undefined, undefined);
+history.apply(BymOffice.renameSheet(workbook, 0, 'Veri'), undefined, undefined);
+if (BymOffice.canDeleteSheet(workbook, 1) === undefined) history.apply(BymOffice.deleteSheet(workbook, 1), undefined, undefined);
+history.undo();
+```
+
+| İşlev | İş |
+|---|---|
+| `insertSheet(workbook, at, { name?, locale? })`, `renameSheet(workbook, index, name)`, `deleteSheet(workbook, index)` | İşlemi (`Op[]`) üretir, modeli değiştirmez; yapılamayacaksa `RangeError` fırlatır. `renameSheet` ad aynıysa boş dizi döndürür. Ekleme `workbook.activeSheet`'in gösterdiği sayfayı değiştirmez (dizin kayar); silme onu geçerli, görünür bir sayfaya ayarlar |
+| `canInsertSheet(workbook, at, name?)`, `canRenameSheet(workbook, index, name?)`, `canDeleteSheet(workbook, index)` | Yapılamıyorsa İngilizce neden, yapılabiliyorsa `undefined`. Hücrelere bakmaz (ucuzdur); okunamayan formül reddi yalnız işlem uygulanırken çıkar |
+| `defaultSheetName(workbook, locale?)` | İlk boş varsayılan ad (`Sayfa1` / `Sheet1`) |
+| `checkSheetName(name)` | Adı döndürür; sayfa adı olamayacaksa `RangeError` fırlatır (çakışmaya bakmaz) |
+| `quoteSheetName(name)` | Adı formülde yazıldığı gibi verir (gerekirse tırnaklı) |
+| `renameSheetsInFormula(text, map)`, `formulaNamesSheetsUnread(text)` | Formül metnindeki sayfa adlarını `map(ad)` ile değiştirir (`string` yeni ad, `null` silindi → `#REF!`, `undefined` dokunma); formül sonuna dek okunamıyor ve okunmayan kısmı sayfa adı içerebiliyor mu |
+| `fileSheetName(sheet)`, `currentSheetName(workbook, nameInFile)`, `sheetNameMap(workbook)` | Sayfanın dosyadaki adı (dosyada olmayan yeni sayfada `undefined`); dosyadaki bir adın bugünkü karşılığı (`null`: silindi); hepsi için eşleme işlevi (hiçbir ad değişmediyse `undefined`). Dosyadan olduğu gibi tutulan içerik (koşullu biçim, veri doğrulama kuralları) sayfaları dosyadaki adlarıyla anar |
+| `Op` türleri `insertSheet`, `deleteSheet`, `renameSheet`, `restoreSheets`; `SheetsSnapshot` | İlk üçünün tersi `restoreSheets`'tir (kendi tersidir) ve sayfa listesinin önceki halini `SheetsSnapshot` olarak taşır. Hepsinde `sheet` etkilenen dizindir |
 
 ### Tablo modeli: `file.workbook()`
 

@@ -6,12 +6,15 @@
 // place instead of altering the old one. That is what lets a structural
 // operation keep the previous state for undo by reference, without copying it.
 
-import { adjustFormula, adjustRange, adjustReferenceText, shiftFormula, type StructuralEdit } from '../calc/refs';
+import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import {
   FILTER_NAME,
   MAX_COLS,
   MAX_ROWS,
   cellName,
+  checkSheetName,
+  createSheet,
+  foldSheetName,
   parseCellRef,
   parseRange,
   type AutoFilter,
@@ -23,6 +26,8 @@ import {
   type Hyperlink,
   type Row,
   type Sheet,
+  type SheetNameMap,
+  type SheetNeighbours,
   type SheetStructuralEdit,
   type StyleSheet,
   type Workbook,
@@ -46,6 +51,25 @@ export interface SheetSnapshot {
   colCount: number;
   structuralEdits: SheetStructuralEdit[] | undefined;
   autoFilter?: AutoFilter;
+}
+
+/**
+ * The list of sheets and everything an operation on it alters, held by reference: what the
+ * workbook is put back to by "restoreSheets".
+ */
+export interface SheetsSnapshot {
+  /** The sheets, in order; the very objects, so that a sheet that comes back is the one that went. */
+  sheets: Sheet[];
+  /** The name of a sheet (and the name the file has for it) to put back. */
+  renamed?: { sheet: Sheet; name: string; nameInFile: string | undefined };
+  /** Cells whose formulas named a sheet, as they were. Shared formulas stay shared. */
+  cells: { sheet: Sheet; cells: CellChange[] }[];
+  /** Links that pointed into a sheet, as they were. */
+  links: { sheet: Sheet; hyperlinks: Hyperlink[] }[];
+  definedNames: DefinedName[];
+  activeSheet: number;
+  removedSheetNames: string[] | undefined;
+  removedSheetNeighbours: SheetNeighbours[] | undefined;
 }
 
 export type Op =
@@ -106,6 +130,43 @@ export type Op =
       definedNames: DefinedName[];
       /** Roughly how many rows this operation keeps alive for undo; History uses it to bound memory. */
       weight?: number;
+    }
+  | {
+      /**
+       * Adds an empty worksheet named `name` so that it becomes sheet number `sheet` (0 puts it
+       * first, the number of sheets last). Sheets after it move up by one, and with them the
+       * active sheet and the sheets that defined names are local to.
+       */
+      type: 'insertSheet';
+      sheet: number;
+      name: string;
+    }
+  | {
+      /**
+       * Removes a worksheet. What other sheets, defined names and links read from it becomes
+       * #REF!, the names local to it go with it, and another visible sheet becomes the active
+       * one when it was. Refused for the last visible sheet.
+       */
+      type: 'deleteSheet';
+      sheet: number;
+    }
+  | {
+      /** Gives a worksheet another name, and writes that name wherever a formula, a defined name or a link names the sheet. */
+      type: 'renameSheet';
+      sheet: number;
+      name: string;
+    }
+  | {
+      /**
+       * Puts the list of sheets back the way a snapshot recorded it; the inverse of the three
+       * operations on sheets, and its own inverse. `sheet` is the index the operation it undoes
+       * was about (where a sheet comes back, goes away or changes its name).
+       */
+      type: 'restoreSheets';
+      sheet: number;
+      state: SheetsSnapshot;
+      /** As for "restore". */
+      weight?: number;
     };
 
 /** The row properties an operation may set. */
@@ -128,11 +189,15 @@ function checkCell(row: number, col: number): void {
   }
 }
 
-/** Applies cell changes and returns the changes that undo them, in reverse order. */
-function setCells(sheet: Sheet, changes: CellChange[]): CellChange[] {
+/**
+ * Applies cell changes and returns the changes that undo them, in reverse order. With
+ * `keepShared` the cells that depend on a changed shared formula are left as they are: for
+ * changes that are the same for every cell of the group (another name for a sheet).
+ */
+function setCells(sheet: Sheet, changes: CellChange[], keepShared = false): CellChange[] {
   // Everything is checked before anything is changed: an operation applies as a whole or not at all.
   for (const change of changes) checkCell(change.row, change.col);
-  const all = withDependants(sheet, changes);
+  const all = keepShared ? changes : withDependants(sheet, changes);
   const undo: CellChange[] = [];
   // Rows are copied once per operation, on their first change.
   const copied = new Set<number>();
@@ -765,6 +830,323 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
   return { type: 'restore', sheet: index, snapshot, others: [], definedNames: workbook.definedNames, weight };
 }
 
+// ---------------------------------------------------------------------------
+// Sheets
+
+/**
+ * Kinds of parts that name sheets in text the engine does not rewrite: the ranges of a chart
+ * and the source of a pivot table. A workbook with any keeps its sheets and their names.
+ */
+const NAME_HOLDERS = ['chart', 'pivotTable'];
+
+/**
+ * Form controls are linked to cells by formulas in parts that are written back as they are
+ * (the legacy drawing, control properties, <controlPr>): those would go on naming a sheet by
+ * the name it had. The kinds are the ones the reader notes in Sheet.anchored.
+ */
+const CONTROL_KINDS = ['formControl', 'ctrlProp', 'control'];
+
+function nameHolder(workbook: Workbook): string | undefined {
+  for (const sheet of workbook.sheets) {
+    const anchored = sheet.anchored;
+    if (!anchored) continue;
+    for (const kind of NAME_HOLDERS) if (anchored.indexOf(kind) >= 0) return kind;
+    for (const kind of CONTROL_KINDS) if (anchored.indexOf(kind) >= 0) return 'form controls';
+  }
+  return undefined;
+}
+
+/**
+ * Sheet names are told apart without regard to case (see foldSheetName()). In a workbook
+ * that has two sheets whose names differ by no more than that, a reference cannot be told to
+ * belong to one of them: the sheets of such a workbook are left as they are. Returns why,
+ * undefined for every other workbook.
+ */
+function sheetNameClash(workbook: Workbook): string | undefined {
+  const seen = new Map<string, string>();
+  for (const sheet of workbook.sheets) {
+    const key = foldSheetName(sheet.name);
+    const other = seen.get(key);
+    if (other !== undefined) return `Cannot change the sheets: "${other}" and "${sheet.name}" differ only by case`;
+    seen.set(key, sheet.name);
+  }
+  return undefined;
+}
+
+/**
+ * Why a sheet cannot be called `name`; undefined when it can. `except` is the index of the
+ * sheet that is being renamed: a sheet may take its own name written in other letter case.
+ */
+export function sheetNameProblem(workbook: Workbook, name: string, except?: number): string | undefined {
+  try {
+    checkSheetName(name);
+  } catch (error) {
+    return (error as Error).message;
+  }
+  const wanted = foldSheetName(name);
+  for (let i = 0; i < workbook.sheets.length; i++) {
+    if (i !== except && foldSheetName(workbook.sheets[i].name) === wanted) return `Cannot name the sheet "${name}": another sheet has that name`;
+  }
+  return undefined;
+}
+
+/** Why a sheet cannot be renamed (to `name`, when one is given); undefined when it can. Looks at no cell. */
+export function renameSheetProblem(workbook: Workbook, index: number, name?: string): string | undefined {
+  const sheet = workbook.sheets[index];
+  if (!sheet) return `No sheet at index ${index}`;
+  if (sheet.kind !== 'worksheet') return `Cannot rename a ${sheet.kind}: not supported yet`;
+  const clash = sheetNameClash(workbook);
+  if (clash) return clash;
+  const holder = nameHolder(workbook);
+  if (holder) return `Cannot rename a sheet in a workbook with ${holder}: not supported yet`;
+  return name === undefined ? undefined : sheetNameProblem(workbook, name, index);
+}
+
+/** Why a sheet cannot be deleted; undefined when it can. Looks at no cell. */
+export function deleteSheetProblem(workbook: Workbook, index: number): string | undefined {
+  const sheet = workbook.sheets[index];
+  if (!sheet) return `No sheet at index ${index}`;
+  if (sheet.kind !== 'worksheet') return `Cannot delete a ${sheet.kind}: not supported yet`;
+  const clash = sheetNameClash(workbook);
+  if (clash) return clash;
+  const holder = nameHolder(workbook);
+  if (holder) return `Cannot delete a sheet in a workbook with ${holder}: not supported yet`;
+  // Formulas elsewhere name the columns of a table by the table's name, which is not rewritten.
+  if ((sheet.anchored || []).indexOf('table') >= 0) return 'Cannot delete a sheet with table: not supported yet';
+  if (!workbook.sheets.some((other) => other !== sheet && other.state === 'visible')) return 'Cannot delete the last visible sheet';
+  return undefined;
+}
+
+/** Why a sheet cannot be inserted at an index under a name; undefined when it can. */
+export function insertSheetProblem(workbook: Workbook, at: number, name: string): string | undefined {
+  if (!(at >= 0 && at <= workbook.sheets.length) || Math.floor(at) !== at) return `Cannot insert a sheet at index ${at}`;
+  return sheetNameClash(workbook) || sheetNameProblem(workbook, name);
+}
+
+/** What giving sheets other names (see renameSheetsInFormula()) changes outside the list of sheets. */
+interface SheetNameChanges {
+  cells: { sheet: Sheet; cells: CellChange[] }[];
+  links: { sheet: Sheet; hyperlinks: Hyperlink[] }[];
+  /** The workbook's own list when no name changed. */
+  definedNames: DefinedName[];
+  /** Cells and names changed. */
+  count: number;
+}
+
+/**
+ * Works out what a change of sheet names does to the formulas, defined names and links of a
+ * workbook, without changing anything. `skip` is a sheet whose content does not matter (it
+ * is being deleted). Throws when a formula that may name a sheet cannot be read to its end:
+ * it would be left naming the sheet as it was.
+ */
+function sheetNameChanges(workbook: Workbook, map: SheetNameMap, what: string, skip?: Sheet): SheetNameChanges {
+  const out: SheetNameChanges = { cells: [], links: [], definedNames: workbook.definedNames, count: 0 };
+  const rewritten = (text: string, where: () => string): string => {
+    // No sheet is named without a "!"; most formulas are done with here.
+    if (text.indexOf('!') < 0) return text;
+    if (formulaNamesSheetsUnread(text)) throw new RangeError(`Cannot ${what} the sheet: the formula of ${where()} cannot be read`);
+    return renameSheetsInFormula(text, map);
+  };
+  for (const sheet of workbook.sheets) {
+    if (sheet === skip) continue;
+    const changes: CellChange[] = [];
+    for (const [index, row] of sheet.rows) {
+      row.cells.forEach((cell, col) => {
+        const formula = cell.formula;
+        // A cell that only points at its shared formula has no text; the cell that holds the text is rewritten.
+        if (!formula || formula.text === '') return;
+        const text = rewritten(formula.text, () => `${sheet.name}!${cellName(index, col)}`);
+        if (text !== formula.text) changes.push({ row: index, col, cell: { ...cell, formula: { ...formula, text } } });
+      });
+    }
+    if (changes.length > 0) {
+      out.cells.push({ sheet, cells: changes });
+      out.count += changes.length;
+    }
+    let links: Hyperlink[] | undefined;
+    sheet.hyperlinks.forEach((link, i) => {
+      if (link.location === undefined) return;
+      // The place a link goes to is not a formula: one that cannot be read is left alone.
+      const location = renameSheetsInFormula(link.location, map);
+      if (location === link.location) return;
+      if (!links) links = sheet.hyperlinks.slice();
+      links[i] = { ...link, location };
+    });
+    if (links) out.links.push({ sheet, hyperlinks: links });
+  }
+  let names: DefinedName[] | undefined;
+  workbook.definedNames.forEach((name, i) => {
+    if (skip && name.localSheet !== undefined && workbook.sheets[name.localSheet] === skip) return;
+    const value = rewritten(name.value, () => `the name ${name.name}`);
+    if (value === name.value) return;
+    if (!names) names = workbook.definedNames.slice();
+    names[i] = { ...name, value };
+    out.count++;
+  });
+  if (names) out.definedNames = names;
+  return out;
+}
+
+function sheetsSnapshot(workbook: Workbook): SheetsSnapshot {
+  return {
+    sheets: workbook.sheets,
+    cells: [],
+    links: [],
+    definedNames: workbook.definedNames,
+    activeSheet: workbook.activeSheet,
+    removedSheetNames: workbook.removedSheetNames,
+    removedSheetNeighbours: workbook.removedSheetNeighbours,
+  };
+}
+
+/** Puts changed cells and links in place and notes in `undo` what was there. */
+function applySheetNameChanges(changes: Pick<SheetNameChanges, 'cells' | 'links'>, undo: SheetsSnapshot): void {
+  for (const change of changes.cells) {
+    undo.cells.push({ sheet: change.sheet, cells: setCells(change.sheet, change.cells, true) });
+    change.sheet.modified = true;
+  }
+  for (const change of changes.links) {
+    undo.links.push({ sheet: change.sheet, hyperlinks: change.sheet.hyperlinks });
+    change.sheet.hyperlinks = change.hyperlinks;
+    change.sheet.hyperlinksModified = true;
+    change.sheet.modified = true;
+  }
+}
+
+function renameSheetOp(workbook: Workbook, index: number, name: string): Op {
+  const problem = renameSheetProblem(workbook, index, name);
+  if (problem) throw new RangeError(problem);
+  const sheet = workbook.sheets[index];
+  const old = foldSheetName(sheet.name);
+  const changes = sheetNameChanges(workbook, (written) => (foldSheetName(written) === old ? name : undefined), 'rename');
+
+  const undo = sheetsSnapshot(workbook);
+  undo.renamed = { sheet, name: sheet.name, nameInFile: sheet.nameInFile };
+  applySheetNameChanges(changes, undo);
+  workbook.definedNames = changes.definedNames;
+  // What is kept the way the file has it goes on naming the sheet as the file does.
+  if (sheet.part !== '' && sheet.nameInFile === undefined && sheet.name !== name) sheet.nameInFile = sheet.name;
+  sheet.name = name;
+  workbook.sheetsModified = true;
+  return { type: 'restoreSheets', sheet: index, state: undo, weight: changes.count };
+}
+
+function deleteSheetOp(workbook: Workbook, index: number): Op {
+  const problem = deleteSheetProblem(workbook, index);
+  if (problem) throw new RangeError(problem);
+  const sheet = workbook.sheets[index];
+  const gone = foldSheetName(sheet.name);
+  const before = workbook.sheets;
+  const map: SheetNameMap = (written) => (foldSheetName(written) === gone ? null : undefined);
+  // A 3D reference that ends at the sheet ends at the sheet beside it from now on.
+  map.runs = {
+    neighbour: (_name, step) => {
+      const beside = before[index + step];
+      return beside ? beside.name : undefined;
+    },
+    index: (name) => {
+      const wanted = foldSheetName(name);
+      for (let i = 0; i < before.length; i++) if (foldSheetName(before[i].name) === wanted) return i;
+      return -1;
+    },
+  };
+  const changes = sheetNameChanges(workbook, map, 'delete', sheet);
+
+  const undo = sheetsSnapshot(workbook);
+  applySheetNameChanges(changes, undo);
+  // The names of the sheet go with it; those of the sheets after it follow their sheets.
+  const names: DefinedName[] = [];
+  let namesChanged = changes.definedNames !== undo.definedNames;
+  for (const name of changes.definedNames) {
+    if (name.localSheet === undefined || name.localSheet < index) names.push(name);
+    else {
+      namesChanged = true;
+      if (name.localSheet > index) names.push({ ...name, localSheet: name.localSheet - 1 });
+    }
+  }
+  if (namesChanged) workbook.definedNames = names;
+  const sheets = workbook.sheets.filter((other) => other !== sheet);
+  workbook.sheets = sheets;
+  let active = workbook.activeSheet;
+  if (active > index) active--;
+  else if (active === index || !sheets[active]) {
+    // The next visible sheet takes its place, or the one before when it was the last.
+    active = -1;
+    for (let i = index; i < sheets.length && active < 0; i++) if (sheets[i].state === 'visible') active = i;
+    for (let i = Math.min(index, sheets.length) - 1; i >= 0 && active < 0; i--) if (sheets[i].state === 'visible') active = i;
+  }
+  workbook.activeSheet = active;
+  // What stood beside a sheet deleted earlier and was this sheet is now the sheet beside this one.
+  const beside: SheetNeighbours = { previous: before[index - 1], next: before[index + 1] };
+  let neighbours = (workbook.removedSheetNeighbours || []).map((entry) =>
+    entry.previous === sheet || entry.next === sheet
+      ? { previous: entry.previous === sheet ? beside.previous : entry.previous, next: entry.next === sheet ? beside.next : entry.next }
+      : entry,
+  );
+  if (sheet.part !== '') {
+    workbook.removedSheetNames = (workbook.removedSheetNames || []).concat([sheet.nameInFile !== undefined ? sheet.nameInFile : sheet.name]);
+    neighbours = neighbours.concat([beside]);
+  }
+  if (neighbours.length > 0) workbook.removedSheetNeighbours = neighbours;
+  workbook.sheetsModified = true;
+  return { type: 'restoreSheets', sheet: index, state: undo, weight: changes.count + sheet.rows.size };
+}
+
+function insertSheetOp(workbook: Workbook, at: number, name: string): Op {
+  const problem = insertSheetProblem(workbook, at, name);
+  if (problem) throw new RangeError(problem);
+  let sheetId = 0;
+  for (const other of workbook.sheets) if (other.sheetId > sheetId) sheetId = other.sheetId;
+  // An empty part name: the sheet is not in the file, the writer gives it a part.
+  const sheet = createSheet({ name, sheetId: sheetId + 1, state: 'visible', kind: 'worksheet', part: '' });
+  sheet.modified = true;
+
+  const undo = sheetsSnapshot(workbook);
+  const sheets = workbook.sheets.slice();
+  sheets.splice(at, 0, sheet);
+  workbook.sheets = sheets;
+  if (workbook.definedNames.some((defined) => defined.localSheet !== undefined && defined.localSheet >= at)) {
+    workbook.definedNames = workbook.definedNames.map((defined) => (defined.localSheet !== undefined && defined.localSheet >= at ? { ...defined, localSheet: defined.localSheet + 1 } : defined));
+  }
+  // The sheet that was shown stays the one that is.
+  if (workbook.activeSheet >= at) workbook.activeSheet++;
+  workbook.sheetsModified = true;
+  return { type: 'restoreSheets', sheet: at, state: undo };
+}
+
+function restoreSheets(workbook: Workbook, index: number, state: SheetsSnapshot, weight: number | undefined): Op {
+  const undo = sheetsSnapshot(workbook);
+  if (state.renamed) {
+    const sheet = state.renamed.sheet;
+    undo.renamed = { sheet, name: sheet.name, nameInFile: sheet.nameInFile };
+    sheet.name = state.renamed.name;
+    if (state.renamed.nameInFile === undefined) delete sheet.nameInFile;
+    else sheet.nameInFile = state.renamed.nameInFile;
+  }
+  // Last first: the order the changes are undone in.
+  for (let i = state.cells.length - 1; i >= 0; i--) {
+    const change = state.cells[i];
+    undo.cells.push({ sheet: change.sheet, cells: setCells(change.sheet, change.cells, true) });
+    change.sheet.modified = true;
+  }
+  for (let i = state.links.length - 1; i >= 0; i--) {
+    const change = state.links[i];
+    undo.links.push({ sheet: change.sheet, hyperlinks: change.sheet.hyperlinks });
+    change.sheet.hyperlinks = change.hyperlinks;
+    change.sheet.hyperlinksModified = true;
+    change.sheet.modified = true;
+  }
+  workbook.sheets = state.sheets;
+  workbook.definedNames = state.definedNames;
+  workbook.activeSheet = state.activeSheet;
+  if (state.removedSheetNames === undefined) delete workbook.removedSheetNames;
+  else workbook.removedSheetNames = state.removedSheetNames;
+  if (state.removedSheetNeighbours === undefined) delete workbook.removedSheetNeighbours;
+  else workbook.removedSheetNeighbours = state.removedSheetNeighbours;
+  workbook.sheetsModified = true;
+  return { type: 'restoreSheets', sheet: index, state: undo, weight };
+}
+
 /** Column settings sorted, clipped to the sheet and free of overlaps (an earlier range wins). */
 function normalizeColumns(columns: ColumnRange[]): ColumnRange[] {
   const sorted = columns
@@ -873,6 +1255,14 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       workbook.definedNames = op.definedNames;
       return { type: 'restore', sheet: op.sheet, snapshot, others, otherLinks, definedNames, weight: op.weight };
     }
+    case 'insertSheet':
+      return insertSheetOp(workbook, op.sheet, op.name);
+    case 'deleteSheet':
+      return deleteSheetOp(workbook, op.sheet);
+    case 'renameSheet':
+      return renameSheetOp(workbook, op.sheet, op.name);
+    case 'restoreSheets':
+      return restoreSheets(workbook, op.sheet, op.state, op.weight);
   }
 }
 
@@ -886,7 +1276,7 @@ const MAX_UNDO_WEIGHT = 300000;
 function weightOf(ops: Op[]): number {
   let weight = 0;
   for (const op of ops) {
-    if (op.type === 'restore') weight += op.weight || 0;
+    if (op.type === 'restore' || op.type === 'restoreSheets') weight += op.weight || 0;
     else if (op.type === 'setCells') weight += op.cells.length / 16;
     else if (op.type === 'setAutoFilter') weight += ((op.show ? op.show.length : 0) + (op.hide ? op.hide.length : 0)) / 16;
   }

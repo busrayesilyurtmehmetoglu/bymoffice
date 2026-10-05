@@ -775,8 +775,19 @@ export interface Sheet {
   sheetId: number;
   state: SheetState;
   kind: SheetKind;
-  /** Part this sheet was read from, e.g. "/xl/worksheets/sheet1.xml". */
+  /**
+   * Part this sheet was read from, e.g. "/xl/worksheets/sheet1.xml". Empty for a sheet that is
+   * not in the file (one added since it was read): the writer gives such a sheet its part.
+   */
   part: string;
+  /**
+   * The name the sheet has in the file, set when a sheet that was read from the file is first
+   * given another name. Content kept the way the file has it (conditional formats, data
+   * validations, the source XML) names sheets as the file does: see fileSheetName() and
+   * sheetNameMap(). Undoing the rename removes it again; renaming the sheet back to the name
+   * of the file by another rename leaves it, equal to `name`.
+   */
+  nameInFile?: string;
   /** Sparse, keyed by row index. */
   rows: Map<number, Row>;
   /** Sorted by `min`, not overlapping. */
@@ -877,6 +888,145 @@ export interface Workbook {
   activeSheet: number;
   /** The pictures of the workbook's drawings, by DrawingPicture.media. */
   media?: WorkbookMedia;
+  /**
+   * Set once a sheet was inserted, deleted or renamed after the workbook was read (and never
+   * cleared, not by undo either): the list of sheets, their names or the defined names may
+   * differ from the file, and the writer regenerates what holds them.
+   */
+  sheetsModified?: boolean;
+  /**
+   * The names, as the file has them, of sheets of the file that were deleted. Undoing the
+   * deletion takes the name out again. A sheet added after the file was read and deleted
+   * again is not listed. Missing while nothing was deleted.
+   */
+  removedSheetNames?: string[];
+  /**
+   * One entry per name of removedSheetNames, in the same order: the sheets that stood before
+   * and after the deleted sheet. A 3D reference that ended at the deleted sheet ends at one of
+   * them (see SheetRuns). Kept pointing at sheets of the workbook: when such a neighbour is
+   * deleted in turn, its own neighbour takes its place here.
+   */
+  removedSheetNeighbours?: SheetNeighbours[];
+}
+
+/** The sheets on either side of a deleted sheet; undefined where it was the first or the last. */
+export interface SheetNeighbours {
+  previous?: Sheet;
+  next?: Sheet;
+}
+
+/**
+ * Sheet names compare without regard to case. The four Turkish letters I, İ, ı, i count as
+ * one, without relying on locale data: "İ" lower-cases to "i" plus a combining dot (U+0307).
+ */
+export function foldSheetName(name: string): string {
+  return String(name).toLowerCase().replace(/\u0307/g, '').replace(/\u0131/g, 'i');
+}
+
+/**
+ * What a sheet may be called: 1 to 31 characters that are not all spaces,
+ * none of []:*?/\ and no control character, no apostrophe at either end,
+ * not "History" (which Excel keeps for itself), and only characters an XML
+ * file can hold. Returns the name; throws RangeError for a name that is none.
+ */
+export function checkSheetName(name: string): string {
+  const ok =
+    typeof name === 'string' &&
+    name.length >= 1 &&
+    name.length <= 31 &&
+    name.trim() !== '' &&
+    !/[[\]:*?/\\\u0000-\u001f\ufffe\uffff]/.test(name) &&
+    // A surrogate without its other half.
+    !/[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/.test(name) &&
+    name.charAt(0) !== "'" &&
+    name.charAt(name.length - 1) !== "'" &&
+    name.toLowerCase() !== 'history';
+  if (!ok) throw new RangeError('A sheet name has 1 to 31 characters, none of [ ] : * ? / \\ and no control character, no apostrophe at its start or end, and is not "History"');
+  return name;
+}
+
+/** The name a sheet has in the file it was read from; undefined for a sheet that is not in the file. */
+export function fileSheetName(sheet: Sheet): string | undefined {
+  if (sheet.part === '') return undefined;
+  return sheet.nameInFile !== undefined ? sheet.nameInFile : sheet.name;
+}
+
+/**
+ * What a sheet name of the file stands for now: the name the sheet has today, null when the
+ * sheet was deleted, undefined when the name is to be left as it is (the sheet still has it,
+ * or the file has no sheet of that name).
+ */
+export interface SheetNameMap {
+  (name: string): string | null | undefined;
+  /** How a 3D reference goes on when the sheet at one of its ends was deleted; without it such a reference is an error. */
+  runs?: SheetRuns;
+}
+
+/**
+ * What a 3D reference ("Sheet2:Sheet4!A1") needs to know when a sheet at one of its ends was
+ * deleted: the run then ends at the sheet that stood next to the deleted one, inside the run.
+ */
+export interface SheetRuns {
+  /**
+   * The name, as it is now, of the sheet that stood after (`step` 1) or before (`step` -1) the
+   * deleted sheet the map answers null for; undefined when there is none.
+   */
+  neighbour(name: string, step: 1 | -1): string | undefined;
+  /** Where the sheet of this name (as it is now) stands among the sheets; -1 for no sheet. */
+  index(name: string): number;
+}
+
+/**
+ * The map from the sheet names of the file to the sheets as they are now, for content that
+ * is kept the way the file has it. Undefined while every sheet of the file is there under
+ * its own name, which is the usual case and needs no work. All names are looked up in the
+ * state of the file at once, never one rename after another: with "Sheet2" deleted and
+ * "Sheet3" renamed to "Sheet2", the file's "Sheet2" is the deleted sheet (null) and the
+ * file's "Sheet3" is today's "Sheet2". The map reflects the workbook at the time of the
+ * call; ask again after the sheets changed.
+ */
+export function sheetNameMap(workbook: Workbook): SheetNameMap | undefined {
+  const removed = workbook.removedSheetNames;
+  let names: Map<string, string | null> | undefined;
+  if (removed && removed.length > 0) {
+    names = new Map();
+    for (const name of removed) names.set(foldSheetName(name), null);
+  }
+  for (const sheet of workbook.sheets || []) {
+    if (sheet.part === '' || sheet.nameInFile === undefined || sheet.nameInFile === sheet.name) continue;
+    if (!names) names = new Map();
+    names.set(foldSheetName(sheet.nameInFile), sheet.name);
+  }
+  if (!names) return undefined;
+  const known = names;
+  const map: SheetNameMap = (name) => known.get(foldSheetName(name));
+  const neighbours = workbook.removedSheetNeighbours;
+  if (removed && removed.length > 0 && neighbours) {
+    const sheets = workbook.sheets;
+    const beside = new Map<string, SheetNeighbours>();
+    removed.forEach((name, i) => {
+      if (neighbours[i]) beside.set(foldSheetName(name), neighbours[i]);
+    });
+    map.runs = {
+      neighbour: (name, step) => {
+        const entry = beside.get(foldSheetName(name));
+        const sheet = entry && (step > 0 ? entry.next : entry.previous);
+        return sheet && sheets.indexOf(sheet) >= 0 ? sheet.name : undefined;
+      },
+      index: (name) => {
+        const wanted = foldSheetName(name);
+        for (let i = 0; i < sheets.length; i++) if (foldSheetName(sheets[i].name) === wanted) return i;
+        return -1;
+      },
+    };
+  }
+  return map;
+}
+
+/** What one sheet name of the file stands for now; sheetNameMap() is the one to use for many names. */
+export function currentSheetName(workbook: Workbook, nameInFile: string): string | null | undefined {
+  const map = sheetNameMap(workbook);
+  return map ? map(nameInFile) : undefined;
 }
 
 export function createSheet(init: Pick<Sheet, 'name' | 'sheetId' | 'state' | 'kind' | 'part'>): Sheet {

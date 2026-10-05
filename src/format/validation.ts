@@ -14,9 +14,9 @@
 
 import type { CalcEngine, CellAddress } from '../calc/engine';
 import { parseFormula, type Node } from '../calc/parse';
-import { adjustAnchoredFormula, adjustRange, type StructuralEdit } from '../calc/refs';
+import { adjustAnchoredFormula, adjustRange, renameSheetsInFormula, type StructuralEdit } from '../calc/refs';
 import { isError, type Scalar } from '../calc/values';
-import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, fileSheetName, getCell, sheetNameMap, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
 import { resolveCellStyle } from '../model/sheet/color';
 import { applyOp, type Op } from '../ops/ops';
 import { foldCase } from '../ops/sort';
@@ -190,6 +190,13 @@ function compare(value: number, operator: string, a: number, b: number | undefin
   }
 }
 
+/**
+ * Stands for the name in the file of a sheet that is not in the file: no reference of the
+ * file names it (a sheet name holds no control character), references without a sheet name
+ * still follow the sheet's own edits.
+ */
+const NOT_IN_FILE = '\u0000';
+
 /** The data validations of one sheet, as they apply now. */
 export class DataValidations {
   private readonly workbook: Workbook;
@@ -199,6 +206,10 @@ export class DataValidations {
   private rulesSeen: DataValidation[] | undefined;
   /** The structuralEdits lists of all sheets the entries were built for. */
   private editsSeen: (Sheet['structuralEdits'] | undefined)[] = [];
+  /** The sheets, their names and the deleted sheets the entries were built for. */
+  private sheetsSeen: Sheet[] = [];
+  private namesSeen: string[] = [];
+  private removedSeen: string[] | undefined;
 
   constructor(workbook: Workbook, sheet: Sheet, options: ValidationOptions = {}) {
     this.workbook = workbook;
@@ -357,8 +368,11 @@ export class DataValidations {
   private stale(): boolean {
     if (!this.entries || this.rulesSeen !== this.sheet.dataValidations) return true;
     const sheets = this.workbook.sheets || [];
-    if (sheets.length !== this.editsSeen.length) return true;
-    for (let i = 0; i < sheets.length; i++) if (sheets[i].structuralEdits !== this.editsSeen[i]) return true;
+    if (sheets.length !== this.editsSeen.length || this.removedSeen !== this.workbook.removedSheetNames) return true;
+    for (let i = 0; i < sheets.length; i++) {
+      // A sheet inserted or deleted moves the others in the list; a renamed one keeps its place.
+      if (sheets[i] !== this.sheetsSeen[i] || sheets[i].name !== this.namesSeen[i] || sheets[i].structuralEdits !== this.editsSeen[i]) return true;
+    }
     return false;
   }
 
@@ -367,11 +381,22 @@ export class DataValidations {
     const sheets = this.workbook.sheets || [];
     this.rulesSeen = sheet.dataValidations;
     this.editsSeen = sheets.map((other) => other.structuralEdits);
-    const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: sheet.name }));
+    this.sheetsSeen = sheets.slice();
+    this.namesSeen = sheets.map((other) => other.name);
+    this.removedSeen = this.workbook.removedSheetNames;
+    // The formulas of the rules are as the file has them and name sheets as the file does: the
+    // edits are matched with those names, and only then are the sheets given the names they have now.
+    const fileName = fileSheetName(sheet);
+    const ownName = fileName === undefined ? NOT_IN_FILE : fileName;
+    const nameMap = sheetNameMap(this.workbook);
+    const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: ownName }));
     const foreign: StructuralEdit[] = [];
     for (const other of sheets) {
       if (other === sheet || !other.structuralEdits) continue;
-      for (const edit of other.structuralEdits) foreign.push({ ...edit, sheetName: other.name });
+      // Nothing in the file refers to a sheet that is not in it.
+      const name = fileSheetName(other);
+      if (name === undefined) continue;
+      for (const edit of other.structuralEdits) foreign.push({ ...edit, sheetName: name });
     }
     const entries: Entry[] = [];
     const rules = Array.isArray(sheet.dataValidations) ? sheet.dataValidations : [];
@@ -384,7 +409,7 @@ export class DataValidations {
       const adjust = (edit: StructuralEdit, from: CellRange, to: CellRange) => {
         for (let i = 0; i < texts.length; i++) {
           const text = texts[i];
-          if (text !== undefined) texts[i] = adjustAnchoredFormula(text, sheet.name, edit, { row: from.top, col: from.left }, { row: to.top, col: to.left }, true);
+          if (text !== undefined) texts[i] = adjustAnchoredFormula(text, ownName, edit, { row: from.top, col: from.left }, { row: to.top, col: to.left }, true);
         }
       };
       for (const edit of own) {
@@ -402,6 +427,7 @@ export class DataValidations {
       }
       if (ranges.length === 0) continue;
       for (const edit of foreign) adjust(edit, ranges[0], ranges[0]);
+      if (nameMap) for (let i = 0; i < texts.length; i++) if (texts[i] !== undefined) texts[i] = renameSheetsInFormula(texts[i] as string, nameMap);
       entries.push({ rule, ranges, anchorRow: ranges[0].top, anchorCol: ranges[0].left, formula1: texts[0], formula2: texts[1] });
     }
     this.entries = entries;

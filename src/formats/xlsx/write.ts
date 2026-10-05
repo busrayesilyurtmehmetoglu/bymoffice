@@ -7,17 +7,19 @@
 // regenerated from the bytes the file had when it was opened, never from the
 // output of an earlier save: the model records its changes relative to those.
 
-import { adjustAnchoredFormula, adjustFormula, adjustRange, adjustReferenceText, type StructuralEdit } from '../../calc/refs';
+import { adjustAnchoredFormula, adjustFormula, adjustRange, adjustReferenceText, renameSheetsInFormula, type StructuralEdit } from '../../calc/refs';
 import {
   FILTER_NAME,
   MAX_COLS,
   MAX_ROWS,
   cellName,
   columnName,
+  foldSheetName,
   getCell,
   parseCellRef,
   parseRange,
   rangeName,
+  sheetNameMap,
   type Alignment,
   type Border,
   type BorderEdge,
@@ -35,6 +37,7 @@ import {
   type Row,
   type SharedString,
   type Sheet,
+  type SheetNameMap,
   type SheetStructuralEdit,
   type SortState,
   type StyleSheet,
@@ -51,6 +54,7 @@ const NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const NS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const NS_REL_STRICT = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
 const STYLES_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml';
+const WORKSHEET_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml';
 
 // --- escaping ----------------------------------------------------------------
 
@@ -562,14 +566,19 @@ const DROP = 1;
 const DROP_PARENT = 2;
 
 interface Adjuster {
-  /** Name of the sheet the part belongs to: references without a sheet name are its own. */
+  /** Name the file has for the sheet the part belongs to: references without a sheet name are its own. */
   sheetName: string;
   /** Rows and columns inserted into or deleted from this sheet, in order. */
   own: StructuralEdit[];
   /** The same for the other sheets of the workbook; only formulas that name those sheets follow them. */
   foreign: StructuralEdit[];
-  /** Lower-case spellings of the other edited sheets' names; text that has none of them needs no look. */
+  /** Folded spellings of the names of the other edited sheets and of the sheets that were renamed or deleted; text that has none of them needs no look. */
   needles: string[];
+  /**
+   * What the sheet names of the file stand for now, when sheets were renamed or deleted. Applied
+   * to a formula last: the edits above are matched with the names the file has.
+   */
+  rename?: SheetNameMap;
   /** Set when anything was altered; an element that was not is copied from the source instead. */
   changed: boolean;
 }
@@ -605,7 +614,7 @@ function adjustList(text: string, adjuster: Adjuster): string {
 function adjustFormulaText(text: string, adjuster: Adjuster): string {
   for (const edit of adjuster.own) text = adjustFormula(text, adjuster.sheetName, edit);
   for (const edit of adjuster.foreign) text = adjustFormula(text, adjuster.sheetName, edit);
-  return text;
+  return adjuster.rename ? renameSheetsInFormula(text, adjuster.rename) : text;
 }
 
 /** Where one cell of this sheet ends up, as text; '' when it was deleted, the text itself when it is no cell. */
@@ -802,6 +811,8 @@ function adjustRule(el: XmlElement, adjuster: Adjuster): number | undefined {
       texts[i] = anchor ? adjustAnchoredFormula(texts[i], name, edit, anchor, anchor, true) : adjustFormula(texts[i], name, edit);
     }
   }
+  // Last, as where the rules are evaluated: the sheets get the names they have now.
+  if (adjuster.rename) for (let i = 0; i < texts.length; i++) texts[i] = renameSheetsInFormula(texts[i], adjuster.rename);
 
   if (list !== original) {
     list = collapseSingleCells(list);
@@ -865,7 +876,7 @@ function adjustAutoFilter(el: XmlElement, adjuster: Adjuster): number {
 }
 
 /** Whether <dataRef sheet="..."> names the sheet being written. */
-const sameSheetName = (a: string | undefined, b: string) => a !== undefined && a.toLowerCase() === b.toLowerCase();
+const sameSheetName = (a: string | undefined, b: string) => a !== undefined && foldSheetName(a) === foldSheetName(b);
 
 /**
  * Makes the references inside an element follow the structural edits.
@@ -906,6 +917,20 @@ function adjustElement(el: XmlElement, adjuster: Adjuster): number {
     }
     if (next !== value) {
       el.attrs.set(name, next);
+      adjuster.changed = true;
+    }
+  }
+
+  // Last, the name itself: a source on a sheet that was deleted is gone with it.
+  if (local === 'dataRef' && adjuster.rename) {
+    const named = el.attrs.get('sheet');
+    const now = named === undefined ? undefined : adjuster.rename(named);
+    if (now === null) {
+      adjuster.changed = true;
+      return DROP;
+    }
+    if (now !== undefined && now !== named) {
+      el.attrs.set('sheet', now);
       adjuster.changed = true;
     }
   }
@@ -956,9 +981,11 @@ const elementText = (root: XmlElement) => serializeXml({ declaration: null, lead
  */
 function adjustRaw(raw: string, name: string, adjuster: Adjuster): string {
   if (adjuster.own.length === 0) {
-    // Only formulas that name another edited sheet can change; most elements name none.
-    const lower = raw.toLowerCase();
-    if (!adjuster.needles.some((needle) => lower.indexOf(needle) >= 0)) return raw;
+    // Only formulas that name another edited sheet, or a sheet that has another name now, can change; most
+    // elements name none. The text is looked at as a reader of the file sees it: a name may be spelled with
+    // character references ("R&#38;D", "&apos;It&apos;&apos;s&apos;").
+    const folded = foldSheetName(plainOf(raw));
+    if (!adjuster.needles.some((needle) => folded.indexOf(needle) >= 0)) return raw;
   }
   adjuster.changed = false;
   try {
@@ -982,7 +1009,7 @@ function adjustRaw(raw: string, name: string, adjuster: Adjuster): string {
 export function adjustSheetElement(raw: string, sheetName: string, own: StructuralEdit[], foreign: StructuralEdit[]): string {
   if (own.length === 0 && foreign.length === 0) return raw;
   const name = /^<([^\s/>]+)/.exec(raw);
-  return adjustRaw(raw, name ? name[1] : '', { sheetName, own, foreign, needles: nameNeedles(foreign), changed: false });
+  return adjustRaw(raw, name ? name[1] : '', { sheetName, own, foreign, needles: nameNeedles(foreign.map((edit) => edit.sheetName)), changed: false });
 }
 
 // --- regenerated parts of the sheet ---------------------------------------------------
@@ -1248,6 +1275,23 @@ interface SheetRewrite {
    */
   rawOnly?: boolean;
   overrides?: Map<number, Map<number, Cell>>;
+  /** The name the file has for the sheet, which its raw content and the edits are matched with; the sheet's own name without it. */
+  fileName?: string;
+  /** Sheets of the file that have another name now, or are gone: applied to raw formulas after the edits. */
+  rename?: SheetRenames;
+  /** What <sheetView tabSelected> has to say; undefined leaves it as it is. */
+  tabSelected?: boolean;
+  /**
+   * The source is the skeleton of a sheet that is not in the file: everything the model
+   * holds is written from it, whatever was marked as changed.
+   */
+  fresh?: boolean;
+}
+
+interface SheetRenames {
+  map: SheetNameMap;
+  /** The names of the file that the map answers for. */
+  names: string[];
 }
 
 interface ChildState {
@@ -1258,6 +1302,25 @@ interface ChildState {
   changed: boolean;
   /** What <sheetPr filterMode> has to say once the filter was changed; undefined leaves it as it is. */
   filterMode: boolean | undefined;
+  /** What <sheetView tabSelected> has to say; undefined leaves it as it is. */
+  tabSelected: boolean | undefined;
+  /** Every row is written from the model. */
+  full: boolean;
+}
+
+const isTrueAttr = (value: string | undefined) => value === '1' || value === 'true';
+
+/** <sheetViews> with the sheet marked as the selected one, or as not selected; the text itself when it says so already. */
+function selectTab(raw: string, selected: boolean): string {
+  const root = parseXml(raw).root;
+  let changed = false;
+  for (const view of childrenOf(root, 'sheetView')) {
+    if (isTrueAttr(view.attrs.get('tabSelected')) === selected) continue;
+    if (selected) view.attrs.set('tabSelected', '1');
+    else view.attrs.delete('tabSelected');
+    changed = true;
+  }
+  return changed ? elementText(root) : raw;
 }
 
 /**
@@ -1284,11 +1347,18 @@ function writeChild(
       const rows = sc.readRaw();
       return { text: rows, end: start + rows.length };
     }
-    return writeSheetData(sc, s, start, sheet, writer, adjuster !== undefined && adjuster.own.length > 0);
+    return writeSheetData(sc, s, start, sheet, writer, state.full || (adjuster !== undefined && adjuster.own.length > 0));
   }
   const currentRef = local === 'dimension' ? sc.attr('ref') : undefined;
-  const raw = sc.readRaw();
-  const end = start + raw.length;
+  const source = sc.readRaw();
+  const end = start + source.length;
+  let raw = source;
+  if (local === 'sheetViews' && state.tabSelected !== undefined) {
+    // The source has the element: it is brought in line instead of being made.
+    regenerated.delete(local);
+    raw = selectTab(source, state.tabSelected);
+    if (raw !== source) state.changed = true;
+  }
 
   if (local === 'dimension') {
     const ref = rawOnly ? currentRef : usedRange(sheet);
@@ -1325,12 +1395,28 @@ function writeChild(
   return { text, end };
 }
 
-/** Lower-case spellings under which a sheet name may appear in the raw text of a part. */
-function nameNeedles(edits: StructuralEdit[]): string[] {
+const ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+
+/**
+ * Raw XML with its entities and character references read: what to look for a sheet name in.
+ * Not a parse: a reference that is none stays as it is, which hides no name.
+ */
+function plainOf(raw: string): string {
+  if (raw.indexOf('&') < 0) return raw;
+  return raw.replace(/&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|amp|lt|gt|quot|apos);/g, (match, ref: string) => {
+    if (ref.charCodeAt(0) !== 35) return ENTITIES[ref];
+    const hex = ref.charCodeAt(1) === 120 || ref.charCodeAt(1) === 88;
+    const code = hex ? parseInt(ref.slice(2), 16) : parseInt(ref.slice(1), 10);
+    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;
+  });
+}
+
+/** Folded spellings (see foldSheetName()) under which sheet names may appear in the text of a part once its entities are read (see plainOf()). */
+function nameNeedles(names: string[]): string[] {
   const out: string[] = [];
-  for (const edit of edits) {
-    const lower = edit.sheetName.toLowerCase();
-    for (const spelling of [lower, escapeText(lower), lower.replace(/'/g, "''"), escapeText(lower.replace(/'/g, "''")), escapeAttr(lower)]) {
+  for (const name of names) {
+    const lower = foldSheetName(name);
+    for (const spelling of [lower, lower.replace(/'/g, "''")]) {
       if (out.indexOf(spelling) < 0) out.push(spelling);
     }
   }
@@ -1359,37 +1445,53 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
   const out: string[] = [fixDeclaration(s.slice(0, rootStart)), s.slice(rootStart, cursor)];
 
   const writer: CellWriter = { prefix, shared: workbook.sharedStrings, styledColumns: sheet.columns.filter((range) => !!range.style), overrides: options.overrides };
-  const own: StructuralEdit[] = rawOnly ? [] : (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: sheet.name }));
+  const fresh = !!options.fresh;
+  // The raw content names sheets as the file does, this one included.
+  const fileName = options.fileName !== undefined ? options.fileName : sheet.name;
+  const own: StructuralEdit[] = rawOnly || fresh ? [] : (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: fileName }));
   const foreign = options.foreign || [];
+  const rename = options.rename;
   const structural = own.length > 0;
   const adjuster: Adjuster | undefined =
-    structural || foreign.length > 0 ? { sheetName: sheet.name, own, foreign, needles: nameNeedles(foreign), changed: false } : undefined;
+    !fresh && (structural || foreign.length > 0 || rename)
+      ? {
+          sheetName: fileName,
+          own,
+          foreign,
+          needles: nameNeedles(foreign.map((edit) => edit.sheetName).concat(rename ? rename.names : [])),
+          rename: rename ? rename.map : undefined,
+          changed: false,
+        }
+      : undefined;
 
   // These come from the model once it changed them, or once rows or columns moved; they are put at
   // the place the schema gives them when the source has none.
   const regenerated = new Map<string, string>();
   if (!rawOnly) {
-    if (structural || sheet.columnsModified) regenerated.set('cols', sheet.columns.length > 0 ? COLS_MARKER : '');
-    if (structural || sheet.mergesModified) regenerated.set('mergeCells', mergeCellsXml(sheet, prefix));
-    if (structural || sheet.hyperlinksModified) regenerated.set('hyperlinks', sheet.hyperlinks.length > 0 ? LINKS_MARKER : '');
+    if (fresh || structural || sheet.columnsModified) regenerated.set('cols', sheet.columns.length > 0 ? COLS_MARKER : '');
+    if (fresh || structural || sheet.mergesModified) regenerated.set('mergeCells', mergeCellsXml(sheet, prefix));
+    if (fresh || structural || sheet.hyperlinksModified) regenerated.set('hyperlinks', sheet.hyperlinks.length > 0 ? LINKS_MARKER : '');
   }
   // A filter that was changed is written from the model; one that was not is copied, and only follows moved rows and columns.
   let filterMode: boolean | undefined;
-  if (!rawOnly && sheet.autoFilterModified) {
+  if (!rawOnly && (fresh || sheet.autoFilterModified)) {
     regenerated.set('autoFilter', autoFilterXml(sheet, prefix));
     filterMode = !!sheet.autoFilter && sheet.autoFilter.columns.some((column) => column.kind !== 'none');
     // Applications mark a sheet whose filter hides rows; without a <sheetPr> to hold the mark, one is made.
     if (filterMode) regenerated.set('sheetPr', `<${prefix}sheetPr filterMode="1"/>`);
   }
-  const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode };
+  // A sheet without views is not the selected one; one that has to be gets a view that says so.
+  if (options.tabSelected) regenerated.set('sheetViews', `<${prefix}sheetViews><${prefix}sheetView tabSelected="1" workbookViewId="0"/></${prefix}sheetViews>`);
+  const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode, tabSelected: options.tabSelected, full: fresh };
   /** Writes the regenerated elements that belong before the element of rank `rank` and were not in the source. */
   const flush = (rank: number) => {
     if (regenerated.size === 0) return;
-    for (const local of ['sheetPr', 'cols', 'autoFilter', 'mergeCells', 'hyperlinks']) {
+    for (const local of ['sheetPr', 'sheetViews', 'cols', 'autoFilter', 'mergeCells', 'hyperlinks']) {
       const text = regenerated.get(local);
       if (text === undefined || WORKSHEET_ORDER.indexOf(local) >= rank) continue;
       out.push(text);
       regenerated.delete(local);
+      if (text !== '') state.changed = true;
     }
   };
 
@@ -1796,29 +1898,47 @@ function adjustAnchorsIn(el: XmlElement, edits: SheetStructuralEdit[]): boolean 
   return changed;
 }
 
-/** Shapes and connectors may show the content of a cell: textlink="Sheet1!$A$5" is a formula. */
-function adjustTextLinks(el: XmlElement, edits: SheetStructuralEdit[], sheetName: string): boolean {
+/** What happened to the other sheets of the workbook, for a part that names them. */
+interface OtherSheets {
+  /** Rows and columns moved in the other sheets, under the names the file has for those. */
+  foreign: StructuralEdit[];
+  /** What the sheet names of the file stand for now, when sheets were renamed or deleted. */
+  rename?: SheetNameMap;
+}
+
+/**
+ * Shapes and connectors may show the content of a cell: textlink="Sheet1!$A$5" is a formula. It
+ * follows the rows and columns of its own sheet and of the sheets it names (all named as the
+ * file names them), and then names the sheets as they are called now.
+ */
+function adjustTextLinks(el: XmlElement, edits: SheetStructuralEdit[], sheetName: string, others: OtherSheets | undefined): boolean {
   let changed = false;
   const link = el.attrs.get('textlink');
   if (link !== undefined && link !== '') {
     let next = link;
     for (const edit of edits) next = adjustFormula(next, sheetName, { ...edit, sheetName });
+    if (others) {
+      for (const edit of others.foreign) next = adjustFormula(next, sheetName, edit);
+      if (others.rename) next = renameSheetsInFormula(next, others.rename);
+    }
     if (next !== link) {
       el.attrs.set('textlink', next);
       changed = true;
     }
   }
-  for (const node of el.children) if (node.type === 'element' && adjustTextLinks(node, edits, sheetName)) changed = true;
+  for (const node of el.children) if (node.type === 'element' && adjustTextLinks(node, edits, sheetName, others)) changed = true;
   return changed;
 }
 
-/** A drawing part with its anchors moved; the same bytes when nothing moved. */
-function adjustDrawing(bytes: Uint8Array, edits: SheetStructuralEdit[], sheetName: string): Uint8Array {
+/** A drawing part with its anchors moved and its text links brought up to date; the same bytes when nothing changed. */
+function adjustDrawing(bytes: Uint8Array, edits: SheetStructuralEdit[], sheetName: string, others?: OtherSheets): Uint8Array {
+  // Without rows or columns moved in the sheet itself, only a link to a cell can change.
+  if (edits.length === 0 && (!others || decodeSource(bytes).indexOf('textlink') < 0)) return bytes;
   const doc = parseXml(bytes);
   const moved = adjustAnchorsIn(doc.root, edits);
   let linked: boolean;
   try {
-    linked = adjustTextLinks(doc.root, edits, sheetName);
+    linked = adjustTextLinks(doc.root, edits, sheetName, others);
   } catch (error) {
     if (error instanceof RangeError) throw new Error('Cannot write the drawing: its content is nested too deeply to adjust');
     throw error;
@@ -1981,7 +2101,33 @@ function adjustVml(bytes: Uint8Array, edits: SheetStructuralEdit[]): Uint8Array 
 }
 
 /** Parts of a sheet that follow its rows and columns, by the last segment of their relationship type. */
-const ANCHORED_PARTS: Record<string, (bytes: Uint8Array, edits: SheetStructuralEdit[], sheetName: string) => Uint8Array> = {
+/** The elements of a table part that hold formulas. */
+const TABLE_FORMULAS = ['calculatedColumnFormula', 'totalsRowFormula'];
+
+/**
+ * The formulas of a table (of a calculated column, of the totals row) after rows and columns
+ * moved in the other sheets and sheets were renamed or deleted. Returns whether any changed.
+ * (Rows and columns do not move in the sheet of a table itself: the model refuses that.)
+ */
+function adjustTableFormulas(el: XmlElement, sheetName: string, others: OtherSheets, depth = 0): boolean {
+  let changed = false;
+  for (const node of el.children) {
+    if (node.type !== 'element') continue;
+    if (TABLE_FORMULAS.indexOf(localName(node.name)) >= 0 && isTextOnly(node)) {
+      const text = plainText(node);
+      let next = text;
+      for (const edit of others.foreign) next = adjustFormula(next, sheetName, edit);
+      if (others.rename) next = renameSheetsInFormula(next, others.rename);
+      if (next !== text) {
+        node.children = [{ type: 'text', value: next }];
+        changed = true;
+      }
+    } else if (depth < 8 && adjustTableFormulas(node, sheetName, others, depth + 1)) changed = true;
+  }
+  return changed;
+}
+
+const ANCHORED_PARTS: Record<string, (bytes: Uint8Array, edits: SheetStructuralEdit[], sheetName: string, others?: OtherSheets) => Uint8Array> = {
   drawing: adjustDrawing,
   comments: adjustComments,
   vmlDrawing: adjustVml,
@@ -2014,22 +2160,214 @@ const WORKBOOK_ORDER = [
 
 const isFilterName = (name: string) => name.toLowerCase() === FILTER_NAME.toLowerCase();
 
-/** Brings workbook.xml up to date: defined names follow the model, and formulas are recalculated on load. */
-function updateWorkbookXml(doc: XmlDocument, workbook: Workbook): void {
+/** A sheet as the workbook part of the file lists it. */
+interface FileSheet {
+  element: XmlElement;
+  name: string;
+  /** The part the sheet is in; '' when the file does not say. */
+  part: string;
+  /** Its entry in the relationships of the workbook part. */
+  rel: XmlElement | undefined;
+}
+
+/** The sheets of the file in its order, each with the part its relationship leads to. */
+function fileSheetsOf(root: XmlElement, relationships: XmlElement[], main: string): FileSheet[] {
+  const byId = new Map<string, XmlElement>();
+  for (const rel of relationships) byId.set(rel.attrs.get('Id') || '', rel);
+  const list = childNamed(root, 'sheets');
+  const out: FileSheet[] = [];
+  for (const el of list ? childrenNamed(list, 'sheet') : []) {
+    let id: string | undefined;
+    for (const [name, value] of el.attrs) {
+      if (name.indexOf(':') >= 0 && localName(name) === 'id') {
+        id = value;
+        break;
+      }
+    }
+    const rel = id === undefined ? undefined : byId.get(id);
+    const internal = rel && rel.attrs.get('TargetMode') !== 'External';
+    out.push({ element: el, name: el.attrs.get('name') || '', part: rel && internal ? resolveTarget(main, rel.attrs.get('Target') || '') : '', rel });
+  }
+  return out;
+}
+
+/** What a save does to the workbook part beyond the defined names. */
+interface BookChange {
+  file: FileSheet[];
+  /** Sheets have other names than in the file. */
+  renamed: boolean;
+  /** The sheets are not the ones of the file, one for one (a sheet was added or deleted): whatever counts sheets is brought up to date. */
+  reordered: boolean;
+  /** The relationship made for each sheet that is not in the file. */
+  relIds: Map<Sheet, string>;
+  /** The namespace relationship ids are in, in this flavour of the format (transitional or strict). */
+  relNamespace: string;
+  /** Index of the sheet the file opens on. */
+  active: number;
+  /** Stored results may be stale: the application is asked to calculate when it opens the file. */
+  recalculate: boolean;
+}
+
+const MAX_SHEET_ID = 65534;
+
+/**
+ * Brings <sheets> in line with the model: the elements of the file in the order of the model,
+ * each with the name its sheet has now and everything else it had; none for a sheet that was
+ * deleted; a new one for a sheet that is not in the file. Returns the sheetId of each sheet.
+ */
+function updateSheetList(root: XmlElement, workbook: Workbook, change: BookChange): number[] {
+  const list = childNamed(root, 'sheets');
+  if (!list) throw new Error('Cannot write the workbook: its part has no list of sheets');
+  const listed = new Map<string, XmlElement>();
+  for (const sheet of change.file) if (sheet.part !== '') listed.set(sheet.part, sheet.element);
+  const kept = workbook.sheets.map((sheet) => (sheet.part === '' ? undefined : listed.get(sheet.part)));
+  const taken = new Set<number>();
+  for (const el of kept) if (el) taken.add(parseUint(el.attrs.get('sheetId')));
+
+  // The prefix relationship ids have where the root declares one; a new element declares its own otherwise.
+  let idAttr = 'r:id';
+  let declared = false;
+  for (const [name, value] of root.attrs) {
+    if (!declared && name.slice(0, 6) === 'xmlns:' && (value === NS_REL || value === NS_REL_STRICT)) {
+      idAttr = `${name.slice(6)}:id`;
+      declared = true;
+    }
+  }
+  const sample = change.file.length > 0 ? change.file[0].element : undefined;
+  const prefix = sample ? prefixOf(sample) : prefixOf(list);
+
+  const ids: number[] = [];
+  const elements = workbook.sheets.map((sheet, index) => {
+    const el = kept[index];
+    if (el) {
+      if (el.attrs.get('name') !== sheet.name) el.attrs.set('name', sheet.name);
+      ids.push(parseUint(el.attrs.get('sheetId')));
+      return el;
+    }
+    if (sheet.part !== '') throw new Error(`Cannot write sheet "${sheet.name}": the file has no sheet in ${sheet.part}`);
+    // The id the model gave the sheet, unless a sheet of the file has it.
+    let id = sheet.sheetId;
+    if (!(id >= 1 && id <= MAX_SHEET_ID && Math.floor(id) === id) || taken.has(id)) {
+      id = 1;
+      while (taken.has(id)) id++;
+    }
+    taken.add(id);
+    ids.push(id);
+    const attrs: Attrs = [
+      ['name', sheet.name],
+      ['sheetId', String(id)],
+    ];
+    if (sheet.state === 'hidden' || sheet.state === 'veryHidden') attrs.push(['state', sheet.state]);
+    if (!declared) attrs.push(['xmlns:r', change.relNamespace]);
+    attrs.push([idAttr, change.relIds.get(sheet) || '']);
+    return element(`${prefix}sheet`, attrs);
+  });
+  if (!change.reordered) return ids;
+
+  // Whatever stands before an element (white space, a comment) stays before it.
+  const leading = new Map<XmlNode, XmlNode[]>();
+  const sheetElements = new Set<XmlNode>(change.file.map((sheet) => sheet.element));
+  const others: XmlNode[] = [];
+  let pending: XmlNode[] = [];
+  for (const node of list.children) {
+    if (sheetElements.has(node)) {
+      leading.set(node, pending);
+      pending = [];
+    } else if (node.type === 'element') {
+      // Not a sheet, whatever it is: kept after the sheets.
+      others.push(...pending, node);
+      pending = [];
+    } else pending.push(node);
+  }
+  const children: XmlNode[] = [];
+  for (const el of elements) children.push(...(leading.get(el) || []), el);
+  list.children = children.concat(others, pending);
+  return ids;
+}
+
+/**
+ * The views of the workbook after sheets were added or deleted: the sheet shown is the active
+ * one of the model, and the first tab shown stays the sheet it was (or what is at its place).
+ */
+function updateBookViews(root: XmlElement, workbook: Workbook, change: BookChange, sheetIds: number[]): void {
+  const prefix = prefixOf(root);
+  const count = workbook.sheets.length;
+  const indexOfPart = new Map<string, number>();
+  workbook.sheets.forEach((sheet, index) => {
+    if (sheet.part !== '') indexOfPart.set(sheet.part, index);
+  });
+  let views = childNamed(root, 'bookViews');
+  if (!views && change.active > 0) {
+    views = element(`${prefix}bookViews`, [], [element(`${prefix}workbookView`)]);
+    insertInOrder(root, views, WORKBOOK_ORDER);
+  }
+  for (const view of views ? childrenNamed(views, 'workbookView') : []) {
+    // UNSURE: a second window of the workbook shows its own sheet; here every window opens on the active sheet of the model.
+    const stated = view.attrs.get('activeTab');
+    if ((stated === undefined ? '0' : stated) !== String(change.active)) {
+      if (change.active === 0) view.attrs.delete('activeTab');
+      else view.attrs.set('activeTab', String(change.active));
+    }
+    const first = view.attrs.get('firstSheet');
+    if (first !== undefined) {
+      const was = parseUint(first);
+      const sheet = was >= 0 ? change.file[was] : undefined;
+      const now = sheet ? indexOfPart.get(sheet.part) : undefined;
+      const next = now !== undefined ? now : Math.max(0, Math.min(was, count - 1));
+      if (String(next) !== first) view.attrs.set('firstSheet', String(next));
+    }
+  }
+  // A custom view names the sheet it shows by its sheetId; one that showed a deleted sheet shows the active one.
+  const custom = childNamed(root, 'customWorkbookViews');
+  for (const view of custom ? childrenNamed(custom, 'customWorkbookView') : []) {
+    const shown = view.attrs.get('activeSheetId');
+    if (shown !== undefined && sheetIds.indexOf(parseUint(shown)) < 0 && sheetIds[change.active] >= 0) view.attrs.set('activeSheetId', String(sheetIds[change.active]));
+  }
+}
+
+/** The scope of a <definedName> whose sheet was deleted, and of one whose sheet the file does not have. */
+const SCOPE_GONE = -1;
+const SCOPE_UNKNOWN = -2;
+
+/**
+ * Brings workbook.xml up to date: the list of sheets and what counts them follow the model, defined
+ * names follow the model, and formulas are recalculated on load.
+ */
+function updateWorkbookXml(doc: XmlDocument, workbook: Workbook, change: BookChange): void {
   const root = doc.root;
   const prefix = prefixOf(root);
+  if (change.renamed || change.reordered) {
+    const sheetIds = updateSheetList(root, workbook, change);
+    if (change.reordered) updateBookViews(root, workbook, change, sheetIds);
+  }
+
+  // localSheetId counts the sheets of the file; the model counts its own. A name is found by
+  // the sheet it belongs to: the id of the file, the part of that sheet, the index it has now.
+  const indexOfPart = new Map<string, number>();
+  workbook.sheets.forEach((sheet, index) => {
+    if (sheet.part !== '') indexOfPart.set(sheet.part, index);
+  });
   let container: XmlElement | undefined = childrenNamed(root, 'definedNames')[0];
   const elements = container ? childrenNamed(container, 'definedName') : [];
-  const used = new Set<XmlElement>();
-  const matches = (el: XmlElement, name: string, localSheet: number | undefined) => {
-    if (used.has(el) || (el.attrs.get('name') || '') !== name) return false;
+  const scopes = new Map<XmlElement, number | undefined>();
+  for (const el of elements) {
     const local = el.attrs.get('localSheetId');
-    return (local !== undefined && /^\d{1,6}$/.test(local) ? Number(local) : undefined) === localSheet;
-  };
+    let scope = local !== undefined && /^\d{1,6}$/.test(local) ? Number(local) : undefined;
+    if (scope !== undefined && change.reordered) {
+      const sheet = change.file[scope];
+      const now = sheet && sheet.part !== '' ? indexOfPart.get(sheet.part) : undefined;
+      scope = !sheet || sheet.part === '' ? SCOPE_UNKNOWN : now === undefined ? SCOPE_GONE : now;
+    }
+    scopes.set(el, scope);
+  }
+  const used = new Set<XmlElement>();
+  const matches = (el: XmlElement, name: string, localSheet: number | undefined) => !used.has(el) && (el.attrs.get('name') || '') === name && scopes.get(el) === localSheet;
   workbook.definedNames.forEach((name, index) => {
     // The lists normally line up; otherwise the name and its scope identify the element.
     let target: XmlElement | undefined = elements[index];
     if (!target || !matches(target, name.name, name.localSheet)) target = elements.find((el) => matches(el, name.name, name.localSheet));
+    // A name of a sheet the file does not have (a damaged id) is known by its name alone.
+    if (!target && name.localSheet !== undefined) target = elements.find((el) => !used.has(el) && scopes.get(el) === SCOPE_UNKNOWN && (el.attrs.get('name') || '') === name.name);
     if (!target) {
       // The only name the model adds is the range of a filter that was switched on; any other
       // name that is not in the file is a mistake of the caller.
@@ -2048,15 +2386,18 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook): void {
     }
     used.add(target);
     if (textOf(target) !== name.value) target.children = [{ type: 'text', value: name.value }];
+    const scope = scopes.get(target);
+    if (name.localSheet !== undefined && scope !== undefined && scope >= 0 && target.attrs.get('localSheetId') !== String(name.localSheet)) target.attrs.set('localSheetId', String(name.localSheet));
   });
-  // The range of a filter that was switched off goes with it; an empty list is not valid.
-  const gone = (el: XmlElement) => !used.has(el) && isFilterName(el.attrs.get('name') || '');
+  // The range of a filter that was switched off goes with it, and the names of a deleted sheet with their sheet; an empty list is not valid.
+  const gone = (el: XmlElement) => !used.has(el) && (isFilterName(el.attrs.get('name') || '') || scopes.get(el) === SCOPE_GONE);
   if (container && elements.some(gone)) {
     const list = container;
     list.children = list.children.filter((node) => node.type !== 'element' || localName(node.name) !== 'definedName' || !gone(node));
     if (!list.children.some((node) => node.type === 'element')) root.children = root.children.filter((node) => node !== list);
   }
 
+  if (!change.recalculate) return;
   // Results stored in the file may be stale after an edit; the application recalculates when it opens the file.
   let calcPr = childrenNamed(root, 'calcPr')[0];
   if (!calcPr) {
@@ -2064,6 +2405,46 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook): void {
     insertInOrder(root, calcPr, WORKBOOK_ORDER);
   }
   calcPr.attrs.set('fullCalcOnLoad', '1');
+}
+
+/**
+ * The extended properties part (docProps/app.xml) lists the names of the sheets. The list is
+ * brought up to date where that is safe: where one of its groups holds exactly the names the
+ * worksheets have in the file. Returns undefined to leave the part as it is.
+ */
+function updateAppXml(bytes: Uint8Array, fileNames: string[], names: string[]): Uint8Array | undefined {
+  if (fileNames.length === 0 || names.length === 0) return undefined;
+  let doc: XmlDocument;
+  try {
+    doc = parseXml(bytes);
+  } catch (error) {
+    return undefined;
+  }
+  const elementsOf = (el: XmlElement | undefined) => (el ? el.children.filter((node): node is XmlElement => node.type === 'element') : []);
+  const titlesVector = childNamed(childNamed(doc.root, 'TitlesOfParts'), 'vector');
+  const pairsVector = childNamed(childNamed(doc.root, 'HeadingPairs'), 'vector');
+  if (!titlesVector || !pairsVector) return undefined;
+  const titles = elementsOf(titlesVector);
+  if (titles.some((el) => localName(el.name) !== 'lpstr' || el.children.some((node) => node.type !== 'text'))) return undefined;
+  // Pairs of a heading and the number of titles under it, in the order of the titles.
+  const variants = elementsOf(pairsVector);
+  let offset = 0;
+  let found: { at: number; count: XmlElement } | undefined;
+  for (let i = 0; i + 1 < variants.length; i += 2) {
+    const count = elementsOf(variants[i + 1])[0];
+    const size = count && localName(count.name) === 'i4' ? parseUint(plainText(count).trim()) : -1;
+    if (size < 0) return undefined;
+    if (!found && size === fileNames.length && fileNames.every((name, k) => titles[offset + k] !== undefined && plainText(titles[offset + k]) === name)) found = { at: offset, count };
+    offset += size;
+  }
+  if (!found || offset !== titles.length || variants.length % 2 !== 0) return undefined;
+  const at = found.at;
+  const made = names.map((name) => element(titles[at].name, [], [{ type: 'text', value: name }]));
+  const next = titles.slice(0, at).concat(made, titles.slice(at + fileNames.length));
+  titlesVector.children = next;
+  if (titlesVector.attrs.has('size')) titlesVector.attrs.set('size', String(next.length));
+  found.count.children = [{ type: 'text', value: String(names.length) }];
+  return encoder.encode(serializeXml(doc));
 }
 
 function resolveTarget(source: string, target: string): string {
@@ -2079,6 +2460,9 @@ function resolveTarget(source: string, target: string): string {
 
 const endsWith = (text: string, suffix: string) => text.slice(-suffix.length) === suffix;
 
+/** "/xl/_rels/workbook.xml.rels": a part that holds the relationships of another. */
+const isRelsPart = (part: string) => /(^|\/)_rels\/[^/]*\.rels$/i.test(part);
+
 const relsPartOf = (part: string) => `${part.slice(0, part.lastIndexOf('/'))}/_rels/${part.slice(part.lastIndexOf('/') + 1)}.rels`;
 
 interface SaveState {
@@ -2087,12 +2471,31 @@ interface SaveState {
   /**
    * Per sheet part: the parts around it (drawings, comments, relationships)
    * that the last save wrote differently from the original. A save that no
-   * longer changes them has to put the original back.
+   * longer changes them has to put the original back. Under BOOK: the parts
+   * of the workbook itself (its part, its relationships, the list of titles).
    */
   moved: Map<string, string[]>;
+  /**
+   * Parts of the file that the last save took out of the package (those of deleted sheets), each
+   * with its content type. Their bytes are in `originals`: a sheet that comes back by undo comes
+   * back with every part it had.
+   */
+  removed: Map<string, string | undefined>;
+  /**
+   * The sheets that are not in the file, each with the part the last save wrote it to. The model
+   * keeps saying that such a sheet has no part (Sheet.part stays ''): every save starts from the
+   * file as it was opened, in which the sheet is not.
+   */
+  added: Map<Sheet, string>;
 }
 
 const SAVES = new WeakMap<Workbook, SaveState>();
+
+/** The key of the workbook's own parts in SaveState.moved; no sheet part has it. */
+const BOOK = '';
+
+/** More parts than any package has; following relationships stops there. */
+const MAX_RELATED_PARTS = 1000000;
 
 type PartWrite = [part: string, data: Uint8Array | XmlDocument, contentType?: string];
 
@@ -2130,18 +2533,46 @@ function syncTableColumns(table: XmlElement, sheet: Sheet, workbook: Workbook): 
   return { changed, row: range.top, cells };
 }
 
-/** Brings the package up to date with the model. Does nothing when nothing was modified. */
+/** Index of the sheet a saved file opens on: the active one of the model, or the first visible one when that is hidden. */
+function activeSheetOf(workbook: Workbook): number {
+  const sheets = workbook.sheets;
+  let active = workbook.activeSheet;
+  if (!(active >= 0 && active < sheets.length && Math.floor(active) === active)) active = 0;
+  if (sheets[active] && sheets[active].state !== 'visible') {
+    for (let i = 0; i < sheets.length; i++) {
+      if (sheets[i].state === 'visible') return i;
+    }
+  }
+  return active;
+}
+
+/**
+ * Brings the package up to date with the model. Does nothing when nothing was modified.
+ *
+ * Sheets that were inserted, deleted or renamed (Workbook.sheetsModified):
+ * - A sheet that is not in the file (Sheet.part === '') is written to a part of its own, the
+ *   first free /xl/worksheets/sheetN.xml. The model is not told: the part is remembered here,
+ *   and the next save writes the sheet to the same part. Once the sheet is gone from the model
+ *   (undo, or deleted), the next save takes the part out again.
+ * - A sheet of the file that is gone from the model loses its part and every part only it
+ *   leads to (its relationships, drawing, comments, printer settings, pictures no other part
+ *   shows). Their bytes are kept: when the sheet is back in the model, the next save puts them
+ *   back as they were.
+ * - Content copied from the file names sheets as the file does. Rows and columns moved are
+ *   matched with those names first; then the sheets get the names they have now.
+ */
 export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<void> {
   const modifiedSheets = workbook.sheets.filter((sheet) => sheet.modified && sheet.kind !== 'chartsheet');
   const stylesModified = !!workbook.styles.modified;
-  if (modifiedSheets.length === 0 && !stylesModified) return;
+  const sheetsModified = !!workbook.sheetsModified || workbook.sheets.some((sheet) => sheet.part === '');
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
-    saved = { originals: new Map(), moved: new Map() };
+    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map() };
     SAVES.set(workbook, saved);
   }
-  const { originals, moved } = saved;
+  const { originals, moved, removed, added } = saved;
   // The first time a part is about to be rewritten, the package still holds it as the file had it.
   const originalOf = async (part: string): Promise<Uint8Array | undefined> => {
     const kept = originals.get(part);
@@ -2149,6 +2580,15 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const bytes = pkg.hasPart(part) ? await pkg.readPart(part) : undefined;
     originals.set(part, bytes === undefined ? null : bytes);
     return bytes;
+  };
+  // The same for a part that is only looked at: its bytes are not kept.
+  const peek = async (part: string): Promise<Uint8Array | undefined> => {
+    const kept = originals.get(part);
+    if (kept !== undefined) return kept === null ? undefined : kept;
+    return pkg.hasPart(part) ? pkg.readPart(part) : undefined;
+  };
+  const keep = (part: string, bytes: Uint8Array) => {
+    if (!originals.has(part)) originals.set(part, bytes);
   };
 
   const main = await pkg.mainPart();
@@ -2163,6 +2603,83 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   const typeOf = (rel: XmlElement) => rel.attrs.get('Type') || '';
   const withType = (suffix: string) => relationships.find((rel) => endsWith(typeOf(rel), suffix) && internal(rel));
   let relsChanged = false;
+  let highest = 0;
+  for (const rel of relationships) {
+    const match = /^rId(\d{1,9})$/.exec(rel.attrs.get('Id') || '');
+    if (match && Number(match[1]) > highest) highest = Number(match[1]);
+  }
+  // The same flavour of relationship types as the rest of the file (transitional or strict).
+  const sampleRel = withType('/worksheet');
+  const sampleType = sampleRel ? typeOf(sampleRel) : '';
+  const relBase = sampleType ? sampleType.slice(0, sampleType.lastIndexOf('/')) : NS_REL;
+  /** Adds a relationship from the workbook to one of its parts and returns its id. */
+  const relate = (kind: string, part: string): string => {
+    const id = `rId${++highest}`;
+    rels.root.children.push(
+      element(`${prefixOf(rels.root)}Relationship`, [
+        ['Id', id],
+        ['Type', `${relBase}/${kind}`],
+        ['Target', part.slice(0, slash + 1) === main.slice(0, slash + 1) ? part.slice(slash + 1) : part],
+      ]),
+    );
+    relsChanged = true;
+    return id;
+  };
+
+  const mainBytes = await originalOf(main);
+  if (!mainBytes) throw new Error('Cannot write the workbook: its part is missing');
+  const book = parseXml(mainBytes);
+  const file = fileSheetsOf(book.root, relationships, main);
+  const listed = new Map<string, FileSheet>();
+  for (const sheet of file) if (sheet.part !== '') listed.set(sheet.part, sheet);
+
+  // What became of the sheets of the file. A sheet is known by its part, which never changes.
+  let reordered = false;
+  let renamed = false;
+  const present = new Set<string>();
+  if (sheetsModified) {
+    reordered = workbook.sheets.length !== file.length;
+    workbook.sheets.forEach((sheet, index) => {
+      if (sheet.part === '') {
+        reordered = true;
+        return;
+      }
+      const inFile = listed.get(sheet.part);
+      if (!inFile) throw new Error(`Cannot write sheet "${sheet.name}": the file has no sheet in ${sheet.part}`);
+      present.add(sheet.part);
+      if (!file[index] || file[index].part !== sheet.part) reordered = true;
+      if (inFile.name !== sheet.name) renamed = true;
+    });
+  }
+  const gone = sheetsModified ? file.filter((sheet) => sheet.part !== '' && !present.has(sheet.part)) : [];
+  /** The name the file has for a sheet; undefined for a sheet that is not in the file. */
+  const fileNameOf = (sheet: Sheet): string | undefined => {
+    if (sheet.part === '') return undefined;
+    const inFile = listed.get(sheet.part);
+    return inFile ? inFile.name : sheet.name;
+  };
+  // Content copied from the file names sheets as the file does: what those names stand for now.
+  let rename: SheetRenames | undefined;
+  if (renamed || gone.length > 0) {
+    const names = new Map<string, string | null>();
+    const list: string[] = [];
+    for (const sheet of gone) {
+      names.set(foldSheetName(sheet.name), null);
+      list.push(sheet.name);
+    }
+    for (const sheet of workbook.sheets) {
+      const name = fileNameOf(sheet);
+      if (name === undefined || name === sheet.name) continue;
+      names.set(foldSheetName(name), sheet.name);
+      list.push(name);
+    }
+    const map: SheetNameMap = (name) => names.get(foldSheetName(name));
+    // Which sheet takes the place of a deleted one at the end of a 3D reference is what the model noted when it was deleted.
+    const noted = sheetNameMap(workbook);
+    if (noted && noted.runs) map.runs = noted.runs;
+    rename = { map, names: list };
+  }
+  const active = activeSheetOf(workbook);
 
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
@@ -2171,30 +2688,17 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const stylesRel = withType('/styles');
     const stylesPart = stylesRel ? resolveTarget(main, stylesRel.attrs.get('Target') || '') : `${main.slice(0, slash)}/styles.xml`;
     writes.push([stylesPart, writeStyles(await originalOf(stylesPart), workbook.styles), STYLES_CONTENT_TYPE]);
-    if (!stylesRel) {
-      let highest = 0;
-      for (const rel of relationships) {
-        const match = /^rId(\d{1,9})$/.exec(rel.attrs.get('Id') || '');
-        if (match && Number(match[1]) > highest) highest = Number(match[1]);
-      }
-      // The same flavour of relationship types as the rest of the file (transitional or strict).
-      const sample = withType('/worksheet');
-      const sampleType = sample ? typeOf(sample) : '';
-      const base = sampleType ? sampleType.slice(0, sampleType.lastIndexOf('/')) : NS_REL;
-      rels.root.children.push(
-        element(`${prefixOf(rels.root)}Relationship`, [
-          ['Id', `rId${highest + 1}`],
-          ['Type', `${base}/styles`],
-          ['Target', stylesPart.slice(0, slash + 1) === main.slice(0, slash + 1) ? stylesPart.slice(slash + 1) : stylesPart],
-        ]),
-      );
-      relsChanged = true;
-    }
+    if (!stylesRel) relate('styles', stylesPart);
   }
 
-  // Rows and columns moved in one sheet change what the others say about it.
-  const editsOf = (sheet: Sheet): StructuralEdit[] => (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: sheet.name }));
-  const edited = workbook.sheets.filter((sheet) => sheet.kind !== 'chartsheet' && sheet.structuralEdits && sheet.structuralEdits.length > 0);
+  // Rows and columns moved in one sheet change what the others say about it. What the others say is
+  // content of the file, which knows the sheet by the name the file has for it; nothing in the file
+  // refers to a sheet that is not in it.
+  const editsOf = (sheet: Sheet): StructuralEdit[] => {
+    const name = fileNameOf(sheet);
+    return name === undefined ? [] : (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: name }));
+  };
+  const edited = workbook.sheets.filter((sheet) => sheet.kind !== 'chartsheet' && sheet.part !== '' && sheet.structuralEdits && sheet.structuralEdits.length > 0);
   const foreignOf = (sheet: Sheet): StructuralEdit[] => {
     let out: StructuralEdit[] = [];
     for (const other of edited) if (other !== sheet) out = out.concat(editsOf(other));
@@ -2202,66 +2706,70 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   };
 
   const movedNow = new Map<string, string[]>();
-  for (const sheet of workbook.sheets) {
-    if (sheet.kind === 'chartsheet' || sheet.modified) continue;
-    // A sheet that was not modified itself: only its raw content that names an edited sheet changes
-    // (the source of a validation list on another sheet, say). Its cells were adjusted through the
-    // model, which marked the sheet as modified if any of them changed.
+  for (let index = 0; index < workbook.sheets.length; index++) {
+    const sheet = workbook.sheets[index];
+    if (sheet.kind === 'chartsheet' || sheet.part === '') continue;
+    const fileName = fileNameOf(sheet) as string;
     const foreign = foreignOf(sheet);
     const before = moved.get(sheet.part) || [];
-    if (foreign.length === 0 && before.length === 0) continue;
-    const kept = originals.get(sheet.part);
-    const bytes = kept || (pkg.hasPart(sheet.part) ? await pkg.readPart(sheet.part) : undefined);
-    if (!bytes) continue;
-    const next = foreign.length > 0 ? rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true }) : undefined;
-    if (next) {
-      // From here on the package no longer holds the part as the file had it.
-      originals.set(sheet.part, bytes);
-      writes.push([sheet.part, next]);
-      movedNow.set(sheet.part, [sheet.part]);
-    } else {
-      if (before.indexOf(sheet.part) >= 0 && kept) writes.push([sheet.part, kept]);
-      movedNow.set(sheet.part, []);
-    }
-  }
-
-  for (const sheet of modifiedSheets) {
-    const bytes = await originalOf(sheet.part);
-    if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
+    // Once sheets were added or deleted, the one sheet marked as selected is the active one.
+    const tabSelected = reordered && !!sheet.view.tabSelected !== (index === active) ? index === active : undefined;
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
+    const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
 
-    // Tables name their columns after their header cells; the two have to agree.
+    // Tables name their columns after their header cells; the two have to agree. Their formulas
+    // name sheets as the file does and follow what happened to those.
     let overrides: Map<number, Map<number, Cell>> | undefined;
-    if (sheet.changedRows && sheet.changedRows.size > 0) {
-      const tableRels = await originalOf(sheetRelsPart);
-      for (const rel of tableRels ? childrenNamed(parseXml(tableRels).root, 'Relationship') : []) {
-        if (!endsWith(typeOf(rel), '/table') || !internal(rel)) continue;
-        const part = resolveTarget(sheet.part, rel.attrs.get('Target') || '');
-        const original = await originalOf(part);
-        if (!original) continue;
-        const doc = parseXml(original);
-        const headers = syncTableColumns(doc.root, sheet, workbook);
-        if (!headers) continue;
-        if (headers.changed) {
-          writes.push([part, doc]);
-          rewritten.push(part);
-        }
-        if (headers.cells.size > 0) {
-          if (!overrides) overrides = new Map();
-          const row = overrides.get(headers.row) || new Map<number, Cell>();
-          for (const [col, cell] of headers.cells) row.set(col, cell);
-          overrides.set(headers.row, row);
-        }
+    const headersChanged = !!sheet.modified && !!sheet.changedRows && sheet.changedRows.size > 0;
+    const tableRels = headersChanged || others ? await peek(sheetRelsPart) : undefined;
+    for (const rel of tableRels ? childrenNamed(parseXml(tableRels).root, 'Relationship') : []) {
+      if (!endsWith(typeOf(rel), '/table') || !internal(rel)) continue;
+      const part = resolveTarget(sheet.part, rel.attrs.get('Target') || '');
+      const original = await peek(part);
+      if (!original) continue;
+      const doc = parseXml(original);
+      const headers = headersChanged ? syncTableColumns(doc.root, sheet, workbook) : undefined;
+      const formulas = others ? adjustTableFormulas(doc.root, fileName, others) : false;
+      if ((headers && headers.changed) || formulas) {
+        keep(part, original);
+        writes.push([part, doc]);
+        rewritten.push(part);
+      }
+      if (headers && headers.cells.size > 0) {
+        if (!overrides) overrides = new Map();
+        const row = overrides.get(headers.row) || new Map<number, Cell>();
+        for (const [col, cell] of headers.cells) row.set(col, cell);
+        overrides.set(headers.row, row);
       }
     }
-    writes.push([sheet.part, rewriteSheet(bytes, sheet, workbook, { foreign: foreignOf(sheet), overrides }) as Uint8Array]);
+
+    if (!sheet.modified) {
+      // A sheet that was not modified itself: only its raw content that names an edited or a renamed
+      // sheet changes (the source of a validation list on another sheet, say). Its cells were adjusted
+      // through the model, which marked the sheet as modified if any of them changed.
+      const bytes = await peek(sheet.part);
+      const next = bytes && (foreign.length > 0 || rename || tabSelected !== undefined) ? rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected }) : undefined;
+      if (bytes && next) {
+        // From here on the package no longer holds the part as the file had it.
+        keep(sheet.part, bytes);
+        writes.push([sheet.part, next]);
+        rewritten.push(sheet.part);
+      }
+    } else {
+      const bytes = await originalOf(sheet.part);
+      if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
+      writes.push([sheet.part, rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected }) as Uint8Array]);
+      rewritten.push(sheet.part);
+    }
 
     // After rows or columns moved: the pictures and comments of the sheet follow, and the
-    // relationships of links that are gone are removed.
-    const edits = sheet.structuralEdits && sheet.structuralEdits.length > 0 ? sheet.structuralEdits : undefined;
-    const sheetRelsBytes = edits ? await originalOf(sheetRelsPart) : undefined;
-    if (edits && sheetRelsBytes) {
+    // relationships of links that are gone are removed. After rows or columns moved in another
+    // sheet, or sheets were renamed or deleted: the shapes that show a cell of such a sheet follow.
+    const edits = sheet.modified && sheet.structuralEdits && sheet.structuralEdits.length > 0 ? sheet.structuralEdits : undefined;
+    const sheetRelsBytes = edits || others ? await peek(sheetRelsPart) : undefined;
+    if (sheetRelsBytes) {
       const sheetRels = parseXml(sheetRelsBytes);
       const linkIds = new Set<string>();
       for (const link of sheet.hyperlinks) if (link.rId !== undefined) linkIds.add(link.rId);
@@ -2270,63 +2778,240 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
         const type = typeOf(rel);
         const kind = type.slice(type.lastIndexOf('/') + 1);
         if (kind === 'hyperlink') {
-          if (!linkIds.has(rel.attrs.get('Id') || '')) {
+          if (edits && !linkIds.has(rel.attrs.get('Id') || '')) {
             sheetRels.root.children = sheetRels.root.children.filter((node) => node !== rel);
             dropped = true;
           }
           continue;
         }
         const adjust = Object.prototype.hasOwnProperty.call(ANCHORED_PARTS, kind) ? ANCHORED_PARTS[kind] : undefined;
-        if (!adjust || !internal(rel)) continue;
+        // Of these parts only a drawing names sheets.
+        if (!adjust || !internal(rel) || (!edits && kind !== 'drawing')) continue;
         const part = resolveTarget(sheet.part, rel.attrs.get('Target') || '');
-        const original = await originalOf(part);
+        const original = await peek(part);
         if (!original) continue;
-        // One sheet's rows cannot move a part that another sheet shows as well.
-        for (const other of workbook.sheets) {
-          if (other === sheet || other.kind === 'chartsheet') continue;
-          for (const otherRel of await pkg.relationships(other.part)) {
-            if (otherRel.part === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
+        if (edits) {
+          // One sheet's rows cannot move a part that another sheet shows as well.
+          for (const other of workbook.sheets) {
+            if (other === sheet || other.kind === 'chartsheet' || other.part === '') continue;
+            for (const otherRel of await pkg.relationships(other.part)) {
+              if (otherRel.part === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
+            }
           }
         }
-        const adjusted = adjust(original, edits, sheet.name);
+        const adjusted = adjust(original, edits || [], fileName, others);
         if (adjusted !== original) {
+          keep(part, original);
           writes.push([part, adjusted]);
           rewritten.push(part);
         }
       }
       if (dropped) {
+        keep(sheetRelsPart, sheetRelsBytes);
         writes.push([sheetRelsPart, sheetRels]);
         rewritten.push(sheetRelsPart);
       }
     }
     // What an earlier save moved and this one does not goes back to what the file had.
-    for (const part of moved.get(sheet.part) || []) {
+    for (const part of before) {
       const original = originals.get(part);
       if (rewritten.indexOf(part) < 0 && original) writes.push([part, original]);
     }
     movedNow.set(sheet.part, rewritten);
   }
 
-  let calcChain: string | undefined;
-  if (modifiedSheets.length > 0) {
-    const mainBytes = await originalOf(main);
-    if (!mainBytes) throw new Error('Cannot write the workbook: its part is missing');
-    const doc = parseXml(mainBytes);
-    updateWorkbookXml(doc, workbook);
-    writes.push([main, doc]);
+  // Sheets that are not in the file: each is written to a part of its own, the one the last save gave it.
+  const addedNow = new Map<Sheet, string>();
+  const relIds = new Map<Sheet, string>();
+  let taken: Set<string> | undefined;
+  for (let index = 0; index < workbook.sheets.length; index++) {
+    const sheet = workbook.sheets[index];
+    if (sheet.part !== '') continue;
+    if (sheet.kind !== 'worksheet') throw new Error(`Cannot write sheet "${sheet.name}": a ${sheet.kind} that is not in the file cannot be written`);
+    let part = added.get(sheet);
+    if (part === undefined) {
+      if (!taken) {
+        // Part names are told apart without regard to case. A part that was taken out may come back.
+        taken = new Set();
+        for (const name of pkg.partNames()) taken.add(name.toLowerCase());
+        for (const [name, bytes] of originals) if (bytes !== null) taken.add(name.toLowerCase());
+        for (const name of removed.keys()) taken.add(name.toLowerCase());
+        for (const name of added.values()) taken.add(name.toLowerCase());
+      }
+      for (let n = 1; part === undefined; n++) {
+        const candidate = `${main.slice(0, slash)}/worksheets/sheet${n}.xml`;
+        // Relationships left behind under the name would become those of the new sheet.
+        if (!taken.has(candidate.toLowerCase()) && !taken.has(relsPartOf(candidate).toLowerCase())) part = candidate;
+      }
+      taken.add(part.toLowerCase());
+    }
+    const rootPrefix = prefixOf(book.root);
+    const mainNamespace = book.root.attrs.get(rootPrefix === '' ? 'xmlns' : `xmlns:${rootPrefix.slice(0, -1)}`) || NS_MAIN;
+    const skeleton =
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="${escapeAttr(mainNamespace)}" xmlns:r="${escapeAttr(relBase)}">` +
+      `<dimension ref="A1"/><sheetViews><sheetView${index === active ? ' tabSelected="1"' : ''} workbookViewId="0"/></sheetViews><sheetData/></worksheet>`;
+    // A link to another file belongs to the relationships of the sheet it was made in; only places in the workbook are written.
+    const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
+    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true }) as Uint8Array;
+    if (!originals.has(part)) originals.set(part, null);
+    writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
+    addedNow.set(sheet, part);
+    relIds.set(sheet, relate('worksheet', part));
+  }
+  const deletions: string[] = [];
+  for (const [sheet, part] of added) if (addedNow.get(sheet) !== part) deletions.push(part);
 
-    // A calculation chain that no longer matches the formulas makes the application report the file
-    // as damaged; without one it simply builds a new chain.
-    const chainRel = withType('/calcChain');
-    if (chainRel) {
-      calcChain = resolveTarget(main, chainRel.attrs.get('Target') || '');
-      rels.root.children = rels.root.children.filter((node) => node !== chainRel);
+  // Sheets of the file that are gone: their parts, and what only they lead to, leave the package.
+  const wanted = new Set<string>();
+  if (gone.length > 0) {
+    const actual = new Map<string, string>();
+    for (const name of removed.keys()) actual.set(name.toLowerCase(), name);
+    for (const name of pkg.partNames()) actual.set(name.toLowerCase(), name);
+    /** The parts a part leads to in the file as it was opened. */
+    const targetsOf = async (source: string): Promise<string[]> => {
+      const bytes = await peek(relsPartOf(source));
+      const out: string[] = [];
+      if (!bytes) return out;
+      let doc: XmlDocument;
+      try {
+        doc = parseXml(bytes);
+      } catch (error) {
+        // Relationships that cannot be read lead nowhere: what they may point at stays.
+        return out;
+      }
+      for (const rel of childrenNamed(doc.root, 'Relationship')) {
+        if (!internal(rel)) continue;
+        const target = actual.get(resolveTarget(source, rel.attrs.get('Target') || '').toLowerCase());
+        // A relationships part is not content: it goes with the part it belongs to and with nothing else.
+        if (target !== undefined && !isRelsPart(target)) out.push(target);
+      }
+      return out;
+    };
+    /** Every part that can be reached from `from` without passing through a part of `blocked`. */
+    const reach = async (from: string[], blocked: Set<string>): Promise<Set<string>> => {
+      const seen = new Set<string>(from);
+      const queue = from.slice();
+      for (let i = 0; i < queue.length; i++) {
+        if (i >= MAX_RELATED_PARTS) throw new Error('Cannot write the workbook: its parts refer to each other without end');
+        for (const target of await targetsOf(queue[i])) {
+          if (seen.has(target) || blocked.has(target)) continue;
+          seen.add(target);
+          queue.push(target);
+        }
+      }
+      return seen;
+    };
+    const roots: string[] = [];
+    for (const sheet of gone) {
+      const name = actual.get(sheet.part.toLowerCase());
+      if (name !== undefined) roots.push(name);
+    }
+    const doomed = await reach(roots, new Set());
+    // What the rest of the package shows as well (a picture two drawings share) stays.
+    const kept = await reach(['/'], new Set(roots));
+    // Whatever the relationships of the deleted sheet claim, the package keeps what it stands on:
+    // the workbook part and the parts of the sheets that stay.
+    kept.add(actual.get(main.toLowerCase()) || main);
+    for (const sheet of file) {
+      if (sheet.part === '' || !present.has(sheet.part)) continue;
+      kept.add(actual.get(sheet.part.toLowerCase()) || sheet.part);
+    }
+    for (const part of doomed) if (!kept.has(part) && !isRelsPart(part) && part.toLowerCase() !== '/[content_types].xml') wanted.add(part);
+    for (const sheet of gone) {
+      if (sheet.rel) rels.root.children = rels.root.children.filter((node) => node !== sheet.rel);
       relsChanged = true;
+      // What an earlier save wrote differently around the sheet and stays in the package goes back to what the file had.
+      for (const part of moved.get(sheet.part) || []) {
+        const original = originals.get(part);
+        if (original && !wanted.has(actual.get(part.toLowerCase()) || part)) writes.push([part, original]);
+      }
+      movedNow.set(sheet.part, []);
     }
   }
 
+  // A calculation chain that no longer matches the formulas makes the application report the file
+  // as damaged; without one it simply builds a new chain.
+  const recalculate = modifiedSheets.length > 0 || reordered;
+  let calcChain: string | undefined;
+  const chainRel = recalculate ? withType('/calcChain') : undefined;
+  if (chainRel) {
+    const chain = resolveTarget(main, chainRel.attrs.get('Target') || '');
+    rels.root.children = rels.root.children.filter((node) => node !== chainRel);
+    relsChanged = true;
+    // A modified sheet stays modified, and the chain stays out with it. Without one, undoing may
+    // bring back the sheets of the file, and the chain with them.
+    if (modifiedSheets.length > 0) calcChain = chain;
+    else if (pkg.hasPart(chain) || removed.has(chain)) wanted.add(chain);
+  }
+
+  // Parts that were taken out and belong to the workbook again go back in first, as the file had them.
+  const restores: PartWrite[] = [];
+  const restored: string[] = [];
+  for (const [part, contentType] of removed) {
+    if (wanted.has(part) || part === calcChain) continue;
+    const bytes = originals.get(part);
+    if (bytes) restores.push([part, bytes, contentType]);
+    const partRels = originals.get(relsPartOf(part));
+    if (partRels) restores.push([relsPartOf(part), partRels]);
+    restored.push(part);
+  }
+  const removals: [part: string, contentType: string | undefined][] = [];
+  for (const part of wanted) {
+    if (removed.has(part)) continue;
+    await originalOf(part);
+    await originalOf(relsPartOf(part));
+    removals.push([part, pkg.contentTypeOf(part)]);
+  }
+
+  const bookParts: string[] = [];
+  if (recalculate || renamed) {
+    updateWorkbookXml(book, workbook, { file, renamed, reordered, relIds, relNamespace: relBase, active, recalculate });
+    writes.push([main, book]);
+    bookParts.push(main);
+    if (reordered || renamed) {
+      // The list of titles in the extended properties names the sheets as well.
+      let appPart: string | undefined;
+      for (const rel of await pkg.relationships('/')) if (endsWith(rel.type, '/extended-properties') && rel.part) appPart = rel.part;
+      const appBytes = appPart === undefined ? undefined : await peek(appPart);
+      const isWorksheet = (sheet: FileSheet) => !!sheet.rel && endsWith(typeOf(sheet.rel), '/worksheet');
+      const app = appBytes
+        ? updateAppXml(
+            appBytes,
+            file.filter(isWorksheet).map((sheet) => sheet.name),
+            workbook.sheets.filter((sheet) => sheet.kind === 'worksheet').map((sheet) => sheet.name),
+          )
+        : undefined;
+      if (appPart !== undefined && appBytes && app) {
+        keep(appPart, appBytes);
+        writes.push([appPart, app]);
+        bookParts.push(appPart);
+      }
+    }
+  }
+  if (relsChanged) {
+    writes.push([relsPart, rels]);
+    bookParts.push(relsPart);
+  }
+  for (const part of moved.get(BOOK) || []) {
+    const original = originals.get(part);
+    if (bookParts.indexOf(part) < 0 && original) writes.push([part, original]);
+  }
+  movedNow.set(BOOK, bookParts);
+
+  for (const [part, data, contentType] of restores) pkg.writePart(part, data, contentType);
   for (const [part, data, contentType] of writes) pkg.writePart(part, data, contentType);
-  for (const [part, list] of movedNow) moved.set(part, list);
+  for (const [part] of removals) pkg.deletePart(part);
+  for (const part of deletions) pkg.deletePart(part);
   if (calcChain !== undefined) pkg.deletePart(calcChain);
-  if (relsChanged) pkg.writePart(relsPart, rels);
+
+  for (const [part, list] of movedNow) moved.set(part, list);
+  for (const part of restored) removed.delete(part);
+  for (const [part, contentType] of removals) removed.set(part, contentType);
+  if (calcChain !== undefined && removed.has(calcChain)) {
+    // Gone for good from here on: its bytes need not be kept.
+    removed.delete(calcChain);
+    originals.delete(calcChain);
+  }
+  added.clear();
+  for (const [sheet, part] of addedNow) added.set(sheet, part);
 }

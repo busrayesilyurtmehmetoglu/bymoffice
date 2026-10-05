@@ -308,6 +308,8 @@ export function createBridge(host: BridgeHost): Bridge {
   const maxPendingChars = host.maxPendingChars === undefined ? DEFAULT_MAX_PENDING_CHARS : host.maxPendingChars;
 
   let shown: Shown | undefined;
+  /** How many sheets the workbook that is shown has now; undefined while none is shown. */
+  let sheetCount: (() => number) | undefined;
   let destroyed = false;
   /**
    * Counts loads and closes. A load that finds another number than its own
@@ -377,7 +379,9 @@ export function createBridge(host: BridgeHost): Bridge {
         // One `changed` stands for all that were waiting: it names every sheet they named.
         if (type === 'changed' && older.sheets) {
           const sheets = (message.sheets as number[]).slice();
-          for (const index of older.sheets) if (sheets.indexOf(index) < 0) sheets.push(index);
+          // A sheet may have been deleted since: an index of before that no sheet has now names nothing.
+          const count = sheetCount ? sheetCount() : Infinity;
+          for (const index of older.sheets) if (index < count && sheets.indexOf(index) < 0) sheets.push(index);
           message = { ...message, sheets: sheets.sort((a, b) => a - b) };
         }
       }
@@ -431,6 +435,7 @@ export function createBridge(host: BridgeHost): Bridge {
     fileSerial++;
     const view = shown.view || shown.pages;
     shown = undefined;
+    sheetCount = undefined;
     if (view) view.destroy();
   };
 
@@ -679,6 +684,7 @@ export function createBridge(host: BridgeHost): Bridge {
       return fail('corrupt', errorText(error), id);
     }
     shown = { file, view, pages: undefined, name, locked, convertedFrom };
+    sheetCount = () => (Array.isArray(book.sheets) ? book.sheets.length : Infinity);
     setLocale(locale);
     setState('open');
     loaded(

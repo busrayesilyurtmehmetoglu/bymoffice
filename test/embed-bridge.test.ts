@@ -1627,3 +1627,23 @@ test('bridge: print of a workbook hands dpi, the choice of sheets and the name o
   await settle();
   assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'p4', code: 'print-failed', message: 'The print resolution must be a positive number of dots per inch' });
 });
+
+test('bridge: a merged "changed" does not name a sheet that was deleted while it waited', async () => {
+  const f = fake();
+  // One workbook object, so that the test can take a sheet out of it as the view would.
+  const book = { sheets: ['A', 'B', 'C'].map((name) => ({ name, state: 'visible', kind: 'worksheet' })) };
+  f.host.open = async () => ({ format: 'xlsx', workbook: async () => book, save: async () => new Uint8Array([1]) }) as unknown as OfficeFile;
+  const bridge = createBridge(f.host);
+  await bridge.receive(JSON.stringify({ type: 'load', id: 'l', data: DATA }));
+  f.channel = false;
+  const options = f.views[0];
+  options.onChange!({ sheets: [2] });
+  options.onChange!({ sheets: [1] });
+  // The last sheet is deleted: the view reports the sheets there are now.
+  book.sheets.pop();
+  options.onChange!({ sheets: [0, 1] });
+  f.channel = true;
+  f.runRetries();
+  assert.deepEqual(f.sent.filter((m) => m.type === 'changed'), [{ type: 'changed', sheets: [0, 1], canUndo: false, canRedo: false }]);
+  bridge.destroy();
+});
