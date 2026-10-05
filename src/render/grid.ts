@@ -123,6 +123,8 @@ export interface GridScene {
   drawings?: GridDrawingSource;
   /** Comments of the sheet: a red corner in the top right of each cell that has one. */
   comments?: GridCommentSource;
+  /** The cells a formula that is being typed was pointed at: framed with a dashed line. */
+  reference?: CellRange;
 }
 
 /** Space between a cell edge and its text, in pixels. */
@@ -169,6 +171,10 @@ interface LineStyle {
 }
 
 const NO_DASH: number[] = [];
+/** The frame around the cells a formula being typed was pointed at. */
+const REFERENCE_COLOR = '#1A73E8';
+const REFERENCE_FILL = 'rgba(26, 115, 232, 0.08)';
+const REFERENCE_DASH = [4, 3];
 const line = (name: string, width: number, rank: number, dash: number[] = NO_DASH, double = false, alpha = 1): LineStyle => ({
   name,
   width,
@@ -291,6 +297,7 @@ interface Frame {
   cellMark: ((row: number, col: number) => string | undefined) | undefined;
   drawings: GridDrawingSource | undefined;
   comments: GridCommentSource | undefined;
+  reference: CellRange | undefined;
   dpr: number;
   /** Grid lines are drawn, and how wide: on screen as the sheet says and one pixel, on paper as its print options say and thinner. */
   gridLines: boolean;
@@ -334,6 +341,7 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     cellMark: typeof scene.cellMark === 'function' ? scene.cellMark : undefined,
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: scene.comments && typeof scene.comments.has === 'function' ? scene.comments : undefined,
+    reference: scene.reference ? clampRange(scene.reference) : undefined,
     dpr,
     gridLines: sheet.view.showGridLines !== false,
     gridLineWidth: 1,
@@ -476,6 +484,7 @@ export function renderGridPrint(ctx: CanvasRenderingContext2D, scene: GridPrintS
     cellMark: undefined,
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: undefined,
+    reference: undefined,
     dpr: scale,
     gridLines: scene.gridLines === true,
     gridLineWidth: PRINT_GRID_LINE,
@@ -934,6 +943,7 @@ function drawPane(frame: Frame, view: PaneView): void {
   if (frame.dropdown) drawDropdown(frame, view, frame.dropdown);
   if (frame.drawings) drawFloating(frame, view, frame.drawings);
   if (frame.selection) drawSelection(frame, view, frame.selection);
+  if (frame.reference) drawReference(frame, view, frame.reference);
 
   ctx.restore();
   frame.painter.invalidate();
@@ -1772,6 +1782,33 @@ function drawSelection(frame: Frame, view: PaneView, selection: GridSelection): 
   ctx.lineWidth = 2;
   ctx.strokeRect(x0, y0, x1 - x0 - 1, y1 - y0 - 1);
   ctx.lineWidth = 1;
+}
+
+/** The dashed frame around the cells a formula being typed was pointed at. */
+function drawReference(frame: Frame, view: PaneView, range: CellRange): void {
+  const { ctx } = frame;
+  const metrics = frame.layout.metrics;
+  const { cols, rows } = view;
+  const rect = view.pane.rect;
+  const x0 = Math.round(cols.origin + metrics.cols.offset(range.left));
+  const x1 = Math.round(cols.origin + metrics.cols.offset(range.right + 1));
+  const y0 = Math.round(rows.origin + metrics.rows.offset(range.top));
+  const y1 = Math.round(rows.origin + metrics.rows.offset(range.bottom + 1));
+  if (x1 <= x0 || y1 <= y0 || x1 < rect.x || y1 < rect.y || x0 > rect.x + rect.width + 1 || y0 > rect.y + rect.height + 1) return;
+  // Only the part in the pane is stroked: a whole column is a million rows high, and dashes are counted along all of it.
+  const left = Math.max(x0, rect.x - 8);
+  const top = Math.max(y0, rect.y - 8);
+  const right = Math.min(x1, rect.x + rect.width + 8);
+  const bottom = Math.min(y1, rect.y + rect.height + 8);
+  ctx.fillStyle = REFERENCE_FILL;
+  ctx.fillRect(left, top, right - left, bottom - top);
+  ctx.strokeStyle = REFERENCE_COLOR;
+  ctx.lineWidth = 2;
+  ctx.setLineDash(REFERENCE_DASH);
+  ctx.strokeRect(left, top, right - left - 1, bottom - top - 1);
+  ctx.setLineDash(NO_DASH);
+  ctx.lineWidth = 1;
+  frame.painter.invalidate();
 }
 
 function drawHeaders(frame: Frame, views: PaneView[]): void {

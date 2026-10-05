@@ -271,6 +271,7 @@ interface DrawOptions {
   cellMark?: GridScene['cellMark'];
   drawings?: GridScene['drawings'];
   comments?: GridScene['comments'];
+  reference?: GridScene['reference'];
 }
 
 function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
@@ -302,6 +303,7 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     cellMark: options.cellMark,
     drawings: options.drawings,
     comments: options.comments,
+    reference: options.reference,
   });
   assert.equal(ctx.saves, ctx.restores, 'save() and restore() are balanced');
   return ctx;
@@ -849,6 +851,38 @@ test('grid: selection', () => {
     assert.equal(draw(sheet, { selection: { active: { row: 0, col: 0 }, range: bad } }).strokeRects.length, 0);
   }
   assert.equal(draw(sheet, { selection: { active: { row: Number.NaN, col: 0 }, range: range(0, 0, 0, 0) } }).strokeRects.length, 0);
+});
+
+test('grid: the cells a formula is pointed at get a dashed frame, cut to the pane', () => {
+  const sheet = newSheet();
+  const COLOR = '#1A73E8';
+  const frames = (ctx: FakeContext) => ctx.strokeRects.filter((rect) => rect.style === COLOR).map((rect) => [rect.x, rect.y, rect.width, rect.height, rect.lineWidth]);
+  const x = HX + CW;
+  const y = HY + RH;
+  const ctx = draw(sheet, { selection: { active: { row: 0, col: 0 }, range: range(0, 0, 0, 0) }, reference: range(1, 1, 2, 2) });
+  assert.deepEqual(frames(ctx), [[x, y, 2 * CW - 1, 2 * RH - 1, 2]]);
+  assert.deepEqual(ctx.fills('rgba(26, 115, 232, 0.08)').map((rect) => [rect.x, rect.y, rect.width, rect.height]), [[x, y, 2 * CW, 2 * RH]]);
+  // The dashes do not stay on the context, and the selection is drawn as ever.
+  assert.deepEqual((ctx as unknown as { dash: number[] }).dash, []);
+  assert.equal(ctx.strokeRects.filter((rect) => rect.style === DEFAULT_GRID_THEME.selectionBorder).length, 1);
+
+  // No reference, no frame.
+  assert.deepEqual(frames(draw(sheet, { selection: { active: { row: 0, col: 0 }, range: range(0, 0, 0, 0) } })), []);
+
+  // A whole column is framed over what the pane shows of it, not over a million rows.
+  const column = frames(draw(sheet, { reference: range(0, 2, 1048575, 2) }));
+  assert.equal(column.length, 1);
+  assert.equal(column[0][0], HX + 2 * CW);
+  assert.equal(column[0][2], CW - 1);
+  assert.ok(column[0][3] <= 600, `the frame is ${column[0][3]} px high`);
+
+  // Out of view, or no range at all: nothing is drawn and nothing breaks.
+  assert.deepEqual(frames(draw(sheet, { reference: range(5000, 0, 5001, 0) })), []);
+  for (const bad of [range(Number.NaN, 0, 1, 1), range(5, 5, 1, 1), range(-10, -10, -5, -5)]) assert.deepEqual(frames(draw(sheet, { reference: bad })), []);
+
+  // With frozen panes each pane frames its part.
+  sheet.view.frozenCols = 1;
+  assert.equal(frames(draw(sheet, { scrollX: CW, reference: range(0, 0, 0, 2) })).length, 2);
 });
 
 test('grid: the selection is clipped by the frozen panes', () => {

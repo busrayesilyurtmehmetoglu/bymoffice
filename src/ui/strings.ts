@@ -149,6 +149,10 @@ export interface UiStrings {
   sheetName: string;
   /** Said after a sheet was deleted. */
   sheetDeleted(name: string): string;
+  /** Said when a reference was put into the formula being typed by pointing at cells: "Reference B5:D9". */
+  referenceAdded(reference: string): string;
+  /** Said when what was typed could not be written because the sheet of the cell is no longer in the workbook. */
+  editSheetGone: string;
   // What the operations on sheets refuse to do.
   badSheetName: string;
   sheetNameTaken(name: string): string;
@@ -268,6 +272,8 @@ export const STRINGS_EN: UiStrings = {
   deleteSheet: 'Delete',
   sheetName: 'Sheet name',
   sheetDeleted: (name) => `Sheet ${name} was deleted. Undo brings it back.`,
+  referenceAdded: (reference) => `Reference ${reference}`,
+  editSheetGone: 'The sheet of the cell is gone; what was typed was not written.',
   badSheetName: 'A sheet name has 1 to 31 characters, none of [ ] : * ? / \\, no apostrophe at its start or end, and is not "History"',
   sheetNameTaken: (name) => `Another sheet is already named "${name}"`,
   cannotDeleteLastSheet: 'The last visible sheet cannot be deleted',
@@ -392,6 +398,8 @@ export const STRINGS_TR: UiStrings = {
   deleteSheet: 'Sil',
   sheetName: 'Sayfa adı',
   sheetDeleted: (name) => `${name} sayfası silindi. Geri al ile geri gelir.`,
+  referenceAdded: (reference) => `Başvuru ${reference}`,
+  editSheetGone: 'Hücrenin sayfası artık yok; yazılan kaydedilmedi.',
   badSheetName: 'Sayfa adı 1-31 karakter olmalı; [ ] : * ? / \\ içeremez, kesme işaretiyle başlayıp bitemez ve "History" olamaz',
   sheetNameTaken: (name) => `"${name}" adında başka bir sayfa var`,
   cannotDeleteLastSheet: 'Görünen son sayfa silinemez',

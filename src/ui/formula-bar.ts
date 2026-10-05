@@ -5,6 +5,7 @@
 
 import { cellName, parseRange, rangeName } from '../model/sheet/types';
 import type { EditorStrings } from './editor-strings';
+import { EDIT_FIELD_ATTRIBUTE } from './sheet-view';
 import type { ShellHost } from './toolbar';
 
 /** Longest address the name box takes ("XFD1048576:XFD1048576" is 21 characters). */
@@ -41,6 +42,9 @@ export class FormulaBar {
     content.className = 'bym-formula-input';
     content.rows = 1;
     content.setAttribute('wrap', 'off');
+    // Tells the grid that this field edits the cell with it: while a formula is typed here, a press on a
+    // cell puts its reference at the caret of this field, and the focus stays here.
+    content.setAttribute(EDIT_FIELD_ATTRIBUTE, '');
     plainInput(content);
 
     element.appendChild(nameBox);

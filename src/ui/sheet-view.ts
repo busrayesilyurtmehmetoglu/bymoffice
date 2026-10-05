@@ -15,6 +15,7 @@ import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale'
 import { resolveUiStrings, type UiStrings } from './strings';
 import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
 import { clearRange, copyRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
+import { canPointAt, isFormulaText, pointReference, pointSpanLive } from '../edit/point';
 import {
   formatAt,
   formatRange,
@@ -146,9 +147,18 @@ const MAX_RECALC_CELLS = 100000;
 
 /** The cell being edited. */
 interface Edit {
-  sheet: number;
+  /** The sheet of the cell: another one may be shown while a formula is pointed at its cells. */
+  home: Sheet;
   row: number;
   col: number;
+  /**
+   * The arrow keys point at cells where the formula takes a reference (the edit was begun by
+   * typing); otherwise they move the caret in the text (it was begun with F2 or a double click).
+   * F2 goes from one to the other.
+   */
+  keys: boolean;
+  /** Cells were pointed at during this edit, which may have scrolled the cell out of view. */
+  pointed: boolean;
   /** The text the cell had for editing when the edit began; committing the same text changes nothing. */
   original: string;
   /**
@@ -164,6 +174,22 @@ interface CellPos {
   row: number;
   col: number;
 }
+
+/** The reference a formula that is being typed was last pointed at, and where it stands in the text. */
+interface Point {
+  sheet: Sheet;
+  active: CellPos;
+  focus: CellPos;
+  range: CellRange;
+  /** The field the text is typed in: the editor of the grid, or the field of a formula bar. */
+  field: HTMLTextAreaElement;
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** Marks the field of a shell around the view (a formula bar) that edits the cell together with the grid's editor. */
+export const EDIT_FIELD_ATTRIBUTE = 'data-bym-edit-field';
 
 /** What is remembered for a sheet while another one is shown. */
 interface SheetState {
@@ -214,6 +240,8 @@ interface Drag {
   originX: number;
   originY: number;
   moved: boolean;
+  /** The drag points at cells for the formula that is being typed instead of selecting them. */
+  point?: boolean;
 }
 
 interface Touch {
@@ -356,6 +384,7 @@ const STYLE_TEXT =
   'margin:0;padding:0;border:0;border-top:1px solid #dadce0;border-right:1px solid #dadce0;border-radius:0;background:#f1f3f4;color:#444746;' +
   'font:inherit;font-size:18px;line-height:1;text-align:center;cursor:pointer}' +
   '.bym-tab-add:hover{background:#e8eaed}' +
+  '.bym-tab-add[aria-disabled="true"]{opacity:.38;cursor:default;background:transparent}' +
   '.bym-tab-add:focus{outline:2px solid #1a7f45;outline-offset:-2px}' +
   '.bym-tab-add:focus:not(:focus-visible){outline:none}' +
   '.bym-tab-input{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;height:auto;min-width:0;max-width:none;max-height:none;' +
@@ -512,6 +541,39 @@ function expandByMerges(index: MergeIndex, range: CellRange): CellRange {
   return out;
 }
 
+/**
+ * Puts text in the place of a part of a field, the caret behind it. As typing would where the
+ * browser lets a script do that: the field's own undo (Ctrl+Z) then takes the text back in one step.
+ */
+function replaceFieldText(field: HTMLTextAreaElement, start: number, end: number, text: string): void {
+  const before = field.value;
+  const wanted = before.substring(0, start) + text + before.substring(end);
+  const caret = start + text.length;
+  const root = field.getRootNode() as Document | ShadowRoot;
+  if (root.activeElement === field) {
+    try {
+      // Away and back: Chromium takes what a script inserts right after typing for part of that typing, and
+      // ends the step where the selection moves; its undo then takes back the reference alone. Firefox does
+      // so anyway. WebKit undoes everything typed in a row at once whatever is done here.
+      field.setSelectionRange(0, 0);
+      field.setSelectionRange(start, end);
+      const doc = field.ownerDocument;
+      if (doc && typeof doc.execCommand === 'function') doc.execCommand('insertText', false, text);
+    } catch {
+      // Not available here; the text is set below.
+    }
+  }
+  if (field.value !== wanted) {
+    if (field.value === before && typeof field.setRangeText === 'function') field.setRangeText(text, start, end, 'end');
+    if (field.value !== wanted) field.value = wanted;
+  }
+  try {
+    if (field.selectionStart !== caret || field.selectionEnd !== caret) field.setSelectionRange(caret, caret);
+  } catch {
+    // Only fails on an element that is not rendered; the caret position is cosmetic.
+  }
+}
+
 const fullWidth = (range: CellRange) => range.left === 0 && range.right === MAX_COLS - 1;
 const fullHeight = (range: CellRange) => range.top === 0 && range.bottom === MAX_ROWS - 1;
 
@@ -621,6 +683,14 @@ export class WorkbookView {
   private drag: Drag | undefined;
   private touch: Touch | undefined;
   private edit: Edit | undefined;
+  /** The reference last pointed at for the formula being typed; the next one pointed at takes its place. */
+  private point: Point | undefined;
+  /** Set while a selection command runs for pointing: it moves the cells pointed at, not the selection. */
+  private pointing = false;
+  /** Set while the view itself writes a reference into the text, which is not the user typing. */
+  private pointWriting = false;
+  /** An input method is composing in the editor or in a field of the shell. */
+  private composing = false;
   private menu: ContextMenu | undefined;
   /** What dropped down from a cell: the menu of a filter button or the list of a data validation. */
   private panel: FilterMenu | ListMenu | undefined;
@@ -785,6 +855,7 @@ export class WorkbookView {
     input.addEventListener('keydown', this.onKeyDown);
     input.addEventListener('input', this.onInput);
     input.addEventListener('compositionstart', this.onCompositionStart);
+    input.addEventListener('mousedown', this.onInputMouseDown);
     input.addEventListener('focus', this.onFocus);
     input.addEventListener('blur', this.onBlur);
     input.addEventListener('copy', this.onCopy);
@@ -806,7 +877,13 @@ export class WorkbookView {
     addButton.addEventListener('click', this.onAddClick);
     root.addEventListener('mousedown', this.onRootMouseDown);
     root.addEventListener('focusout', this.onFocusOut);
-    if (options.focusScope) options.focusScope.addEventListener('focusout', this.onFocusOut);
+    root.addEventListener('compositionstart', this.onComposition);
+    root.addEventListener('compositionend', this.onComposition);
+    if (options.focusScope) {
+      options.focusScope.addEventListener('focusout', this.onFocusOut);
+      options.focusScope.addEventListener('compositionstart', this.onComposition);
+      options.focusScope.addEventListener('compositionend', this.onComposition);
+    }
     // Not passive: a finger on the border between two headers resizes instead of scrolling.
     canvas.addEventListener('touchstart', this.onTouchStart, { passive: false });
     scroller.addEventListener('focus', this.onScrollerFocus);
@@ -847,11 +924,19 @@ export class WorkbookView {
     if (!Number.isInteger(index) || index < 0 || index >= this.workbook.sheets.length) {
       throw new RangeError(`No sheet with index ${index}`);
     }
-    if (this.destroyed || index === this.sheetIndex) return;
-    // What is being typed belongs to the sheet that is being left.
-    if (this.edit) this.commitEditing();
+    if (this.destroyed) return;
+    // What is being typed belongs to the sheet of its cell, and is written before another sheet is shown for
+    // good - also when that is the sheet shown now, for a formula to point at.
+    if (this.edit && (index !== this.sheetIndex || this.editAway())) this.commitEditing();
+    if (index === this.sheetIndex) return;
     // So does a name that is being typed for it.
     this.finishRename(true, true);
+    this.show(index);
+  }
+
+  /** Shows another sheet and leaves what is being typed alone: see setActiveSheet(). */
+  private show(index: number): void {
+    if (index === this.sheetIndex) return;
     this.closeMenu();
     this.endDrag();
     this.endTouch();
@@ -957,12 +1042,14 @@ export class WorkbookView {
     this.endTouch();
     this.clearTabPress();
     this.edit = undefined;
+    this.point = undefined;
     this.renaming = undefined;
     this.closeMenu();
     const input = this.input;
     input.removeEventListener('keydown', this.onKeyDown);
     input.removeEventListener('input', this.onInput);
     input.removeEventListener('compositionstart', this.onCompositionStart);
+    input.removeEventListener('mousedown', this.onInputMouseDown);
     input.removeEventListener('focus', this.onFocus);
     input.removeEventListener('blur', this.onBlur);
     input.removeEventListener('copy', this.onCopy);
@@ -987,7 +1074,13 @@ export class WorkbookView {
     this.addButton.removeEventListener('click', this.onAddClick);
     this.root.removeEventListener('mousedown', this.onRootMouseDown);
     this.root.removeEventListener('focusout', this.onFocusOut);
-    if (this.options.focusScope) this.options.focusScope.removeEventListener('focusout', this.onFocusOut);
+    this.root.removeEventListener('compositionstart', this.onComposition);
+    this.root.removeEventListener('compositionend', this.onComposition);
+    if (this.options.focusScope) {
+      this.options.focusScope.removeEventListener('focusout', this.onFocusOut);
+      this.options.focusScope.removeEventListener('compositionstart', this.onComposition);
+      this.options.focusScope.removeEventListener('compositionend', this.onComposition);
+    }
     this.canvas.removeEventListener('touchstart', this.onTouchStart);
     this.scroller.removeEventListener('focus', this.onScrollerFocus);
     const canvas = this.canvas;
@@ -1395,7 +1488,8 @@ export class WorkbookView {
     const sheets = this.workbook.sheets;
     for (let i = this.sheetIndex + step; i >= 0 && i < sheets.length; i += step) {
       if (sheets[i].state === 'visible') {
-        this.attempt(() => this.setActiveSheet(i));
+        // While a formula is typed the sheet is shown for pointing at its cells, and the edit goes on.
+        this.attempt(() => (this.formulaEdit() ? this.show(i) : this.setActiveSheet(i)));
         return;
       }
     }
@@ -1806,7 +1900,8 @@ export class WorkbookView {
    * not available, and says why. Returns false when no menu was opened (a read-only view).
    */
   private openTabMenu(index: number, x: number, y: number, keyboard: boolean): boolean {
-    if (this.destroyed || this.locked) return false;
+    // The list of sheets stays as it is while a formula is typed.
+    if (this.destroyed || this.locked || this.formulaEdit()) return false;
     const sheet = this.workbook.sheets[index];
     if (!sheet) return false;
     this.finishRename(true, true);
@@ -1879,6 +1974,13 @@ export class WorkbookView {
     this.renameTarget = undefined;
     const sheet = this.workbook.sheets[index];
     const pointer = event.detail > 0;
+    if (this.formulaEdit()) {
+      // A formula is being typed: the sheet is shown for pointing at its cells. The edit goes on, the focus
+      // stays in the field it is typed in, and a second click renames nothing.
+      this.lastTabTap = undefined;
+      this.show(index);
+      return;
+    }
     // A pointer click hands the keyboard back to the cells; a tab chosen with the keyboard keeps the focus.
     if (pointer) this.focusInput(true);
     // A double click, or two taps of a finger, on the same tab renames the sheet. The clicks are counted here:
@@ -1899,13 +2001,16 @@ export class WorkbookView {
     if (!target || !target.classList || !target.classList.contains('bym-tab')) return;
     const index = this.tabSheetOf(target);
     if (index < 0) return;
+    const locked = this.formulaEdit();
     if (event.key === 'F2' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
       event.preventDefault();
+      if (locked) return;
       this.attempt(() => {
         this.startRename(index);
       });
     } else if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey)) {
       event.preventDefault();
+      if (locked) return;
       const rect = target.getBoundingClientRect();
       const point = this.rootPoint(rect.left, rect.top);
       this.attempt(() => {
@@ -1920,8 +2025,8 @@ export class WorkbookView {
     const index = this.tabSheetOf(event.target);
     if (index < 0) return;
     event.preventDefault();
-    // The long press or the key that this event follows opened the menu already.
-    if (this.menu) return;
+    // The long press or the key that this event follows opened the menu already. None while a formula is typed.
+    if (this.menu || this.formulaEdit()) return;
     const tab = this.tabOf(index);
     const rect = tab ? tab.getBoundingClientRect() : undefined;
     // From the keyboard the event carries no place of its own.
@@ -1943,7 +2048,7 @@ export class WorkbookView {
     if (index < 0) return;
     // A name is being typed: the field closes when this press takes the focus, and the tabs move under the pointer.
     if (this.renaming) this.renameTarget = this.workbook.sheets[index];
-    if (event.pointerType !== 'touch') return;
+    if (event.pointerType !== 'touch' || this.formulaEdit()) return;
     this.tabPress = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, sheet: this.workbook.sheets[index], scroll: this.tabs.scrollLeft };
     this.tabPressTimer = window.setTimeout(this.onTabLongPress, LONG_PRESS_MS);
   };
@@ -1983,7 +2088,8 @@ export class WorkbookView {
   }
 
   private onAddClick = (event: MouseEvent): void => {
-    if (this.destroyed || this.locked) return;
+    // The list of sheets stays as it is while a formula is typed.
+    if (this.destroyed || this.locked || this.formulaEdit()) return;
     this.attempt(() => {
       this.insertSheet();
     });
@@ -2211,6 +2317,8 @@ export class WorkbookView {
       drawings: floating,
       // Asked for every visible cell: only for a sheet that has comments.
       comments: floating && state.sheet.comments && state.sheet.comments.length > 0 ? floating : undefined,
+      // What the formula being typed was pointed at, on the sheet it is on.
+      reference: this.edit && this.point && this.point.sheet === state.sheet ? this.point.range : undefined,
     });
     // Rules whose formulas took too long are finished in the next frames.
     if (conditional && conditional.pending) this.schedule();
@@ -2448,6 +2556,8 @@ export class WorkbookView {
    */
   openValidationList(touch = false): boolean {
     if (this.destroyed || this.locked) return false;
+    // First of all: what is being typed is written, which shows the sheet of its cell again.
+    if (!this.tryCommit()) return false;
     const state = this.state();
     const sheet = state.sheet;
     const rules = sheet.kind === 'worksheet' ? this.validationOf(sheet) : undefined;
@@ -2826,6 +2936,8 @@ export class WorkbookView {
    */
   openFilterMenu(col: number, touch = false): boolean {
     if (this.destroyed || this.locked) return false;
+    // First of all: what is being typed is written, which shows the sheet of its cell again.
+    if (!this.tryCommit()) return false;
     const state = this.state();
     const sheet = state.sheet;
     const filter = this.gridFilter(sheet);
@@ -2897,6 +3009,14 @@ export class WorkbookView {
 
   private setSelection(active: CellPos, range: CellRange, focus: CellPos, revealCell?: CellPos): void {
     const state = this.state();
+    if (this.pointing) {
+      // The command moves what a formula is pointed at: pointBy() reads it from here and puts the selection back.
+      state.active = { row: active.row, col: active.col };
+      state.range = { ...range };
+      state.focus = { row: focus.row, col: focus.col };
+      if (revealCell) this.reveal(revealCell, range);
+      return;
+    }
     const changed = !sameCell(active, state.active) || !sameRange(range, state.range);
     // A list that belongs to another cell has nothing to choose for this one.
     if (changed && this.panel) this.panel.close();
@@ -3260,6 +3380,10 @@ export class WorkbookView {
       this.beginEdit();
     }
     this.input.value = String(text);
+    // The echo of a reference the view itself wrote into a field of the shell: writePoint() goes on from here.
+    if (this.pointWriting) return;
+    // Typed in a field of the shell: what was pointed at before is part of the text now.
+    this.typed();
     this.placeInput();
     this.emitEditing();
   }
@@ -3327,6 +3451,7 @@ export class WorkbookView {
   }
 
   private emitEditing(): void {
+    this.syncSheetLock();
     if (this.options.onEditingChange) this.options.onEditingChange({ editing: this.edit !== undefined, text: this.editText });
   }
 
@@ -3406,6 +3531,15 @@ export class WorkbookView {
     const text = this.input.value;
     // Text that was only looked at, or the idle text an abandoned composition left behind, is not a change.
     const unchanged = text === edit.original || (edit.idle !== undefined && text === edit.idle);
+    // The cell is written on its own sheet, shown as it is for every other change: undo comes back to it.
+    this.returnHome(edit);
+    const home = this.workbook.sheets.indexOf(edit.home);
+    if (home < 0) {
+      // The sheet of the cell left the workbook under the view: there is no cell to write. Said, not passed over.
+      this.endEdit();
+      if (!unchanged) this.notify(this.strings.editSheetGone, 'error');
+      return true;
+    }
     if (!unchanged) {
       // The editor stays open until the cell is written: if that fails, what was typed is still there.
       this.committing = true;
@@ -3415,9 +3549,9 @@ export class WorkbookView {
         const styles = markStyles(this.workbook.styles);
         let ops: Op[];
         try {
-          ops = setCellInput(this.workbook, edit.sheet, edit.row, edit.col, text, { locale: this.locale });
+          ops = setCellInput(this.workbook, home, edit.row, edit.col, text, { locale: this.locale });
           // A value the cell's data validation refuses is not written, and the editor stays open with it.
-          warning = this.validateInput(edit.sheet, edit.row, edit.col, text, ops);
+          warning = this.validateInput(home, edit.row, edit.col, text, ops);
         } catch (error) {
           // What is refused leaves nothing behind: saved, the file is byte for byte what it was.
           resetStyles(this.workbook.styles, styles);
@@ -3797,14 +3931,17 @@ export class WorkbookView {
     }
   }
 
-  private beginEdit(idle?: string): void {
+  private beginEdit(idle?: string, keys = false): void {
     const state = this.state();
     const { row, col } = state.active;
     const style = resolveCellStyle(this.workbook.styles, styleAt(state.sheet, row, col));
+    this.point = undefined;
     this.edit = {
-      sheet: this.sheetIndex,
+      home: state.sheet,
       row,
       col,
+      keys,
+      pointed: false,
       // As the input will hold it: a text field turns every kind of line break into "\n".
       original: editTextAt(this.workbook, state.sheet, row, col, { locale: this.locale }).replace(/\r\n?/g, '\n'),
       idle,
@@ -3817,7 +3954,19 @@ export class WorkbookView {
   }
 
   private endEdit(): void {
+    const edit = this.edit;
+    const pointed = edit !== undefined && edit.pointed;
     this.edit = undefined;
+    this.point = undefined;
+    this.composing = false;
+    if (this.drag && this.drag.point) this.endDrag();
+    // Back to the sheet of the cell, when another one was shown for the formula to point at.
+    if (edit) this.returnHome(edit);
+    // Pointing may have scrolled the cell away.
+    if (pointed) {
+      this.reveal(this.state().active);
+      this.schedule();
+    }
     this.input.setAttribute('inputmode', 'none');
     if (this.keyboardShown) {
       this.keyboardShown = false;
@@ -3890,13 +4039,15 @@ export class WorkbookView {
     const state = this.state();
     const layout = this.layout(state);
     const edit = this.edit;
-    const cell = edit || state.active;
+    // The editor of a cell of another sheet waits out of sight with its text while this sheet is pointed at.
+    const here = edit !== undefined && edit.home === state.sheet;
+    const cell = edit && here ? edit : state.active;
     const merge = mergeIn(this.merges(), cell.row, cell.col);
     const rect = rangeRect(layout, merge || { top: cell.row, left: cell.col, bottom: cell.row, right: cell.col });
     const paneLeft = layout.metrics.headerWidth + (cell.col < layout.frozenCols ? 0 : layout.frozenWidth);
     const paneTop = layout.metrics.headerHeight + (cell.row < layout.frozenRows ? 0 : layout.frozenHeight);
     const inView = rect.width > 0 && rect.height > 0 && rect.x >= paneLeft && rect.y >= paneTop && rect.x < this.width && rect.y < this.height;
-    if (!edit || !inView) {
+    if (!edit || !here || !inView) {
       // Out of sight but still inside the view, so the browser never scrolls anything to show it. An editor
       // whose cell is scrolled away waits here with its text.
       style.left = `${clamp(rect.x, 0, Math.max(this.width - 1, 0))}px`;
@@ -3949,8 +4100,13 @@ export class WorkbookView {
         return;
       }
       this.closeMenu();
-      this.beginEdit();
+      // Begun by typing: the arrow keys point at cells where the formula takes a reference.
+      this.beginEdit(undefined, true);
     }
+    // The view itself wrote a reference: writePoint() places the editor and reports the text, once.
+    if (this.pointWriting) return;
+    // Typing goes on after the reference that was pointed at: the next one is added, not put in its place.
+    this.typed();
     this.placeInput();
     this.emitEditing();
   };
@@ -3959,8 +4115,19 @@ export class WorkbookView {
     if (this.destroyed || this.edit || this.locked || this.state().sheet.kind !== 'worksheet') return;
     // An input method composes in place; the editor has to be there from its first key.
     this.selectIdleText();
-    this.beginEdit(this.input.value);
+    this.beginEdit(this.input.value, true);
     this.emitEditing();
+  };
+
+  /** An input method began or ended composing, in the editor or in a field of the shell: no pointing meanwhile. */
+  private onComposition = (event: Event): void => {
+    this.composing = event.type === 'compositionstart';
+    if (!this.destroyed) this.syncSheetLock();
+  };
+
+  /** A press inside the editor places the caret: from here on the arrow keys move it. */
+  private onInputMouseDown = (): void => {
+    if (this.edit) this.edit.keys = false;
   };
 
   private onFocus = (): void => {
@@ -3971,6 +4138,8 @@ export class WorkbookView {
 
   private onBlur = (event: FocusEvent): void => {
     if (this.destroyed || this.refocusing) return;
+    // A composition does not outlive the focus, whether its end is reported or not.
+    this.composing = false;
     // The scrolling element can take the focus (a click on its scroll bar in some browsers); it hands it straight back.
     if (event.relatedTarget === this.scroller) return;
     this.root.classList.remove('bym-focus-ring');
@@ -3983,7 +4152,10 @@ export class WorkbookView {
    * toolbar button, a sheet tab - the edit goes on.
    */
   private onFocusOut = (event: FocusEvent): void => {
-    if (this.destroyed || this.refocusing || !this.edit) return;
+    if (this.destroyed || this.refocusing) return;
+    // A composition does not outlive the focus, whether its end is reported or not.
+    this.composing = false;
+    if (!this.edit) return;
     const to = event.relatedTarget as Node | null;
     const scope = this.options.focusScope;
     if (to && (this.root.contains(to) || (scope !== undefined && scope.contains(to)))) return;
@@ -3998,6 +4170,11 @@ export class WorkbookView {
   private onRootMouseDown = (event: MouseEvent): void => {
     const target = event.target as Element | null;
     if (this.destroyed || !target || target === this.input || this.scroller.contains(target)) return;
+    if (this.formulaEdit() && (this.tabs.contains(target) || target === this.addButton)) {
+      // A formula is being typed: a press on a tab shows its sheet and leaves the focus in the field of the formula.
+      event.preventDefault();
+      return;
+    }
     if (typeof target.closest === 'function' && target.closest('button, input, .bym-menu')) return;
     event.preventDefault();
     this.focusInput(true);
@@ -4007,12 +4184,15 @@ export class WorkbookView {
     // Enter that confirms an input method's candidate is not Enter for the cell.
     if (event.isComposing || event.keyCode === 229) return;
     const shift = event.shiftKey;
+    const ctrl = event.ctrlKey || event.metaKey;
+    const edit = this.edit as Edit;
     switch (event.key) {
       case 'Enter':
         event.preventDefault();
         if (event.altKey) {
           const input = this.input;
           input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end');
+          this.typed();
           this.placeInput();
           this.emitEditing();
         } else {
@@ -4029,9 +4209,222 @@ export class WorkbookView {
         event.stopPropagation();
         this.cancelEditing();
         break;
+      case 'F2':
+        // From pointing at cells with the arrow keys to moving the caret with them, and back.
+        if (!ctrl && !event.altKey && !shift) {
+          event.preventDefault();
+          edit.keys = !edit.keys;
+        }
+        break;
+      case 'PageUp':
+      case 'PageDown': {
+        const step = event.key === 'PageDown' ? 1 : -1;
+        if (ctrl || event.altKey) {
+          // The keys that change sheets: while a formula is typed the next sheet is shown for pointing at its cells.
+          if (ctrl !== event.altKey && !shift && this.formulaEdit()) {
+            event.preventDefault();
+            this.stepSheet(step);
+          }
+        } else if (edit.keys && this.pointBy(() => this.page(step, shift), true)) event.preventDefault();
+        break;
+      }
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight': {
+        if (!edit.keys || event.altKey) break;
+        const dRow = event.key === 'ArrowUp' ? -1 : event.key === 'ArrowDown' ? 1 : 0;
+        const dCol = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+        // Where the formula takes a reference the keys point at cells; anywhere else they move the caret.
+        if (this.pointBy(() => this.moveBy(dRow, dCol, ctrl, shift), true)) event.preventDefault();
+        break;
+      }
       default:
-      // Every other key is the editor's own: arrows move the caret, not the selection.
+      // Every other key is the editor's own.
     }
+  }
+
+  // ------------------------------------------------------------ point mode
+
+  /** Whether a formula is being typed: sheets are then shown without ending the edit, and the list of sheets stays as it is. */
+  private formulaEdit(): boolean {
+    return this.edit !== undefined && !this.composing && isFormulaText(this.input.value);
+  }
+
+  /** Whether the sheet shown is another one than the sheet of the cell being edited. */
+  private editAway(): boolean {
+    return this.edit !== undefined && this.state().sheet !== this.edit.home;
+  }
+
+  /** Shows the sheet of the cell being edited again. */
+  private returnHome(edit: Edit): void {
+    const home = this.workbook.sheets.indexOf(edit.home);
+    if (home >= 0 && home !== this.sheetIndex) this.show(home);
+  }
+
+  /** The button that adds a sheet says that it is not available while a formula is typed. */
+  private syncSheetLock(): void {
+    const locked = this.formulaEdit();
+    if (locked === this.addButton.hasAttribute('aria-disabled')) return;
+    if (locked) this.addButton.setAttribute('aria-disabled', 'true');
+    else this.addButton.removeAttribute('aria-disabled');
+  }
+
+  /**
+   * The field the edit is typed in: the editor of the grid, or a field of the shell around the
+   * view (a formula bar) that has the focus, says that it edits the cell and holds the same text.
+   */
+  private editField(): HTMLTextAreaElement {
+    const scope = this.options.focusScope;
+    if (!scope) return this.input;
+    const active = (this.input.getRootNode() as Document | ShadowRoot).activeElement as HTMLTextAreaElement | null;
+    if (!active || active === this.input || active.tagName !== 'TEXTAREA' || !scope.contains(active)) return this.input;
+    return active.hasAttribute(EDIT_FIELD_ATTRIBUTE) && active.value === this.input.value ? active : this.input;
+  }
+
+  /**
+   * Where a reference that is pointed at now goes: in the place of the one pointed at last while
+   * the caret still stands right behind it, else at the caret (in the place of the selected
+   * text) when the formula takes a reference there. Undefined when pointing does nothing: no
+   * formula is being typed, an input method is composing, the place is not one for a reference.
+   */
+  private pointTarget(): { field: HTMLTextAreaElement; start: number; end: number; live: Point | undefined } | undefined {
+    if (!this.edit || this.destroyed || this.locked || this.composing || this.committing) return undefined;
+    if (this.state().sheet.kind !== 'worksheet') return undefined;
+    const field = this.editField();
+    const text = field.value;
+    const start = field.selectionStart;
+    const end = field.selectionEnd;
+    const point = this.point;
+    if (point && point.field === field && pointSpanLive(text, start, end, point)) return { field, start: point.start, end: point.end, live: point };
+    return canPointAt(text, start, end, { decimal: this.locale.decimal }) ? { field, start, end, live: undefined } : undefined;
+  }
+
+  private clearPoint(): void {
+    if (!this.point) return;
+    this.point = undefined;
+    this.schedule();
+  }
+
+  /**
+   * Something was typed into the formula: the reference pointed at last is part of the text now, and a
+   * drag that was pointing at a range is over (it would go on from the edited cell otherwise).
+   */
+  private typed(): void {
+    this.clearPoint();
+    if (this.drag && this.drag.point) this.endDrag();
+  }
+
+  /**
+   * Whether the text being edited is a formula, an input method composing or not. Borders between
+   * headers do not resize meanwhile: what is typed could not always be written first, and the press
+   * would end the edit where it can.
+   */
+  private typingFormula(): boolean {
+    return this.edit !== undefined && isFormulaText(this.input.value);
+  }
+
+  /**
+   * Runs a command that moves the selection (a press, a drag, an arrow key) as pointing: the
+   * command works on the cells pointed at last, or on the active cell of the shown sheet, and
+   * where it ends is written into the formula as a reference. The selection itself stays as
+   * it is. Returns false when the formula takes no reference now; the command is not run then.
+   * With `keys` (an arrow key) a command that moved nothing writes nothing while no reference
+   * was pointed at yet: at the edge of the sheet the formula would refer to its own cell.
+   */
+  private pointBy(run: () => void, keys = false): boolean {
+    const target = this.pointTarget();
+    const edit = this.edit;
+    if (!target || !edit) return false;
+    const state = this.state();
+    const saved = { active: state.active, focus: state.focus, range: state.range };
+    const live = target.live && target.live.sheet === state.sheet ? target.live : undefined;
+    if (live) {
+      state.active = live.active;
+      state.focus = live.focus;
+      state.range = live.range;
+    } else {
+      // From the active cell alone, whatever else is selected with it.
+      const merge = mergeIn(this.merges(), saved.active.row, saved.active.col);
+      state.focus = saved.active;
+      state.range = merge ? { ...merge } : { top: saved.active.row, left: saved.active.col, bottom: saved.active.row, right: saved.active.col };
+    }
+    const from = { active: state.active, range: state.range };
+    edit.pointed = true;
+    let next: { active: CellPos; focus: CellPos; range: CellRange };
+    this.pointing = true;
+    try {
+      run();
+    } finally {
+      this.pointing = false;
+      next = { active: state.active, focus: state.focus, range: state.range };
+      state.active = saved.active;
+      state.focus = saved.focus;
+      state.range = saved.range;
+    }
+    if (keys && !live && sameCell(next.active, from.active) && sameRange(next.range, from.range)) return true;
+    this.writePoint(target, state.sheet, next);
+    return true;
+  }
+
+  /** Writes the reference to cells of the shown sheet into the formula and remembers it as the one pointed at. */
+  private writePoint(
+    target: { field: HTMLTextAreaElement; start: number; end: number; live?: Point },
+    sheet: Sheet,
+    at: { active: CellPos; focus: CellPos; range: CellRange },
+  ): void {
+    const edit = this.edit;
+    if (!edit) return;
+    const merge = mergeIn(this.merges(), at.active.row, at.active.col);
+    // The name of a sheet comes from the file: it only ever becomes text of the field.
+    const text = pointReference(at.range, { single: merge !== undefined && sameRange(merge, at.range), sheet: sheet === edit.home ? undefined : sheet.name });
+    const field = target.field;
+    const live = target.live;
+    if (live && live.sheet === sheet && live.text === text) {
+      // The same reference again (the pointer moved inside the cell): nothing is written, said or reported,
+      // and the undo of the field gets no step.
+      live.active = { ...at.active };
+      live.focus = { ...at.focus };
+      live.range = { ...at.range };
+      return;
+    }
+    // The focus was somewhere else in the view (on a tab chosen with the keyboard): typing goes on in the editor.
+    if (field === this.input && !this.hasFocus()) this.focusInput(true);
+    this.pointWriting = true;
+    try {
+      replaceFieldText(field, target.start, target.end, text);
+    } finally {
+      this.pointWriting = false;
+    }
+    if (field !== this.input) this.input.value = field.value;
+    this.point = {
+      sheet,
+      active: { ...at.active },
+      focus: { ...at.focus },
+      range: { ...at.range },
+      field,
+      start: target.start,
+      end: target.start + text.length,
+      text,
+    };
+    this.placeInput();
+    this.schedule();
+    this.live.textContent = this.strings.referenceAdded(text);
+    this.emitEditing();
+  }
+
+  /**
+   * Writes what is being typed before a press is handled as a press on the sheet. When another
+   * sheet was shown for the formula to point at, the press was on that sheet: it is shown again.
+   * Returns false when the text could not be written; the editor stays open then.
+   */
+  private commitForPress(): boolean {
+    if (!this.edit) return true;
+    const shown = this.state().sheet;
+    if (!this.tryCommit()) return false;
+    const index = this.workbook.sheets.indexOf(shown);
+    if (index >= 0 && index !== this.sheetIndex) this.setActiveSheet(index);
+    return true;
   }
 
   private onCopy = (event: ClipboardEvent): void => {
@@ -4077,7 +4470,8 @@ export class WorkbookView {
    * point. Returns false when the point is not on a header.
    */
   private openHeaderMenu(x: number, y: number): boolean {
-    if (this.state().sheet.kind !== 'worksheet') return false;
+    // No menu on a sheet that is only shown for a formula to point at.
+    if (this.state().sheet.kind !== 'worksheet' || this.editAway()) return false;
     const hit = hitTest(this.layout(), x, y);
     if (hit.area === 'cell') return this.openCellMenu(x, y, hit.row, hit.col);
     if (this.locked || (hit.area !== 'rowHeader' && hit.area !== 'colHeader')) return false;
@@ -4335,13 +4729,18 @@ export class WorkbookView {
     const rect = this.canvas.getBoundingClientRect();
     const x = (touch.clientX - rect.left) * (rect.width > 0 ? this.width / rect.width : 1);
     const y = (touch.clientY - rect.top) * (rect.height > 0 ? this.height / rect.height : 1);
-    // Keeps the browser from scrolling with a finger that is resizing.
-    if (this.resizeAt(x, y, RESIZE_REACH_TOUCH) && event.cancelable) event.preventDefault();
+    // Keeps the browser from scrolling with a finger that is resizing (none does while a formula is typed).
+    if (!this.typingFormula() && this.resizeAt(x, y, RESIZE_REACH_TOUCH) && event.cancelable) event.preventDefault();
   };
 
   private onContextMenu = (event: MouseEvent): void => {
     if (this.destroyed) return;
     const point = this.canvasPoint(event);
+    if (this.editAway()) {
+      // The sheet is only shown for a formula to point at: neither the view's menu nor the browser's.
+      event.preventDefault();
+      return;
+    }
     if (this.openHeaderMenu(point.x, point.y)) {
       event.preventDefault();
       // On a touch screen this is the long press; lifting the finger must not count as a tap.
@@ -4372,7 +4771,10 @@ export class WorkbookView {
     if (this.destroyed) return;
     const point = this.canvasPoint(event);
     const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
-    if (resize) this.autoFit(resize);
+    if (resize) {
+      // Not while a formula is typed, as a drag of the border.
+      if (!this.typingFormula()) this.autoFit(resize);
+    }
     // A second click on a button inside a cell belongs to the button.
     else if (this.filterButtonAt(point.x, point.y, 0) >= 0 || this.dropdownAt(point.x, point.y, 0)) return;
     else if (hitTest(this.layout(), point.x, point.y).area === 'cell') this.startEditing();
@@ -4432,6 +4834,11 @@ export class WorkbookView {
 
   /** Stretches the selection of a drag to the cell, row or column under the pointer. */
   private dragTo(drag: Drag): void {
+    if (drag.point && !this.pointing) {
+      // The drag points at cells for the formula; it ends when the formula takes no reference any more.
+      if (!this.pointBy(() => this.dragTo(drag))) this.endDrag();
+      return;
+    }
     const state = this.state();
     const cell = this.cellAt(drag.x, drag.y);
     const anchor = state.active;
@@ -4466,7 +4873,8 @@ export class WorkbookView {
       this.readScroll();
       this.endTouch();
       this.touchInput = true;
-      const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_TOUCH);
+      // No resizing while a formula is typed: the finger on a border is one that taps or scrolls.
+      const resize = this.typingFormula() ? undefined : this.resizeAt(point.x, point.y, RESIZE_REACH_TOUCH);
       this.touch = { pointerId, x: point.x, y: point.y, domX: this.domX, domY: this.domY, moved: false, consumed: false, resize };
       this.longPressTimer = window.setTimeout(this.onLongPress, LONG_PRESS_MS);
       return;
@@ -4475,7 +4883,29 @@ export class WorkbookView {
     // Keeps the browser from starting a text selection or an image drag.
     event.preventDefault();
     this.touchInput = false;
-    if (!this.tryCommit()) return;
+    if (this.typingFormula()) {
+      this.readScroll();
+      // No resizing while a formula is typed: a press on a border between headers does nothing at all,
+      // the edit goes on and nothing is written.
+      if (this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE)) return;
+    }
+    if (this.pointTarget()) {
+      this.readScroll();
+      // A formula is being typed and takes a reference here: the press points at the cell, row or column, and
+      // a drag at a range. The focus stays in the field of the formula. A press on the corner does nothing.
+      this.endDrag();
+      if (hitTest(this.layout(), point.x, point.y).area === 'corner') return;
+      let mode: Drag['mode'] = 'cell';
+      const pointed = this.pointBy(() => {
+        mode = this.press(point.x, point.y, event.shiftKey);
+      });
+      if (pointed) {
+        this.drag = { pointerId, mode, x: point.x, y: point.y, originX: point.x, originY: point.y, moved: false, point: true };
+        this.capturePointer(pointerId);
+      }
+      return;
+    }
+    if (!this.commitForPress()) return;
     this.focusInput(true);
     this.endDrag();
     this.readScroll();
@@ -4515,7 +4945,7 @@ export class WorkbookView {
     const point = this.canvasPoint(event);
     const touch = this.touch;
     if (touch && touch.pointerId === pointerId) {
-      const resize = touch.resize;
+      const resize = this.typingFormula() ? undefined : touch.resize;
       if (resize && !touch.consumed && (Math.abs(point.x - touch.x) > DRAG_SLOP || Math.abs(point.y - touch.y) > DRAG_SLOP)) {
         // The finger on a border has started to move: from here on it resizes.
         this.endTouch();
@@ -4574,7 +5004,17 @@ export class WorkbookView {
       const point = this.canvasPoint(event);
       const still = Math.abs(point.x - touch.x) <= TAP_SLOP && Math.abs(point.y - touch.y) <= TAP_SLOP;
       if (touch.consumed || touch.moved || !still || touch.domX !== this.domX || touch.domY !== this.domY) return;
-      if (!this.tryCommit()) return;
+      if (this.pointTarget()) {
+        // A formula is being typed and takes a reference here: the tap points at the cell, row or column.
+        this.lastTap = undefined;
+        if (hitTest(this.layout(), point.x, point.y).area !== 'corner') {
+          this.pointBy(() => {
+            this.press(point.x, point.y, false);
+          });
+        }
+        return;
+      }
+      if (!this.commitForPress()) return;
       this.focusInput(true);
       if (this.pressCellButton(point.x, point.y, true)) {
         this.lastTap = undefined;
@@ -4608,6 +5048,7 @@ export class WorkbookView {
       }
       return;
     }
+    if (drag.point) return;
     // A click on a cell that is cut off by the edge brings it into view; with Shift that is the clicked cell, not the active one.
     if (!drag.moved && drag.mode === 'cell') this.reveal(this.state().focus, this.state().range);
   };
