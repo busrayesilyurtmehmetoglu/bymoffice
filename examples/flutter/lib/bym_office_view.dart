@@ -93,8 +93,10 @@ class BymOfficeSelection {
 }
 
 /// An `error` message. [code] is one of: unsupported, corrupt, load-failed,
-/// save-failed, bad-message, not-loaded (and "timeout" and "closed", which only
-/// this wrapper produces).
+/// save-failed, bad-message, not-loaded, print-unavailable, print-failed,
+/// read-only, no-sheet, sheet-refused (and "timeout" and "closed", which only
+/// this wrapper produces). For sheet-refused the [message] is the reason in
+/// the language of the editor, fit to be shown to the user.
 class BymOfficeException implements Exception {
   const BymOfficeException(this.code, this.message);
 
@@ -111,6 +113,21 @@ class BymOfficeSheetChange {
 
   final int index;
   final String name;
+}
+
+/// A `sheets` message: the list of sheets changed (a sheet was inserted,
+/// deleted or renamed, by a command, by the user or by undo). [sheets] is the
+/// whole list as it is now, in the form [BymOfficeDocument.sheets] has it.
+///
+/// NOTE: added with the sheet commands below; like the rest of this file it
+/// was never compiled.
+class BymOfficeSheetList {
+  const BymOfficeSheetList({required this.sheets, required this.activeSheet});
+
+  final List<BymOfficeSheet> sheets;
+
+  /// Index of the sheet that is shown.
+  final int activeSheet;
 }
 
 /// Drives one editor. Create it once, hand it to a [BymOfficeView] and dispose
@@ -144,6 +161,7 @@ class BymOfficeController {
   final StreamController<BymOfficeChange> _changes = StreamController<BymOfficeChange>.broadcast();
   final StreamController<BymOfficeSelection> _selections = StreamController<BymOfficeSelection>.broadcast();
   final StreamController<BymOfficeSheetChange> _sheets = StreamController<BymOfficeSheetChange>.broadcast();
+  final StreamController<BymOfficeSheetList> _sheetLists = StreamController<BymOfficeSheetList>.broadcast();
   final StreamController<BymOfficeException> _errors = StreamController<BymOfficeException>.broadcast();
   final StreamController<String> _links = StreamController<String>.broadcast();
   int _nextId = 0;
@@ -155,6 +173,9 @@ class BymOfficeController {
   Stream<BymOfficeChange> get onChanged => _changes.stream;
   Stream<BymOfficeSelection> get onSelection => _selections.stream;
   Stream<BymOfficeSheetChange> get onSheetChanged => _sheets.stream;
+
+  /// The list of sheets changed; never sent for a document.
+  Stream<BymOfficeSheetList> get onSheetsChanged => _sheetLists.stream;
 
   /// A link in a document was activated; the page never opens it itself.
   Stream<String> get onLink => _links.stream;
@@ -255,6 +276,26 @@ class BymOfficeController {
   Future<void> redo() => _request(<String, dynamic>{'type': 'redo'});
   Future<void> close() => _request(<String, dynamic>{'type': 'close'});
 
+  // Sheets of a workbook. Each is one undo step; the new list arrives on
+  // [onSheetsChanged]. They fail with a BymOfficeException whose code is
+  // read-only, no-sheet (no sheet has the index; a document is open),
+  // sheet-refused (the editor's reason is the message) or bad-message.
+
+  /// Adds an empty sheet at [at] (after the last one when null) and shows it.
+  /// Without a [name] it gets the next default name of the editor's language.
+  /// Completes with the index of the new sheet.
+  Future<int> insertSheet({int? at, String? name}) async {
+    final Map<String, dynamic> answer = await _request(<String, dynamic>{
+      'type': 'insertSheet',
+      if (at != null) 'at': at,
+      if (name != null) 'name': name,
+    });
+    return (answer['index'] as num).toInt();
+  }
+
+  Future<void> renameSheet(int index, String name) => _request(<String, dynamic>{'type': 'renameSheet', 'index': index, 'name': name});
+  Future<void> deleteSheet(int index) => _request(<String, dynamic>{'type': 'deleteSheet', 'index': index});
+
   /// Closes the file in the page, detaches from the WebView and fails whatever
   /// is still waiting. Requests made afterwards fail at once.
   void dispose() {
@@ -271,6 +312,7 @@ class BymOfficeController {
     _changes.close();
     _selections.close();
     _sheets.close();
+    _sheetLists.close();
     _errors.close();
     _links.close();
   }
@@ -348,6 +390,17 @@ class BymOfficeController {
         ));
       case 'sheet':
         _sheets.add(BymOfficeSheetChange(index: (message['index'] as num).toInt(), name: message['name'] as String? ?? ''));
+      case 'sheets':
+        _sheetLists.add(BymOfficeSheetList(
+          activeSheet: (message['activeSheet'] as num).toInt(),
+          sheets: (message['sheets'] as List<dynamic>)
+              .map((dynamic entry) => BymOfficeSheet(
+                    name: entry['name'] as String,
+                    state: entry['state'] as String,
+                    kind: entry['kind'] as String,
+                  ))
+              .toList(),
+        ));
       case 'link':
         final Object? url = message['url'];
         if (url is String) _links.add(url);

@@ -808,6 +808,88 @@ test.describe('saving', () => {
   });
 });
 
+test.describe('the sheet a saved file opens on', () => {
+  /** The sheet the saved file opens on, the sheets it marks as selected, and whether it is the file that was opened. */
+  const savedActive = (page: Page, bytes: Uint8Array): Promise<{ active: number; selected: boolean[]; same: boolean }> =>
+    page.evaluate(async (original) => {
+      const api = (window as any).BymOffice;
+      const saved: Uint8Array = await (window as any).__file.save();
+      const workbook = await (await api.open(saved)).workbook();
+      const same = saved.length === original.length && saved.every((value, index) => value === original[index]);
+      return { active: workbook.activeSheet, selected: workbook.sheets.map((sheet: any) => sheet.view.tabSelected), same };
+    }, Array.from(bytes));
+  const modelActive = (page: Page): Promise<number> => view(page, 'view.workbook.activeSheet');
+
+  test('a sheet that is only looked at leaves the file byte for byte what it was', async ({ page }) => {
+    const bytes = await tabsWorkbook();
+    await mount(page, bytes);
+    await tab(page, 'Notes').click();
+    await expect(selectedTab(page)).toHaveText('Notes');
+    expect(await modelActive(page)).toBe(2);
+    expect(await savedActive(page, bytes)).toEqual({ active: 0, selected: [false, false, false], same: true });
+  });
+
+  test('with a cell edited, the file opens on the sheet that was shown last', async ({ page }) => {
+    const bytes = await tabsWorkbook();
+    await mount(page, bytes);
+    await view(page, 'view.setCellInput(4, 0, "5")');
+    await tab(page, 'Notes').click();
+    expect(await savedActive(page, bytes)).toEqual({ active: 2, selected: [false, false, true], same: false });
+    // Back on the first sheet, the next save says so again.
+    await tab(page, 'Data').click();
+    expect(await savedActive(page, bytes)).toMatchObject({ active: 0, selected: [false, false, false] });
+  });
+
+  test('a sheet added with the button is the one the file opens on; undone, the file is the one that came', async ({ page }) => {
+    const bytes = await tabsWorkbook();
+    await mount(page, bytes);
+    await tab(page, 'Calc').click();
+    await addButton(page).click();
+    await expect(selectedTab(page)).toHaveText('Sheet1');
+    expect(await modelActive(page)).toBe(3);
+    await view(page, 'view.undo()');
+    // The sheet that was shown before is shown again, and the model says the same; nothing is left to write.
+    expect(await activeSheet(page)).toBe(1);
+    expect(await modelActive(page)).toBe(1);
+    expect(await savedActive(page, bytes)).toMatchObject({ active: 0, same: true });
+    await view(page, 'view.redo()');
+    await expect(selectedTab(page)).toHaveText('Sheet1');
+    expect(await modelActive(page)).toBe(3);
+    expect(await savedActive(page, bytes)).toEqual({ active: 3, selected: [false, false, false, true], same: false });
+    // Undone after it was saved, the file is the one that came again, byte for byte.
+    await view(page, 'view.undo()');
+    expect(await savedActive(page, bytes)).toEqual({ active: 0, selected: [false, false, false], same: true });
+  });
+
+  test('a sheet looked at for a formula to point at is not the sheet of the file', async ({ page }) => {
+    const bytes = await tabsWorkbook();
+    await mount(page, bytes);
+    await view(page, 'view.select({ top: 4, left: 0, bottom: 4, right: 0 })');
+    await view(page, 'view.focus()');
+    await page.keyboard.type('=1+2');
+    await tab(page, 'Calc').click();
+    expect(await activeSheet(page)).toBe(1);
+    expect(await view(page, 'view.isEditing')).toBe(true);
+    expect(await modelActive(page)).toBe(0);
+    await view(page, 'view.commitEditing()');
+    expect(await activeSheet(page)).toBe(0);
+    expect(await modelActive(page)).toBe(0);
+    expect((await cell(page, 'Data', 'A5')).formula).toBe('1+2');
+    expect(await savedActive(page, bytes)).toMatchObject({ active: 0, same: false });
+  });
+
+  test('a hidden sheet that is shown is not the sheet of the file', async ({ page }) => {
+    const bytes = await loneWorkbook();
+    await mount(page, bytes);
+    await view(page, 'view.setActiveSheet(1)');
+    expect(await activeSheet(page)).toBe(1);
+    expect(await modelActive(page)).toBe(0);
+    await view(page, 'view.setCellInput(3, 0, "5")');
+    expect((await cell(page, 'Unseen', 'A4')).value).toBe(5);
+    expect(await savedActive(page, bytes)).toMatchObject({ active: 0, same: false });
+  });
+});
+
 test.describe('in the editor shell', () => {
   test('the formula bar shows formulas with the new name, and the status bar says why a name is refused', async ({ page }) => {
     await page.goto('/e2e/pages/editor.html');

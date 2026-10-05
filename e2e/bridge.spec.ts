@@ -623,6 +623,76 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       expect((await bridge.messages()).filter((message) => message.notAString || message.type === 'error')).toEqual([]);
       expectNoOutsideRequests(bridge.requests);
     });
+
+    test('sheets: inserted, renamed and deleted by command and by the user, the list is sent each time; refusals carry a code', async ({ page }) => {
+      const bridge = await start(page, mode);
+      await bridge.send({ type: 'load', id: 'l', data: base64(await smallWorkbook()), locale: 'tr' });
+      await bridge.waitFor('loaded');
+      const one = { name: 'Sayfa1', state: 'visible', kind: 'worksheet' };
+      const sheet = (name: string) => ({ ...one, name });
+
+      // A new sheet after the last one, with the default name of the view's language; it is the one shown.
+      await bridge.send({ type: 'insertSheet', id: 'i1' });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'i1', command: 'insertSheet', index: 1, name: 'Sayfa2' });
+      expect(await bridge.waitFor('sheets')).toEqual({ type: 'sheets', sheets: [one, sheet('Sayfa2')], activeSheet: 1 });
+      expect(await bridge.waitFor('sheet')).toEqual({ type: 'sheet', index: 1, name: 'Sayfa2' });
+      await expect(bridge.editor.locator('#editor .bym-tabs button')).toHaveText(['Sayfa1', 'Sayfa2']);
+      // The list comes before what else the command caused.
+      const order = (await bridge.messages()).map((message) => message.type).filter((type) => type === 'sheets' || type === 'sheet' || type === 'changed' || type === 'done');
+      expect(order).toEqual(['sheets', 'sheet', 'changed', 'done']);
+
+      await bridge.send({ type: 'insertSheet', id: 'i2', at: 0, name: 'Özet' });
+      expect(await bridge.waitFor('done', 2)).toEqual({ type: 'done', id: 'i2', command: 'insertSheet', index: 0, name: 'Özet' });
+      expect(await bridge.waitFor('sheets', 2)).toEqual({ type: 'sheets', sheets: [sheet('Özet'), one, sheet('Sayfa2')], activeSheet: 0 });
+
+      await bridge.send({ type: 'renameSheet', id: 'r', index: 2, name: 'Notlar' });
+      expect(await bridge.waitFor('done', 3)).toEqual({ type: 'done', id: 'r', command: 'renameSheet' });
+      expect(await bridge.waitFor('sheets', 3)).toEqual({ type: 'sheets', sheets: [sheet('Özet'), one, sheet('Notlar')], activeSheet: 0 });
+      await expect(bridge.editor.locator('#editor .bym-tabs button')).toHaveText(['Özet', 'Sayfa1', 'Notlar']);
+
+      await bridge.send({ type: 'deleteSheet', id: 'd', index: 0 });
+      expect(await bridge.waitFor('done', 4)).toEqual({ type: 'done', id: 'd', command: 'deleteSheet' });
+      expect(await bridge.waitFor('sheets', 4)).toEqual({ type: 'sheets', sheets: [one, sheet('Notlar')], activeSheet: 0 });
+
+      // Undo brings the sheet back, and the list says so.
+      await bridge.send({ type: 'undo', id: 'u' });
+      await bridge.waitFor('done', 5);
+      expect(await bridge.waitFor('sheets', 5)).toEqual({ type: 'sheets', sheets: [sheet('Özet'), one, sheet('Notlar')], activeSheet: 0 });
+
+      // The user adds a sheet with the button of the view: no command, the same message. The name is the first one that is free.
+      await bridge.editor.locator('#editor .bym-tab-add').click();
+      expect(await bridge.waitFor('sheets', 6)).toEqual({ type: 'sheets', sheets: [sheet('Özet'), one, sheet('Notlar'), sheet('Sayfa2')], activeSheet: 3 });
+
+      // Refusals: the reason in the language of the view, the code the same for all of them.
+      await bridge.send({ type: 'renameSheet', id: 'e1', index: 0, name: 'notlar' });
+      expect(await bridge.waitFor('error')).toEqual({ type: 'error', id: 'e1', code: 'sheet-refused', message: expect.stringContaining('notlar') });
+      await bridge.send({ type: 'renameSheet', id: 'e2', index: 0, name: 'a/b' });
+      expect(await bridge.waitFor('error', 2)).toMatchObject({ id: 'e2', code: 'sheet-refused' });
+      await bridge.send({ type: 'deleteSheet', id: 'e3', index: 9 });
+      expect(await bridge.waitFor('error', 3)).toEqual({ type: 'error', id: 'e3', code: 'no-sheet', message: 'No sheet with index 9' });
+      await bridge.send({ type: 'insertSheet', id: 'e4', name: 7 });
+      expect(await bridge.waitFor('error', 4)).toMatchObject({ id: 'e4', code: 'bad-message' });
+      await bridge.send({ type: 'setReadOnly', readOnly: true });
+      await bridge.send({ type: 'insertSheet', id: 'e5' });
+      expect(await bridge.waitFor('error', 5)).toEqual({ type: 'error', id: 'e5', code: 'read-only', message: 'The file is read-only' });
+      // Nothing of what was refused changed the list.
+      expect((await bridge.messages()).filter((message) => message.type === 'sheets')).toHaveLength(6);
+
+      // The saved file has the sheets, in order.
+      await bridge.send({ type: 'save', id: 's' });
+      await bridge.waitFor('saved');
+      const workbook = await (await open(new Uint8Array(Buffer.from(await bridge.savedData(), 'base64')))).workbook();
+      expect(workbook.sheets.map((entry) => entry.name)).toEqual(['Özet', 'Sayfa1', 'Notlar', 'Sayfa2']);
+      expect(workbook.activeSheet).toBe(3);
+
+      // A document has no sheets.
+      await bridge.send({ type: 'load', id: 'doc', blank: 'docx' });
+      await bridge.waitFor('loaded', 2);
+      await bridge.send({ type: 'insertSheet', id: 'e6' });
+      expect(await bridge.waitFor('error', 6)).toEqual({ type: 'error', id: 'e6', code: 'no-sheet', message: 'The open file is a document: it has no sheets' });
+      expect((await bridge.messages()).filter((message) => message.notAString)).toEqual([]);
+      expectNoOutsideRequests(bridge.requests);
+    });
   });
 }
 

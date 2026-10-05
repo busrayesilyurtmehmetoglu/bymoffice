@@ -15,6 +15,8 @@ import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale'
 import { resolveUiStrings, type UiStrings } from './strings';
 import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
 import { clearRange, copyRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
+import { formulaReferences } from '../calc/refs';
+import { cycleAbsolute } from '../edit/absolute';
 import { canPointAt, isFormulaText, pointReference, pointSpanLive } from '../edit/point';
 import {
   formatAt,
@@ -946,7 +948,21 @@ export class WorkbookView {
     this.shown = this.workbook.sheets[index];
     this.showSheet();
     this.schedule();
+    this.noteActiveSheet();
     if (this.options.onSheetChange) this.options.onSheetChange(index);
+  }
+
+  /**
+   * Tells the model which sheet is shown, so that a saved file opens on it (the writer says so
+   * only along with another change: see writeXlsx()). Not a sheet that is only looked at for a
+   * formula to point at - the view goes back to the sheet of the cell when the input ends - and
+   * not a hidden sheet, which setActiveSheet() can show: a file does not open on one.
+   */
+  private noteActiveSheet(): void {
+    if (this.destroyed || this.editAway()) return;
+    const sheet = this.workbook.sheets[this.sheetIndex];
+    if (!sheet || sheet !== this.shown || sheet.state !== 'visible') return;
+    if (this.workbook.activeSheet !== this.sheetIndex) this.workbook.activeSheet = this.sheetIndex;
   }
 
   get selection(): GridSelection {
@@ -1586,6 +1602,8 @@ export class WorkbookView {
         else this.focusInput(true);
       }
     }
+    // The operation, or its undoing, left the model with the active sheet it worked out; the one shown is it.
+    this.noteActiveSheet();
     if (moved && this.options.onSheetChange) this.options.onSheetChange(index);
   }
 
@@ -2608,6 +2626,12 @@ export class WorkbookView {
     for (const op of ops) {
       if (op.type !== 'setCells' || op.sheet !== sheetIndex) continue;
       for (const change of op.cells) if (change.row === row && change.col === col) cell = change.cell;
+    }
+    if (cell && cell.formula) {
+      // A formula is judged by what it gives: a calculation under way is finished first, so that the
+      // cells it reads hold what they come to. One that cannot be finished leaves the formula unjudged.
+      const engine = this.conditionalEngine();
+      if (engine && engine.incomplete) this.finishCalculation(engine);
     }
     const verdict = rules.check(row, col, cell, text, (run) => this.tryOut(ops, run));
     if (verdict.ok) return undefined;
@@ -3962,6 +3986,7 @@ export class WorkbookView {
     if (this.drag && this.drag.point) this.endDrag();
     // Back to the sheet of the cell, when another one was shown for the formula to point at.
     if (edit) this.returnHome(edit);
+    this.noteActiveSheet();
     // Pointing may have scrolled the cell away.
     if (pointed) {
       this.reveal(this.state().active);
@@ -4216,6 +4241,10 @@ export class WorkbookView {
           edit.keys = !edit.keys;
         }
         break;
+      case 'F4':
+        // Where there is no reference to change the key is the browser's.
+        if (!ctrl && !event.altKey && !shift && this.cycleReference()) event.preventDefault();
+        break;
       case 'PageUp':
       case 'PageDown': {
         const step = event.key === 'PageDown' ? 1 : -1;
@@ -4297,7 +4326,62 @@ export class WorkbookView {
     const end = field.selectionEnd;
     const point = this.point;
     if (point && point.field === field && pointSpanLive(text, start, end, point)) return { field, start: point.start, end: point.end, live: point };
+    // The reference pointed at last is selected, with or without the name of its sheet (F4 leaves it so):
+    // the next one takes its place all the same.
+    if (point && point.field === field && start >= point.start && start < end && end === point.end && text.substring(point.start, end) === point.text) {
+      return { field, start: point.start, end, live: point };
+    }
     return canPointAt(text, start, end, { decimal: this.locale.decimal }) ? { field, start, end, live: undefined } : undefined;
+  }
+
+  /**
+   * F4: the references of the formula being typed that the caret stands at, or that the
+   * selection touches, go on to their next state ($A$1, A$1, $A1, A1; see cycleAbsolute()).
+   * A caret ends up right behind the reference, a selection stays a selection. Works on the field the formula is typed in: the editor of the grid, or
+   * the field of a formula bar. Returns false, and changes nothing, when no formula is being
+   * typed or no reference is there.
+   */
+  cycleReference(): boolean {
+    if (!this.edit || this.destroyed || this.locked || this.composing || this.committing) return false;
+    const field = this.editField();
+    const before = field.value;
+    const next = cycleAbsolute(before, field.selectionStart, field.selectionEnd);
+    if (!next) return false;
+    const after = next.text;
+    // Only what differs is written, as typing it would be: the field's own undo takes it back.
+    let from = 0;
+    while (from < before.length && from < after.length && before.charCodeAt(from) === after.charCodeAt(from)) from++;
+    let tail = 0;
+    while (tail < before.length - from && tail < after.length - from && before.charCodeAt(before.length - 1 - tail) === after.charCodeAt(after.length - 1 - tail)) tail++;
+    const point = this.point;
+    this.pointWriting = true;
+    try {
+      replaceFieldText(field, from, before.length - tail, after.substring(from, after.length - tail));
+    } finally {
+      this.pointWriting = false;
+    }
+    try {
+      field.setSelectionRange(next.start, next.end);
+    } catch {
+      // Only fails on an element that is not rendered; the selection is a convenience.
+    }
+    if (field !== this.input) this.input.value = field.value;
+    // The reference pointed at last stays the one the next press replaces when it is the one that was
+    // changed, and is still where it was; any other trace would name a place that has moved.
+    const kept =
+      point !== undefined && point.field === field && before.substring(point.start, point.end) === point.text && from >= point.start && before.length - tail <= point.end;
+    if (point && kept) {
+      point.end += after.length - before.length;
+      point.text = after.substring(point.start, point.end);
+    } else this.clearPoint();
+    this.placeInput();
+    this.schedule();
+    // What was changed, as it is written now; it reads the same in every language.
+    const changedTo = after.length - tail;
+    const changed = formulaReferences(after).filter((ref) => ref.bodyStart <= changedTo && ref.end >= from);
+    if (changed.length > 0) this.live.textContent = after.substring(changed[0].bodyStart, changed[changed.length - 1].end);
+    this.emitEditing();
+    return true;
   }
 
   private clearPoint(): void {

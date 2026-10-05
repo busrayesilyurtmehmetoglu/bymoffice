@@ -15,7 +15,18 @@ import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { SheetPrintOptions } from '../ui/sheet-print';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 
-export type BridgeErrorCode = 'unsupported' | 'corrupt' | 'load-failed' | 'save-failed' | 'bad-message' | 'not-loaded' | 'print-unavailable' | 'print-failed';
+export type BridgeErrorCode =
+  | 'unsupported'
+  | 'corrupt'
+  | 'load-failed'
+  | 'save-failed'
+  | 'bad-message'
+  | 'not-loaded'
+  | 'print-unavailable'
+  | 'print-failed'
+  | 'read-only'
+  | 'no-sheet'
+  | 'sheet-refused';
 
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
 export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
@@ -275,7 +286,26 @@ const DEFAULT_MAX_FETCH_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_PENDING_CHARS = 64 * 1024 * 1024;
 
 /** Messages that say how things are now: of those waiting for a channel only the newest of each kind is kept. */
-const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet';
+const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet' || type === 'sheets';
+
+/** Longest name of a sheet a message may carry. What a sheet may be called is the view's to say; this only bounds what is looked at. */
+const MAX_NAME_CHARS = 255;
+
+/** A field that counts sheets: a whole number from 0 that a workbook could have as an index. */
+function sheetIndexField(message: Message, name: string, required: boolean): number | undefined {
+  const value = field<number>(message, name, 'number', required);
+  if (value !== undefined && !(Number.isInteger(value) && value >= 0 && value <= 0x7fffffff)) throw new BadMessage(`"${name}" must be a sheet index`);
+  return value;
+}
+
+function sheetNameField(message: Message, required: boolean): string | undefined {
+  const value = field<string>(message, 'name', 'string', required);
+  if (value !== undefined && value.length > MAX_NAME_CHARS) throw new BadMessage('"name" is too long');
+  return value;
+}
+
+/** The sheets of a workbook as `loaded` and `sheets` list them. */
+const sheetList = (workbook: Workbook): Message[] => workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind }));
 
 interface Outgoing {
   type: string;
@@ -332,6 +362,8 @@ export function createBridge(host: BridgeHost): Bridge {
   let selectionDue: { sheet: number; range: string; active: string } | undefined;
   let selectionScheduled = false;
   let selectionSent = '';
+  /** The list of sheets as the application was last told (in `loaded` or `sheets`), as JSON; '' while no workbook is shown. */
+  let sheetsSent = '';
 
   const deliver = (json: string): boolean => {
     try {
@@ -371,7 +403,18 @@ export function createBridge(host: BridgeHost): Bridge {
   const send = (message: Message) => {
     if (destroyed) return;
     const type = message.type as string;
-    if (isStatus(type)) {
+    if (type === 'sheets') {
+      // The list that waits is brought up to date where it stands: what follows it (a `sheet`, a
+      // `changed`, the answer to a command) speaks of sheets by index, and must not arrive before it.
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (pending[i].type !== type || pending[i].file !== fileSerial) continue;
+        const json = JSON.stringify(message);
+        pendingChars += json.length - pending[i].json.length;
+        pending[i] = { ...pending[i], json };
+        flush();
+        return;
+      }
+    } else if (isStatus(type)) {
       for (let i = pending.length - 1; i >= 0; i--) {
         if (pending[i].type !== type || pending[i].file !== fileSerial) continue;
         const older = pending.splice(i, 1)[0];
@@ -431,6 +474,7 @@ export function createBridge(host: BridgeHost): Bridge {
   const closeShown = () => {
     selectionDue = undefined;
     selectionSent = '';
+    sheetsSent = '';
     if (!shown) return;
     fileSerial++;
     const view = shown.view || shown.pages;
@@ -653,9 +697,24 @@ export function createBridge(host: BridgeHost): Bridge {
     if (sheet !== undefined && sheet >= workbook.sheets.length) return refuse('bad-message', `No sheet with index ${sheet}`);
 
     let view: WorkbookView | undefined;
+    /**
+     * Tells the application the list of sheets when it is not the one it was told last: a
+     * sheet was inserted, deleted or renamed, by a command, by the user or by undoing that.
+     * Sent before the message that made the bridge look, so that what that one says about
+     * a sheet (an index, a name) is said of a list the application knows.
+     */
+    const tellSheets = () => {
+      if (!view || !shown || shown.view !== view) return;
+      const sheets = sheetList(book);
+      const json = JSON.stringify(sheets);
+      if (json === sheetsSent) return;
+      sheetsSent = json;
+      send({ type: 'sheets', sheets, activeSheet: view.activeSheet });
+    };
     const options: SpreadsheetEditorOptions = {
       onChange: (change) => {
         if (!view) return;
+        tellSheets();
         send({ type: 'changed', sheets: change.sheets, canUndo: view.history.canUndo, canRedo: view.history.canRedo });
       },
       // At most one selection message per frame, and only the last selection of that frame.
@@ -666,6 +725,7 @@ export function createBridge(host: BridgeHost): Bridge {
         frame(flushSelection);
       },
       onSheetChange: (index) => {
+        tellSheets();
         const entry = book.sheets[index];
         send({ type: 'sheet', index, name: entry ? entry.name : '' });
       },
@@ -687,11 +747,52 @@ export function createBridge(host: BridgeHost): Bridge {
     sheetCount = () => (Array.isArray(book.sheets) ? book.sheets.length : Infinity);
     setLocale(locale);
     setState('open');
-    loaded(
-      view.activeSheet,
-      workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind })),
-      false,
-    );
+    const list = sheetList(workbook);
+    sheetsSent = JSON.stringify(list);
+    loaded(view.activeSheet, list, false);
+  };
+
+  /**
+   * Inserts, renames or deletes a sheet through the view, as one undo step. The list that
+   * results is told by `sheets` (see tellSheets() in load()), whether or not the command
+   * has an id; the answer says that the command was done, or why it was not.
+   */
+  const changeSheets = (type: 'insertSheet' | 'renameSheet' | 'deleteSheet', message: Message, id: string | undefined) => {
+    // Everything that comes from outside is looked at before anything is asked of the view.
+    const at = type === 'insertSheet' ? sheetIndexField(message, 'at', false) : undefined;
+    const index = type === 'insertSheet' ? undefined : sheetIndexField(message, 'index', true);
+    const name = type === 'deleteSheet' ? undefined : sheetNameField(message, type === 'renameSheet');
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const view = shown.view;
+    if (!view) return fail('no-sheet', 'The open file is a document: it has no sheets', id);
+    if (shown.locked || view.readOnly === true) return fail('read-only', 'The file is read-only', id);
+    if (typeof view.insertSheet !== 'function' || typeof view.renameSheet !== 'function' || typeof view.deleteSheet !== 'function') {
+      return fail('sheet-refused', 'This view cannot change its sheets', id);
+    }
+    const count = sheetCount ? sheetCount() : 0;
+    if (index !== undefined && index >= count) return fail('no-sheet', `No sheet with index ${index}`, id);
+    if (at !== undefined && at > count) return fail('no-sheet', `A sheet cannot be inserted at index ${at}: there are ${count} sheets`, id);
+    const answer: Message = { type: 'done', id, command: type };
+    try {
+      if (type === 'insertSheet') {
+        const placed = view.insertSheet(at, name);
+        if (placed < 0) return fail('read-only', 'The file is read-only', id);
+        const entry = view.workbook && Array.isArray(view.workbook.sheets) ? view.workbook.sheets[placed] : undefined;
+        answer.index = placed;
+        if (entry) answer.name = entry.name;
+      } else if (type === 'renameSheet') view.renameSheet(index as number, name as string);
+      else view.deleteSheet(index as number);
+    } catch (error) {
+      // The reason in the words the view has for it, in its language; the code is the same for every refusal.
+      let text: string;
+      try {
+        text = typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
+      } catch {
+        text = errorText(error);
+      }
+      return fail('sheet-refused', text, id);
+    }
+    if (id !== undefined) send(answer);
   };
 
   const save = async (id: string | undefined) => {
@@ -777,6 +878,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'load') return await load(fields, id, mine);
       if (type === 'save') return await save(id);
       if (type === 'print') return print(fields, id);
+      if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
       }

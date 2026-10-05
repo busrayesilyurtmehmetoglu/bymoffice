@@ -5,6 +5,7 @@
 
 import { cellName, parseRange, rangeName } from '../model/sheet/types';
 import type { EditorStrings } from './editor-strings';
+import { cycleAbsolute } from '../edit/absolute';
 import { EDIT_FIELD_ATTRIBUTE } from './sheet-view';
 import type { ShellHost } from './toolbar';
 
@@ -174,6 +175,14 @@ export class FormulaBar {
       view.cancelEditing();
       this.setContent(view.editText);
       view.focus();
+    } else if (event.key === 'F4' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+      // The reference at the caret goes from relative to absolute and on; without one the key is the browser's.
+      if (view.readOnly) return;
+      const field = this.content;
+      if (!cycleAbsolute(field.value, field.selectionStart, field.selectionEnd)) return;
+      // A formula that was only looked at so far is being edited from here on, as if it had been typed in.
+      if (!view.isEditing) view.setEditText(field.value);
+      if (view.cycleReference()) event.preventDefault();
     }
   };
 }

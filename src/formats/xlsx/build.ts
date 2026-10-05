@@ -549,14 +549,15 @@ function writableCell(cell: Cell, row: number, col: number, masters: Map<number,
   return out;
 }
 
-function sheetViewXml(sheet: Sheet): string {
+/** `selected`: the sheet is the one the file opens on, which is the one sheet marked as selected. */
+function sheetViewXml(sheet: Sheet, selected: boolean): string {
   const view = sheet.view;
   let out = '<sheetView';
   if (!view.showGridLines) out += ' showGridLines="0"';
   if (!view.showRowColHeaders) out += ' showRowColHeaders="0"';
   if (!view.showZeros) out += ' showZeros="0"';
   if (view.rightToLeft) out += ' rightToLeft="1"';
-  if (view.tabSelected) out += ' tabSelected="1"';
+  if (selected) out += ' tabSelected="1"';
   const firstVisible = oneCell(view.firstVisibleCell);
   if (firstVisible !== undefined) out += ` topLeftCell="${firstVisible}"`;
   if (view.zoomScale !== 100 && view.zoomScale >= 10 && view.zoomScale <= 400) out += ` zoomScale="${Math.round(view.zoomScale)}"`;
@@ -1286,7 +1287,7 @@ interface SheetNumbers {
   vmlBlocks: { next: number };
 }
 
-function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media: MediaStore, numbers: SheetNumbers, notes: Notes): SheetParts {
+function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media: MediaStore, numbers: SheetNumbers, notes: Notes, selected: boolean): SheetParts {
   const rels = new Rels();
   const out: SheetParts = { xml: '', rels };
   let metrics: SheetMetrics | undefined;
@@ -1299,7 +1300,7 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   // Filled in once the rows are written: the range of what was written.
   const dimensionAt = parts.length;
   parts.push('');
-  parts.push(`<sheetViews>${sheetViewXml(sheet)}</sheetViews>`);
+  parts.push(`<sheetViews>${sheetViewXml(sheet, selected)}</sheetViews>`);
   parts.push(sheetFormatXml(sheet));
   const formatCount = Math.max(workbook.styles.cellXfs.length, 1);
   const badFormat = 'Format: a cell, row or column refers to a format the workbook does not have and is written with the default one';
@@ -1534,6 +1535,12 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
     mediaTypes.set(kind.extension, kind.type);
   }
 
+  // The sheet the file opens on, which is also the one sheet its views mark as selected: one that is shown.
+  let active = isIndex(workbook.activeSheet, sheets.length) ? workbook.activeSheet : 0;
+  const shown = sheets.findIndex((sheet) => sheet.state !== 'hidden' && sheet.state !== 'veryHidden');
+  const activeHidden = shown >= 0 && (sheets[active].state === 'hidden' || sheets[active].state === 'veryHidden');
+  if (activeHidden) active = shown;
+
   // From here to the end nothing is awaited: the count is this build's alone.
   replacedCharacters = 0;
   const numbers: SheetNumbers = { drawing: 0, comments: 0, vmlBlocks: { next: 1 } };
@@ -1546,7 +1553,7 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
       notes.add(sheet.kind === 'dialogsheet' ? 'Sheet: a dialog sheet is written as a worksheet' : `Sheet: the content of a ${sheet.kind === 'chartsheet' ? 'chart sheet' : 'macro sheet'} is not in the model; it is written as an empty worksheet`);
     }
     const before = { drawing: numbers.drawing, comments: numbers.comments };
-    const parts = sheetXml(workbook, sheet, strings, media, numbers, notes);
+    const parts = sheetXml(workbook, sheet, strings, media, numbers, notes, index === active);
     if (parts.pending) pendingFormulas = true;
     written.push({ name: `xl/worksheets/sheet${index + 1}.xml`, parts, drawing: numbers.drawing > before.drawing ? numbers.drawing : 0, comments: numbers.comments > before.comments ? numbers.comments : 0 });
   });
@@ -1555,13 +1562,7 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
   const bookRels = new Rels();
   const ids = sheetIdsOf(sheets);
   let book = `${XML_DECLARATION}<workbook xmlns="${NS_MAIN}" xmlns:r="${NS_REL}"><workbookPr${workbook.date1904 ? ' date1904="1"' : ''}/>`;
-  let active = isIndex(workbook.activeSheet, sheets.length) ? workbook.activeSheet : 0;
-  const shown = sheets.findIndex((sheet) => sheet.state !== 'hidden' && sheet.state !== 'veryHidden');
-  if (shown >= 0 && (sheets[active].state === 'hidden' || sheets[active].state === 'veryHidden')) {
-    // The sheet a file opens on is one that is shown.
-    active = shown;
-    notes.add('Workbook: the active sheet is hidden; the first visible one is made the active sheet');
-  }
+  if (activeHidden) notes.add('Workbook: the active sheet is hidden; the first visible one is made the active sheet');
   book += `<bookViews><workbookView${active > 0 ? ` activeTab="${active}"` : ''}/></bookViews><sheets>`;
   sheets.forEach((sheet, index) => {
     const state = sheet.state === 'hidden' || sheet.state === 'veryHidden' ? ` state="${sheet.state}"` : '';

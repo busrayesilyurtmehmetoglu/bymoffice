@@ -327,7 +327,7 @@ function oneCell(ref: string | undefined): string | undefined {
   return range ? cellName(range.top, range.left) : undefined;
 }
 
-function sheetContent(sheet: Sheet, format: (index: number | undefined) => string, digests: Map<string, string> | undefined, expected: boolean): unknown {
+function sheetContent(sheet: Sheet, format: (index: number | undefined) => string, digests: Map<string, string> | undefined, expected: boolean, selected?: boolean): unknown {
   const metrics = createSheetMetrics(sheet);
   const indexes = [...sheet.rows.keys()].filter((index) => Number.isInteger(index) && index >= 0 && index < MAX_ROWS).sort((a, b) => a - b);
   const masters = new Map<number, { row: number; col: number; text: string }>();
@@ -356,6 +356,8 @@ function sheetContent(sheet: Sheet, format: (index: number | undefined) => strin
   }
 
   const view = { ...sheet.view };
+  // The one sheet a written file marks as selected is the sheet it opens on, whatever the sheets of the model say.
+  if (selected !== undefined) view.tabSelected = selected;
   if (expected) {
     view.activeCell = oneCell(view.activeCell);
     view.firstVisibleCell = oneCell(view.firstVisibleCell);
@@ -443,7 +445,7 @@ export function workbookContent(workbook: Workbook, options: ContentOptions = {}
       // Chart sheets and macro sheets are written as empty worksheets (with a warning), so the kind is not compared.
       sheets: workbook.sheets.map((sheet) => [sheet.name, sheet.state]),
     },
-    sheets: workbook.sheets.map((sheet) => sheetContent(sheet, format, options.digests, expected)),
+    sheets: workbook.sheets.map((sheet, index) => sheetContent(sheet, format, options.digests, expected, expected ? index === active : undefined)),
   };
 }
 

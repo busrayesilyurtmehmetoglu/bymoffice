@@ -1324,6 +1324,51 @@ function selectTab(raw: string, selected: boolean): string {
 }
 
 /**
+ * The part of a chart sheet with its views marked as those of the selected sheet, or as not
+ * selected; undefined when the part says so already, or cannot be read. A chart sheet is not
+ * in the model: its part is the file's, and only the <sheetViews> element is written anew
+ * here (added behind <sheetPr> when the sheet has none and becomes the selected one). Every
+ * other byte stays what it was. A part in UTF-16 is left alone: writing it would change all of it.
+ */
+function selectChartTab(original: Uint8Array, selected: boolean): Uint8Array | undefined {
+  if ((original[0] === 0xff && original[1] === 0xfe) || (original[0] === 0xfe && original[1] === 0xff)) return undefined;
+  try {
+    const whole = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(original);
+    const mark = whole.charCodeAt(0) === 0xfeff ? whole.charAt(0) : '';
+    const s = mark === '' ? whole : whole.slice(1);
+    const sc = new XmlScanner(s);
+    if (openRoot(sc) !== 'chartsheet') return undefined;
+    const prefix = sc.name.slice(0, sc.name.length - sc.local.length);
+    const views = `<${prefix}sheetViews><${prefix}sheetView tabSelected="1" workbookViewId="0"/></${prefix}sheetViews>`;
+    const rootStart = nextTag(s, 0);
+    let cursor = startTagEnd(s, rootStart);
+    // A root without content has no views to change, and none are made up for it.
+    if (sc.selfClosing) return undefined;
+    let insertAt = cursor;
+    while (sc.next()) {
+      if (sc.kind === 'close') break;
+      if (sc.kind !== 'open') continue;
+      const start = nextTag(s, cursor);
+      const local = sc.local;
+      const raw = sc.readRaw();
+      const end = start + raw.length;
+      if (local === 'sheetViews') {
+        let next = selectTab(raw, selected);
+        // A list without a view cannot say that the sheet is selected.
+        if (selected && next === raw && !/tabSelected/.test(raw)) next = views;
+        return next === raw ? undefined : encoder.encode(mark + s.slice(0, start) + next + s.slice(end));
+      }
+      if (local === 'sheetPr') insertAt = end;
+      cursor = end;
+    }
+    return selected ? encoder.encode(mark + s.slice(0, insertAt) + views + s.slice(insertAt)) : undefined;
+  } catch (error) {
+    // A chart sheet that cannot be read stays as it is.
+    return undefined;
+  }
+}
+
+/**
  * With a child of the worksheet root current: the text that takes its place,
  * and the element consumed.
  */
@@ -2204,6 +2249,8 @@ interface BookChange {
   relNamespace: string;
   /** Index of the sheet the file opens on. */
   active: number;
+  /** The sheets are those of the file, and the model opens on another one of them than the file does. */
+  activeMoved: boolean;
   /** Stored results may be stale: the application is asked to calculate when it opens the file. */
   recalculate: boolean;
 }
@@ -2286,8 +2333,9 @@ function updateSheetList(root: XmlElement, workbook: Workbook, change: BookChang
 }
 
 /**
- * The views of the workbook after sheets were added or deleted: the sheet shown is the active
- * one of the model, and the first tab shown stays the sheet it was (or what is at its place).
+ * The views of the workbook after sheets were added or deleted, or another sheet is the one
+ * shown: the sheet shown is the active one of the model, and the first tab shown stays the
+ * sheet it was (or what is at its place).
  */
 function updateBookViews(root: XmlElement, workbook: Workbook, change: BookChange, sheetIds: number[]): void {
   const prefix = prefixOf(root);
@@ -2340,6 +2388,8 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook, change: BookCha
     const sheetIds = updateSheetList(root, workbook, change);
     if (change.reordered) updateBookViews(root, workbook, change, sheetIds);
   }
+  // The same sheets, another one shown: no custom view has lost its sheet, so none is looked at.
+  if (change.activeMoved) updateBookViews(root, workbook, change, []);
 
   // localSheetId counts the sheets of the file; the model counts its own. A name is found by
   // the sheet it belongs to: the id of the file, the part of that sheet, the index it has now.
@@ -2546,8 +2596,26 @@ function activeSheetOf(workbook: Workbook): number {
   return active;
 }
 
+/** The active sheet of the model as the reader gives it: an index that is none stands for the first sheet. */
+function modelActiveOf(workbook: Workbook): number {
+  const active = workbook.activeSheet;
+  return active >= 0 && active < workbook.sheets.length && Math.floor(active) === active ? active : 0;
+}
+
+/** The sheet the file says it opens on, as the reader takes it (see readWorkbook): activeTab of the first view. */
+function fileActiveOf(root: XmlElement, count: number): number {
+  const views = childNamed(root, 'bookViews');
+  const view = views ? childrenNamed(views, 'workbookView')[0] : undefined;
+  const stated = (view && view.attrs.get('activeTab')) || '';
+  const active = /^\d{1,6}$/.test(stated) ? Number(stated) : 0;
+  return active < count ? active : 0;
+}
+
 /**
  * Brings the package up to date with the model. Does nothing when nothing was modified.
+ *
+ * The sheet the file opens on (Workbook.activeSheet) is written when anything else is: see
+ * `activeMoved` below.
  *
  * Sheets that were inserted, deleted or renamed (Workbook.sheetsModified):
  * - A sheet that is not in the file (Sheet.part === '') is written to a part of its own, the
@@ -2680,6 +2748,21 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     rename = { map, names: list };
   }
   const active = activeSheetOf(workbook);
+  // The sheet the file opens on follows the model, but only along with something else that is
+  // written: a file that was looked at and not edited is saved byte for byte, whatever sheet was
+  // shown last. A list of sheets that is marked as changed and is the list of the file again (a
+  // sheet inserted and taken back) is no change. The model is compared as the reader made it
+  // from the file, so that a file whose active sheet is hidden is not corrected on the way.
+  // Not in a file with several windows: each has its own active sheet and its own view of every
+  // sheet, and which of them the user looked at is not known. (Once sheets are added or deleted
+  // every window has to be brought in line anyway, and all of them open on the active sheet.)
+  // And only when the sheet that would be written is another one than the file has: a hidden
+  // sheet as the active one of the model stands for the first visible one.
+  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed;
+  const fileActive = fileActiveOf(book.root, file.length);
+  const bookViews = childNamed(book.root, 'bookViews');
+  const windows = bookViews ? childrenNamed(bookViews, 'workbookView').length : 0;
+  const activeMoved = edited && !reordered && windows <= 1 && modelActiveOf(workbook) !== fileActive && active !== fileActive;
 
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
@@ -2698,22 +2781,45 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const name = fileNameOf(sheet);
     return name === undefined ? [] : (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: name }));
   };
-  const edited = workbook.sheets.filter((sheet) => sheet.kind !== 'chartsheet' && sheet.part !== '' && sheet.structuralEdits && sheet.structuralEdits.length > 0);
+  const moving = workbook.sheets.filter((sheet) => sheet.kind !== 'chartsheet' && sheet.part !== '' && sheet.structuralEdits && sheet.structuralEdits.length > 0);
   const foreignOf = (sheet: Sheet): StructuralEdit[] => {
     let out: StructuralEdit[] = [];
-    for (const other of edited) if (other !== sheet) out = out.concat(editsOf(other));
+    for (const other of moving) if (other !== sheet) out = out.concat(editsOf(other));
     return out;
   };
 
   const movedNow = new Map<string, string[]>();
   for (let index = 0; index < workbook.sheets.length; index++) {
     const sheet = workbook.sheets[index];
-    if (sheet.kind === 'chartsheet' || sheet.part === '') continue;
+    if (sheet.part === '') continue;
+    const before = moved.get(sheet.part) || [];
+    if (sheet.kind === 'chartsheet') {
+      // A chart sheet is not in the model. Its part only ever changes in what it says about being the selected sheet.
+      const changed: string[] = [];
+      if (reordered || activeMoved) {
+        const bytes = await peek(sheet.part);
+        const next = bytes ? selectChartTab(bytes, index === active) : undefined;
+        if (bytes && next) {
+          keep(sheet.part, bytes);
+          writes.push([sheet.part, next]);
+          changed.push(sheet.part);
+        }
+      }
+      for (const part of before) {
+        const original = originals.get(part);
+        if (changed.indexOf(part) < 0 && original) writes.push([part, original]);
+      }
+      movedNow.set(sheet.part, changed);
+      continue;
+    }
     const fileName = fileNameOf(sheet) as string;
     const foreign = foreignOf(sheet);
-    const before = moved.get(sheet.part) || [];
     // Once sheets were added or deleted, the one sheet marked as selected is the active one.
-    const tabSelected = reordered && !!sheet.view.tabSelected !== (index === active) ? index === active : undefined;
+    // The same when another sheet of the file is the active one: the sheet that was marked and the one that is now are written.
+    // In a file with several windows a sheet has a view for each, and the model knows one of them:
+    // every sheet is looked at, and written when one of its views says something else.
+    let tabSelected = (reordered || activeMoved) && !!sheet.view.tabSelected !== (index === active) ? index === active : undefined;
+    if (reordered && windows > 1) tabSelected = index === active;
     if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
@@ -2964,8 +3070,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   }
 
   const bookParts: string[] = [];
-  if (recalculate || renamed) {
-    updateWorkbookXml(book, workbook, { file, renamed, reordered, relIds, relNamespace: relBase, active, recalculate });
+  if (recalculate || renamed || activeMoved) {
+    updateWorkbookXml(book, workbook, { file, renamed, reordered, relIds, relNamespace: relBase, active, activeMoved, recalculate });
     writes.push([main, book]);
     bookParts.push(main);
     if (reordered || renamed) {

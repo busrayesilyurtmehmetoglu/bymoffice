@@ -938,6 +938,212 @@ test.describe('pointing at another sheet', () => {
   });
 });
 
+test.describe('F4 while a formula is typed', () => {
+  const caret = (page: Page, field = input(page)): Promise<number[]> => field.evaluate((element) => [(element as HTMLTextAreaElement).selectionStart, (element as HTMLTextAreaElement).selectionEnd]);
+  const setCaret = (page: Page, start: number, end = start, field = input(page)) =>
+    field.evaluate((element, [start, end]) => (element as HTMLTextAreaElement).setSelectionRange(start, end), [start, end]);
+  /** Notes for every F4 that reaches the page whether something took the key for itself. */
+  const watchF4 = (page: Page) =>
+    page.evaluate(() => {
+      (window as any).__f4 = [];
+      window.addEventListener('keydown', (event) => {
+        if (event.key === 'F4') (window as any).__f4.push(event.defaultPrevented);
+      });
+    });
+  const f4Taken = (page: Page): Promise<boolean[]> => page.evaluate(() => (window as any).__f4.slice());
+
+  test('the reference at the caret goes A1, $A$1, A$1, $A1 and back, and typing goes on behind it', async ({ page }) => {
+    await mount(page, await pointWorkbook());
+    await watchF4(page);
+    await typeIn(page, 'A6', '=B2');
+    const seen: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      await page.keyboard.press('F4');
+      seen.push(await input(page).inputValue());
+      // The caret stands right behind the reference.
+      expect(await caret(page)).toEqual([seen[i].length, seen[i].length]);
+    }
+    expect(seen).toEqual(['=$B$2', '=B$2', '=$B2', '=B2']);
+    expect(await f4Taken(page)).toEqual([true, true, true, true]);
+    await page.keyboard.press('F4');
+    await expect(live(page)).toHaveText('$B$2');
+    await page.keyboard.type('*2+c3');
+    // The caret inside a reference, before it, and a range.
+    await setCaret(page, 9);
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=$B$2*2+$C$3');
+    await page.keyboard.type('+SUM(B3:C4');
+    await setCaret(page, 18);
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=$B$2*2+$C$3+SUM($B$3:$C$4');
+    expect(await caret(page)).toEqual([26, 26]);
+    await page.keyboard.type(')');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Enter');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'A6')).toEqual({ value: 240, formula: '$B$2*2+$C$3+SUM($B$3:$C$4)' });
+    // One undo step, as for every other edit.
+    expect(await view(page, 'view.undo()')).toBe(true);
+    expect(await cell(page, 'A6')).toEqual({});
+  });
+
+  test('every reference in the selection goes on, and the selection stays', async ({ page }) => {
+    await mount(page, await pointWorkbook());
+    await typeIn(page, 'A6', '=B2+C3+B:B');
+    await setCaret(page, 0, 6);
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=$B$2+$C$3+B:B');
+    expect(await caret(page)).toEqual([0, 10]);
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=B$2+C$3+B:B');
+    expect(await caret(page)).toEqual([0, 8]);
+    await setCaret(page, 9, 12);
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=B$2+C$3+$B:$B');
+    expect(await caret(page)).toEqual([9, 14]);
+    await page.keyboard.press('Escape');
+    expect(await cell(page, 'A6')).toEqual({});
+  });
+
+  test('where there is no reference the key does nothing and is left to the browser', async ({ page }) => {
+    await mount(page, await pointWorkbook());
+    await watchF4(page);
+    // Text that is no formula.
+    await typeIn(page, 'A6', 'B2');
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('B2');
+    await page.keyboard.press('Escape');
+    // A formula without a reference at the caret; a text in quotes; the name of a function.
+    await typeIn(page, 'A6', '=1+"B2"+LOG10(5)');
+    for (const at of [3, 6, 12, 16]) {
+      await setCaret(page, at);
+      await page.keyboard.press('F4');
+    }
+    await expect(input(page)).toHaveValue('=1+"B2"+LOG10(5)');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    // No cell is being edited.
+    await page.keyboard.press('F4');
+    expect(await editing(page)).toBe(false);
+    expect(await f4Taken(page)).toEqual([false, false, false, false, false, false]);
+    // With a modifier the key is not the view's either.
+    await typeIn(page, 'A6', '=B2');
+    await page.keyboard.press('Shift+F4');
+    await expect(input(page)).toHaveValue('=B2');
+    await page.keyboard.press('Escape');
+  });
+
+  test('a reference that was pointed at is changed, and the next press still takes its place', async ({ page, hasTouch }) => {
+    await mount(page, await pointWorkbook());
+    await typeIn(page, 'A6', '=SUM(');
+    await pressCell(page, hasTouch, 1, 1);
+    await expect(input(page)).toHaveValue('=SUM(B2');
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=SUM($B$2');
+    // The frame around the cell pointed at is still there.
+    await expect.poll(() => framePixels(page, 1, 1)).toBeGreaterThan(10);
+    // Another cell instead: the whole reference goes, "$" signs included, and nothing is left of it.
+    await pressCell(page, hasTouch, 2, 2);
+    await expect(input(page)).toHaveValue('=SUM(C3');
+    await page.keyboard.press('F4');
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=SUM(C$3');
+    await page.keyboard.type(',');
+    await pressCell(page, hasTouch, 3, 2);
+    await expect(input(page)).toHaveValue('=SUM(C$3,C4');
+    await page.keyboard.type(')');
+    await page.keyboard.press('Enter');
+    expect(await cell(page, 'A6')).toEqual({ value: 100, formula: 'SUM(C$3,C4)' });
+  });
+
+  test('after another reference was changed, a press does not write over the place the pointed one had', async ({ page, hasTouch }) => {
+    await mount(page, await pointWorkbook());
+    await typeIn(page, 'A6', '=B1+');
+    await pressCell(page, hasTouch, 1, 1);
+    await expect(input(page)).toHaveValue('=B1+B2');
+    // The first reference grows by two characters: the one pointed at is no longer where it was.
+    await setCaret(page, 2);
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=$B$1+B2');
+    expect(await caret(page)).toEqual([5, 5]);
+    // Behind an operand a press ends the edit, as it always did; the formula is written as it stands.
+    await setCaret(page, 8);
+    await pressCell(page, hasTouch, 2, 2);
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'A6')).toEqual({ value: 12, formula: '$B$1+B2' });
+    expect(await selection(page)).toEqual({ active: 'C3', range: 'C3' });
+  });
+
+  test('a reference to another sheet keeps the name of the sheet', async ({ page, hasTouch }) => {
+    await mount(page, await pointWorkbook());
+    await typeIn(page, 'A6', '=');
+    await pressTab(page, hasTouch, 'Satış 2026');
+    await pressCell(page, hasTouch, 0, 0);
+    await expect(input(page)).toHaveValue("='Satış 2026'!A1");
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue("='Satış 2026'!$A$1");
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue("='Satış 2026'!A$1");
+    await view(page, 'view.commitEditing()');
+    expect(await activeSheet(page)).toBe(0);
+    expect(await cell(page, 'A6')).toEqual({ value: 100, formula: "'Satış 2026'!A$1" });
+  });
+
+  test('Ctrl+Z in the editor takes the change back', async ({ page, hasTouch, browserName }) => {
+    test.skip(!!hasTouch, 'the undo of a text field is a key of a desktop keyboard');
+    await mount(page, await pointWorkbook());
+    await typeIn(page, 'A6', '=SUM(B2');
+    await page.keyboard.press('F4');
+    await expect(input(page)).toHaveValue('=SUM($B$2');
+    await page.keyboard.press('ControlOrMeta+z');
+    // WebKit takes everything typed into a field in a row for one undo step (see the test of pointing above).
+    if (browserName === 'webkit') await expect(input(page)).not.toHaveValue(/\$/);
+    else await expect(input(page)).toHaveValue('=SUM(B2');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    expect(await cell(page, 'A6')).toEqual({});
+  });
+
+  test('in the formula bar the key works on the text of the bar, which keeps the focus', async ({ page }) => {
+    await mountEditor(page, await pointWorkbook());
+    await watchF4(page);
+    await select(page, 'A6');
+    await bar(page).click();
+    await page.keyboard.type('=B2+C3');
+    await page.keyboard.press('F4');
+    await expect(bar(page)).toHaveValue('=B2+$C$3');
+    await expect(input(page)).toHaveValue('=B2+$C$3');
+    await expect(bar(page)).toBeFocused();
+    expect(await caret(page, bar(page))).toEqual([8, 8]);
+    await setCaret(page, 1, 1, bar(page));
+    await page.keyboard.press('F4');
+    await page.keyboard.press('F4');
+    await expect(bar(page)).toHaveValue('=B$2+$C$3');
+    await page.keyboard.press('Enter');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'A6')).toEqual({ value: 50, formula: 'B$2+$C$3' });
+
+    // A formula that is only shown in the bar: the key begins the edit.
+    await select(page, 'A6');
+    await bar(page).click();
+    await expect(bar(page)).toHaveValue('=B$2+$C$3');
+    expect(await editing(page)).toBe(false);
+    await setCaret(page, 4, 4, bar(page));
+    await page.keyboard.press('F4');
+    await expect(bar(page)).toHaveValue('=$B2+$C$3');
+    expect(await editing(page)).toBe(true);
+    await expect(input(page)).toHaveValue('=$B2+$C$3');
+    await page.keyboard.press('Escape');
+    expect(await cell(page, 'A6')).toEqual({ value: 50, formula: 'B$2+$C$3' });
+    // On a number in the bar the key is the browser's.
+    await select(page, 'B2');
+    await bar(page).click();
+    await page.keyboard.press('F4');
+    expect(await editing(page)).toBe(false);
+    expect((await f4Taken(page)).pop()).toBe(false);
+  });
+});
+
 test.describe('pointing in other languages and from the formula bar', () => {
   test('in Turkish the reference is the same, and the separator is what the user types', async ({ page, hasTouch }) => {
     await mount(page, await pointWorkbook(), { locale: 'tr' });

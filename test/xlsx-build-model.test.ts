@@ -51,7 +51,7 @@ const CT_FONT = ['b', 'i', 'strike', 'condense', 'extend', 'outline', 'shadow', 
 const CT_BORDER = ['start', 'end', 'left', 'right', 'top', 'bottom', 'diagonal', 'vertical', 'horizontal'];
 const CT_RPRELT = ['rFont', 'charset', 'family', 'b', 'i', 'strike', 'outline', 'shadow', 'condense', 'extend', 'color', 'sz', 'u', 'vertAlign', 'scheme'];
 
-test('buildXlsx: a workbook without sheets gets one, and an empty sheet is a sheet', async () => {
+test('buildXlsx: a workbook without sheets gets one, and an empty sheet is a sheet (the one the file opens on)', async () => {
   const empty = await build(bookOf());
   assert.deepEqual(empty.after.sheets.map((sheet) => [sheet.name, sheet.state, sheet.rowCount]), [['Sheet1', 'visible', 0]]);
   assert.deepEqual(empty.warnings, ['Workbook: it has no sheets; an empty one is written']);
@@ -60,7 +60,7 @@ test('buildXlsx: a workbook without sheets gets one, and an empty sheet is a she
   assert.deepEqual(blank.warnings, []);
   assert.deepEqual(blank.after.sheets.map((sheet) => [sheet.name, sheet.rows.size, sheet.dimension]), [['Boş', 0, { top: 0, left: 0, bottom: 0, right: 0 }]]);
   assert.deepEqual(blank.pkg.partNames(), ['/_rels/.rels', '/xl/workbook.xml', '/xl/_rels/workbook.xml.rels', '/xl/worksheets/sheet1.xml', '/xl/styles.xml']);
-  assert.equal(text(await blank.pkg.readPart('/xl/worksheets/sheet1.xml')).split('\n')[1], '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><dimension ref="A1"/><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetData/></worksheet>');
+  assert.equal(text(await blank.pkg.readPart('/xl/worksheets/sheet1.xml')).split('\n')[1], '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><dimension ref="A1"/><sheetViews><sheetView tabSelected="1" workbookViewId="0"/></sheetViews><sheetData/></worksheet>');
 });
 
 const AWKWARD = [

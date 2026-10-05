@@ -168,12 +168,93 @@ test.describe('data validation', () => {
     await typeIn(page, 'A3', 'many');
     expect(await editing(page)).toBe(true);
     await page.keyboard.press('Escape');
-    // Outside the rule anything goes; a formula is not checked.
+    // Outside the rule anything goes, a formula too.
     await typeIn(page, 'A10', '999');
     expect((await cell(page, 'A10')).value).toBe(999);
-    await typeIn(page, 'A4', '=50*2');
-    expect(await cell(page, 'A4')).toEqual({ value: 100, formula: '50*2' });
+    await typeIn(page, 'A11', '=50*2');
+    expect(await cell(page, 'A11')).toEqual({ value: 100, formula: '50*2' });
     expect(await editing(page)).toBe(false);
+  });
+
+  test('a formula is judged by what it gives when it is entered, and not again when that changes', async ({ page }) => {
+    const bytes = await checkWorkbook();
+    await mount(page, bytes);
+    const saved = () => page.evaluate(async () => Array.from((await (window as any).__file.save()) as Uint8Array));
+    // A2 is 3 and A3 is 4: their sum is within 1 to 10, ten times A3 is not.
+    await typeIn(page, 'A4', '=A3*10');
+    expect(await editing(page)).toBe(true);
+    await expect(message(page)).toHaveText('Quantity: Enter 1 to 10');
+    expect(await page.evaluate(() => (window as any).__editor.view.editText)).toBe('=A3*10');
+    expect(await cell(page, 'A4')).toEqual({ value: null, formula: null });
+    // Nothing of the attempt is left: the file is the one that was opened.
+    await page.keyboard.press('Escape');
+    expect(await saved()).toEqual(Array.from(bytes));
+    expect(await page.evaluate(() => (window as any).__editor.view.history.canUndo)).toBe(false);
+
+    await typeIn(page, 'A4', '=A2+A3');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'A4')).toEqual({ value: 7, formula: 'A2+A3' });
+    // Not a whole number; text.
+    await typeIn(page, 'A5', '=A3/8');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    await typeIn(page, 'A5', '=B1');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    expect(await cell(page, 'A5')).toEqual({ value: null, formula: null });
+    // What it reads changes afterwards: the formula stays, although it gives 13 now.
+    await typeIn(page, 'A3', '10');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'A4')).toEqual({ value: 13, formula: 'A2+A3' });
+
+    // A list takes what the formula gives, not its text; a rule that only warns writes and says so.
+    await typeIn(page, 'B3', '="Yes"');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'B3')).toEqual({ value: 'Yes', formula: '"Yes"' });
+    await typeIn(page, 'B4', '="Never"');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    await typeIn(page, 'C3', '=A2');
+    expect(await editing(page)).toBe(false);
+    await expect(message(page)).toHaveText('Unknown colour (the value was entered anyway)');
+    expect(await cell(page, 'C3')).toEqual({ value: 3, formula: 'A2' });
+    // The custom rule (ISNUMBER of the cell) reads the cell as the formula leaves it.
+    await typeIn(page, 'D2', '=A2*2');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'D2')).toEqual({ value: 6, formula: 'A2*2' });
+    await typeIn(page, 'D3', '=B1');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    expect(await cell(page, 'D3')).toEqual({ value: null, formula: null });
+  });
+
+  test('a formula that cannot be calculated here, or gives an error value, is let through', async ({ page }) => {
+    await mount(page, await checkWorkbook());
+    await typeIn(page, 'A4', '=NOSUCHFUNCTION(A2)*100');
+    expect(await editing(page)).toBe(false);
+    expect((await cell(page, 'A4')).formula).toBe('NOSUCHFUNCTION(A2)*100');
+    // UNSURE: whether Excel refuses a formula whose result is an error value; it is written here.
+    await typeIn(page, 'A5', '=1/0');
+    expect(await editing(page)).toBe(false);
+    expect((await cell(page, 'A5')).formula).toBe('1/0');
+  });
+
+  test('a formula typed the Turkish way is judged as the formula it is stored as; without calculation none is', async ({ page }) => {
+    await mount(page, await checkWorkbook(), { locale: 'tr' });
+    await typeIn(page, 'A4', '=TOPLA(A2;A3)*1,5');
+    expect(await editing(page)).toBe(true);
+    await page.keyboard.press('Escape');
+    await typeIn(page, 'A4', '=TOPLA(A2;A3)');
+    expect(await editing(page)).toBe(false);
+    expect(await cell(page, 'A4')).toEqual({ value: 7, formula: 'SUM(A2,A3)' });
+
+    await mount(page, await checkWorkbook(), { calculate: false });
+    await typeIn(page, 'A4', '=A3*10');
+    expect(await editing(page)).toBe(false);
+    expect((await cell(page, 'A4')).formula).toBe('A3*10');
+    // A value is still checked.
+    await typeIn(page, 'A5', '40');
+    expect(await editing(page)).toBe(true);
   });
 
   test('a rule without a message of its own says the default, in the language of the view', async ({ page }) => {

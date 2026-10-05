@@ -40,7 +40,7 @@ Sayfa, aşağıdaki kanallardan **var olan ilkine** gönderir (her gönderimde y
 Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen iletiler saklanır ve kanal 50 ms aralıklarla, **son başarılı gönderimden sonra** en çok 10 saniye aranır. Süre dolduktan sonra da uygulamanın her `receive` çağrısında saklanan iletiler (önce `ready`) yeniden denenir. Saklananlar için kurallar:
 
 - `ready`, `loaded`, `saved`, `error`, `done` asla düşürülmez ve sıraları korunur.
-- Durum bildiren iletilerden (`changed`, `selection`, `sheet`) her türden yalnız sonuncusu tutulur; birleştirilen `changed` iletisinin `sheets` alanı, yerine geçtiklerinin sayfalarını da içerir.
+- Durum bildiren iletilerden (`changed`, `selection`, `sheet`, `sheets`) her türden yalnız sonuncusu tutulur; birleştirilen `changed` iletisinin `sheets` alanı, yerine geçtiklerinin sayfalarını da içerir.
 - Saklanan iletilerin toplamı 64 milyon karakteri aşarsa en eski `saved` iletileri, aynı `id` ile `error` / `save-failed` iletisine çevrilir (dosya baytları bırakılır, isteğin yanıtı kaybolmaz).
 
 `ready`'yi kaçırdığını düşünen uygulama (ör. dinleyicisini sayfa yüklendikten sonra kuran bir üst sayfa) `{ "type": "hello" }` gönderir; sayfa `ready`'yi yeniden gönderir.
@@ -64,10 +64,13 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 | `setLocale` | `locale` (ör. `"tr"`, `"en"`); isteğe bağlı `id` | Sayı/tarih biçimlerinin, görünüm metinlerinin ve sayfanın kendi yazılarının dilini değiştirir |
 | `undo`, `redo` | isteğe bağlı `id` | Geri al, yinele (tablo ve belge). Bir şey değişirse `changed` gelir |
 | `print` | isteğe bağlı `id`, `dpi` (sayı, varsayılan 200), `sheets` (`"active"` varsayılan / `"all"`; yalnız tabloda) | Açık belgeyi ya da tabloyu yazdırır: sayfaları hazırlar ve sayfanın `window.print()`'ini çağırır. Yanıt: yazdırma penceresi kapanınca `done`, yapılamazsa `error` (aşağıda "Yazdırma") |
+| `insertSheet` | isteğe bağlı `id`, `at` (0 tabanlı yer; verilmezse sona), `name` (verilmezse görünümün dilinde sıradaki varsayılan ad: `Sayfa2`, `Sheet2`) | Boş bir çalışma sayfası ekler ve gösterir (tek geri alma adımı). Yanıt: `done` (`index` ve `name` ile) ya da `error` |
+| `renameSheet` | `index`, `name`; isteğe bağlı `id` | Sayfayı yeniden adlandırır; formüller yeni adı izler. Ad aynıysa hiçbir şey değişmez, yine `done` gelir |
+| `deleteSheet` | `index`; isteğe bağlı `id` | Sayfayı siler (onay sorulmaz; `undo` geri getirir) |
 | `close` | isteğe bağlı `id` | Dosyayı kapatır, süren yüklemeyi iptal eder, boş duruma döner. Dosya yokken de hata vermez |
 | `hello` | — | Sayfa `ready`'yi yeniden gönderir |
 
-`setReadOnly`, `setLocale`, `undo`, `redo`, `print` ve `close` başarılı olduğunda, **`id` verilmişse** `{ "type": "done", "id": …, "command": "<type>" }` ile onaylanır; `id` verilmemişse yanıt gelmez. `undo`/`redo` için `done`, komutun işlendiğini bildirir; geri alınacak bir şey olup olmadığını `changed` iletisi gösterir.
+`setReadOnly`, `setLocale`, `undo`, `redo`, `print`, `insertSheet`, `renameSheet`, `deleteSheet` ve `close` başarılı olduğunda, **`id` verilmişse** `{ "type": "done", "id": …, "command": "<type>" }` ile onaylanır; `id` verilmemişse yanıt gelmez. `undo`/`redo` için `done`, komutun işlendiğini bildirir; geri alınacak bir şey olup olmadığını `changed` iletisi gösterir.
 
 ```json
 { "type": "load", "id": "1", "data": "UEsDBBQ…", "name": "rapor.xlsx", "locale": "tr", "readOnly": false, "sheet": 0 }
@@ -75,6 +78,19 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 { "type": "setReadOnly", "readOnly": true }
 { "type": "load", "id": "3", "data": "0M8R4KGx…", "name": "eski.doc", "convert": true, "toolbar": true }
 { "type": "load", "id": "4", "blank": "docx", "locale": "tr" }
+```
+
+Sayfa işlemleri (`insertSheet`, `renameSheet`, `deleteSheet`):
+
+- Yalnız tabloda (xlsx; `convert` ile açılmış xls) çalışır ve görünümün kendi sekme şeridindeki işlemlerle aynı koddur: her biri tek geri alma adımıdır, kurallar ve sınırlar aynıdır ([kullanım kılavuzu](kullanim-kilavuzu.md), "Sayfa ekleme, silme, yeniden adlandırma"). O sırada düzenlenen hücre önce yazılır.
+- Güncel liste **her zaman** `sheets` iletisiyle gelir (aşağıda), `id` verilmemiş olsa da; `done` yalnız komutun işlendiğini bildirir. `insertSheet`'in `done` yanıtı yeni sayfanın `index` ve `name` alanlarını da taşır: `{ "type": "done", "id": …, "command": "insertSheet", "index": 1, "name": "Sayfa2" }`.
+- Alanlar denetlenir: `index` ve `at` 0 ya da daha büyük tam sayı, `name` en çok 255 karakterlik dizge olmalıdır; değilse `bad-message` (hiçbir şey denenmez). Adın sayfa adı kurallarına uyması (en çok 31 karakter, `\ / ? * [ ] :` yok, başka sayfanın adı değil…) görünümün işidir ve aşağıdaki `sheet-refused` ile reddedilir.
+- Hatalar: açık dosya yoksa `not-loaded`; açık dosya bir belgeyse ya da `index` hiçbir sayfanın dizini değilse (`at` için: sayfa sayısından büyükse) `no-sheet`; görünüm salt okunursa (`load.readOnly`, `setReadOnly(true)` ya da yazılamayan biçim) `read-only`; görünüm işlemi reddederse `sheet-refused`. `sheet-refused` iletisinin `message` alanı nedeni **görünümün dilinde** verir ve kullanıcıya gösterilebilir (ör. "Başka bir sayfa bu adı taşıyor", son görünür sayfa silinemez, grafik/pivot içeren kitapta silme yok, düzenlenen hücredeki değer veri doğrulamaya takıldı); kod hepsinde aynıdır.
+
+```json
+{ "type": "insertSheet", "id": "7", "name": "Özet", "at": 0 }
+{ "type": "renameSheet", "id": "8", "index": 1, "name": "Veri 2026" }
+{ "type": "deleteSheet", "id": "9", "index": 2 }
 ```
 
 Yazdırma (`print`):
@@ -109,7 +125,8 @@ Yazdırma (`print`):
 | `saved` | `id`?, `data` (base64), `name`?, `format`? ve `convertedFrom`? (yalnız dönüştürülerek açılmış dosyada, ikisi birlikte) | `save` başarılı |
 | `selection` | `sheet`, `range` (`"A1:B2"`, tek hücrede `"A1"`), `active` (`"A1"`) | Seçim değişince; **kare başına en çok bir kez**, yalnız o karedeki son seçim, bir öncekiyle aynıysa gönderilmez |
 | `sheet` | `index`, `name` | Gösterilen sayfa (sekme) değişince |
-| `done` | `id`, `command`, `readOnly`? (`true`: `setReadOnly(false)` istendi ama dosya salt okunur kalıyor) | `id` taşıyan `setReadOnly`, `setLocale`, `undo`, `redo`, `print`, `close` başarılı (`print`'te: yazdırma penceresi kapandı) |
+| `sheets` | `sheets: [{ name, state, kind }]` (`loaded.sheets` ile aynı biçim, listenin tamamı), `activeSheet` (gösterilen sayfanın dizini) | Sayfa listesi değişince: sayfa eklendi, silindi ya da adı değişti — komutla, kullanıcının sekme şeridinden ya da bunların geri alınması/yinelenmesiyle. Aynı değişikliğin `sheet` ve `changed` iletilerinden **önce** gelir. Belgede gelmez |
+| `done` | `id`, `command`, `readOnly`? (`true`: `setReadOnly(false)` istendi ama dosya salt okunur kalıyor) | `id` taşıyan `setReadOnly`, `setLocale`, `undo`, `redo`, `print`, `insertSheet`, `renameSheet`, `deleteSheet`, `close` başarılı (`print`'te: yazdırma penceresi kapandı; `insertSheet`'te ek olarak `index`, `name`) |
 | `link` | `url` | Belgede bir bağlantı etkinleştirildi (Bölüm 7) |
 | `error` | `id`?, `code`, `message` | Aşağıdaki durumlarda |
 
@@ -133,7 +150,10 @@ Yazdırma (`print`):
 | Kod | Anlam |
 |---|---|
 | `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), `data`/`url`/`blank`'ten birden fazlası ya da hiçbiri, `"docx"`/`"xlsx"` dışında bir `blank`, olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
-| `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale`, `print` gönderildi ama açık dosya yok |
+| `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale`, `print`, `insertSheet`, `renameSheet`, `deleteSheet` gönderildi ama açık dosya yok |
+| `read-only` | Sayfa komutu gönderildi ama görünüm salt okunur |
+| `no-sheet` | Sayfa komutu gönderildi ama açık dosya bir belge, ya da verilen dizinde sayfa yok |
+| `sheet-refused` | Sayfa komutunu görünüm reddetti; `message` nedeni görünümün dilinde verir (kullanıcıya gösterilebilir) |
 | `print-unavailable` | `print` gönderildi ama yazdırılamıyor: pencerede `print()` yok (ya da sayfayı barındıran uygulamanın verdiği görünüm yazdıramıyor) |
 | `print-failed` | Yazdırma başlatılamadı ya da yarıda kaldı: belge ya da tablo sınırların ötesinde uzun, tabloda yazdırılacak bir şey yok, bir sayfa çizilemedi, `print()` hata fırlattı, ya da sayfalar hazırlanırken dosya kapatıldı |
 | `unsupported` | Dosya gösterilemeyen bir türde (Word 95 ve öncesi, parola korumalı, Office dosyası olmayan içerik, boş içerik) |

@@ -31,18 +31,41 @@ function resolveTarget(source: string, target: string): string {
   return `/${segments.join('/')}`;
 }
 
+/**
+ * What a list of content types says, whatever order it says it in: every child of the root
+ * with its attributes. Two lists with the same signature declare the same types.
+ */
+function typesSignature(doc: XmlDocument): string {
+  const lines: string[] = [];
+  for (const node of doc.root.children) {
+    if (node.type !== 'element') continue;
+    const attrs = [...node.attrs].map(([name, value]) => `${name}=${JSON.stringify(value)}`).sort();
+    // Anything inside a declaration (there should be nothing) makes it one of its own.
+    lines.push(`${node.name} ${attrs.join(' ')}${node.children.length > 0 ? ` ${serializeXml({ ...doc, root: node })}` : ''}`);
+  }
+  return lines.sort().join('\n');
+}
+
 export class OpcPackage {
   private typesDirty = false;
+  /** The content types part as the file had it, and what it declares: see save(). */
+  private readonly typesBytes: Uint8Array;
+  private readonly typesWere: string;
 
   private constructor(
     readonly zip: ZipArchive,
     private types: XmlDocument,
-  ) {}
+    typesBytes: Uint8Array,
+  ) {
+    this.typesBytes = typesBytes;
+    this.typesWere = typesSignature(types);
+  }
 
   static async open(bytes: Uint8Array): Promise<OpcPackage> {
     const zip = ZipArchive.read(bytes);
     if (!zip.has(CONTENT_TYPES)) throw new Error('Not an OPC package: [Content_Types].xml is missing');
-    return new OpcPackage(zip, parseXml(await zip.read(CONTENT_TYPES)));
+    const typesBytes = await zip.read(CONTENT_TYPES);
+    return new OpcPackage(zip, parseXml(typesBytes), typesBytes);
   }
 
   // Part names are case-insensitive in OPC, ZIP entry names are not.
@@ -154,9 +177,15 @@ export class OpcPackage {
     return true;
   }
 
+  /**
+   * The package as a file. Content types that declare what the file declared (parts were
+   * added and removed again, in whatever order) are written with the bytes the file had,
+   * so that a package that was changed and changed back is the file that was opened.
+   */
   async save(): Promise<Uint8Array> {
     if (this.typesDirty) {
-      this.zip.set(CONTENT_TYPES, encoder.encode(serializeXml(this.types)));
+      const asInFile = typesSignature(this.types) === this.typesWere;
+      this.zip.set(CONTENT_TYPES, asInFile ? this.typesBytes : encoder.encode(serializeXml(this.types)));
       this.typesDirty = false;
     }
     return this.zip.write();

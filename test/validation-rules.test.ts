@@ -179,9 +179,10 @@ test('validation: whole numbers, decimals, dates, times and text lengths', async
   assert.equal(type('Q1', '19:30').ok, true);
 });
 
-test('validation: a formula is not checked, and neither is a cell whose rule shows no error', async () => {
+test('validation: a formula is checked by its result; a cell whose rule shows no error is not checked', async () => {
   const { type } = await load();
-  assert.equal(type('A1', '=99+1').ok, true);
+  assert.equal(type('A1', '=99+1').ok, false);
+  assert.equal(type('A1', '=9+1').ok, true);
   assert.equal(type('O1', '77').ok, true);
   assert.equal(type('P1', 'anything').ok, true);
 });

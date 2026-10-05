@@ -351,6 +351,69 @@ function rewrite(s: string, transform: Transform): string {
   return copied === 0 ? s : out + s.slice(copied);
 }
 
+/** A reference found in a formula text; see formulaReferences(). */
+export interface FormulaReference {
+  /** Offset of the token: of the sheet prefix when there is one, else of the reference itself. */
+  start: number;
+  /** Offset of the reference itself, after the "!" of a prefix. */
+  bodyStart: number;
+  /** Offset just past the reference. */
+  end: number;
+  kind: 'cell' | 'cols' | 'rows';
+  /** Whether the column and the row of the first corner are written with "$"; false for the side a column or row range does not have. */
+  absCol: boolean;
+  absRow: boolean;
+  /**
+   * The reference itself (without its prefix) written with or without "$" before the
+   * columns and the rows of both corners, as the text from `bodyStart` to `end` would be.
+   */
+  write(absCol: boolean, absRow: boolean): string;
+}
+
+/**
+ * The references of a formula text in the order they are written, as the functions of this
+ * module see them: whole words only ("A1" in "A1B2" and "E5" in "1E5" are none), not the
+ * name of a function or a table ("LOG10("), not inside a text in quotes, not what is left of
+ * a reference to a deleted sheet ("#REF!A1"). A range is one reference. References into
+ * another workbook are listed too. The text may begin with "="; nothing after a quote or
+ * bracket that is never closed is looked at. Never throws.
+ */
+export function formulaReferences(text: string): FormulaReference[] {
+  const s = toText(text);
+  const n = s.length;
+  const found: FormulaReference[] = [];
+  let i = 0;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 34) {
+      const q = skipQuoted(s, i, '"');
+      if (q < 0) break;
+      i = q;
+    } else if (c === 35) {
+      i = skipError(s, i);
+    } else if (c === 39 || c === 91 || isWordChar(c)) {
+      const item = readItem(s, i);
+      if (!item) break;
+      const ref = item.ref;
+      if (ref) {
+        found.push({
+          start: item.start,
+          bodyStart: item.bodyStart,
+          end: item.end,
+          kind: ref.kind === K_COL ? 'cols' : ref.kind === K_ROW ? 'rows' : 'cell',
+          absCol: ref.absC1,
+          absRow: ref.absR1,
+          write: (absCol, absRow) => formatRef({ ...ref, absC1: absCol === true, absC2: absCol === true, absR1: absRow === true, absR2: absRow === true }),
+        });
+      }
+      i = item.end;
+    } else {
+      i++;
+    }
+  }
+  return found;
+}
+
 // ---------------------------------------------------------------------------
 // Writing
 

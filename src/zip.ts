@@ -141,8 +141,21 @@ function stripZip64(extra: Uint8Array): Uint8Array {
   return extra;
 }
 
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export class ZipArchive {
   private entries = new Map<string, ZipEntry>();
+  /**
+   * The entries as the archive had them, in its order, by name. An entry that is given the
+   * content it had is written as the archive had it (compressed bytes, extra fields), and
+   * one that was deleted and comes back takes its place again: a package that is changed and
+   * changed back is the file that was opened. These objects are never changed.
+   */
+  private originals = new Map<string, { entry: ZipEntry; index: number }>();
   /** Archive comment, written back as it was read. */
   private comment: Uint8Array = EMPTY;
 
@@ -256,6 +269,7 @@ export class ZipArchive {
         comment: bytes.subarray(next - entryCommentLength, next),
         raw: bytes.subarray(dataStart, dataStart + compressedSize),
       });
+      zip.originals.set(name, { entry: zip.entries.get(name) as ZipEntry, index: zip.originals.size });
       p = next;
     }
     return zip;
@@ -292,9 +306,14 @@ export class ZipArchive {
     return data;
   }
 
-  /** Adds an entry or replaces its content; an existing entry keeps its position. */
+  /**
+   * Adds an entry or replaces its content; an existing entry keeps its position, and so does
+   * one the archive had and that was deleted since.
+   */
   set(name: string, data: Uint8Array): void {
-    const existing = this.entries.get(name);
+    const original = this.originals.get(name);
+    // Headers of the entry as it is now; of one that comes back, as the archive had them.
+    const existing = this.entries.get(name) || (original ? original.entry : undefined);
     this.entries.set(name, {
       name,
       method: METHOD_DEFLATE,
@@ -321,9 +340,53 @@ export class ZipArchive {
     return this.entries.delete(name);
   }
 
+  /**
+   * Whether the content waiting to be written for an entry is the content the archive had
+   * for it: the same length and checksum first, which settles nearly every case without
+   * inflating anything, then the bytes themselves.
+   */
+  private async isOriginal(entry: ZipEntry, original: ZipEntry): Promise<boolean> {
+    const data = entry.data as Uint8Array;
+    if (data.length !== original.uncompressedSize || crc32(data) !== original.crc32) return false;
+    if (original.method === METHOD_STORE) return sameBytes(data, original.raw);
+    try {
+      return sameBytes(data, await inflate(original.raw, original.uncompressedSize));
+    } catch (error) {
+      // An entry of the archive that cannot be read is not what anybody wrote here.
+      return false;
+    }
+  }
+
   async write(): Promise<Uint8Array> {
-    for (const entry of this.entries.values()) {
+    // Entries the archive had come first, in its order; whatever was deleted and came back is among them again.
+    let ordered = true;
+    let last = -1;
+    let added = false;
+    for (const name of this.entries.keys()) {
+      const original = this.originals.get(name);
+      if (!original) added = true;
+      else if (added || original.index < last) ordered = false;
+      else last = original.index;
+    }
+    if (!ordered) {
+      const names = [...this.entries.keys()];
+      const place = (name: string) => {
+        const original = this.originals.get(name);
+        return original ? original.index : Infinity;
+      };
+      // A stable sort: entries the archive did not have keep the order they were added in.
+      const sorted = names.map((name, at) => ({ name, at })).sort((a, b) => place(a.name) - place(b.name) || a.at - b.at);
+      const next = new Map<string, ZipEntry>();
+      for (const { name } of sorted) next.set(name, this.entries.get(name) as ZipEntry);
+      this.entries = next;
+    }
+    for (const [name, entry] of this.entries) {
       if (!entry.data) continue;
+      const original = this.originals.get(name);
+      if (original && (await this.isOriginal(entry, original.entry))) {
+        this.entries.set(name, original.entry);
+        continue;
+      }
       const compressed = entry.data.length > 0 ? await deflate(entry.data) : entry.data;
       const useDeflate = compressed.length < entry.data.length;
       entry.method = useDeflate ? METHOD_DEFLATE : METHOD_STORE;

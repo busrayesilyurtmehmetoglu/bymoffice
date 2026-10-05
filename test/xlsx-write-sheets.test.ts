@@ -644,13 +644,9 @@ test('sheets: a deleted sheet nothing refers to comes back by undo with the pack
   doc.history.undo();
   const back = await roundTrip(doc);
   assert.deepEqual(back.facts.parts, before.parts);
-  // The list of content types holds the same entries in another order; every part is the file's.
-  assert.deepEqual(await changedParts(original, back.bytes), ['[Content_Types].xml']);
-  const typesOf = async (bytes: Uint8Array) =>
-    all(parseXml(await text(bytes, '[Content_Types].xml')).root, 'Override')
-      .map((el) => `${el.attrs.get('PartName')} ${el.attrs.get('ContentType')}`)
-      .sort();
-  assert.deepEqual(await typesOf(back.bytes), await typesOf(original));
+  // Every part is the file's, the list of content types and of titles included, and so is the archive.
+  assert.deepEqual(await changedParts(original, back.bytes), []);
+  assert.ok(sameBytes(back.bytes, original), 'the file that was opened, byte for byte');
 });
 
 test('sheets: deleting the active sheet, the first sheet and a hidden sheet', async () => {
@@ -689,7 +685,7 @@ test('sheets: deleting the active sheet, the first sheet and a hidden sheet', as
 
   for (let i = 0; i < 3; i++) doc.history.undo();
   const back = await save(doc);
-  assert.deepEqual(await changedParts(original, back), ['[Content_Types].xml']);
+  assert.ok(sameBytes(back, original), 'the file that was opened, byte for byte');
 });
 
 test('sheets: a save that fails leaves the package as it was, and the next one succeeds', async () => {
@@ -797,9 +793,9 @@ test('sheets: insert, save, undo, save leaves no trace of the sheet; redo brings
   doc.history.undo();
   const back = await roundTrip(doc);
   assert.deepEqual(back.facts.parts, before.parts);
-  // The list of content types was written again, with the entries it had.
-  assert.deepEqual(await changedParts(original, back.bytes), ['[Content_Types].xml']);
-  assert.ok(!(await text(back.bytes, '[Content_Types].xml')).includes('sheet4'));
+  // Nothing is left of it: the file that was opened, byte for byte.
+  assert.deepEqual(await changedParts(original, back.bytes), []);
+  assert.ok(sameBytes(back.bytes, original));
 
   doc.history.redo();
   const redone = await roundTrip(doc);
@@ -810,7 +806,7 @@ test('sheets: insert, save, undo, save leaves no trace of the sheet; redo brings
   apply(doc, deleteSheet(doc.wb, 1));
   const deleted = await roundTrip(doc);
   assert.deepEqual(deleted.facts.parts, before.parts);
-  assert.deepEqual(await changedParts(original, deleted.bytes), ['[Content_Types].xml']);
+  assert.deepEqual(await changedParts(original, deleted.bytes), []);
 });
 
 test('sheets: two new sheets, one deleted again, and a name of the file taken by a new sheet', async () => {
@@ -1273,7 +1269,7 @@ test('review: relationships of a deleted sheet that point at the parts the packa
   assert.equal(valueOf(saved.wb, 1, 'A2'), 5);
   doc.history.undo();
   const back = await save(doc);
-  assert.deepEqual(await changedParts(original, back), ['[Content_Types].xml']);
+  assert.ok(sameBytes(back, original), 'the file that was opened, byte for byte');
   assert.deepEqual(names(await reopen(back)), ['Sheet1', 'Sheet2', 'Sheet3']);
 });
 

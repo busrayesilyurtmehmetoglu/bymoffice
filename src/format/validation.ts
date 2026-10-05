@@ -294,23 +294,35 @@ export class DataValidations {
    * they are, and puts everything back (see tryOps()). When it answers undefined the value
    * could not be tried, and the rule is not applied.
    *
-   * A formula is not checked (UNSURE: Excel checks its result), and neither is a cell
-   * whose rule says nothing happens on a wrong value. Never throws.
+   * A formula is judged by what it gives now, where it is entered; it is not judged again
+   * when the cells it reads change. A formula that cannot be calculated here (no engine, a
+   * function the engine lacks, another workbook) is let through, since Excel may well know
+   * what it gives. UNSURE: so is a formula that gives an error value; whether Excel refuses
+   * those is not known, and refusing what Excel takes would lose the input.
+   *
+   * A cell whose rule says nothing happens on a wrong value is not checked. Never throws.
    */
   check(row: number, col: number, cell: Cell | undefined, typed: string, tryOut?: <T>(run: () => T) => T | undefined): ValidationVerdict {
     try {
       const entry = this.entryAt(row, col);
       if (!entry) return OK;
       const rule = entry.rule;
-      if (!rule.showErrorMessage || rule.type === 'none' || (cell && cell.formula)) return OK;
+      if (!rule.showErrorMessage || rule.type === 'none') return OK;
       const date1904 = this.workbook.date1904 === true;
-      const value = plainValue(cell, date1904);
+      let value = plainValue(cell, date1904);
+      if (cell && cell.formula) {
+        const result = this.resultOf(cell.formula.text, row, col);
+        if (result === undefined) return OK;
+        value = result;
+        // A list looks for the text that was typed; of a formula that is what it gives.
+        typed = typeof result === 'string' ? result : typeof result === 'boolean' ? (result ? 'TRUE' : 'FALSE') : String(result);
+      }
       const failed: ValidationVerdict = { ok: false, style: rule.errorStyle };
       if (typeof rule.errorTitle === 'string' && rule.errorTitle !== '') failed.title = rule.errorTitle;
       if (typeof rule.error === 'string' && rule.error !== '') failed.message = rule.error;
       if (value === undefined || value === '') {
         // An error value typed in is never what a rule asks for; an empty cell is, where blanks are allowed.
-        if (cell && cell.kind === 'error') return failed;
+        if (cell && cell.kind === 'error' && !cell.formula) return failed;
         return rule.allowBlank ? OK : failed;
       }
       let passes: boolean | undefined;
@@ -452,6 +464,57 @@ export class DataValidations {
     if (isBeyondEngine(node)) return undefined;
     const value = engine.evaluateShifted(formula, { sheet: this.sheetIndex(), row: entry.anchorRow, col: entry.anchorCol }, { row, col });
     return isError(value) && value.error === '#NAME?' ? undefined : value;
+  }
+
+  /**
+   * What a formula typed into a cell gives there, from the values the cells hold now;
+   * undefined when that is not known (see calculate()) or is an error value. Not known
+   * either: while a calculation is under way (`incomplete`), when cells the formula reads
+   * may still hold values of before - the caller finishes the calculation first where it
+   * can; and of a formula that names its own cell, alone or within a range, which would be
+   * given the value the cell had (to Excel that is a circular reference).
+   */
+  private resultOf(formula: string, row: number, col: number): Plain | undefined {
+    const engine = this.engine();
+    if (!engine || engine.incomplete || typeof formula !== 'string' || formula === '') return undefined;
+    let node: Node;
+    try {
+      node = parseFormula(formula);
+    } catch (error) {
+      return undefined;
+    }
+    if (isBeyondEngine(node) || this.readsCell(node, row, col)) return undefined;
+    const value = engine.evaluateText(formula, { sheet: this.sheetIndex(), row, col });
+    return value === null || isError(value) ? undefined : value;
+  }
+
+  /** Whether a formula names a cell of this sheet in a reference of its own (not through a name or a function that makes references). */
+  private readsCell(root: Node, row: number, col: number): boolean {
+    const own = this.sheet.name.toLowerCase();
+    const stack: Node[] = [root];
+    while (stack.length > 0) {
+      const node = stack.pop() as Node;
+      switch (node.type) {
+        case 'ref': {
+          if (node.external || node.sheetEnd !== undefined || (node.sheet !== undefined && node.sheet.toLowerCase() !== own)) break;
+          const range = node.range;
+          if (row >= range.top && row <= range.bottom && col >= range.left && col <= range.right) return true;
+          break;
+        }
+        case 'call':
+          for (const arg of node.args) if (arg) stack.push(arg);
+          break;
+        case 'unary':
+          stack.push(node.operand);
+          break;
+        case 'binary':
+          stack.push(node.left, node.right);
+          break;
+        default:
+        // Constants and names hold nothing more.
+      }
+    }
+    return false;
   }
 
   /**
