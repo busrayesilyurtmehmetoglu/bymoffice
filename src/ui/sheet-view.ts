@@ -43,6 +43,7 @@ import {
   setFilterColumn,
 } from '../ops/filter';
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
+import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps } from '../ops/notes';
 import { canDeleteSheet, canRenameSheet, defaultSheetName, deleteSheet as deleteSheetOps, insertSheet as insertSheetOps, renameSheet as renameSheetOps } from '../ops/sheets';
 import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
@@ -83,6 +84,8 @@ export interface WorkbookViewOptions {
   readOnly?: boolean;
   /** Recalculate formulas after every change. Default true. */
   calculate?: boolean;
+  /** Who the notes added in this view are by. Default "Author". A note that is edited keeps its author. */
+  author?: string;
   /** Called after every change to the workbook, including undo and redo. */
   onChange?(change: { sheets: number[] }): void;
   /**
@@ -371,6 +374,13 @@ const STYLE_TEXT =
   'font:12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;letter-spacing:normal;text-transform:none;text-align:left;' +
   'white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain}' +
   '.bym-comment-author{font-weight:700}' +
+  // The field a note is typed in, in the place of the box that shows it.
+  '.bym-note-edit{background:#ffffe1;border:1px solid #b8b28a;border-radius:2px;box-shadow:0 1px 4px rgba(0,0,0,.25);overflow:hidden}' +
+  '.bym-note-input{-webkit-appearance:none;appearance:none;display:block;box-sizing:border-box;width:100%;height:100%;min-width:0;min-height:0;margin:0;padding:6px 8px;border:0;border-radius:0;' +
+  'outline:0;box-shadow:none;background:transparent;color:#202124;font:12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;letter-spacing:normal;text-transform:none;' +
+  'text-align:left;white-space:pre-wrap;overflow-wrap:break-word;resize:none;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain}' +
+  '.bym-note-input:focus-visible{outline:2px solid #1a73e8;outline-offset:-2px}' +
+  '.bym-note-input[aria-invalid="true"]{outline:2px solid #d93025;outline-offset:-2px}' +
   '.bym-comment-reply{margin-top:6px;padding-top:6px;border-top:1px solid #d8d2a8}' +
   '.bym-tabs{background:#f1f3f4;border-top:1px solid #dadce0}' +
   '.bym-tab{-webkit-appearance:none;appearance:none;display:block;float:none;flex:none;box-sizing:border-box;width:auto;height:auto;min-width:0;' +
@@ -449,6 +459,11 @@ interface PrintJob {
 }
 
 /** Largest size of the box that shows a comment beside its cell, in pixels; longer text scrolls. */
+/** Size of the field a note is typed in, in pixels; larger where a finger has to reach it. */
+const NOTE_FIELD_WIDTH = 220;
+const NOTE_FIELD_HEIGHT = 96;
+const NOTE_FIELD_WIDTH_COARSE = 260;
+const NOTE_FIELD_HEIGHT_COARSE = 132;
 const COMMENT_MAX_WIDTH = 280;
 const COMMENT_MAX_HEIGHT = 240;
 /** Runs of a comment that keep their own weight in the box; the rest follows as plain text of the last one. */
@@ -713,6 +728,8 @@ export class WorkbookView {
   private commentShown: { sheet: Sheet; row: number; col: number; comment: SheetComment } | undefined;
   /** The cell the mouse pointer is over, while it carries a comment. */
   private hoverComment: CellPos | undefined;
+  /** The note being typed: a field in the place of the box that shows the note of its cell. */
+  private noteEdit: { sheet: Sheet; row: number; col: number; box: HTMLDivElement; input: HTMLTextAreaElement; original: string; busy: boolean } | undefined;
   /** Sheets about which it was said that some of their drawings or comments are not shown. */
   private warned = new WeakSet<Sheet>();
   /** The comment of this cell was put away with Escape; it stays away until another cell is active. */
@@ -931,8 +948,9 @@ export class WorkbookView {
     // good - also when that is the sheet shown now, for a formula to point at.
     if (this.edit && (index !== this.sheetIndex || this.editAway())) this.commitEditing();
     if (index === this.sheetIndex) return;
-    // So does a name that is being typed for it.
+    // So does a name that is being typed for it, and a note that is being typed on it.
     this.finishRename(true, true);
+    this.finishNote(true, true);
     this.show(index);
   }
 
@@ -944,6 +962,7 @@ export class WorkbookView {
     this.endTouch();
     this.lastTap = undefined;
     this.hoverComment = undefined;
+    this.finishNote(true, true);
     this.sheetIndex = index;
     this.shown = this.workbook.sheets[index];
     this.showSheet();
@@ -1060,6 +1079,7 @@ export class WorkbookView {
     this.edit = undefined;
     this.point = undefined;
     this.renaming = undefined;
+    this.closeNote(false);
     this.closeMenu();
     const input = this.input;
     input.removeEventListener('keydown', this.onKeyDown);
@@ -1642,6 +1662,7 @@ export class WorkbookView {
    */
   private applySheetOps(kind: SheetOpKind, ops: Op[], index: number): void {
     this.closeMenu();
+    this.finishNote(true, true);
     this.endDrag();
     this.endTouch();
     // A calculation under way is finished first: the graph it works on does not outlive the step.
@@ -2344,6 +2365,7 @@ export class WorkbookView {
     this.placeInput();
     this.placeTip();
     this.placeComment();
+    this.placeNote();
   }
 
   // -------------------------------------------------- drawings and comments
@@ -2424,7 +2446,7 @@ export class WorkbookView {
     if (!this.commentShown && !(state.sheet.comments && state.sheet.comments.length > 0)) return;
     let target: { row: number; col: number; comment: SheetComment } | undefined;
     // Not in the way of an editor, a menu or a list.
-    if (!this.edit && !this.panel && !this.menu && !this.drag) {
+    if (!this.edit && !this.panel && !this.menu && !this.drag && !this.noteEdit) {
       const hover = this.hoverComment;
       if (hover) target = this.commentOf(hover.row, hover.col);
       if (!target) {
@@ -2484,6 +2506,206 @@ export class WorkbookView {
     box.style.left = `${Math.round(left)}px`;
     box.style.top = `${Math.round(top)}px`;
   }
+
+  // ------------------------------------------------------------------- notes
+
+  /**
+   * Sets the note of a cell of the shown sheet, as one undo step: `text` becomes its text (a
+   * cell without a note gets one by the `author` of the options), and without text (undefined,
+   * empty, only white space) the note is deleted. In a merged cell the note is the one of its
+   * top-left cell. Does nothing in a read-only view. Throws RangeError for a text that is too
+   * long and for a cell with a threaded comment, which is not edited here.
+   */
+  setComment(row: number, col: number, text: string | undefined): void {
+    if (this.destroyed || this.locked) return;
+    const r = toIndex(row, MAX_ROWS);
+    const c = toIndex(col, MAX_COLS);
+    this.commitEditing();
+    this.finishNote(true, true);
+    this.applyNote(r, c, text);
+  }
+
+  /**
+   * Opens the field the note of a cell is typed in, beside the cell (the active one without
+   * arguments), with the text of the note the cell has. Ctrl+Enter, or leaving the field,
+   * applies what was typed; Escape gives it up. Returns false when there is no field (a
+   * read-only view, a sheet without cells). Throws RangeError for a cell with a threaded comment.
+   */
+  editComment(row?: number, col?: number): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (this.state().sheet.kind !== 'worksheet') return false;
+    this.commitEditing();
+    this.finishRename(true, true);
+    this.finishNote(true, true);
+    this.closeMenu();
+    const state = this.state();
+    const r = row === undefined ? state.active.row : toIndex(row, MAX_ROWS);
+    const c = col === undefined ? state.active.col : toIndex(col, MAX_COLS);
+    const problem = noteProblem(this.workbook, this.sheetIndex, r, c);
+    if (problem) throw new RangeError(problem);
+    // The cell is selected and brought into view: the field stands beside it.
+    this.collapseTo({ row: r, col: c }, true);
+    const cell = this.state().active;
+    const found = commentAtCell(state.sheet, cell.row, cell.col);
+    const strings = this.strings;
+    const coarse = coarsePointer();
+    const box = document.createElement('div');
+    box.className = 'bym-note-edit';
+    box.style.cssText = 'position:absolute;z-index:2;left:0;top:0;box-sizing:border-box';
+    const input = document.createElement('textarea');
+    input.className = 'bym-note-input';
+    input.setAttribute('aria-label', `${strings.noteField} ${cellName(cell.row, cell.col)}`);
+    input.title = strings.noteHint;
+    input.maxLength = MAX_NOTE_TEXT;
+    input.setAttribute('autocomplete', 'off');
+    // A field with smaller text makes a phone zoom into the page.
+    if (coarse) input.style.fontSize = '16px';
+    // The text of a note comes from the file: it is only ever the value of the field.
+    input.value = found ? found.comment.text.replace(/\r\n?/g, '\n') : '';
+    box.appendChild(input);
+    this.root.appendChild(box);
+    input.addEventListener('keydown', this.onNoteKey);
+    input.addEventListener('input', this.onNoteInput);
+    input.addEventListener('blur', this.onNoteBlur);
+    input.addEventListener('compositionstart', this.onNoteComposition);
+    input.addEventListener('compositionend', this.onNoteComposition);
+    // As the field holds it: a text field turns every kind of line break into "\n".
+    this.noteEdit = { sheet: state.sheet, row: cell.row, col: cell.col, box, input, original: input.value, busy: false };
+    this.placeNote();
+    input.focus({ preventScroll: true });
+    try {
+      input.setSelectionRange(input.value.length, input.value.length);
+    } catch {
+      // Not rendered; the caret is wherever the browser put it.
+    }
+    this.schedule();
+    return true;
+  }
+
+  /** Whether a note is being typed in its field. */
+  get isEditingComment(): boolean {
+    return this.noteEdit !== undefined;
+  }
+
+  /** Applies a note to a cell of the shown sheet as one undo step, and says so when that deleted it. */
+  private applyNote(row: number, col: number, text: string | undefined): void {
+    const sheet = this.state().sheet;
+    const had = commentAtCell(sheet, row, col) !== undefined;
+    const done = this.applyOps(setCommentOps(this.workbook, this.sheetIndex, row, col, text, { author: this.options.author }));
+    // Nothing is left on the cell to be read out: that the note went is said in its place.
+    if (done && had && !commentAtCell(sheet, row, col)) this.live.textContent = this.strings.noteDeleted;
+  }
+
+  /**
+   * Ends typing a note. With `apply` the cell gets the text of the field; a text it cannot
+   * take is said, and the field stays open with it - unless the field is being left
+   * (`leaving`: the focus went elsewhere, another sheet is shown, another change is made).
+   */
+  private finishNote(apply: boolean, leaving = false): void {
+    const note = this.noteEdit;
+    if (!note || note.busy) return;
+    const focused = (note.input.getRootNode() as Document | ShadowRoot).activeElement === note.input;
+    // The sheet of the note left the workbook under the view, or is no longer the one shown: there is no cell to write.
+    const here = this.workbook.sheets[this.sheetIndex] === note.sheet;
+    // Text that was only looked at is no change, whatever the note holds (runs, other line breaks, no text at all).
+    if (apply && here && !this.locked && note.input.value !== note.original) {
+      note.busy = true;
+      try {
+        this.applyNote(note.row, note.col, note.input.value);
+      } catch (error) {
+        note.busy = false;
+        const message = this.localizeError(error);
+        if (!leaving) {
+          note.input.setAttribute('aria-invalid', 'true');
+          this.notify(message, 'error');
+          return;
+        }
+        this.closeNote(false);
+        this.notify(message, 'error');
+        return;
+      }
+      note.busy = false;
+    }
+    this.closeNote(!leaving && focused);
+  }
+
+  /** Takes the field of the note away, and gives the focus back to the cells when asked to. */
+  private closeNote(focusGrid: boolean): void {
+    const note = this.noteEdit;
+    if (!note) return;
+    // Forgotten first: taking the field away may report that it lost the focus.
+    this.noteEdit = undefined;
+    const { input, box } = note;
+    input.removeEventListener('keydown', this.onNoteKey);
+    input.removeEventListener('input', this.onNoteInput);
+    input.removeEventListener('blur', this.onNoteBlur);
+    input.removeEventListener('compositionstart', this.onNoteComposition);
+    input.removeEventListener('compositionend', this.onNoteComposition);
+    if (box.parentNode) box.parentNode.removeChild(box);
+    if (this.destroyed) return;
+    if (focusGrid) this.focusInput(false);
+    this.schedule();
+  }
+
+  /** Keeps the field of the note beside its cell, inside the view, through scrolling and resizing. */
+  private placeNote(): void {
+    const note = this.noteEdit;
+    if (!note) return;
+    const state = this.state();
+    if (state.sheet !== note.sheet) return;
+    const coarse = coarsePointer();
+    const width = Math.max(Math.min(coarse ? NOTE_FIELD_WIDTH_COARSE : NOTE_FIELD_WIDTH, this.width - 8), 0);
+    const height = Math.max(Math.min(coarse ? NOTE_FIELD_HEIGHT_COARSE : NOTE_FIELD_HEIGHT, this.height - 8), 0);
+    const merge = mergeIn(this.merges(), note.row, note.col);
+    const rect = rangeRect(this.layout(state), merge || { top: note.row, left: note.col, bottom: note.row, right: note.col });
+    // To the right of the cell as the box of the note is; to its left when there is no room; else wherever it fits.
+    const right = rect.x + rect.width + 8;
+    const leftSide = rect.x - width - 8;
+    const left = right + width <= this.width - 4 ? right : leftSide >= 4 ? leftSide : clamp(right, 4, Math.max(this.width - width - 4, 4));
+    const top = clamp(rect.y - 4, 4, Math.max(this.height - height - 4, 4));
+    const style = note.box.style;
+    style.width = `${width}px`;
+    style.height = `${height}px`;
+    style.left = `${Math.round(left)}px`;
+    style.top = `${Math.round(top)}px`;
+  }
+
+  private onNoteKey = (event: KeyboardEvent): void => {
+    // The keys of the field are its own (Enter is a new line, Ctrl+Z undoes what was typed in it): none reaches the grid.
+    event.stopPropagation();
+    // Enter or Escape that belongs to an input method is not for the note.
+    if (this.destroyed || event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.altKey) {
+      event.preventDefault();
+      this.finishNote(true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      this.finishNote(false);
+    } else if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === 'p' || event.key === 'P')) {
+      // As in the grid: the browser would print the host page.
+      event.preventDefault();
+      this.print().catch(() => undefined);
+    }
+  };
+
+  private onNoteInput = (event: Event): void => {
+    // Another text is being typed: what was said about the last one no longer holds.
+    (event.target as HTMLTextAreaElement).removeAttribute('aria-invalid');
+  };
+
+  private onNoteBlur = (event: FocusEvent): void => {
+    const note = this.noteEdit;
+    if (this.destroyed || !note || note.input !== event.target) return;
+    // The focus only left the page (another window, another tab): the field is still there when it comes back.
+    const root = note.input.getRootNode() as Document | ShadowRoot;
+    if (root.activeElement === note.input) return;
+    this.finishNote(true, true);
+  };
+
+  /** A composition in the field of a note is not one of the grid. */
+  private onNoteComposition = (event: Event): void => {
+    event.stopPropagation();
+  };
 
   /** Notes the cell under the mouse pointer when it carries a comment; the box follows in the next frame. */
   private hoverAt(x: number, y: number): void {
@@ -3203,7 +3425,10 @@ export class WorkbookView {
         else if (!this.locked) this.attempt(() => this.clearSelection());
         break;
       case 'F2':
-        this.startEditing();
+        // Shift+F2 is the note of the cell, as in Excel.
+        if (shift && !ctrl) {
+          if (!this.locked) this.attempt(() => void this.editComment());
+        } else this.startEditing();
         break;
       case 'b':
       case 'B':
@@ -3452,6 +3677,12 @@ export class WorkbookView {
     if (message === 'Cannot sort a range that contains merged cells') return strings.cannotSortMerged;
     if ((match = /^Cannot sort through the array formula in (.+)$/.exec(message))) return strings.cannotSortArray(match[1]);
     if ((match = /^Cannot (sort|filter) in a sheet with (.+): not supported yet$/.exec(message))) return strings.sortNotSupportedWith(match[1] as 'sort' | 'filter', match[2]);
+    if ((match = /^Cannot change the comment in (.+): it is a threaded comment$/.exec(message))) return strings.noteThreaded(match[1]);
+    if ((match = /^The text of a note cannot be longer than (\d+) characters$/.exec(message))) return strings.noteTooLong(Number(match[1]));
+    if (message === 'The sheet has too many comments') return strings.tooManyNotes;
+    if ((match = /^Cannot change the comments of this sheet: (.+)$/.exec(message))) {
+      return strings.notesBlocked(/legacy drawing/.test(match[1]) ? 'drawing' : /shared/.test(match[1]) ? 'shared' : 'parts');
+    }
     return sheetErrorText(message, strings) || strings.actionFailed;
   }
 
@@ -3617,6 +3848,7 @@ export class WorkbookView {
     if (next) {
       this.commitEditing();
       this.finishRename(true, true);
+      this.finishNote(true, true);
       this.closeMenu();
     }
     this.locked = next;
@@ -3840,6 +4072,8 @@ export class WorkbookView {
    */
   private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }): boolean {
     if (ops.length === 0) return false;
+    // A note that is being typed is a step of its own, before this one.
+    this.finishNote(true, true);
     const sheets: number[] = [];
     // Anything but a change of cells can change sizes, hidden runs or merged cells of its sheet.
     let structural = false;
@@ -3848,7 +4082,8 @@ export class WorkbookView {
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
-      if (op.type !== 'setCells') structural = true;
+      // A note changes no size and no position.
+      if (op.type !== 'setCells' && op.type !== 'setComments') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
       if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }
@@ -3889,6 +4124,11 @@ export class WorkbookView {
     // A name being typed for a sheet is given up, as a cell being edited is.
     if (this.renaming) {
       this.finishRename(false);
+      return true;
+    }
+    // So is a note being typed.
+    if (this.noteEdit) {
+      this.finishNote(false);
       return true;
     }
     const listBefore = this.workbook.sheets;
@@ -4200,7 +4440,7 @@ export class WorkbookView {
       event.preventDefault();
       return;
     }
-    if (typeof target.closest === 'function' && target.closest('button, input, .bym-menu')) return;
+    if (typeof target.closest === 'function' && target.closest('button, input, .bym-menu, .bym-note-edit')) return;
     event.preventDefault();
     this.focusInput(true);
   };
@@ -4626,9 +4866,33 @@ export class WorkbookView {
       if (cols > 0) items.push({ label: strings.insertColumnsLeft(cols), action: () => this.attempt(() => this.structural('insert', 'col', range.left, cols)) });
       if (rows > 0) items.push({ label: strings.deleteRows(rows), action: () => this.attempt(() => this.structural('delete', 'row', range.top, rows)) });
       if (cols > 0) items.push({ label: strings.deleteColumns(cols), action: () => this.attempt(() => this.structural('delete', 'col', range.left, cols)) });
+      this.noteItems(items);
     }
     this.showMenu(items, x, y);
     return true;
+  }
+
+  /** The note commands of the active cell for its menu: a note is added, or the one it has is edited or deleted. */
+  private noteItems(items: MenuItem[]): void {
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return;
+    const { row, col } = state.active;
+    const strings = this.strings;
+    let problem: string | undefined;
+    try {
+      problem = noteProblem(this.workbook, this.sheetIndex, row, col);
+    } catch (error) {
+      return;
+    }
+    // What cannot be done is shown all the same, and says why.
+    const reason = problem === undefined ? undefined : this.localizeError(problem);
+    const explain = reason === undefined ? undefined : () => this.notify(reason, 'error');
+    const edit = () => this.attempt(() => void this.editComment(row, col));
+    items.push({ label: '', separator: true });
+    if (commentAtCell(state.sheet, row, col)) {
+      items.push({ label: strings.editNote, disabled: reason !== undefined, title: reason, explain, action: edit });
+      items.push({ label: strings.deleteNote, disabled: reason !== undefined, title: reason, explain, action: () => this.attempt(() => this.setComment(row, col, undefined)) });
+    } else items.push({ label: strings.addNote, disabled: reason !== undefined, title: reason, explain, action: edit });
   }
 
   /**

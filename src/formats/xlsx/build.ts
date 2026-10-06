@@ -51,7 +51,7 @@ import {
   type StyleSheet,
   type Workbook,
 } from '../../model/sheet/types';
-import { adjustCommentCell, adjustDrawingAnchor } from '../../render/sheet-drawings';
+import { adjustCommentCell, adjustDrawingAnchor, commentEdits } from '../../render/sheet-drawings';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
 import { ZipArchive } from '../../zip';
 import {
@@ -69,6 +69,10 @@ import {
   formatElement,
   mergeCellsXml,
   replaceUnwritable,
+  VML_BLOCK,
+  defaultNoteAnchor,
+  noteShapeTypeXml,
+  noteShapeXml,
   rowXml,
   runPropertiesXml,
   textElement,
@@ -91,8 +95,6 @@ const EMU_PER_PIXEL = 9525;
 const MAX_EMU = 2e12;
 /** Groups inside groups that are written; deeper members are left out, as the reader leaves them out. */
 const MAX_GROUP_DEPTH = 16;
-/** Shape ids one <o:idmap> block of a legacy drawing stands for. */
-const VML_BLOCK = 1024;
 
 /** What a build did; filled in when passed with the options. */
 export interface XlsxBuildReport {
@@ -1132,11 +1134,13 @@ function commentsXml(sheet: Sheet, metrics: () => SheetMetrics, blocks: { next: 
     // Like anchors, comments stay where the file has them in the model: they follow the rows and columns
     // moved since, and one whose cell was deleted went with it.
     let comment = stated;
-    if (sheet.structuralEdits && sheet.structuralEdits.length > 0 && isIndex(stated.row, MAX_ROWS) && isIndex(stated.col, MAX_COLS)) {
-      const cell = adjustCommentCell(stated.row, stated.col, sheet.structuralEdits);
+    // A note added since stands where it was put: only the edits made after it move it.
+    const edits = commentEdits(stated, sheet.structuralEdits);
+    if (edits && edits.length > 0 && isIndex(stated.row, MAX_ROWS) && isIndex(stated.col, MAX_COLS)) {
+      const cell = adjustCommentCell(stated.row, stated.col, edits);
       if (!cell) continue;
       comment = { ...stated, row: cell.row, col: cell.col };
-      if (stated.box) comment.box = adjustDrawingAnchor(stated.box, sheet.structuralEdits);
+      if (stated.box) comment.box = adjustDrawingAnchor(stated.box, edits);
     }
     if (!isIndex(comment.row, MAX_ROWS) || !isIndex(comment.col, MAX_COLS)) {
       notes.add('Comment: a comment outside the sheet is left out');
@@ -1172,7 +1176,7 @@ function commentsXml(sheet: Sheet, metrics: () => SheetMetrics, blocks: { next: 
     items += `<comment ref="${cellName(comment.row, comment.col)}" authorId="${authorId(comment.author || '')}"><text>${richTextXml(text, comment.runs)}</text></comment>`;
 
     // The box: where the model says it is, else beside the cell, where applications put a new one.
-    let numbers = [Math.min(comment.col + 1, MAX_COLS - 1), 15, Math.max(comment.row - 1, 0), 10, Math.min(comment.col + 3, MAX_COLS - 1), 15, Math.min(comment.row + 3, MAX_ROWS - 1), 4];
+    let numbers = defaultNoteAnchor(comment.row, comment.col);
     const box = comment.box;
     if (box && box.kind === 'twoCell' && validMarker(box.from) && validMarker(box.to)) {
       const from = markerOffset(box.from, metrics());
@@ -1183,12 +1187,7 @@ function commentsXml(sheet: Sheet, metrics: () => SheetMetrics, blocks: { next: 
     // Block n stands for the ids n*1024 .. n*1024+1023, of which the first is not used.
     if (index % (VML_BLOCK - 1) === 0) used.push(blocks.next++);
     const id = used[used.length - 1] * VML_BLOCK + (index % (VML_BLOCK - 1)) + 1;
-    shapes +=
-      `<v:shape id="_x0000_s${id}" type="#_x0000_t202" style="position:absolute;visibility:${comment.visible ? 'visible' : 'hidden'}" fillcolor="#ffffe1" o:insetmode="auto">` +
-      '<v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/>' +
-      '<v:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></v:textbox>' +
-      `<x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>${numbers.join(', ')}</x:Anchor><x:AutoFill>False</x:AutoFill>` +
-      `<x:Row>${comment.row}</x:Row><x:Column>${comment.col}</x:Column>${comment.visible ? '<x:Visible/>' : ''}</x:ClientData></v:shape>`;
+    shapes += noteShapeXml(id, comment.row, comment.col, numbers, !!comment.visible);
   });
 
   let comments = `${XML_DECLARATION}<comments xmlns="${NS_MAIN}"><authors>`;
@@ -1197,8 +1196,7 @@ function commentsXml(sheet: Sheet, metrics: () => SheetMetrics, blocks: { next: 
   const vml =
     '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">' +
     `<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="${used.join(',')}"/></o:shapelayout>` +
-    '<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>' +
-    `${shapes}</xml>`;
+    `${noteShapeTypeXml()}${shapes}</xml>`;
   return { comments, vml };
 }
 

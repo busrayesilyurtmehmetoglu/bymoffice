@@ -6,7 +6,7 @@
 import type { OpcPackage, Relationship } from '../../opc';
 import { createSheet, type DefinedName, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
 import { childElements, localName, type XmlDocument, type XmlElement } from '../../xml';
-import { parsePersons, readSheetComments } from './comments';
+import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
 import { readSheetDrawings } from './drawings';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
@@ -77,6 +77,8 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
 
   const sheets: Sheet[] = [];
   const seenParts = new Set<string>();
+  /** The sheet that shows each comments part and legacy drawing: a part two sheets show cannot be changed for one of them. */
+  const noteParts = new Map<string, Sheet>();
   const sheetsElement = child(root, 'sheets');
   for (const element of sheetsElement ? childElements(sheetsElement, 'sheet') : []) {
     const name = element.attrs.get('name') ?? '';
@@ -107,8 +109,18 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
       }
       // Everything related to the sheet except links and printer settings is placed by cell position.
       const anchored = new Set<string>();
+      let commentParts = 0;
       for (const r of sheetRels) {
         const type = r.type.slice(r.type.lastIndexOf('/') + 1);
+        if ((type === 'comments' || type === 'vmlDrawing') && r.part && pkg.hasPart(r.part)) {
+          if (type === 'comments' && ++commentParts > 1 && sheet.notesBlocked === undefined) sheet.notesBlocked = 'parts';
+          const key = r.part.toLowerCase();
+          const other = noteParts.get(key);
+          if (other && other !== sheet) {
+            other.notesBlocked = 'shared';
+            sheet.notesBlocked = 'shared';
+          } else noteParts.set(key, sheet);
+        }
         if (type !== 'hyperlink' && type !== 'printerSettings') anchored.add(type);
         // A drawing may hold charts, whose series refer to cells of this sheet from yet another part.
         if (type === 'drawing' && r.part && pkg.hasPart(r.part)) {
@@ -119,7 +131,10 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
         }
         // Comment boxes are moved by the writer; form controls in the same part are not.
         if (type === 'vmlDrawing' && r.part && pkg.hasPart(r.part)) {
-          const vml = new TextDecoder().decode(await pkg.readPart(r.part));
+          const vmlBytes = await pkg.readPart(r.part);
+          // A drawing without so much as a root takes no boxes: the notes of the sheet are shown, not changed.
+          if (sheet.notesBlocked === undefined && !vmlTakesNotes(vmlBytes)) sheet.notesBlocked = 'drawing';
+          const vml = new TextDecoder().decode(vmlBytes);
           const kinds = vml.match(/ObjectType\s*=\s*"[^"]*"/g) || [];
           if (kinds.some((kind) => !/"Note"$/.test(kind))) anchored.add('formControl');
         }

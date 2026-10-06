@@ -20,6 +20,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - **RTF dosyalarını salt okunur açar ve gösterir** (`.doc` uzantısıyla kaydedilmiş RTF dahil; biçim içerikten tanınır): metin ve kod sayfaları (Türkçe 1254 dahil), karakter/paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, resimler, metin kutuları, şekiller (doc ile aynı kapsam: dikdörtgen, yuvarlatılmış dikdörtgen, elips, düz çizgi; dolgu ve çizgi). Yarıda kesilmiş RTF hata vermez; okunabilen kısmı gösterilir.
 - **Eski Excel dosyalarını (xls, Excel 97–2003) salt okunur açar**: hücreler, stiller, birleştirmeler, sütun/satır ölçüleri, dondurulmuş bölmeler, köprüler, tanımlı adlar, formül metinleri ve dosyadaki sonuçları, sayfa yapısı (kenar boşlukları, kâğıt, yön, ölçek/sığdırma, üstbilgi/altbilgi, sayfa sonları; `sheet.pageSetup`). `mount()` xls'i her zaman salt okunur kurar. **`file.saveAsXlsx()` xls'i xlsx olarak yazar** (aşağıda "xls dosyasını xlsx olarak kaydetme"). Ayrıntı için `BymOffice.readXlsWithReport(file.cfb)` okunmayan kayıtları ve çevrilemeyen formülleri sayar. Excel 5/95 dosyaları da okunur ama gerçek dosyayla sınanmamıştır.
 - **Excel sayfalarında görselleri, basit şekilleri/metin kutularını ve hücre yorumlarını gösterir** (xlsx ve xls): görseller (png, jpeg, gif, bmp, webp) çapalandıkları hücrelerde, satır/sütun eklenip silinince yazıcının dosyaya yazdığıyla aynı yere kayar; yorumlu hücrenin köşesinde kırmızı üçgen vardır ve üzerine gelince, hücre seçilince ya da dokununca yorum balonu açılır. Dış bağlantılı görseller yüklenmez; SVG/EMF/WMF yerinde yer tutucu görünür. Model: `sheet.drawings`, `sheet.comments`, `sheet.warnings`.
+- **Hücre notları eklenir, düzenlenir ve silinir** (xlsx): hücrenin sağ tık menüsünden ya da Shift+F2 ile; not hücrenin yanındaki alana yazılır, her değişiklik tek geri alma adımıdır ve `save()` ile dosyaya yazılır. Değişmeyen notlar, kutuları ve iş parçacıklı yorumlar (yazışmalar) dosyada bayt bayt korunur. Bkz. "Hücre notları".
 - **Sayfa yapısını (yazdırma ayarlarını) modele okur** (xlsx ve xls): `sheet.pageSetup` — kenar boşlukları, kâğıt boyutu, yön, ölçek ve sayfaya sığdırma, üstbilgi/altbilgi metinleri, yatay/dikey ortalama, kılavuz çizgisi ve başlık yazdırma, sayfa sonları. xls → xlsx dönüştürmede yeni dosyaya yazılır. Yazdırmada uygulanır ("Tabloyu yazdırma"); bu ayarları değiştiren bir arayüz yoktur.
 - **Word belgelerini yazdırır** (docx, doc, RTF; salt okunur görünümde de): belge çubuğundaki Yazdır düğmesi, Ctrl/Cmd+P ya da `print()` tarayıcının yazdırma penceresini belgenin kâğıt boyutunda açar; "PDF olarak kaydet" de oradan yapılır. Sayfalar görüntü olarak basılır (ayrıntı ve sınırlar: "Belgeyi yazdırma").
 - **Tabloları yazdırır** (xlsx, xls; salt okunur görünümde de): araç çubuğundaki Yazdır düğmesi, Ctrl/Cmd+P ya da `print()` etkin sayfayı (istenirse görünür bütün sayfaları) sayfa yapısına göre kâğıda dizer: kâğıt ve yön, kenar boşlukları, ölçek ya da sayfaya sığdırma, yazdırma alanı, yinelenen başlıklar, elle sayfa sonları, üstbilgi/altbilgi, kılavuz çizgisi ve satır/sütun başlığı seçenekleri (ayrıntı ve sınırlar: "Tabloyu yazdırma").
@@ -59,7 +60,8 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Model | doc ve RTF `document()` ile docx'le aynı belge modeline, xls `workbook()` ile aynı tablo modeline okunur. docx modeli `BymOffice.docOps` işlemleriyle düzenlenir ve `file.save()` ile dosyaya yazılır; doc ve RTF modeli yalnız `saveAsDocx()` ile docx olarak, xls modeli yalnız `saveAsXlsx()` ile xlsx olarak yazılır |
 | doc/xls biçimine yazma | Yok; `save()` özgün baytları döndürür (`saveAsDocx()`/`saveAsXlsx()` yeni biçime çevirir) |
 | Parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
-| Excel'de grafik ve pivot tablo gösterimi (yerinde yer tutucu görünür); görsel/şekil ekleme, taşıma, boyutlandırma; dikdörtgen, elips ve çizgi dışındaki şekil geometrileri; gradyan/desen dolgu, gölge; yorum ekleme/düzenleme | Yok; dosyada korunur |
+| Excel'de grafik ve pivot tablo gösterimi (yerinde yer tutucu görünür); görsel/şekil ekleme, taşıma, boyutlandırma; dikdörtgen, elips ve çizgi dışındaki şekil geometrileri; gradyan/desen dolgu, gölge | Yok; dosyada korunur |
+| Hücre notlarında: iş parçacıklı yorumu (Excel 365 "yorum"; yazışma) düzenleme, silme ve yanıtlama; yeni yazışma başlatma; not kutusunu taşıma/boyutlandırma ve "hep göster" ayarını değiştirme; notta zengin metin (kalın, renk); kopyala/kes-yapıştır ile notu taşıma; sıralamada notların satırlarıyla taşınması; editör araç çubuğunda not düğmesi; köprüde not komutu; xls'e yazma | Yok. İş parçacıklı yorumu olan hücrede not komutları nedeniyle birlikte devre dışıdır ve yorum dosyada bayt bayt kalır. Biçimli bir notun metni düzenlenirse not **tek biçimli düz metin** olur (düzenlenmeyen notların biçimi korunur). Notlu sayfada sıralama reddedilir. Hücre içeriğini silmek (Delete) notu silmez |
 | npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
 | 4 GB ve üzeri arşiv yazma | Yok |
 
@@ -164,6 +166,7 @@ Bir dosyayı açar ve `container` içinde gösterir: xlsx ve xls tablo düzenley
 | `locale` | Sayı ve tarih biçimlerinin dili: `'tr'`, `'en'` gibi bir etiket ya da tam bir `FormatLocale` nesnesi. Verilmezse tarayıcının dili (`navigator.language`); Türkçe dışındaki her dil İngilizce (en-US) kurallarıyla gösterilir |
 | `toolbar`, `formulaBar`, `statusBar` | `false` verilirse ilgili bölüm gösterilmez (varsayılan hepsi `true`). Üçü de kapalıyken yalnız ızgara ve sayfa sekmeleri kalır |
 | `calculate` | `false` verilirse formüller yeniden hesaplanmaz (varsayılan `true`) |
+| `author` | Tabloda: bu görünümde **eklenen notların** yazarı (dosyaya `<author>` olarak yazılır). Verilmezse `"Author"`; 255 karakterden uzunsa kesilir. Düzenlenen not kendi yazarını korur. Belgede: izlenen değişikliklerin yazarı (bkz. "Belge koruması ve değişiklik izleme") |
 | `onNotice({ message, kind })` | Kullanıcıya gösterilen hata ve bilgi iletileri (arayüz dilinde) |
 | `sheet` | İlk gösterilecek sayfanın dizini. Verilmezse dosyanın etkin sayfası; o gizliyse ilk görünür sayfa |
 | `readOnly` | `true` ise düzenleme kapalıdır (editör, yapıştırma, kesme, silme, geri al, satır/sütun komutları çalışmaz); kopyalama çalışır. Varsayılan `false` |
@@ -188,7 +191,8 @@ Izgaranın (`mounted.view`) üyeleri:
 | `setLocale(locale)` | Sayı ve tarih biçimlerinin dilini değiştirir ve yeniden çizer |
 | `setCellInput(row, col, text)` | Hücreye, kullanıcı yazmış gibi metin girer (tek geri alma adımı) |
 | `startEditing(text?)`, `commitEditing()`, `cancelEditing()`, `isEditing` | Hücre editörünü programla açar, yazar, kapatır |
-| `clearSelection()` | Seçili aralığın içeriğini siler, biçimi korur |
+| `clearSelection()` | Seçili aralığın içeriğini siler, biçimi korur (notlar kalır) |
+| `setComment(row, col, text)`, `editComment(row?, col?)`, `isEditingComment` | Hücrenin notunu yazar ya da (metin `undefined`/boşsa) siler; not alanını hücrenin yanında açar. Aşağıda "Hücre notları" |
 | `undo()`, `redo()`, `history.canUndo`, `history.canRedo` | Geri al ve yinele; seçim ve sayfa da geri döner |
 | `insertSheet(at?, name?)`, `renameSheet(index, name)`, `deleteSheet(index)`, `startRename(index)`, `isRenaming` | Sayfa ekler, yeniden adlandırır, siler; sekmede ad alanını açar. Aşağıda "Sayfa ekleme, silme, yeniden adlandırma" |
 | `cycleReference()` | F4'ün yaptığı: yazılmakta olan formülde imlecin durduğu (ya da seçimin değdiği) başvuruları bir sonraki hale geçirir (`A1` → `$A$1` → `A$1` → `$A1`). Değiştirecek başvuru yoksa ya da formül yazılmıyorsa `false` döner |
@@ -624,6 +628,47 @@ history.undo();
 | `fileSheetName(sheet)`, `currentSheetName(workbook, nameInFile)`, `sheetNameMap(workbook)` | Sayfanın dosyadaki adı (dosyada olmayan yeni sayfada `undefined`); dosyadaki bir adın bugünkü karşılığı (`null`: silindi); hepsi için eşleme işlevi (hiçbir ad değişmediyse `undefined`). Dosyadan olduğu gibi tutulan içerik (koşullu biçim, veri doğrulama kuralları) sayfaları dosyadaki adlarıyla anar |
 | `Op` türleri `insertSheet`, `deleteSheet`, `renameSheet`, `restoreSheets`; `SheetsSnapshot` | İlk üçünün tersi `restoreSheets`'tir (kendi tersidir) ve sayfa listesinin önceki halini `SheetsSnapshot` olarak taşır. Hepsinde `sheet` etkilenen dizindir |
 
+### Hücre notları
+
+Bir hücrenin notu (Excel 365'te "not", eski sürümlerde "açıklama"; dosyada `xl/commentsN.xml` + `xl/drawings/vmlDrawingN.vml`) görünümden ve programla eklenir, düzenlenir, silinir. Her değişiklik **tek geri alma adımıdır** ve `save()` ile dosyaya yazılır.
+
+```js
+const view = mounted.view;                    // WorkbookView
+view.setComment(1, 1, 'Kontrol edildi');      // B2'ye not yazar (yoksa ekler, varsa metnini değiştirir)
+view.setComment(1, 1, undefined);             // notu siler (boş ya da yalnız boşluk metin de siler; aşağıda "Metin kuralı")
+view.editComment();                           // etkin hücrenin not alanını açar; editComment(4, 0) → A5
+view.isEditingComment;                        // not alanı açık mı
+```
+
+- **Arayüz:** hücrenin sağ tık menüsünde (dokunmatikte uzun basma) notu olmayan hücrede **Not ekle**, olan hücrede **Notu düzenle** ve **Notu sil**; klavyede **Shift+F2** etkin hücrenin notunu ekler ya da düzenler. Not, balonun yerinde açılan çok satırlı alana (`.bym-note-input`) yazılır: **Ctrl+Enter** (macOS'ta Cmd+Enter de) ya da alanın dışına tıklamak/dokunmak **uygular**, **Esc vazgeçer**, Enter yeni satırdır. Alandayken tuşlar ızgaraya gitmez; giriş yöntemi (IME) bileşimi sırasındaki Enter/Esc notu etkilemez. Alan açıkken başka bir sayfa gösterilirse, görünüm salt okunura alınırsa ya da programdan başka bir değişiklik yapılırsa yazılan önce uygulanır; `undo()`/`redo()` çağrısı ise yazılanı bırakır (hücre editöründe olduğu gibi). Metni boşaltıp uygulamak notu siler. **Alan açılıp metin değiştirilmeden kapatılırsa hiçbir şey değişmez** (geri alma adımı oluşmaz; biçimli, satır sonu farklı ya da metni boş bir not olduğu gibi kalır). Köşedeki kırmızı üçgen ve balon hemen güncellenir; silme canlı bölgeden "Not silindi" diye duyurulur.
+- **Yazar:** yeni notun yazarı `mount({ author })` / `new WorkbookView(…, { author })` seçeneğidir; verilmezse `"Author"` yazılır (UNSURE: Excel oturum açan kullanıcının adını yazar; var olan notların yazarı yeni nota **verilmez**). Excel'in yeni nota kendiliğinden eklediği kalın "Ad:" satırı eklenmez; metin yazıldığı gibidir, yazar balonda ayrıca gösterilir. Düzenlenen not yazarını korur.
+- **Sınırlar ve retler:** metin en çok 32.767 karakterdir (hücre metni sınırı); aşan metin `RangeError` ile reddedilir ve alan açık kalır. **İş parçacıklı yorumu** (yazışma) olan hücrede ekleme, düzenleme ve silme reddedilir (`RangeError`; menüde öğeler devre dışıdır ve nedenini söyler); aynı sayfadaki öbür notlar düzenlenebilir. Salt okunur görünümde (ve dönüştürülmemiş xls'te) not komutları yoktur, yöntemler hiçbir şey yapmaz.
+- **Metin kuralı (tek kural):** `undefined` notu siler; notun zaten taşıdığı metin (satır sonu yazımı dışında aynıysa) **değişiklik değildir**; bunların dışında boş ya da yalnız boşluk olan metin notu siler. Yani metni boş bir dosya notuna `''` vermek onu silmez (silmek için `undefined`); notu olmayan hücreye boş metin not eklemez.
+- **Birleşik hücre:** birleşik alanın tek notu vardır: sol üst hücresindeki, o yoksa alanın içindeki herhangi bir hücrede duran not (not yazıldıktan sonra birleştirilen hücreler). Alanın hangi hücresi verilirse verilsin o not düzenlenir/silinir; alana ikinci not eklenmez. Yeni not sol üst hücreye konur. (Sol üstte olmayan notun köşe işareti ve balonu gösterilmez; menü ve Shift+F2 onu bulur.)
+- **Not işlemlerinin kapalı olduğu sayfalar:** not kutularının çizimi (VML) okunamayan, yorum parçasını başka bir sayfayla paylaşan ya da birden çok yorum parçası olan sayfada notlar gösterilir ama eklenemez, düzenlenemez, silinemez (`sheet.notesBlocked`: `"drawing"` / `"shared"` / `"parts"`; `noteProblem` nedenini verir, menüde öğeler nedeniyle devre dışıdır). Sayfanın geri kalanı düzenlenir ve kaydedilir.
+- **Öbür işlemlerle:** satır/sütun eklenip silinince notlar hücreleriyle kayar; hücresi silinen not silinir (geri alınınca döner). Hücre içeriğini silmek, kesmek, kopyalayıp yapıştırmak notu **silmez ve taşımaz**. Üzerinde not (ya da yazışma) duran sayfada sıralama reddedilir (not satırıyla taşınamadığı için); bütün notları silinmiş ya da satırlarıyla gitmiş sayfa sıralanır (okuyucunun gösteremediği yorumu olan sayfa hariç). Sayfa silinince notlarının parçaları da paketten çıkar.
+- **Biçimli notlar:** birden çok biçimli (kalın yazar adı + düz metin gibi) bir notun metni düzenlenirse not tek biçimli düz metin olur; kutusu, yazarı ve "hep göster" ayarı kalır. Düzenlenmeyen notlar biçimleriyle bayt bayt korunur.
+- **Dosyaya yazma:** yalnız notları değişen sayfanın not parçaları yeniden yazılır; değişmeyen her `<comment>` öğesi ve her VML şekli (form denetimleri dahil) özgün baytlarıyla, satır sonlarıyla birlikte kalır (parça kes-ekle ile yazılır; satır/sütun kaydırması gereken sayfada yorum parçası baştan serileştirilir). UTF-16 parça UTF-8 olarak yazılır ve bildirimi düzeltilir. İlk notu eklenen sayfaya `xl/commentsN.xml`, `xl/drawings/vmlDrawingN.vml`, ilişkileri ve sayfa XML'inde `<legacyDrawing>` eklenir (içerik türleri parça başına `Override` ile bildirilir); son notu silinen sayfada bunlar kaldırılır (form denetimi taşıyan VML kalır). Yalnız not değiştiren bir düzenleme yeniden hesap istemez (`fullCalcOnLoad` yazılmaz, `calcChain` kalır) ve hücre verisine dokunmaz. Sayfa parçası yalnız ilk notta (`<legacyDrawing>` eklenir) ve son notta (kaldırılır) değişir, başka hiçbir baytı değişmez; çalışma kitabı parçası ve iki sayfanın `tabSelected` işareti yalnız gösterilen sayfa dosyadakinden farklıysa yazılır (her kayıtta olduğu gibi). **"not ekle/düzenle/sil → kaydet → geri al → kaydet" açılan dosyayı bayt bayt geri verir** (arada hücre ya da satır/sütun değişikliği yapılmadıysa). Yeni kutunun yeri ve boyutu sabittir (hücrenin sağ üstü; Excel açınca kendi ölçüsüne göre çizer).
+
+Görünüm olmadan, model üzerinde:
+
+```js
+const history = new BymOffice.History(workbook);
+history.apply(BymOffice.setComment(workbook, 0, 1, 1, 'Not', { author: 'Ada' }), undefined, undefined);
+BymOffice.noteProblem(workbook, 0, 1, 1);          // yapılamıyorsa İngilizce neden, yoksa undefined
+BymOffice.commentAtCell(workbook.sheets[0], 1, 1); // { comment, index } | undefined — hücrenin ŞİMDİKİ yerine göre
+```
+
+| Üye | İş |
+|---|---|
+| `setComment(workbook, sheetIndex, row, col, text, { author? })` | İşlemi (`Op[]`) üretir, modeli değiştirmez; değişiklik yoksa boş dizi. Metin kuralı yukarıdadır. Satır sonları `\n` yapılır |
+| `noteProblem(workbook, sheetIndex, row, col)`, `commentAtCell(sheet, row, col)` | Ret nedeni; hücrenin (birleşikse birleşik alanın) şimdiki notu |
+| `MAX_NOTE_TEXT`, `DEFAULT_NOTE_AUTHOR` | 32767; `"Author"` |
+| `Op` türü `setComments` | Sayfanın yorum listesini değiştirir (`comments: SheetComment[] \| undefined`); tersi yine `setComments`'tir. Liste değiştirilmez, yenisiyle değiştirilir |
+| `commentCellNow(comment, edits)`, `commentEdits(comment, edits)` | Bir yorumun şimdi durduğu hücre (hücresi silindiyse `undefined`); yorumu kaydıran yapısal düzenlemeler |
+
+**Modelde konum kuralı.** `sheet.comments` dosyadaki yorumları **dosyadaki** hücreleriyle tutar; sonradan eklenen/silinen satır ve sütunlar (`sheet.structuralEdits`) gösterirken ve yazarken uygulanır. Sonradan **eklenen** not ise konduğu andaki hücresini ve o ana dek yapılmış yapısal düzenleme sayısını (`comment.since`) taşır; onu yalnız daha sonraki düzenlemeler kaydırır. Düzenlenen dosya notu yerinde kalır, yalnız metni değişir. Görünüm, `writeXlsx` ve `buildXlsx` aynı işlevi (`commentCellNow`) kullanır. `sheet.commentsModified` notların değiştiğini, `sheet.modified`'dan bağımsız olarak söyler.
+
 ### Tablo modeli: `file.workbook()`
 
 İlk çağrıda dosyayı okur, sonraki çağrılarda aynı nesneyi döndürür. Modeli okumak dosyayı değiştirmez; `save()` yine özgün baytları verir.
@@ -816,7 +861,7 @@ Sayfada yapabilecekleriniz:
 - Bir ya da birden çok dosyayı sürükleyip bırakmak ya da seçmek.
 - Her dosya için biçimi, boyutu, açılış süresini ve "kaydet → yeniden aç" sonucunu görmek (yeşil: tüm parçalar aynı; sarı: desteklenmiyor ya da ikili biçim; kırmızı: hata ya da içerik değişti).
 - Parçaya ya da akışa tıklayıp içeriğini görmek (XML metin olarak, diğerleri onaltılık döküm).
-- xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler) ve **hücre düzenleme** (yazma, geri al/yinele, kopyala/yapıştır, satır/sütun ekle-sil; üstteki düğmeler ve "Salt okunur" seçimi); araç çubuğundaki **Yazdır** düğmesi (ya da Ctrl/Cmd+P) etkin sayfayı sayfa yapısına göre yazdırır; altında seçili aralık, etkin hücrenin görünen değeri, ham değeri ve formülü yazar. "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; indirilen dosyayı Excel'de açıp denetleyebilirsiniz. "Sayı ve tarih biçimi dili" seçimiyle Türkçe ve İngilizce gösterim arasında geçilir.
+- xlsx dosyalarında **tablo görünümü**: gerçek ızgara (kaydırma, seçim, klavye, sayfa sekmeleri, dondurulmuş bölmeler) ve **hücre düzenleme** (yazma, geri al/yinele, kopyala/yapıştır, satır/sütun ekle-sil; üstteki düğmeler ve "Salt okunur" seçimi); **hücre notları** (sağ tık → Not ekle / Notu düzenle / Notu sil, ya da Shift+F2); araç çubuğundaki **Yazdır** düğmesi (ya da Ctrl/Cmd+P) etkin sayfayı sayfa yapısına göre yazdırır; altında seçili aralık, etkin hücrenin görünen değeri, ham değeri ve formülü yazar. "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; indirilen dosyayı Excel'de açıp denetleyebilirsiniz. "Sayı ve tarih biçimi dili" seçimiyle Türkçe ve İngilizce gösterim arasında geçilir.
 - docx dosyalarında **belge görünümü**: sayfalar ve belge düzenleyici (yazma, seçim, biçimlendirme araç çubuğu, geri al/yinele, pano); doc ve RTF salt okunur gösterilir. Korumalı belge salt okunur açılır; izleme isteyen belgede düzenlemeler **"Yazar adı"** alanındaki adla izlenir (yazılan altı çizili, silinen üstü çizili) ve görünümün üstünde koruma/izleme durumu yazar. Belge çubuğundaki **Yazdır** düğmesi (ya da Ctrl/Cmd+P) tarayıcının yazdırma penceresini açar.
 - "Yeniden kaydet ve indir" ile kaydedilen dosyayı indirip Word/Excel'de açmak.
 - Bir xls dosyası seçiliyken "xlsx olarak indir" ile `saveAsXlsx()` çıktısını indirmek.

@@ -747,6 +747,8 @@ export function createBridge(host: BridgeHost): Bridge {
     if (readOnly !== undefined) options.readOnly = readOnly;
     if (locked) options.readOnly = true;
     if (sheet !== undefined) options.sheet = sheet;
+    // Who the notes added to cells are by.
+    if (author !== undefined) options.author = author;
 
     const createSheet = (toolbar === true && host.createEditor) || host.createView;
     closeShown();

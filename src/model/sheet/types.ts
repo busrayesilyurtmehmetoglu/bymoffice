@@ -631,6 +631,14 @@ export interface SheetComment {
   visible?: boolean;
   /** Where the box is, when the file says so. Offsets are in EMU, as in every anchor. */
   box?: DrawingAnchor;
+  /**
+   * Set on a note that was added since the sheet was read: how many of the sheet's
+   * structuralEdits had been made by then. `row` and `col` are where the cell was at that
+   * time, and only the edits from this index on move the note. A comment of the file has
+   * none: it is where the file has it, and every structural edit moves it. (A note of the
+   * file whose text is edited stays a comment of the file: only its text is another.)
+   */
+  since?: number;
 }
 
 /** The margins of the printed page, in inches (<pageMargins>). `header` and `footer` are the distances of the header and the footer from the edge of the paper. */
@@ -855,8 +863,25 @@ export interface Sheet {
    * are shown (see SheetDrawings), by the rules the writer moves the anchors in the file with.
    */
   drawings?: SheetDrawing[];
-  /** Comments as the file has them; structuralEdits are applied where they are shown. */
+  /**
+   * Comments as the file has them; structuralEdits are applied where they are shown. Notes
+   * added by editing stand where they were put (SheetComment.since says after how many of the
+   * structural edits), so that the same rule places both: see commentCellNow(). The list is
+   * replaced, never altered, by an edit ("setComments").
+   */
   comments?: SheetComment[];
+  /**
+   * Notes were added, edited or deleted; the writer brings the comment parts of the sheet in
+   * line with the model. Set on its own, without `modified`: the cells did not change.
+   */
+  commentsModified?: boolean;
+  /**
+   * Set by the reader for a sheet whose comment parts the writer could not bring in line with
+   * notes that are added, edited or deleted: its legacy drawing cannot be read ("drawing"),
+   * another sheet shows the same comments part or legacy drawing ("shared"), or the sheet has
+   * more than one comments part ("parts"). Notes of such a sheet are shown and not changed.
+   */
+  notesBlocked?: 'drawing' | 'shared' | 'parts';
   /** What of the sheet's drawings and comments could not be read and is not shown (it is still written back). */
   warnings?: string[];
 }

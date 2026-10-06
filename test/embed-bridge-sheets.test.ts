@@ -429,3 +429,19 @@ test('bridge sheets: a list that waits for a channel is brought up to date where
     ['sheets', 'changed'],
   );
 });
+
+test('bridge: "author" of a load reaches the view of a workbook, where it is who the notes added to cells are by', async () => {
+  const named = await loaded({}, { author: 'Ada Lovelace' });
+  assert.equal(named.options().author, 'Ada Lovelace');
+  const plain = await loaded();
+  assert.equal('author' in plain.options(), false);
+  const long = fake();
+  await long.bridge.receive({ type: 'load', id: 'l', data: DATA, author: 'x'.repeat(256) });
+  assert.deepEqual(
+    long
+      .take()
+      .filter((message) => message.type === 'error')
+      .map((message) => message.code),
+    ['bad-message'],
+  );
+});

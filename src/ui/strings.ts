@@ -72,6 +72,21 @@ export interface UiStrings {
   formulaStale: string;
   /** Said before the comment of a cell, and the label of the box that shows it. */
   comment: string;
+  // Notes on cells: the commands of the menu of a cell, and the field a note is typed in.
+  addNote: string;
+  editNote: string;
+  deleteNote: string;
+  /** Label of the field a note is typed in; the address of its cell follows it. */
+  noteField: string;
+  /** Said beside the field: how what was typed is applied and given up. */
+  noteHint: string;
+  noteDeleted: string;
+  /** Why the comment of a cell cannot be changed: it is a conversation. `ref` is the address of the cell. */
+  noteThreaded(ref: string): string;
+  noteTooLong(max: number): string;
+  tooManyNotes: string;
+  /** Why no note of a sheet can be changed: `kind` is "drawing", "shared" or "parts" (Sheet.notesBlocked). */
+  notesBlocked(kind: string): string;
   /** Said once when a sheet is shown of which some drawings or comments could not be read. */
   drawingsNotShown: string;
   // The document view.
@@ -230,6 +245,17 @@ export const STRINGS_EN: UiStrings = {
   formulaCircular: 'Circular reference',
   formulaStale: 'The calculation is not finished; the value may be out of date',
   comment: 'Comment',
+  addNote: 'Add note',
+  editNote: 'Edit note',
+  deleteNote: 'Delete note',
+  noteField: 'Note',
+  noteHint: 'Ctrl+Enter applies, Escape cancels',
+  noteDeleted: 'Note deleted',
+  noteThreaded: (ref) => `The comment in ${ref} is a threaded comment: it cannot be edited here`,
+  noteTooLong: (max) => `A note cannot be longer than ${max} characters`,
+  tooManyNotes: 'The sheet has too many notes',
+  notesBlocked: (kind) =>
+    `The notes of this sheet cannot be changed: ${kind === 'shared' ? 'another sheet shows the same notes' : kind === 'parts' ? 'the file keeps them in more than one part' : 'its drawing of note boxes cannot be read'}`,
   drawingsNotShown: 'Some drawings or comments of this sheet could not be read and are not shown',
   document: 'Document',
   documentTools: 'Document tools',
@@ -364,6 +390,17 @@ export const STRINGS_TR: UiStrings = {
   formulaCircular: 'Döngüsel başvuru',
   formulaStale: 'Hesap bitmedi; değer eski olabilir',
   comment: 'Yorum',
+  addNote: 'Not ekle',
+  editNote: 'Notu düzenle',
+  deleteNote: 'Notu sil',
+  noteField: 'Not',
+  noteHint: 'Ctrl+Enter uygular, Esc vazgeçer',
+  noteDeleted: 'Not silindi',
+  noteThreaded: (ref) => `${ref} hücresindeki yorum bir yazışma: burada düzenlenemez`,
+  noteTooLong: (max) => `Bir not ${max} karakterden uzun olamaz`,
+  tooManyNotes: 'Sayfada çok fazla not var',
+  notesBlocked: (kind) =>
+    `Bu sayfanın notları değiştirilemez: ${kind === 'shared' ? 'aynı notları başka bir sayfa da gösteriyor' : kind === 'parts' ? 'dosya onları birden çok parçada tutuyor' : 'not kutularının çizimi okunamıyor'}`,
   drawingsNotShown: 'Bu sayfadaki bazı çizimler ya da yorumlar okunamadı; gösterilmiyor',
   document: 'Belge',
   documentTools: 'Belge araçları',

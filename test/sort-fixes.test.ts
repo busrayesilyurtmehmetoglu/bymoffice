@@ -194,6 +194,8 @@ test('sort: comments, tables and pivot tables in the sheet refuse a sort, each b
   for (const part of ['comments', 'table', 'pivotTable']) {
     const sheet = sheetOf([[2], [1]]);
     sheet.anchored = ['drawing', part];
+    // As the reader leaves a sheet with a note: the part is named and the note is in the model.
+    if (part === 'comments') sheet.comments = [{ row: 5, col: 5, text: 'not' }];
     const workbook = bookOf(sheet);
     const ops = sortRange(workbook, 0, { top: 0, left: 0, bottom: 1, right: 0 }, [{ col: 0 }]);
     assert.throws(() => apply(workbook, ops), new RegExp(`^RangeError: Cannot sort in a sheet with ${part}: not supported yet$`));

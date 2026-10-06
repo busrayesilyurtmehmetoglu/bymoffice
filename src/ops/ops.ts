@@ -7,6 +7,7 @@
 // operation keep the previous state for undo by reference, without copying it.
 
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
+import { hasLiveComments } from './notes';
 import {
   FILTER_NAME,
   MAX_COLS,
@@ -26,6 +27,7 @@ import {
   type Hyperlink,
   type Row,
   type Sheet,
+  type SheetComment,
   type SheetNameMap,
   type SheetNeighbours,
   type SheetStructuralEdit,
@@ -115,6 +117,16 @@ export type Op =
       sheet: number;
       range: CellRange;
       order: number[];
+    }
+  | {
+      /**
+       * Replaces the comments of a sheet (undefined: none). The list is held by reference and
+       * never altered, so that the inverse puts the very list back. What the list may hold is
+       * the business of the commands (see notes.ts).
+       */
+      type: 'setComments';
+      sheet: number;
+      comments: SheetComment[] | undefined;
     }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
@@ -723,7 +735,14 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
   }
 
   // What is placed by cell position in other parts would stay behind while its cell moves.
-  const stuck = (sheet.anchored || []).filter((part) => SORT_BLOCKERS.indexOf(part) >= 0);
+  let stuck = (sheet.anchored || []).filter((part) => SORT_BLOCKERS.indexOf(part) >= 0);
+  // Comments are in the way while there is one on a cell: those of the file, and notes added since, which
+  // are in no part yet. Once none is left (deleted, or gone with their rows) nothing would stay behind -
+  // unless the file has comments the reader could not show, which the model cannot know to be gone.
+  const unread = (sheet.warnings || []).some((warning) => /comment/i.test(warning));
+  const comments = hasLiveComments(sheet) || (stuck.indexOf('comments') >= 0 && (unread || sheet.notesBlocked !== undefined));
+  stuck = stuck.filter((part) => part !== 'comments');
+  if (comments) stuck.unshift('comments');
   if (stuck.length > 0) throw new RangeError(`Cannot sort in a sheet with ${stuck.join(', ')}: not supported yet`);
   // Like Excel: merged cells cannot be told apart from their rows.
   for (const merge of sheet.merges) if (intersects(merge, range)) throw new RangeError('Cannot sort a range that contains merged cells');
@@ -1232,6 +1251,16 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       syncFilterName(workbook, op.sheet);
       return { type: 'setAutoFilter', sheet: op.sheet, autoFilter: previous, show: hidden, hide: shown };
     }
+    case 'setComments': {
+      const sheet = sheetAt(workbook, op.sheet);
+      if (op.comments !== undefined && !Array.isArray(op.comments)) throw new RangeError('The comments of a sheet are a list');
+      const previous = sheet.comments;
+      if (op.comments && op.comments.length > 0) sheet.comments = op.comments;
+      else delete sheet.comments;
+      // Not `modified`: no cell changed, so the sheet part stays as it is and nothing has to be calculated again.
+      sheet.commentsModified = true;
+      return { type: 'setComments', sheet: op.sheet, comments: previous };
+    }
     case 'sortRange':
       return sortRows(workbook, op.sheet, op.range, op.order);
     case 'insert':
@@ -1279,6 +1308,8 @@ function weightOf(ops: Op[]): number {
     if (op.type === 'restore' || op.type === 'restoreSheets') weight += op.weight || 0;
     else if (op.type === 'setCells') weight += op.cells.length / 16;
     else if (op.type === 'setAutoFilter') weight += ((op.show ? op.show.length : 0) + (op.hide ? op.hide.length : 0)) / 16;
+    // The list of comments a step replaced is kept, not the comments themselves.
+    else if (op.type === 'setComments') weight += (op.comments ? op.comments.length : 0) / 16;
   }
   return weight;
 }

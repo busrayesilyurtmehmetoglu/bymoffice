@@ -47,6 +47,9 @@ import { cellDisplayText } from '../../format/cell-format';
 import type { OpcPackage } from '../../opc';
 import { localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
+import { commentCellNow } from '../../render/sheet-drawings';
+import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
+import { decodeXstring } from './shared-strings';
 
 const encoder = new TextEncoder();
 
@@ -55,6 +58,11 @@ const NS_REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationsh
 const NS_REL_STRICT = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
 const STYLES_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml';
 const WORKSHEET_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml';
+const COMMENTS_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml';
+const VML_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.vmlDrawing';
+const NS_VML = 'urn:schemas-microsoft-com:vml';
+const NS_VML_OFFICE = 'urn:schemas-microsoft-com:office:office';
+const NS_VML_EXCEL = 'urn:schemas-microsoft-com:office:excel';
 
 // --- escaping ----------------------------------------------------------------
 
@@ -1286,6 +1294,12 @@ interface SheetRewrite {
    * holds is written from it, whatever was marked as changed.
    */
   fresh?: boolean;
+  /**
+   * What <legacyDrawing> has to say once the notes of the sheet were changed: the id of the
+   * relationship to the drawing with their boxes, or null for a sheet that has none any more.
+   * Undefined leaves the element as it is.
+   */
+  legacyDrawing?: string | null;
 }
 
 interface SheetRenames {
@@ -1432,6 +1446,7 @@ function writeChild(
       }
     }
     regenerated.delete(local);
+    if (local === 'legacyDrawing' && replacement !== raw) state.changed = true;
     return { text: replacement, end };
   }
   if (!adjuster) return { text: raw, end };
@@ -1525,13 +1540,19 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
     // Applications mark a sheet whose filter hides rows; without a <sheetPr> to hold the mark, one is made.
     if (filterMode) regenerated.set('sheetPr', `<${prefix}sheetPr filterMode="1"/>`);
   }
+  // The boxes of notes: the element is put where the schema has it when the sheet got its first note.
+  if (options.legacyDrawing !== undefined) {
+    const id = options.legacyDrawing;
+    const attr = relPrefix !== undefined ? `${relPrefix}:id` : `xmlns:r="${NS_REL}" r:id`;
+    regenerated.set('legacyDrawing', id === null ? '' : `<${prefix}legacyDrawing ${attr}="${escapeAttr(id)}"/>`);
+  }
   // A sheet without views is not the selected one; one that has to be gets a view that says so.
   if (options.tabSelected) regenerated.set('sheetViews', `<${prefix}sheetViews><${prefix}sheetView tabSelected="1" workbookViewId="0"/></${prefix}sheetViews>`);
   const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode, tabSelected: options.tabSelected, full: fresh };
   /** Writes the regenerated elements that belong before the element of rank `rank` and were not in the source. */
   const flush = (rank: number) => {
     if (regenerated.size === 0) return;
-    for (const local of ['sheetPr', 'sheetViews', 'cols', 'autoFilter', 'mergeCells', 'hyperlinks']) {
+    for (const local of ['sheetPr', 'sheetViews', 'cols', 'autoFilter', 'mergeCells', 'hyperlinks', 'legacyDrawing']) {
       const text = regenerated.get(local);
       if (text === undefined || WORKSHEET_ORDER.indexOf(local) >= rank) continue;
       out.push(text);
@@ -1544,7 +1565,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
     if (sc.kind === 'close') break;
     if (sc.kind !== 'open') continue;
     const start = nextTag(s, cursor);
-    const rank = WORKSHEET_ORDER.indexOf(sc.local);
+    const rank = worksheetRank(s, start, sc.local);
     if (rank >= 0) flush(rank);
     out.push(s.slice(cursor, start));
     const emitted = writeChild(sc, s, start, sheet, writer, adjuster, regenerated, state, rawOnly);
@@ -2178,6 +2199,531 @@ const ANCHORED_PARTS: Record<string, (bytes: Uint8Array, edits: SheetStructuralE
   vmlDrawing: adjustVml,
 };
 
+// --- notes: comments added, edited and deleted ---------------------------------------------------
+//
+// The comment parts of a sheet are brought in line with the model by cutting and pasting in
+// their text: a comment or a box that did not change keeps every byte it has. First the rows
+// and columns moved since the file was read are applied, as for a sheet whose notes were not
+// touched (adjustComments(), adjustVml()); then, by the cells the comments are on now, what
+// the model no longer has is cut out, a text that is another one is replaced, and the notes
+// added since are appended.
+
+/** Shape ids one <o:idmap> block of a legacy drawing stands for. */
+export const VML_BLOCK = 1024;
+
+/** The namespace prefixes of a legacy drawing, without their colons. */
+export interface VmlPrefixes {
+  v: string;
+  o: string;
+  x: string;
+}
+
+const VML_PREFIXES: VmlPrefixes = { v: 'v', o: 'o', x: 'x' };
+
+/** The shape type the boxes of notes are of (a text box), as applications declare it once per drawing. */
+export function noteShapeTypeXml(p: VmlPrefixes = VML_PREFIXES): string {
+  return (
+    `<${p.v}:shapetype id="_x0000_t202" coordsize="21600,21600" ${p.o}:spt="202" path="m,l,21600r21600,l21600,xe">` +
+    `<${p.v}:stroke joinstyle="miter"/><${p.v}:path gradientshapeok="t" ${p.o}:connecttype="rect"/></${p.v}:shapetype>`
+  );
+}
+
+/** <x:Anchor> of the box of a note the model gives no place for: beside its cell, where applications put a new one. */
+export function defaultNoteAnchor(row: number, col: number): number[] {
+  return [Math.min(col + 1, MAX_COLS - 1), 15, Math.max(row - 1, 0), 10, Math.min(col + 3, MAX_COLS - 1), 15, Math.min(row + 3, MAX_ROWS - 1), 4];
+}
+
+/**
+ * The box of a note in a legacy drawing. `anchor` is the eight numbers of <x:Anchor>;
+ * `declare` is put into the start tag (namespace declarations a drawing lacks).
+ */
+export function noteShapeXml(id: number, row: number, col: number, anchor: number[], visible: boolean, p: VmlPrefixes = VML_PREFIXES, declare = ''): string {
+  return (
+    `<${p.v}:shape${declare} id="_x0000_s${id}" type="#_x0000_t202" style="position:absolute;visibility:${visible ? 'visible' : 'hidden'}" fillcolor="#ffffe1" ${p.o}:insetmode="auto">` +
+    `<${p.v}:fill color2="#ffffe1"/><${p.v}:shadow on="t" color="black" obscured="t"/><${p.v}:path ${p.o}:connecttype="none"/>` +
+    `<${p.v}:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></${p.v}:textbox>` +
+    `<${p.x}:ClientData ObjectType="Note"><${p.x}:MoveWithCells/><${p.x}:SizeWithCells/><${p.x}:Anchor>${anchor.join(', ')}</${p.x}:Anchor><${p.x}:AutoFill>False</${p.x}:AutoFill>` +
+    `<${p.x}:Row>${row}</${p.x}:Row><${p.x}:Column>${col}</${p.x}:Column>${visible ? `<${p.x}:Visible/>` : ''}</${p.x}:ClientData></${p.v}:shape>`
+  );
+}
+
+interface AddedNote {
+  row: number;
+  col: number;
+  text: string;
+  author: string;
+}
+
+/** What the model says about the notes of a sheet, by the cells they are on now. */
+interface NotePlan {
+  /** Comments of the file that are still there: cell key -> their text, or null for one that is left as it is (a conversation). */
+  kept: Map<number, string | null>;
+  /** Notes added since the sheet was read, in the order of the model. */
+  added: AddedNote[];
+}
+
+const cellKey = (row: number, col: number): number => row * MAX_COLS + col;
+
+function notePlanOf(sheet: Sheet): NotePlan {
+  const plan: NotePlan = { kept: new Map(), added: [] };
+  const seen = new Set<number>();
+  const edits = sheet.structuralEdits;
+  for (const comment of sheet.comments || []) {
+    if (!comment || !(comment.row >= 0 && comment.row < MAX_ROWS && comment.col >= 0 && comment.col < MAX_COLS)) continue;
+    const cell = commentCellNow(comment, edits);
+    if (!cell) continue;
+    const key = cellKey(cell.row, cell.col);
+    // As where comments are shown: the first one of a cell is the one that counts.
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (comment.since === undefined) plan.kept.set(key, comment.threaded ? null : String(comment.text));
+    else plan.added.push({ row: cell.row, col: cell.col, text: String(comment.text), author: comment.author || '' });
+  }
+  return plan;
+}
+
+interface RawChild {
+  local: string;
+  start: number;
+  end: number;
+  /** The attribute that was asked for. */
+  value: string | undefined;
+}
+
+interface RawElement {
+  name: string;
+  /** Offset of its start tag, and just past it. */
+  start: number;
+  openEnd: number;
+  /** Offset of its end tag; `openEnd` for an element without one. */
+  closeStart: number;
+  selfClosing: boolean;
+  children: RawChild[];
+}
+
+/** Where the children of the first element of `s` are in it, without building a tree. */
+function rawElement(s: string, attr?: string): RawElement {
+  const sc = new XmlScanner(s);
+  openRoot(sc);
+  const name = sc.name;
+  const start = nextTag(s, 0);
+  let cursor = startTagEnd(s, start);
+  const openEnd = cursor;
+  const children: RawChild[] = [];
+  if (sc.selfClosing) return { name, start, openEnd, closeStart: openEnd, selfClosing: true, children };
+  while (sc.next()) {
+    if (sc.kind === 'close') break;
+    if (sc.kind !== 'open') continue;
+    const at = nextTag(s, cursor);
+    const local = sc.local;
+    const value = attr === undefined ? undefined : sc.attr(attr);
+    const raw = sc.readRaw();
+    cursor = at + raw.length;
+    children.push({ local, start: at, end: cursor, value });
+  }
+  return { name, start, openEnd, closeStart: nextTag(s, cursor), selfClosing: false, children };
+}
+
+interface Splice {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** Text put inside an element behind what it holds; an element without an end tag gets one. `base` is where the element's text starts. */
+function appendInside(el: RawElement, base: number, text: string): Splice {
+  if (!el.selfClosing) return { start: base + el.closeStart, end: base + el.closeStart, text };
+  // "<name .../>": the slash goes, and the end tag comes behind the new content.
+  return { start: base + el.openEnd - 2, end: base + el.openEnd, text: `>${text}</${el.name}>` };
+}
+
+function applySplices(s: string, splices: Splice[]): string {
+  if (splices.length === 0) return s;
+  // Splices at one offset keep the order they were made in.
+  const order = splices.map((splice, index) => ({ splice, index })).sort((a, b) => a.splice.start - b.splice.start || a.index - b.index);
+  let out = '';
+  let cursor = 0;
+  for (const { splice } of order) {
+    if (splice.start < cursor) throw new Error('Cannot write the comments: their parts cannot be read');
+    out += s.slice(cursor, splice.start) + splice.text;
+    cursor = splice.end;
+  }
+  return out + s.slice(cursor);
+}
+
+/**
+ * Applies splices whose offsets are those of the part as the scanner sees it (decodeSource():
+ * no byte order mark, line breaks as "\n") to the part as it is, so that everything between
+ * the splices keeps its bytes, line breaks included. The result is UTF-8; a declaration that
+ * names another encoding is corrected.
+ */
+function spliceExact(source: Uint8Array, splices: Splice[]): Uint8Array {
+  const exact = decodeExact(source);
+  const mark = exact.charCodeAt(0) === 0xfeff ? 1 : 0;
+  // Offsets (in the scanner's text) of the line breaks that are two characters in the part.
+  const pairs: number[] = [];
+  for (let i = exact.indexOf('\r\n', mark); i >= 0; i = exact.indexOf('\r\n', i + 2)) pairs.push(i - mark - pairs.length);
+  const toExact = (offset: number): number => {
+    let low = 0;
+    let high = pairs.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (pairs[middle] < offset) low = middle + 1;
+      else high = middle;
+    }
+    return mark + offset + low;
+  };
+  const out = applySplices(
+    exact,
+    splices.map((splice) => ({ start: toExact(splice.start), end: toExact(splice.end), text: splice.text })),
+  );
+  return encoder.encode(mark ? out : fixDeclaration(out));
+}
+
+/** The place of a child of a worksheet in the order of the schema; -1 for one the schema does not name. */
+function worksheetRank(s: string, start: number, local: string): number {
+  if (local !== 'AlternateContent') return WORKSHEET_ORDER.indexOf(local);
+  // A wrapper stands where what it wraps would: the first element of its first choice.
+  const match = /^<[^>]*>\s*<[^>]*>\s*<(?:[A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*)/.exec(s.slice(start, start + 4096));
+  return match ? WORKSHEET_ORDER.indexOf(match[1]) : -1;
+}
+
+/**
+ * A sheet part with nothing changed but what <legacyDrawing> says (see SheetRewrite.legacyDrawing):
+ * every other byte stays. Undefined when the part already says so.
+ */
+function setLegacyDrawing(original: Uint8Array, id: string | null, sheetName: string): Uint8Array | undefined {
+  const s = decodeSource(original);
+  const root = rawElement(s);
+  const rootLocal = localName(root.name);
+  if (rootLocal !== 'worksheet' && rootLocal !== 'dialogsheet' && rootLocal !== 'macrosheet') {
+    throw new Error(`Cannot write sheet "${sheetName}": its part has the root element <${root.name}>, not a worksheet`);
+  }
+  const prefix = root.name.slice(0, root.name.length - rootLocal.length);
+  const declared = new RegExp(`\\sxmlns:([A-Za-z_][\\w.-]*)\\s*=\\s*["'](?:${escapeRegExp(NS_REL)}|${escapeRegExp(NS_REL_STRICT)})["']`).exec(s.slice(root.start, root.openEnd));
+  const attr = declared ? `${declared[1]}:id` : `xmlns:r="${NS_REL}" r:id`;
+  const text = id === null ? '' : `<${prefix}legacyDrawing ${attr}="${escapeAttr(id)}"/>`;
+  const rank = WORKSHEET_ORDER.indexOf('legacyDrawing');
+  const present = root.children.find((child) => child.local === 'legacyDrawing');
+  if (present) {
+    if (s.slice(present.start, present.end) === text) return undefined;
+    return spliceExact(original, [{ start: present.start, end: present.end, text }]);
+  }
+  if (id === null) return undefined;
+  if (root.selfClosing) throw new Error(`Cannot write sheet "${sheetName}": its part has no <sheetData>`);
+  const behind = root.children.find((child) => worksheetRank(s, child.start, child.local) > rank);
+  const at = behind ? behind.start : root.closeStart;
+  return spliceExact(original, [{ start: at, end: at, text }]);
+}
+
+/** The comments read so far of a sheet, over all of its comment parts: what the reader took as the comments of the sheet. */
+interface CommentsScan {
+  seen: Set<number>;
+  known: number;
+}
+
+/** Indexes of authors beyond this are not made room for (the part is damaged). */
+const MAX_AUTHOR_INDEX = 65535;
+
+interface CommentsEdit {
+  bytes: Uint8Array;
+  changed: boolean;
+  /** Comments the part holds afterwards. */
+  left: number;
+}
+
+/**
+ * A comments part brought in line with the notes of the model. `source` has its comments at
+ * the cells they are on now. The cells of the comments that were cut out are added to `removed`.
+ */
+function editComments(source: Uint8Array, plan: NotePlan, added: AddedNote[], scan: CommentsScan, removed: Set<number>): CommentsEdit {
+  const s = decodeSource(source);
+  const root = rawElement(s);
+  const prefix = root.name.slice(0, root.name.length - localName(root.name).length);
+  const splices: Splice[] = [];
+  let left = 0;
+  /** The highest index of an author a comment of the part names, listed or not. */
+  let highestAuthor = -1;
+  let authors: RawChild | undefined;
+  let firstList: RawChild | undefined;
+  let extensions: RawChild | undefined;
+  for (const part of root.children) {
+    if (part.local === 'authors' && !authors) authors = part;
+    if (part.local === 'extLst' && !extensions) extensions = part;
+    if (part.local !== 'commentList') continue;
+    if (!firstList) firstList = part;
+    const listText = s.slice(part.start, part.end);
+    const list = rawElement(listText, 'ref');
+    for (const item of list.children) {
+      if (item.local !== 'comment') continue;
+      const named = /\sauthorId\s*=\s*["'](\d{1,5})["']/.exec(listText.slice(item.start, startTagEnd(listText, item.start)));
+      if (named && Number(named[1]) > highestAuthor && Number(named[1]) <= MAX_AUTHOR_INDEX) highestAuthor = Number(named[1]);
+      const cell = item.value === undefined ? undefined : parseCellRef(item.value);
+      const key = cell ? cellKey(cell.row, cell.col) : -1;
+      // What the reader did not take as a comment of the sheet (no cell, a second one on a cell, one too many) stays as it is.
+      if (!cell || scan.seen.has(key) || scan.known >= MAX_SHEET_COMMENTS) {
+        left++;
+        continue;
+      }
+      scan.seen.add(key);
+      scan.known++;
+      const base = part.start + item.start;
+      if (!plan.kept.has(key)) {
+        splices.push({ start: base, end: part.start + item.end, text: '' });
+        removed.add(key);
+        continue;
+      }
+      left++;
+      const wanted = plan.kept.get(key);
+      if (wanted === null || wanted === undefined) continue;
+      const itemText = listText.slice(item.start, item.end);
+      const element = parseXml(itemText).root;
+      if (readText(childNamed(element, 'text')).text === wanted) continue;
+      const body = `<${prefix}text>${textElement(wanted, prefix)}</${prefix}text>`;
+      const inner = rawElement(itemText);
+      const text = inner.children.find((child) => child.local === 'text');
+      if (text) splices.push({ start: base + text.start, end: base + text.end, text: body });
+      else if (inner.selfClosing) splices.push(appendInside(inner, base, body));
+      // <text> is the first child of a comment.
+      else splices.push({ start: base + inner.openEnd, end: base + inner.openEnd, text: body });
+    }
+  }
+
+  if (added.length > 0) {
+    const names: string[] = [];
+    let authorsEl: RawElement | undefined;
+    if (authors) {
+      authorsEl = rawElement(s.slice(authors.start, authors.end));
+      const parsed = parseXml(s.slice(authors.start, authors.end)).root;
+      for (const author of childrenNamed(parsed, 'author')) names.push(decodeXstring(textOf(author) || ''));
+    }
+    const known = names.length;
+    // Comments may name authors the list does not have (they are then by nobody). A new author is listed behind
+    // every index that is in use, so that none of those comments becomes one of the new author.
+    const padding = Math.max(highestAuthor + 1 - known, 0);
+    const fresh: string[] = [];
+    let items = '';
+    for (const note of added) {
+      let id = names.indexOf(note.author);
+      if (id < 0) {
+        id = fresh.indexOf(note.author);
+        if (id < 0) {
+          id = fresh.length;
+          fresh.push(note.author);
+        }
+        id += known + padding;
+      }
+      items += `<${prefix}comment ref="${cellName(note.row, note.col)}" authorId="${id}" shapeId="0"><${prefix}text>${textElement(note.text, prefix)}</${prefix}text></${prefix}comment>`;
+      left++;
+    }
+    let newAuthors = '';
+    if (fresh.length > 0) for (let i = 0; i < padding; i++) newAuthors += `<${prefix}author></${prefix}author>`;
+    for (const name of fresh) newAuthors += `<${prefix}author>${escapeXstring(name)}</${prefix}author>`;
+    if (authors && authorsEl) {
+      if (newAuthors !== '') splices.push(appendInside(authorsEl, authors.start, newAuthors));
+    } else {
+      // The list of authors is the first child of the part.
+      const at = root.selfClosing ? -1 : root.openEnd;
+      newAuthors = `<${prefix}authors>${newAuthors}</${prefix}authors>`;
+      if (at >= 0) splices.push({ start: at, end: at, text: newAuthors });
+      else items = newAuthors + `<${prefix}commentList>${items}</${prefix}commentList>`;
+    }
+    if (firstList) splices.push(appendInside(rawElement(s.slice(firstList.start, firstList.end)), firstList.start, items));
+    else if (root.selfClosing) splices.push(appendInside(root, 0, items));
+    else {
+      const at = extensions ? extensions.start : root.closeStart;
+      splices.push({ start: at, end: at, text: `<${prefix}commentList>${items}</${prefix}commentList>` });
+    }
+  }
+  if (splices.length === 0) return { bytes: source, changed: false, left };
+  return { bytes: spliceExact(source, splices), changed: true, left };
+}
+
+/** A part as text with nothing brought in line: every line break as it is, a byte order mark kept. */
+function decodeExact(bytes: Uint8Array): string {
+  if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) return decodeSource(bytes);
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error) {
+    return new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes);
+  }
+}
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** The prefix a namespace is declared with in a text, without parsing it. */
+function declaredPrefix(text: string, namespace: string): string | undefined {
+  const match = new RegExp(`xmlns:([A-Za-z_][\\w.-]*)\\s*=\\s*["']${escapeRegExp(namespace)}["']`).exec(text);
+  return match ? match[1] : undefined;
+}
+
+/** Blocks of shape ids a legacy drawing uses: those its <o:idmap> names and those its shapes are in. */
+function vmlBlocks(text: string): number[] {
+  const out: number[] = [];
+  const map = /:idmap\b[^>]*?\bdata\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(text);
+  if (map) {
+    for (const piece of (map[1] !== undefined ? map[1] : map[2]).split(',')) {
+      const block = parseUint(piece.trim());
+      if (block > 0) out.push(block);
+    }
+  }
+  const ids = /_x0000_s(\d{1,9})(?!\d)/g;
+  let match: RegExpExecArray | null;
+  let guard = 0;
+  while ((match = ids.exec(text)) && guard++ < 10000000) out.push(Math.floor(Number(match[1]) / VML_BLOCK));
+  return out;
+}
+
+interface VmlEdit {
+  bytes: Uint8Array;
+  changed: boolean;
+  /** Nothing is drawn by the part any more: it holds no shape, only what a drawing declares. */
+  empty: boolean;
+}
+
+/**
+ * A legacy drawing brought in line with the notes of the model: the boxes of the notes on the
+ * cells of `removed` are cut out, and a box is appended for every note of `added`. Like
+ * adjustVmlText() this works on the text, so that a part that is not well-formed is no
+ * obstacle and every other shape (a form control, a box that stays) keeps its bytes.
+ * `nextBlock` gives a block of shape ids that no drawing of the workbook uses.
+ */
+function editVml(source: Uint8Array, removed: Set<number>, added: AddedNote[], nextBlock: () => number): VmlEdit {
+  let text = decodeExact(source);
+  const declared = { v: declaredPrefix(text, NS_VML), o: declaredPrefix(text, NS_VML_OFFICE), x: declaredPrefix(text, NS_VML_EXCEL) };
+  const p: VmlPrefixes = { v: declared.v || 'v', o: declared.o || 'o', x: declared.x || 'x' };
+  let changed = false;
+
+  if (removed.size > 0) {
+    const open = `<${p.v}:shape`;
+    const close = `</${p.v}:shape>`;
+    const isNote = new RegExp(`<${escapeRegExp(p.x)}:ClientData[^>]*ObjectType\\s*=\\s*["']Note["']`);
+    const rowOf = new RegExp(`<${escapeRegExp(p.x)}:Row>\\s*(\\d{1,7})\\s*</${escapeRegExp(p.x)}:Row>`);
+    const colOf = new RegExp(`<${escapeRegExp(p.x)}:Column>\\s*(\\d{1,5})\\s*</${escapeRegExp(p.x)}:Column>`);
+    const gone = new Set<number>();
+    let out = '';
+    let copied = 0;
+    let i = 0;
+    for (;;) {
+      const start = text.indexOf(open, i);
+      if (start < 0) break;
+      const after = text.charCodeAt(start + open.length);
+      // "<v:shapetype" and the like are other elements.
+      if (!(after === 32 || after === 62 || after === 9 || after === 10 || after === 13)) {
+        i = start + open.length;
+        continue;
+      }
+      const end = text.indexOf(close, start);
+      if (end < 0) break;
+      i = end + close.length;
+      const block = text.slice(start, i);
+      if (!isNote.test(block)) continue;
+      const row = rowOf.exec(block);
+      const col = colOf.exec(block);
+      if (!row || !col) continue;
+      const key = cellKey(Number(row[1]), Number(col[1]));
+      // One box per note; a second box on the cell is not the one of the note that went.
+      if (!removed.has(key) || gone.has(key)) continue;
+      gone.add(key);
+      out += text.slice(copied, start);
+      copied = i;
+    }
+    if (copied > 0) {
+      text = out + text.slice(copied);
+      changed = true;
+    }
+  }
+
+  if (added.length > 0) {
+    // The reader marks a sheet with such a drawing, and the operations refuse its notes: this is the last defence.
+    const root = vmlRoot(text);
+    if (!root) throw new Error('Cannot write the notes: the legacy drawing of the sheet cannot be read');
+    const rootEnd = root.openEnd;
+    const closeAt = root.closeStart;
+    // Shape ids come in blocks; each block a drawing uses is named in its <o:idmap>.
+    // Block n stands for the ids n*1024 .. n*1024+1023, of which the first is not used.
+    const map = new RegExp(`<${escapeRegExp(p.o)}:idmap\\b[^>]*?\\bdata\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(text);
+    const listed: number[] = [];
+    if (map) {
+      for (const piece of (map[1] !== undefined ? map[1] : map[2]).split(',')) {
+        const number = parseUint(piece.trim());
+        if (number > 0) listed.push(number);
+      }
+    }
+    let block = listed.length > 0 ? listed[listed.length - 1] : -1;
+    let next = 0;
+    if (block > 0) {
+      next = block * VML_BLOCK + 1;
+      const ids = /_x0000_s(\d{1,9})(?!\d)/g;
+      let match: RegExpExecArray | null;
+      let guard = 0;
+      while ((match = ids.exec(text)) && guard++ < 10000000) {
+        const id = Number(match[1]);
+        if (Math.floor(id / VML_BLOCK) === block && id >= next) next = id + 1;
+      }
+    }
+    const fresh: number[] = [];
+    // Prefixes the drawing does not declare are declared on each box.
+    let declare = '';
+    if (!declared.v) declare += ` xmlns:${p.v}="${NS_VML}"`;
+    if (!declared.o) declare += ` xmlns:${p.o}="${NS_VML_OFFICE}"`;
+    if (!declared.x) declare += ` xmlns:${p.x}="${NS_VML_EXCEL}"`;
+    let shapes = '';
+    for (const note of added) {
+      if (block <= 0 || next >= (block + 1) * VML_BLOCK) {
+        block = nextBlock();
+        fresh.push(block);
+        next = block * VML_BLOCK + 1;
+      }
+      shapes += noteShapeXml(next++, note.row, note.col, defaultNoteAnchor(note.row, note.col), false, p, declare);
+    }
+    if (text.indexOf('id="_x0000_t202"') < 0 && text.indexOf("id='_x0000_t202'") < 0) shapes = noteShapeTypeXml(p).replace(`<${p.v}:shapetype`, `<${p.v}:shapetype${declare}`) + shapes;
+    const splices: Splice[] = [{ start: closeAt, end: closeAt, text: shapes }];
+    if (fresh.length > 0) {
+      if (map) {
+        const value = map[1] !== undefined ? map[1] : map[2];
+        const at = map.index + map[0].length - 1 - value.length;
+        splices.push({ start: at, end: at + value.length, text: listed.concat(fresh).join(',') });
+      } else {
+        const layout = `<${p.o}:shapelayout${declare} ${p.v}:ext="edit"><${p.o}:idmap ${p.v}:ext="edit" data="${fresh.join(',')}"/></${p.o}:shapelayout>`;
+        splices.push({ start: rootEnd, end: rootEnd, text: layout });
+      }
+    }
+    text = applySplices(text, splices);
+    changed = true;
+  }
+  if (!changed) return { bytes: source, changed: false, empty: false };
+  // The bytes are UTF-8 from here on, whatever the part was in: its declaration has to say so.
+  if (text.charCodeAt(0) !== 0xfeff) text = fixDeclaration(text);
+
+  // A drawing that draws nothing is not kept: only what parses and holds nothing but declarations counts as that.
+  let empty = false;
+  try {
+    empty = parseXml(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).root.children.every((node) => node.type !== 'element' || localName(node.name) === 'shapelayout' || localName(node.name) === 'shapetype');
+  } catch (error) {
+    empty = false;
+  }
+  return { bytes: encoder.encode(text), changed: true, empty };
+}
+
+/** The id of the relationship <legacyDrawing> of a sheet names; undefined for a sheet without the element. */
+function legacyDrawingId(sheetXml: string): string | undefined {
+  const match = /<(?:[A-Za-z_][\w.-]*:)?legacyDrawing(?=[\s/>])[^>]*?\b[A-Za-z_][\w.-]*:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(sheetXml);
+  if (!match) return undefined;
+  return plainOf(match[1] !== undefined ? match[1] : match[2]);
+}
+
+/** The target of a relationship from one part to another, relative the way applications write it. */
+function relativeTarget(from: string, to: string): string {
+  const base = from.split('/').slice(1, -1);
+  const target = to.split('/').slice(1);
+  let same = 0;
+  while (same < base.length && same < target.length - 1 && base[same] === target[same]) same++;
+  let out = '';
+  for (let i = same; i < base.length; i++) out += '../';
+  return out + target.slice(same).join('/');
+}
+
 // --- the package --------------------------------------------------------------------
 
 /** Children of CT_Workbook in schema order. */
@@ -2537,6 +3083,33 @@ interface SaveState {
    * file as it was opened, in which the sheet is not.
    */
   added: Map<Sheet, string>;
+  /**
+   * Per sheet: the parts the last save made for its notes that the file does not have (a
+   * comments part, a legacy drawing, the relationships of the sheet). A save that no longer
+   * needs one takes it out again; one that does writes it under the same name.
+   */
+  notes: Map<Sheet, NoteParts>;
+}
+
+/** Names of the parts made for the notes of a sheet; each is of a part the file does not have. */
+interface NoteParts {
+  comments?: string;
+  vml?: string;
+  rels?: string;
+}
+
+/** What a save does around a sheet for its notes. */
+interface NoteWrites {
+  /** Parts of the file with what they become; null takes the part out. */
+  parts: Map<string, Uint8Array | null>;
+  /** Parts the file does not have. */
+  fresh: PartWrite[];
+  /** Relationships of the sheet to add, and the ids of those to drop. */
+  relate: { id: string; kind: string; part: string }[];
+  unrelate: Set<string>;
+  /** See SheetRewrite.legacyDrawing. */
+  legacy: string | null | undefined;
+  names: NoteParts;
 }
 
 const SAVES = new WeakMap<Workbook, SaveState>();
@@ -2633,14 +3206,15 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   const modifiedSheets = workbook.sheets.filter((sheet) => sheet.modified && sheet.kind !== 'chartsheet');
   const stylesModified = !!workbook.styles.modified;
   const sheetsModified = !!workbook.sheetsModified || workbook.sheets.some((sheet) => sheet.part === '');
-  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified) return;
+  const notesModified = workbook.sheets.some((sheet) => sheet.commentsModified && sheet.kind !== 'chartsheet');
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
-    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map() };
+    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map(), notes: new Map() };
     SAVES.set(workbook, saved);
   }
-  const { originals, moved, removed, added } = saved;
+  const { originals, moved, removed, added, notes: noted } = saved;
   // The first time a part is about to be rewritten, the package still holds it as the file had it.
   const originalOf = async (part: string): Promise<Uint8Array | undefined> => {
     const kept = originals.get(part);
@@ -2747,6 +3321,194 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     if (noted && noted.runs) map.runs = noted.runs;
     rename = { map, names: list };
   }
+  // Names of parts that are taken: part names are told apart without regard to case, and a part
+  // that was taken out may come back.
+  let taken: Set<string> | undefined;
+  const takenNames = (): Set<string> => {
+    if (!taken) {
+      taken = new Set();
+      for (const name of pkg.partNames()) taken.add(name.toLowerCase());
+      for (const [name, bytes] of originals) if (bytes !== null) taken.add(name.toLowerCase());
+      for (const name of removed.keys()) taken.add(name.toLowerCase());
+      for (const name of added.values()) taken.add(name.toLowerCase());
+      for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined) taken.add(name.toLowerCase());
+    }
+    return taken;
+  };
+  /** The first free name of a numbered part: "/xl/comments" + n + ".xml". */
+  const freeName = (head: string, tail: string): string => {
+    const names = takenNames();
+    for (let n = 1; ; n++) {
+      const candidate = `${head}${n}${tail}`;
+      if (names.has(candidate.toLowerCase())) continue;
+      names.add(candidate.toLowerCase());
+      return candidate;
+    }
+  };
+  // Parts taken out of the package by this save; see `removed`.
+  const wanted = new Set<string>();
+
+  // The highest block of shape ids a legacy drawing of the file uses; new boxes get their ids from the blocks behind it.
+  let topBlock: number | undefined;
+  const useBlocks = async (): Promise<() => number> => {
+    if (topBlock === undefined) {
+      let top = 0;
+      const names = pkg.partNames().concat([...removed.keys()]);
+      for (const name of names) {
+        if (!/\.vml$/i.test(name)) continue;
+        const bytes = await peek(name);
+        if (!bytes) continue;
+        for (const block of vmlBlocks(decodeExact(bytes))) if (block > top) top = block;
+      }
+      topBlock = top;
+    }
+    return () => {
+      topBlock = (topBlock as number) + 1;
+      return topBlock;
+    };
+  };
+
+  const mainPrefix = prefixOf(book.root);
+  const mainNamespace = book.root.attrs.get(mainPrefix === '' ? 'xmlns' : `xmlns:${mainPrefix.slice(0, -1)}`) || NS_MAIN;
+  const notesNow = new Map<Sheet, NoteParts>();
+  /**
+   * What the notes of a sheet whose notes were changed ask of the parts around it; undefined
+   * when the parts of the file say what the model says (nothing was changed after all, or
+   * everything was undone). `sheetXml` and `sheetRels` are the sheet as the file has it
+   * (undefined for a sheet that is not in the file).
+   */
+  const notesOf = async (sheet: Sheet, sheetPart: string, sheetXml: string | undefined, sheetRels: Uint8Array | undefined, edits: SheetStructuralEdit[] | undefined): Promise<NoteWrites | undefined> => {
+    const plan = notePlanOf(sheet);
+    const rels = sheetRels ? childrenNamed(parseXml(sheetRels).root, 'Relationship') : [];
+    const out: NoteWrites = { parts: new Map(), fresh: [], relate: [], unrelate: new Set(), legacy: undefined, names: {} };
+    const before = noted.get(sheet) || {};
+    const ids = new Set<string>();
+    let highestId = 0;
+    for (const rel of rels) {
+      const id = rel.attrs.get('Id') || '';
+      ids.add(id);
+      const match = /^rId(\d{1,9})$/.exec(id);
+      if (match && Number(match[1]) > highestId) highestId = Number(match[1]);
+    }
+    const newId = (): string => {
+      for (;;) {
+        const id = `rId${++highestId}`;
+        if (!ids.has(id)) {
+          ids.add(id);
+          return id;
+        }
+      }
+    };
+    const dir = main.slice(0, slash);
+
+    // The comments: what the file has, moved along with the rows and columns, then brought in line with the model.
+    const scan: CommentsScan = { seen: new Set(), known: 0 };
+    const removedCells = new Set<number>();
+    let changed = false;
+    let first = true;
+    for (const rel of rels) {
+      if (!endsWith(typeOf(rel), '/comments') || !internal(rel)) continue;
+      const part = resolveTarget(sheetPart, rel.attrs.get('Target') || '');
+      const original = await peek(part);
+      if (!original) continue;
+      const staged = edits ? adjustComments(original, edits) : original;
+      const edit = editComments(staged, plan, first ? plan.added : [], scan, removedCells);
+      first = false;
+      if (!edit.changed) continue;
+      changed = true;
+      if (edit.left === 0) {
+        out.parts.set(part, null);
+        out.unrelate.add(rel.attrs.get('Id') || '');
+      } else out.parts.set(part, edit.bytes);
+    }
+    if (first && plan.added.length > 0) {
+      const part = before.comments || freeName(`${dir}/comments`, '.xml');
+      const skeleton = encoder.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<comments xmlns="${escapeAttr(mainNamespace)}"><authors></authors><commentList></commentList></comments>`);
+      const edit = editComments(skeleton, plan, plan.added, { seen: new Set(), known: 0 }, removedCells);
+      out.fresh.push([part, edit.bytes, COMMENTS_CONTENT_TYPE]);
+      out.relate.push({ id: newId(), kind: 'comments', part });
+      out.names.comments = part;
+      changed = true;
+    }
+
+    // Their boxes, in the drawing <legacyDrawing> names.
+    const legacyId = sheetXml === undefined ? undefined : legacyDrawingId(sheetXml);
+    const vmlRel = legacyId === undefined ? undefined : rels.find((rel) => rel.attrs.get('Id') === legacyId && internal(rel));
+    const vmlPart = vmlRel ? resolveTarget(sheetPart, vmlRel.attrs.get('Target') || '') : undefined;
+    const vmlBytes = vmlPart === undefined ? undefined : await peek(vmlPart);
+    if (vmlPart !== undefined && vmlBytes && vmlRel) {
+      if (removedCells.size > 0 || plan.added.length > 0) {
+        const staged = edits ? adjustVml(vmlBytes, edits) : vmlBytes;
+        const edit = editVml(staged, removedCells, plan.added, await useBlocks());
+        if (edit.changed) {
+          changed = true;
+          if (edit.empty) {
+            out.parts.set(vmlPart, null);
+            out.unrelate.add(vmlRel.attrs.get('Id') || '');
+            out.legacy = null;
+          } else out.parts.set(vmlPart, edit.bytes);
+        }
+      }
+    } else if (plan.added.length > 0) {
+      const part = before.vml || freeName(`${dir}/drawings/vmlDrawing`, '.vml');
+      const skeleton = encoder.encode(`<xml xmlns:v="${NS_VML}" xmlns:o="${NS_VML_OFFICE}" xmlns:x="${NS_VML_EXCEL}"></xml>`);
+      const edit = editVml(skeleton, new Set(), plan.added, await useBlocks());
+      out.fresh.push([part, edit.bytes, VML_CONTENT_TYPE]);
+      const id = newId();
+      out.relate.push({ id, kind: 'vmlDrawing', part });
+      out.legacy = id;
+      out.names.vml = part;
+      changed = true;
+    }
+    if (!changed) return undefined;
+    // One sheet's notes cannot change a part that another sheet shows as well.
+    for (const part of out.parts.keys()) {
+      for (const other of workbook.sheets) {
+        if (other === sheet || other.kind === 'chartsheet' || other.part === '') continue;
+        for (const otherRel of await pkg.relationships(other.part)) {
+          if (otherRel.part === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
+        }
+      }
+    }
+    return out;
+  };
+  /** The relationships of a sheet with what its notes ask for; undefined when they ask for nothing. */
+  const relateNotes = (doc: XmlDocument, sheetPart: string, notes: NoteWrites): boolean => {
+    let changed = false;
+    if (notes.unrelate.size > 0) {
+      const kept = doc.root.children.filter((node) => !(node.type === 'element' && localName(node.name) === 'Relationship' && notes.unrelate.has(node.attrs.get('Id') || '')));
+      if (kept.length !== doc.root.children.length) {
+        doc.root.children = kept;
+        changed = true;
+      }
+    }
+    for (const rel of notes.relate) {
+      doc.root.children.push(
+        element(`${prefixOf(doc.root)}Relationship`, [
+          ['Id', rel.id],
+          ['Type', `${relBase}/${rel.kind}`],
+          ['Target', relativeTarget(sheetPart, rel.part)],
+        ]),
+      );
+      changed = true;
+    }
+    return changed;
+  };
+  const emptyRels = (): XmlDocument => parseXml('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>');
+
+
+  // The notes of the sheets of the file are looked at first: whether anything of them is
+  // written decides, with the rest, whether the file counts as edited.
+  const fileNotes = new Map<Sheet, NoteWrites>();
+  for (const sheet of workbook.sheets) {
+    if (!sheet.commentsModified || sheet.kind === 'chartsheet' || sheet.part === '') continue;
+    const bytes = await peek(sheet.part);
+    if (!bytes) continue;
+    const edits = sheet.modified && sheet.structuralEdits && sheet.structuralEdits.length > 0 ? sheet.structuralEdits : undefined;
+    const notes = await notesOf(sheet, sheet.part, decodeSource(bytes), await peek(relsPartOf(sheet.part)), edits);
+    if (notes) fileNotes.set(sheet, notes);
+  }
+
   const active = activeSheetOf(workbook);
   // The sheet the file opens on follows the model, but only along with something else that is
   // written: a file that was looked at and not edited is saved byte for byte, whatever sheet was
@@ -2758,7 +3520,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   // every window has to be brought in line anyway, and all of them open on the active sheet.)
   // And only when the sheet that would be written is another one than the file has: a hidden
   // sheet as the active one of the model stands for the first visible one.
-  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed;
+  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed || fileNotes.size > 0;
   const fileActive = fileActiveOf(book.root, file.length);
   const bookViews = childNamed(book.root, 'bookViews');
   const windows = bookViews ? childrenNamed(bookViews, 'workbookView').length : 0;
@@ -2820,7 +3582,9 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     // every sheet is looked at, and written when one of its views says something else.
     let tabSelected = (reordered || activeMoved) && !!sheet.view.tabSelected !== (index === active) ? index === active : undefined;
     if (reordered && windows > 1) tabSelected = index === active;
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0) continue;
+    // Notes that were added, edited or deleted: the comment parts of the sheet follow the model.
+    const notes = fileNotes.get(sheet);
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
@@ -2851,12 +3615,19 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       }
     }
 
+    const edits = sheet.modified && sheet.structuralEdits && sheet.structuralEdits.length > 0 ? sheet.structuralEdits : undefined;
+    const legacyDrawing = notes ? notes.legacy : undefined;
     if (!sheet.modified) {
       // A sheet that was not modified itself: only its raw content that names an edited or a renamed
       // sheet changes (the source of a validation list on another sheet, say). Its cells were adjusted
       // through the model, which marked the sheet as modified if any of them changed.
       const bytes = await peek(sheet.part);
-      const next = bytes && (foreign.length > 0 || rename || tabSelected !== undefined) ? rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected }) : undefined;
+      let next: Uint8Array | undefined;
+      // Only the notes of the sheet changed: every byte of the part stays but the element that names their boxes.
+      if (bytes && legacyDrawing !== undefined && foreign.length === 0 && !rename && tabSelected === undefined) next = setLegacyDrawing(bytes, legacyDrawing, sheet.name);
+      else if (bytes && (foreign.length > 0 || rename || tabSelected !== undefined || legacyDrawing !== undefined)) {
+        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, legacyDrawing });
+      }
       if (bytes && next) {
         // From here on the package no longer holds the part as the file had it.
         keep(sheet.part, bytes);
@@ -2866,17 +3637,16 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     } else {
       const bytes = await originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
-      writes.push([sheet.part, rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected }) as Uint8Array]);
+      writes.push([sheet.part, rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, legacyDrawing }) as Uint8Array]);
       rewritten.push(sheet.part);
     }
 
     // After rows or columns moved: the pictures and comments of the sheet follow, and the
     // relationships of links that are gone are removed. After rows or columns moved in another
     // sheet, or sheets were renamed or deleted: the shapes that show a cell of such a sheet follow.
-    const edits = sheet.modified && sheet.structuralEdits && sheet.structuralEdits.length > 0 ? sheet.structuralEdits : undefined;
-    const sheetRelsBytes = edits || others ? await peek(sheetRelsPart) : undefined;
-    if (sheetRelsBytes) {
-      const sheetRels = parseXml(sheetRelsBytes);
+    const sheetRelsBytes = edits || others || notes ? await peek(sheetRelsPart) : undefined;
+    if (sheetRelsBytes || notes) {
+      const sheetRels = sheetRelsBytes ? parseXml(sheetRelsBytes) : emptyRels();
       const linkIds = new Set<string>();
       for (const link of sheet.hyperlinks) if (link.rId !== undefined) linkIds.add(link.rId);
       let dropped = false;
@@ -2894,6 +3664,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
         // Of these parts only a drawing names sheets.
         if (!adjust || !internal(rel) || (!edits && kind !== 'drawing')) continue;
         const part = resolveTarget(sheet.part, rel.attrs.get('Target') || '');
+        // Written below, moved along and with the notes of the model.
+        if (notes && notes.parts.has(part)) continue;
         const original = await peek(part);
         if (!original) continue;
         if (edits) {
@@ -2912,10 +3684,33 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
           rewritten.push(part);
         }
       }
+      if (notes) {
+        for (const [part, data] of notes.parts) {
+          const original = await originalOf(part);
+          if (data === null) wanted.add(part);
+          else if (original) {
+            writes.push([part, data]);
+            rewritten.push(part);
+          }
+        }
+        for (const [part, data, contentType] of notes.fresh) {
+          if (!originals.has(part)) originals.set(part, null);
+          writes.push([part, data, contentType]);
+        }
+        if (relateNotes(sheetRels, sheet.part, notes)) dropped = true;
+        if (!sheetRelsBytes && dropped) {
+          // The file has no relationships for the sheet: the part made for them goes when it is no longer needed.
+          if (!originals.has(sheetRelsPart)) originals.set(sheetRelsPart, null);
+          notes.names.rels = sheetRelsPart;
+        }
+        notesNow.set(sheet, notes.names);
+      }
       if (dropped) {
-        keep(sheetRelsPart, sheetRelsBytes);
+        if (sheetRelsBytes) {
+          keep(sheetRelsPart, sheetRelsBytes);
+          rewritten.push(sheetRelsPart);
+        }
         writes.push([sheetRelsPart, sheetRels]);
-        rewritten.push(sheetRelsPart);
       }
     }
     // What an earlier save moved and this one does not goes back to what the file had.
@@ -2929,46 +3724,52 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   // Sheets that are not in the file: each is written to a part of its own, the one the last save gave it.
   const addedNow = new Map<Sheet, string>();
   const relIds = new Map<Sheet, string>();
-  let taken: Set<string> | undefined;
   for (let index = 0; index < workbook.sheets.length; index++) {
     const sheet = workbook.sheets[index];
     if (sheet.part !== '') continue;
     if (sheet.kind !== 'worksheet') throw new Error(`Cannot write sheet "${sheet.name}": a ${sheet.kind} that is not in the file cannot be written`);
     let part = added.get(sheet);
     if (part === undefined) {
-      if (!taken) {
-        // Part names are told apart without regard to case. A part that was taken out may come back.
-        taken = new Set();
-        for (const name of pkg.partNames()) taken.add(name.toLowerCase());
-        for (const [name, bytes] of originals) if (bytes !== null) taken.add(name.toLowerCase());
-        for (const name of removed.keys()) taken.add(name.toLowerCase());
-        for (const name of added.values()) taken.add(name.toLowerCase());
-      }
+      const names = takenNames();
       for (let n = 1; part === undefined; n++) {
         const candidate = `${main.slice(0, slash)}/worksheets/sheet${n}.xml`;
         // Relationships left behind under the name would become those of the new sheet.
-        if (!taken.has(candidate.toLowerCase()) && !taken.has(relsPartOf(candidate).toLowerCase())) part = candidate;
+        if (!names.has(candidate.toLowerCase()) && !names.has(relsPartOf(candidate).toLowerCase())) part = candidate;
       }
-      taken.add(part.toLowerCase());
+      names.add(part.toLowerCase());
     }
-    const rootPrefix = prefixOf(book.root);
-    const mainNamespace = book.root.attrs.get(rootPrefix === '' ? 'xmlns' : `xmlns:${rootPrefix.slice(0, -1)}`) || NS_MAIN;
+    // The notes of the sheet: all of them were added, and so are the parts that hold them.
+    const notes = sheet.comments && sheet.comments.length > 0 ? await notesOf(sheet, part, undefined, undefined, undefined) : undefined;
     const skeleton =
       `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="${escapeAttr(mainNamespace)}" xmlns:r="${escapeAttr(relBase)}">` +
       `<dimension ref="A1"/><sheetViews><sheetView${index === active ? ' tabSelected="1"' : ''} workbookViewId="0"/></sheetViews><sheetData/></worksheet>`;
     // A link to another file belongs to the relationships of the sheet it was made in; only places in the workbook are written.
     const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
-    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true }) as Uint8Array;
+    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined }) as Uint8Array;
     if (!originals.has(part)) originals.set(part, null);
     writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
+    if (notes) {
+      const sheetRels = emptyRels();
+      relateNotes(sheetRels, part, notes);
+      const sheetRelsPart = relsPartOf(part);
+      for (const [name, data, contentType] of notes.fresh.concat([[sheetRelsPart, sheetRels]])) {
+        if (!originals.has(name)) originals.set(name, null);
+        writes.push([name, data, contentType]);
+      }
+      notes.names.rels = sheetRelsPart;
+      notesNow.set(sheet, notes.names);
+    }
     addedNow.set(sheet, part);
     relIds.set(sheet, relate('worksheet', part));
   }
   const deletions: string[] = [];
   for (const [sheet, part] of added) if (addedNow.get(sheet) !== part) deletions.push(part);
+  // Parts made for notes that are no longer there (undone, deleted, or their sheet is gone).
+  const noteParts = new Set<string>();
+  for (const names of notesNow.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined) noteParts.add(name);
+  for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined && !noteParts.has(name)) deletions.push(name);
 
   // Sheets of the file that are gone: their parts, and what only they lead to, leave the package.
-  const wanted = new Set<string>();
   if (gone.length > 0) {
     const actual = new Map<string, string>();
     for (const name of removed.keys()) actual.set(name.toLowerCase(), name);
@@ -3120,4 +3921,6 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   }
   added.clear();
   for (const [sheet, part] of addedNow) added.set(sheet, part);
+  noted.clear();
+  for (const [sheet, names] of notesNow) noted.set(sheet, names);
 }

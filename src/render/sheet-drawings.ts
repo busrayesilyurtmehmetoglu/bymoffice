@@ -211,6 +211,25 @@ function place(order: number, object: DrawingObject, rect: Rect): Placed | undef
   return { order, object, x, y, width, height, left: left - reach, top: top - reach, right: right + reach, bottom: bottom + reach };
 }
 
+/**
+ * The structural edits that move a comment: all of them for a comment of the file, and for a
+ * note added since only those made after it was (SheetComment.since).
+ */
+export function commentEdits(comment: Pick<SheetComment, 'since'>, edits: readonly SheetStructuralEdit[] | undefined): readonly SheetStructuralEdit[] | undefined {
+  const since = comment.since;
+  if (!edits || since === undefined || !(since > 0)) return edits;
+  // A count that is not one of this list (it can only come from outside) moves the note by nothing.
+  return since >= edits.length || Math.floor(since) !== since ? [] : edits.slice(since);
+}
+
+/**
+ * The cell a comment is on now; undefined when its cell was deleted. The one rule by which
+ * the view, the writer and the operations place a comment of the model.
+ */
+export function commentCellNow(comment: Pick<SheetComment, 'row' | 'col' | 'since'>, edits: readonly SheetStructuralEdit[] | undefined): { row: number; col: number } | undefined {
+  return adjustCommentCell(comment.row, comment.col, commentEdits(comment, edits));
+}
+
 // -------------------------------------------------------------------- comments
 
 /** A comment where it is now. */
@@ -415,7 +434,7 @@ export class SheetDrawings {
     for (let i = 0; i < comments.length; i++) {
       const comment = comments[i];
       if (!comment || !(comment.row >= 0 && comment.row < MAX_ROWS && comment.col >= 0 && comment.col < MAX_COLS)) continue;
-      const cell = adjustCommentCell(comment.row, comment.col, edits);
+      const cell = commentCellNow(comment, edits);
       if (!cell) continue;
       const key = cell.row * MAX_COLS + cell.col;
       if (byCell.has(key)) continue;
@@ -446,7 +465,7 @@ export class SheetDrawings {
       const { row, col, comment } = this.placedComments[i];
       if (!comment.visible) continue;
       let rect: Rect;
-      if (comment.box) rect = anchorRect(adjustDrawingAnchor(comment.box, edits), metrics);
+      if (comment.box) rect = anchorRect(adjustDrawingAnchor(comment.box, commentEdits(comment, edits)), metrics);
       else rect = { x: metrics.cols.offset(col + 1) + 11, y: Math.max(metrics.rows.offset(row) - 7, 0), width: NOTE_WIDTH, height: NOTE_HEIGHT };
       const item = place(drawings.length + i, noteShape(comment), rect);
       if (item) items.push(item);

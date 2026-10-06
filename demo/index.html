@@ -105,6 +105,9 @@
             <select id="locale"><option value="tr">Türkçe (1.234,50 · 15.03.2024)</option><option value="en">English (1,234.50 · 3/15/2024)</option></select>
           </label>
           <label><input type="checkbox" id="readonly" /> Salt okunur</label>
+          <label title="Bu görünümde eklenen hücre notlarının yazarı olarak dosyaya yazılır.">Yazar adı (yeni notlar)
+            <input type="text" id="sheet-author" value="Deneme Kullanıcısı" maxlength="255" />
+          </label>
         </div>
         <div class="row" style="margin: 0 0 10px"><span class="muted" id="edit-state"></span></div>
         <div id="grid"></div>
@@ -113,7 +116,7 @@
           Üstteki araç çubuğuyla biçimlendirin (kalın, renk, dolgu, kenarlık, hizalama, birleştirme, sayı biçimi); formül çubuğundan ya da hücrenin içinden düzenleyin.
           Hücreye yazmaya başlayın, F2'ye basın ya da çift tıklayın; Enter yazar, Esc vazgeçer, Delete temizler. Ctrl+Z / Ctrl+Y geri alır ve yineler; Ctrl+C / X / V kopyalar, keser, yapıştırır.
           Formül yazarken (<code>=</code> ile başlayın) bir hücreye tıklamak başvurusunu ekler, sürüklemek aralık ekler; ok tuşları da hücre gösterir (F2 metin imlecine geçirir). F4 imlecin durduğu başvuruyu <code>A1</code> → <code>$A$1</code> → <code>A$1</code> → <code>$A1</code> sırasıyla dolaştırır (Mac dizüstünde Fn+F4). Formül yazarken başka bir sayfanın sekmesine tıklayıp oradaki hücreyi gösterebilirsiniz; Enter ilk sayfaya döner.
-          Sağ tık menüsü kes/kopyala/yapıştır ve satır-sütun ekle-sil sunar; sütun ya da satır başlığının kenarını sürükleyerek boyutlandırın, çift tıklayarak içeriğe sığdırın.
+          Sağ tık menüsü kes/kopyala/yapıştır, satır-sütun ekle-sil ve hücre notu (Not ekle / Notu düzenle / Notu sil) sunar; Shift+F2 etkin hücrenin notunu açar (Ctrl+Enter ya da dışarı tıklama uygular, Esc vazgeçer; yeni notların yazarı üstteki "Yazar adı" alanındaki addır; ad, bir sonraki dosya açılışında geçerli olur). İş parçacıklı yorumu olan hücrede not komutları devre dışıdır. sütun ya da satır başlığının kenarını sürükleyerek boyutlandırın, çift tıklayarak içeriğe sığdırın.
           Sayfalar: sekmelerin solundaki + yeni sayfa ekler; sekmeye sağ tıklayarak (dokunmatikte uzun basarak) sayfa ekleyin, yeniden adlandırın ya da silin; sekmeye çift tıklamak ya da F2 adı yerinde düzenletir. Silinen sayfa Ctrl+Z ile geri gelir. WebView köprüsünde aynı işlemler <code>insertSheet</code> / <code>renameSheet</code> / <code>deleteSheet</code> komutlarıyla yapılır ve güncel liste <code>sheets</code> iletisiyle bildirilir.
         </p>
         <p class="muted"><strong>Kaydetme:</strong> "Yeniden kaydet ve indir" düzenlemelerinizi dosyaya yazar; değiştirmediğiniz her şey özgün baytlarıyla kalır. İndirilen dosyayı Excel'de açıp denetleyebilirsiniz. Formüller burada hesaplanmaz; Excel dosyayı açarken yeniden hesaplar.</p>
@@ -377,6 +380,8 @@
           editor = new BymOffice.SpreadsheetEditor($('grid'), workbook, {
             locale: $('locale').value,
             readOnly: $('readonly').checked,
+            // Who the notes added to cells are by.
+            author: $('sheet-author').value,
             onChange: () => {
               changes++;
               refreshTools();

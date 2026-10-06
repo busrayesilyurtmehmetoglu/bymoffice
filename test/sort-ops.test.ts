@@ -215,6 +215,8 @@ test('sort: merged cells, array formulas and anchored comments are refused with 
 
   const noted = sheetOf([[2], [1]]);
   noted.anchored = ['comments', 'vmlDrawing'];
+  // As the reader leaves a sheet with a note: the part is named and the note is in the model.
+  noted.comments = [{ row: 0, col: 0, text: 'not' }];
   const wb4 = bookOf(noted);
   assert.throws(() => apply(wb4, sortRange(wb4, 0, full(noted), [{ col: 0 }])), /Cannot sort in a sheet with comments: not supported yet/);
 });

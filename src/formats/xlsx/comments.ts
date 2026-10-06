@@ -43,7 +43,7 @@ function textOf(el: XmlElement | undefined): string {
 const keyOf = (row: number, col: number): number => row * MAX_COLS + col;
 
 /** The text of a <text> element: plain (<t>) or in runs (<r>); phonetic text is left out. */
-function readText(el: XmlElement | undefined): { text: string; runs?: RichRun[] } {
+export function readText(el: XmlElement | undefined): { text: string; runs?: RichRun[] } {
   let text = '';
   const runs: RichRun[] = [];
   let formatted = false;
@@ -252,6 +252,44 @@ export function parseVmlNotes(bytes: Uint8Array): NoteBox[] {
     if (note) out.push(note);
   }
   return out;
+}
+
+/**
+ * Where the content of the root element of a legacy drawing is in its text: just past the
+ * start tag of the root, and at its end tag. Undefined for a text without that much (an
+ * empty part, a root that never ends), to which no box can be added. Not a parse: the rest
+ * of the part need not be well-formed.
+ */
+export function vmlRoot(text: string): { openEnd: number; closeStart: number } | undefined {
+  const start = text.search(/<[A-Za-z_]/);
+  if (start < 0) return undefined;
+  let end = -1;
+  for (let i = start + 1; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 62) {
+      end = i + 1;
+      break;
+    }
+    if (c === 34 || c === 39) {
+      i = text.indexOf(c === 34 ? '"' : "'", i + 1);
+      if (i < 0) return undefined;
+    }
+  }
+  const close = text.lastIndexOf('</');
+  if (end < 0 || text.charCodeAt(end - 2) === 47 || close < end) return undefined;
+  return { openEnd: end, closeStart: close };
+}
+
+/** A part as text, whatever of the three encodings of XML it is in. */
+function decodeAny(bytes: Uint8Array): string {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
+  return new TextDecoder().decode(bytes);
+}
+
+/** Whether boxes of notes can be added to and taken out of a legacy drawing part. */
+export function vmlTakesNotes(bytes: Uint8Array): boolean {
+  return vmlRoot(decodeAny(bytes)) !== undefined;
 }
 
 /** Sets what the legacy drawing says about their boxes on the comments of a sheet. */

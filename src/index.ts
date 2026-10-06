@@ -49,6 +49,7 @@ export { writeXlsx } from './formats/xlsx/write';
 export { buildXlsx, type BuildXlsxOptions, type XlsxBuildReport } from './formats/xlsx/build';
 export { History, applyOp, ensureCellFormat, ensureNumberFormat, type CellChange, type Op, type SheetsSnapshot } from './ops/ops';
 export { canDeleteSheet, canInsertSheet, canRenameSheet, defaultSheetName, deleteSheet, insertSheet, renameSheet, type InsertSheetOptions } from './ops/sheets';
+export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
 export { clearRange, copyRange, editTextAt, pasteAt, setCellInput, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
 export { MAX_FILTER_VALUES, clearFilter, filterSummary, filterValues, setAutoFilter, setFilterColumn, type FilterCriterion, type FilterValue, type FilterValueList } from './ops/filter';
 export { collationKey, currentRegion, sortRange, type SortKey, type SortOptions } from './ops/sort';
@@ -58,7 +59,7 @@ export { parseTsv, toTsv } from './edit/clipboard';
 export { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, quoteSheetName, renameSheetsInFormula, shiftFormula, type StructuralEdit } from './calc/refs';
 export { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, renderGridPrint, type GridBand, type GridFilter, type GridPrintScene, type GridScene, type GridSelection, type GridTheme } from './render/grid';
 export type { GridCommentSource, GridDrawingSource } from './render/grid';
-export { SheetDrawings, adjustCommentCell, adjustDrawingAnchor, anchorRect, type DrawingTarget, type PlacedComment, type SheetDrawingLabels, type SheetDrawingsOptions } from './render/sheet-drawings';
+export { SheetDrawings, adjustCommentCell, adjustDrawingAnchor, commentCellNow, commentEdits, anchorRect, type DrawingTarget, type PlacedComment, type SheetDrawingLabels, type SheetDrawingsOptions } from './render/sheet-drawings';
 export type { DecodedImage } from './render/images';
 export { cellText, formatGeneral } from './render/cell-text';
 export { cellDisplayText, formatCell, isoToSerial } from './format/cell-format';
@@ -299,7 +300,10 @@ export interface MountOptions extends SpreadsheetEditorOptions {
    * edited with tracked changes; false does not turn that off.
    */
   trackChanges?: boolean;
-  /** Documents: who is editing, the author the tracked changes name. Default "Author". */
+  /**
+   * Who is editing: the author that tracked changes of a document name, and the author of
+   * the notes added to the cells of a spreadsheet. Default "Author".
+   */
   author?: string;
   /** Documents: the clock tracked changes take their date from (tests). Default: the system's. */
   now?(): Date;
