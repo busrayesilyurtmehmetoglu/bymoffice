@@ -7,6 +7,7 @@ import { createSheetMetrics, type SheetMetrics } from '../src/layout/sheet-metri
 import { createSheet, type DrawingAnchor, type DrawingObject, type DrawingShape, type Sheet, type SheetDrawing } from '../src/model/sheet/types';
 import type { DecodedImage } from '../src/render/images';
 import { SheetDrawings, type SheetDrawingsOptions } from '../src/render/sheet-drawings';
+import { registerFont, unregisterFont } from '../src/render/fonts';
 import { FONT_FALLBACK, clearTextMeasureCache } from '../src/render/text';
 
 const PX = 9525;
@@ -603,4 +604,32 @@ test('layer: a comment that is always shown is a box with its text; the others a
       ['adsız', false],
     ],
   );
+});
+
+test('layer: the text of a shape follows the fonts that are registered, on the same layer', async () => {
+  // The browser's web fonts, as far as the registry uses them.
+  const globals = globalThis as { FontFace?: unknown; document?: unknown };
+  const before = { face: globals.FontFace, document: globals.document };
+  globals.FontFace = class {
+    load(): Promise<unknown> {
+      return Promise.resolve(this);
+    }
+  };
+  globals.document = { fonts: { add: () => undefined, delete: () => undefined } };
+  try {
+    const text = { paragraphs: [{ runs: [{ text: 'one two', size: 12, font: 'Bookman Old Style Tur' }] }] };
+    const sheet = withDrawings({ anchor: cells(1, 1, 3, 9), object: shape({ fill: '#FFFFFF', text }) });
+    const layer = new SheetDrawings(sheet);
+    const fonts = () => Array.from(new Set(paint(sheet, { layer }).texts.map((call) => call.font)));
+    const plain = `16px "Bookman Old Style Tur", "Bookman Old Style", ${FONT_FALLBACK}`;
+    assert.deepEqual(fonts(), [plain]);
+    await registerFont({ family: 'My Bonum', source: new Uint8Array([0, 1, 0, 0]), as: 'Bookman Old Style' });
+    assert.deepEqual(fonts(), [`16px "Bookman Old Style Tur", "Bookman Old Style", "My Bonum", ${FONT_FALLBACK}`]);
+    assert.equal(unregisterFont('My Bonum'), true);
+    assert.deepEqual(fonts(), [plain]);
+  } finally {
+    unregisterFont('My Bonum');
+    globals.FontFace = before.face;
+    globals.document = before.document;
+  }
 });

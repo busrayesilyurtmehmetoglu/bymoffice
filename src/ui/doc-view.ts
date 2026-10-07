@@ -21,6 +21,7 @@ import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperl
 import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
+import { onFontsChanged } from '../render/fonts';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
 import { cutLoses, fragmentOfRange, setCopyMedia, sliceHtml, sliceOf, storeCopy, storedCopy, type DocSlice, type StoredCopy } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
@@ -654,6 +655,9 @@ export class DocumentView {
   private layoutTimer: ReturnType<typeof setTimeout> | undefined;
   private fontTimer: ReturnType<typeof setTimeout> | undefined;
   private fontRelayouts = 0;
+  private unwatchFonts: (() => void) | undefined;
+  /** Fonts arrived while a composition or a drag was under way: the layout is due when it ends. */
+  private fontsDue = false;
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
@@ -861,6 +865,7 @@ export class DocumentView {
         this.history.seal();
         this.composed = 0;
         this.schedule();
+        this.fontsSettled();
       },
     });
     this.applyInputMode();
@@ -1369,6 +1374,7 @@ export class DocumentView {
     this.watchPixelRatio();
     const fonts = (document as { fonts?: { addEventListener?(type: string, listener: () => void): void } }).fonts;
     if (fonts && typeof fonts.addEventListener === 'function') fonts.addEventListener('loadingdone', this.onFontsLoaded);
+    this.unwatchFonts = onFontsChanged(this.onFontsRegistered);
   }
 
   private unlisten(): void {
@@ -1406,6 +1412,8 @@ export class DocumentView {
     this.unwatchPixelRatio();
     const fonts = (document as { fonts?: { removeEventListener?(type: string, listener: () => void): void } }).fonts;
     if (fonts && typeof fonts.removeEventListener === 'function') fonts.removeEventListener('loadingdone', this.onFontsLoaded);
+    if (this.unwatchFonts) this.unwatchFonts();
+    this.unwatchFonts = undefined;
   }
 
   private readZoomOption(zoom: DocumentZoom | undefined): void {
@@ -1545,9 +1553,48 @@ export class DocumentView {
     this.fontTimer = setTimeout(() => {
       this.fontTimer = undefined;
       this.fontRelayouts++;
-      this.relayout();
+      this.relayoutForFonts();
     }, 50);
   };
+
+  /**
+   * The application registered a font or took one out (registerFont()): what
+   * was measured without it is measured anew. Not counted as the fonts of the
+   * page are: the application decides how often this happens.
+   */
+  private onFontsRegistered = (): void => {
+    if (this.destroyed || this.fontTimer !== undefined) return;
+    // Several fonts registered together are one layout.
+    this.fontTimer = setTimeout(() => {
+      this.fontTimer = undefined;
+      this.relayoutForFonts();
+    }, 50);
+  };
+
+  /**
+   * Lays the document out again because fonts arrived, but not under the
+   * hands of the user: while an input method composes or a selection is
+   * dragged the layout waits, and fontsSettled() runs it when that is over.
+   */
+  private relayoutForFonts(): void {
+    if (this.destroyed) return;
+    if (this.typing.composing || this.dragging) {
+      this.fontsDue = true;
+      return;
+    }
+    this.fontsDue = false;
+    this.relayout();
+  }
+
+  /** A composition or a drag ended: the layout that waited for it runs. */
+  private fontsSettled(): void {
+    if (!this.fontsDue || this.destroyed || this.fontTimer !== undefined) return;
+    // After the event that ended it has been dealt with to its end.
+    this.fontTimer = setTimeout(() => {
+      this.fontTimer = undefined;
+      this.relayoutForFonts();
+    }, 0);
+  }
 
   // -------------------------------------------------------------- geometry
 
@@ -2206,6 +2253,7 @@ export class DocumentView {
     this.dragPoint = undefined;
     if (!this.dragging) return;
     this.dragging = false;
+    this.fontsSettled();
     window.removeEventListener('pointermove', this.onPointerMove as EventListener);
     window.removeEventListener('mousemove', this.onPointerMove as EventListener);
     window.removeEventListener('pointerup', this.onPointerUp);

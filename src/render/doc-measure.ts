@@ -7,9 +7,16 @@
 // Common Office fonts are followed by fonts with the same metrics (Calibri ->
 // Carlito, ...), so that a document breaks its lines the same way on a device
 // that has only the substitute; the last entry is always a generic family.
+//
+// A name with a code page suffix ("Bookman Old Style Tur", "Arial CE") is the
+// font in front of the suffix: it is followed by that family, and everything
+// that is looked up by family (substitutes, line metrics, the generic family)
+// is looked up by it. Fonts the application registered for a family
+// (registerFont() with `as`) come right after it. The name in the model is
+// never changed.
 
 import type { FontMetrics, LayoutFont, TextMeasurer } from '../layout/doc/types';
-import { sanitizeFontFamily } from './text';
+import { fontsVersion, replacementFonts, sanitizeFontFamily, splitFontFamily } from './fonts';
 
 /** What the measurer needs of a canvas context. */
 export interface MeasureContext {
@@ -57,6 +64,14 @@ const SUBSTITUTES: { [family: string]: string[] } = {
   georgia: ['Gelasio'],
   carlito: ['Calibri'],
   caladea: ['Cambria'],
+  // The families below are missing on Apple and Android devices. Their substitutes are clones of the PostScript
+  // fonts the Monotype families were drawn to match (ITC Bookman, Palatino, New Century Schoolbook, ITC Avant Garde
+  // Gothic). UNSURE: that the Monotype files have exactly the advance widths of those PostScript fonts was not
+  // checked against the files (none was at hand).
+  'bookman old style': ['TeX Gyre Bonum', 'URW Bookman', 'URW Bookman L', 'Bookman'],
+  'book antiqua': ['TeX Gyre Pagella', 'Palatino Linotype', 'Palatino', 'URW Palladio L'],
+  'century schoolbook': ['TeX Gyre Schola', 'Century Schoolbook L'],
+  'century gothic': ['TeX Gyre Adventor', 'URW Gothic'],
 };
 
 const SERIF = [
@@ -127,6 +142,9 @@ const VERTICAL_METRICS: { [family: string]: [number, number, number] } = {
   impact: [2066, 432, 0], // verified
   'microsoft sans serif': [1888, 430, 0], // verified
   'andale mono': [1858, 446, 0], // verified
+  'arial rounded mt bold': [1938, 432, 0], // verified (macOS file)
+  'brush script mt': [1820, 692, 0], // verified (macOS file)
+  rockwell: [2099, 600, 0], // verified (macOS file)
   webdings: [1638, 410, 0], // verified
   wingdings: [1841, 432, 0], // verified
   'wingdings 2': [1727, 432, 0], // verified
@@ -143,6 +161,15 @@ const VERTICAL_METRICS: { [family: string]: [number, number, number] } = {
   'century gothic': [2060, 451, 0], // UNSURE (line 1.226 em)
   symbol: [2059, 450, 0], // UNSURE (line 1.225 em)
 };
+
+/** The row of the table for a family of a document: by its name, then by the name without its code page suffix. */
+function tableMetrics(family: unknown): [number, number, number] | undefined {
+  if (typeof family !== 'string') return undefined;
+  const name = family.trim().toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(VERTICAL_METRICS, name)) return VERTICAL_METRICS[name];
+  const base = splitFontFamily(family).base.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(VERTICAL_METRICS, base) ? VERTICAL_METRICS[base] : undefined;
+}
 
 /** Size at which the font box of a family that is not in the table is measured; the result is scaled to the size asked for. */
 const METRICS_PROBE_PX = 1000;
@@ -181,6 +208,8 @@ export class CanvasTextMeasurer implements TextMeasurer {
   private widths = new Map<string, number>();
   /** Font box per px of size, by face (family list and style), of the families that are not in the table. */
   private extents = new Map<string, { ascent: number; descent: number } | null>();
+  /** fontsVersion() the family lists were built for. */
+  private registered = fontsVersion();
 
   constructor(options: CanvasMeasurerOptions = {}) {
     this.context = options.context;
@@ -197,6 +226,7 @@ export class CanvasTextMeasurer implements TextMeasurer {
    * family. Every name is sanitized and quoted.
    */
   cssFamilies(family: string): string {
+    this.sync();
     let list = this.families.get(family);
     if (list !== undefined) return list;
     const names = this.chain(family);
@@ -210,6 +240,7 @@ export class CanvasTextMeasurer implements TextMeasurer {
 
   /** The value for `ctx.font`. */
   cssFont(font: LayoutFont): string {
+    this.sync();
     let css = this.byFont.get(font);
     if (css === undefined) {
       css = (font.italic === true ? 'italic ' : '') + (font.bold === true ? 'bold ' : '') + fontSize(font.size) + 'px ' + this.cssFamilies(font.family);
@@ -234,10 +265,9 @@ export class CanvasTextMeasurer implements TextMeasurer {
 
   metrics(font: LayoutFont): FontMetrics {
     const size = fontSize(font.size);
-    const name = typeof font.family === 'string' ? font.family.trim().toLowerCase() : '';
-    if (Object.prototype.hasOwnProperty.call(VERTICAL_METRICS, name)) {
+    const units = tableMetrics(font.family);
+    if (units) {
       // The same in every browser, and what Word used when it broke the document into pages.
-      const units = VERTICAL_METRICS[name];
       return { ascent: (units[0] * size) / UNITS_PER_EM, descent: (units[1] * size) / UNITS_PER_EM, lineGap: (units[2] * size) / UNITS_PER_EM };
     }
     // Measured once per face at a large size: a canvas that reports whole pixels is off by up to 4% at text sizes.
@@ -261,6 +291,7 @@ export class CanvasTextMeasurer implements TextMeasurer {
 
   /** Whether the device can show the family, or a font with the same metrics. */
   hasFont(family: string): boolean {
+    this.sync();
     const names = this.chain(family);
     for (let i = 0; i < names.length; i++) if (this.isAvailable(names[i])) return true;
     return false;
@@ -274,7 +305,22 @@ export class CanvasTextMeasurer implements TextMeasurer {
     this.current = undefined;
   }
 
-  /** The family, its alternative and its substitutes, sanitized, without repeats. */
+  /** A font was registered or removed since the family lists were built: they and everything measured with them are forgotten. */
+  private sync(): void {
+    const now = fontsVersion();
+    if (now === this.registered) return;
+    this.registered = now;
+    this.families.clear();
+    this.byFont = new WeakMap();
+    this.clear();
+  }
+
+  /**
+   * The names to try for a family of the document, sanitized, without
+   * repeats: registered fonts preferred to it, the name itself, the family
+   * without its code page suffix, the other registered fonts that stand in
+   * for it, the alternative of the font table and the substitutes.
+   */
   private chain(family: string): string[] {
     const names: string[] = [];
     const add = (name: unknown) => {
@@ -284,11 +330,16 @@ export class CanvasTextMeasurer implements TextMeasurer {
       for (let i = 0; i < names.length; i++) if (names[i].toLowerCase() === lower) return;
       names.push(clean);
     };
-    add(family);
+    const { full, base } = splitFontFamily(family);
+    const registered = full === '' ? undefined : replacementFonts(full, base);
+    if (registered) for (let i = 0; i < registered.first.length; i++) add(registered.first[i]);
+    add(full);
+    add(base);
+    if (registered) for (let i = 0; i < registered.then.length; i++) add(registered.then[i]);
     const hint = this.hints ? this.hints.get(family) : undefined;
     if (hint) add(hint.altName);
-    const first = names.length ? names[0].toLowerCase() : '';
-    const substitutes = Object.prototype.hasOwnProperty.call(SUBSTITUTES, first) ? SUBSTITUTES[first] : undefined;
+    const lower = base.toLowerCase();
+    const substitutes = Object.prototype.hasOwnProperty.call(SUBSTITUTES, lower) ? SUBSTITUTES[lower] : undefined;
     if (substitutes) for (let i = 0; i < substitutes.length; i++) add(substitutes[i]);
     return names;
   }

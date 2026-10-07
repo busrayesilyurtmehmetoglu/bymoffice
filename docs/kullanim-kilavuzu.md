@@ -53,6 +53,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Belge düzenlemede: dipnot/sonnot başvurusu, yorum, denklem, içerik denetimi, izlenen değişiklik, metin kutusu ve metinli şekil, grafik, diyagram, gömülü nesne (OLE), VML resim, `mc:AlternateContent`, birden çok paragrafa yayılan alan (içindekiler tablosu), akıllı etiket ve özel XML'in panoyla taşınması (kopyada bunların yalnız metni gider; bunları içeren seçim **kesilemez**, bildirimle yerinde bırakılır), başka sekmedeki/sayfadaki bir düzenleyiciye ya da başka uygulamaya zengin içerik taşıma (pano dışarıya yalnız metin ve basit HTML verir), dışarıdan gelen HTML'in biçimiyle yapıştırılması (yalnız metni alınır), tablo hücrelerinin üzerine hücre hücre yapıştırma (tablo, iç içe tablo olarak eklenir), değişiklik izleme ve yorum düzenleme, metin kutularının içini düzenleme | Yok. Görsel, bağlantı, alan, sayfa/sütun sonu, tablo, paragraf biçimi, stil ve liste aynı sayfadaki düzenleyiciler arasında taşınır (bkz. Pano) |
 | İzlenen değişikliklerde: kabul et / reddet (arayüzde ve programdan), izlemeyi arayüzden açıp kapatma, kenar çubuğu ve balonlar, "yalnız son hali göster" görünümü; **izleme açıkken** biçim (kalın, renk, yazı tipi…), paragraf biçimi ve stil, liste, tablo ekleme ve satır/sütun ekle-sil, görsel ve bağlantı ekleme, blok ekleme (`insertBlock`), biçimli/görselli/tablolu yapıştırma, tabloya girip çıkan ya da tablo kapsayan seçimi silme | Yok. İzleme açık belgede bu işlemler **reddedilir** (bildirimle; belge değişmez), çünkü izlenmeden yapılmaları belgenin ayarına aykırı olurdu. Zengin kopya, metni izlenen ekleme olarak yapıştırılır ve bu bildirilir. Yazma, silme, Enter, sayfa sonu, kesme ve düz metin yapıştırma izlenir (bkz. "Belge koruması ve değişiklik izleme") |
 | Belge korumasında: parola doğrulama, korumayı kaldırma ya da ekleme; yorum ekleme ve form alanı doldurma (bu korumalar salt okunur açılır); korumadan muaf aralıkların (`w:permStart`/`w:permEnd`) düzenlenebilmesi; `w:writeProtection` (salt okunur önerisi) ve biçimlendirme kısıtlamasının (`w:formatting`; `w:edit` taşımayan koruma hiçbir şeyi kilitlemez) uygulanması; doc'ta salt okunur korumanın okunması | Yok. Koruma öğesi dosyada bayt bayt korunur; muaf aralık varlığı `protection.exceptions` ile bildirilir, belge yine tümüyle salt okunurdur |
+| Fontlarda: pakete gömülü font (hiçbir font dosyası paketle gelmez; cihazdakiler ve `registerFont` ile verdikleriniz kullanılır), belgeye gömülü fontların (docx `word/fonts/*.odttf`) yüklenmesi, Tahoma/Verdana/Garamond/Palatino Linotype için ölçü uyumlu yedek, Bookman Old Style ve tabloda olmayan öbür aileler için Word'ün satır yüksekliği, `FontFace` olmayan tarayıcıda font kaydı | Yok. Bkz. "Fontlar" |
 | Belgede: belge içi bağlantılar, arama, sağdan sola yazı, heceleme, grafik ve vektör görsel (EMF/WMF/SVG) çizimi, belgeye gömülü fontlar | Yok. Çizilemeyen nesnelerin yerinde yer tutucu görünür |
 | Belgede şekiller (docx, doc, RTF): dikdörtgen, yuvarlatılmış dikdörtgen, elips ve düz çizgi dışındaki geometriler (oklar, serbest biçimler, akış şeması şekilleri…); ok başları; çift/üçlü (bileşik) çizgi; özel kesik çizgi; gradyan, desen ve resim dolgu; saydamlık; gölge ve diğer efektler; şekil gruplarının ve çizim tuvalinin parçaları; metin kutusunun metniyle birlikte döndürülmesi | Yok. **Tek şekilli çizimde** (grup değil) çizilenler: hazır geometri `rect` (kesik/tek köşesi yuvarlak dikdörtgen türleri ve `flowChartProcess` de düz dikdörtgen olarak), `roundRect`, `ellipse`, `line`, `straightConnector1`; düz renk dolgu; çizginin rengi, kalınlığı (0 = en ince çizgi) ve hazır kesiklik türü; metinsiz şekilde döndürme, çizgide çevirme. **Yaklaşık çizilenler:** ok başlı çizgi başsız, bileşik çizgi tek, özel kesiklik düz çizilir; gölge çizilmez; kısmi saydam renk opak boyanır (tam saydam boyanmaz); gradyan/desen olan *çizgi* hiç çizilmez; metinli şekil döndürülmez. **Yer tutucu olanlar:** metinsiz şekil başka bir geometrideyse (ya da docx'te özel geometri taşıyor ya da geometri belirtmiyorsa) ya da dolgusu gradyan/desen/resimse; metinsiz gruplar, tuvaller, grafikler, diyagramlar. Bu durumlardaki **metin kutusunda** metin gösterilir: tanınmayan geometride docx'te çerçevesiz, doc/RTF'te dikdörtgen çerçeveyle; gösterilemeyen dolguda dolgusuz. **Gruplarda** yalnız parçaların metinleri (alt alta) ve resimleri gösterilir, parçaların geometrisi çizilmez. doc/RTF'te ayrıca: palet/şema/sistem dizinli renkler çözülmez (dolgu boyanmaz, çizgi siyah olur), çizim grubunun varsayılan özellik tablosu okunmaz (şekil kendi belirtmediği özellikte belirtimin varsayılanını alır), ok başı, bileşik çizgi ve gölge okunmaz; resmi bulunamayan resim şekli yer tutucudur. docx'te tüm bunlar dosyada korunur |
 | Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
@@ -171,6 +172,7 @@ Bir dosyayı açar ve `container` içinde gösterir: xlsx ve xls tablo düzenley
 | `sheet` | İlk gösterilecek sayfanın dizini. Verilmezse dosyanın etkin sayfası; o gizliyse ilk görünür sayfa |
 | `readOnly` | `true` ise düzenleme kapalıdır (editör, yapıştırma, kesme, silme, geri al, satır/sütun komutları çalışmaz); kopyalama çalışır. Varsayılan `false` |
 | `onChange({ sheets })` | Çalışma kitabı her değiştiğinde çağrılır (geri al ve yinele dahil); `sheets` etkilenmiş olabilecek sayfa dizinleridir |
+| `fonts` | Dosya gösterilmeden önce kaydedilecek fontlar: `registerFont()`'a verilen nesnelerin dizisi (bkz. "Fontlar"). Yüklenmeleri en çok 3 saniye beklenir, böylece dosya baştan bu fontlarla dizilir. Yüklenemeyen font dosyanın açılmasını engellemez: `onNotice` ile bildirilir (`kind: 'error'`); süre dolduğunda hâlâ yüklenen font da bildirilir (`kind: 'info'`) ve geldiğinde görünüm kendiliğinden yeniden dizilir. Fontlar görünüm kaldırılınca kayıtlı kalır |
 | `convert` | `true` ise yazılamayan biçimler (doc, RTF, xls) **dönüştürülerek düzenlenebilir açılır**: doc ve RTF docx'e, xls xlsx'e çevrilir; gösterilen, düzenlenen ve `save()` ile alınan dosya yeni biçimdedir. Dönüş değerinde `conversion: { from, to, warnings }` bulunur ve `onNotice` ile bildirilir (bildirimin dili görünümlerle aynı kuralla seçilir: `locale` bir dil etiketiyse o, verilmemişse ya da nesneyse tarayıcının dili). `readOnly: true` ile birlikte verilirse dönüştürme yapılmaz. Varsayılan `false`: bu dosyalar olduğu gibi, salt okunur gösterilir |
 | `onSave(bytes)` | Kullanıcı görünümde Ctrl+S / Cmd+S'e basınca dosyanın baytlarıyla çağrılır; verilmezse kısayol tarayıcıya bırakılır. Hata olursa `onError(error)` çağrılır |
 | `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
@@ -492,6 +494,69 @@ Belge yazdırmayla **aynı altyapıdır**: sayfalar görüntü olarak hazırlan�
 - **Sınırlar:** belgedekiyle aynı (en çok 2.000 sayfa; toplam piksel ve bayt sınırları). Sınırın ötesindeki sayfa — ör. kullanılan alanı 1.048.576. satıra uzanan bir sayfa — daha dizilirken, hiçbir sayfa çizilmeden `too-long` ile reddedilir ("Sayfa bir kerede yazdırılamayacak kadar uzun").
 - **Excel'le doğrulanamayanlar** (elde Excel yok; kodda `UNSURE` ile işaretli): sığdırma açıkken elle sayfa sonlarının yok sayılması; silinen satırların içinde kalan sayfa sonunun silme yerine taşınması; `sheets: 'all'`'da sayfa numaralarının sayfalar arasında sürmesi; `alignWithMargins` kapalıyken 0,7 inçlik iç boşluk.
 - Alt düzey (DOM gerektirmez, Node'da da çalışır): `BymOffice.paginateSheet(sheet, { areas, titleRows, titleCols, styles, drawings, defaultPaper, maxPages })` → `{ paper, margins, scale, headings, gridLines, pages: [{ rows, cols, titleRows?, titleCols?, x, y, width, height }] }` (px, inç başına 96; boş sayfada ya da sınır aşımında `SheetPagesError`), `BymOffice.printRanges(workbook, sayfaDizini)` (yazdırma alanı ve başlıklar), `BymOffice.usedRange(sheet, …)`, `BymOffice.paperSize(page, varsayılan)`, `BymOffice.planSheetPages(workbook, sayfaDizinleri, …)` (bir işin bütün yaprakları, numaralarıyla), `BymOffice.parseHeaderFooter(kod)` + `BymOffice.headerFooterLines(parçalar, değerler)`, `BymOffice.paintSheetPage(ctx, …)` (bir yaprağı tuvale çizer).
+
+### Fontlar
+
+Dosyalar font adlarını taşır, fontların kendisini taşımaz; metin, cihazda bulunan fontla ölçülür ve çizilir. İstenen font cihazda yoksa satır ve sayfa sonları kayar. Motor bunu üç yolla azaltır:
+
+**1. Kod sayfası sonekli adlar.** Eski Windows belgeleri (doc, RTF, xls) aynı fontu kod sayfasına göre adlandırır: `Bookman Old Style Tur`, `Arial CE`, `Times New Roman Cyr`. Böyle bir font hiçbir cihazda yoktur; kastedilen, sonekin önündeki fonttur. Gösterim ve ölçümde ad, taban adıyla birlikte denenir:
+
+| Sonek | Örnek | Taban ad |
+|---|---|---|
+| ` Tur`, ` CE`, ` Cyr`, ` Greek`, ` Baltic` (büyük/küçük harf fark etmez) | `Arial Tur`, `Arial CYR` | `Arial` |
+| ` (Turkish)`, ` (Hebrew)`, ` (Arabic)`, ` (Vietnamese)`, ` (Thai)`, ` (Greek)`, ` (Cyrillic)`, ` (Baltic)`, ` (Central European)`, ` (Western)` | `Tahoma (Thai)` | `Tahoma` |
+
+- Yalnız bu liste, adın **sonunda** ve ayrı bir sözcük olarak sonektir. `Arial Hebrew`, `Noto Sans Thai`, `Arial Turkish` (ayraçsız) kendi adlarıyla kalır; ad yalnız sonekten oluşuyorsa (`Tur`) dokunulmaz; yalnız bir sonek soyulur.
+- Font dizgisinde dosyadaki ad **önce** gelir, taban ad hemen ardından: `"SBL Greek"` gibi gerçekten o adı taşıyan bir font cihazda varsa o kullanılır.
+- Yerine koyma zinciri, satır yüksekliği tablosu, serif/eş aralıklı sınıflaması ve "cihazda var mı" sınaması (`hasFont`) taban adla çalışır.
+- **Modeldeki ve dosyaya yazılan ad değişmez**; soyma yalnız gösterim katmanındadır (belgede `CanvasTextMeasurer`, tabloda `cssFont`). `BymOffice.baseFontFamily('Arial Tur')` → `'Arial'`.
+
+**2. Ölçü uyumlu yedekler.** Belgede bir font adı şu sırayla denenir: `prefer` ile kaydedilmiş fontlar → dosyadaki ad → taban ad → `as` ile kaydedilmiş fontlar → dosyanın font tablosundaki alternatif ad (`w:altName`, RTF `\falt`) → aşağıdaki ölçü uyumlu açık fontlar → genel aile (`serif` / `sans-serif` / `monospace`).
+
+| İstenen | Ardından denenenler |
+|---|---|
+| Calibri, Calibri Light | Carlito |
+| Cambria, Cambria Math | Caladea |
+| Arial (Helvetica) | Liberation Sans, Arimo, Helvetica |
+| Arial Narrow | Liberation Sans Narrow |
+| Times New Roman (Times) | Liberation Serif, Tinos, Times |
+| Courier New (Courier) | Liberation Mono, Cousine, Courier |
+| Georgia | Gelasio |
+| Bookman Old Style | TeX Gyre Bonum, URW Bookman, URW Bookman L, Bookman |
+| Book Antiqua | TeX Gyre Pagella, Palatino Linotype, Palatino, URW Palladio L |
+| Century Schoolbook | TeX Gyre Schola, Century Schoolbook L |
+| Century Gothic | TeX Gyre Adventor, URW Gothic |
+
+Bu fontlar pakette **yoktur**; cihazda ya da sayfanızda (`@font-face` ya da `registerFont`) varsa kullanılırlar. Son dört satır UNSURE: yedekler, Monotype ailelerinin uyumlu çizildiği PostScript fontlarının (ITC Bookman, Palatino, New Century Schoolbook, ITC Avant Garde Gothic) eşleridir; Monotype dosyalarıyla genişlikleri karşılaştırılamadı. Tahoma, Verdana, Garamond ve Palatino Linotype için ölçü uyumlu açık font bilinmiyor: zincirleri yalnız genel aileyle biter. Tablo (xlsx/xls) görünümünde zincir daha kısadır: ad, taban ad, kaydedilmiş fontlar, sonra Carlito/Calibri/Arial.
+
+Satır yüksekliği, yaygın fontlar için font dosyalarından okunmuş sayılardan gelir (Word'ün kullandığı `usWinAscent`/`usWinDescent` ve dış satır aralığı) ve her tarayıcıda aynıdır. Tabloda olmayan bir ailede (ör. Bookman Old Style) satır yüksekliği, tarayıcının o an çizdiği fontun kutusudur; yedek fontun kutusu özgün fontunkinden farklıysa sayfa sonları kayabilir.
+
+**3. Kendi fontunuzu kaydetme: `registerFont`.** Uygulama, cihazda olmayan bir fontu sayfaya ekleyebilir ve belge font adlarının yerine geçirebilir:
+
+```js
+await BymOffice.registerFont({
+  family: 'TeX Gyre Bonum',                 // fontun kendi aile adı
+  source: '/fonts/texgyrebonum-regular.woff2', // adres ya da baytlar (ArrayBuffer, Uint8Array, Blob/File)
+  as: ['Bookman Old Style'],                // yerine geçeceği belge font adları (isteğe bağlı)
+});
+await BymOffice.registerFont({ family: 'TeX Gyre Bonum', source: boldBytes, weight: 'bold', as: ['Bookman Old Style'] });
+```
+
+| Alan | İş |
+|---|---|
+| `family` | Aile adı. Dosyadan gelen adlarla aynı kuraldan geçer: yalnız harf, rakam, boşluk ve tire kalır; geriye bir şey kalmıyorsa reddedilir |
+| `source` | Font dosyasının adresi (dizge; olduğu gibi tarayıcıya verilir, CORS ve içerik güvenliği ilkesi sayfanızınkidir) ya da baytları. TrueType, OpenType, WOFF, WOFF2 (tarayıcının desteklediği) |
+| `weight` | `'normal'` (varsayılan), `'bold'` ya da 1–1000 arası sayı |
+| `style` | `'normal'` (varsayılan) ya da `'italic'` |
+| `as` | Bir ad ya da ad dizisi (en çok 32): belgede/tabloda bu adlar (ve sonekli halleri: `Bookman Old Style Tur`) istenince, **cihazda o font yoksa** bu font kullanılır. Cihazda varsa cihazdaki kullanılır |
+| `prefer` | `true` ise `as` adları için cihazdaki font yerine **her zaman** bu font kullanılır (her cihazda aynı satır sonları için) |
+
+- Dönüş: `Promise<RegisteredFont>` (`{ family, weight, style, as, prefer, status: 'loaded' }`; `weight` sayıdır: `'normal'` 400, `'bold'` 700); font dosyası okunup kullanılabilir olunca çözülür. Dosya yüklenemez ya da font değilse, kayıt geçersizse, 64 yüz sınırı aşılırsa reddeder. Kalın ve italik için ayrı dosyalar ayrı çağrılarla kaydedilir; kaydedilmeyen yüzü tarayıcı yapay olarak üretir. Aynı yüz (aile adı büyük/küçük harf ayırmadan + ağırlık + stil; `'bold'` ile `700` aynı yüzdür) yeniden kaydedilirse yenisi **yüklendiği anda** eskisinin yerini alır ve görünümler bir kez yeniden dizilir; o ana dek eski yüz kullanılmaya devam eder (`registeredFonts()` ikisini de gösterir: biri `loaded`, biri `loading`). Yeni dosya yüklenemezse çağrı reddeder ve eski yüz kalır. Aynı yüz için yüklenmesi süren bir kayıt varken yenisi gelirse öncekinden vazgeçilir (onun sözü reddeder).
+- Yükleme bitince **açık bütün görünümler kendiliğinden yeniden ölçer**: belge baştan dizilir (düzenleyicide imleç ve seçim korunur, görünen sayfa aynı kalır; salt okunur görünümde seçim kalkar), tablo yeniden çizilir (hücreler ve şekil/metin kutusu metinleri). Belge düzenleyicide bir giriş yöntemi (IME) bileşimi ya da fareyle sürükleyerek seçim sürüyorsa yeniden dizme **o bitene dek ertelenir** (sayfaya `@font-face` ile gelen fontlar için de). Baskı hazırlığı sürerken gelen font, sayfaların baştan hazırlanmasına yol açar. Yazdırma da kayıtlı fontu kullanır. Belge araç çubuğundaki font listesine kayıtlı aileler eklenir.
+- `BymOffice.registeredFonts()` kayıtları listeler (yüklenmekte olanlar `status: 'loading'`); `BymOffice.unregisterFont(family)` ailenin bütün yüzlerini kaldırır (görünümler yine yeniden dizilir) ve bir şey kaldırdıysa `true` döner. Üçü `BymOffice.fonts` altında da durur (`BymOffice.fonts.registerFont` …).
+- Kayıt sayfa genelindedir (tarayıcının `FontFace` arayüzü ve `document.fonts`); görünüm kaldırılınca silinmez. `FontFace` olmayan ortamda (Node, çok eski WebView) `registerFont` açıklayıcı bir hatayla reddeder; `@font-face` kuralıyla yedek yol **yoktur**. Sayfanıza kendi `@font-face` kuralınızla eklediğiniz fontlar da çalışır: belge görünümü tarayıcının "fontlar yüklendi" olayında yeniden dizilir.
+- `mount({ fonts: [...] })` aynı nesneleri alır (yukarıdaki seçenek tablosu); WebView köprüsünde `load.fonts` (bkz. `docs/webview-koprusu.md`).
+- Dosyanın içindeki gömülü fontlar (docx `word/fonts/*.odttf`) **yüklenmez**; yalnız dosyada korunur.
 
 ### Formüller
 
@@ -868,6 +933,7 @@ Sayfada yapabilecekleriniz:
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Boş docx oluştur ve aç" / "Boş xlsx oluştur ve aç" ile `createBlank()` çıktısını açmak.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
+- **"Font dosyası"** ile kendi font dosyanızı (ttf, otf, woff, woff2) yanındaki alana yazdığınız belge font adının (varsayılan `Bookman Old Style`) yerine kaydetmek (`registerFont`); açık belge ve tablo kendiliğinden yeniden dizilir. "Fontları kaldır" kayıtları siler.
 
 Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez.
 

@@ -63,7 +63,7 @@ const MAX_SLICE_RUNS = 20000;
 const escapeHtml = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 /** A font name as it may stand in a style attribute: letters, digits, spaces and hyphens only. */
-const safeFont = (name: string): string => name.replace(/[^A-Za-z0-9 \-À-￿]/g, '').slice(0, 64);
+const safeFont = (name: string): string => name.replace(/[^A-Za-z0-9 \-\u00C0-\uFFFF]/g, '').slice(0, 64);
 
 /** The runs of a paragraph between two offsets, each with the formatting in effect for it. */
 function runsOf(doc: DocModel, story: string, path: number[], paragraph: Paragraph, from: number, to: number, budget: { runs: number }): SliceRun[] | undefined {

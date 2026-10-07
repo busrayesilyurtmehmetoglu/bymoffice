@@ -10,6 +10,7 @@ import { readXls } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
 import { buildXlsx } from './formats/xlsx/build';
 import { resolveUiStrings } from './ui/strings';
+import { registerFont, registeredFonts, settleFonts, unregisterFont, type FontFailure, type FontRegistration } from './render/fonts';
 import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
@@ -77,6 +78,7 @@ export { DocLayout } from './layout/doc/layout';
 export { revisionColor } from './layout/doc/prep';
 export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, ShapeItem, TextItem, TextMeasurer } from './layout/doc/types';
 export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
+export { baseFontFamily, registerFont, registeredFonts, unregisterFont, type FontRegistration, type FontSource, type RegisteredFont } from './render/fonts';
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
@@ -110,6 +112,14 @@ export { DocLines, type Affinity, type CaretBox, type PageLine, type Place } fro
 export { sliceHtml, sliceOf, type DocSlice } from './ui/doc-clipboard';
 export type { LineMark } from './layout/doc/types';
 export type { EditProgress } from './layout/doc/layout';
+
+/**
+ * The fonts of the application: registerFont() adds a font to the ones the
+ * device has (also as a stand-in for font names of files), registeredFonts()
+ * lists them and unregisterFont() takes one out again. The same functions
+ * are exported on their own.
+ */
+export const fonts = { registerFont, registeredFonts, unregisterFont };
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
 
@@ -285,6 +295,15 @@ export interface MountOptions extends SpreadsheetEditorOptions {
    * and onNotice says so. Has no effect on docx and xlsx.
    */
   convert?: boolean;
+  /**
+   * Fonts to register before the file is shown: see registerFont(). They are
+   * waited for, for three seconds at most, so that the file is laid out with
+   * them from the start. A font that cannot be loaded does not keep the file
+   * from being shown: onNotice is told, and so it is of a font that is still
+   * loading when the wait ends (the view lays its text out again when it
+   * arrives). The fonts stay registered when the view is destroyed.
+   */
+  fonts?: FontRegistration[];
   /** Documents: the zoom, 1 = 100%, or a mode that follows the container. Default: 100%, less when the page is wider than the container. */
   zoom?: DocumentZoom;
   /** Documents: called when the page in view or the number of pages changes. `page` counts from 1. */
@@ -399,6 +418,9 @@ export interface MountedDocument {
 /** What mount() resolves to; `kind` tells which of the two it is. */
 export type MountedView = MountedSpreadsheet | MountedDocument;
 
+/** How long mount() waits for its fonts before it shows the file without them. */
+const FONT_WAIT_MS = 3000;
+
 /**
  * Opens a file and shows it inside `container`, which must have a size: a
  * spreadsheet (xlsx) in the editor, with a toolbar, a formula bar and a status
@@ -407,6 +429,8 @@ export type MountedView = MountedSpreadsheet | MountedDocument;
  * Other formats reject with UnsupportedFileError.
  */
 export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
+  // The fonts load while the file is fetched and read. This never rejects: a font is no reason not to show a file.
+  const fontsSettled: Promise<FontFailure[]> = Array.isArray(options.fonts) ? settleFonts(options.fonts, FONT_WAIT_MS) : Promise.resolve([]);
   let input = options.file;
   if (typeof input === 'string') {
     const response = await fetch(input);
@@ -427,10 +451,14 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       conversion = { from: opened.conversion.from, to: file.format as 'docx' | 'xlsx', warnings: opened.conversion.warnings };
     } else if (opened.failed !== undefined) notConverted = from;
   }
+  const fontFailures = await fontsSettled;
   const converted = (): void => {
     if (!options.onNotice) return;
     // In the language the views speak for the same option.
     const strings = resolveUiStrings(options.locale);
+    for (let i = 0; i < fontFailures.length; i++) {
+      options.onNotice({ message: strings.fontNotLoaded(fontFailures[i].family, fontFailures[i].pending), kind: fontFailures[i].pending ? 'info' : 'error' });
+    }
     if (conversion) options.onNotice({ message: strings.openedConverted(conversion.from, conversion.to), kind: 'info' });
     else if (notConverted !== undefined) options.onNotice({ message: strings.notConverted(notConverted), kind: 'error' });
   };

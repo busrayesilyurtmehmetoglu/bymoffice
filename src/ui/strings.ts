@@ -132,6 +132,8 @@ export interface UiStrings {
   openedConverted(from: string, to: string): string;
   /** A file could not be converted to be edited and is shown as it is, read-only. */
   notConverted(from: string): string;
+  /** A font of MountOptions.fonts that could not be loaded; `late` when it was still loading when the file was shown. */
+  fontNotLoaded(family: string, late: boolean): string;
   pictureNotSupported: string;
   linkNotAllowed: string;
   /** Said when the caret enters another part of the document: `kind` is "body", "header", "footer", "footnote" or "endnote". */
@@ -288,6 +290,7 @@ export const STRINGS_EN: UiStrings = {
   documentPasteTooLarge: 'The text on the clipboard is too long to paste',
   openedConverted: (from, to) => `This ${from} file was converted to ${to} to be edited; it is saved as ${to}`,
   notConverted: (from) => `This ${from} file could not be converted to be edited; it is shown read-only`,
+  fontNotLoaded: (family, late) => (late ? `The font "${family}" is still loading; the file is shown without it until it arrives` : `The font "${family}" could not be loaded; the file is shown without it`),
   pictureNotSupported: 'This picture cannot be inserted',
   linkNotAllowed: 'This address cannot be used as a link',
   editingStory: (kind) => (kind === 'header' ? 'Editing the header' : kind === 'footer' ? 'Editing the footer' : kind === 'footnote' ? 'Editing a footnote' : kind === 'endnote' ? 'Editing an endnote' : 'Editing the text'),
@@ -433,6 +436,7 @@ export const STRINGS_TR: UiStrings = {
   documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
   openedConverted: (from, to) => `Bu ${from} dosyası düzenlenebilmesi için ${to} biçimine çevrildi; ${to} olarak kaydedilir`,
   notConverted: (from) => `Bu ${from} dosyası düzenlenebilecek biçime çevrilemedi; salt okunur gösteriliyor`,
+  fontNotLoaded: (family, late) => (late ? `"${family}" fontu hâlâ yükleniyor; gelene dek dosya onsuz gösteriliyor` : `"${family}" fontu yüklenemedi; dosya onsuz gösteriliyor`),
   pictureNotSupported: 'Bu görsel eklenemiyor',
   linkNotAllowed: 'Bu adres bağlantı olarak kullanılamaz',
   editingStory: (kind) => (kind === 'header' ? 'Üstbilgi düzenleniyor' : kind === 'footer' ? 'Altbilgi düzenleniyor' : kind === 'footnote' ? 'Dipnot düzenleniyor' : kind === 'endnote' ? 'Sonnot düzenleniyor' : 'Metin düzenleniyor'),

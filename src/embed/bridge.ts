@@ -9,6 +9,7 @@ import { documentPictures } from '../model/doc/pictures';
 import type { OfficeFile } from '../index';
 import { enforcedProtection, hasPermissionRanges, tracksChanges, type DocModel } from '../model/doc/types';
 import { cellName, rangeName, type Workbook } from '../model/sheet/types';
+import { registerFont, sanitizeFontFamily, settleFonts, type FontFailure, type FontRegistration } from '../render/fonts';
 import type { DocumentEditorOptions } from '../ui/doc-editor';
 import type { DocumentViewOptions } from '../ui/doc-view';
 import type { SpreadsheetEditorOptions } from '../ui/editor';
@@ -104,6 +105,11 @@ export interface BridgeHost {
   maxFetchBytes?: number;
   /** Characters of undelivered messages kept before `saved` messages are given up. Default 64 M. */
   maxPendingChars?: number;
+  /**
+   * Registers a font of a `load` with `fonts`; resolves when the font can be
+   * used. Default: the engine's registerFont().
+   */
+  registerFont?(font: FontRegistration): Promise<unknown>;
   /** Called when what the page should show around the editor changes. `code` comes with 'error'. */
   onState?(state: BridgeState, code?: BridgeErrorCode): void;
   /** Called with the language tag of a successful `load` or `setLocale`. */
@@ -302,6 +308,95 @@ function sheetNameField(message: Message, required: boolean): string | undefined
   const value = field<string>(message, 'name', 'string', required);
   if (value !== undefined && value.length > MAX_NAME_CHARS) throw new BadMessage('"name" is too long');
   return value;
+}
+
+/** Fonts one `load` may bring. */
+const MAX_FONTS = 16;
+/** Base64 characters of one font: about 24 MB of font file. */
+const MAX_FONT_CHARS = 32 * 1024 * 1024;
+/** Largest font file fetched from an address. */
+const MAX_FONT_BYTES = 24 * 1024 * 1024;
+const MAX_FONT_ALIASES = 32;
+/** How long a `load` waits for its fonts before the file is shown without them. */
+const FONT_WAIT_MS = 3000;
+
+/**
+ * The `fonts` of a `load` as registrations: each `{ family, data | url,
+ * weight?, style?, as?, prefer? }`, with the font file as base64 in `data` or
+ * at an address a `load` may fetch from. Throws BadMessage for anything else.
+ */
+function fontsField(message: Message, host: BridgeHost): FontRegistration[] {
+  const value = message.fonts;
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new BadMessage('"fonts" must be a list');
+  if (value.length > MAX_FONTS) throw new BadMessage(`"fonts" names more than ${MAX_FONTS} fonts`);
+  const out: FontRegistration[] = [];
+  /** Family, weight and style of the fonts so far, as the registry tells faces apart. */
+  const faces: string[] = [];
+  for (let i = 0; i < value.length; i++) {
+    const where = `fonts[${i}]`;
+    const entry = value[i] as Message;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) throw new BadMessage(`${where} must be an object`);
+    const read = <T>(name: string, type: 'string' | 'boolean', required: boolean): T | undefined => {
+      try {
+        return field<T>(entry, name, type, required);
+      } catch (error) {
+        throw new BadMessage(`${where}: ${errorText(error)}`);
+      }
+    };
+    const family = read<string>('family', 'string', true) as string;
+    if (family.length > MAX_NAME_CHARS) throw new BadMessage(`${where}: "family" is too long`);
+    if (sanitizeFontFamily(family) === '') throw new BadMessage(`${where}: "family" must be a font name of letters, digits, spaces or hyphens`);
+    const data = read<string>('data', 'string', false);
+    const url = read<string>('url', 'string', false);
+    if ((data === undefined ? 0 : 1) + (url === undefined ? 0 : 1) !== 1) throw new BadMessage(`${where} needs exactly one of "data" and "url"`);
+    let source: string | Uint8Array;
+    if (data !== undefined) {
+      if (data.length > MAX_FONT_CHARS) throw new BadMessage(`${where}: "data" is too long`);
+      try {
+        source = base64Decode(data);
+      } catch (error) {
+        throw new BadMessage(`${where}: ${errorText(error)}`);
+      }
+      if (source.length === 0) throw new BadMessage(`${where}: "data" is empty`);
+    } else {
+      // The same addresses as for the file itself: nothing is fetched from another origin.
+      if (host.allowUrl === false) throw new BadMessage(`${where}: "url" is not accepted by a framed page; send the font as "data"`);
+      const address = resolveLoadUrl(url as string, host.baseUrl);
+      if (address === undefined) throw new BadMessage(`${where}: "url" must be a blob: or data: URL or an address of the page's own origin`);
+      source = address;
+    }
+    const font: FontRegistration = { family, source };
+    const weight = entry.weight;
+    if (weight !== undefined && weight !== null) {
+      if (weight !== 'normal' && weight !== 'bold' && !(typeof weight === 'number' && weight >= 1 && weight <= 1000)) {
+        throw new BadMessage(`${where}: "weight" must be "normal", "bold" or a number from 1 to 1000`);
+      }
+      font.weight = weight;
+    }
+    const style = entry.style;
+    if (style !== undefined && style !== null) {
+      if (style !== 'normal' && style !== 'italic') throw new BadMessage(`${where}: "style" must be "normal" or "italic"`);
+      font.style = style;
+    }
+    const as = entry.as;
+    if (as !== undefined && as !== null) {
+      const names = typeof as === 'string' ? [as] : as;
+      const named = Array.isArray(names) && names.every((name) => typeof name === 'string' && name.length <= MAX_NAME_CHARS);
+      if (!named) throw new BadMessage(`${where}: "as" must be a font name or a list of font names`);
+      if ((names as string[]).length > MAX_FONT_ALIASES) throw new BadMessage(`${where}: "as" names more than ${MAX_FONT_ALIASES} fonts`);
+      font.as = (names as string[]).slice();
+    }
+    const prefer = read<boolean>('prefer', 'boolean', false);
+    if (prefer !== undefined) font.prefer = prefer;
+    // One face twice: which of the two files would be the face depends on which loads last.
+    const face = sanitizeFontFamily(family).toLowerCase() + '|' + (font.weight === undefined || font.weight === 'normal' ? 400 : font.weight === 'bold' ? 700 : Math.round(font.weight * 100) / 100) + '|' + (font.style || 'normal');
+    const earlier = faces.indexOf(face);
+    if (earlier >= 0) throw new BadMessage(`${where} is the same face as fonts[${earlier}] (family, weight and style)`);
+    faces.push(face);
+    out.push(font);
+  }
+  return out;
 }
 
 /** The sheets of a workbook as `loaded` and `sheets` list them. */
@@ -541,6 +636,49 @@ export function createBridge(host: BridgeHost): Bridge {
       );
     });
 
+  /**
+   * Registers a font of a `load`. A font at an address is fetched here, as
+   * the file is (the page's policy allows no other way, and the size is
+   * bounded), and registered as bytes.
+   */
+  const registerLoadFont = (font: FontRegistration): Promise<unknown> => {
+    const register = host.registerFont ? (entry: FontRegistration) => (host.registerFont as NonNullable<BridgeHost['registerFont']>)(entry) : registerFont;
+    const address = font.source;
+    if (typeof address !== 'string') return register(font);
+    return new Promise<Uint8Array>((resolve, reject) => {
+      const fetchBytes = host.fetchBytes;
+      if (!fetchBytes) return reject(new Error('loading from a URL is not available here'));
+      const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+      let over = false;
+      timer(() => {
+        if (over) return;
+        over = true;
+        if (controller) controller.abort();
+        reject(new Error(`no answer within ${Math.round(fetchTimeout / 1000)} s`));
+      }, fetchTimeout);
+      let request: Promise<Uint8Array>;
+      try {
+        request = fetchBytes(address, { signal: controller ? controller.signal : undefined, maxBytes: MAX_FONT_BYTES });
+      } catch (error) {
+        request = Promise.reject(error);
+      }
+      request.then(
+        (bytes) => {
+          if (over) return;
+          over = true;
+          if (bytes.length > MAX_FONT_BYTES) reject(new Error(`the font file is larger than ${MAX_FONT_BYTES} bytes`));
+          else if (bytes.length === 0) reject(new Error('the font file is empty'));
+          else resolve(bytes);
+        },
+        (error) => {
+          if (over) return;
+          over = true;
+          reject(error);
+        },
+      );
+    }).then((bytes) => register(Object.assign({}, font, { source: bytes })));
+  };
+
   const load = async (message: Message, id: string | undefined, mine: number) => {
     const data = field<string>(message, 'data', 'string', false);
     const url = field<string>(message, 'url', 'string', false);
@@ -559,6 +697,7 @@ export function createBridge(host: BridgeHost): Bridge {
     }
     if (blank !== undefined && blank !== 'docx' && blank !== 'xlsx') throw new BadMessage('"blank" must be "docx" or "xlsx"');
     if (sheet !== undefined && (!Number.isInteger(sheet) || sheet < 0)) throw new BadMessage('"sheet" must be a sheet index');
+    const fonts = fontsField(message, host);
     let address: string | undefined;
     if (url !== undefined) {
       if (host.allowUrl === false) throw new BadMessage('"url" is not accepted by a framed page; send the file as "data"');
@@ -588,6 +727,8 @@ export function createBridge(host: BridgeHost): Bridge {
 
     if (overtaken()) return;
     if (!shown) setState('loading');
+    // The fonts load while the file is fetched and read; the file is shown without those that fail or are late.
+    const fontsSettled: Promise<FontFailure[]> = fonts.length > 0 ? settleFonts(fonts, FONT_WAIT_MS, registerLoadFont, timer) : Promise.resolve([]);
     if (blank !== undefined) {
       try {
         bytes = await createBlank(blank as 'docx' | 'xlsx', locale === undefined ? {} : { locale });
@@ -646,6 +787,13 @@ export function createBridge(host: BridgeHost): Bridge {
       return refuse(error instanceof Error && error.name === 'UnsupportedFileError' ? 'unsupported' : 'corrupt', errorText(error));
     }
     if (overtaken()) return;
+    const fontFailures = await fontsSettled;
+    if (overtaken()) return;
+    for (let i = 0; i < fontFailures.length; i++) {
+      const failure = fontFailures[i];
+      const text = failure.pending ? `The font "${failure.family}" is still loading; the file is shown without it until it arrives` : `The font "${failure.family}" could not be loaded: ${failure.reason}`;
+      (warnings || (warnings = [])).push(text);
+    }
     // What the document enforces: a protection for comments or forms allows no editing here, as the read-only one.
     const protection = doc ? enforcedProtection(doc) : undefined;
     // Only docx and xlsx are written back with their changes; the other formats stay read-only until they are converted.

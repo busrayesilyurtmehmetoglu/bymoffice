@@ -49,6 +49,7 @@ import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
 import { SheetDrawings } from '../render/sheet-drawings';
+import { onFontsChanged } from '../render/fonts';
 import { cssFont } from '../render/text';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
@@ -760,6 +761,7 @@ export class WorkbookView {
   private quietFocus = false;
   private refocusing = false;
   private resizeObserver: ResizeObserver | undefined;
+  private unwatchFonts: (() => void) | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
   private printJob: PrintJob | undefined;
@@ -932,6 +934,9 @@ export class WorkbookView {
     this.showSheet();
     this.draw();
     this.calculateMissing();
+    // A font the application registered or took out: the cells are painted anew (what was measured is forgotten by
+    // the measuring itself). Last of all: a constructor that throws leaves no listener behind.
+    this.unwatchFonts = onFontsChanged(() => this.schedule());
   }
 
   get activeSheet(): number {
@@ -1068,6 +1073,8 @@ export class WorkbookView {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.unwatchFonts) this.unwatchFonts();
+    this.unwatchFonts = undefined;
     // A print job under way ends here: its pages leave the document at once.
     if (this.printJob) this.endPrint(this.printJob);
     if (this.calcTimer !== undefined) clearTimeout(this.calcTimer);

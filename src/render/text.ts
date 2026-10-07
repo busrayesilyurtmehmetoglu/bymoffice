@@ -6,6 +6,9 @@
 // removed from it.
 
 import type { Font } from '../model/sheet/types';
+import { fontFamilyChain, fontsVersion, sanitizeFontFamily } from './fonts';
+
+export { sanitizeFontFamily };
 
 /** Fonts tried after the one a cell asks for. Carlito is metric-compatible with Calibri. */
 export const FONT_FALLBACK = '"Carlito", "Calibri", Arial, sans-serif';
@@ -13,25 +16,6 @@ export const FONT_FALLBACK = '"Carlito", "Calibri", Arial, sans-serif';
 const DEFAULT_FONT_POINTS = 11;
 /** Excel's largest font size, in points. */
 const MAX_FONT_POINTS = 409;
-const MAX_FAMILY_LENGTH = 128;
-
-/** Keeps letters, combining marks, digits, spaces and hyphens; the result is safe inside a quoted CSS family name. */
-export function sanitizeFontFamily(name: unknown): string {
-  if (typeof name !== 'string') return '';
-  // Cut first: a surrogate pair split by the cut is removed by the filter below.
-  const head = name.length > MAX_FAMILY_LENGTH ? name.slice(0, MAX_FAMILY_LENGTH) : name;
-  return head
-    // Everything in ASCII except letters, digits, space and hyphen goes; that covers the
-    // characters that mean something in a font string. No \p{..} classes: old WebViews
-    // fail to parse them and would lose the whole bundle.
-    .replace(/[^A-Za-z0-9 \-\u00C0-\uFFFF]/g, '')
-    // Halves of surrogate pairs left alone by the cut above.
-    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
-    .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1')
-    .replace(/ +/g, ' ')
-    .trim();
-}
-
 /** Font size in CSS pixels at 96 dpi; sizes that are missing or not a positive number read as 11 pt. */
 export function fontPixels(font: Pick<Font, 'size'> | undefined): number {
   const size = font ? font.size : undefined;
@@ -39,23 +23,23 @@ export function fontPixels(font: Pick<Font, 'size'> | undefined): number {
   return Math.round(((points * 96) / 72) * 100) / 100;
 }
 
-/** The value for `ctx.font`: style, weight, size and a quoted family followed by the fallback stack. */
+/**
+ * The value for `ctx.font`: style, weight, size and the quoted family followed by the fallback stack. A name with a
+ * code page suffix ("Arial Tur") is followed by its family, and a registered font that stands in for the family by that font.
+ */
 export function cssFont(font: Font | undefined): string {
-  const family = sanitizeFontFamily(font ? font.name : undefined);
-  return (
-    (font && font.italic === true ? 'italic ' : '') +
-    (font && font.bold === true ? 'bold ' : '') +
-    fontPixels(font) +
-    'px ' +
-    (family ? '"' + family + '", ' : '') +
-    FONT_FALLBACK
-  );
+  const names = fontFamilyChain(font ? font.name : undefined);
+  let families = '';
+  for (let i = 0; i < names.length; i++) families += '"' + names[i] + '", ';
+  return (font && font.italic === true ? 'italic ' : '') + (font && font.bold === true ? 'bold ' : '') + fontPixels(font) + 'px ' + families + FONT_FALLBACK;
 }
 
 const MEASURE_CACHE_LIMIT = 5000;
 /** Longer strings are measured every time: they are rare and would make the cache keys large. */
 const MEASURE_CACHE_MAX_TEXT = 200;
 const measureCache = new Map<string, number>();
+/** fontsVersion() the cached widths were measured under: a font that was registered or taken out since makes the same font string measure differently. */
+let measuredUnder = fontsVersion();
 
 /**
  * Empties the width cache. Widths are cached by font string and text, so call
@@ -103,6 +87,11 @@ export class TextPainter {
     if (text.length > MEASURE_CACHE_MAX_TEXT) {
       this.setFont(font);
       return this.ctx.measureText(text).width;
+    }
+    const now = fontsVersion();
+    if (now !== measuredUnder) {
+      measuredUnder = now;
+      measureCache.clear();
     }
     const key = font + '\n' + text;
     let width = measureCache.get(key);

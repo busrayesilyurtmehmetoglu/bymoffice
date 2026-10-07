@@ -71,6 +71,12 @@
           </label>
         </div>
         <div class="row"><span id="summary"></span></div>
+        <div class="row" title="Cihazda olmayan bir fontun yerine kendi font dosyanızı kaydeder (BymOffice.registerFont). Açık görünümler yeniden dizilir.">
+          <label>Font dosyası <input type="file" id="font-file" accept=".ttf,.otf,.woff,.woff2" /></label>
+          <label>yerine geçeceği ad <input type="text" id="font-as" value="Bookman Old Style" maxlength="128" /></label>
+          <button id="font-clear">Fontları kaldır</button>
+          <span class="muted" id="font-state"></span>
+        </div>
       </section>
 
       <section>
@@ -557,6 +563,31 @@
         );
         await handle([{ name: 'ornek.xlsx', data: await zip.write() }]);
       });
+
+      // A font file of the user's, registered under its file name for the family typed next to it.
+      const fontState = $('font-state');
+      const showFonts = (note) => {
+        const names = BymOffice.registeredFonts().map((font) => `${font.family}${font.as.length ? ' → ' + font.as.join(', ') : ''}`);
+        fontState.textContent = (note ? note + ' ' : '') + (names.length ? 'Kayıtlı: ' + names.join('; ') : 'Kayıtlı font yok.');
+      };
+      $('font-file').addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        event.target.value = '';
+        if (!file) return;
+        const family = 'Demo ' + file.name.replace(/\.[^.]*$/, '');
+        const as = $('font-as').value.trim();
+        try {
+          await BymOffice.registerFont({ family, source: file, as: as ? [as] : [] });
+          showFonts();
+        } catch (error) {
+          showFonts(`Font yüklenemedi: ${error && error.message ? error.message : error}.`);
+        }
+      });
+      $('font-clear').addEventListener('click', () => {
+        for (const font of BymOffice.registeredFonts()) BymOffice.unregisterFont(font.family);
+        showFonts();
+      });
+      showFonts();
 
       // New, empty files as BymOffice.createBlank() makes them, in Turkish.
       for (const kind of ['docx', 'xlsx']) {

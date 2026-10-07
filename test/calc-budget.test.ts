@@ -223,7 +223,8 @@ test('a formula that would build gigabytes of text is #VALUE!, not a crash', () 
       actual = result(formula);
     });
     assert.equal(actual, '#VALUE!', formula.f);
-    assert.ok(took < 4000, `${formula.f} took ${took} ms`);
+    // A guard against a hang, not a measurement: about 2 s on an idle machine, several times that under load.
+    assert.ok(took < 30000, `${formula.f} took ${took} ms`);
   }
   // Well inside the limit it works.
   assert.equal(result({ f: 'SUM(LEN(REPT("x",1000)&ROW(A1:A1000)))', type: 'array', ref: 'H1' }), 1000 * 1000 + 9 + 90 * 2 + 900 * 3 + 4);

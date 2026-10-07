@@ -31,6 +31,7 @@ import {
   type SheetStructuralEdit,
 } from '../model/sheet/types';
 import type { DecodedImage } from './images';
+import { fontsVersion } from './fonts';
 import { cssFont, FONT_FALLBACK, TextPainter, wrapLines } from './text';
 
 const EMU_PER_PIXEL = 9525;
@@ -357,6 +358,8 @@ export class SheetDrawings {
   private tops: number[] = [];
   private reach: number[] = [];
   private layouts = new WeakMap<DrawingText, TextLayout>();
+  /** fontsVersion() the layouts were made under: they hold font strings and widths of that time. */
+  private layoutFonts = fontsVersion();
 
   constructor(sheet: Sheet, options: SheetDrawingsOptions = {}) {
     this.sheet = sheet;
@@ -521,6 +524,12 @@ export class SheetDrawings {
     const items = this.visible(clip.x - originX, clip.y - originY, clip.x + clip.width - originX, clip.y + clip.height - originY);
     if (items.length === 0) return;
     const dpr = target.devicePixelRatio > 0 && target.devicePixelRatio < Infinity ? target.devicePixelRatio : 1;
+    // A font was registered or taken out: the broken lines hold the font strings and the widths from before.
+    const fonts = fontsVersion();
+    if (fonts !== this.layoutFonts) {
+      this.layoutFonts = fonts;
+      this.layouts = new WeakMap();
+    }
     const frame: PaintFrame = { ctx, painter: new TextPainter(ctx), dpr, images: this.images, labels: this.labels, layouts: this.layouts, painted: 0, depth: 0 };
     ctx.save();
     ctx.beginPath();

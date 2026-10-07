@@ -13,6 +13,7 @@ import { withShortcut, type EditorStrings } from './editor-strings';
 import type { DocumentView } from './doc-view';
 import { ICON_BAR_CLASS, createDocIcon, createIcon, type DocIconName, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
+import { onFontsChanged, registeredFonts } from '../render/fonts';
 
 /** What the toolbar needs from the editor that holds it. */
 export interface DocShellHost {
@@ -121,6 +122,7 @@ export class DocToolbar {
   private readonly openers = new Set<HTMLButtonElement>();
   private readonly styleSelect: HTMLSelectElement;
   private readonly fontSelect: HTMLSelectElement;
+  private readonly unwatchFonts: () => void;
   private readonly sizeSelect: HTMLSelectElement;
   private readonly fileInput: HTMLInputElement;
   private readonly bars: { textColor?: SVGElement; highlight?: SVGElement } = {};
@@ -204,6 +206,8 @@ export class DocToolbar {
     this.fontSelect.addEventListener('change', this.onFontChange);
     this.sizeSelect.addEventListener('change', this.onSizeChange);
     fileInput.addEventListener('change', this.onFileChange);
+    // The list of fonts follows the fonts that are registered.
+    this.unwatchFonts = onFontsChanged(() => this.update());
 
     this.applyStrings();
   }
@@ -365,6 +369,7 @@ export class DocToolbar {
     if (this.destroyed) return;
     this.closePopover();
     this.destroyed = true;
+    this.unwatchFonts();
     const element = this.element;
     element.removeEventListener('click', this.onClick);
     element.removeEventListener('mousedown', this.onMouseDown);
@@ -517,6 +522,9 @@ export class DocToolbar {
       if (name !== '' && names.size < MAX_LIST_ENTRIES && !names.has(name.toLowerCase())) names.set(name.toLowerCase(), name);
     };
     for (let i = 0; i < COMMON_FONTS.length; i++) add(COMMON_FONTS[i]);
+    // The fonts the application registered: they are there for certain.
+    const registered = registeredFonts();
+    for (let i = 0; i < registered.length; i++) if (registered[i].status === 'loaded') add(registered[i].family);
     this.host.view.document.fonts.forEach((_info, name) => add(name));
     if (font !== undefined) add(font);
     const list: string[] = [];
