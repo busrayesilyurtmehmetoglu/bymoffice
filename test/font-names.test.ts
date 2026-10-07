@@ -176,8 +176,9 @@ test('doc measure: families that Apple and Android devices lack are followed by 
 });
 
 test('doc measure: a family that is not in the table of line metrics takes the font box of the canvas', () => {
-  const measurer = new CanvasTextMeasurer({ context: deviceContext({ 'TeX Gyre Bonum': 0.6 }) });
-  // Bookman Old Style is not in the table: the box of the font that is shown, no leading.
+  const measurer = new CanvasTextMeasurer({ context: deviceContext({ 'URW Bookman': 0.6 }) });
+  // Bookman Old Style is not in the table, and neither is the font it is shown with here: the box of that font, no
+  // leading. (Shown with a font of the table it takes the row of that font: fonts-embedded.test.ts.)
   const box = measurer.metrics(font('Bookman Old Style', 10));
   assert.ok(Math.abs(box.ascent - 9) < 1e-9 && Math.abs(box.descent - 3) < 1e-9 && box.lineGap === 0, JSON.stringify(box));
   const unknown = new CanvasTextMeasurer({ context: deviceContext({}) }).metrics(font('No Such Font', 10));

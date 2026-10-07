@@ -77,6 +77,10 @@
           <button id="font-clear">Fontları kaldır</button>
           <span class="muted" id="font-state"></span>
         </div>
+        <div class="row" title="Paketle gelen font (TeX Gyre Bonum): bir dosya Bookman Old Style ile yazılmış metin çizerken, cihazda o font yoksa betiğin yanındaki fonts/ klasöründen kendiliğinden yüklenir (BymOffice.fonts.configure).">
+          <label><input type="checkbox" id="font-embedded" checked /> Paketle gelen font (Bookman Old Style için TeX Gyre Bonum)</label>
+          <span class="muted" id="font-embedded-state"></span>
+        </div>
       </section>
 
       <section>
@@ -588,6 +592,22 @@
         showFonts();
       });
       showFonts();
+
+      // The font the package brings: where it is fetched from and whether it has been. Nothing tells a page when it
+      // arrives but the views, so the line is brought up to date now and then.
+      const embeddedState = $('font-embedded-state');
+      const showEmbedded = () => {
+        const state = BymOffice.fonts.embedded();
+        const words = { off: 'kapalı', idle: 'henüz gerekmedi', loading: 'yükleniyor…', loaded: 'yüklendi', failed: 'yüklenemedi' };
+        const text = `${state.family}: ${words[state.status] || state.status}` + (state.baseUrl ? ` — ${state.baseUrl}` : '');
+        if (embeddedState.textContent !== text) embeddedState.textContent = text;
+      };
+      $('font-embedded').addEventListener('change', (event) => {
+        BymOffice.fonts.configure({ baseUrl: event.target.checked ? undefined : null });
+        showEmbedded();
+      });
+      showEmbedded();
+      setInterval(showEmbedded, 1000);
 
       // New, empty files as BymOffice.createBlank() makes them, in Turkish.
       for (const kind of ['docx', 'xlsx']) {

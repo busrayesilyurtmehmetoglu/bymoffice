@@ -11,6 +11,7 @@ import { readXlsx } from './formats/xlsx/workbook';
 import { buildXlsx } from './formats/xlsx/build';
 import { resolveUiStrings } from './ui/strings';
 import { registerFont, registeredFonts, settleFonts, unregisterFont, type FontFailure, type FontRegistration } from './render/fonts';
+import { configureEmbeddedFonts, embeddedFontsState } from './render/embedded-fonts';
 import { writeXlsx } from './formats/xlsx/write';
 import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
@@ -79,6 +80,7 @@ export { revisionColor } from './layout/doc/prep';
 export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, ShapeItem, TextItem, TextMeasurer } from './layout/doc/types';
 export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
 export { baseFontFamily, registerFont, registeredFonts, unregisterFont, type FontRegistration, type FontSource, type RegisteredFont } from './render/fonts';
+export { EMBEDDED_FONT_FACES, EMBEDDED_FONT_FAMILY, configureEmbeddedFonts, embeddedFontsState, type EmbeddedFontsOptions, type EmbeddedFontsState } from './render/embedded-fonts';
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
@@ -118,8 +120,12 @@ export type { EditProgress } from './layout/doc/layout';
  * device has (also as a stand-in for font names of files), registeredFonts()
  * lists them and unregisterFont() takes one out again. The same functions
  * are exported on their own.
+ *
+ * configure() sets where the font the package brings (TeX Gyre Bonum, shown
+ * for Bookman Old Style on devices that lack it) is fetched from, or turns
+ * it off; embedded() tells its state. See EmbeddedFontsOptions.
  */
-export const fonts = { registerFont, registeredFonts, unregisterFont };
+export const fonts = { registerFont, registeredFonts, unregisterFont, configure: configureEmbeddedFonts, embedded: embeddedFontsState };
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
 
@@ -302,8 +308,18 @@ export interface MountOptions extends SpreadsheetEditorOptions {
    * from being shown: onNotice is told, and so it is of a font that is still
    * loading when the wait ends (the view lays its text out again when it
    * arrives). The fonts stay registered when the view is destroyed.
+   *
+   * `false` turns the font the package brings off, as `fontsUrl: null` does.
    */
-  fonts?: FontRegistration[];
+  fonts?: FontRegistration[] | false;
+  /**
+   * Where the fonts of the package are: the address of its `dist/fonts/`
+   * folder, as fonts.configure({ baseUrl }) takes it. Needed where the
+   * engine is inside a bundle (the folder is then not next to the script).
+   * `null` turns the embedded font off. Like the fonts themselves the
+   * setting is the page's, not this view's: it stays when the view is destroyed.
+   */
+  fontsUrl?: string | null;
   /** Documents: the zoom, 1 = 100%, or a mode that follows the container. Default: 100%, less when the page is wider than the container. */
   zoom?: DocumentZoom;
   /** Documents: called when the page in view or the number of pages changes. `page` counts from 1. */
@@ -429,6 +445,9 @@ const FONT_WAIT_MS = 3000;
  * Other formats reject with UnsupportedFileError.
  */
 export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
+  // Before anything is measured: the first text in a family the embedded font stands in for is what fetches it.
+  if (options.fonts === false || options.fontsUrl === null) configureEmbeddedFonts({ baseUrl: null });
+  else if (options.fontsUrl !== undefined) configureEmbeddedFonts({ baseUrl: options.fontsUrl });
   // The fonts load while the file is fetched and read. This never rejects: a font is no reason not to show a file.
   const fontsSettled: Promise<FontFailure[]> = Array.isArray(options.fonts) ? settleFonts(options.fonts, FONT_WAIT_MS) : Promise.resolve([]);
   let input = options.file;

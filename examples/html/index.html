@@ -69,6 +69,12 @@
 
       In production load the script from your own server or from a CDN:
         <script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js"></script>
+
+      Fonts: text set in Bookman Old Style is drawn with the font the package brings (TeX Gyre Bonum)
+      on devices without Bookman Old Style. Its files are fetched from the folder fonts/ next to the
+      script, only when a file needs them. Serving the script yourself, copy that folder with it
+      (dist/fonts/); if it lives elsewhere, or the engine is imported as a module or bundled, say
+      where: BymOffice.mount(el, { fontsUrl: '/my/fonts/' }). `fontsUrl: null` turns the font off.
     -->
     <div id="bar">
       <span id="name"></span>

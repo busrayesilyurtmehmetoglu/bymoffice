@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office e2e: ES module that says where the fonts are</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <p id="state">loading</p>
+    <!--
+      A module does not know its own address (the engine does not use import.meta), so the application
+      says where the folder of fonts is, from its own module, in one line.
+    -->
+    <script type="module">
+      import * as BymOfficeModule from '../../dist/bymoffice.esm.js';
+      BymOfficeModule.fonts.configure({ baseUrl: new URL('../../dist/fonts/', import.meta.url).href });
+      window.__bym = BymOfficeModule;
+      window.__bymFlavour = 'esm';
+      document.getElementById('state').textContent = 'ready';
+    </script>
+  </body>
+</html>

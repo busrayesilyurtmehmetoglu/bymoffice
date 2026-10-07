@@ -6,7 +6,7 @@
 // dependencies.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Script, createContext } from 'node:vm';
 
@@ -31,9 +31,26 @@ const names = packed.files.map((file) => file.path);
 for (const wanted of ['package.json', 'README.md', 'CHANGELOG.md', 'dist/bymoffice.min.js', 'dist/bymoffice.esm.js', 'dist/bymoffice.webview.html', 'dist/types/index.d.ts']) {
   if (!names.includes(wanted)) fail(`the archive lacks ${wanted}`);
 }
-const stray = names.filter((name) => !/^(package\.json|README\.md|CHANGELOG\.md|LICENSE[^/]*|dist\/.+)$/.test(name));
+const stray = names.filter((name) => !/^(package\.json|README\.md|CHANGELOG\.md|THIRD-PARTY-NOTICES\.md|LICENSE[^/]*|dist\/.+)$/.test(name));
 if (stray.length) fail(`the archive holds files that are not part of the package: ${stray.slice(0, 5).join(', ')}`);
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+
+// The font of the package: its four files and their licence, each as large as its source, and the notice that
+// names them. (That they are the same bytes is looked at below, in the installed copy.)
+const fontSource = join(root, 'assets', 'fonts', 'tex-gyre-bonum');
+const fontFiles = readdirSync(fontSource).sort();
+if (fontFiles.filter((name) => /\.otf$/.test(name)).length !== 4 || !fontFiles.includes('GUST-FONT-LICENSE.txt')) fail('assets/fonts/tex-gyre-bonum must hold four font files and their licence');
+let fontBytes = 0;
+for (const name of fontFiles) {
+  const entry = packed.files.find((file) => file.path === `dist/fonts/tex-gyre-bonum/${name}`);
+  if (!entry) fail(`the archive lacks dist/fonts/tex-gyre-bonum/${name}`);
+  const size = readFileSync(join(fontSource, name)).length;
+  if (entry.size !== size) fail(`dist/fonts/tex-gyre-bonum/${name} is ${entry.size} bytes in the archive and ${size} in assets/`);
+  fontBytes += size;
+}
+const fontEntries = names.filter((name) => name.startsWith('dist/fonts/'));
+if (fontEntries.length !== fontFiles.length) fail(`dist/fonts holds files that are not in assets/: ${fontEntries.join(', ')}`);
+if (!names.includes('THIRD-PARTY-NOTICES.md')) fail('the archive lacks THIRD-PARTY-NOTICES.md');
 if (manifest.dependencies && Object.keys(manifest.dependencies).length) fail('the package must have no runtime dependencies');
 
 // 2. Installed into an empty project.
@@ -59,6 +76,29 @@ console.log('esm ok');
 `,
 );
 if (!run('node', ['use.mjs'], consumer).includes('esm ok')) fail('the ES module did not run');
+
+// 3b. The fonts as they were installed: the same bytes as in assets/, reachable under "bymoffice/fonts/…" and next to
+// the scripts, where the engine looks for them.
+writeFileSync(
+  join(consumer, 'fonts.mjs'),
+  `import { fileURLToPath } from 'node:url';
+import * as api from 'bymoffice';
+const out = {};
+for (const face of api.EMBEDDED_FONT_FACES) out[face.file] = fileURLToPath(import.meta.resolve('bymoffice/fonts/tex-gyre-bonum/' + face.file));
+out['GUST-FONT-LICENSE.txt'] = fileURLToPath(import.meta.resolve('bymoffice/fonts/tex-gyre-bonum/GUST-FONT-LICENSE.txt'));
+if (typeof api.fonts.configure !== 'function' || api.fonts.embedded().family !== 'TeX Gyre Bonum') throw new Error('fonts.configure / fonts.embedded');
+console.log(JSON.stringify(out));
+`,
+);
+{
+  const installed = JSON.parse(run('node', ['fonts.mjs'], consumer));
+  if (Object.keys(installed).sort().join() !== fontFiles.join()) fail(`the package names other font files than assets/ holds: ${Object.keys(installed).join(', ')}`);
+  for (const name of fontFiles) {
+    if (!readFileSync(installed[name]).equals(readFileSync(join(fontSource, name)))) fail(`${name} of the installed package differs from assets/`);
+    const beside = join(consumer, 'node_modules', 'bymoffice', 'dist', 'fonts', 'tex-gyre-bonum', name);
+    if (resolve(installed[name]) !== resolve(beside)) fail(`bymoffice/fonts/tex-gyre-bonum/${name} is not the file next to the scripts`);
+  }
+}
 
 // 4. The types, resolved the way a bundler does and the way Node does.
 writeFileSync(
@@ -108,4 +148,8 @@ for (const [module, resolution] of [
 }
 if (manifest.unpkg !== manifest.jsdelivr || !names.includes(manifest.unpkg)) fail('unpkg and jsdelivr must name the script that is in the archive');
 
-console.log(`pack-check: ${packed.filename}, ${names.length} files, ${(packed.size / 1024).toFixed(0)} KB packed, ${(packed.unpackedSize / 1024).toFixed(0)} KB unpacked; ESM, types (bundler, node16, nodenext) and the CDN script work`);
+const kb = (bytes) => `${(bytes / 1024).toFixed(0)} KB`;
+console.log(
+  `pack-check: ${packed.filename}, ${names.length} files, ${kb(packed.size)} packed, ${kb(packed.unpackedSize)} unpacked (of which the fonts: ${fontFiles.length} files, ${kb(fontBytes)}); ` +
+    'ESM, types (bundler, node16, nodenext), the CDN script and the font files work',
+);

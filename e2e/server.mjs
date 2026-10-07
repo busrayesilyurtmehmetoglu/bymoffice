@@ -19,6 +19,8 @@ const TYPES = {
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.woff2': 'font/woff2',
+  '.otf': 'font/otf',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
 const send = (res, status, text) => {

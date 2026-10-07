@@ -10,7 +10,17 @@ Mobil ve masaüstü uygulamalar editörü bir WebView içinde gösterir. Bunun i
 pnpm install && pnpm build   # dist/bymoffice.webview.html
 ```
 
-Sayfa `src/embed/host.html` şablonundan üretilir; derleme motoru (`bymoffice.min.js`) içine gömer. Motor güncellenince dosya yeniden kopyalanır. Sözleşmenin sürümü paket sürümüdür ve `ready` iletisinde bildirilir.
+Sayfa `src/embed/host.html` şablonundan üretilir; derleme motoru (`bymoffice.min.js`) ve paketle gelen fontu içine gömer. Motor güncellenince dosya yeniden kopyalanır. Sözleşmenin sürümü paket sürümüdür ve `ready` iletisinde bildirilir.
+
+**Paketle gelen font sayfanın içindedir.** Bookman Old Style için kullanılan TeX Gyre Bonum'un dört dosyası sayfaya base64 olarak gömülüdür (`<script type="text/plain" data-bym-font="…">` veri blokları; tarayıcı bunları çalıştırmaz) ve yanlarında lisans metni yorum olarak durur. Bir dosya Bookman Old Style ile yazılmış metin çizdiğinde, cihazda o font yoksa ve `load.fonts` ile o ad için font verilmemişse, baytlar çözülüp sayfaya eklenir: **ağ isteği yapılmaz**, uygulamanın bir şey yapması gerekmez. Bu aileyi kullanmayan dosyada bloklara dokunulmaz. Kurallar ve sınırlar kullanım kılavuzunun "Fontlar" bölümündedir (4. madde).
+
+Fontlar sayfaya 770.873 bayt ekler (fontsuz 1.510.719 bayt, fontlu 2.281.592 bayt). Küçük dosya isteyen fontsuz sayfa derleyebilir:
+
+```sh
+BYM_NO_FONTS=1 pnpm build    # dist/bymoffice.webview.html fontsuz; dist/fonts/ yine üretilir
+```
+
+Fontsuz sayfada paketle gelen font kapalıdır (istenecek bir adres de yoktur): Bookman Old Style cihazın yedek fontuyla gösterilir, bildirim yapılmaz. Kendi fontunuzu `load.fonts` ile yine verebilirsiniz.
 
 ## 2. Taşıma
 
@@ -318,7 +328,7 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
   ```
 
   - `script-src`: yalnız sayfanın kendi iki satır içi betiği (motor ve başlatıcı), derlemede hesaplanan SHA-256 özetleriyle. `unsafe-inline` ve `unsafe-eval` yoktur; sonradan eklenen hiçbir betik çalışmaz.
-  - `style-src 'unsafe-inline'`: motor kendi `<style>` öğesini çalışma zamanında ekler ve içeriği derleme sırasında köprü derlemesine açık değildir, bu yüzden özet kullanılamadı. Stil kod çalıştıramaz; `img-src`/`font-src` kapalı olduğu için stil üzerinden dışarıya istek de atılamaz.
+  - `style-src 'unsafe-inline'`: motor kendi `<style>` öğesini çalışma zamanında ekler ve içeriği derleme sırasında köprü derlemesine açık değildir, bu yüzden özet kullanılamadı. Stil kod çalıştıramaz; `img-src`/`font-src` kapalı olduğu için stil üzerinden dışarıya istek de atılamaz. (`font-src` tanımlı değildir, yani `default-src 'none'` geçerlidir: adresle font yüklenemez. Sayfaya gömülü font ve `load.fonts` baytlardan `FontFace` ile eklenir; bu bir getirme değildir ve ilkeye takılmaz — Chromium, Firefox ve WebKit'te sınandı.)
   - `img-src data: blob:`: boş sayfa simgesi ve belgedeki görseller (sayfanın dosya baytlarından kendi ürettiği `blob:` adresleri) için.
   - `connect-src 'self' blob: data:`: **uzak adreslere çıkış yoktur.** Karar: köprü sayfası çoğunlukla çevrimdışı bir uygulama varlığıdır ve dosya `data` ile verilir. `url` yalnız sayfanın kendi kökeni (sanal ana makine ya da web sunucusuyla sunulduğunda, en üst pencere olarak), `blob:` ve `data:` adresleri için çalışır. Kod da aynı kuralı uygular: başka kökenden bir adres daha istek atılmadan `bad-message` ile reddedilir; ilke ikinci savunma hattıdır (ör. kendi kökenden başka kökene yönlendirme `load-failed` ile sonuçlanır). Uzak bir dosya gerekiyorsa uygulama onu kendisi indirip `data` ile verir; kimlik doğrulama da böylece uygulamada kalır.
 - **iframe içinde kim konuşabilir.** İzinli üst kökenler yalnız sayfanın **içindeki** ayardan okunur: `<meta name="bymoffice-parent-origins" content="">` (boşlukla ayrılmış köken listesi). Boşsa iframe taşıması kapalıdır: sayfa üst pencereden hiçbir ileti kabul etmez ve ona hiçbir ileti göndermez. Liste derlemede `BYM_PARENT_ORIGINS` ortam değişkeniyle ya da sunan tarafın dosyadaki etiketi doldurmasıyla verilir. Sayfanın adresindeki hiçbir parametre bu listeyi etkilemez; çünkü adresi, sayfayı gömen (güvenilmeyen) taraf seçer.

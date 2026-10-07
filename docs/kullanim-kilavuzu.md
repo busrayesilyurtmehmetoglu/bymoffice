@@ -53,7 +53,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Belge düzenlemede: dipnot/sonnot başvurusu, yorum, denklem, içerik denetimi, izlenen değişiklik, metin kutusu ve metinli şekil, grafik, diyagram, gömülü nesne (OLE), VML resim, `mc:AlternateContent`, birden çok paragrafa yayılan alan (içindekiler tablosu), akıllı etiket ve özel XML'in panoyla taşınması (kopyada bunların yalnız metni gider; bunları içeren seçim **kesilemez**, bildirimle yerinde bırakılır), başka sekmedeki/sayfadaki bir düzenleyiciye ya da başka uygulamaya zengin içerik taşıma (pano dışarıya yalnız metin ve basit HTML verir), dışarıdan gelen HTML'in biçimiyle yapıştırılması (yalnız metni alınır), tablo hücrelerinin üzerine hücre hücre yapıştırma (tablo, iç içe tablo olarak eklenir), değişiklik izleme ve yorum düzenleme, metin kutularının içini düzenleme | Yok. Görsel, bağlantı, alan, sayfa/sütun sonu, tablo, paragraf biçimi, stil ve liste aynı sayfadaki düzenleyiciler arasında taşınır (bkz. Pano) |
 | İzlenen değişikliklerde: kabul et / reddet (arayüzde ve programdan), izlemeyi arayüzden açıp kapatma, kenar çubuğu ve balonlar, "yalnız son hali göster" görünümü; **izleme açıkken** biçim (kalın, renk, yazı tipi…), paragraf biçimi ve stil, liste, tablo ekleme ve satır/sütun ekle-sil, görsel ve bağlantı ekleme, blok ekleme (`insertBlock`), biçimli/görselli/tablolu yapıştırma, tabloya girip çıkan ya da tablo kapsayan seçimi silme | Yok. İzleme açık belgede bu işlemler **reddedilir** (bildirimle; belge değişmez), çünkü izlenmeden yapılmaları belgenin ayarına aykırı olurdu. Zengin kopya, metni izlenen ekleme olarak yapıştırılır ve bu bildirilir. Yazma, silme, Enter, sayfa sonu, kesme ve düz metin yapıştırma izlenir (bkz. "Belge koruması ve değişiklik izleme") |
 | Belge korumasında: parola doğrulama, korumayı kaldırma ya da ekleme; yorum ekleme ve form alanı doldurma (bu korumalar salt okunur açılır); korumadan muaf aralıkların (`w:permStart`/`w:permEnd`) düzenlenebilmesi; `w:writeProtection` (salt okunur önerisi) ve biçimlendirme kısıtlamasının (`w:formatting`; `w:edit` taşımayan koruma hiçbir şeyi kilitlemez) uygulanması; doc'ta salt okunur korumanın okunması | Yok. Koruma öğesi dosyada bayt bayt korunur; muaf aralık varlığı `protection.exceptions` ile bildirilir, belge yine tümüyle salt okunurdur |
-| Fontlarda: pakete gömülü font (hiçbir font dosyası paketle gelmez; cihazdakiler ve `registerFont` ile verdikleriniz kullanılır), belgeye gömülü fontların (docx `word/fonts/*.odttf`) yüklenmesi, Tahoma/Verdana/Garamond/Palatino Linotype için ölçü uyumlu yedek, Bookman Old Style ve tabloda olmayan öbür aileler için Word'ün satır yüksekliği, `FontFace` olmayan tarayıcıda font kaydı | Yok. Bkz. "Fontlar" |
+| Fontlarda: Bookman Old Style dışındaki aileler için paketle gelen font (yalnız TeX Gyre Bonum gelir; öbür ailelerde cihazdakiler ve `registerFont` ile verdikleriniz kullanılır), belgeye gömülü fontların (docx `word/fonts/*.odttf`) yüklenmesi, Tahoma/Verdana/Garamond/Palatino Linotype için ölçü uyumlu yedek, Bookman Old Style ve tabloda olmayan öbür aileler için Word'ün satır yüksekliği, `FontFace` olmayan tarayıcıda font kaydı | Yok. Bkz. "Fontlar" |
 | Belgede: belge içi bağlantılar, arama, sağdan sola yazı, heceleme, grafik ve vektör görsel (EMF/WMF/SVG) çizimi, belgeye gömülü fontlar | Yok. Çizilemeyen nesnelerin yerinde yer tutucu görünür |
 | Belgede şekiller (docx, doc, RTF): dikdörtgen, yuvarlatılmış dikdörtgen, elips ve düz çizgi dışındaki geometriler (oklar, serbest biçimler, akış şeması şekilleri…); ok başları; çift/üçlü (bileşik) çizgi; özel kesik çizgi; gradyan, desen ve resim dolgu; saydamlık; gölge ve diğer efektler; şekil gruplarının ve çizim tuvalinin parçaları; metin kutusunun metniyle birlikte döndürülmesi | Yok. **Tek şekilli çizimde** (grup değil) çizilenler: hazır geometri `rect` (kesik/tek köşesi yuvarlak dikdörtgen türleri ve `flowChartProcess` de düz dikdörtgen olarak), `roundRect`, `ellipse`, `line`, `straightConnector1`; düz renk dolgu; çizginin rengi, kalınlığı (0 = en ince çizgi) ve hazır kesiklik türü; metinsiz şekilde döndürme, çizgide çevirme. **Yaklaşık çizilenler:** ok başlı çizgi başsız, bileşik çizgi tek, özel kesiklik düz çizilir; gölge çizilmez; kısmi saydam renk opak boyanır (tam saydam boyanmaz); gradyan/desen olan *çizgi* hiç çizilmez; metinli şekil döndürülmez. **Yer tutucu olanlar:** metinsiz şekil başka bir geometrideyse (ya da docx'te özel geometri taşıyor ya da geometri belirtmiyorsa) ya da dolgusu gradyan/desen/resimse; metinsiz gruplar, tuvaller, grafikler, diyagramlar. Bu durumlardaki **metin kutusunda** metin gösterilir: tanınmayan geometride docx'te çerçevesiz, doc/RTF'te dikdörtgen çerçeveyle; gösterilemeyen dolguda dolgusuz. **Gruplarda** yalnız parçaların metinleri (alt alta) ve resimleri gösterilir, parçaların geometrisi çizilmez. doc/RTF'te ayrıca: palet/şema/sistem dizinli renkler çözülmez (dolgu boyanmaz, çizgi siyah olur), çizim grubunun varsayılan özellik tablosu okunmaz (şekil kendi belirtmediği özellikte belirtimin varsayılanını alır), ok başı, bileşik çizgi ve gölge okunmaz; resmi bulunamayan resim şekli yer tutucudur. docx'te tüm bunlar dosyada korunur |
 | Görünümde: döndürülmüş metin, sığdırmak için küçültme, iki yana yaslama, sağdan sola sayfa, yakınlaştırma, çapraz kenarlık, desenli/gradyan dolgu, başlıkları gizleme, görsel ve grafikler | Yok; içerik düz çizilir ya da atlanır |
@@ -83,6 +83,7 @@ pnpm build
 | `dist/bymoffice.esm.js` | ES modülü (`import`) |
 | `dist/types/index.d.ts` | TypeScript tipleri (`moduleResolution` `bundler`, `node16` ve `nodenext` ile çözülür) |
 | `dist/bymoffice.webview.html` | WebView'ler için tek dosyalık köprü sayfası (pakette `bymoffice/webview.html`) |
+| `dist/fonts/tex-gyre-bonum/` | Paketle gelen font (TeX Gyre Bonum, dört `.otf`) ve lisansı; betikle **birlikte** sunulur (pakette `bymoffice/fonts/…`). Bkz. "Fontlar" |
 
 Paket yalnız ES modülü ve `<script>` olarak dağıtılır; ayrı bir CommonJS çıktısı yoktur (`require()` yalnız ES modülünü yükleyebilen Node sürümlerinde çalışır). Çalışma zamanı bağımlılığı yoktur.
 
@@ -126,6 +127,8 @@ import { open, UnsupportedFileError } from './dist/bymoffice.esm.js';
 const response = await fetch('/files/report.xlsx');
 const file = await open(await response.arrayBuffer());
 ```
+
+ES modülü kendi adresini bilmez; paketle gelen fontu (bkz. "Fontlar", 4. madde) kullanacaksanız klasörünü bir kez bildirin: `fonts.configure({ baseUrl: new URL('./dist/fonts/', import.meta.url).href })` ya da `mount(el, { fontsUrl })`.
 
 ### Node
 
@@ -172,7 +175,8 @@ Bir dosyayı açar ve `container` içinde gösterir: xlsx ve xls tablo düzenley
 | `sheet` | İlk gösterilecek sayfanın dizini. Verilmezse dosyanın etkin sayfası; o gizliyse ilk görünür sayfa |
 | `readOnly` | `true` ise düzenleme kapalıdır (editör, yapıştırma, kesme, silme, geri al, satır/sütun komutları çalışmaz); kopyalama çalışır. Varsayılan `false` |
 | `onChange({ sheets })` | Çalışma kitabı her değiştiğinde çağrılır (geri al ve yinele dahil); `sheets` etkilenmiş olabilecek sayfa dizinleridir |
-| `fonts` | Dosya gösterilmeden önce kaydedilecek fontlar: `registerFont()`'a verilen nesnelerin dizisi (bkz. "Fontlar"). Yüklenmeleri en çok 3 saniye beklenir, böylece dosya baştan bu fontlarla dizilir. Yüklenemeyen font dosyanın açılmasını engellemez: `onNotice` ile bildirilir (`kind: 'error'`); süre dolduğunda hâlâ yüklenen font da bildirilir (`kind: 'info'`) ve geldiğinde görünüm kendiliğinden yeniden dizilir. Fontlar görünüm kaldırılınca kayıtlı kalır |
+| `fonts` | Dosya gösterilmeden önce kaydedilecek fontlar: `registerFont()`'a verilen nesnelerin dizisi (bkz. "Fontlar"). Yüklenmeleri en çok 3 saniye beklenir, böylece dosya baştan bu fontlarla dizilir. Yüklenemeyen font dosyanın açılmasını engellemez: `onNotice` ile bildirilir (`kind: 'error'`); süre dolduğunda hâlâ yüklenen font da bildirilir (`kind: 'info'`) ve geldiğinde görünüm kendiliğinden yeniden dizilir. Fontlar görünüm kaldırılınca kayıtlı kalır. `false`: paketle gelen fontu kapatır (`fontsUrl: null` ile aynı) |
+| `fontsUrl` | Paketle gelen fontun (TeX Gyre Bonum; bkz. "Fontlar", 4. madde) klasörünün adresi: paketin `dist/fonts/` klasörü nereye konduysa orası. Verilmezse betiğin yanındaki `fonts/` klasörü kullanılır. Motoru ES modülü olarak (`import`) ya da bir paketleyiciyle (Vite, webpack…) kullanıyorsanız **vermeniz gerekir**. `null` fontu kapatır. Ayar sayfa genelindedir (`BymOffice.fonts.configure({ baseUrl })` ile aynı şey) ve görünüm kaldırılınca kalır |
 | `convert` | `true` ise yazılamayan biçimler (doc, RTF, xls) **dönüştürülerek düzenlenebilir açılır**: doc ve RTF docx'e, xls xlsx'e çevrilir; gösterilen, düzenlenen ve `save()` ile alınan dosya yeni biçimdedir. Dönüş değerinde `conversion: { from, to, warnings }` bulunur ve `onNotice` ile bildirilir (bildirimin dili görünümlerle aynı kuralla seçilir: `locale` bir dil etiketiyse o, verilmemişse ya da nesneyse tarayıcının dili). `readOnly: true` ile birlikte verilirse dönüştürme yapılmaz. Varsayılan `false`: bu dosyalar olduğu gibi, salt okunur gösterilir |
 | `onSave(bytes)` | Kullanıcı görünümde Ctrl+S / Cmd+S'e basınca dosyanın baytlarıyla çağrılır; verilmezse kısayol tarayıcıya bırakılır. Hata olursa `onError(error)` çağrılır |
 | `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
@@ -233,7 +237,7 @@ Kullanıcı etkileşimi:
 Bilinmesi gerekenler:
 
 - Hücreler dosyadaki sayı biçimiyle gösterilir. `[Red]` gibi renk bölümleri yazı rengini değiştirir; biçimiyle gösterilemeyen değer (ör. negatif tarih) ve sütuna sığmayan sayı `####` olarak çizilir.
-- Çizimde hücrenin kendi fontu kullanılır; cihazda yoksa `Carlito`, `Calibri`, `Arial` sırasıyla yedeğe düşülür. Font farkı metin genişliklerini biraz değiştirebilir.
+- Çizimde hücrenin kendi fontu kullanılır; cihazda yoksa `Carlito`, `Calibri`, `Arial` sırasıyla yedeğe düşülür (Bookman Old Style için önce paketle gelen font yüklenir; bkz. "Fontlar"). Font farkı metin genişliklerini biraz değiştirebilir.
 - Sütun genişlikleri ve satır yükseklikleri Excel'in piksel yuvarlamasıyla hesaplanır (varsayılan sütun 64 px, satır 20 px).
 - Sayfa her zaman 1.048.576 satır × 16.384 sütundur; kaydırma alanı kullanılan alanla başlar ve sona yaklaşıldıkça büyür.
 - Erişilebilirlik: klavye odağı görünümdeki gizli bir metin alanındadır (`aria-label="Cell editor"`); kaydırılan bölüm `role="grid"` taşır, sekmeler `role="tab"` düğmeleridir; etkin hücrenin adresi ve metni ekran okuyucular için bir canlı bölgede duyurulur. Ekran okuyucuyla henüz denenmedi.
@@ -414,7 +418,7 @@ if (mounted.kind === 'document') {
 - Çok sayıda bloğu değiştiren işlemde (ör. bütün belgeyi kalın yapmak) sayfalar açılıştaki gibi dilimler halinde yeniden dizilir; arayüz donmaz.
 - Tuşlar: Ctrl/Cmd ile `+`, `-`, `0` ve tekerlek yakınlaştırır (dokunmatikte iki parmak); PageUp/PageDown/Boşluk/Home/End/oklar gezdirir; fareyle sürükleyerek ya da Ctrl/Cmd+A ile seçilen metin Ctrl/Cmd+C ile kopyalanır.
 - Sayfalar aşamalı dizilir: ilk sayfalar hemen görünür, kalanı arka planda; binlerce sayfalık belgede yalnız ekrandaki sayfaların tuvali tutulur.
-- **Fontlar ve sayfalama:** metin cihazdaki fontlarla ölçülür. Belgenin fontu cihazda yoksa ölçüleri uyumlu açık fontlar denenir (Calibri→Carlito, Cambria→Caladea, Arial→Liberation Sans, Times New Roman→Liberation Serif, Courier New→Liberation Mono), sonra genel aile. Bu fontları sayfanıza `@font-face` ile eklerseniz kendiliğinden kullanılır. Font farklıysa satır ve sayfa kırılmaları Word'dekinden farklı olabilir; Word'le yan yana karşılaştırma yapılmamıştır.
+- **Fontlar ve sayfalama:** metin cihazdaki fontlarla ölçülür. Belgenin fontu cihazda yoksa ölçüleri uyumlu açık fontlar denenir (Calibri→Carlito, Cambria→Caladea, Arial→Liberation Sans, Times New Roman→Liberation Serif, Courier New→Liberation Mono), sonra genel aile. Bookman Old Style için yedek (TeX Gyre Bonum) paketle gelir ve kendiliğinden yüklenir; öbür fontları sayfanıza `@font-face` ile eklerseniz kendiliğinden kullanılır. Font farklıysa satır ve sayfa kırılmaları Word'dekinden farklı olabilir; Word'le yan yana karşılaştırma yapılmamıştır.
 - Alt düzey: `BymOffice.createCanvasMeasurer({ fonts: doc.fonts })` → `new BymOffice.DocLayout(doc, measurer)` → `layout.layout({ pages: 5 })` → `BymOffice.renderPage(ctx, layout.pages[0], { scale })`. Sayfanın öğeleri (`page.items`) `text`, `rect`, `line`, `image`, `shape` (şekil: `geometry`, `fill`, `stroke`, `rotation`) ve `mark` türündedir. Model düzenlendikten sonra `layout.edited({ milliseconds })` yalnız değişen sayfadan itibaren yeniden dizer; `undefined` dönerse ya da sonraki `layout()` çağrılarından sonra `layout.broken` `true` olursa yeni bir `DocLayout` kurulur.
 
 ### Belge koruması ve değişiklik izleme
@@ -497,7 +501,7 @@ Belge yazdırmayla **aynı altyapıdır**: sayfalar görüntü olarak hazırlan�
 
 ### Fontlar
 
-Dosyalar font adlarını taşır, fontların kendisini taşımaz; metin, cihazda bulunan fontla ölçülür ve çizilir. İstenen font cihazda yoksa satır ve sayfa sonları kayar. Motor bunu üç yolla azaltır:
+Dosyalar font adlarını taşır, fontların kendisini taşımaz; metin, cihazda bulunan fontla ölçülür ve çizilir. İstenen font cihazda yoksa satır ve sayfa sonları kayar. Motor bunu dört yolla azaltır:
 
 **1. Kod sayfası sonekli adlar.** Eski Windows belgeleri (doc, RTF, xls) aynı fontu kod sayfasına göre adlandırır: `Bookman Old Style Tur`, `Arial CE`, `Times New Roman Cyr`. Böyle bir font hiçbir cihazda yoktur; kastedilen, sonekin önündeki fonttur. Gösterim ve ölçümde ad, taban adıyla birlikte denenir:
 
@@ -511,7 +515,7 @@ Dosyalar font adlarını taşır, fontların kendisini taşımaz; metin, cihazda
 - Yerine koyma zinciri, satır yüksekliği tablosu, serif/eş aralıklı sınıflaması ve "cihazda var mı" sınaması (`hasFont`) taban adla çalışır.
 - **Modeldeki ve dosyaya yazılan ad değişmez**; soyma yalnız gösterim katmanındadır (belgede `CanvasTextMeasurer`, tabloda `cssFont`). `BymOffice.baseFontFamily('Arial Tur')` → `'Arial'`.
 
-**2. Ölçü uyumlu yedekler.** Belgede bir font adı şu sırayla denenir: `prefer` ile kaydedilmiş fontlar → dosyadaki ad → taban ad → `as` ile kaydedilmiş fontlar → dosyanın font tablosundaki alternatif ad (`w:altName`, RTF `\falt`) → aşağıdaki ölçü uyumlu açık fontlar → genel aile (`serif` / `sans-serif` / `monospace`).
+**2. Ölçü uyumlu yedekler.** Belgede bir font adı şu sırayla denenir: `prefer` ile kaydedilmiş fontlar → dosyadaki ad → taban ad → `as` ile kaydedilmiş fontlar → dosyanın font tablosundaki alternatif ad (`w:altName`, RTF `\falt`) → aşağıdaki ölçü uyumlu açık fontlar (paketle gelen font bunların içindedir) → genel aile (`serif` / `sans-serif` / `monospace`).
 
 | İstenen | Ardından denenenler |
 |---|---|
@@ -527,9 +531,9 @@ Dosyalar font adlarını taşır, fontların kendisini taşımaz; metin, cihazda
 | Century Schoolbook | TeX Gyre Schola, Century Schoolbook L |
 | Century Gothic | TeX Gyre Adventor, URW Gothic |
 
-Bu fontlar pakette **yoktur**; cihazda ya da sayfanızda (`@font-face` ya da `registerFont`) varsa kullanılırlar. Son dört satır UNSURE: yedekler, Monotype ailelerinin uyumlu çizildiği PostScript fontlarının (ITC Bookman, Palatino, New Century Schoolbook, ITC Avant Garde Gothic) eşleridir; Monotype dosyalarıyla genişlikleri karşılaştırılamadı. Tahoma, Verdana, Garamond ve Palatino Linotype için ölçü uyumlu açık font bilinmiyor: zincirleri yalnız genel aileyle biter. Tablo (xlsx/xls) görünümünde zincir daha kısadır: ad, taban ad, kaydedilmiş fontlar, sonra Carlito/Calibri/Arial.
+**TeX Gyre Bonum dışında** bu fontlar pakette yoktur; cihazda ya da sayfanızda (`@font-face` ya da `registerFont`) varsa kullanılırlar. TeX Gyre Bonum paketle gelir (4. madde). Son dört satır UNSURE: yedekler, Monotype ailelerinin uyumlu çizildiği PostScript fontlarının (ITC Bookman, Palatino, New Century Schoolbook, ITC Avant Garde Gothic) eşleridir; Monotype dosyalarıyla genişlikleri karşılaştırılamadı. Tahoma, Verdana, Garamond ve Palatino Linotype için ölçü uyumlu açık font bilinmiyor: zincirleri yalnız genel aileyle biter. Tablo (xlsx/xls) görünümünde zincir daha kısadır: ad, taban ad, kaydedilmiş fontlar, (Bookman Old Style için, yüklenmeye başladıysa) paketle gelen font, sonra Carlito/Calibri/Arial.
 
-Satır yüksekliği, yaygın fontlar için font dosyalarından okunmuş sayılardan gelir (Word'ün kullandığı `usWinAscent`/`usWinDescent` ve dış satır aralığı) ve her tarayıcıda aynıdır. Tabloda olmayan bir ailede (ör. Bookman Old Style) satır yüksekliği, tarayıcının o an çizdiği fontun kutusudur; yedek fontun kutusu özgün fontunkinden farklıysa sayfa sonları kayabilir.
+Satır yüksekliği, yaygın fontlar için font dosyalarından okunmuş sayılardan gelir (Word'ün kullandığı `usWinAscent`/`usWinDescent` ve dış satır aralığı) ve her tarayıcıda aynıdır. Belirleyici olan belgenin **istediği** ailedir (Word belgeyi onunla sayfalamıştır), cihazın çizdiği font değil. Tek istisna paketle gelen fonttur: istenen aile tabloda yoksa ve zincirde cihazın gösterebildiği **ilk** font TeX Gyre Bonum ise onun satırı kullanılır. Bookman Old Style isteyen ve TeX Gyre Bonum ile çizilen metnin satırı, Bonum dosyalarından okunmuş değerlerle (1000 birimlik em'de düz 1069/268, kalın 1153/306, italik 1073/279, kalın italik 1141/328; satır arası boşluk 0) hesaplanır ve **bütün tarayıcılarda aynıdır**. UNSURE: gerçek Bookman Old Style dosyası elde olmadığı için onun değerleri bilinmiyor; bu satır yüksekliği Word'dekinden farklı olabilir ve sayfa sonları kayabilir. Tablodaki öbür satırlar başka aileye **ödünç verilmez**: tabloda olmayan bir aile başka bir fontla çizildiğinde (ör. Book Antiqua → Palatino Linotype, Cambria Math → Caladea, `w:altName`'i Arial olan bilinmeyen aile) satır yüksekliği tarayıcının o an çizdiği fontun kutusudur (tarayıcıdan tarayıcıya bir pikselden az oynar).
 
 **3. Kendi fontunuzu kaydetme: `registerFont`.** Uygulama, cihazda olmayan bir fontu sayfaya ekleyebilir ve belge font adlarının yerine geçirebilir:
 
@@ -557,6 +561,36 @@ await BymOffice.registerFont({ family: 'TeX Gyre Bonum', source: boldBytes, weig
 - Kayıt sayfa genelindedir (tarayıcının `FontFace` arayüzü ve `document.fonts`); görünüm kaldırılınca silinmez. `FontFace` olmayan ortamda (Node, çok eski WebView) `registerFont` açıklayıcı bir hatayla reddeder; `@font-face` kuralıyla yedek yol **yoktur**. Sayfanıza kendi `@font-face` kuralınızla eklediğiniz fontlar da çalışır: belge görünümü tarayıcının "fontlar yüklendi" olayında yeniden dizilir.
 - `mount({ fonts: [...] })` aynı nesneleri alır (yukarıdaki seçenek tablosu); WebView köprüsünde `load.fonts` (bkz. `docs/webview-koprusu.md`).
 - Dosyanın içindeki gömülü fontlar (docx `word/fonts/*.odttf`) **yüklenmez**; yalnız dosyada korunur.
+
+**4. Paketle gelen font: TeX Gyre Bonum (Bookman Old Style için).** Bookman Old Style macOS, iOS ve Android'de yoktur. Paket, onunla aynı karakter genişliklerine göre çizilmiş açık fontu, TeX Gyre Bonum'u dört yüzüyle (düz, kalın, italik, kalın italik) getirir: `dist/fonts/tex-gyre-bonum/texgyrebonum-{regular,bold,italic,bolditalic}.otf` (toplam 576 KB) ve lisansı. Dosyalar GUST e-foundry'nin dağıttığı haliyle, **değiştirilmeden** gelir (alt küme çıkarılmaz, biçim çevrilmez, ad değişmez; derleme sağlama toplamlarını denetler). Betiklerin (`bymoffice.min.js`, `bymoffice.esm.js`) içinde font yoktur.
+
+- **Ne zaman yüklenir.** Bir belge ya da tablo görünümü `Bookman Old Style` (ya da sonekli hali: `Bookman Old Style Tur`) ile yazılmış metni ilk kez ölçtüğünde, şu üçü birden doğruysa dört dosya istenir: cihaz o aileyi gösteremiyor; font zincirinde ondan önce gelen hiçbir şey (dosyanın `w:altName` alternatifi, `as` ile kaydettiğiniz font) gösterilemiyor; uygulama o ad için kendi fontunu kaydetmemiş (`registerFont` ile `as: ['Bookman Old Style']`, ya da aile adı `Bookman Old Style` / `TeX Gyre Bonum` olan bir kayıt; yüklenmesi süren kayıt da sayılır). Bu aileyi kullanmayan dosyada **hiçbir istek yapılmaz**. Aynı sayfadaki bütün görünümler için tek yükleme yapılır (dört istek, yüz başına bir); gelince açık görünümler kendiliğinden yeniden dizilir. Cihazda zincirin başka bir yedeği (ör. Linux'ta URW Bookman) bulunsa da TeX Gyre Bonum yüklenir ve zincirde ondan önce gelir: bütün cihazlar aynı fontu gösterir. Font **dört yüzüyle birlikte** kullanılır: biri gelmezse hiçbiri kullanılmaz. Font, yalnız sayfaya eklendikten sonra font dizgilerine girer (belgede ve tabloda aynı kural).
+- **Kendi fontunuz önce gelir.** `registerFont` ile `as: ['Bookman Old Style']` verdiğiniz font zincirde paketle gelenden öndedir; paketle gelen font `registeredFonts()` listesinde görünmez ve `unregisterFont` ile kaldırılmaz.
+- **Dosyaya yazılan ad değişmez.** Belge araç çubuğunun font listesinde `Bookman Old Style` vardır (font yüklenebildiği sürece); seçilince belgeye `Bookman Old Style` yazılır, ekranda TeX Gyre Bonum ile gösterilir, Word'de gerçek fontla açılır.
+- **Dosyalar nereden istenir.** Varsayılan: betiğin kendi adresinin yanındaki `fonts/` klasörü.
+
+  | Kullanım | Çözülen adres |
+  |---|---|
+  | `<script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js">` (unpkg de aynı) | `…/npm/bymoffice/dist/fonts/` — ek ayar gerekmez. Çapraz köken font isteği CORS ister; UNSURE: jsDelivr ve unpkg `Access-Control-Allow-Origin: *` gönderir, paket yayımlanmadığı için denenemedi |
+  | `<script src="/vendor/bymoffice.min.js">` (kendi sunucunuz; `async`, `defer`, sonradan eklenen betik ve `?v=…` dahil) | `/vendor/fonts/` — `dist/fonts/` klasörünü betikle **birlikte kopyalayın**. Başka kökenden sunuyorsanız font dosyalarına `Access-Control-Allow-Origin` başlığı verin |
+  | ES modülü (`import … from '…/bymoffice.esm.js'`, `<script type="module">`) | **Kendiliğinden çözülmez** (modül kendi adresini bilmez; motor `import.meta` kullanmaz, ES2019 olarak ayrıştırılır). Adresi siz verirsiniz, kendi modülünüzde bir satırla: `fonts.configure({ baseUrl: new URL('./fonts/', import.meta.url).href })` ya da `mount(el, { fontsUrl: '/dist/fonts/' })`. Vermezseniz istek yapılmaz ve bir kez bildirilir |
+  | Paketleyici (Vite, webpack, esbuild…) | Çözülemez ya da yanlış çözülür (betiğin adresi paketleyicinin ürettiği dosyadır). `node_modules/bymoffice/dist/fonts` klasörünü sitenizin statik dosyalarına kopyalayın ve adresini verin: `mount(el, { fontsUrl: '/static/bymoffice-fonts/' })`. Dosyalara paket içinden `bymoffice/fonts/tex-gyre-bonum/…` adıyla da ulaşılır. (Paketleyicilerle denenmedi) |
+  | Satır içi betik, `blob:`/`data:` modülü, `file:` olmayan bir sayfada `file:` adresi | Çözülemez; adresi verin |
+  | WebView köprü sayfası (`bymoffice.webview.html`) | Ağ isteği yok: font sayfanın içindedir (bkz. `docs/webview-koprusu.md`) |
+
+- **Ayar: `BymOffice.fonts.configure(options)`** (sayfa genelinde; yalnız verilen alanlar değişir; bir şey değiştiyse açık görünümler yeniden ölçer ve daha önce yüklenememiş font yeniden denenir):
+
+  | Alan | Anlamı |
+  |---|---|
+  | `baseUrl` | Font klasörünün (`dist/fonts/`, içinde `tex-gyre-bonum/` olan) adresi; sayfanın adresine göre okunur (`'/static/bym-fonts'`, `'../fonts/'`, tam adres). `null`: paketle gelen font **kapalı**: hiçbir istek yapılmaz; font yüklenmişse sayfadan çıkarılır ve görünümler onsuz yeniden dizilir (okunan dosyalar bellekte kalır, yeniden açınca istek yapılmadan geri gelir). `undefined`: varsayılana (`<script>`'in yanı) döner |
+  | `as` | Fontun yerine geçtiği belge font adları; varsayılan `['Bookman Old Style']`. Sonekli adlar taban adla kapsanır. Örn. `['Bookman Old Style', 'Bookman']` |
+  | `source` | `(dosyaAdı) => baytlar \| adres \| Promise` — dosyayı kendiniz verirsiniz (köprü sayfası böyle yapar). Bir şey döndürmediği dosya `baseUrl`'den istenir |
+  | `hasFamily` | `(aile) => boolean` — "cihazda bu aile var mı" sınamasının yerine geçer (testler için; yalnız tablo görünümünde ve ölçücüsü olmayan yerde sorulur, belgede `createCanvasMeasurer({ hasFamily })` geçerlidir) |
+
+  `mount({ fontsUrl })` `baseUrl` ile, `mount({ fonts: false })` ve `fontsUrl: null` kapatma ile aynıdır. `BymOffice.fonts.embedded()` durumu verir: `{ family: 'TeX Gyre Bonum', as, baseUrl, status }`; `status`: `'off'`, `'idle'` (henüz gerekmedi), `'loading'`, `'loaded'` (dört yüz sayfada), `'failed'`.
+- **Yüklenemezse.** Adres çözülemiyorsa ya da istekler başarısızsa dosya yine açılır ve metin genel yedek fontla gösterilir; sayfadaki görünümlerden **biri**, **bir kez** `onNotice` ile bildirir (`kind: 'info'`; "Bu cihazda "Bookman Old Style" fontu yok, yerine geçen font da yüklenemedi… Font klasörünün adresini "fontsUrl" ile verin ya da fontu "fonts: false" ile kapatın"). Yeniden deneme yapılmaz; `configure()` ile ayar değişirse yeniden denenir (yükleme sürerken değişen ayar, eski yükleme başarısız bittiğinde denenir) ve yeni bir başarısızlık yeniden bildirilir. Dört yüzden biri bile gelmezse font kullanılmaz (`status: 'failed'`).
+- **Sınırlar.** Gerçek Bookman Old Style ile genişlik karşılaştırması yapılamadı (dosya yok; UNSURE: TeX Gyre Bonum, Bookman Old Style'ın uyumlu çizildiği ITC Bookman'ın eşidir). Satır yüksekliği Bonum'un kendi ölçüsüdür (2. maddenin sonu). `FontFace` olmayan ortamda (Node, çok eski WebView) font yüklenmez ve bildirim de yapılmaz. Uygulamanın kendi kaydı yüklenirken başarısız olursa paketle gelen font o görünüm yeniden ölçene dek istenmez. Paketleyicilerle deneme yapılmadı.
+- **Lisans.** TeX Gyre Bonum, GUST Font License (LPPL 1.3c) ile dağıtılır; metni fontların yanındadır (`dist/fonts/tex-gyre-bonum/GUST-FONT-LICENSE.txt`), ayrıntı depo kökündeki `THIRD-PARTY-NOTICES.md` dosyasındadır. Font klasörünü kopyalarken lisans dosyasını da kopyalayın. BYM Office'in MIT lisansı font dosyalarını kapsamaz.
 
 ### Formüller
 
@@ -908,7 +942,7 @@ Düşük düzey ZIP erişimi: `ZipArchive.read(bytes)`, `names()`, `has(name)`, 
 
 - Güncel Chrome, Firefox, Safari; iOS ve Android tarayıcıları ve WebView'leri. Her değişiklikte Playwright ile Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır.
 - Tarayıcının yerleşik sıkıştırması (`DecompressionStream`) yoksa ya da `deflate-raw` biçimini desteklemiyorsa motor kendi inflate/deflate kodunu kullanır (iOS 16.4 öncesi, eski Android WebView). Ek ayar gerekmez.
-- Paket ES2019 sözdizimine indirilmiş olarak derlenir.
+- Paket ES2019 sözdizimine indirilmiş olarak derlenir. İki çıktıda da `import.meta` yoktur.
 - Sınır: gerçek eski cihazlarda deneme yapılmadı; eski ortam, testlerde yerleşik API'ler kaldırılarak taklit edilir.
 
 ## 6. Test arayüzü
@@ -934,6 +968,7 @@ Sayfada yapabilecekleriniz:
 - "Boş docx oluştur ve aç" / "Boş xlsx oluştur ve aç" ile `createBlank()` çıktısını açmak.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
 - **"Font dosyası"** ile kendi font dosyanızı (ttf, otf, woff, woff2) yanındaki alana yazdığınız belge font adının (varsayılan `Bookman Old Style`) yerine kaydetmek (`registerFont`); açık belge ve tablo kendiliğinden yeniden dizilir. "Fontları kaldır" kayıtları siler.
+- **"Paketle gelen font"** kutusu TeX Gyre Bonum'u açıp kapatır (`BymOffice.fonts.configure({ baseUrl: null })`); yanındaki satır durumunu ve dosyaların isteneceği adresi gösterir. Bookman Old Style kullanan bir belge açınca "yüklendi" olur.
 
 Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez.
 

@@ -14,6 +14,7 @@ import type { DocumentView } from './doc-view';
 import { ICON_BAR_CLASS, createDocIcon, createIcon, type DocIconName, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
 import { onFontsChanged, registeredFonts } from '../render/fonts';
+import { embeddedFontNames } from '../render/embedded-fonts';
 
 /** What the toolbar needs from the editor that holds it. */
 export interface DocShellHost {
@@ -525,6 +526,10 @@ export class DocToolbar {
     // The fonts the application registered: they are there for certain.
     const registered = registeredFonts();
     for (let i = 0; i < registered.length; i++) if (registered[i].status === 'loaded') add(registered[i].family);
+    // The names the font of the package is shown for (Bookman Old Style): the document gets that name, and where
+    // the device lacks the font the text is drawn with the one of the package.
+    const embedded = embeddedFontNames();
+    for (let i = 0; i < embedded.length; i++) add(embedded[i]);
     this.host.view.document.fonts.forEach((_info, name) => add(name));
     if (font !== undefined) add(font);
     const list: string[] = [];

@@ -148,6 +148,14 @@ export function onFontsChanged(listener: () => void): () => void {
   };
 }
 
+/**
+ * Tells the views that the fonts of the page changed in a way the registry does not know of (the embedded font
+ * arrived, or where it comes from was set): family lists are built and text is measured anew.
+ */
+export function notifyFontsChanged(): void {
+  changed();
+}
+
 function changed(): void {
   version++;
   const all = listeners.slice();
@@ -203,6 +211,23 @@ export function fontFamilyChain(name: unknown): string[] {
   add(base);
   if (registered) for (let i = 0; i < registered.then.length; i++) add(registered.then[i]);
   return names;
+}
+
+/**
+ * Whether the application has seen to a font name of a file itself: a font registered under that name or under
+ * `family`, or one that stands in for the name. One that is still loading counts.
+ */
+export function appFontFor(full: string, base: string, family: string): boolean {
+  if (entries.length === 0) return false;
+  const fullLower = full.toLowerCase();
+  const baseLower = base.toLowerCase();
+  const familyLower = family.toLowerCase();
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.lower === fullLower || entry.lower === baseLower || entry.lower === familyLower) return true;
+    if (entry.asLower.indexOf(fullLower) >= 0 || entry.asLower.indexOf(baseLower) >= 0) return true;
+  }
+  return false;
 }
 
 const describe = (entry: Entry): RegisteredFont => ({
@@ -270,6 +295,11 @@ function styleOf(style: unknown): 'normal' | 'italic' {
   throw new TypeError('The style of a font must be "normal" or "italic"');
 }
 
+/** The names of an `as`, sanitized and without repeats. */
+export function fontAliases(as: unknown): string[] {
+  return aliasesOf(as);
+}
+
 function aliasesOf(as: unknown): string[] {
   if (as === undefined || as === null) return [];
   const given = typeof as === 'string' ? [as] : as;
@@ -329,6 +359,40 @@ function loadFace(make: FaceMaker, family: string, source: string | ArrayBuffer 
     if (!(error instanceof Error) || error.name !== 'SyntaxError') throw error;
     return attempt('"' + family + '"');
   });
+}
+
+/** A face of the page that is not in the registry. */
+export interface PageFont {
+  /** Makes the face usable: adds it to the fonts of the page. */
+  add(): void;
+  /** Takes it off the page again; it can be added anew. */
+  remove(): void;
+}
+
+/** Whether fonts can be added to the page: a browser with FontFace and document.fonts. */
+export function canLoadFonts(): boolean {
+  return typeof globalThis !== 'undefined' && typeof (globalThis as { FontFace?: unknown }).FontFace === 'function' && faceSet() !== undefined;
+}
+
+/**
+ * Reads a font file into a face without registering it: the registry of the
+ * application does not list it and unregisterFont() does not know it.
+ * `family` must be sanitized. Nobody is told; see notifyFontsChanged().
+ */
+export function loadPageFont(family: string, source: FontSource, weight: number, style: 'normal' | 'italic'): Promise<PageFont> {
+  const make = (typeof globalThis !== 'undefined' ? (globalThis as { FontFace?: unknown }).FontFace : undefined) as FaceMaker | undefined;
+  const fonts = faceSet();
+  if (typeof make !== 'function' || !fonts) return Promise.reject(new Error('Fonts cannot be loaded here: there is no FontFace and document.fonts'));
+  return faceSource(source)
+    .then((data) => loadFace(make, family, data, { weight: String(weight), style }))
+    .then((face) => ({
+      add: () => {
+        fonts.add(face);
+      },
+      remove: () => {
+        fonts.delete(face);
+      },
+    }));
 }
 
 /**

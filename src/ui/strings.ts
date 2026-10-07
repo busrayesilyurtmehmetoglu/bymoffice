@@ -134,6 +134,8 @@ export interface UiStrings {
   notConverted(from: string): string;
   /** A font of MountOptions.fonts that could not be loaded; `late` when it was still loading when the file was shown. */
   fontNotLoaded(family: string, late: boolean): string;
+  /** The font of the package that stands in for `family` was needed and could not be loaded. */
+  embeddedFontNotLoaded(family: string): string;
   pictureNotSupported: string;
   linkNotAllowed: string;
   /** Said when the caret enters another part of the document: `kind` is "body", "header", "footer", "footnote" or "endnote". */
@@ -290,6 +292,7 @@ export const STRINGS_EN: UiStrings = {
   documentPasteTooLarge: 'The text on the clipboard is too long to paste',
   openedConverted: (from, to) => `This ${from} file was converted to ${to} to be edited; it is saved as ${to}`,
   notConverted: (from) => `This ${from} file could not be converted to be edited; it is shown read-only`,
+  embeddedFontNotLoaded: (family) => `This device does not have the font "${family}", and the font that stands in for it could not be loaded; the text is shown in another font. Give the address of the font folder with "fontsUrl", or turn the font off with "fonts: false"`,
   fontNotLoaded: (family, late) => (late ? `The font "${family}" is still loading; the file is shown without it until it arrives` : `The font "${family}" could not be loaded; the file is shown without it`),
   pictureNotSupported: 'This picture cannot be inserted',
   linkNotAllowed: 'This address cannot be used as a link',
@@ -436,6 +439,7 @@ export const STRINGS_TR: UiStrings = {
   documentPasteTooLarge: 'Panodaki metin yapıştırılamayacak kadar uzun',
   openedConverted: (from, to) => `Bu ${from} dosyası düzenlenebilmesi için ${to} biçimine çevrildi; ${to} olarak kaydedilir`,
   notConverted: (from) => `Bu ${from} dosyası düzenlenebilecek biçime çevrilemedi; salt okunur gösteriliyor`,
+  embeddedFontNotLoaded: (family) => `Bu cihazda "${family}" fontu yok, yerine geçen font da yüklenemedi; metin başka bir fontla gösteriliyor. Font klasörünün adresini "fontsUrl" ile verin ya da fontu "fonts: false" ile kapatın`,
   fontNotLoaded: (family, late) => (late ? `"${family}" fontu hâlâ yükleniyor; gelene dek dosya onsuz gösteriliyor` : `"${family}" fontu yüklenemedi; dosya onsuz gösteriliyor`),
   pictureNotSupported: 'Bu görsel eklenemiyor',
   linkNotAllowed: 'Bu adres bağlantı olarak kullanılamaz',

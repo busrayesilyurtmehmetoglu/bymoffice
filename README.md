@@ -18,6 +18,10 @@ ES modülü olarak: `import { open } from './bymoffice.esm.js'`.
 
 Ayrıntılı anlatım, API ve test arayüzü: [geliştirici kullanım kılavuzu](docs/kullanim-kilavuzu.md). Sürüm notları: [CHANGELOG.md](CHANGELOG.md).
 
+## Fontlar ve üçüncü taraf içerik
+
+Paket, Bookman Old Style'ı olmayan cihazlarda (macOS, iOS, Android) o fontla yazılmış metni göstermek için **TeX Gyre Bonum** fontunu getirir (`dist/fonts/tex-gyre-bonum/`; B. Jackowski ve J. M. Nowacki, GUST e-foundry). Font dosyaları değiştirilmeden, kendi lisanslarıyla (GUST Font License) dağıtılır ve yalnız gerektiğinde yüklenir; ayrıntı: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) ve kılavuzun "Fontlar" bölümü. Betiği kendi sunucunuzdan sunuyorsanız `dist/fonts/` klasörünü de yanına koyun; ES modülü ya da paketleyici kullanıyorsanız klasörün adresini `mount(el, { fontsUrl })` ile verin.
+
 ## Komutlar
 
 | Komut | İş |

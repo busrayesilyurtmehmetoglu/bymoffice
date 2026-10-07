@@ -22,6 +22,7 @@ import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
 import { onFontsChanged } from '../render/fonts';
+import { onEmbeddedFontNotice } from '../render/embedded-fonts';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
 import { cutLoses, fragmentOfRange, setCopyMedia, sliceHtml, sliceOf, storeCopy, storedCopy, type DocSlice, type StoredCopy } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
@@ -656,6 +657,7 @@ export class DocumentView {
   private fontTimer: ReturnType<typeof setTimeout> | undefined;
   private fontRelayouts = 0;
   private unwatchFonts: (() => void) | undefined;
+  private unwatchEmbeddedFont: (() => void) | undefined;
   /** Fonts arrived while a composition or a drag was under way: the layout is due when it ends. */
   private fontsDue = false;
   private resizeObserver: ResizeObserver | undefined;
@@ -1375,6 +1377,10 @@ export class DocumentView {
     const fonts = (document as { fonts?: { addEventListener?(type: string, listener: () => void): void } }).fonts;
     if (fonts && typeof fonts.addEventListener === 'function') fonts.addEventListener('loadingdone', this.onFontsLoaded);
     this.unwatchFonts = onFontsChanged(this.onFontsRegistered);
+    // The font of the package was needed and could not be loaded: said once, by one view of the page.
+    this.unwatchEmbeddedFont = onEmbeddedFontNotice((notice) => {
+      if (!this.destroyed) this.notify(this.strings.embeddedFontNotLoaded(notice.family), 'info');
+    });
   }
 
   private unlisten(): void {
@@ -1414,6 +1420,8 @@ export class DocumentView {
     if (fonts && typeof fonts.removeEventListener === 'function') fonts.removeEventListener('loadingdone', this.onFontsLoaded);
     if (this.unwatchFonts) this.unwatchFonts();
     this.unwatchFonts = undefined;
+    if (this.unwatchEmbeddedFont) this.unwatchEmbeddedFont();
+    this.unwatchEmbeddedFont = undefined;
   }
 
   private readZoomOption(zoom: DocumentZoom | undefined): void {

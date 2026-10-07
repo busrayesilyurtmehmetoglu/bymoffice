@@ -80,6 +80,7 @@
     <div id="status" role="status">
       <p id="status-title"></p>
     </div>
+    __BYM_FONTS__
     <script>__BYM_ENGINE__</script>
     <script>
       // Not compiled: this has to parse wherever the engine does.
@@ -124,6 +125,22 @@
           return;
         }
         show('empty');
+        // The font of the package (for Bookman Old Style) is inside this page, each file as base64 in a block of
+        // data: the engine is given the bytes when a file needs the font, so that nothing is fetched. A page built
+        // without the fonts has no folder to fetch them from either: the embedded font is turned off.
+        var fontBlocks = document.querySelectorAll('script[data-bym-font]');
+        if (window.BymOffice.fonts && window.BymOffice.fonts.configure) {
+          if (fontBlocks.length === 0) window.BymOffice.fonts.configure({ baseUrl: null });
+          else {
+            window.BymOffice.fonts.configure({
+              source: function (file) {
+                for (var i = 0; i < fontBlocks.length; i++) {
+                  if (fontBlocks[i].getAttribute('data-bym-font') === file) return window.BymOffice.base64Decode(fontBlocks[i].textContent);
+                }
+              },
+            });
+          }
+        }
         // The bridge drives the view inside an editor; these three calls are passed on to the
         // editor so that the shell around the view follows.
         function withShell(editor) {

@@ -30,13 +30,15 @@
       "default": "./dist/bymoffice.esm.js"
     },
     "./webview.html": "./dist/bymoffice.webview.html",
+    "./fonts/*": "./dist/fonts/*",
     "./dist/*": "./dist/*",
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.json && node scripts/fix-types.mjs",

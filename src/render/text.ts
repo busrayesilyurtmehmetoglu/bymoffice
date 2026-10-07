@@ -6,6 +6,7 @@
 // removed from it.
 
 import type { Font } from '../model/sheet/types';
+import { embeddedFontFor } from './embedded-fonts';
 import { fontFamilyChain, fontsVersion, sanitizeFontFamily } from './fonts';
 
 export { sanitizeFontFamily };
@@ -26,11 +27,15 @@ export function fontPixels(font: Pick<Font, 'size'> | undefined): number {
 /**
  * The value for `ctx.font`: style, weight, size and the quoted family followed by the fallback stack. A name with a
  * code page suffix ("Arial Tur") is followed by its family, and a registered font that stands in for the family by that font.
+ * A family the font of the package stands in for is followed by that font while it is on the page; asking here is what
+ * has it fetched (see embedded-fonts.ts).
  */
 export function cssFont(font: Font | undefined): string {
   const names = fontFamilyChain(font ? font.name : undefined);
   let families = '';
   for (let i = 0; i < names.length; i++) families += '"' + names[i] + '", ';
+  const embedded = names.length > 0 ? embeddedFontFor((font as Font).name) : undefined;
+  if (embedded !== undefined && names.indexOf(embedded) < 0) families += '"' + embedded + '", ';
   return (font && font.italic === true ? 'italic ' : '') + (font && font.bold === true ? 'bold ' : '') + fontPixels(font) + 'px ' + families + FONT_FALLBACK;
 }
 

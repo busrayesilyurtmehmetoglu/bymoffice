@@ -28,9 +28,17 @@ function bookmanDocx(): Promise<Uint8Array> {
   return buildDocx({ styles: fontStyles('Bookman Old Style', SIZE), body: body + docSection() });
 }
 
+/**
+ * These tests are about the fonts an application registers. The font the
+ * package brings for Bookman Old Style would arrive on its own in the middle
+ * of them: it is turned off (it has its own tests in font-embedded.spec.ts).
+ */
+const withoutEmbeddedFont = (page: Page) => page.evaluate(() => (window as any).BymOffice.fonts.configure({ baseUrl: null }));
+
 async function mountDoc(page: Page, bytes: Uint8Array): Promise<void> {
   await page.goto('/e2e/pages/doc.html');
   await expect(page.locator('#state')).toHaveText('ready');
+  await withoutEmbeddedFont(page);
   await page.evaluate(([input, opts]) => (window as any).__mountDoc(input, opts), [Array.from(bytes), {}] as [number[], object]);
 }
 
@@ -107,6 +115,7 @@ test.describe('fonts', () => {
 
   test('an editor keeps its caret when a font arrives', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const bytes = Array.from(await bookmanDocx());
     const result = await page.evaluate(
       async ([doc, font]) => {
@@ -153,6 +162,7 @@ test.describe('fonts', () => {
 
   test('a font that arrives while an input method composes is laid out when the composition has ended', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const bytes = Array.from(await bookmanDocx());
     const result = await page.evaluate(
       async ([doc, font]) => {
@@ -215,6 +225,7 @@ test.describe('fonts', () => {
 
   test('a font that arrives while a selection is dragged is laid out when the pointer is released', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const bytes = Array.from(await bookmanDocx());
     await page.evaluate(async (doc) => {
       const api = (window as any).BymOffice;
@@ -253,6 +264,7 @@ test.describe('fonts', () => {
 
   test('mount registers its fonts before the document is laid out, and says which did not load', async ({ page, pageProblems }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const bytes = Array.from(await bookmanDocx());
     const result = await page.evaluate(
       async ([doc, font]) => {
@@ -289,6 +301,7 @@ test.describe('fonts', () => {
 
   test('a family name with a word that starts with a digit can be registered', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const width = await page.evaluate(async (font) => {
       const api = (window as any).BymOffice;
       await api.registerFont({ family: 'Bym 39 Test-2', source: new Uint8Array(font).buffer });
@@ -300,6 +313,7 @@ test.describe('fonts', () => {
 
   test('a font from an address and a Blob; the bold face is the one registered as bold', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const wide = Array.from(testFont({ advance: 2000 }));
     const result = await page.evaluate(
       async ([regular, bold]) => {
@@ -326,6 +340,7 @@ test.describe('fonts', () => {
 
   test('a spreadsheet paints its cells anew with a font that arrives', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const result = await page.evaluate(async (font) => {
       const api = (window as any).BymOffice;
       const host = document.getElementById('editor')!;
@@ -363,6 +378,7 @@ test.describe('fonts', () => {
 
   test('the font list of the document toolbar offers the registered families', async ({ page }) => {
     await page.goto('/e2e/pages/mount.html');
+    await withoutEmbeddedFont(page);
     const bytes = Array.from(await bookmanDocx());
     await page.evaluate(async (doc) => {
       (window as any).__mounted = await (window as any).BymOffice.mount(document.getElementById('editor'), { file: new Uint8Array(doc) });
@@ -383,6 +399,7 @@ test.describe('fonts', () => {
       (window as any).BymOfficeHost = { postMessage: (json: string) => (window as any).__messages.push(JSON.parse(json)) };
     });
     await page.goto('/dist/bymoffice.webview.html');
+    await withoutEmbeddedFont(page);
     const base64 = (bytes: Uint8Array | number[]) => Buffer.from(Uint8Array.from(bytes)).toString('base64');
     const loaded = async (id: string) => {
       let found: any;

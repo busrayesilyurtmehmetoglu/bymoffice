@@ -14,8 +14,15 @@
 // is looked up by it. Fonts the application registered for a family
 // (registerFont() with `as`) come right after it. The name in the model is
 // never changed.
+//
+// The font the package brings (embedded-fonts.ts) is, while it is on the
+// page, in the list of the families it stands in for, after everything the
+// document and the application name for them; building the list of such a
+// family is what has its files fetched, when nothing the document or the
+// application names for it can be shown.
 
 import type { FontMetrics, LayoutFont, TextMeasurer } from '../layout/doc/types';
+import { embeddedFontForNames } from './embedded-fonts';
 import { fontsVersion, replacementFonts, sanitizeFontFamily, splitFontFamily } from './fonts';
 
 /** What the measurer needs of a canvas context. */
@@ -106,7 +113,8 @@ const MONOSPACE = ['courier new', 'courier', 'consolas', 'lucida console', 'libe
  * 17 px in one browser, 19 in another and 18.4 in Word. With the table the
  * lines of these fonts are as high as in Word, in every browser. The family
  * the document asks for decides, not the font the device shows it with: that
- * is how Word paginated the document.
+ * is how Word paginated the document. The rows of this table are never lent
+ * to another family: only the font of the package lends its rows, below.
  *
  * "verified": read from the font file. "UNSURE": from memory, no file of the
  * font was at hand to check; the sum (the line pitch) is the better known part.
@@ -162,13 +170,48 @@ const VERTICAL_METRICS: { [family: string]: [number, number, number] } = {
   symbol: [2059, 450, 0], // UNSURE (line 1.225 em)
 };
 
-/** The row of the table for a family of a document: by its name, then by the name without its code page suffix. */
-function tableMetrics(family: unknown): [number, number, number] | undefined {
+/**
+ * The font of the package, whose faces are files with metrics of their own,
+ * in units of 1/1000 em: a row for the regular, the bold, the italic and the
+ * bold italic face, each [ascent, descent, leading] as in the table above.
+ *
+ * A family that is not in the table above and is shown with this font takes
+ * these rows (Bookman Old Style, whose own metrics are not known): not what
+ * Word set the document with, but the same in every browser, which the font
+ * box of a canvas is not.
+ */
+const FACE_UNITS_PER_EM = 1000;
+const FACE_METRICS: { [family: string]: [[number, number, number], [number, number, number], [number, number, number], [number, number, number]] } = {
+  // verified (files in assets/fonts/tex-gyre-bonum; hhea.lineGap is 0 and hhea spans what OS/2 does, so no leading)
+  'tex gyre bonum': [
+    [1069, 268, 0],
+    [1153, 306, 0],
+    [1073, 279, 0],
+    [1141, 328, 0],
+  ],
+};
+
+/** A row of the tables with the units it is in. */
+interface MetricsRow {
+  units: [number, number, number];
+  perEm: number;
+}
+
+/** The row of a face of the font of the package, by family name in lower case. */
+function faceRowOf(name: string, bold: boolean, italic: boolean): MetricsRow | undefined {
+  return Object.prototype.hasOwnProperty.call(FACE_METRICS, name) ? { units: FACE_METRICS[name][(bold ? 1 : 0) + (italic ? 2 : 0)], perEm: FACE_UNITS_PER_EM } : undefined;
+}
+
+/** The row for a family name in lower case, as the tables spell it. */
+function rowOf(name: string, bold: boolean, italic: boolean): MetricsRow | undefined {
+  if (Object.prototype.hasOwnProperty.call(VERTICAL_METRICS, name)) return { units: VERTICAL_METRICS[name], perEm: UNITS_PER_EM };
+  return faceRowOf(name, bold, italic);
+}
+
+/** The row of the tables for a family of a document: by its name, then by the name without its code page suffix. */
+function tableMetrics(family: unknown, bold: boolean, italic: boolean): MetricsRow | undefined {
   if (typeof family !== 'string') return undefined;
-  const name = family.trim().toLowerCase();
-  if (Object.prototype.hasOwnProperty.call(VERTICAL_METRICS, name)) return VERTICAL_METRICS[name];
-  const base = splitFontFamily(family).base.toLowerCase();
-  return Object.prototype.hasOwnProperty.call(VERTICAL_METRICS, base) ? VERTICAL_METRICS[base] : undefined;
+  return rowOf(family.trim().toLowerCase(), bold, italic) || rowOf(splitFontFamily(family).base.toLowerCase(), bold, italic);
 }
 
 /** Size at which the font box of a family that is not in the table is measured; the result is scaled to the size asked for. */
@@ -208,6 +251,8 @@ export class CanvasTextMeasurer implements TextMeasurer {
   private widths = new Map<string, number>();
   /** Font box per px of size, by face (family list and style), of the families that are not in the table. */
   private extents = new Map<string, { ascent: number; descent: number } | null>();
+  /** The row a face takes from the font of the package it is shown with, by family and style; null when it is shown with another font. */
+  private shownRows = new Map<string, MetricsRow | null>();
   /** fontsVersion() the family lists were built for. */
   private registered = fontsVersion();
 
@@ -264,11 +309,16 @@ export class CanvasTextMeasurer implements TextMeasurer {
   }
 
   metrics(font: LayoutFont): FontMetrics {
+    // A font that came or went since the last line was measured counts for this one.
+    this.sync();
     const size = fontSize(font.size);
-    const units = tableMetrics(font.family);
-    if (units) {
+    // The family the document asks for; where the table does not know it and it is shown with the font of the
+    // package, the rows of that font.
+    const row = tableMetrics(font.family, font.bold === true, font.italic === true) || this.shownRow(font);
+    if (row) {
+      const units = row.units;
       // The same in every browser, and what Word used when it broke the document into pages.
-      return { ascent: (units[0] * size) / UNITS_PER_EM, descent: (units[1] * size) / UNITS_PER_EM, lineGap: (units[2] * size) / UNITS_PER_EM };
+      return { ascent: (units[0] * size) / row.perEm, descent: (units[1] * size) / row.perEm, lineGap: (units[2] * size) / row.perEm };
     }
     // Measured once per face at a large size: a canvas that reports whole pixels is off by up to 4% at text sizes.
     const face = (font.italic === true ? 'italic ' : '') + (font.bold === true ? 'bold ' : '') + METRICS_PROBE_PX + 'px ' + this.cssFamilies(font.family);
@@ -289,6 +339,33 @@ export class CanvasTextMeasurer implements TextMeasurer {
     return { ascent: Math.max(size * FALLBACK_ASCENT, inkUp), descent: Math.max(size * FALLBACK_DESCENT, inkDown), lineGap: 0 };
   }
 
+  /**
+   * The row of the font of the package when a family is shown with it: when
+   * it is the first name of the family's list the device can show. Undefined
+   * for a family shown with any other font, and when the device has none of the list.
+   */
+  private shownRow(font: LayoutFont): MetricsRow | undefined {
+    const bold = font.bold === true;
+    const italic = font.italic === true;
+    const key = (bold ? 'b' : '') + (italic ? 'i' : '') + '\n' + font.family;
+    let row = this.shownRows.get(key);
+    if (row === undefined) {
+      row = null;
+      const names = this.chain(font.family);
+      // The device is only tried when the font of the package is in the list at all.
+      let known = false;
+      for (let i = 0; i < names.length && !known; i++) known = faceRowOf(names[i].toLowerCase(), bold, italic) !== undefined;
+      for (let i = 0; known && i < names.length; i++) {
+        if (!this.isAvailable(names[i])) continue;
+        row = faceRowOf(names[i].toLowerCase(), bold, italic) || null;
+        break;
+      }
+      if (this.shownRows.size >= FAMILY_CACHE_LIMIT) this.shownRows.clear();
+      this.shownRows.set(key, row);
+    }
+    return row || undefined;
+  }
+
   /** Whether the device can show the family, or a font with the same metrics. */
   hasFont(family: string): boolean {
     this.sync();
@@ -301,6 +378,7 @@ export class CanvasTextMeasurer implements TextMeasurer {
   clear(): void {
     this.widths.clear();
     this.extents.clear();
+    this.shownRows.clear();
     this.available.clear();
     this.current = undefined;
   }
@@ -319,7 +397,8 @@ export class CanvasTextMeasurer implements TextMeasurer {
    * The names to try for a family of the document, sanitized, without
    * repeats: registered fonts preferred to it, the name itself, the family
    * without its code page suffix, the other registered fonts that stand in
-   * for it, the alternative of the font table and the substitutes.
+   * for it, the alternative of the font table, the substitutes and the
+   * font of the package where it stands in for the family.
    */
   private chain(family: string): string[] {
     const names: string[] = [];
@@ -338,9 +417,18 @@ export class CanvasTextMeasurer implements TextMeasurer {
     if (registered) for (let i = 0; i < registered.then.length; i++) add(registered.then[i]);
     const hint = this.hints ? this.hints.get(family) : undefined;
     if (hint) add(hint.altName);
+    // What the document and the application name for the family ends here.
+    const own = names.length;
     const lower = base.toLowerCase();
     const substitutes = Object.prototype.hasOwnProperty.call(SUBSTITUTES, lower) ? SUBSTITUTES[lower] : undefined;
     if (substitutes) for (let i = 0; i < substitutes.length; i++) add(substitutes[i]);
+    // Asking is what fetches the font, unless one of the names above can be shown. It is fetched although the device
+    // has another font of the substitutes (URW Bookman on Linux): every device then shows the same font.
+    const embedded = embeddedFontForNames(full, base, () => {
+      for (let i = 0; i < own; i++) if (this.isAvailable(names[i])) return true;
+      return false;
+    });
+    if (embedded !== undefined) add(embedded);
     return names;
   }
 
