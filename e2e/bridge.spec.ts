@@ -693,6 +693,66 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       expect((await bridge.messages()).filter((message) => message.notAString)).toEqual([]);
       expectNoOutsideRequests(bridge.requests);
     });
+
+    test('sheets: moved, hidden and shown, copied and coloured by command; the list is sent each time and the saved file has it', async ({ page }) => {
+      const bridge = await start(page, mode);
+      const three = await buildXlsx({
+        sheets: ['Bir', 'İki', 'Üç'].map((name, index) => ({ name, xml: worksheetXml(`<sheetData><row r="1"><c r="A1"><v>${index + 1}</v></c></row></sheetData>`) })),
+      });
+      await bridge.send({ type: 'load', id: 'l', data: base64(three), locale: 'tr' });
+      await bridge.waitFor('loaded');
+      const sheet = (name: string, more: Record<string, unknown> = {}) => ({ name, state: 'visible', kind: 'worksheet', ...more });
+
+      await bridge.send({ type: 'moveSheet', id: 'm', from: 0, to: 2 });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'm', command: 'moveSheet' });
+      // The sheet that was shown is still the one shown, at the place it has now.
+      expect(await bridge.waitFor('sheets')).toEqual({ type: 'sheets', sheets: [sheet('İki'), sheet('Üç'), sheet('Bir')], activeSheet: 2 });
+      await expect(bridge.editor.locator('#editor .bym-tabs button.bym-tab')).toHaveText(['İki', 'Üç', 'Bir']);
+
+      await bridge.send({ type: 'setSheetState', id: 'h', index: 2, state: 'hidden' });
+      expect(await bridge.waitFor('done', 2)).toEqual({ type: 'done', id: 'h', command: 'setSheetState' });
+      expect(await bridge.waitFor('sheets', 2)).toEqual({ type: 'sheets', sheets: [sheet('İki'), sheet('Üç'), sheet('Bir', { state: 'hidden' })], activeSheet: 1 });
+      await expect(bridge.editor.locator('#editor .bym-tabs button.bym-tab')).toHaveText(['İki', 'Üç']);
+
+      await bridge.send({ type: 'copySheet', id: 'c', index: 0 });
+      expect(await bridge.waitFor('done', 3)).toEqual({ type: 'done', id: 'c', command: 'copySheet', index: 1, name: 'İki (2)' });
+      expect(await bridge.waitFor('sheets', 3)).toEqual({ type: 'sheets', sheets: [sheet('İki'), sheet('İki (2)'), sheet('Üç'), sheet('Bir', { state: 'hidden' })], activeSheet: 1 });
+
+      await bridge.send({ type: 'setTabColor', id: 't', index: 2, color: '#ff8800' });
+      expect(await bridge.waitFor('done', 4)).toEqual({ type: 'done', id: 't', command: 'setTabColor' });
+      expect(await bridge.waitFor('sheets', 4)).toEqual({
+        type: 'sheets',
+        sheets: [sheet('İki'), sheet('İki (2)'), sheet('Üç', { tabColor: '#FF8800' }), sheet('Bir', { state: 'hidden' })],
+        activeSheet: 1,
+      });
+
+      await bridge.send({ type: 'save', id: 's' });
+      await bridge.waitFor('saved');
+      const workbook = await (await open(new Uint8Array(Buffer.from(await bridge.savedData(), 'base64')))).workbook();
+      expect(workbook.sheets.map((entry) => `${entry.name}:${entry.state}:${entry.tabColor ? entry.tabColor.rgb : '-'}:${getCell(entry, 0, 0)!.value}`)).toEqual([
+        'İki:visible:-:2',
+        'İki (2):visible:-:2',
+        'Üç:visible:FFFF8800:3',
+        'Bir:hidden:-:1',
+      ]);
+      expect(workbook.activeSheet).toBe(1);
+
+      // Refusals carry the code and the reason in the language of the view; fields that are not in the contract are bad messages.
+      await bridge.send({ type: 'setSheetState', id: 'e1', index: 0, state: 'hidden' });
+      await bridge.send({ type: 'setSheetState', id: 'e2', index: 1, state: 'hidden' });
+      await bridge.waitFor('done', 6);
+      await bridge.send({ type: 'setSheetState', id: 'e3', index: 2, state: 'hidden' });
+      expect(await bridge.waitFor('error')).toEqual({ type: 'error', id: 'e3', code: 'sheet-refused', message: 'Görünen son sayfa gizlenemez' });
+      await bridge.send({ type: 'setTabColor', id: 'e4', index: 0, color: 'red' });
+      expect(await bridge.waitFor('error', 2)).toMatchObject({ id: 'e4', code: 'bad-message' });
+      await bridge.send({ type: 'moveSheet', id: 'e5', from: 9, to: 0 });
+      expect(await bridge.waitFor('error', 3)).toMatchObject({ id: 'e5', code: 'no-sheet' });
+      // Undo by command takes the last change of the list back, and the list says so.
+      await bridge.send({ type: 'undo', id: 'u' });
+      await bridge.waitFor('done', 7);
+      expect(((await bridge.messages()).filter((message) => message.type === 'sheets').pop() as any).sheets.map((entry: any) => entry.state)).toEqual(['hidden', 'visible', 'visible', 'hidden']);
+      expectNoOutsideRequests(bridge.requests);
+    });
   });
 }
 

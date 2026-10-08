@@ -165,17 +165,22 @@ test('notes: commentCellNow() applies only the structural edits made after a not
   assert.equal(commentCellNow({ row: 1, col: 1, text: '', since: 0 }, [{ kind: 'delete', axis: 'row', at: 1, count: 1 }]), undefined);
 });
 
-test('notes: a sheet that got a note is not sorted (the note would stay behind)', () => {
+test('notes: a sheet that got a note is sorted, and the note goes with its row', () => {
   const wb = book();
   const sheet = wb.sheets[0];
   applyOp(wb, { type: 'setCells', sheet: 0, cells: [{ row: 0, col: 0, cell: { kind: 'number', value: 2, style: 0 } }, { row: 1, col: 0, cell: { kind: 'number', value: 1, style: 0 } }] });
   const range = { top: 0, left: 0, bottom: 1, right: 0 };
   const sorted = sortRange(wb, 0, range, [{ col: 0 }]);
   applyOp(wb, setComment(wb, 0, 0, 0, 'n')[0]);
-  assert.throws(() => {
-    for (const op of sorted) applyOp(wb, op);
-  }, /Cannot sort in a sheet with comments: not supported yet/);
-  assert.equal(sheet.rows.get(0)!.cells[0].value, 2);
+  const before = sheet.comments;
+  const undo = sorted.map((op) => applyOp(wb, op));
+  assert.equal(sheet.rows.get(0)!.cells[0].value, 1);
+  assert.deepEqual(shown(sheet), ['1,0:n']);
+  // A note added since has no cell in the file to remember.
+  assert.equal(sheet.comments![0].from, undefined);
+  for (const op of undo.reverse()) applyOp(wb, op);
+  assert.equal(sheet.comments, before);
+  assert.deepEqual(shown(sheet), ['0,0:n']);
 });
 
 test('notes: clearing cells and deleting a sheet leave the model of notes as it is; "setComments" is its own inverse', () => {
@@ -226,13 +231,13 @@ test('review: one rule for text: undefined deletes; the text the note has is no 
   assert.deepEqual(setComment(wb, 0, 9, 9, ''), []);
 });
 
-test('review: a note whose cell was deleted neither blocks sorting nor counts towards the limit', () => {
+test('review: a note whose cell was deleted does not count towards the limit, and comments the reader could not show block sorting', () => {
   const wb = book([{ row: 5, col: 0, text: 'gone' }]);
   const sheet = wb.sheets[0];
   sheet.anchored = ['comments', 'vmlDrawing'];
   applyOp(wb, { type: 'setCells', sheet: 0, cells: [{ row: 0, col: 0, cell: { kind: 'number', value: 2, style: 0 } }, { row: 1, col: 0, cell: { kind: 'number', value: 1, style: 0 } }] });
   const range = { top: 0, left: 0, bottom: 1, right: 0 };
-  assert.throws(() => sortRange(wb, 0, range, [{ col: 0 }]).forEach((op) => applyOp(wb, op)), /Cannot sort in a sheet with comments/);
+  // (A note that is there does not block a sort either: it goes with its row, or stays outside the range.)
   applyOp(wb, { type: 'delete', sheet: 0, axis: 'row', at: 5, count: 1 });
   assert.deepEqual(shown(sheet), []);
   sortRange(wb, 0, range, [{ col: 0 }]).forEach((op) => applyOp(wb, op));

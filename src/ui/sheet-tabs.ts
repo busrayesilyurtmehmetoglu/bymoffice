@@ -6,7 +6,7 @@ import type { Sheet } from '../model/sheet/types';
 import type { UiStrings } from './strings';
 
 /** What an undo step did to the list of sheets. */
-export type SheetOpKind = 'insert' | 'delete' | 'rename';
+export type SheetOpKind = 'insert' | 'delete' | 'rename' | 'move' | 'state' | 'copy' | 'color';
 
 /**
  * The sheet to show when the one at `index` cannot be (it was deleted, or the index is
@@ -39,6 +39,9 @@ export function sheetErrorText(message: string, strings: UiStrings): string | un
   // The name is the user's own text and may hold anything, line breaks aside (those are refused before).
   if ((match = /^Cannot name the sheet "([\s\S]*)": another sheet has that name$/.exec(message))) return strings.sheetNameTaken(match[1]);
   if (message === 'Cannot delete the last visible sheet') return strings.cannotDeleteLastSheet;
+  if (message === 'Cannot hide the last visible sheet') return strings.cannotHideLastSheet;
+  if (/^Cannot copy a \S+: not supported yet$/.test(message)) return strings.sheetKindFixed('copy');
+  if (/^Cannot colour the tab of a \S+: not supported yet$/.test(message)) return strings.sheetKindFixed('color');
   if ((match = /^Cannot (rename|delete) a sheet (?:in a workbook )?with (.+): not supported yet$/.exec(message))) {
     return strings.sheetBlockedBy(match[1] as 'rename' | 'delete', match[2]);
   }
@@ -130,4 +133,23 @@ export function recalculateForSheets(engine: SheetCalcEngine, change: SheetListC
   const left = engine.incomplete;
   engine.invalidate();
   if (left) engine.recalculate(undefined, { overwrite: true });
+}
+
+/**
+ * Where a tab that is dragged goes: the index moveSheet() is to be given for the sheet at
+ * `from` so that it stands before the tab `gap` of the visible ones (`visible`: the indexes
+ * of the sheets that have a tab, in order; a gap of their number is behind the last).
+ * Undefined when the sheet would stay where it is, between the same tabs.
+ */
+export function dropIndex(visible: readonly number[], from: number, gap: number): number | undefined {
+  const count = visible.length;
+  if (count === 0 || !(gap >= 0 && gap <= count) || Math.floor(gap) !== gap) return undefined;
+  // Beside itself on either side: nothing moves.
+  if ((gap < count && visible[gap] === from) || (gap > 0 && visible[gap - 1] === from)) return undefined;
+  if (gap === count) {
+    const last = visible[count - 1];
+    return (last > from ? last - 1 : last) + 1;
+  }
+  const before = visible[gap];
+  return before > from ? before - 1 : before;
 }

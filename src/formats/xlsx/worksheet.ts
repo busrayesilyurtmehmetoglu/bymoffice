@@ -204,11 +204,51 @@ function parseSheetViews(sc: XmlScanner, sheet: Sheet): void {
   }
 }
 
+/** Entries of Sheet.unmodelled that are kept; a part with more is damaged or made to be large. */
+const MAX_UNMODELLED = 256;
+
+/** Notes the name of something in the part that the model has no field for (see Sheet.unmodelled). */
+function unmodelled(sheet: Sheet, name: string): void {
+  const list = sheet.unmodelled || (sheet.unmodelled = []);
+  if (list.length < MAX_UNMODELLED) list.push(name);
+}
+
+/** The attributes of the current element that belong to no namespace and declare none, as the file has them. */
+function plainAttrs(sc: XmlScanner): [string, string][] {
+  const out: [string, string][] = [];
+  for (const [name, value] of sc.attrs()) if (name.indexOf(':') < 0 && name !== 'xmlns' && out.length < 64) out.push([name, value]);
+  return out;
+}
+
+/** Ranges of one sheet that are read; more than any sheet has. */
+const MAX_PROTECTED_RANGES = 10000;
+
+function parseProtectedRanges(sc: XmlScanner, sheet: Sheet): void {
+  const ranges: NonNullable<NonNullable<Sheet['protection']>['ranges']> = [];
+  eachChild(sc, () => {
+    if (sc.local !== 'protectedRange' || ranges.length >= MAX_PROTECTED_RANGES) return sc.skip();
+    const range: (typeof ranges)[number] = { attrs: plainAttrs(sc) };
+    eachChild(sc, () => {
+      if (sc.local !== 'securityDescriptor') return sc.skip();
+      const text = sc.readText();
+      if (!range.descriptors) range.descriptors = [];
+      if (range.descriptors.length < 64) range.descriptors.push(text);
+    });
+    ranges.push(range);
+  });
+  if (ranges.length === 0) return;
+  const protection = sheet.protection || (sheet.protection = {});
+  if (!protection.ranges) protection.ranges = ranges;
+}
+
 function parseSheetPr(sc: XmlScanner, sheet: Sheet): void {
+  // What the element says beside the colour of the tab and the page: the code name, how the sheet is published, ...
+  for (const [name] of sc.attrs()) if (name !== 'filterMode' && name.slice(0, 5) !== 'xmlns') unmodelled(sheet, name);
   if (sc.selfClosing) return;
   while (sc.next()) {
     if (sc.kind === 'close') break;
     if (sc.kind !== 'open') continue;
+    if (sc.local !== 'tabColor' && sc.local !== 'pageSetUpPr') unmodelled(sheet, sc.local);
     if (sc.local === 'tabColor') {
       const color = parseColor(sc);
       if (color) sheet.tabColor = color;
@@ -1145,12 +1185,16 @@ function eachChild(sc: XmlScanner, visit: () => void): void {
 }
 
 /** With the worksheet's <extLst> open tag current: reads the conditional formats and the validations of the 2010 extension. */
-function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[], validations: DataValidation[]): void {
+function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[], validations: DataValidation[], sheet: Sheet): void {
   eachChild(sc, () => {
     if (sc.local !== 'ext') return sc.skip();
     eachChild(sc, () => {
       if (sc.local === 'dataValidations') return parseDataValidations(sc, validations, true);
-      if (sc.local !== 'conditionalFormattings') return sc.skip();
+      if (sc.local !== 'conditionalFormattings') {
+        // Sparklines, slicers, ...: kept in the source part.
+        unmodelled(sheet, sc.local);
+        return sc.skip();
+      }
       eachChild(sc, () => {
         if (sc.local === 'conditionalFormatting') extended.push(parseConditionalFormatting(sc, true));
         else sc.skip();
@@ -1236,6 +1280,8 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           if (colWidth !== undefined && colWidth >= 0) sheet.defaultColWidth = colWidth;
           const baseWidth = parseFinite(sc.attr('baseColWidth'));
           if (baseWidth !== undefined && baseWidth >= 0) sheet.baseColWidth = baseWidth;
+          // How deep the rows and columns are grouped is not in the model.
+          if (/^[1-9]/.test(sc.attr('outlineLevelRow') || '') || /^[1-9]/.test(sc.attr('outlineLevelCol') || '')) unmodelled(sheet, 'outlineLevels');
           sc.skip();
           break;
         }
@@ -1266,7 +1312,7 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           parseDataValidations(sc, validations, false);
           break;
         case 'extLst':
-          parseSheetExtensions(sc, extended, validations);
+          parseSheetExtensions(sc, extended, validations, sheet);
           break;
         case 'pageMargins':
           if (!pageSetupOf(sheet).margins) pageSetupOf(sheet).margins = parsePageMargins(sc);
@@ -1297,8 +1343,28 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           }
           break;
         }
+        case 'sheetProtection': {
+          const protection = sheet.protection || (sheet.protection = {});
+          if (!protection.attrs) protection.attrs = plainAttrs(sc);
+          sc.skip();
+          break;
+        }
+        case 'protectedRanges':
+          parseProtectedRanges(sc, sheet);
+          break;
+        case 'drawing':
+        case 'legacyDrawing':
+        case 'legacyDrawingHF':
+        case 'tableParts':
+        case 'picture':
+        case 'oleObjects':
+        case 'controls':
+          // What these lead to is in parts of its own, and is known by them (Sheet.anchored, the drawings, the comments).
+          sc.skip();
+          break;
         default:
-          // Drawings, protection, ...: kept in the source part.
+          // Kept in the source part; its name is noted for what a copy of the sheet has to say.
+          unmodelled(sheet, sc.local);
           sc.skip();
       }
     }

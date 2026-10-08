@@ -29,6 +29,7 @@ import {
   type CellFormula,
   type Color,
   type ColumnRange,
+  type DrawingAnchor,
   type Fill,
   type FilterColumn,
   type Font,
@@ -47,9 +48,11 @@ import { cellDisplayText } from '../../format/cell-format';
 import type { OpcPackage } from '../../opc';
 import { localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
-import { commentCellNow } from '../../render/sheet-drawings';
+import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../../render/sheet-drawings';
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
+import { parseColor } from './styles';
+import { freshSheetParts } from './build';
 
 const encoder = new TextEncoder();
 
@@ -1298,6 +1301,8 @@ interface SheetRewrite {
   rename?: SheetRenames;
   /** What <sheetView tabSelected> has to say; undefined leaves it as it is. */
   tabSelected?: boolean;
+  /** The windows of the workbook (by workbookViewId) whose views `tabSelected` is for; all of them without it. */
+  tabWindows?: Set<number>;
   /**
    * The source is the skeleton of a sheet that is not in the file: everything the model
    * holds is written from it, whatever was marked as changed.
@@ -1327,6 +1332,7 @@ interface ChildState {
   filterMode: boolean | undefined;
   /** What <sheetView tabSelected> has to say; undefined leaves it as it is. */
   tabSelected: boolean | undefined;
+  tabWindows: Set<number> | undefined;
   /** Every row is written from the model. */
   full: boolean;
 }
@@ -1334,10 +1340,12 @@ interface ChildState {
 const isTrueAttr = (value: string | undefined) => value === '1' || value === 'true';
 
 /** <sheetViews> with the sheet marked as the selected one, or as not selected; the text itself when it says so already. */
-function selectTab(raw: string, selected: boolean): string {
+function selectTab(raw: string, selected: boolean, windows?: Set<number>): string {
   const root = parseXml(raw).root;
   let changed = false;
   for (const view of childrenOf(root, 'sheetView')) {
+    // Only the views of these windows of the workbook, when some are named.
+    if (windows && !windows.has(Math.max(parseUint(view.attrs.get('workbookViewId')), 0))) continue;
     if (isTrueAttr(view.attrs.get('tabSelected')) === selected) continue;
     if (selected) view.attrs.set('tabSelected', '1');
     else view.attrs.delete('tabSelected');
@@ -1424,7 +1432,7 @@ function writeChild(
   if (local === 'sheetViews' && state.tabSelected !== undefined) {
     // The source has the element: it is brought in line instead of being made.
     regenerated.delete(local);
-    raw = selectTab(source, state.tabSelected);
+    raw = selectTab(source, state.tabSelected, state.tabWindows);
     if (raw !== source) state.changed = true;
   }
 
@@ -1557,7 +1565,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
   }
   // A sheet without views is not the selected one; one that has to be gets a view that says so.
   if (options.tabSelected) regenerated.set('sheetViews', `<${prefix}sheetViews><${prefix}sheetView tabSelected="1" workbookViewId="0"/></${prefix}sheetViews>`);
-  const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode, tabSelected: options.tabSelected, full: fresh };
+  const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode, tabSelected: options.tabSelected, tabWindows: options.tabWindows, full: fresh };
   /** Writes the regenerated elements that belong before the element of rank `rank` and were not in the source. */
   const flush = (rank: number) => {
     if (regenerated.size === 0) return;
@@ -2091,11 +2099,94 @@ function adjustComments(bytes: Uint8Array, edits: SheetStructuralEdit[]): Uint8A
   return changed ? encoder.encode(serializeXml(doc)) : bytes;
 }
 
+/**
+ * What became of the comments of the file once a sort moved notes (SheetComment.from): rows
+ * and columns that were inserted or deleted move every comment alike, a sort moves each one
+ * on its own, so each comment of the file is looked up by the cell the file has it on.
+ */
+interface NoteMoves {
+  /** Cell of the file -> where the comment is now, with the numbers of its box (null: its cell was deleted). Only comments a sort moved. */
+  moved: Map<number, { row: number; col: number; anchor: number[] | undefined } | null>;
+  /** Cells of the file whose comments were not moved by a sort and are still in the model: the edits place them. */
+  known: Set<number>;
+}
+
+/**
+ * A comments part with each comment at the cell it is on now, for a sheet in which a sort moved
+ * notes. A comment a sort moved gets the cell the model has for it; one that is no longer in
+ * the model is removed, and its cell (of the file) is added to `gone`; every other one is moved
+ * by the edits, as adjustComments() does. `seen` holds the cells of the file read so far: a
+ * second comment on a cell is not one of the model and only follows the edits.
+ */
+function placeComments(bytes: Uint8Array, edits: SheetStructuralEdit[], moves: NoteMoves, gone: Set<number>, seen: Set<number>): Uint8Array {
+  const doc = parseXml(bytes);
+  let changed = false;
+  for (const list of childrenNamed(doc.root, 'commentList')) {
+    list.children = list.children.filter((node) => {
+      if (node.type !== 'element' || localName(node.name) !== 'comment') return true;
+      const ref = node.attrs.get('ref');
+      const cell = ref === undefined ? undefined : parseCellRef(ref);
+      if (!cell) return true;
+      const key = cellKey(cell.row, cell.col);
+      const first = !seen.has(key);
+      seen.add(key);
+      let target: { row: number; col: number } | undefined | null;
+      if (first && moves.moved.has(key)) target = moves.moved.get(key);
+      else if (first && !moves.known.has(key)) target = null;
+      else target = moveCell(cell.row, cell.col, edits);
+      if (!target) {
+        if (first) gone.add(key);
+        changed = true;
+        return false;
+      }
+      const next = cellName(target.row, target.col);
+      if (next !== ref) {
+        node.attrs.set('ref', next);
+        changed = true;
+      }
+      return true;
+    });
+  }
+  return changed ? encoder.encode(serializeXml(doc)) : bytes;
+}
+
 interface Note {
   row: number;
   col: number;
   /** Text of <x:Anchor>: left column, offset, top row, offset, right column, offset, bottom row, offset. */
   anchor: string | undefined;
+}
+
+/** What becomes of a comment box of a legacy drawing; undefined takes it out. */
+type PlaceNote = (note: Note) => Note | undefined;
+
+/**
+ * The rule for the boxes of a sheet in which a sort moved notes: the box of a moved note goes
+ * to the cell of its note with the place the model has for it, the box of a note that went
+ * (`gone`, by the cells of the file) goes too, and every other box follows the edits. One box
+ * per cell is the box of the note; a second one follows the edits.
+ */
+function placeNoteBy(edits: SheetStructuralEdit[], moves: NoteMoves, gone: Set<number>): PlaceNote {
+  const seen = new Set<number>();
+  return (note) => {
+    const key = cellKey(note.row, note.col);
+    const first = !seen.has(key);
+    seen.add(key);
+    if (first && moves.moved.has(key)) {
+      const target = moves.moved.get(key);
+      if (!target) return undefined;
+      let anchor = note.anchor;
+      if (anchor !== undefined && target.anchor) {
+        const lead = /^\s*/.exec(anchor) as RegExpExecArray;
+        const trail = /\s*$/.exec(anchor) as RegExpExecArray;
+        const next = lead[0] + target.anchor.join(', ') + trail[0];
+        if (next.replace(/\s/g, '') !== anchor.replace(/\s/g, '')) anchor = next;
+      }
+      return { row: target.row, col: target.col, anchor };
+    }
+    if (first && gone.has(key)) return undefined;
+    return adjustNote(note, edits);
+  };
 }
 
 /** A comment box of the legacy drawing at its new place; undefined when its cell was deleted. */
@@ -2124,7 +2215,7 @@ function adjustNote(note: Note, edits: SheetStructuralEdit[]): Note | undefined 
 }
 
 /** The legacy drawing as a tree. Returns undefined when nothing changed. */
-function adjustVmlTree(doc: XmlDocument, edits: SheetStructuralEdit[]): XmlDocument | undefined {
+function adjustVmlTree(doc: XmlDocument, place: PlaceNote): XmlDocument | undefined {
   let changed = false;
   doc.root.children = doc.root.children.filter((node) => {
     if (node.type !== 'element' || localName(node.name) !== 'shape') return true;
@@ -2137,7 +2228,7 @@ function adjustVmlTree(doc: XmlDocument, edits: SheetStructuralEdit[]): XmlDocum
     const row = parseUint((textOf(rowEl) || '').trim());
     const col = parseUint((textOf(colEl) || '').trim());
     if (!rowEl || !colEl || row < 0 || col < 0 || row >= MAX_ROWS || col >= MAX_COLS) return true;
-    const moved = adjustNote({ row, col, anchor: textOf(anchorEl) }, edits);
+    const moved = place({ row, col, anchor: textOf(anchorEl) });
     if (!moved) {
       changed = true;
       return false;
@@ -2155,7 +2246,7 @@ function adjustVmlTree(doc: XmlDocument, edits: SheetStructuralEdit[]): XmlDocum
  * (VML is older than the rule that it has to be). Only the three elements of
  * a comment box are touched; everything else is copied.
  */
-function adjustVmlText(text: string, edits: SheetStructuralEdit[]): string {
+function adjustVmlText(text: string, place: PlaceNote): string {
   let out = '';
   let copied = 0;
   let i = 0;
@@ -2178,7 +2269,7 @@ function adjustVmlText(text: string, edits: SheetStructuralEdit[]): string {
     const colMatch = /<x:Column>\s*(\d{1,5})\s*<\/x:Column>/.exec(block);
     if (!rowMatch || !colMatch) continue;
     const anchorMatch = /<x:Anchor>([^<]*)<\/x:Anchor>/.exec(block);
-    const moved = adjustNote({ row: Number(rowMatch[1]), col: Number(colMatch[1]), anchor: anchorMatch ? anchorMatch[1] : undefined }, edits);
+    const moved = place({ row: Number(rowMatch[1]), col: Number(colMatch[1]), anchor: anchorMatch ? anchorMatch[1] : undefined });
     let next = '';
     if (moved) {
       next = block.replace(rowMatch[0], `<x:Row>${moved.row}</x:Row>`).replace(colMatch[0], `<x:Column>${moved.col}</x:Column>`);
@@ -2193,6 +2284,11 @@ function adjustVmlText(text: string, edits: SheetStructuralEdit[]): string {
 
 /** A legacy drawing part (the boxes of comments) moved along; the same bytes when nothing moved. */
 function adjustVml(bytes: Uint8Array, edits: SheetStructuralEdit[]): Uint8Array {
+  return placeVml(bytes, (note) => adjustNote(note, edits));
+}
+
+/** A legacy drawing with each comment box where `place` puts it; the same bytes when nothing changed. */
+function placeVml(bytes: Uint8Array, place: PlaceNote): Uint8Array {
   let doc: XmlDocument | undefined;
   try {
     doc = parseXml(bytes);
@@ -2200,12 +2296,21 @@ function adjustVml(bytes: Uint8Array, edits: SheetStructuralEdit[]): Uint8Array 
     doc = undefined;
   }
   if (doc) {
-    const next = adjustVmlTree(doc, edits);
+    const next = adjustVmlTree(doc, place);
     return next ? encoder.encode(serializeXml(next)) : bytes;
   }
   const text = decodeSource(bytes);
-  const next = adjustVmlText(text, edits);
+  const next = adjustVmlText(text, place);
   return next === text ? bytes : encoder.encode(next);
+}
+
+/** Whether a legacy drawing draws nothing: it parses and holds nothing but what a drawing declares. */
+function vmlDrawsNothing(bytes: Uint8Array): boolean {
+  try {
+    return parseXml(bytes).root.children.every((node) => node.type !== 'element' || localName(node.name) === 'shapelayout' || localName(node.name) === 'shapetype');
+  } catch (error) {
+    return false;
+  }
 }
 
 /** Parts of a sheet that follow its rows and columns, by the last segment of their relationship type. */
@@ -2302,6 +2407,17 @@ interface NotePlan {
   kept: Map<number, string | null>;
   /** Notes added since the sheet was read, in the order of the model. */
   added: AddedNote[];
+  /** Set when a sort moved a comment of the file: where the comments of the file are found by the cells the file has them on. */
+  moves?: NoteMoves;
+}
+
+const EMU_PER_PIXEL = 9525;
+
+/** The eight numbers of <x:Anchor> for the box of a note, when the model places it between two cells. */
+function anchorNumbers(box: DrawingAnchor | undefined): number[] | undefined {
+  if (!box || box.kind !== 'twoCell' || !box.from || !box.to) return undefined;
+  const numbers = [box.from.col, Math.round(box.from.colOff / EMU_PER_PIXEL), box.from.row, Math.round(box.from.rowOff / EMU_PER_PIXEL), box.to.col, Math.round(box.to.colOff / EMU_PER_PIXEL), box.to.row, Math.round(box.to.rowOff / EMU_PER_PIXEL)];
+  return numbers.every((n) => n >= 0 && Math.floor(n) === n) ? numbers : undefined;
 }
 
 const cellKey = (row: number, col: number): number => row * MAX_COLS + col;
@@ -2310,17 +2426,27 @@ function notePlanOf(sheet: Sheet): NotePlan {
   const plan: NotePlan = { kept: new Map(), added: [] };
   const seen = new Set<number>();
   const edits = sheet.structuralEdits;
+  const known = new Set<number>();
+  let moved: NoteMoves['moved'] | undefined;
   for (const comment of sheet.comments || []) {
     if (!comment || !(comment.row >= 0 && comment.row < MAX_ROWS && comment.col >= 0 && comment.col < MAX_COLS)) continue;
     const cell = commentCellNow(comment, edits);
+    // A comment of the file that a sort moved is known by the cell the file has it on.
+    const from = comment.since !== undefined ? comment.from : undefined;
+    const ofFile = comment.since === undefined || from !== undefined;
+    if (from) {
+      const box = cell && comment.box ? anchorNumbers(adjustDrawingAnchor(comment.box, commentEdits(comment, edits))) : undefined;
+      (moved || (moved = new Map())).set(cellKey(from.row, from.col), cell ? { row: cell.row, col: cell.col, anchor: box } : null);
+    } else if (ofFile) known.add(cellKey(comment.row, comment.col));
     if (!cell) continue;
     const key = cellKey(cell.row, cell.col);
     // As where comments are shown: the first one of a cell is the one that counts.
     if (seen.has(key)) continue;
     seen.add(key);
-    if (comment.since === undefined) plan.kept.set(key, comment.threaded ? null : String(comment.text));
+    if (ofFile) plan.kept.set(key, comment.threaded ? null : String(comment.text));
     else plan.added.push({ row: cell.row, col: cell.col, text: String(comment.text), author: comment.author || '' });
   }
+  if (moved) plan.moves = { moved, known };
   return plan;
 }
 
@@ -2456,6 +2582,45 @@ function setLegacyDrawing(original: Uint8Array, id: string | null, sheetName: st
   const behind = root.children.find((child) => worksheetRank(s, child.start, child.local) > rank);
   const at = behind ? behind.start : root.closeStart;
   return spliceExact(original, [{ start: at, end: at, text }]);
+}
+
+const sameColor = (a: Color | undefined, b: Color | undefined): boolean =>
+  (!a && !b) || (!!a && !!b && (a.rgb === undefined ? undefined : a.rgb.toUpperCase()) === (b.rgb === undefined ? undefined : b.rgb.toUpperCase()) && a.theme === b.theme && a.indexed === b.indexed && a.tint === b.tint && a.auto === b.auto);
+
+/**
+ * A sheet part with nothing changed but the colour of its tab (<tabColor> in <sheetPr>):
+ * every other byte stays, the other attributes and children of <sheetPr> included. Undefined
+ * when the part says what the model says already, so that a colour of the file (by theme, by
+ * index, with a tint) is only written anew once it is another one.
+ */
+function setTabColorIn(original: Uint8Array, color: Color | undefined, sheetName: string): Uint8Array | undefined {
+  const s = decodeSource(original);
+  const root = rawElement(s);
+  const rootLocal = localName(root.name);
+  if (rootLocal !== 'worksheet' && rootLocal !== 'dialogsheet' && rootLocal !== 'macrosheet') {
+    throw new Error(`Cannot write sheet "${sheetName}": its part has the root element <${root.name}>, not a worksheet`);
+  }
+  const prefix = root.name.slice(0, root.name.length - rootLocal.length);
+  const text = color ? `<${prefix}tabColor${colorAttrs(color)}/>` : '';
+  const properties = root.children.find((child) => child.local === 'sheetPr');
+  if (!properties) {
+    if (!color) return undefined;
+    // A root without content gets its first child, and an end tag with it.
+    if (root.selfClosing) return spliceExact(original, [appendInside(root, 0, `<${prefix}sheetPr>${text}</${prefix}sheetPr>`)]);
+    // <sheetPr> is the first child of a worksheet.
+    return spliceExact(original, [{ start: root.openEnd, end: root.openEnd, text: `<${prefix}sheetPr>${text}</${prefix}sheetPr>` }]);
+  }
+  const raw = s.slice(properties.start, properties.end);
+  const element = rawElement(raw);
+  const present = element.children.find((child) => child.local === 'tabColor');
+  if (present) {
+    if (sameColor(parseColor(parseXml(raw.slice(present.start, present.end)).root), color)) return undefined;
+    return spliceExact(original, [{ start: properties.start + present.start, end: properties.start + present.end, text }]);
+  }
+  if (!color) return undefined;
+  // <tabColor> is the first child of <sheetPr>.
+  if (element.selfClosing) return spliceExact(original, [appendInside(element, properties.start, text)]);
+  return spliceExact(original, [{ start: properties.start + element.openEnd, end: properties.start + element.openEnd, text }]);
 }
 
 /** The comments read so far of a sheet, over all of its comment parts: what the reader took as the comments of the sheet. */
@@ -2829,6 +2994,8 @@ interface BookChange {
   file: FileSheet[];
   /** Sheets have other names than in the file. */
   renamed: boolean;
+  /** Sheets of the file are shown that the file hides, or the other way round. */
+  restated: boolean;
   /** The sheets are not the ones of the file, one for one (a sheet was added or deleted): whatever counts sheets is brought up to date. */
   reordered: boolean;
   /** The relationship made for each sheet that is not in the file. */
@@ -2841,9 +3008,21 @@ interface BookChange {
   activeMoved: boolean;
   /** Stored results may be stale: the application is asked to calculate when it opens the file. */
   recalculate: boolean;
+  /**
+   * Windows of the workbook (by their place among the <workbookView> elements) that open on a
+   * sheet which is hidden now: each opens on the active sheet instead. Only where the sheets are
+   * those of the file in its order.
+   */
+  hiddenWindows?: Set<number>;
 }
 
 const MAX_SHEET_ID = 65534;
+
+/** Whether the file shows a sheet, as the reader takes <sheet state>. */
+function fileStateOf(el: XmlElement): string {
+  const state = el.attrs.get('state');
+  return state === 'hidden' || state === 'veryHidden' ? state : 'visible';
+}
 
 /**
  * Brings <sheets> in line with the model: the elements of the file in the order of the model,
@@ -2876,6 +3055,10 @@ function updateSheetList(root: XmlElement, workbook: Workbook, change: BookChang
     const el = kept[index];
     if (el) {
       if (el.attrs.get('name') !== sheet.name) el.attrs.set('name', sheet.name);
+      if (fileStateOf(el) !== sheet.state) {
+        if (sheet.state === 'visible') el.attrs.delete('state');
+        else el.attrs.set('state', sheet.state);
+      }
       ids.push(parseUint(el.attrs.get('sheetId')));
       return el;
     }
@@ -2972,12 +3155,28 @@ const SCOPE_UNKNOWN = -2;
 function updateWorkbookXml(doc: XmlDocument, workbook: Workbook, change: BookChange): void {
   const root = doc.root;
   const prefix = prefixOf(root);
-  if (change.renamed || change.reordered) {
+  if (change.renamed || change.reordered || change.restated) {
     const sheetIds = updateSheetList(root, workbook, change);
     if (change.reordered) updateBookViews(root, workbook, change, sheetIds);
   }
   // The same sheets, another one shown: no custom view has lost its sheet, so none is looked at.
   if (change.activeMoved) updateBookViews(root, workbook, change, []);
+  if (change.restated && !change.reordered) {
+    // No window opens on a sheet that is hidden now, and none has one as the first tab it shows.
+    const views = childNamed(root, 'bookViews');
+    const sheets = workbook.sheets;
+    let firstVisible = 0;
+    while (firstVisible < sheets.length - 1 && sheets[firstVisible].state !== 'visible') firstVisible++;
+    (views ? childrenNamed(views, 'workbookView') : []).forEach((view, index) => {
+      if (change.hiddenWindows && change.hiddenWindows.has(index)) {
+        if (change.active === 0) view.attrs.delete('activeTab');
+        else view.attrs.set('activeTab', String(change.active));
+      }
+      const first = view.attrs.get('firstSheet');
+      const at = first === undefined ? -1 : parseUint(first);
+      if (at >= 0 && at < sheets.length && sheets[at].state !== 'visible' && String(firstVisible) !== first) view.attrs.set('firstSheet', String(firstVisible));
+    });
+  }
 
   // localSheetId counts the sheets of the file; the model counts its own. A name is found by
   // the sheet it belongs to: the id of the file, the part of that sheet, the index it has now.
@@ -3007,9 +3206,11 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook, change: BookCha
     // A name of a sheet the file does not have (a damaged id) is known by its name alone.
     if (!target && name.localSheet !== undefined) target = elements.find((el) => !used.has(el) && scopes.get(el) === SCOPE_UNKNOWN && (el.attrs.get('name') || '') === name.name);
     if (!target) {
-      // The only name the model adds is the range of a filter that was switched on; any other
-      // name that is not in the file is a mistake of the caller.
-      if (!isFilterName(name.name)) throw new Error(`Cannot write the workbook: the defined name "${name.name}" is not in the file`);
+      // The names the model adds are the range of a filter that was switched on and the names of a sheet
+      // that is not in the file (a copy brings the names of its sheet); any other name that is not in the
+      // file is a mistake of the caller.
+      const ofNewSheet = name.localSheet !== undefined && !!workbook.sheets[name.localSheet] && workbook.sheets[name.localSheet].part === '';
+      if (!isFilterName(name.name) && !ofNewSheet) throw new Error(`Cannot write the workbook: the defined name "${name.name}" is not in the file`);
       const attrs: Attrs = [['name', name.name]];
       if (name.localSheet !== undefined) attrs.push(['localSheetId', String(name.localSheet)]);
       if (name.hidden) attrs.push(['hidden', '1']);
@@ -3320,6 +3521,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   // What became of the sheets of the file. A sheet is known by its part, which never changes.
   let reordered = false;
   let renamed = false;
+  let restated = false;
   const present = new Set<string>();
   if (sheetsModified) {
     reordered = workbook.sheets.length !== file.length;
@@ -3333,6 +3535,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       present.add(sheet.part);
       if (!file[index] || file[index].part !== sheet.part) reordered = true;
       if (inFile.name !== sheet.name) renamed = true;
+      if (fileStateOf(inFile.element) !== sheet.state) restated = true;
     });
   }
   const gone = sheetsModified ? file.filter((sheet) => sheet.part !== '' && !present.has(sheet.part)) : [];
@@ -3458,6 +3661,11 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     // The comments: what the file has, moved along with the rows and columns, then brought in line with the model.
     const scan: CommentsScan = { seen: new Set(), known: 0 };
     const removedCells = new Set<number>();
+    // Once a sort moved notes, each comment of the file is placed on its own (see NoteMoves), and the parts
+    // are written by this save whatever they come out as: the edits alone would put the comments elsewhere.
+    const moves = plan.moves;
+    const goneFile = new Set<number>();
+    const seenFile = new Set<number>();
     let changed = false;
     let first = true;
     for (const rel of rels) {
@@ -3465,10 +3673,10 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       const part = actualOf(resolveTarget(sheetPart, rel.attrs.get('Target') || ''));
       const original = await peek(part);
       if (!original) continue;
-      const staged = edits ? adjustComments(original, edits) : original;
+      const staged = moves ? placeComments(original, edits || [], moves, goneFile, seenFile) : edits ? adjustComments(original, edits) : original;
       const edit = editComments(staged, plan, first ? plan.added : [], scan, removedCells);
       first = false;
-      if (!edit.changed) continue;
+      if (!edit.changed && !moves) continue;
       changed = true;
       if (edit.left === 0) {
         out.parts.set(part, null);
@@ -3491,12 +3699,12 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const vmlPart = vmlRel ? actualOf(resolveTarget(sheetPart, vmlRel.attrs.get('Target') || '')) : undefined;
     const vmlBytes = vmlPart === undefined ? undefined : await peek(vmlPart);
     if (vmlPart !== undefined && vmlBytes && vmlRel) {
-      if (removedCells.size > 0 || plan.added.length > 0) {
-        const staged = edits ? adjustVml(vmlBytes, edits) : vmlBytes;
+      if (removedCells.size > 0 || plan.added.length > 0 || moves) {
+        const staged = moves ? placeVml(vmlBytes, placeNoteBy(edits || [], moves, goneFile)) : edits ? adjustVml(vmlBytes, edits) : vmlBytes;
         const edit = editVml(staged, removedCells, plan.added, await useBlocks());
-        if (edit.changed) {
+        if (edit.changed || moves) {
           changed = true;
-          if (edit.empty) {
+          if (edit.changed ? edit.empty : staged !== vmlBytes && vmlDrawsNothing(staged)) {
             out.parts.set(vmlPart, null);
             out.unrelate.add(vmlRel.attrs.get('Id') || '');
             out.legacy = null;
@@ -3574,11 +3782,34 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   // every window has to be brought in line anyway, and all of them open on the active sheet.)
   // And only when the sheet that would be written is another one than the file has: a hidden
   // sheet as the active one of the model stands for the first visible one.
-  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed || fileNotes.size > 0;
+  // The colours of tabs: a sheet whose part says what the model says is not written for it.
+  // A colour that is the one the sheet came with again (undone, or set back) costs nothing: the part is not
+  // even read. Any other is put into the part here, once.
+  const tabbed = new Map<Sheet, Uint8Array>();
+  for (const sheet of workbook.sheets) {
+    if (!sheet.tabColorModified || sheet.kind !== 'worksheet' || sheet.part === '') continue;
+    if (sheet.tabColorRead && sameColor(sheet.tabColorRead.color, sheet.tabColor)) continue;
+    const bytes = await originalOf(sheet.part);
+    const coloured = bytes ? setTabColorIn(bytes, sheet.tabColor, sheet.name) : undefined;
+    if (coloured) tabbed.set(sheet, coloured);
+  }
+
+  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed || restated || fileNotes.size > 0 || tabbed.size > 0;
   const fileActive = fileActiveOf(book.root, file.length);
   const bookViews = childNamed(book.root, 'bookViews');
   const windows = bookViews ? childrenNamed(bookViews, 'workbookView').length : 0;
   const activeMoved = edited && !reordered && windows <= 1 && modelActiveOf(workbook) !== fileActive && active !== fileActive;
+  // A file with several windows keeps the sheet of each - but not a sheet that was hidden since: such a
+  // window opens on the active sheet of the model (the first visible one when that is hidden itself).
+  let hiddenWindows: Set<number> | undefined;
+  if (restated && !reordered && windows > 1 && bookViews) {
+    childrenNamed(bookViews, 'workbookView').forEach((view, index) => {
+      const stated = view.attrs.get('activeTab') || '';
+      const at = /^\d{1,6}$/.test(stated) && Number(stated) < file.length ? Number(stated) : 0;
+      const sheet = workbook.sheets[at];
+      if (sheet && sheet.state !== 'visible' && fileStateOf(file[at].element) === 'visible') (hiddenWindows || (hiddenWindows = new Set())).add(index);
+    });
+  }
 
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
@@ -3636,9 +3867,20 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     // every sheet is looked at, and written when one of its views says something else.
     let tabSelected = (reordered || activeMoved) && !!sheet.view.tabSelected !== (index === active) ? index === active : undefined;
     if (reordered && windows > 1) tabSelected = index === active;
+    // Windows that showed a sheet which is hidden now: that sheet is the selected one of no window, and
+    // the active sheet is the selected one of those windows.
+    let tabWindows: Set<number> | undefined;
+    if (hiddenWindows) {
+      if (sheet.state !== 'visible') tabSelected = false;
+      else if (index === active) {
+        tabSelected = true;
+        tabWindows = hiddenWindows;
+      }
+    }
     // Notes that were added, edited or deleted: the comment parts of the sheet follow the model.
     const notes = fileNotes.get(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes) continue;
+    const tab = tabbed.has(sheet);
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
@@ -3680,8 +3922,10 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       // Only the notes of the sheet changed: every byte of the part stays but the element that names their boxes.
       if (bytes && legacyDrawing !== undefined && foreign.length === 0 && !rename && tabSelected === undefined) next = setLegacyDrawing(bytes, legacyDrawing, sheet.name);
       else if (bytes && (foreign.length > 0 || rename || tabSelected !== undefined || legacyDrawing !== undefined)) {
-        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, legacyDrawing });
+        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing });
       }
+      // The colour of the tab, in the part as it is by now.
+      if (bytes && tab) next = next ? setTabColorIn(next, sheet.tabColor, sheet.name) || next : tabbed.get(sheet);
       if (bytes && next) {
         // From here on the package no longer holds the part as the file had it.
         keep(sheet.part, bytes);
@@ -3691,7 +3935,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     } else {
       const bytes = await originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
-      writes.push([sheet.part, rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, legacyDrawing }) as Uint8Array]);
+      const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing }) as Uint8Array;
+      writes.push([sheet.part, (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written]);
       rewritten.push(sheet.part);
     }
 
@@ -3807,9 +4052,12 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     }
     // The notes of the sheet: all of them were added, and so are the parts that hold them.
     const notes = sheet.comments && sheet.comments.length > 0 ? await notesOf(sheet, part, undefined, undefined, undefined) : undefined;
+    // What the model holds of the sheet beside its cells (a copy of a sheet has all of it): the colour of its
+    // tab, how it is shown and printed, its default sizes. An empty new sheet has none of these.
+    const around = freshSheetParts(sheet, index === active);
     const skeleton =
       `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="${escapeAttr(mainNamespace)}" xmlns:r="${escapeAttr(relBase)}">` +
-      `<dimension ref="A1"/><sheetViews><sheetView${index === active ? ' tabSelected="1"' : ''} workbookViewId="0"/></sheetViews><sheetData/></worksheet>`;
+      `${around.properties}<dimension ref="A1"/><sheetViews>${around.view}</sheetViews>${around.format}<sheetData/>${around.protection}${around.page}</worksheet>`;
     // A link to another file belongs to the relationships of the sheet it was made in; only places in the workbook are written.
     const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
     const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined }) as Uint8Array;
@@ -3939,8 +4187,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   }
 
   const bookParts: string[] = [];
-  if (recalculate || renamed || activeMoved) {
-    updateWorkbookXml(book, workbook, { file, renamed, reordered, relIds, relNamespace: relBase, active, activeMoved, recalculate });
+  if (recalculate || renamed || activeMoved || restated) {
+    updateWorkbookXml(book, workbook, { file, renamed, restated, reordered, relIds, relNamespace: relBase, active, activeMoved, recalculate, hiddenWindows });
     writes.push([main, book]);
     bookParts.push(main);
     if (reordered || renamed) {

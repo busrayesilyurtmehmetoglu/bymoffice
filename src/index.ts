@@ -50,9 +50,29 @@ export { calcError, isError, type CalcError, type ErrorCode, type Scalar, type V
 export { writeXlsx } from './formats/xlsx/write';
 export { buildXlsx, type BuildXlsxOptions, type XlsxBuildReport } from './formats/xlsx/build';
 export { History, applyOp, ensureCellFormat, ensureNumberFormat, type CellChange, type Op, type SheetsSnapshot } from './ops/ops';
-export { canDeleteSheet, canInsertSheet, canRenameSheet, defaultSheetName, deleteSheet, insertSheet, renameSheet, type InsertSheetOptions } from './ops/sheets';
-export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
-export { clearRange, copyRange, editTextAt, pasteAt, setCellInput, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
+export {
+  canCopySheet,
+  canDeleteSheet,
+  canHideSheet,
+  canInsertSheet,
+  canMoveSheet,
+  canRenameSheet,
+  copySheet,
+  copySheetLosses,
+  copySheetName,
+  defaultSheetName,
+  deleteSheet,
+  insertSheet,
+  moveSheet,
+  renameSheet,
+  setSheetState,
+  setTabColor,
+  type CopySheetLoss,
+  type CopySheetOptions,
+  type InsertSheetOptions,
+} from './ops/sheets';
+export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
+export { clearRange, copyRange, cutRange, editTextAt, pasteAt, setCellInput, type CopiedNote, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
 export { MAX_FILTER_VALUES, clearFilter, filterSummary, filterValues, setAutoFilter, setFilterColumn, type FilterCriterion, type FilterValue, type FilterValueList } from './ops/filter';
 export { collationKey, currentRegion, sortRange, type SortKey, type SortOptions } from './ops/sort';
 export { parseCellInput, cellEditText, type ParsedInput, type InputOptions } from './edit/input';

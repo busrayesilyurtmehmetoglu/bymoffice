@@ -7,7 +7,7 @@
 // operation keep the previous state for undo by reference, without copying it.
 
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
-import { hasLiveComments } from './notes';
+import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
 import {
   FILTER_NAME,
   MAX_COLS,
@@ -23,14 +23,17 @@ import {
   type Cell,
   type CellFormat,
   type CellRange,
+  type Color,
   type ColumnRange,
   type DefinedName,
+  type DrawingAnchor,
   type Hyperlink,
   type Row,
   type Sheet,
   type SheetComment,
   type SheetNameMap,
   type SheetNeighbours,
+  type SheetState,
   type SheetStructuralEdit,
   type StyleSheet,
   type Workbook,
@@ -54,6 +57,8 @@ export interface SheetSnapshot {
   colCount: number;
   structuralEdits: SheetStructuralEdit[] | undefined;
   autoFilter?: AutoFilter;
+  /** The comments, when the operation moved notes (a sort): the list to put back. Missing when it left them alone. */
+  comments?: { list: SheetComment[] | undefined };
 }
 
 /**
@@ -65,6 +70,8 @@ export interface SheetsSnapshot {
   sheets: Sheet[];
   /** The name of a sheet (and the name the file has for it) to put back. */
   renamed?: { sheet: Sheet; name: string; nameInFile: string | undefined };
+  /** Whether a sheet is shown, to put back. */
+  shown?: { sheet: Sheet; state: SheetState };
   /** Cells whose formulas named a sheet, as they were. Shared formulas stay shared. */
   cells: { sheet: Sheet; cells: CellChange[] }[];
   /** Links that pointed into a sheet, as they were. */
@@ -171,7 +178,44 @@ export type Op =
     }
   | {
       /**
-       * Puts the list of sheets back the way a snapshot recorded it; the inverse of the three
+       * Moves a sheet so that it becomes sheet number `to`. The active sheet and the sheets that
+       * defined names are local to follow their sheets. No formula changes: a 3D reference
+       * ("Sheet1:Sheet3!A1") is the text it was and reads the sheets that stand between its ends
+       * now, as in Excel (this engine calculates no 3D reference).
+       */
+      type: 'moveSheet';
+      sheet: number;
+      to: number;
+    }
+  | {
+      /**
+       * Shows or hides a sheet. Refused for the last visible sheet; when the active sheet is
+       * hidden, another visible one becomes the active one.
+       */
+      type: 'setSheetState';
+      sheet: number;
+      state: SheetState;
+    }
+  | {
+      /**
+       * Adds `copy` (a sheet that is in no file: see copySheet() in sheets.ts, which makes it)
+       * so that it becomes sheet number `sheet`, with the defined names that are local to it
+       * (`names`, whose `localSheet` is set here). Otherwise like "insertSheet".
+       */
+      type: 'copySheet';
+      sheet: number;
+      copy: Sheet;
+      names: DefinedName[];
+    }
+  | {
+      /** Sets the colour of the tab of a sheet; undefined removes it. Its own inverse. */
+      type: 'setTabColor';
+      sheet: number;
+      color: Color | undefined;
+    }
+  | {
+      /**
+       * Puts the list of sheets back the way a snapshot recorded it; the inverse of the
        * operations on sheets, and its own inverse. `sheet` is the index the operation it undoes
        * was about (where a sheet comes back, goes away or changes its name).
        */
@@ -301,6 +345,11 @@ function restoreSnapshot(sheet: Sheet, snapshot: SheetSnapshot): void {
   sheet.structuralEdits = snapshot.structuralEdits;
   if (snapshot.autoFilter) sheet.autoFilter = snapshot.autoFilter;
   else delete sheet.autoFilter;
+  if (snapshot.comments) {
+    if (snapshot.comments.list && snapshot.comments.list.length > 0) sheet.comments = snapshot.comments.list;
+    else delete sheet.comments;
+    sheet.commentsModified = true;
+  }
 }
 
 export type SharedMasters = Map<number, { text: string; row: number; col: number }>;
@@ -713,6 +762,19 @@ export function shiftUnqualified(text: string, dRow: number): string {
   return start === 0 ? shiftFormula(text, dRow, 0) : out + shiftFormula(text.slice(start), dRow, 0);
 }
 
+/** The box of a note moved by rows with its cell; it stays on the sheet, as tall as it was where it can. */
+function shiftAnchorRows(anchor: DrawingAnchor, by: number): DrawingAnchor {
+  const from = anchor.from;
+  if (by === 0 || anchor.kind === 'absolute' || !from) return anchor;
+  const to = anchor.kind === 'twoCell' ? anchor.to : undefined;
+  // Not above the first row, and not below the last one.
+  let delta = Math.max(by, -from.row);
+  delta = Math.min(delta, MAX_ROWS - 1 - (to ? Math.max(to.row, from.row) : from.row));
+  const moved: DrawingAnchor = { ...anchor, from: { ...from, row: from.row + delta } };
+  if (to) moved.to = { ...to, row: to.row + delta };
+  return moved;
+}
+
 /** Moves the cells of rows within a range (see the operation "sortRange"). */
 function sortRows(workbook: Workbook, index: number, range: CellRange, order: number[]): Op {
   const sheet = sheetAt(workbook, index);
@@ -737,14 +799,30 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
 
   // What is placed by cell position in other parts would stay behind while its cell moves.
   let stuck = (sheet.anchored || []).filter((part) => SORT_BLOCKERS.indexOf(part) >= 0);
-  // Comments are in the way while there is one on a cell: those of the file, and notes added since, which
-  // are in no part yet. Once none is left (deleted, or gone with their rows) nothing would stay behind -
-  // unless the file has comments the reader could not show, which the model cannot know to be gone.
+  // Notes go with their rows (see below). Comments are in the way only where the model does not hold all
+  // of them, or cannot change them: the file has comments the reader could not show (a second one on a
+  // cell, one too many), or its comment parts are not the sheet's alone.
   const unread = (sheet.warnings || []).some((warning) => /comment/i.test(warning));
-  const comments = hasLiveComments(sheet) || (stuck.indexOf('comments') >= 0 && (unread || sheet.notesBlocked !== undefined));
+  const comments = stuck.indexOf('comments') >= 0 && (unread || sheet.notesBlocked !== undefined);
   stuck = stuck.filter((part) => part !== 'comments');
   if (comments) stuck.unshift('comments');
   if (stuck.length > 0) throw new RangeError(`Cannot sort in a sheet with ${stuck.join(', ')}: not supported yet`);
+  // The notes of the rows that move, each with the cell it is on now. A conversation is kept in parts
+  // that are written back as they are, by cell: it cannot follow its row, so its range is not sorted.
+  const edits = sheet.structuralEdits;
+  const editCount = edits ? edits.length : 0;
+  let movedNotes: Map<number, { row: number; col: number }> | undefined;
+  const sheetComments = sheet.comments;
+  if (sheetComments) {
+    for (let i = 0; i < sheetComments.length; i++) {
+      const comment = sheetComments[i];
+      if (!comment || !(comment.row >= 0 && comment.row < MAX_ROWS && comment.col >= 0 && comment.col < MAX_COLS)) continue;
+      const cell = commentCellNow(comment, edits);
+      if (!cell || cell.row < range.top || cell.row > range.bottom || cell.col < range.left || cell.col > range.right) continue;
+      if (comment.threaded) throw new RangeError('Cannot sort a range that contains threaded comments');
+      if (target[cell.row - range.top] !== cell.row - range.top) (movedNotes || (movedNotes = new Map())).set(i, cell);
+    }
+  }
   // Like Excel: merged cells cannot be told apart from their rows.
   for (const merge of sheet.merges) if (intersects(merge, range)) throw new RangeError('Cannot sort a range that contains merged cells');
   // An array formula covers its range as one unit; one that fills a single cell moves with it.
@@ -845,6 +923,23 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
   if (links) {
     sheet.hyperlinks = links;
     sheet.hyperlinksModified = true;
+  }
+  // A note goes where its cell goes. It is held from now on like a note that was put on that cell (see
+  // SheetComment.since); a comment of the file remembers the cell the file has it on (SheetComment.from).
+  if (movedNotes && sheetComments) {
+    snapshot.comments = { list: sheetComments };
+    const next = sheetComments.slice();
+    for (const [i, cell] of movedNotes) {
+      const comment = sheetComments[i];
+      const row = range.top + target[cell.row - range.top];
+      const placed: SheetComment = { ...comment, row, col: cell.col, since: editCount };
+      if (comment.since === undefined && comment.from === undefined) placed.from = { row: comment.row, col: comment.col };
+      if (comment.box) placed.box = shiftAnchorRows(adjustDrawingAnchor(comment.box, commentEdits(comment, edits)), row - cell.row);
+      next[i] = placed;
+    }
+    sheet.comments = next;
+    sheet.commentsModified = true;
+    weight += movedNotes.size;
   }
   sheet.modified = true;
   return { type: 'restore', sheet: index, snapshot, others: [], definedNames: workbook.definedNames, weight };
@@ -1134,8 +1229,118 @@ function insertSheetOp(workbook: Workbook, at: number, name: string): Op {
   return { type: 'restoreSheets', sheet: at, state: undo };
 }
 
+/** Why a sheet cannot be moved to an index; undefined when it can. */
+export function moveSheetProblem(workbook: Workbook, from: number, to: number): string | undefined {
+  if (!workbook.sheets[from]) return `No sheet at index ${from}`;
+  if (!(to >= 0 && to < workbook.sheets.length) || Math.floor(to) !== to) return `Cannot move a sheet to index ${to}`;
+  return sheetNameClash(workbook);
+}
+
+/** Why a sheet cannot be given a state; undefined when it can. */
+export function sheetStateProblem(workbook: Workbook, index: number, state: SheetState): string | undefined {
+  const sheet = workbook.sheets[index];
+  if (!sheet) return `No sheet at index ${index}`;
+  if (state !== 'visible' && state !== 'hidden' && state !== 'veryHidden') return 'A sheet is visible, hidden or veryHidden';
+  const clash = sheetNameClash(workbook);
+  if (clash) return clash;
+  if (state !== 'visible' && sheet.state === 'visible' && !workbook.sheets.some((other) => other !== sheet && other.state === 'visible')) return 'Cannot hide the last visible sheet';
+  return undefined;
+}
+
+/** Why a sheet cannot be copied (under `name`, when one is given, to `at`); undefined when it can. */
+export function copySheetProblem(workbook: Workbook, index: number, at?: number, name?: string): string | undefined {
+  const sheet = workbook.sheets[index];
+  if (!sheet) return `No sheet at index ${index}`;
+  if (sheet.kind !== 'worksheet') return `Cannot copy a ${sheet.kind}: not supported yet`;
+  if (at !== undefined && (!(at >= 0 && at <= workbook.sheets.length) || Math.floor(at) !== at)) return `Cannot insert a sheet at index ${at}`;
+  const clash = sheetNameClash(workbook);
+  if (clash) return clash;
+  return name === undefined ? undefined : sheetNameProblem(workbook, name);
+}
+
+/** Why the tab of a sheet cannot be coloured; undefined when it can. */
+export function tabColorProblem(workbook: Workbook, index: number): string | undefined {
+  const sheet = workbook.sheets[index];
+  if (!sheet) return `No sheet at index ${index}`;
+  if (sheet.kind !== 'worksheet') return `Cannot colour the tab of a ${sheet.kind}: not supported yet`;
+  return sheetNameClash(workbook);
+}
+
+/** The defined names with the sheets they are local to looked up again after the list of sheets changed. */
+function rescopeNames(workbook: Workbook, before: Sheet[]): void {
+  const after = workbook.sheets;
+  let names: DefinedName[] | undefined;
+  workbook.definedNames.forEach((name, i) => {
+    if (name.localSheet === undefined) return;
+    const sheet = before[name.localSheet];
+    const now = sheet ? after.indexOf(sheet) : -1;
+    if (now < 0 || now === name.localSheet) return;
+    if (!names) names = workbook.definedNames.slice();
+    names[i] = { ...name, localSheet: now };
+  });
+  if (names) workbook.definedNames = names;
+}
+
+function moveSheetOp(workbook: Workbook, from: number, to: number): Op {
+  const problem = moveSheetProblem(workbook, from, to);
+  if (problem) throw new RangeError(problem);
+  const undo = sheetsSnapshot(workbook);
+  const before = workbook.sheets;
+  const active = before[workbook.activeSheet];
+  const sheets = before.slice();
+  const moved = sheets.splice(from, 1)[0];
+  sheets.splice(to, 0, moved);
+  workbook.sheets = sheets;
+  rescopeNames(workbook, before);
+  if (active) workbook.activeSheet = sheets.indexOf(active);
+  workbook.sheetsModified = true;
+  return { type: 'restoreSheets', sheet: from, state: undo };
+}
+
+function setSheetStateOp(workbook: Workbook, index: number, state: SheetState): Op {
+  const problem = sheetStateProblem(workbook, index, state);
+  if (problem) throw new RangeError(problem);
+  const sheet = workbook.sheets[index];
+  const undo = sheetsSnapshot(workbook);
+  undo.shown = { sheet, state: sheet.state };
+  sheet.state = state;
+  if (state !== 'visible' && workbook.activeSheet === index) {
+    // The next visible sheet takes its place, or the one before when there is none after it.
+    const sheets = workbook.sheets;
+    let active = -1;
+    for (let i = index + 1; i < sheets.length && active < 0; i++) if (sheets[i].state === 'visible') active = i;
+    for (let i = index - 1; i >= 0 && active < 0; i--) if (sheets[i].state === 'visible') active = i;
+    if (active >= 0) workbook.activeSheet = active;
+  }
+  workbook.sheetsModified = true;
+  return { type: 'restoreSheets', sheet: index, state: undo };
+}
+
+function copySheetOp(workbook: Workbook, at: number, copy: Sheet, names: DefinedName[]): Op {
+  if (!copy || typeof copy !== 'object' || !(copy.rows instanceof Map) || copy.part !== '' || copy.kind !== 'worksheet') throw new RangeError('The copy of a sheet is a worksheet that is in no file');
+  if (workbook.sheets.indexOf(copy) >= 0) throw new RangeError('The sheet is in the workbook already');
+  const problem = insertSheetProblem(workbook, at, copy.name);
+  if (problem) throw new RangeError(problem);
+  const undo = sheetsSnapshot(workbook);
+  const sheets = workbook.sheets.slice();
+  sheets.splice(at, 0, copy);
+  workbook.sheets = sheets;
+  const shifted = workbook.definedNames.map((defined) => (defined.localSheet !== undefined && defined.localSheet >= at ? { ...defined, localSheet: defined.localSheet + 1 } : defined));
+  workbook.definedNames = shifted.concat((Array.isArray(names) ? names : []).map((defined) => ({ ...defined, localSheet: at })));
+  // The sheet that was shown stays the one that is.
+  if (workbook.activeSheet >= at) workbook.activeSheet++;
+  workbook.sheetsModified = true;
+  // The step holds the list of sheets as it was, which the copy is not in: it weighs nothing. (Undone, the
+  // step that brings the copy back holds it, on the stack of what can be done again, which is not weighed.)
+  return { type: 'restoreSheets', sheet: at, state: undo };
+}
+
 function restoreSheets(workbook: Workbook, index: number, state: SheetsSnapshot, weight: number | undefined): Op {
   const undo = sheetsSnapshot(workbook);
+  if (state.shown) {
+    undo.shown = { sheet: state.shown.sheet, state: state.shown.sheet.state };
+    state.shown.sheet.state = state.shown.state;
+  }
   if (state.renamed) {
     const sheet = state.renamed.sheet;
     undo.renamed = { sheet, name: sheet.name, nameInFile: sheet.nameInFile };
@@ -1270,6 +1475,7 @@ export function applyOp(workbook: Workbook, op: Op): Op {
     case 'restore': {
       const sheet = sheetAt(workbook, op.sheet);
       const snapshot = snapshotOf(sheet);
+      if (op.snapshot.comments) snapshot.comments = { list: sheet.comments };
       restoreSnapshot(sheet, op.snapshot);
       sheet.modified = true;
       const others = op.others.map((other) => ({ sheet: other.sheet, cells: setCells(sheetAt(workbook, other.sheet), other.cells) }));
@@ -1291,6 +1497,26 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       return deleteSheetOp(workbook, op.sheet);
     case 'renameSheet':
       return renameSheetOp(workbook, op.sheet, op.name);
+    case 'moveSheet':
+      return moveSheetOp(workbook, op.sheet, op.to);
+    case 'setSheetState':
+      return setSheetStateOp(workbook, op.sheet, op.state);
+    case 'copySheet':
+      return copySheetOp(workbook, op.sheet, op.copy, op.names);
+    case 'setTabColor': {
+      const problem = tabColorProblem(workbook, op.sheet);
+      if (problem) throw new RangeError(problem);
+      const sheet = sheetAt(workbook, op.sheet);
+      const previous = sheet.tabColor;
+      // What the sheet came with, noted once: the writer leaves the part alone while the colour is that one.
+      if (!sheet.tabColorRead) sheet.tabColorRead = { color: previous };
+      if (op.color) sheet.tabColor = op.color;
+      else delete sheet.tabColor;
+      // Not `modified`: no cell changed, and nothing has to be calculated again.
+      sheet.tabColorModified = true;
+      workbook.sheetsModified = true;
+      return { type: 'setTabColor', sheet: op.sheet, color: previous };
+    }
     case 'restoreSheets':
       return restoreSheets(workbook, op.sheet, op.state, op.weight);
   }

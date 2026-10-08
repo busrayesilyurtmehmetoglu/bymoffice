@@ -303,3 +303,56 @@ test('the refusals for form controls and for names that differ only by case have
   assert.equal(sheetErrorText(clash, STRINGS_EN), 'The sheets of this workbook cannot be changed: "IL" and "İL" differ only by case');
   assert.equal(sheetErrorText(clash, STRINGS_TR), STRINGS_TR.sheetNamesClash('IL', 'İL'));
 });
+
+test('tabs: where a dragged tab goes, by the gap between the visible tabs it is dropped in', async () => {
+  const { dropIndex } = await import('../src/ui/sheet-tabs');
+  // Sheets 0, 1, 3 have tabs; 2 is hidden.
+  const shown = [0, 1, 3];
+  // Beside itself, on either side: nothing moves.
+  assert.equal(dropIndex(shown, 0, 0), undefined);
+  assert.equal(dropIndex(shown, 0, 1), undefined);
+  assert.equal(dropIndex(shown, 1, 1), undefined);
+  assert.equal(dropIndex(shown, 1, 2), undefined);
+  assert.equal(dropIndex(shown, 3, 3), undefined);
+  // Before a tab further right: the place that tab has once the dragged sheet is out of the list.
+  assert.equal(dropIndex(shown, 0, 2), 2);
+  // Behind the last tab, before the first one.
+  assert.equal(dropIndex(shown, 0, 3), 3);
+  assert.equal(dropIndex(shown, 3, 0), 0);
+  assert.equal(dropIndex(shown, 3, 1), 1);
+  assert.equal(dropIndex(shown, 1, 3), 3);
+  assert.equal(dropIndex(shown, 1, 0), 0);
+  // What is no gap of the list.
+  for (const gap of [-1, 4, 1.5, NaN]) assert.equal(dropIndex(shown, 0, gap), undefined);
+  assert.equal(dropIndex([], 0, 0), undefined);
+  // Applied to a list, the sheet ends up between the tabs it was dropped between.
+  for (let from = 0; from < 5; from++) {
+    for (let gap = 0; gap <= 5; gap++) {
+      const all = [0, 1, 2, 3, 4];
+      const to = dropIndex(all, from, gap);
+      if (to === undefined) continue;
+      const list = all.slice();
+      list.splice(to, 0, list.splice(from, 1)[0]);
+      const at = list.indexOf(from);
+      assert.equal(list[at + 1], gap < 5 ? gap : undefined, `from ${from} into gap ${gap}`);
+    }
+  }
+});
+
+test('tabs: the refusals of moving, hiding, copying and colouring have words in both languages', () => {
+  for (const strings of [STRINGS_EN, STRINGS_TR]) {
+    assert.equal(sheetErrorText('Cannot hide the last visible sheet', strings), strings.cannotHideLastSheet);
+    assert.equal(sheetErrorText('Cannot copy a chartsheet: not supported yet', strings), strings.sheetKindFixed('copy'));
+    assert.equal(sheetErrorText('Cannot colour the tab of a chartsheet: not supported yet', strings), strings.sheetKindFixed('color'));
+    assert.notEqual(strings.sheetKindFixed('copy'), strings.sheetKindFixed('delete'));
+    assert.match(strings.copyLoss('conditionalFormats', 2), /^2 /);
+    assert.equal(strings.copyLoss('ctrlProp', 1), 'ctrlProp');
+    // What the reader notes of a sheet part has a name in both languages.
+    for (const what of ['codeName', 'outlinePr', 'outlineLevels', 'sortState', 'customSheetViews', 'ignoredErrors', 'cellWatches', 'phoneticPr', 'sparklineGroups', 'rowAttributes']) {
+      assert.notEqual(strings.copyLoss(what, 1), what, what);
+    }
+    assert.ok(strings.sheetMoved('A', 2, 3).indexOf('A') >= 0);
+    assert.ok(strings.notesNotPasted(1).length > 0 && strings.sheetCopiedWithout('A', 'x').indexOf('x') > 0);
+    for (const key of ['duplicateSheet', 'moveSheetLeft', 'moveSheetRight', 'hideSheet', 'unhideSheet', 'hiddenSheets', 'tabColor', 'noTabColor', 'cannotSortThreaded'] as const) assert.ok(strings[key].length > 0, key);
+  }
+});

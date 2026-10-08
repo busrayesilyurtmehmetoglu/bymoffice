@@ -195,7 +195,7 @@ test('sort: a link on one cell goes with its cell', () => {
   assert.equal(sheet.hyperlinksModified, true);
 });
 
-test('sort: merged cells, array formulas and anchored comments are refused with a message, and nothing changes', () => {
+test('sort: merged cells, array formulas, comments that cannot be moved and conversations are refused with a message, and nothing changes', () => {
   const merged = sheetOf([[2], [1], [3]]);
   merged.merges = [{ top: 1, left: 0, bottom: 2, right: 0 }];
   const wb1 = bookOf(merged);
@@ -215,10 +215,17 @@ test('sort: merged cells, array formulas and anchored comments are refused with 
 
   const noted = sheetOf([[2], [1]]);
   noted.anchored = ['comments', 'vmlDrawing'];
-  // As the reader leaves a sheet with a note: the part is named and the note is in the model.
+  // A sheet whose comment parts are not its own alone: its notes cannot be moved with their rows.
   noted.comments = [{ row: 0, col: 0, text: 'not' }];
+  noted.notesBlocked = 'shared';
   const wb4 = bookOf(noted);
   assert.throws(() => apply(wb4, sortRange(wb4, 0, full(noted), [{ col: 0 }])), /Cannot sort in a sheet with comments: not supported yet/);
+  // A conversation cannot follow its row.
+  const threaded = sheetOf([[2], [1]]);
+  threaded.comments = [{ row: 1, col: 0, text: 'ilk', threaded: true }];
+  const wb5 = bookOf(threaded);
+  assert.throws(() => apply(wb5, sortRange(wb5, 0, full(threaded), [{ col: 0 }])), /Cannot sort a range that contains threaded comments/);
+  assert.deepEqual(column(threaded, 0, 0, 1), [2, 1]);
 });
 
 test('sort: a key outside the range and an order that is no permutation are refused', () => {

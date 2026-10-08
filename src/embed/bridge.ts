@@ -8,6 +8,7 @@ import { needsConversion, openConverted } from '../formats/convert';
 import { documentPictures } from '../model/doc/pictures';
 import type { OfficeFile } from '../index';
 import { enforcedProtection, hasPermissionRanges, tracksChanges, type DocModel } from '../model/doc/types';
+import { resolveColor } from '../model/sheet/color';
 import { cellName, rangeName, type Workbook } from '../model/sheet/types';
 import { registerFont, sanitizeFontFamily, settleFonts, type FontFailure, type FontRegistration } from '../render/fonts';
 import type { DocumentEditorOptions } from '../ui/doc-editor';
@@ -400,7 +401,14 @@ function fontsField(message: Message, host: BridgeHost): FontRegistration[] {
 }
 
 /** The sheets of a workbook as `loaded` and `sheets` list them. */
-const sheetList = (workbook: Workbook): Message[] => workbook.sheets.map((entry) => ({ name: entry.name, state: entry.state, kind: entry.kind }));
+const sheetList = (workbook: Workbook): Message[] =>
+  workbook.sheets.map((entry) => {
+    const out: Message = { name: entry.name, state: entry.state, kind: entry.kind };
+    // The colour of the tab, for a sheet that has one: a CSS colour ("#RRGGBB").
+    const color = entry.tabColor ? resolveColor(entry.tabColor, workbook.styles) : undefined;
+    if (color) out.tabColor = color;
+    return out;
+  });
 
 interface Outgoing {
   type: string;
@@ -975,6 +983,61 @@ export function createBridge(host: BridgeHost): Bridge {
     if (id !== undefined) send(answer);
   };
 
+  /**
+   * Moves, hides or shows, copies a sheet or colours its tab through the view, as one undo
+   * step. Like changeSheets(): the list that results is told by `sheets`, and the answer says
+   * that the command was done, or why it was not.
+   */
+  const arrangeSheets = (type: 'moveSheet' | 'setSheetState' | 'copySheet' | 'setTabColor', message: Message, id: string | undefined) => {
+    // Everything that comes from outside is looked at before anything is asked of the view.
+    const index = sheetIndexField(message, type === 'moveSheet' ? 'from' : 'index', true) as number;
+    const to = type === 'moveSheet' ? (sheetIndexField(message, 'to', true) as number) : undefined;
+    const at = type === 'copySheet' ? sheetIndexField(message, 'at', false) : undefined;
+    const name = type === 'copySheet' ? sheetNameField(message, false) : undefined;
+    const state = type === 'setSheetState' ? field<string>(message, 'state', 'string', true) : undefined;
+    if (state !== undefined && state !== 'visible' && state !== 'hidden' && state !== 'veryHidden') throw new BadMessage('"state" must be "visible", "hidden" or "veryHidden"');
+    // No colour, or null, takes the colour away.
+    const color = type === 'setTabColor' && message.color !== null ? field<string>(message, 'color', 'string', false) : undefined;
+    if (color !== undefined && !/^#[0-9a-fA-F]{6}$/.test(color)) throw new BadMessage('"color" must be written #RRGGBB');
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const view = shown.view;
+    if (!view) return fail('no-sheet', 'The open file is a document: it has no sheets', id);
+    if (shown.locked || view.readOnly === true) return fail('read-only', 'The file is read-only', id);
+    if (typeof view.moveSheet !== 'function' || typeof view.setSheetState !== 'function' || typeof view.copySheet !== 'function' || typeof view.setTabColor !== 'function') {
+      return fail('sheet-refused', 'This view cannot change its sheets', id);
+    }
+    const count = sheetCount ? sheetCount() : 0;
+    if (index >= count) return fail('no-sheet', `No sheet with index ${index}`, id);
+    if (to !== undefined && to >= count) return fail('no-sheet', `No sheet with index ${to}`, id);
+    if (at !== undefined && at > count) return fail('no-sheet', `A sheet cannot be inserted at index ${at}: there are ${count} sheets`, id);
+    const answer: Message = { type: 'done', id, command: type };
+    try {
+      if (type === 'moveSheet') view.moveSheet(index, to as number);
+      else if (type === 'setSheetState') view.setSheetState(index, state as 'visible' | 'hidden' | 'veryHidden');
+      else if (type === 'setTabColor') view.setTabColor(index, color);
+      else {
+        const options: { at?: number; name?: string } = {};
+        if (at !== undefined) options.at = at;
+        if (name !== undefined) options.name = name;
+        const placed = view.copySheet(index, options);
+        if (placed < 0) return fail('read-only', 'The file is read-only', id);
+        const entry = view.workbook && Array.isArray(view.workbook.sheets) ? view.workbook.sheets[placed] : undefined;
+        answer.index = placed;
+        if (entry) answer.name = entry.name;
+      }
+    } catch (error) {
+      let text: string;
+      try {
+        text = typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
+      } catch {
+        text = errorText(error);
+      }
+      return fail('sheet-refused', text, id);
+    }
+    // A command that changed nothing a message tells of (a colour) still has its list looked at.
+    if (id !== undefined) send(answer);
+  };
+
   const save = async (id: string | undefined) => {
     const current = shown;
     if (!current) return fail('not-loaded', 'No file is open', id);
@@ -1060,6 +1123,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'save') return await save(id);
       if (type === 'print') return print(fields, id);
       if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
+      if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
       }

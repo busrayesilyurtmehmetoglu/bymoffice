@@ -9,8 +9,9 @@ import { cellEditText, parseCellInput } from '../edit/input';
 import { builtinFormatId, formatCell } from '../format/cell-format';
 import type { FormatLocale } from '../format/locale';
 import { resolveCellStyle } from '../model/sheet/color';
-import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { rowRunsWithout, rowsHiddenByFilter } from './filter';
+import { DEFAULT_NOTE_AUTHOR, MAX_SHEET_NOTES, cellNow, clearNotes, notesBlocked } from './notes';
 import { ensureCellFormat, ensureNumberFormat, explicitFormula, sharedMasters, type CellChange, type Op, type SharedMasters } from './ops';
 
 export interface EditOptions {
@@ -166,6 +167,20 @@ export interface CopiedRange {
    * moves by the distance from the row it really came from.
    */
   rows?: number[];
+  /**
+   * The notes of the copied cells: `row` and `col` count from the first row of `cells` and its
+   * first cell. Text and author only: a pasted note is a new one, with plain text and a box
+   * where a new note gets it. Threaded comments are not copied. Missing when there is none.
+   */
+  notes?: CopiedNote[];
+}
+
+/** A note of a copied cell. */
+export interface CopiedNote {
+  row: number;
+  col: number;
+  text: string;
+  author?: string;
 }
 
 /** Largest selection that a smaller copied block is repeated over. */
@@ -218,13 +233,97 @@ export function copyRange(workbook: Workbook, sheetIndex: number, range: CellRan
   }
   const copied: CopiedRange = { text: toTsv(grid), html: toHtmlTable(grid), sheet: sheetIndex, range: { top: range.top, left: range.left, bottom, right }, cells };
   if (filtered.length > 0) copied.rows = rows;
+  // The notes of the selection itself: a note may be on an empty cell beyond the cells that were copied.
+  const notes = copiedNotes(sheet, range.top, range.left, bottom, Math.min(range.bottom, MAX_ROWS - 1), Math.min(range.right, MAX_COLS - 1), rows);
+  if (notes.length > 0) copied.notes = notes;
   return copied;
+}
+
+/**
+ * The notes on the cells of a selection, in the order of the sheet's comments; the first one
+ * of a cell counts. `bottom` is the last row of the cells that were copied and `rows` the
+ * rows that were copied down to it; the selection goes on to `last` and to the column `right`.
+ */
+function copiedNotes(sheet: Sheet, top: number, left: number, bottom: number, last: number, right: number, rows: number[]): CopiedNote[] {
+  const out: CopiedNote[] = [];
+  const comments = sheet.comments;
+  if (!comments || comments.length === 0) return out;
+  // Rows a filter hides are not in the copy: where each row of the sheet stands in it.
+  const contiguous = rows.length === bottom - top + 1;
+  let offsets: Map<number, number> | undefined;
+  let hiddenBelow: Set<number> | undefined;
+  const seen = new Set<number>();
+  for (let i = 0; i < comments.length; i++) {
+    const comment = comments[i];
+    const cell = comment ? cellNow(sheet, comment) : undefined;
+    if (!cell || cell.row < top || cell.row > Math.max(last, bottom) || cell.col < left || cell.col > right) continue;
+    const key = cell.row * MAX_COLS + cell.col;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // A conversation stays where it is: its messages and the people who wrote them are not a note.
+    if (comment.threaded) continue;
+    let row = cell.row - top;
+    if (cell.row > bottom) {
+      // Below the cells that were copied: the rows of the selection follow those of the copy one by one.
+      if (!hiddenBelow) hiddenBelow = new Set(rowsHiddenByFilter(sheet, bottom + 1, last));
+      if (hiddenBelow.has(cell.row)) continue;
+      row = rows.length + (cell.row - bottom - 1);
+    } else if (!contiguous) {
+      if (!offsets) {
+        offsets = new Map();
+        for (let k = 0; k < rows.length; k++) offsets.set(rows[k], k);
+      }
+      const at = offsets.get(cell.row);
+      if (at === undefined) continue;
+      row = at;
+    }
+    const note: CopiedNote = { row, col: cell.col - left, text: String(comment.text) };
+    if (typeof comment.author === 'string' && comment.author !== '') note.author = comment.author;
+    out.push(note);
+  }
+  return out;
+}
+
+/**
+ * Cuts a range: its contents are removed as clearRange() removes them, and the notes on its
+ * cells go with them (a note is cut and pasted with its cell). Formats stay. Like clearRange()
+ * it leaves the rows alone that the filter of the sheet hides.
+ */
+export function cutRange(workbook: Workbook, sheetIndex: number, range: CellRange): Op[] {
+  const sheet = workbook.sheets[sheetIndex];
+  const ops = clearRange(workbook, sheetIndex, range);
+  const used = usedPart(sheet, range);
+  const filtered = rowsHiddenByFilter(sheet, used.top, used.bottom);
+  let rows: number[] | undefined;
+  if (filtered.length > 0) {
+    rows = [];
+    for (const run of rowRunsWithout(range.top, Math.max(used.bottom, range.top), filtered)) for (let r = run.top; r <= run.bottom; r++) rows.push(r);
+  }
+  // Notes may be on cells beyond the used part: the range itself is looked at, without the rows the filter hides.
+  const hidden = filtered.length > 0 ? new Set(filtered) : undefined;
+  const notes = hidden ? clearNotesExcept(workbook, sheetIndex, range, hidden) : clearNotes(workbook, sheetIndex, range);
+  return ops.concat(notes);
+}
+
+function clearNotesExcept(workbook: Workbook, sheetIndex: number, range: CellRange, hidden: Set<number>): Op[] {
+  const sheet = workbook.sheets[sheetIndex];
+  const rows: number[] = [];
+  for (const comment of sheet.comments || []) {
+    const cell = comment ? cellNow(sheet, comment) : undefined;
+    if (cell && cell.row >= range.top && cell.row <= range.bottom && !hidden.has(cell.row)) rows.push(cell.row);
+  }
+  return clearNotes(workbook, sheetIndex, range, rows);
 }
 
 export interface PasteResult {
   ops: Op[];
   /** The range that was written, for the caller to select. */
   range: CellRange;
+  /**
+   * Notes of the copy that were not pasted: their cell has a threaded comment, or the notes
+   * of the sheet cannot be changed. The cells were pasted all the same. Missing when none.
+   */
+  skippedNotes?: number;
 }
 
 /**
@@ -246,10 +345,19 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
     if (parsed.truncated) throw new RangeError(`Cannot paste more than ${MAX_PASTE_CELLS} cells at once`);
     source = parsed.rows;
   }
-  const height = source.length;
-  const width = source.reduce((max, row) => Math.max(max, row.length), 0);
+  const cellHeight = source.length;
+  const cellWidth = source.reduce((max, row) => Math.max(max, row.length), 0);
   // An empty clipboard pastes nothing; it does not clear the target.
-  if (height === 0 || width === 0 || (!internal && text === '')) return { ops: [], range: selection };
+  if (cellHeight === 0 || cellWidth === 0 || (!internal && text === '')) return { ops: [], range: selection };
+  // What is pasted is as large as what was selected: the notes of the copy may reach beyond its cells.
+  let height = cellHeight;
+  let width = cellWidth;
+  if (internal && copied && copied.notes) {
+    for (const note of copied.notes) {
+      if (note.row >= height) height = note.row + 1;
+      if (note.col >= width) width = note.col + 1;
+    }
+  }
 
   const selHeight = selection.bottom - selection.top + 1;
   const selWidth = selection.right - selection.left + 1;
@@ -267,7 +375,10 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
   const cells: CellChange[] = [];
   for (let r = selection.top; r <= bottom; r++) {
     const sourceRow = source[(r - selection.top) % height];
+    // Beyond the cells of the copy (where only a note of it stands) no cell is written.
+    if (!sourceRow) continue;
     for (let c = selection.left; c <= right; c++) {
+      if ((c - selection.left) % width >= cellWidth) continue;
       if (merges.length > 0 && covered(r, c)) continue;
       const item = sourceRow[(c - selection.left) % width];
       let cell: Cell | undefined;
@@ -303,5 +414,77 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
       cells.push({ row: r, col: c, cell });
     }
   }
-  return { ops: cells.length > 0 ? [{ type: 'setCells', sheet: sheetIndex, cells }] : [], range: { top: selection.top, left: selection.left, bottom, right } };
+  const result: PasteResult = { ops: cells.length > 0 ? [{ type: 'setCells', sheet: sheetIndex, cells }] : [], range: { top: selection.top, left: selection.left, bottom, right } };
+  if (internal && copied && copied.notes && copied.notes.length > 0 && sheet.kind === 'worksheet') {
+    const pasted = pasteNotes(sheet, sheetIndex, copied.notes, selection, height, width, bottom, right, merges.length > 0 ? covered : undefined);
+    if (pasted.op) result.ops.push(pasted.op);
+    if (pasted.skipped > 0) result.skippedNotes = pasted.skipped;
+  }
+  return result;
+}
+
+/**
+ * The notes of a copy put on the cells it was pasted to, once for each repeat of the block.
+ * A note of the copy takes the place of the note its cell has; a cell the copy has no note
+ * for keeps its own (UNSURE: Excel's "paste all" removes that one as well; keeping it loses
+ * nothing). A cell with a threaded comment keeps that and gets no note.
+ */
+function pasteNotes(
+  sheet: Sheet,
+  sheetIndex: number,
+  notes: CopiedNote[],
+  selection: CellRange,
+  height: number,
+  width: number,
+  bottom: number,
+  right: number,
+  covered: ((row: number, col: number) => boolean) | undefined,
+): { op: Op | undefined; skipped: number } {
+  const targets: { row: number; col: number; note: CopiedNote }[] = [];
+  for (let top = selection.top; top <= bottom; top += height) {
+    for (let left = selection.left; left <= right; left += width) {
+      for (const note of notes) {
+        const row = top + note.row;
+        const col = left + note.col;
+        if (row > bottom || col > right) continue;
+        targets.push({ row, col, note });
+      }
+    }
+  }
+  if (targets.length === 0) return { op: undefined, skipped: 0 };
+  if (notesBlocked(sheet)) return { op: undefined, skipped: targets.length };
+
+  const comments = sheet.comments || [];
+  // What is on each cell now: the comments of the cell, and whether one of them is a conversation.
+  const here = new Map<number, { indexes: number[]; threaded: boolean }>();
+  let live = 0;
+  for (let i = 0; i < comments.length; i++) {
+    const cell = comments[i] ? cellNow(sheet, comments[i]) : undefined;
+    if (!cell) continue;
+    live++;
+    const key = cell.row * MAX_COLS + cell.col;
+    let entry = here.get(key);
+    if (!entry) here.set(key, (entry = { indexes: [], threaded: false }));
+    entry.indexes.push(i);
+    if (comments[i].threaded) entry.threaded = true;
+  }
+  const since = sheet.structuralEdits ? sheet.structuralEdits.length : 0;
+  const gone = new Set<number>();
+  const added: SheetComment[] = [];
+  let skipped = 0;
+  for (const target of targets) {
+    // A cell under a merged range is not written, and neither is its note.
+    if (covered && covered(target.row, target.col)) continue;
+    const entry = here.get(target.row * MAX_COLS + target.col);
+    if (entry && entry.threaded) {
+      skipped++;
+      continue;
+    }
+    if (entry) for (const index of entry.indexes) gone.add(index);
+    added.push({ row: target.row, col: target.col, text: target.note.text, author: target.note.author !== undefined ? target.note.author : DEFAULT_NOTE_AUTHOR, since });
+  }
+  if (added.length === 0) return { op: undefined, skipped };
+  if (live - gone.size + added.length > MAX_SHEET_NOTES) throw new RangeError('The sheet has too many comments');
+  const next = comments.filter((_, index) => !gone.has(index)).concat(added);
+  return { op: { type: 'setComments', sheet: sheetIndex, comments: next }, skipped };
 }

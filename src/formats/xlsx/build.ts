@@ -597,6 +597,55 @@ function sheetViewXml(sheet: Sheet, selected: boolean): string {
   return inner === '' ? `${out}/>` : `${out}>${inner}</sheetView>`;
 }
 
+/**
+ * What the writer of a sheet that is in no file (see writeXlsx()) takes from here, as the
+ * children of a worksheet in the default namespace: <sheetPr> ('' for none), the content of
+ * <sheetViews>, <sheetFormatPr> ('' for none), and the elements that say how the sheet is
+ * printed, which follow the cells.
+ */
+export function freshSheetParts(sheet: Sheet, selected: boolean): { properties: string; view: string; format: string; protection: string; page: string } {
+  const notes = new Notes();
+  const pageSetup = sheet.pageSetup ? pageSetupXml(sheet.pageSetup, notes) : undefined;
+  const properties = (sheet.tabColor ? colorXml('tabColor', sheet.tabColor) : '') + (pageSetup ? pageSetup.properties : '');
+  return {
+    properties: properties === '' ? '' : `<sheetPr>${properties}</sheetPr>`,
+    view: sheetViewXml(sheet, selected),
+    format: sheetFormatXml(sheet),
+    protection: protectionXml(sheet),
+    page: pageSetup ? pageSetup.page + pageSetup.rowBreaks + pageSetup.colBreaks : '',
+  };
+}
+
+const ATTR_NAME = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+
+/** Attributes the model keeps as the file has them, as they go into a start tag: each once, under a name that is one. */
+function keptAttrs(attrs: [string, string][] | undefined): string {
+  let out = '';
+  const seen = new Set<string>();
+  for (const pair of attrs || []) {
+    if (!pair || typeof pair[0] !== 'string' || typeof pair[1] !== 'string' || !ATTR_NAME.test(pair[0]) || pair[0] === 'xmlns' || seen.has(pair[0])) continue;
+    seen.add(pair[0]);
+    out += ` ${pair[0]}="${escapeAttr(pair[1])}"`;
+  }
+  return out;
+}
+
+/** <sheetProtection> and <protectedRanges> from the model: '' for a sheet that has neither. */
+function protectionXml(sheet: Sheet): string {
+  const protection = sheet.protection;
+  if (!protection) return '';
+  let out = protection.attrs ? `<sheetProtection${keptAttrs(protection.attrs)}/>` : '';
+  let ranges = '';
+  for (const range of protection.ranges || []) {
+    if (!range || !Array.isArray(range.attrs)) continue;
+    let inner = '';
+    for (const text of range.descriptors || []) if (typeof text === 'string') inner += `<securityDescriptor>${escapeText(text)}</securityDescriptor>`;
+    ranges += inner === '' ? `<protectedRange${keptAttrs(range.attrs)}/>` : `<protectedRange${keptAttrs(range.attrs)}>${inner}</protectedRange>`;
+  }
+  if (ranges !== '') out += `<protectedRanges>${ranges}</protectedRanges>`;
+  return out;
+}
+
 function sheetFormatXml(sheet: Sheet): string {
   const positive = (value: number | undefined): value is number => typeof value === 'number' && value > 0 && value < Infinity;
   if (!positive(sheet.baseColWidth) && !positive(sheet.defaultColWidth) && !positive(sheet.defaultRowHeight)) return '';
@@ -1373,6 +1422,8 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   if (parts.length === dataAt + 1) parts[dataAt] = '<sheetData/>';
   else parts.push('</sheetData>');
   parts[dimensionAt] = `<dimension ref="${used.top < 0 ? 'A1' : rangeName(used)}"/>`;
+  // Behind the cells, where the schema has it.
+  parts.push(protectionXml(sheet));
 
   // Conditional formats and validations are kept as the file has them, sheet names included: the
   // rows and columns moved since (in this sheet, and in the sheets their formulas name) are matched

@@ -14,7 +14,7 @@ import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { resolveUiStrings, type UiStrings } from './strings';
 import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
-import { clearRange, copyRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
+import { clearRange, copyRange, cutRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
 import { formulaReferences } from '../calc/refs';
 import { cycleAbsolute } from '../edit/absolute';
 import { canPointAt, isFormulaText, pointReference, pointSpanLive } from '../edit/point';
@@ -44,7 +44,24 @@ import {
 } from '../ops/filter';
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
 import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps } from '../ops/notes';
-import { canDeleteSheet, canRenameSheet, defaultSheetName, deleteSheet as deleteSheetOps, insertSheet as insertSheetOps, renameSheet as renameSheetOps } from '../ops/sheets';
+import {
+  canCopySheet,
+  canDeleteSheet,
+  canHideSheet,
+  canRenameSheet,
+  copySheet as copySheetOps,
+  copySheetLosses,
+  defaultSheetName,
+  deleteSheet as deleteSheetOps,
+  insertSheet as insertSheetOps,
+  moveSheet as moveSheetOps,
+  renameSheet as renameSheetOps,
+  setSheetState as setSheetStateOps,
+  setTabColor as setTabColorOps,
+  type CopySheetOptions,
+} from '../ops/sheets';
+import { Popover, type PopoverItem } from './popover';
+import { PALETTE, PALETTE_COLUMNS } from './toolbar';
 import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
@@ -70,7 +87,7 @@ import {
 } from './doc-print';
 import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
 import { FilterMenu, ListMenu } from './filter-menu';
-import { allSheets, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
+import { allSheets, dropIndex, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
 
 export interface WorkbookViewOptions {
   /**
@@ -300,6 +317,12 @@ interface CellInfo {
 
 /** How long a touch has to rest on a header to open its menu, and how close in time and place two taps make a double tap. */
 const LONG_PRESS_MS = 550;
+/** How far a pointer goes on a tab before the tab is dragged. */
+const TAB_DRAG_SLOP = 6;
+/** How near the ends of the strip a dragged tab scrolls it, by how much and how often. */
+const TAB_SCROLL_EDGE = 24;
+const TAB_SCROLL_STEP = 12;
+const TAB_SCROLL_MS = 30;
 /** How near a border between two headers the pointer has to be to resize, for a mouse and for a finger. */
 const RESIZE_REACH_MOUSE = 4;
 const RESIZE_REACH_TOUCH = 10;
@@ -685,6 +708,19 @@ export class WorkbookView {
   private lastTabTap: { time: number; sheet: Sheet } | undefined;
   /** The click that follows the long press that opened the menu of a tab is not a tap on the tab. */
   private swallowTabClick = false;
+  /**
+   * A tab that may be dragged to another place: pressed with the mouse, or held with a finger
+   * until the long press was seen. `started` once the pointer went far enough; `gap` is the
+   * gap between the tabs it would be dropped in.
+   */
+  private tabDrag: { pointerId: number; sheet: Sheet; x: number; touch: boolean; started: boolean; gap: number; lastX: number } | undefined;
+  /** The line that shows where a dragged tab would go. */
+  private tabDropMark: HTMLElement | undefined;
+  private tabDragTimer = 0;
+  /** The window is listened to for the end of the pointer of `tabDrag` (see watchTabDrag()). */
+  private tabDragWatched = false;
+  /** The palette of the colour of a tab. */
+  private tabPopover: Popover | undefined;
 
   /** Canvas size in CSS pixels and the ratio of its backing store to it. */
   private width = 0;
@@ -899,6 +935,7 @@ export class WorkbookView {
       tabs.addEventListener('pointermove', this.onTabPointerMove);
       tabs.addEventListener('pointerup', this.onTabPointerEnd);
       tabs.addEventListener('pointercancel', this.onTabPointerEnd);
+      tabs.addEventListener('touchmove', this.onTabTouchMove, { passive: false });
     }
     addButton.addEventListener('click', this.onAddClick);
     root.addEventListener('mousedown', this.onRootMouseDown);
@@ -1126,6 +1163,9 @@ export class WorkbookView {
     this.tabs.removeEventListener('pointermove', this.onTabPointerMove);
     this.tabs.removeEventListener('pointerup', this.onTabPointerEnd);
     this.tabs.removeEventListener('pointercancel', this.onTabPointerEnd);
+    this.tabs.removeEventListener('touchmove', this.onTabTouchMove);
+    this.endTabDrag();
+    if (this.tabPopover) this.tabPopover.close('owner');
     this.addButton.removeEventListener('click', this.onAddClick);
     this.root.removeEventListener('mousedown', this.onRootMouseDown);
     this.root.removeEventListener('focusout', this.onFocusOut);
@@ -1598,6 +1638,7 @@ export class WorkbookView {
     const within = focused !== null && this.tabs.contains(focused);
     // A name that was being typed goes with its tab. Forgotten first: taking the field away may report that it lost the focus.
     this.renaming = undefined;
+    this.endTabDrag();
     this.clearTabPress();
     while (this.tabs.firstChild) this.tabs.removeChild(this.tabs.firstChild);
     this.buildTabs();
@@ -1615,6 +1656,7 @@ export class WorkbookView {
     const index = Number.isInteger(show) && show >= 0 && show < sheets.length ? show : Math.max(sheetToShow(sheets, this.sheetIndex), 0);
     const moved = index !== this.sheetIndex || sheets[index] !== this.shown;
     // A drag or a touch that is under way was begun on the list of sheets as it was (undo by a key in the middle of a resize).
+    this.endTabDrag();
     this.endDrag();
     this.endTouch();
     this.lastTap = undefined;
@@ -1708,9 +1750,12 @@ export class WorkbookView {
     const done: HistoryMark = { ...before };
     const inverse = this.history.apply(ops, before, done);
     const now = this.workbook.sheets;
-    // A new sheet is shown; a sheet that stays is still shown, wherever it is now; else the nearest one with a tab.
-    let show = kind === 'insert' ? index : now.indexOf(shown);
+    // A new sheet is shown, and so is one that was hidden and is shown again; a sheet that stays is still shown,
+    // wherever it is now; else the nearest one with a tab.
+    let show = kind === 'insert' || kind === 'copy' || (kind === 'state' && now[index] && now[index].state === 'visible') ? index : now.indexOf(shown);
     if (show < 0 || show >= now.length) show = Math.max(sheetToShow(now, index), 0);
+    // The sheet that was shown is hidden now: the one the operation made the active one is shown.
+    if (now[show].state !== 'visible' && now[this.workbook.activeSheet] && now[this.workbook.activeSheet].state === 'visible') show = this.workbook.activeSheet;
     const to = this.stateOf(now[show]);
     done.sheet = show;
     done.active = { ...to.active };
@@ -1763,9 +1808,7 @@ export class WorkbookView {
    * a sheet cannot have or another sheet has.
    */
   insertSheet(at?: number, name?: string): number {
-    if (this.destroyed || this.locked) return -1;
-    this.commitEditing();
-    this.finishRename(true, true);
+    if (!this.beginSheetChange()) return -1;
     const index = at === undefined ? this.workbook.sheets.length : at;
     const ops = insertSheetOps(this.workbook, index, { name: name === undefined ? defaultSheetName(this.workbook, this.languageTag) : String(name) });
     this.applySheetOps('insert', ops, index);
@@ -1780,9 +1823,12 @@ export class WorkbookView {
    */
   renameSheet(index: number, name: string): boolean {
     if (this.destroyed || this.locked) return false;
+    this.endTabDrag();
     this.commitEditing();
     // A name being typed in the tab gives way to this one.
     this.closeRename(false);
+    // A note being typed is applied first; one that cannot be stays in its field, and the sheet keeps its name.
+    if (!this.commitPending()) return false;
     const ops = renameSheetOps(this.workbook, index, String(name));
     if (ops.length === 0) return false;
     this.applySheetOps('rename', ops, index);
@@ -1796,15 +1842,146 @@ export class WorkbookView {
    * deleted (see canDeleteSheet()): the last visible one, say.
    */
   deleteSheet(index: number): boolean {
-    if (this.destroyed || this.locked) return false;
-    this.commitEditing();
-    this.finishRename(true, true);
+    if (!this.beginSheetChange()) return false;
     const ops = deleteSheetOps(this.workbook, index);
     const name = this.workbook.sheets[index].name;
     this.applySheetOps('delete', ops, index);
     // After what is said about the cell that is active now.
     this.notifyLater(this.strings.sheetDeleted(name));
     return true;
+  }
+
+  /** What every change of the list of sheets through the view starts with; false when the view takes none. */
+  private beginSheetChange(): boolean {
+    if (this.destroyed || this.locked) return false;
+    // A drag of a tab was begun on the list of sheets as it is.
+    this.endTabDrag();
+    // Whatever is being typed (a cell, a note, the name of a sheet) is applied first, as leaving its field
+    // would. What cannot be applied was said, stays in its field, and nothing is done to the sheets.
+    return this.commitPending();
+  }
+
+  /**
+   * Moves a sheet so that it is sheet number `to` (0: first): one undo step. No formula
+   * changes; the sheet that is shown stays shown. Returns false when nothing was done (a
+   * read-only view, the place the sheet has). Throws RangeError for an index outside the list.
+   */
+  moveSheet(from: number, to: number): boolean {
+    if (!this.beginSheetChange()) return false;
+    const ops = moveSheetOps(this.workbook, from, to);
+    if (ops.length === 0) return false;
+    const name = this.workbook.sheets[from].name;
+    this.applySheetOps('move', ops, from);
+    let place = 0;
+    let count = 0;
+    this.workbook.sheets.forEach((sheet, i) => {
+      if (sheet.state !== 'visible') return;
+      count++;
+      if (i <= to) place = count;
+    });
+    this.notifyLater(this.strings.sheetMoved(name, place, count));
+    return true;
+  }
+
+  /**
+   * Hides a sheet ("hidden"; "veryHidden" so that applications do not offer to show it) or
+   * shows it ("visible"): one undo step. When the sheet that is shown is hidden, the next one
+   * with a tab is shown; a sheet that is shown again is the one shown. Returns false when
+   * nothing was done. Throws RangeError for the last visible sheet.
+   */
+  setSheetState(index: number, state: 'visible' | 'hidden' | 'veryHidden'): boolean {
+    if (!this.beginSheetChange()) return false;
+    const ops = setSheetStateOps(this.workbook, index, state);
+    if (ops.length === 0) return false;
+    this.applySheetOps('state', ops, index);
+    return true;
+  }
+
+  /**
+   * Copies a sheet into a new one, by default right behind it and named like it with a
+   * number ("Name (2)"), and shows the copy: one undo step. What the copy does not get
+   * (conditional formats, data validations, pictures, tables, ...: see copySheetLosses()) is
+   * said to onNotice. Returns the index of the copy, -1 in a read-only view. Throws
+   * RangeError for a sheet that cannot be copied and a name that cannot be used.
+   */
+  copySheet(index: number, options: CopySheetOptions = {}): number {
+    if (!this.beginSheetChange()) return -1;
+    const ops = copySheetOps(this.workbook, index, options);
+    const losses = copySheetLosses(this.workbook, index);
+    const name = this.workbook.sheets[index].name;
+    const at = options.at !== undefined ? options.at : index + 1;
+    this.applySheetOps('copy', ops, at);
+    if (losses.length > 0) this.notifyLater(this.strings.sheetCopiedWithout(name, losses.map((loss) => this.strings.copyLoss(loss.what, loss.count)).join(', ')));
+    return at;
+  }
+
+  /**
+   * Sets the colour of the tab of a sheet ("#RRGGBB"); undefined removes it: one undo step.
+   * Returns false when nothing was done. Throws RangeError for a colour written otherwise.
+   */
+  setTabColor(index: number, color: string | undefined): boolean {
+    if (!this.beginSheetChange()) return false;
+    const ops = setTabColorOps(this.workbook, index, color);
+    if (ops.length === 0) return false;
+    this.applySheetOps('color', ops, index);
+    return true;
+  }
+
+  /** The sheets that are hidden and can be shown from the menu of a tab (not the very hidden ones), by index. */
+  get hiddenSheets(): number[] {
+    const out: number[] = [];
+    this.workbook.sheets.forEach((sheet, index) => {
+      if (sheet.state === 'hidden') out.push(index);
+    });
+    return out;
+  }
+
+  /** Opens the list of the hidden sheets at a point of the root: choosing one shows it. */
+  private openHiddenSheets(x: number, y: number, back: () => void): void {
+    const items: MenuItem[] = this.hiddenSheets.map((index) => {
+      const sheet = this.workbook.sheets[index];
+      // The name of a sheet is text of the file: the menu only ever shows it as text.
+      return { label: sheet.name, action: () => this.attempt(() => void (this.workbook.sheets.indexOf(sheet) >= 0 && this.setSheetState(this.workbook.sheets.indexOf(sheet), 'visible'))) };
+    });
+    if (items.length === 0) return;
+    this.menu = new ContextMenu(this.root, items, x, y, () => {
+      this.menu = undefined;
+      if (!this.destroyed) back();
+    });
+    this.menu.element.setAttribute('aria-label', this.strings.hiddenSheets);
+  }
+
+  /** Opens the palette of the colour of a tab under the tab. */
+  private openTabColors(sheet: Sheet, back: () => void): void {
+    const tab = this.tabOf(this.workbook.sheets.indexOf(sheet));
+    if (!tab) return;
+    const current = resolveColor(sheet.tabColor, this.workbook.styles);
+    const apply = (color: string | undefined) => () => {
+      this.attempt(() => {
+        const index = this.workbook.sheets.indexOf(sheet);
+        if (index >= 0) this.setTabColor(index, color);
+      });
+      // The tabs were built again: back to the tab the palette belonged to, or to the cells.
+      back();
+    };
+    const swatches: PopoverItem[] = [];
+    for (let i = 0; i < PALETTE.length; i++) {
+      const hex = `#${PALETTE[i]}`;
+      swatches.push({ label: hex, swatch: hex, value: hex, selected: current !== undefined && current.toUpperCase() === hex, action: apply(hex) });
+    }
+    this.tabPopover = new Popover({
+      parent: this.root,
+      anchor: tab,
+      label: this.strings.tabColor,
+      items: [{ label: this.strings.noTabColor, action: apply(undefined) }],
+      swatches,
+      columns: PALETTE_COLUMNS,
+      onClose: (reason) => {
+        this.tabPopover = undefined;
+        // A colour that was chosen gives the focus back itself, once the tabs are built again; a press elsewhere took it along.
+        if (!this.destroyed && (reason === 'escape' || reason === 'tab')) back();
+      },
+    });
   }
 
   /**
@@ -1983,8 +2160,61 @@ export class WorkbookView {
     const strings = this.strings;
     const renameProblem = canRenameSheet(this.workbook, index);
     const deleteProblem = canDeleteSheet(this.workbook, index);
+    const copyProblem = canCopySheet(this.workbook, index);
+    const hideProblem = canHideSheet(this.workbook, index);
     // The menu closes before an item acts, but the list of sheets is looked at again all the same.
     const at = () => this.workbook.sheets.indexOf(sheet);
+    const blocked = (problem: string | undefined) =>
+      problem === undefined ? {} : { disabled: true, title: this.localizeError(problem), explain: () => this.notify(this.localizeError(problem), 'error') };
+    // The tab beside this one on either side, among the sheets that have a tab.
+    const beside = (step: number): number => {
+      const sheets = this.workbook.sheets;
+      for (let i = at() + step; at() >= 0 && i >= 0 && i < sheets.length; i += step) if (sheets[i].state === 'visible') return i;
+      return -1;
+    };
+    const backToTab = () => {
+      const tab = at() >= 0 ? this.tabOf(at()) : undefined;
+      if (tab && keyboard) tab.focus({ preventScroll: true });
+      else this.focusInput(true);
+    };
+    const more: MenuItem[] = [
+      {
+        label: strings.duplicateSheet,
+        ...blocked(copyProblem),
+        action: () =>
+          this.attempt(() => {
+            if (at() >= 0) this.copySheet(at());
+          }),
+      },
+      { label: '', separator: true },
+      {
+        label: strings.moveSheetLeft,
+        disabled: beside(-1) < 0,
+        action: () =>
+          this.attempt(() => {
+            if (beside(-1) >= 0) this.moveSheet(at(), beside(-1));
+          }),
+      },
+      {
+        label: strings.moveSheetRight,
+        disabled: beside(1) < 0,
+        action: () =>
+          this.attempt(() => {
+            if (beside(1) >= 0) this.moveSheet(at(), beside(1));
+          }),
+      },
+      { label: '', separator: true },
+      {
+        label: strings.hideSheet,
+        ...blocked(hideProblem),
+        action: () =>
+          this.attempt(() => {
+            if (at() >= 0) this.setSheetState(at(), 'hidden');
+          }),
+      },
+    ];
+    if (this.hiddenSheets.length > 0) more.push({ label: strings.unhideSheet, action: () => this.openHiddenSheets(x, y, backToTab) });
+    if (sheet.kind === 'worksheet') more.push({ label: strings.tabColor, action: () => this.openTabColors(sheet, backToTab) });
     const items: MenuItem[] = [
       {
         label: strings.insertSheet,
@@ -2013,6 +2243,7 @@ export class WorkbookView {
             if (at() >= 0) this.deleteSheet(at());
           }),
       },
+      ...more,
     ];
     this.menu = new ContextMenu(
       this.root,
@@ -2022,7 +2253,8 @@ export class WorkbookView {
       () => {
         this.menu = undefined;
         if (this.destroyed) return;
-        // Opened from the keyboard on a tab: back to that tab. Otherwise to the cells.
+        // Opened from the keyboard on a tab: back to that tab. Otherwise to the cells. (An item that opens a
+        // list of its own - the hidden sheets, the colours - takes the focus from there right after.)
         const tab = keyboard && at() >= 0 ? this.tabOf(at()) : undefined;
         if (tab) tab.focus({ preventScroll: true });
         else this.focusInput(true);
@@ -2112,6 +2344,8 @@ export class WorkbookView {
   };
 
   private onTabPointerDown = (event: PointerEvent): void => {
+    // Whatever an earlier press left behind (its end was never heard of) is over.
+    this.endTabDrag();
     this.clearTabPress();
     this.swallowTabClick = false;
     this.renameTarget = undefined;
@@ -2120,12 +2354,36 @@ export class WorkbookView {
     if (index < 0) return;
     // A name is being typed: the field closes when this press takes the focus, and the tabs move under the pointer.
     if (this.renaming) this.renameTarget = this.workbook.sheets[index];
-    if (event.pointerType !== 'touch' || this.formulaEdit()) return;
+    // The list of sheets stays as it is while a formula is typed.
+    if (this.formulaEdit()) return;
+    if (event.pointerType !== 'touch') {
+      // The main button on a tab: the tab is dragged once the pointer goes far enough.
+      if (event.button === 0 && !this.renaming && (event.target as HTMLElement).classList.contains('bym-tab')) {
+        this.tabDrag = { pointerId: event.pointerId, sheet: this.workbook.sheets[index], x: event.clientX, touch: false, started: false, gap: -1, lastX: event.clientX };
+        this.watchTabDrag();
+      }
+      return;
+    }
     this.tabPress = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, sheet: this.workbook.sheets[index], scroll: this.tabs.scrollLeft };
     this.tabPressTimer = window.setTimeout(this.onTabLongPress, LONG_PRESS_MS);
   };
 
   private onTabPointerMove = (event: PointerEvent): void => {
+    const drag = this.tabDrag;
+    if (drag && drag.pointerId === event.pointerId) {
+      // The button was let go where the strip did not hear of it (outside the window, say).
+      if (!drag.touch && (event.buttons & 1) === 0) {
+        this.endTabDrag();
+        return;
+      }
+      if (!drag.started && Math.abs(event.clientX - drag.x) > TAB_DRAG_SLOP) this.startTabDrag(drag);
+      if (drag.started) {
+        event.preventDefault();
+        drag.lastX = event.clientX;
+        this.moveTabDrag(drag);
+      }
+      return;
+    }
     const press = this.tabPress;
     if (!press || press.pointerId !== event.pointerId) return;
     // A finger that moves scrolls the tabs.
@@ -2133,9 +2391,164 @@ export class WorkbookView {
   };
 
   private onTabPointerEnd = (event: PointerEvent): void => {
+    const drag = this.tabDrag;
+    if (drag && drag.pointerId === event.pointerId) {
+      const started = drag.started;
+      const gap = drag.gap;
+      this.endTabDrag();
+      if (started) {
+        // Letting go is not a click on whatever tab is under the pointer now.
+        this.swallowTabClick = true;
+        this.clearTabPress();
+        const from = this.workbook.sheets.indexOf(drag.sheet);
+        const to = event.type === 'pointerup' && from >= 0 ? dropIndex(this.visibleSheets(), from, gap) : undefined;
+        if (to !== undefined) this.attempt(() => void this.moveSheet(from, to));
+        return;
+      }
+    }
     const press = this.tabPress;
     if (press && press.pointerId === event.pointerId) this.clearTabPress();
   };
+
+  /** A finger that drags a tab must not scroll the strip: the browser asks here before it does. */
+  private onTabTouchMove = (event: TouchEvent): void => {
+    if (this.tabDrag && this.tabDrag.touch && event.cancelable) event.preventDefault();
+  };
+
+  /** The indexes of the sheets that have a tab, in order. */
+  private visibleSheets(): number[] {
+    const out: number[] = [];
+    this.workbook.sheets.forEach((sheet, index) => {
+      if (sheet.state === 'visible') out.push(index);
+    });
+    return out;
+  }
+
+  private startTabDrag(drag: NonNullable<WorkbookView['tabDrag']>): void {
+    // The menu a long press opened gives way: the finger went on to drag the tab.
+    if (drag.touch) this.closeMenu();
+    if (this.destroyed || this.locked || this.formulaEdit() || this.workbook.sheets.indexOf(drag.sheet) < 0 || !this.tryCommit()) {
+      this.endTabDrag();
+      return;
+    }
+    this.finishRename(true, true);
+    drag.started = true;
+    try {
+      // The strip goes on hearing of the pointer wherever it goes.
+      this.tabs.setPointerCapture(drag.pointerId);
+    } catch (error) {
+      // A pointer that is gone already; its end is all that is left to come.
+    }
+    const mark = document.createElement('div');
+    mark.className = 'bym-tab-drop';
+    mark.setAttribute('role', 'none');
+    mark.style.cssText = 'position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:#1a73e8;pointer-events:none;z-index:1';
+    if (getComputedStyle(this.tabs).position === 'static') this.tabs.style.position = 'relative';
+    this.tabs.appendChild(mark);
+    this.tabDropMark = mark;
+    const tab = this.tabOf(this.workbook.sheets.indexOf(drag.sheet));
+    if (tab) tab.setAttribute('data-dragging', 'true');
+    this.tabs.style.cursor = 'grabbing';
+  }
+
+  /** Places the mark of a dragged tab by where its pointer is, and scrolls the strip while the pointer is at one of its ends. */
+  private moveTabDrag(drag: NonNullable<WorkbookView['tabDrag']>): void {
+    const strip = this.tabs.getBoundingClientRect();
+    const visible = this.visibleSheets();
+    let gap = visible.length;
+    let left = 0;
+    for (let i = 0; i < visible.length; i++) {
+      const tab = this.tabOf(visible[i]);
+      if (!tab) continue;
+      const rect = tab.getBoundingClientRect();
+      left = tab.offsetLeft + tab.offsetWidth;
+      if (drag.lastX < rect.left + rect.width / 2) {
+        gap = i;
+        left = tab.offsetLeft;
+        break;
+      }
+    }
+    drag.gap = gap;
+    if (this.tabDropMark) this.tabDropMark.style.left = `${left}px`;
+    const edge = drag.lastX < strip.left + TAB_SCROLL_EDGE ? -1 : drag.lastX > strip.right - TAB_SCROLL_EDGE ? 1 : 0;
+    if (edge === 0) {
+      if (this.tabDragTimer) window.clearInterval(this.tabDragTimer);
+      this.tabDragTimer = 0;
+    } else if (!this.tabDragTimer) {
+      this.tabDragTimer = window.setInterval(() => {
+        const current = this.tabDrag;
+        if (this.destroyed || !current || !current.started) return;
+        const before = this.tabs.scrollLeft;
+        this.tabs.scrollLeft = before + (current.lastX < this.tabs.getBoundingClientRect().left + TAB_SCROLL_EDGE ? -TAB_SCROLL_STEP : TAB_SCROLL_STEP);
+        if (this.tabs.scrollLeft !== before) this.moveTabDrag(current);
+      }, TAB_SCROLL_MS);
+    }
+  }
+
+  /**
+   * While a tab may be dragged, the end of its pointer is listened for on the window as well (a button
+   * let go beside the strip is not heard of by the strip), and so is Escape, which gives the drag up.
+   */
+  private watchTabDrag(): void {
+    if (this.tabDragWatched) return;
+    this.tabDragWatched = true;
+    window.addEventListener('pointerup', this.onTabDragEnd, true);
+    window.addEventListener('pointercancel', this.onTabDragEnd, true);
+    window.addEventListener('keydown', this.onTabDragKey, true);
+    window.addEventListener('blur', this.onTabDragBlur);
+  }
+
+  /** The end of a pointer anywhere in the window: one the strip does not hear of itself ends the drag, and moves nothing. */
+  private onTabDragEnd = (event: PointerEvent): void => {
+    const drag = this.tabDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const target = event.target as Node | null;
+    // On the strip (always so once the pointer is captured): its own listener decides what the end means.
+    if (target && (target === this.tabs || this.tabs.contains(target))) return;
+    this.endTabDrag();
+  };
+
+  private onTabDragKey = (event: KeyboardEvent): void => {
+    const drag = this.tabDrag;
+    if (!drag || !drag.started || event.key !== 'Escape') return;
+    // The key gives the drag up and does nothing else.
+    event.preventDefault();
+    event.stopPropagation();
+    this.endTabDrag();
+    // Letting go afterwards is not a click on a tab.
+    this.swallowTabClick = true;
+  };
+
+  private onTabDragBlur = (): void => {
+    this.endTabDrag();
+  };
+
+  /** Ends the drag of a tab, whichever way: the mark goes, the strip is as it was. Moves nothing. */
+  private endTabDrag(): void {
+    const drag = this.tabDrag;
+    this.tabDrag = undefined;
+    if (this.tabDragTimer) window.clearInterval(this.tabDragTimer);
+    this.tabDragTimer = 0;
+    if (this.tabDragWatched) {
+      this.tabDragWatched = false;
+      window.removeEventListener('pointerup', this.onTabDragEnd, true);
+      window.removeEventListener('pointercancel', this.onTabDragEnd, true);
+      window.removeEventListener('keydown', this.onTabDragKey, true);
+      window.removeEventListener('blur', this.onTabDragBlur);
+    }
+    if (this.tabDropMark && this.tabDropMark.parentNode) this.tabDropMark.parentNode.removeChild(this.tabDropMark);
+    this.tabDropMark = undefined;
+    // Whatever a drag set, whether or not this call knows of one.
+    if (this.tabs.style.cursor !== '') this.tabs.style.cursor = '';
+    const tabs = this.tabs.children;
+    for (let i = 0; i < tabs.length; i++) if (tabs[i].hasAttribute('data-dragging')) tabs[i].removeAttribute('data-dragging');
+    if (!drag || !drag.started) return;
+    try {
+      this.tabs.releasePointerCapture(drag.pointerId);
+    } catch (error) {
+      // Released already.
+    }
+  }
 
   private onTabLongPress = (): void => {
     this.tabPressTimer = 0;
@@ -2147,6 +2560,12 @@ export class WorkbookView {
     this.attempt(() => {
       if (this.openTabMenu(index, point.x, point.y, false)) this.swallowTabClick = true;
     });
+    // The finger is still down: lifted where it is, the menu stays; moved on from here, it drags the tab
+    // and the menu gives way (see startTabDrag()).
+    if (!this.locked && this.workbook.sheets.indexOf(press.sheet) >= 0) {
+      this.tabDrag = { pointerId: press.pointerId, sheet: press.sheet, x: press.x, touch: true, started: false, gap: -1, lastX: press.x };
+      this.watchTabDrag();
+    }
   };
 
   private clearTabPressTimer(): void {
@@ -2157,6 +2576,8 @@ export class WorkbookView {
   private clearTabPress(): void {
     this.clearTabPressTimer();
     this.tabPress = undefined;
+    // A drag that has not begun goes with the press it would have come from.
+    if (this.tabDrag && !this.tabDrag.started) this.tabDrag = undefined;
   }
 
   private onAddClick = (event: MouseEvent): void => {
@@ -3717,6 +4138,7 @@ export class WorkbookView {
     if (message === 'The range is too large to copy') return strings.copyTooLarge;
     if (message === 'There is no data to filter') return strings.nothingToFilter;
     if (message === 'Cannot sort a range that contains merged cells') return strings.cannotSortMerged;
+    if (message === 'Cannot sort a range that contains threaded comments') return strings.cannotSortThreaded;
     if ((match = /^Cannot sort through the array formula in (.+)$/.exec(message))) return strings.cannotSortArray(match[1]);
     if ((match = /^Cannot (sort|filter) in a sheet with (.+): not supported yet$/.exec(message))) return strings.sortNotSupportedWith(match[1] as 'sort' | 'filter', match[2]);
     if ((match = /^Cannot change the comment in (.+): it is a threaded comment$/.exec(message))) return strings.noteThreaded(match[1]);
@@ -3906,6 +4328,7 @@ export class WorkbookView {
     const next = readOnly === true;
     if (this.destroyed || next === this.locked) return;
     if (next) {
+      this.endTabDrag();
       this.commitEditing();
       this.finishRename(true, true);
       this.finishNote(true, true);
@@ -3971,7 +4394,8 @@ export class WorkbookView {
     if (!this.destroyed && !this.locked) this.commitEditing();
     const copied = this.copy();
     if (!this.destroyed && !this.locked) {
-      this.applyOps(clearRange(this.workbook, this.sheetIndex, this.state().range));
+      // The notes of the cells go with them, as one step: a paste of this copy puts them where the cells go.
+      this.applyOps(cutRange(this.workbook, this.sheetIndex, this.state().range));
     }
     return copied;
   }
@@ -3994,6 +4418,8 @@ export class WorkbookView {
     const result = pasteAt(this.workbook, this.sheetIndex, state.range, value, own ? this.copied : undefined, { locale: this.locale });
     const after = { active: { row: result.range.top, col: result.range.left }, range: result.range };
     if (!this.applyOps(result.ops, after)) this.restoreSelection(after);
+    // The cells were pasted; notes that could not go with them are said, not refused.
+    if (result.skippedNotes) this.notifyLater(this.strings.notesNotPasted(result.skippedNotes));
   }
 
   insertRows(at: number, count: number): void {
@@ -4179,6 +4605,8 @@ export class WorkbookView {
 
   private travel(redo: boolean): boolean {
     if (this.destroyed || this.locked) return false;
+    // A tab that is being dragged is let go where it was: the step may change the list it was dragged in.
+    this.endTabDrag();
     if (this.edit) {
       this.cancelEditing();
       return true;
@@ -4848,6 +5276,7 @@ export class WorkbookView {
   private closeMenu(): void {
     if (this.menu) this.menu.close();
     if (this.panel) this.panel.close();
+    if (this.tabPopover) this.tabPopover.close('owner');
   }
 
   /**

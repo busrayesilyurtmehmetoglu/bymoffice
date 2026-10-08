@@ -142,6 +142,56 @@ function fake(config: FakeOptions = {}): Fake {
       apply(sheets, active > index ? active - 1 : Math.min(active, sheets.length - 1));
       return true;
     };
+    view.moveSheet = (from: number, to: number): boolean => {
+      state.calls.push(`moveSheet ${from} ${to}`);
+      if (state.readOnly) return false;
+      view.commitEditing();
+      if (from === to) return false;
+      const sheets = book.sheets.slice();
+      sheets.splice(to, 0, sheets.splice(from, 1)[0]);
+      apply(sheets, sheets.indexOf(book.sheets[active]));
+      return true;
+    };
+    view.setSheetState = (index: number, value: string): boolean => {
+      state.calls.push(`setSheetState ${index} ${value}`);
+      if (state.readOnly) return false;
+      view.commitEditing();
+      if (book.sheets[index].state === value) return false;
+      if (value !== 'visible' && book.sheets.filter((entry) => entry.state === 'visible').length === 1 && book.sheets[index].state === 'visible') refuse('The last visible sheet cannot be hidden');
+      apply(
+        book.sheets.map((entry, at) => (at === index ? { ...entry, state: value } : entry)),
+        active,
+      );
+      return true;
+    };
+    view.copySheet = (index: number, given: { at?: number; name?: string } = {}): number => {
+      state.calls.push(`copySheet ${index} ${JSON.stringify(given)}`);
+      if (state.readOnly) return -1;
+      view.commitEditing();
+      const at = given.at === undefined ? index + 1 : given.at;
+      const title = given.name === undefined ? `${book.sheets[index].name} (2)` : given.name;
+      if (book.sheets.some((entry) => entry.name === title)) refuse(`Another sheet is called "${title}"`);
+      const sheets = book.sheets.slice();
+      sheets.splice(at, 0, sheet(title));
+      apply(sheets, at);
+      return at;
+    };
+    view.setTabColor = (index: number, color: string | undefined): boolean => {
+      state.calls.push(`setTabColor ${index} ${color}`);
+      if (state.readOnly) return false;
+      view.commitEditing();
+      apply(
+        book.sheets.map((entry, at) => {
+          if (at !== index) return entry;
+          const next: any = { ...entry };
+          if (color === undefined) delete next.tabColor;
+          else next.tabColor = { rgb: `FF${color.slice(1).toUpperCase()}` };
+          return next;
+        }),
+        active,
+      );
+      return true;
+    };
   }
   state.host = {
     container: {} as HTMLElement,
@@ -502,4 +552,83 @@ test('review 2: save applies what is being typed through commitPending, and save
     f.take().map((message) => [message.type, message.id, message.code]),
     [['error', 'u', 'save-failed']],
   );
+});
+
+test('bridge sheets: moveSheet, setSheetState, copySheet and setTabColor go through the view, send the list and are confirmed', async () => {
+  const f = await loaded();
+  await f.bridge.receive({ type: 'moveSheet', id: 'm', from: 0, to: 2 });
+  assert.deepEqual(f.take(), [
+    { type: 'sheets', sheets: [sheet('Hidden', 'hidden'), sheet('Notes'), sheet('Data')], activeSheet: 2 },
+    { type: 'sheet', index: 2, name: 'Data' },
+    { type: 'changed', sheets: [0, 1, 2], canUndo: false, canRedo: false },
+    { type: 'done', id: 'm', command: 'moveSheet' },
+  ]);
+  await f.bridge.receive({ type: 'setSheetState', id: 's', index: 0, state: 'visible' });
+  assert.deepEqual(f.take(), [
+    { type: 'sheets', sheets: [sheet('Hidden'), sheet('Notes'), sheet('Data')], activeSheet: 2 },
+    { type: 'changed', sheets: [0, 1, 2], canUndo: false, canRedo: false },
+    { type: 'done', id: 's', command: 'setSheetState' },
+  ]);
+  await f.bridge.receive({ type: 'copySheet', id: 'c', index: 1 });
+  assert.deepEqual(f.take(), [
+    { type: 'sheets', sheets: [sheet('Hidden'), sheet('Notes'), sheet('Notes (2)'), sheet('Data')], activeSheet: 2 },
+    { type: 'changed', sheets: [0, 1, 2, 3], canUndo: false, canRedo: false },
+    { type: 'done', id: 'c', command: 'copySheet', index: 2, name: 'Notes (2)' },
+  ]);
+  await f.bridge.receive({ type: 'copySheet', id: 'c2', index: 0, at: 4, name: 'Last' });
+  assert.deepEqual(f.take().pop(), { type: 'done', id: 'c2', command: 'copySheet', index: 4, name: 'Last' });
+  // The colour of a tab is part of the list, as a CSS colour, for the sheets that have one.
+  await f.bridge.receive({ type: 'setTabColor', id: 't', index: 0, color: '#ff8800' });
+  const told = f.take();
+  assert.deepEqual(told[0].sheets[0], { name: 'Hidden', state: 'visible', kind: 'worksheet', tabColor: '#FF8800' });
+  assert.equal(told[0].sheets[1].tabColor, undefined);
+  assert.deepEqual(told[told.length - 1], { type: 'done', id: 't', command: 'setTabColor' });
+  await f.bridge.receive({ type: 'setTabColor', id: 't2', index: 0, color: null });
+  assert.equal(f.take()[0].sheets[0].tabColor, undefined);
+  assert.deepEqual(f.calls.filter((call) => /^(move|setSheet|copy|setTab)/.test(call)), ['moveSheet 0 2', 'setSheetState 0 visible', 'copySheet 1 {}', 'copySheet 0 {"at":4,"name":"Last"}', 'setTabColor 0 #ff8800', 'setTabColor 0 undefined']);
+});
+
+test('bridge sheets: the new commands refuse what is not in the contract, an index no sheet has, a read-only view and what the view refuses', async () => {
+  const f = await loaded();
+  const bad: [Record<string, unknown>, RegExp][] = [
+    [{ type: 'moveSheet', to: 1 }, /"from" is missing/],
+    [{ type: 'moveSheet', from: 0 }, /"to" is missing/],
+    [{ type: 'moveSheet', from: 0, to: 1.5 }, /"to" must be a sheet index/],
+    [{ type: 'setSheetState', index: 0 }, /"state" is missing/],
+    [{ type: 'setSheetState', index: 0, state: 'gone' }, /"state" must be "visible", "hidden" or "veryHidden"/],
+    [{ type: 'copySheet' }, /"index" is missing/],
+    [{ type: 'copySheet', index: 0, name: 7 }, /"name" must be a string/],
+    [{ type: 'setTabColor', index: 0, color: 'red' }, /"color" must be written #RRGGBB/],
+    [{ type: 'setTabColor', index: 0, color: 7 }, /"color" must be a string/],
+  ];
+  for (const [message, reason] of bad) {
+    await f.bridge.receive({ ...message, id: 'x' });
+    const answer = f.take();
+    assert.equal(answer.length, 1, JSON.stringify(message));
+    assert.equal(answer[0].code, 'bad-message', JSON.stringify(message));
+    assert.match(answer[0].message, reason);
+  }
+  assert.deepEqual(f.calls.filter((call) => /^(move|setSheet|copy|setTab)/.test(call)), []);
+  await f.bridge.receive({ type: 'moveSheet', id: 'a', from: 3, to: 0 });
+  await f.bridge.receive({ type: 'moveSheet', id: 'b', from: 0, to: 3 });
+  await f.bridge.receive({ type: 'copySheet', id: 'c', index: 0, at: 4 });
+  assert.deepEqual(f.take().map((message) => message.code), ['no-sheet', 'no-sheet', 'no-sheet']);
+  await f.bridge.receive({ type: 'setSheetState', id: 'd', index: 2, state: 'hidden' });
+  f.take();
+  await f.bridge.receive({ type: 'setSheetState', id: 'e', index: 0, state: 'hidden' });
+  assert.deepEqual(f.take(), [{ type: 'error', id: 'e', code: 'sheet-refused', message: 'Localized: The last visible sheet cannot be hidden' }]);
+  await f.bridge.receive({ type: 'copySheet', id: 'f', index: 0, name: 'Notes' });
+  assert.deepEqual(f.take(), [{ type: 'error', id: 'f', code: 'sheet-refused', message: 'Localized: Another sheet is called "Notes"' }]);
+
+  const locked = await loaded({}, { readOnly: true });
+  for (const message of [{ type: 'moveSheet', from: 0, to: 1 }, { type: 'setSheetState', index: 0, state: 'hidden' }, { type: 'copySheet', index: 0 }, { type: 'setTabColor', index: 0, color: '#000000' }]) {
+    await locked.bridge.receive({ ...message, id: 'r' });
+    assert.deepEqual(locked.take().map((answer) => answer.code), ['read-only'], message.type);
+  }
+  const bare = await loaded({ bare: true });
+  await bare.bridge.receive({ type: 'moveSheet', id: 'g', from: 0, to: 1 });
+  assert.deepEqual(bare.take().map((answer) => answer.code), ['sheet-refused']);
+  const none = fake();
+  await none.bridge.receive({ type: 'setTabColor', id: 'h', index: 0 });
+  assert.equal(none.take().pop().code, 'not-loaded');
 });

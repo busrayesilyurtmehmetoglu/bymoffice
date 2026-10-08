@@ -296,6 +296,29 @@ class BymOfficeController {
   Future<void> renameSheet(int index, String name) => _request(<String, dynamic>{'type': 'renameSheet', 'index': index, 'name': name});
   Future<void> deleteSheet(int index) => _request(<String, dynamic>{'type': 'deleteSheet', 'index': index});
 
+  // NOT COMPILED: the four commands below were written against the contract
+  // (docs/webview-koprusu.md) and have not been built or run with Flutter.
+
+  /// Moves the sheet at [from] so that it is sheet number [to].
+  Future<void> moveSheet(int from, int to) => _request(<String, dynamic>{'type': 'moveSheet', 'from': from, 'to': to});
+
+  /// Shows or hides a sheet: [state] is "visible", "hidden" or "veryHidden".
+  Future<void> setSheetState(int index, String state) => _request(<String, dynamic>{'type': 'setSheetState', 'index': index, 'state': state});
+
+  /// Copies a sheet and shows the copy; completes with the index of the copy.
+  Future<int> copySheet(int index, {int? at, String? name}) async {
+    final Map<String, dynamic> answer = await _request(<String, dynamic>{
+      'type': 'copySheet',
+      'index': index,
+      if (at != null) 'at': at,
+      if (name != null) 'name': name,
+    });
+    return (answer['index'] as num).toInt();
+  }
+
+  /// Sets the colour of a tab ("#RRGGBB"); null removes it.
+  Future<void> setTabColor(int index, String? color) => _request(<String, dynamic>{'type': 'setTabColor', 'index': index, 'color': color});
+
   /// Closes the file in the page, detaches from the WebView and fails whatever
   /// is still waiting. Requests made afterwards fail at once.
   void dispose() {

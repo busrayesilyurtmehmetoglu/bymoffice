@@ -639,6 +639,14 @@ export interface SheetComment {
    * file whose text is edited stays a comment of the file: only its text is another.)
    */
   since?: number;
+  /**
+   * Set, together with `since`, on a comment of the file that a sort moved with its row: the
+   * cell the file has the comment on. `row`, `col` and `box` are then where the comment was put
+   * (after `since` structural edits), like those of a note added since; the writer still knows
+   * the comment of the file by this cell and writes it with its new one. A note added since
+   * has none, however often it is sorted.
+   */
+  from?: { row: number; col: number };
 }
 
 /** The margins of the printed page, in inches (<pageMargins>). `header` and `footer` are the distances of the header and the footer from the edge of the paper. */
@@ -820,6 +828,26 @@ export interface Sheet {
   baseColWidth?: number;
   view: SheetView;
   tabColor?: Color;
+  /** The colour of the tab was changed ("setTabColor"); the writer brings <tabColor> of the sheet part in line with the model. Set on its own, without `modified`. */
+  tabColorModified?: boolean;
+  /** The colour the tab had before it was first changed (none: `color` undefined). Set with `tabColorModified`. */
+  tabColorRead?: { color: Color | undefined };
+  /**
+   * How the sheet is protected (<sheetProtection>), and the ranges that are open in a
+   * protected sheet (<protectedRanges>), as the file states them. Not applied and not changed
+   * by edits: a save of the file copies the source elements; a copy of the sheet and a file
+   * built from the model get them from here.
+   */
+  protection?: SheetProtection;
+  /**
+   * Local names of what the sheet part holds beside what the model has a field for, one entry
+   * per element (or attribute) found: "sortState", "customSheetViews", "ignoredErrors",
+   * "cellWatches", "phoneticPr", "sparklineGroups" (of the extension list), "outlinePr" and
+   * "codeName" (of <sheetPr>), "outlineLevels" (of <sheetFormatPr>), ... Names only: the content
+   * stays in the part and is written back from there. A copy of the sheet does not get it,
+   * which is what the list is for (see copySheetLosses()).
+   */
+  unmodelled?: string[];
   /**
    * Conditional formats as the file has them. They are not changed by edits: rows and
    * columns inserted or deleted since (structuralEdits) are applied where they are evaluated.
@@ -892,6 +920,14 @@ export interface Sheet {
   warnings?: string[];
 }
 
+/** <sheetProtection> and <protectedRanges> of a sheet: attributes as the file has them, never interpreted. */
+export interface SheetProtection {
+  /** The attributes of <sheetProtection> (flags, and the hash of a password); missing for a sheet with ranges alone. */
+  attrs?: [name: string, value: string][];
+  /** One entry per <protectedRange>: its attributes, and the texts of its <securityDescriptor> children. */
+  ranges?: { attrs: [name: string, value: string][]; descriptors?: string[] }[];
+}
+
 export interface SheetStructuralEdit {
   kind: 'insert' | 'delete';
   axis: 'row' | 'col';
@@ -920,9 +956,10 @@ export interface Workbook {
   /** The pictures of the workbook's drawings, by DrawingPicture.media. */
   media?: WorkbookMedia;
   /**
-   * Set once a sheet was inserted, deleted or renamed after the workbook was read (and never
-   * cleared, not by undo either): the list of sheets, their names or the defined names may
-   * differ from the file, and the writer regenerates what holds them.
+   * Set once a sheet was inserted, deleted, renamed, moved, copied, hidden, shown or given
+   * another tab colour after the workbook was read (and never cleared, not by undo either): the
+   * list of sheets, their names, order and states or the defined names may differ from the
+   * file, and the writer regenerates what holds them.
    */
   sheetsModified?: boolean;
   /**

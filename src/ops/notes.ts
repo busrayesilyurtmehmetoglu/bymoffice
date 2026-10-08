@@ -26,7 +26,7 @@ export const DEFAULT_NOTE_AUTHOR = 'Author';
 /** Longest name of an author that is kept. */
 const MAX_AUTHOR = 255;
 /** Comments one sheet holds: as many as are read from a file. */
-const MAX_SHEET_NOTES = 100000;
+export const MAX_SHEET_NOTES = 100000;
 
 export interface NoteOptions {
   /** Who a new note is by. Default "Author". An existing note keeps its author when its text is edited. */
@@ -50,7 +50,7 @@ function noteCell(sheet: Sheet, row: number, col: number): { row: number; col: n
 }
 
 /** Where a comment of the model is now; undefined when its cell was deleted or is none. */
-function cellNow(sheet: Sheet, comment: SheetComment): { row: number; col: number } | undefined {
+export function cellNow(sheet: Sheet, comment: SheetComment): { row: number; col: number } | undefined {
   if (!comment || !(comment.row >= 0 && comment.row < MAX_ROWS && comment.col >= 0 && comment.col < MAX_COLS)) return undefined;
   const edits = sheet.structuralEdits;
   // Without edits a comment is where the model says; nothing is worked out for it.
@@ -169,4 +169,32 @@ export function setComment(workbook: Workbook, sheetIndex: number, row: number, 
     next = comments.concat([added]);
   }
   return [{ type: 'setComments', sheet: sheetIndex, comments: next.length > 0 ? next : undefined }];
+}
+
+/** Whether the notes of a sheet can be changed at all (see Sheet.notesBlocked). */
+export function notesBlocked(sheet: Sheet): boolean {
+  return sheet.notesBlocked !== undefined && Object.prototype.hasOwnProperty.call(BLOCKED, sheet.notesBlocked);
+}
+
+/**
+ * Deletes the notes on the cells of a range, as cutting the cells does: the notes go with
+ * what was cut. `rows` limits it to those rows of the range (the rows a filter shows).
+ * Threaded comments stay, and so does every note of a sheet whose notes cannot be changed:
+ * nothing is refused, and no operation is returned when no note goes.
+ */
+export function clearNotes(workbook: Workbook, sheetIndex: number, range: { top: number; left: number; bottom: number; right: number }, rows?: readonly number[]): Op[] {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet) throw new RangeError(`No sheet at index ${sheetIndex}`);
+  const comments = sheet.comments;
+  if (!comments || comments.length === 0 || sheet.kind !== 'worksheet' || notesBlocked(sheet)) return [];
+  const wanted = rows ? new Set(rows) : undefined;
+  const kept: SheetComment[] = [];
+  for (let i = 0; i < comments.length; i++) {
+    const comment = comments[i];
+    const cell = comment && !comment.threaded ? cellNow(sheet, comment) : undefined;
+    const inside = cell !== undefined && cell.row >= range.top && cell.row <= range.bottom && cell.col >= range.left && cell.col <= range.right && (!wanted || wanted.has(cell.row));
+    if (!inside) kept.push(comment);
+  }
+  if (kept.length === comments.length) return [];
+  return [{ type: 'setComments', sheet: sheetIndex, comments: kept.length > 0 ? kept : undefined }];
 }

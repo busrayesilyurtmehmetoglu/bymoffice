@@ -170,6 +170,27 @@ export interface UiStrings {
   insertSheet: string;
   renameSheet: string;
   deleteSheet: string;
+  /** More items of the menu of a tab. */
+  duplicateSheet: string;
+  moveSheetLeft: string;
+  moveSheetRight: string;
+  hideSheet: string;
+  /** Opens the list of the hidden sheets. */
+  unhideSheet: string;
+  /** Label of the list of the hidden sheets. */
+  hiddenSheets: string;
+  tabColor: string;
+  noTabColor: string;
+  /** Said when a tab that is dragged is let go: "Sheet Bir moved to place 2 of 3". */
+  sheetMoved(name: string, place: number, count: number): string;
+  /** Said after a sheet was copied without some of its content; `what` is the list copyLoss() made. */
+  sheetCopiedWithout(name: string, what: string): string;
+  /** One kind of content a copy of a sheet does not get, with its number: "2 conditional formats". */
+  copyLoss(what: string, count: number): string;
+  /** Said after a paste that left notes out (their cells have a conversation, or the notes of the sheet cannot be changed). */
+  notesNotPasted(count: number): string;
+  cannotHideLastSheet: string;
+  cannotSortThreaded: string;
   /** Label of the field a sheet is renamed in. */
   sheetName: string;
   /** Said after a sheet was deleted. */
@@ -183,7 +204,7 @@ export interface UiStrings {
   sheetNameTaken(name: string): string;
   cannotDeleteLastSheet: string;
   /** A chart sheet or a sheet of another kind that is only kept. */
-  sheetKindFixed(action: 'rename' | 'delete'): string;
+  sheetKindFixed(action: 'rename' | 'delete' | 'copy' | 'color'): string;
   /** `what` names the content in the way: chart, pivotTable, table, form controls. */
   sheetBlockedBy(action: 'rename' | 'delete', what: string): string;
   /** `where` is the cell or the name whose formula cannot be read. */
@@ -316,6 +337,43 @@ export const STRINGS_EN: UiStrings = {
   insertSheet: 'Insert sheet',
   renameSheet: 'Rename',
   deleteSheet: 'Delete',
+  duplicateSheet: 'Duplicate',
+  moveSheetLeft: 'Move left',
+  moveSheetRight: 'Move right',
+  hideSheet: 'Hide',
+  unhideSheet: 'Unhide\u2026',
+  hiddenSheets: 'Hidden sheets',
+  tabColor: 'Tab colour\u2026',
+  noTabColor: 'No colour',
+  sheetMoved: (name, place, count) => `Sheet ${name} moved to place ${place} of ${count}`,
+  sheetCopiedWithout: (name, what) => `Sheet ${name} was copied without: ${what}`,
+  copyLoss: (what, count) => {
+    const names: Record<string, [string, string]> = {
+      conditionalFormats: ['conditional format', 'conditional formats'],
+      dataValidations: ['data validation', 'data validations'],
+      drawings: ['picture or shape', 'pictures and shapes'],
+      threadedComments: ['threaded comment', 'threaded comments'],
+      externalLinks: ['link to another place', 'links to other places'],
+      pageBreaks: ['page break', 'page breaks'],
+      table: ['table', 'tables'],
+      pivotTable: ['pivot table', 'pivot tables'],
+      rowAttributes: ['row with settings of its own', 'rows with settings of their own'],
+      sparklineGroups: ['group of sparklines', 'groups of sparklines'],
+      customSheetViews: ['list of custom views', 'lists of custom views'],
+      ignoredErrors: ['list of ignored errors', 'lists of ignored errors'],
+      cellWatches: ['list of watched cells', 'lists of watched cells'],
+      sortState: ['sort setting', 'sort settings'],
+      phoneticPr: ['phonetic setting', 'phonetic settings'],
+      outlinePr: ['outline setting', 'outline settings'],
+      outlineLevels: ['setting of outline levels', 'settings of outline levels'],
+      codeName: ['code name', 'code names'],
+    };
+    const known = Object.prototype.hasOwnProperty.call(names, what) ? names[what] : undefined;
+    return known ? `${count} ${count === 1 ? known[0] : known[1]}` : what;
+  },
+  notesNotPasted: (count) => (count === 1 ? 'One note was not pasted: its cell cannot take a note' : `${count} notes were not pasted: their cells cannot take notes`),
+  cannotHideLastSheet: 'The last visible sheet cannot be hidden',
+  cannotSortThreaded: 'A range with a threaded comment cannot be sorted yet',
   sheetName: 'Sheet name',
   sheetDeleted: (name) => `Sheet ${name} was deleted. Undo brings it back.`,
   referenceAdded: (reference) => `Reference ${reference}`,
@@ -323,7 +381,7 @@ export const STRINGS_EN: UiStrings = {
   badSheetName: 'A sheet name has 1 to 31 characters, none of [ ] : * ? / \\, no apostrophe at its start or end, and is not "History"',
   sheetNameTaken: (name) => `Another sheet is already named "${name}"`,
   cannotDeleteLastSheet: 'The last visible sheet cannot be deleted',
-  sheetKindFixed: (action) => `This kind of sheet cannot be ${action === 'rename' ? 'renamed' : 'deleted'} yet`,
+  sheetKindFixed: (action) => `This kind of sheet cannot be ${action === 'rename' ? 'renamed' : action === 'copy' ? 'copied' : action === 'color' ? 'given a tab colour' : 'deleted'} yet`,
   sheetBlockedBy: (action, what) =>
     what === 'table'
       ? `A sheet with a table cannot be ${action === 'rename' ? 'renamed' : 'deleted'} yet`
@@ -463,6 +521,42 @@ export const STRINGS_TR: UiStrings = {
   insertSheet: 'Sayfa ekle',
   renameSheet: 'Yeniden adlandır',
   deleteSheet: 'Sil',
+  duplicateSheet: 'Kopyasını oluştur',
+  moveSheetLeft: 'Sola taşı',
+  moveSheetRight: 'Sağa taşı',
+  hideSheet: 'Gizle',
+  unhideSheet: 'Göster\u2026',
+  hiddenSheets: 'Gizli sayfalar',
+  tabColor: 'Sekme rengi\u2026',
+  noTabColor: 'Renk yok',
+  sheetMoved: (name, place, count) => `${name} sayfası ${count} sayfanın ${place}. sırasına taşındı`,
+  sheetCopiedWithout: (name, what) => `${name} sayfası kopyalandı; şunlar kopyalanmadı: ${what}`,
+  copyLoss: (what, count) => {
+    const names: Record<string, string> = {
+      conditionalFormats: 'koşullu biçim',
+      dataValidations: 'veri doğrulama',
+      drawings: 'görsel ya da şekil',
+      threadedComments: 'yorum zinciri',
+      externalLinks: 'dış bağlantı',
+      pageBreaks: 'sayfa sonu',
+      table: 'tablo',
+      pivotTable: 'pivot tablo',
+      rowAttributes: 'kendi ayarı olan satır',
+      sparklineGroups: 'mini grafik grubu',
+      customSheetViews: 'özel görünüm listesi',
+      ignoredErrors: 'yok sayılan hata listesi',
+      cellWatches: 'izlenen hücre listesi',
+      sortState: 'sıralama ayarı',
+      phoneticPr: 'fonetik ayarı',
+      outlinePr: 'anahat ayarı',
+      outlineLevels: 'anahat düzeyi ayarı',
+      codeName: 'kod adı',
+    };
+    return Object.prototype.hasOwnProperty.call(names, what) ? `${count} ${names[what]}` : what;
+  },
+  notesNotPasted: (count) => `${count} not yapıştırılmadı: hücresi not alamıyor`,
+  cannotHideLastSheet: 'Görünen son sayfa gizlenemez',
+  cannotSortThreaded: 'Yorum zinciri içeren aralık henüz sıralanamıyor',
   sheetName: 'Sayfa adı',
   sheetDeleted: (name) => `${name} sayfası silindi. Geri al ile geri gelir.`,
   referenceAdded: (reference) => `Başvuru ${reference}`,
@@ -470,7 +564,7 @@ export const STRINGS_TR: UiStrings = {
   badSheetName: 'Sayfa adı 1-31 karakter olmalı; [ ] : * ? / \\ içeremez, kesme işaretiyle başlayıp bitemez ve "History" olamaz',
   sheetNameTaken: (name) => `"${name}" adında başka bir sayfa var`,
   cannotDeleteLastSheet: 'Görünen son sayfa silinemez',
-  sheetKindFixed: (action) => `Bu tür sayfalar henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : 'silinemiyor'}`,
+  sheetKindFixed: (action) => `Bu tür sayfalar henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : action === 'copy' ? 'kopyalanamıyor' : action === 'color' ? 'renklendirilemiyor' : 'silinemiyor'}`,
   sheetBlockedBy: (action, what) =>
     what === 'table'
       ? `Tablo içeren sayfa henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : 'silinemiyor'}`
