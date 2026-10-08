@@ -114,6 +114,8 @@ test('validation: the reader takes type, operator, formulas, flags and messages;
     error: '1 to 10 only',
     formula1: '1',
     formula2: '10',
+    // Where the element is in the part.
+    src: 0,
   });
   assert.equal(rules[1].errorStyle, 'warning');
   assert.equal(rules[1].operator, 'greaterThan');

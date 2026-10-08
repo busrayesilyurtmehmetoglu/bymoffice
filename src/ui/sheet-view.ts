@@ -9,7 +9,7 @@
 
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { resolveUiStrings, type UiStrings } from './strings';
@@ -44,6 +44,42 @@ import {
 } from '../ops/filter';
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
 import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps } from '../ops/notes';
+import { hasDefinedName } from '../ops/commands';
+import {
+  CONDITIONAL_TYPES,
+  addConditionalRule as addConditionalRuleOps,
+  clearConditionalRules as clearConditionalRulesOps,
+  conditionalRules as conditionalRulesOf,
+  moveConditionalRule as moveConditionalRuleOps,
+  removeConditionalRule as removeConditionalRuleOps,
+  setValidation as setValidationOps,
+  subtractRanges,
+  updateConditionalRule as updateConditionalRuleOps,
+  validationProblem,
+  validationsIn,
+  type ConditionalPatch,
+  type ConditionalRuleInfo,
+  type ConditionalSettings,
+  type ValidationSettings,
+} from '../ops/rules';
+import {
+  ConditionalDialog,
+  ConditionalManager,
+  DIALOG_STYLE,
+  FieldError,
+  MAX_MANAGER_ROWS,
+  ValidationDialog,
+  validationChange,
+  conditionalFields,
+  conditionalFromFields,
+  conditionalPatch,
+  describeRule,
+  parseRangeList,
+  rangeListText,
+  validationFields,
+  validationFromFields,
+  type ManagerRow,
+} from './rules-dialog';
 import {
   canCopySheet,
   canDeleteSheet,
@@ -429,7 +465,8 @@ const STYLE_TEXT =
   '.bym-tab-input[aria-invalid="true"]{border-color:#d93025}' +
   // Text smaller than 16 px makes iOS zoom the page when a field takes the focus.
   '@media (pointer:coarse){.bym-tab-input{min-height:40px;font-size:16px}}' +
-  '.bym-note{color:#5f6368;font-size:14px}';
+  '.bym-note{color:#5f6368;font-size:14px}' +
+  DIALOG_STYLE;
 
 /** One style element per document or shadow root, shared by the views in it. */
 const styleUsers = new WeakMap<Node, { element: HTMLStyleElement; count: number }>();
@@ -771,6 +808,10 @@ export class WorkbookView {
   private hoverComment: CellPos | undefined;
   /** The note being typed: a field in the place of the box that shows the note of its cell. */
   private noteEdit: { sheet: Sheet; row: number; col: number; box: HTMLDivElement; input: HTMLTextAreaElement; original: string; busy: boolean } | undefined;
+  /** The dialog that is open over the view (data validation, conditional formats), with the sheet it is about. */
+  private rulesDialog: { sheet: Sheet; submit(): void; close(): void } | undefined;
+  /** Set while a dialog is closed by the view itself: it then does not hand over to the dialog it was opened from. */
+  private leavingDialog = false;
   /** Sheets about which it was said that some of their drawings or comments are not shown. */
   private warned = new WeakSet<Sheet>();
   /** The comment of this cell was put away with Escape; it stays away until another cell is active. */
@@ -1089,6 +1130,8 @@ export class WorkbookView {
   /** Changes the language of number and date formats, and of the view's own labels, and redraws. */
   setLocale(locale: string | FormatLocale): void {
     this.locale = resolveLocale(locale);
+    // What is typed into a dialog is typed the way the locale writes it: it is not read by another one.
+    if (this.rulesDialog) this.rulesDialog.close();
     this.validation.forEach((rules) => rules.setLocale(this.locale));
     // The view's own words follow a language tag; a locale object only changes formats.
     if (typeof locale === 'string') {
@@ -3298,6 +3341,345 @@ export class WorkbookView {
   }
 
   /**
+   * The data validation of a cell of the shown sheet as it applies now: its ranges where they
+   * are, its formulas (as files store them) written for the first cell of them. Undefined for
+   * a cell without a rule.
+   */
+  validationAt(row: number, col: number): DataValidation | undefined {
+    if (this.destroyed) return undefined;
+    const sheet = this.state().sheet;
+    const rules = sheet.kind === 'worksheet' ? this.validationOf(sheet) : undefined;
+    return rules ? rules.ruleAt(toIndex(row, MAX_ROWS), toIndex(col, MAX_COLS)) : undefined;
+  }
+
+  /**
+   * Sets the data validation of a range of the shown sheet, as one undo step: afterwards
+   * `rule` is the rule of every cell of the range. The cells are taken out of the rules they
+   * were in, which stay for their other cells. Without a rule (undefined, or "any value" with
+   * no input message) the cells are left without one. What is being typed is applied first.
+   * Does nothing in a read-only view. Throws RangeError for a rule that cannot be stated (see
+   * setValidation() of the operations) and for cells under a rule of the extension list.
+   */
+  setValidation(range: CellRange, rule: ValidationSettings | undefined): void {
+    if (this.destroyed || this.locked) return;
+    if (this.rulesDialog) this.rulesDialog.close();
+    if (!this.commitPending()) return;
+    this.applyOps(setValidationOps(this.workbook, this.sheetIndex, range, rule));
+  }
+
+  /**
+   * Opens the dialog that sets the data validation of the selection. It shows the rule the
+   * active cell has; OK makes what it says the rule of every selected cell, as one undo step.
+   * What is being typed is applied first. Returns false when there is no dialog: a read-only
+   * view, a sheet without cells, a formula that is being typed, something typed that cannot
+   * be applied, or cells whose rule cannot be changed (said in the live region and to onNotice).
+   */
+  openValidationDialog(): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (this.state().sheet.kind !== 'worksheet') return false;
+    if (this.formulaEdit()) {
+      this.notify(this.strings.rules.formulaBeingTyped, 'error');
+      return false;
+    }
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    this.finishRename(true);
+    this.finishNote(true);
+    if (this.edit || this.renaming || this.noteEdit) return false;
+    const state = this.state();
+    const sheet = state.sheet;
+    const range = { ...state.range };
+    const strings = this.strings;
+    try {
+      const problem = validationProblem(this.workbook, this.sheetIndex, range);
+      if (problem) throw new RangeError(problem);
+    } catch (error) {
+      this.notify(this.localizeError(error), 'error');
+      return false;
+    }
+    const date1904 = this.workbook.date1904 === true;
+    const found = validationsIn(this.workbook, this.sheetIndex, range);
+    // One rule that has every cell of the selection is what the dialog shows; anything else is said.
+    const mixed = found.length > 1 || (found.length === 1 && subtractRanges([range], found[0].ranges).length > 0);
+    const shown = this.validationAt(state.active.row, state.active.col) || found[0];
+    const initial = validationFields(shown, this.locale, date1904);
+    const apply = (rule: ValidationSettings | undefined) => {
+      // The dialog belongs to the sheet it was opened on.
+      if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
+      const had = validationsIn(this.workbook, this.sheetIndex, range).length > 0;
+      const done = this.applyOps(setValidationOps(this.workbook, this.sheetIndex, range, rule));
+      if (!done) return;
+      const left = validationsIn(this.workbook, this.sheetIndex, range).length > 0;
+      this.live.textContent = left ? strings.rules.validationSet : had ? strings.rules.validationCleared : '';
+    };
+    const dialog = new ValidationDialog({
+      parent: this.options.focusScope || this.root,
+      strings: strings.rules,
+      locale: this.locale,
+      fields: initial,
+      mixed,
+      coarse: coarsePointer(),
+      onApply: (fields) => {
+        const reading = { date1904, isName: (name: string) => hasDefinedName(this.workbook, name) };
+        // What was only looked at is not changed: no step, and the rule stays the element of the file it is.
+        const changed = validationChange(fields, { fields: initial, rule: shown }, this.locale, strings.rules, reading);
+        if (changed) apply(changed);
+        // A selection of several rules gets this one, whether a field was touched or not.
+        else if (mixed) apply(validationFromFields(fields, this.locale, strings.rules, reading));
+      },
+      onClear: () => apply(undefined),
+      explain: (error) => this.localizeError(error),
+      onClose: () => {
+        this.rulesDialog = undefined;
+        // Back to the cells, unless the view is going away.
+        if (!this.destroyed) this.focusInput(true);
+      },
+    });
+    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => dialog.dialog.close() };
+    return true;
+  }
+
+  /** The words of the dialogs and menus of rules, in the language of the view: for a shell that offers their commands. */
+  get ruleStrings(): UiStrings['rules'] {
+    return this.strings.rules;
+  }
+
+  /** Whether a dialog of rules is open over the view. */
+  get isDialogOpen(): boolean {
+    return this.rulesDialog !== undefined;
+  }
+
+  // ------------------------------------------------- conditional formats
+
+  /**
+   * The conditional rules of the shown sheet in the order they are applied in, each as it
+   * applies now; with a range, only those that apply to a cell of it. `index` is what the
+   * methods below name a rule by.
+   */
+  conditionalRules(range?: CellRange): ConditionalRuleInfo[] {
+    if (this.destroyed) return [];
+    return conditionalRulesOf(this.workbook, this.sheetIndex, range);
+  }
+
+  /**
+   * Adds a conditional rule for cells of the shown sheet, as one undo step. The new rule is
+   * the first to be applied (in a sheet with a rule only a newer Excel states: the last).
+   * What is being typed is applied first. Does nothing in a read-only view. Throws RangeError
+   * for a rule that cannot be stated.
+   */
+  addConditionalRule(range: CellRange | CellRange[], rule: ConditionalSettings): void {
+    if (!this.beginRules()) return;
+    this.applyOps(addConditionalRuleOps(this.workbook, this.sheetIndex, range, rule));
+  }
+
+  /**
+   * Changes the rule at `index`: the cells it applies to, whether it stops the rules behind
+   * it, what it says and the format it gives. Throws RangeError for an index that names no
+   * rule and for a rule that is kept as it is.
+   */
+  updateConditionalRule(index: number, patch: ConditionalPatch): void {
+    if (!this.beginRules()) return;
+    this.applyOps(updateConditionalRuleOps(this.workbook, this.sheetIndex, index, patch));
+  }
+
+  /** Deletes the rule at `index`. Throws RangeError for an index that names no rule and for a rule that is kept as it is. */
+  removeConditionalRule(index: number): void {
+    if (!this.beginRules()) return;
+    this.applyOps(removeConditionalRuleOps(this.workbook, this.sheetIndex, index));
+  }
+
+  /** Moves the rule at `index` so that it is applied as number `to` (0: first). */
+  moveConditionalRule(index: number, to: number): void {
+    if (!this.beginRules()) return;
+    this.applyOps(moveConditionalRuleOps(this.workbook, this.sheetIndex, index, to));
+  }
+
+  /** Takes the cells of a range out of every conditional rule of the shown sheet; without a range, deletes all its rules. */
+  clearConditionalRules(range?: CellRange): void {
+    if (!this.beginRules()) return;
+    this.applyOps(clearConditionalRulesOps(this.workbook, this.sheetIndex, range));
+  }
+
+  /** What every command on rules starts with: nothing in a read-only view, no dialog left open, what is typed applied. */
+  private beginRules(): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (this.rulesDialog) this.rulesDialog.close();
+    return this.commitPending();
+  }
+
+  /**
+   * Opens a dialog of conditional formats over the view. `what` says which: "manage" the list
+   * of rules (of the selection, or of the sheet); a number the dialog of that rule (see
+   * conditionalRules()); anything else the dialog of a new rule for the selection - a kind of
+   * rule ("cellIs", "containsText", "top10", "colorScale", "dataBar", ...) or one of the
+   * comparisons "greaterThan", "lessThan", "between", "equal". What is being typed is applied
+   * first. Returns false when there is no dialog: a read-only view, a sheet without cells, a
+   * formula that is being typed, something typed that cannot be applied, a rule that cannot
+   * be changed (said in the live region and to onNotice).
+   */
+  openConditionalDialog(what?: string | number): boolean {
+    if (!this.beginDialog()) return false;
+    if (what === 'manage') return this.openRulesManager('selection');
+    return this.openRuleDialog(what, undefined);
+  }
+
+  /** What every dialog of rules starts with; false when none can be opened. */
+  private beginDialog(): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (this.state().sheet.kind !== 'worksheet') return false;
+    if (this.formulaEdit()) {
+      this.notify(this.strings.rules.formulaBeingTyped, 'error');
+      return false;
+    }
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    this.finishRename(true);
+    this.finishNote(true);
+    return !this.edit && !this.renaming && !this.noteEdit;
+  }
+
+  /** Applies operations on rules for a dialog that stays open, and says what happened. */
+  private applyRules(sheet: Sheet, ops: Op[], said: string): void {
+    // A dialog belongs to the sheet it was opened on.
+    if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
+    if (this.applyOps(ops)) this.live.textContent = said;
+  }
+
+  /** The dialog of one rule: a new one of the kind `what` names, or the rule at that index. `back` is the list to come back to. */
+  private openRuleDialog(what: string | number | undefined, back: 'selection' | 'sheet' | undefined): boolean {
+    const state = this.state();
+    const sheet = state.sheet;
+    const range = { ...state.range };
+    const strings = this.strings;
+    const date1904 = this.workbook.date1904 === true;
+    const styles = this.workbook.styles;
+    let editing: ConditionalRuleInfo | undefined;
+    let type: string | undefined;
+    let operator: string | undefined;
+    if (typeof what === 'number') {
+      editing = conditionalRulesOf(this.workbook, this.sheetIndex)[what];
+      if (!editing || !editing.editable) {
+        this.notify(editing && editing.rule.extended ? strings.rules.extensionRuleKept : editing && editing.rule.extId !== undefined ? strings.rules.extensionRuleSays : strings.rules.ruleKindKept, 'error');
+        return false;
+      }
+    } else if (what === 'greaterThan' || what === 'lessThan' || what === 'between' || what === 'equal') {
+      type = 'cellIs';
+      operator = what;
+    } else if (typeof what === 'string' && (CONDITIONAL_TYPES as readonly string[]).indexOf(what) >= 0) type = what;
+    const fields = conditionalFields(editing, this.locale, date1904, type, (color) => resolveColor(color, styles));
+    if (operator !== undefined) fields.operator = operator;
+    const index = editing ? editing.index : -1;
+    const cells = rangeListText(editing ? editing.ranges : [range], this.locale);
+    const dialog = new ConditionalDialog({
+      parent: this.options.focusScope || this.root,
+      strings: strings.rules,
+      locale: this.locale,
+      fields,
+      ranges: cells,
+      // A rule that is edited is looked at first; a new one starts where its value is typed.
+      focus: editing ? 'type' : undefined,
+      keepFormat: fields.preset === 'keep',
+      coarse: coarsePointer(),
+      onApply: (typed, where) => {
+        const reading = { date1904, isName: (name: string) => hasDefinedName(this.workbook, name) };
+        if (editing) {
+          // Only what was changed in the dialog is changed in the rule; nothing changed is no step.
+          const patch = conditionalPatch(typed, where, { fields, ranges: cells }, editing, this.locale, strings.rules, reading);
+          if (Object.keys(patch).length > 0) this.applyRules(sheet, updateConditionalRuleOps(this.workbook, this.sheetIndex, index, patch), strings.rules.ruleChanged);
+          return;
+        }
+        const ranges = this.rangesOf(where);
+        this.applyRules(sheet, addConditionalRuleOps(this.workbook, this.sheetIndex, ranges, conditionalFromFields(typed, this.locale, strings.rules, reading)), strings.rules.ruleAdded);
+      },
+      explain: (error) => this.localizeError(error),
+      onClose: () => {
+        this.rulesDialog = undefined;
+        if (this.destroyed) return;
+        // Back to the list it was opened from, or to the cells.
+        if (back !== undefined && !this.locked && this.workbook.sheets[this.sheetIndex] === sheet && !this.leavingDialog) this.openRulesManager(back);
+        else this.focusInput(true);
+      },
+    });
+    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => this.dismiss(() => dialog.dialog.close()) };
+    return true;
+  }
+
+  /** Closes a dialog for good: it does not hand over to the list it was opened from. */
+  private dismiss(close: () => void): void {
+    this.leavingDialog = true;
+    try {
+      close();
+    } finally {
+      this.leavingDialog = false;
+    }
+  }
+
+  /** The ranges typed into a field of a dialog; throws FieldError for what names none. */
+  private rangesOf(text: string): CellRange[] {
+    if (text.trim() === '') throw new FieldError(this.strings.rules.needRange, 'ranges');
+    const ranges = parseRangeList(text, this.locale);
+    if (!ranges) throw new FieldError(this.strings.rules.badRange, 'ranges');
+    return ranges;
+  }
+
+  /** The list of the conditional rules of the selection or the sheet. */
+  private openRulesManager(scope: 'selection' | 'sheet'): boolean {
+    const state = this.state();
+    const sheet = state.sheet;
+    const range = { ...state.range };
+    const strings = this.strings;
+    const date1904 = this.workbook.date1904 === true;
+    const rows = (shown: 'selection' | 'sheet'): { rows: ManagerRow[]; total: number } => {
+      if (this.workbook.sheets[this.sheetIndex] !== sheet) return { rows: [], total: 0 };
+      const listed = conditionalRulesOf(this.workbook, this.sheetIndex, shown === 'selection' ? range : undefined);
+      // No more rows than a list can be worked with: the rest is counted.
+      const first = listed.length > MAX_MANAGER_ROWS ? listed.slice(0, MAX_MANAGER_ROWS) : listed;
+      const made = first.map((info): ManagerRow => {
+        // A rule only a newer Excel states is not touched; one it states more about keeps what it says, and can go or go elsewhere.
+        const kept = info.rule.extended === true;
+        const paired = !kept && info.rule.extId !== undefined;
+        return {
+          index: info.index,
+          description: describeRule(info.rule, strings.rules, this.locale, date1904),
+          ranges: rangeListText(info.ranges, this.locale),
+          stopIfTrue: info.rule.stopIfTrue === true,
+          editable: info.editable,
+          removable: info.removable,
+          movable: info.movable,
+          adjustable: !kept,
+          reason: kept ? strings.rules.extensionRuleKept : paired ? strings.rules.extensionRuleSays : !info.movable ? strings.rules.orderFixed : !info.editable ? strings.rules.ruleKindKept : undefined,
+        };
+      });
+      return { rows: made, total: listed.length };
+    };
+    const manager = new ConditionalManager({
+      parent: this.options.focusScope || this.root,
+      strings: strings.rules,
+      scope,
+      coarse: coarsePointer(),
+      rows,
+      onMove: (index, to) => this.applyRules(sheet, moveConditionalRuleOps(this.workbook, this.sheetIndex, index, to), strings.rules.ruleChanged),
+      onRanges: (index, text) => this.applyRules(sheet, updateConditionalRuleOps(this.workbook, this.sheetIndex, index, { ranges: this.rangesOf(text) }), strings.rules.ruleChanged),
+      onStop: (index, stop) => this.applyRules(sheet, updateConditionalRuleOps(this.workbook, this.sheetIndex, index, { stopIfTrue: stop }), strings.rules.ruleChanged),
+      onDelete: (index) => this.applyRules(sheet, removeConditionalRuleOps(this.workbook, this.sheetIndex, index), strings.rules.ruleDeleted),
+      onEdit: (index, shown) => {
+        this.openRuleDialog(index, shown);
+      },
+      onNew: (shown) => {
+        this.openRuleDialog(undefined, shown);
+      },
+      explain: (error) => this.localizeError(error),
+      onClose: () => {
+        this.rulesDialog = undefined;
+        // Back to the cells, unless the view is going away; a dialog that takes the place of the list takes the focus next.
+        if (!this.destroyed) this.focusInput(true);
+      },
+    });
+    this.rulesDialog = { sheet, submit: () => manager.submit(), close: () => manager.dialog.close() };
+    return true;
+  }
+
+  /**
    * Checks what is about to be typed into a cell against the cell's data validation.
    * A rule that stops wrong values throws a ValidationError with the rule's message;
    * a rule that only warns gives back what to say once the value is written.
@@ -4147,6 +4529,21 @@ export class WorkbookView {
     if ((match = /^Cannot change the comments of this sheet: (.+)$/.exec(message))) {
       return strings.notesBlocked(/legacy drawing/.test(match[1]) ? 'drawing' : /shared/.test(match[1]) ? 'shared' : 'parts');
     }
+    const rules = strings.rules;
+    if (/^Cannot (delete|clear) this rule: the extension list/.test(message)) return rules.extensionRuleKept;
+    if (/^Cannot change this rule: the extension list/.test(message)) return rules.extensionRuleSays;
+    if (/^Cannot change the order of the rules of this sheet/.test(message)) return rules.orderFixed;
+    if (/^A rule of the kind ".*" cannot be changed here/.test(message)) return rules.ruleKindKept;
+    if (message === 'The sheet has too many conditional formats') return rules.tooManyConditional;
+    if (message === 'The rule needs a text to look for') return rules.needValue(rules.text);
+    if ((match = /^The number of a top or bottom rule is a whole number between 1 and (\d+)$/.exec(message))) return rules.needWholeUpTo(rules.rank, Number(match[1]));
+    if (/: the rule there is one of the extension list/.test(message)) return rules.extensionRule;
+    if (message === 'The sheet has too many data validations') return rules.tooManyValidations;
+    if (message === 'The rule would be left with too many separate ranges') return rules.tooManyRanges;
+    if ((match = /^The (.+) of the rule cannot be read as a formula$/.exec(message))) return rules.badRuleFormula(match[1] === 'highest value' ? rules.maximum : match[1] === 'source' ? rules.source : match[1] === 'formula' ? rules.formula : rules.value);
+    if (/^The rule needs|^A list needs a value|^A custom rule needs a value/.test(message)) return rules.needValue(rules.value);
+    if ((match = /^The items of a list written into the rule cannot be longer than (\d+) characters together$/.exec(message))) return rules.listTooLong(Number(match[1]));
+    if ((match = /^The (.+) of a rule cannot be longer than (\d+) characters$/.exec(message))) return rules.textTooLong(/title/.test(match[1]) ? rules.title : rules.message, Number(match[2]));
     return sheetErrorText(message, strings) || strings.actionFailed;
   }
 
@@ -4298,13 +4695,22 @@ export class WorkbookView {
    * commitEditing() does, and the editor stays open. A note or a name that cannot be taken is
    * said (in the live region and to onNotice), its field stays open with what was typed, and
    * the answer is false: the workbook is then not what the user sees, and is not to be saved.
+   * A dialog of rules that is open is applied the way its OK button applies it; fields it
+   * cannot take are said in the dialog, which stays open, and the answer is false as well.
    */
   commitPending(): boolean {
     if (this.destroyed) return true;
     if (this.edit) this.commitEditing();
     if (this.renaming) this.finishRename(true);
     if (this.noteEdit) this.finishNote(true);
-    return !this.edit && !this.renaming && !this.noteEdit;
+    // A dialog that is open is applied as its OK button applies it, and nothing takes its place (the dialog of a
+    // rule does not hand back to the list it was opened from); what it cannot take keeps it open. The list of
+    // rules has nothing waiting - each of its changes was applied as it was made - but the cells being typed.
+    if (this.rulesDialog) {
+      const open = this.rulesDialog;
+      this.dismiss(() => open.submit());
+    }
+    return !this.edit && !this.renaming && !this.noteEdit && !this.rulesDialog;
   }
 
   /** commitEditing() for keys, pointers and focus changes: a failure is announced and reported as false. */
@@ -4571,8 +4977,8 @@ export class WorkbookView {
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
-      // A note changes no size and no position.
-      if (op.type !== 'setCells' && op.type !== 'setComments') structural = true;
+      // A note or a rule changes no size and no position.
+      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
       if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }
@@ -4611,15 +5017,19 @@ export class WorkbookView {
       this.cancelEditing();
       return true;
     }
-    this.closeMenu();
     // A name being typed for a sheet, or a note, is not dropped (the keys of its field undo within
     // it; this is a button or a call from outside): it is applied, as leaving the field would, and
     // that is all this call does - the next one undoes it. What cannot be applied stays in its field.
-    if (this.renaming || this.noteEdit) {
+    if (this.renaming || this.noteEdit || this.rulesDialog) {
       this.finishRename(true);
       this.finishNote(true);
-      return !this.renaming && !this.noteEdit;
+      if (this.rulesDialog) {
+        const open = this.rulesDialog;
+        this.dismiss(() => open.submit());
+      }
+      return !this.renaming && !this.noteEdit && !this.rulesDialog;
     }
+    this.closeMenu();
     const listBefore = this.workbook.sheets;
     const namesBefore = this.workbook.definedNames;
     const step = redo ? this.history.redo() : this.history.undo();
@@ -5277,6 +5687,8 @@ export class WorkbookView {
     if (this.menu) this.menu.close();
     if (this.panel) this.panel.close();
     if (this.tabPopover) this.tabPopover.close('owner');
+    // A dialog that something else takes the place of is given up, as Escape gives it up.
+    if (this.rulesDialog) this.rulesDialog.close();
   }
 
   /**
@@ -5357,6 +5769,10 @@ export class WorkbookView {
       if (rows > 0) items.push({ label: strings.deleteRows(rows), action: () => this.attempt(() => this.structural('delete', 'row', range.top, rows)) });
       if (cols > 0) items.push({ label: strings.deleteColumns(cols), action: () => this.attempt(() => this.structural('delete', 'col', range.left, cols)) });
       this.noteItems(items);
+      if (this.state().sheet.kind === 'worksheet') {
+        items.push({ label: '', separator: true });
+        items.push({ label: strings.rules.validationCommand, action: () => void this.openValidationDialog() });
+      }
     }
     this.showMenu(items, x, y);
     return true;

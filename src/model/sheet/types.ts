@@ -233,12 +233,33 @@ export interface ConditionalRule {
   extId?: string;
   /** The rule exists only in the 2010 extension list. */
   extended?: boolean;
+  /**
+   * Set by the reader on a rule of the main part: which <conditionalFormatting> element of the
+   * sheet part it is in (counted among the children of the worksheet) and which <cfRule> of
+   * that element it is. A rule that was changed keeps it: the writer finds by it what the
+   * source element holds beside the fields of the model. A rule added since has none.
+   */
+  src?: [format: number, rule: number];
 }
 
-/** One <conditionalFormatting>: rules and the cells they apply to. A view for reading; the writer copies the source element. */
+/**
+ * One <conditionalFormatting>: rules and the cells they apply to. One that was read is kept
+ * as the file has it, and the writer copies its source element. One that was added or changed
+ * since is `live`.
+ */
 export interface ConditionalFormat {
   ranges: CellRange[];
   rules: ConditionalRule[];
+  /** Set by the reader: the index of the <conditionalFormatting> element among the children of the worksheet. */
+  src?: number;
+  /**
+   * Set on a format that was added or changed since the sheet was read: its ranges, and the
+   * formulas of its rules, are those of the sheet as it is now, under the names the sheets
+   * have now, and every operation that moves cells or names sheets keeps them so. A format
+   * without it is as the file has it (see Sheet.conditionalFormats). conditionalFormatNow()
+   * is the one rule for where either applies.
+   */
+  live?: boolean;
 }
 
 /** One condition of a custom filter ("greater than 5", "begins with a"). */
@@ -341,8 +362,9 @@ export interface AutoFilter {
 }
 
 /**
- * One <dataValidation>: what may be typed into its cells. A view for reading;
- * the writer copies the source element.
+ * One <dataValidation>: what may be typed into its cells. A rule that was read is kept as the
+ * file has it, and the writer copies its source element; one that was added or changed since
+ * is `live`.
  */
 export interface DataValidation {
   ranges: CellRange[];
@@ -365,6 +387,21 @@ export interface DataValidation {
   error?: string;
   /** The rule comes from the 2010 extension list (its list may be on another sheet). */
   extended?: boolean;
+  /**
+   * Set by the reader on a rule of the main part: which <dataValidation> element of the sheet
+   * part it is, counted through all <dataValidations> of the worksheet. A rule that was
+   * changed keeps it: the writer finds by it what the source element holds beside the fields
+   * of the model. A rule added since has none.
+   */
+  src?: number;
+  /**
+   * Set on a rule that was added or changed since the sheet was read: its ranges and formulas
+   * are those of the sheet as it is now, under the names the sheets have now, and every
+   * operation that moves cells or names sheets keeps them so. A rule without it is as the
+   * file has it (see Sheet.dataValidations). dataValidationNow() is the one rule for where
+   * either applies.
+   */
+  live?: boolean;
 }
 
 export interface RichRun {
@@ -849,19 +886,37 @@ export interface Sheet {
    */
   unmodelled?: string[];
   /**
-   * Conditional formats as the file has them. They are not changed by edits: rows and
-   * columns inserted or deleted since (structuralEdits) are applied where they are evaluated.
+   * Conditional formats. Those of the file are as the file has them and are not changed by
+   * edits: rows and columns inserted or deleted since (structuralEdits) are applied where they
+   * are evaluated. Those added or changed since are `live` (see ConditionalFormat.live). The
+   * list is replaced, never altered, by an edit ("setConditionalFormats").
    */
   conditionalFormats?: ConditionalFormat[];
+  /**
+   * Conditional formats were added, changed or deleted; the writer brings the elements of the
+   * sheet part in line with the model. Set on its own, without `modified`: no cell changed.
+   */
+  conditionalModified?: boolean;
+  /** The list the sheet had before its conditional formats were first changed. Set with `conditionalModified`. */
+  conditionalRead?: { list: ConditionalFormat[] | undefined };
   /** The filter of the sheet, kept up to date by edits. Rows it hides are `hidden`, like rows hidden by hand. */
   autoFilter?: AutoFilter;
   /** The filter was changed (switched on or off, a criterion, a sort); the writer regenerates <autoFilter> from the model. */
   autoFilterModified?: boolean;
   /**
-   * Data validations as the file has them. Like conditional formats they are not changed
-   * by edits: structuralEdits are applied where they are evaluated (see DataValidations).
+   * Data validations. Those of the file are as the file has them and, like conditional
+   * formats, are not changed by edits: structuralEdits are applied where they are evaluated
+   * (see DataValidations). Those added or changed since are `live` (see DataValidation.live).
+   * The list is replaced, never altered, by an edit ("setDataValidations").
    */
   dataValidations?: DataValidation[];
+  /**
+   * Data validations were added, changed or deleted; the writer brings <dataValidations> of
+   * the sheet part in line with the model. Set on its own, without `modified`: no cell changed.
+   */
+  validationsModified?: boolean;
+  /** The list the sheet had before its data validations were first changed. Set with `validationsModified`. */
+  validationsRead?: { list: DataValidation[] | undefined };
   /** Margins, paper, scaling, headers and footers and page breaks of the printed sheet, as the file has them. */
   pageSetup?: SheetPageSetup;
   /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */

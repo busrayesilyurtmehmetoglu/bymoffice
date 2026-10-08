@@ -421,8 +421,10 @@ test('buildXlsx: the parts of a workbook and of a sheet come in the order of the
   const expected = sheet.conditionalFormats.map((format) => ({ ranges: format.ranges, rules: format.rules.filter((rule) => !rule.extended) }));
   // A rule without a priority gets the next one after the highest.
   expected[0].rules[2] = { ...expected[0].rules[2], priority: 10 };
-  assert.equal(canonical(read.conditionalFormats), canonical(expected));
-  assert.equal(canonical(read.dataValidations), canonical(sheet.dataValidations));
+  // Where a rule is in the part that was written (`src`) is not what the model said.
+  const placeless = <T extends { src?: unknown }>(item: T): T => ({ ...item, src: undefined });
+  assert.equal(canonical(read.conditionalFormats!.map((format) => ({ ...placeless(format), rules: format.rules.map(placeless) }))), canonical(expected));
+  assert.equal(canonical(read.dataValidations!.map(placeless)), canonical(sheet.dataValidations));
   assert.equal(after.styles.dxfFormats?.[0].font?.bold, true);
   assert.deepEqual([after.date1904, after.sheets[1].state, after.definedNames], [true, 'veryHidden', workbook.definedNames]);
 

@@ -710,7 +710,9 @@ test('worksheet: conditional formats are read beside everything else, from both 
   assert.deepEqual(sheet.conditionalFormats, [
     {
       ranges: [{ top: 0, left: 0, bottom: 1, right: 1 }],
-      rules: [{ type: 'cellIs', priority: 2, stopIfTrue: false, dxfId: 3, operator: 'lessThan', formulas: ['A$1 & "<"'], percent: false, bottom: false, aboveAverage: true, equalAverage: false }],
+      rules: [{ type: 'cellIs', priority: 2, stopIfTrue: false, dxfId: 3, operator: 'lessThan', formulas: ['A$1 & "<"'], percent: false, bottom: false, aboveAverage: true, equalAverage: false, src: [0, 0] }],
+      // Where the element is in the part; the format of the extension list has no such place.
+      src: 0,
     },
     {
       ranges: [{ top: 0, left: 3, bottom: 8, right: 3 }],

@@ -1,10 +1,11 @@
 // Data validation: what may be typed into a cell, the message a cell shows
 // when it is selected, and the list a cell offers its values in.
 //
-// The rules are read from the file and never changed here; the writer copies
-// their source. Rows and columns inserted or deleted since the sheet was read
-// are applied to the ranges and formulas when the rules are looked up, the way
-// conditional formats do it (see ConditionalFormats).
+// The rules are never changed here. Those of the file are kept as the file has
+// them: rows and columns inserted or deleted since the sheet was read are
+// applied to their ranges and formulas when the rules are looked up, the way
+// conditional formats do it (see ConditionalFormats). Rules added or changed
+// by editing are where they say (see dataValidationNow() in ops/rules.ts).
 //
 // Formulas are calculated by the engine the caller provides. A rule that needs
 // one and cannot get it (no engine, a formula the engine cannot read or does
@@ -14,11 +15,12 @@
 
 import type { CalcEngine, CellAddress } from '../calc/engine';
 import { parseFormula, type Node } from '../calc/parse';
-import { adjustAnchoredFormula, adjustRange, renameSheetsInFormula, type StructuralEdit } from '../calc/refs';
+import { relativeExtent, shiftFormula } from '../calc/refs';
 import { isError, type Scalar } from '../calc/values';
-import { MAX_COLS, MAX_ROWS, fileSheetName, foldSheetName, getCell, sheetNameMap, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, foldSheetName, getCell, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
 import { resolveCellStyle } from '../model/sheet/color';
 import { applyOp, type Op } from '../ops/ops';
+import { dataValidationNow, ruleSpace } from '../ops/rules';
 import { foldCase } from '../ops/sort';
 import { builtinFormatId, formatCell, isoToSerial } from './cell-format';
 import type { FormatLocale } from './locale';
@@ -190,13 +192,6 @@ function compare(value: number, operator: string, a: number, b: number | undefin
   }
 }
 
-/**
- * Stands for the name in the file of a sheet that is not in the file: no reference of the
- * file names it (a sheet name holds no control character), references without a sheet name
- * still follow the sheet's own edits.
- */
-const NOT_IN_FILE = '\u0000';
-
 /** The data validations of one sheet, as they apply now. */
 export class DataValidations {
   private readonly workbook: Workbook;
@@ -230,7 +225,7 @@ export class DataValidations {
 
   /** The rule that applies to a cell, with its ranges and formulas where they are now. */
   ruleAt(row: number, col: number): DataValidation | undefined {
-    const entry = this.entryAt(row, col);
+    const entry = this.statedAt(row, col);
     if (!entry) return undefined;
     const rule: DataValidation = { ...entry.rule, ranges: entry.ranges };
     if (entry.formula1 !== undefined) rule.formula1 = entry.formula1;
@@ -372,10 +367,34 @@ export class DataValidations {
     }
   }
 
-  private entryAt(row: number, col: number): Entry | undefined {
+  /** The rule of a cell as it is stated: its formulas written for the first cell of its ranges. */
+  private statedAt(row: number, col: number): Entry | undefined {
     const entries = this.stale() ? this.build() : (this.entries as Entry[]);
     for (let i = 0; i < entries.length; i++) if (inRanges(entries[i].ranges, row, col)) return entries[i];
     return undefined;
+  }
+
+  /**
+   * The rule of a cell for working with: as it is stated while every relative reference of
+   * its formulas stays on the sheet once moved to the cell. A reference that would leave the
+   * sheet comes back in at the opposite edge, as in a conditional format and as the writer
+   * and the commands move such formulas (see shiftFormula()): the rule is then handed out
+   * with its formulas written for the cell itself. (The engine alone would make it #REF!.)
+   */
+  private entryAt(row: number, col: number): Entry | undefined {
+    const entry = this.statedAt(row, col);
+    if (!entry) return undefined;
+    const dRow = row - entry.anchorRow;
+    const dCol = col - entry.anchorCol;
+    if (dRow === 0 && dCol === 0) return entry;
+    const stays = (text: string | undefined): boolean => {
+      if (text === undefined) return true;
+      const extent = relativeExtent(text);
+      return extent.minRow + dRow >= 0 && extent.maxRow + dRow < MAX_ROWS && extent.minCol + dCol >= 0 && extent.maxCol + dCol < MAX_COLS;
+    };
+    if (stays(entry.formula1) && stays(entry.formula2)) return entry;
+    const moved = (text: string | undefined) => (text === undefined ? undefined : shiftFormula(text, dRow, dCol, true));
+    return { ...entry, anchorRow: row, anchorCol: col, formula1: moved(entry.formula1), formula2: moved(entry.formula2) };
   }
 
   /** Rows or columns were inserted or deleted, or the rules replaced, since the entries were built. */
@@ -398,51 +417,24 @@ export class DataValidations {
     this.sheetsSeen = sheets.slice();
     this.namesSeen = sheets.map((other) => other.name);
     this.removedSeen = this.workbook.removedSheetNames;
-    // The formulas of the rules are as the file has them and name sheets as the file does: the
-    // edits are matched with those names, and only then are the sheets given the names they have now.
-    const fileName = fileSheetName(sheet);
-    const ownName = fileName === undefined ? NOT_IN_FILE : fileName;
-    const nameMap = sheetNameMap(this.workbook);
-    const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: ownName }));
-    const foreign: StructuralEdit[] = [];
-    for (const other of sheets) {
-      if (other === sheet || !other.structuralEdits) continue;
-      // Nothing in the file refers to a sheet that is not in it.
-      const name = fileSheetName(other);
-      if (name === undefined) continue;
-      for (const edit of other.structuralEdits) foreign.push({ ...edit, sheetName: name });
-    }
+    // A rule of the file is read through the rows and columns moved and the sheets renamed since; a rule
+    // that was added or changed since is where it is. One function says which, for everyone who asks.
+    const space = ruleSpace(this.workbook, sheet);
     const entries: Entry[] = [];
     const rules = Array.isArray(sheet.dataValidations) ? sheet.dataValidations : [];
     for (const rule of rules) {
-      if (!rule || !Array.isArray(rule.ranges)) continue;
-      let ranges = rule.ranges.filter((range) => !!range && range.top <= range.bottom && range.left <= range.right);
+      const now = dataValidationNow(rule, space);
+      if (!now) continue;
+      const ranges = now.ranges.filter((range) => !!range && range.top <= range.bottom && range.left <= range.right);
       if (ranges.length === 0) continue;
-      const texts = [rule.formula1, rule.formula2].map((text) => (typeof text === 'string' ? text : undefined));
-      // The formulas are written for the top-left cell of the first range; they follow that corner.
-      const adjust = (edit: StructuralEdit, from: CellRange, to: CellRange) => {
-        for (let i = 0; i < texts.length; i++) {
-          const text = texts[i];
-          if (text !== undefined) texts[i] = adjustAnchoredFormula(text, ownName, edit, { row: from.top, col: from.left }, { row: to.top, col: to.left }, true);
-        }
-      };
-      for (const edit of own) {
-        const moved: CellRange[] = [];
-        for (const range of ranges) {
-          const next = adjustRange(range, edit);
-          if (next) moved.push(next);
-        }
-        if (moved.length === 0) {
-          ranges = moved;
-          break;
-        }
-        adjust(edit, ranges[0], moved[0]);
-        ranges = moved;
-      }
-      if (ranges.length === 0) continue;
-      for (const edit of foreign) adjust(edit, ranges[0], ranges[0]);
-      if (nameMap) for (let i = 0; i < texts.length; i++) if (texts[i] !== undefined) texts[i] = renameSheetsInFormula(texts[i] as string, nameMap);
-      entries.push({ rule, ranges, anchorRow: ranges[0].top, anchorCol: ranges[0].left, formula1: texts[0], formula2: texts[1] });
+      entries.push({
+        rule,
+        ranges,
+        anchorRow: ranges[0].top,
+        anchorCol: ranges[0].left,
+        formula1: typeof now.formula1 === 'string' ? now.formula1 : undefined,
+        formula2: typeof now.formula2 === 'string' ? now.formula2 : undefined,
+      });
     }
     this.entries = entries;
     return entries;
@@ -580,11 +572,16 @@ export class DataValidations {
     const dRow = entry ? row - entry.anchorRow : 0;
     const dCol = entry ? col - entry.anchorCol : 0;
     const abs = node.abs;
-    const top = node.wholeCols ? 0 : node.range.top + (abs.top ? 0 : dRow);
-    const bottom = node.wholeCols ? MAX_ROWS - 1 : node.range.bottom + (abs.bottom ? 0 : dRow);
-    const left = node.wholeRows ? 0 : node.range.left + (abs.left ? 0 : dCol);
-    const right = node.wholeRows ? MAX_COLS - 1 : node.range.right + (abs.right ? 0 : dCol);
-    if (!(top >= 0 && left >= 0 && bottom < MAX_ROWS && right < MAX_COLS && top <= bottom && left <= right)) return undefined;
+    const row1 = node.wholeCols ? 0 : node.range.top + (abs.top ? 0 : dRow);
+    const row2 = node.wholeCols ? MAX_ROWS - 1 : node.range.bottom + (abs.bottom ? 0 : dRow);
+    const col1 = node.wholeRows ? 0 : node.range.left + (abs.left ? 0 : dCol);
+    const col2 = node.wholeRows ? MAX_COLS - 1 : node.range.right + (abs.right ? 0 : dCol);
+    // A corner that is relative may end up on the other side of one that is not: the cells between them are the range all the same.
+    const top = Math.min(row1, row2);
+    const bottom = Math.max(row1, row2);
+    const left = Math.min(col1, col2);
+    const right = Math.max(col1, col2);
+    if (!(top >= 0 && left >= 0 && bottom < MAX_ROWS && right < MAX_COLS)) return undefined;
     return { sheet, range: { top, left, bottom, right } };
   }
 

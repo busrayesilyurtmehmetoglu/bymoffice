@@ -42,7 +42,13 @@ const rulesBook = once(() =>
         xml: worksheetXml(
           `<sheetData><row r="1">${num('A1', 1)}</row></sheetData>` +
             '<conditionalFormatting sqref="A1:A9"><cfRule type="cellIs" priority="1" operator="greaterThan"><formula>0</formula></cfRule></conditionalFormatting>' +
-            '<dataValidations count="1"><dataValidation type="whole" sqref="B1"><formula1>1</formula1><formula2>9</formula2></dataValidation></dataValidations>',
+            '<dataValidations count="1"><dataValidation type="whole" sqref="B1"><formula1>1</formula1><formula2>9</formula2></dataValidation></dataValidations>' +
+            // Kept in the part and not in the model: two things a copy does not get.
+            '<ignoredErrors><ignoredError sqref="A1" numberStoredAsText="1"/></ignoredErrors>' +
+            '<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormattings>' +
+            '<x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="iconSet" priority="2" id="{00000000-000E-0000-0000-000001000000}">' +
+            '<x14:iconSet iconSet="3Stars"><x14:cfvo type="percent"><xm:f>0</xm:f></x14:cfvo><x14:cfvo type="percent"><xm:f>33</xm:f></x14:cfvo><x14:cfvo type="percent"><xm:f>67</xm:f></x14:cfvo></x14:iconSet>' +
+            '</x14:cfRule><xm:sqref>C1:C9</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>',
         ),
       },
     ],
@@ -394,9 +400,18 @@ test.describe('copying a sheet', () => {
   test('what a copy does not get is said, with its number', async ({ page }) => {
     await mount(page, await rulesBook());
     expect(await view(page, 'view.copySheet(0)')).toBe(1);
-    await expect.poll(async () => (await notices(page)).map((notice) => notice.message)).toContain('Sheet Rules was copied without: 1 conditional format, 1 data validation');
+    // The rules of the sheet go with the copy; what only the part holds does not.
+    await expect.poll(async () => (await notices(page)).map((notice) => notice.message)).toContain('Sheet Rules was copied without: 1 conditional format setting of a newer Excel, 1 list of ignored errors');
     const file = await saved(page);
     expect(file.map((sheet) => sheet.name)).toEqual(['Rules', 'Rules (2)']);
+    expect(
+      await page.evaluate(async () => {
+        const api = (window as any).BymOffice;
+        const book = await (await api.open((await (window as any).__file.save()) as Uint8Array)).workbook();
+        const copy = book.sheets[1];
+        return [copy.conditionalFormats.map((format: any) => format.rules.map((rule: any) => rule.type).join(',')), copy.dataValidations.map((rule: any) => rule.type)];
+      }),
+    ).toEqual([['cellIs'], ['whole']]);
   });
 });
 

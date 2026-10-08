@@ -8,6 +8,7 @@
 
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
+import { liveRulesMoved, liveRulesRenamed, swapRuleLists, type RuleLists } from './rules';
 import {
   FILTER_NAME,
   MAX_COLS,
@@ -25,6 +26,8 @@ import {
   type CellRange,
   type Color,
   type ColumnRange,
+  type ConditionalFormat,
+  type DataValidation,
   type DefinedName,
   type DrawingAnchor,
   type Hyperlink,
@@ -76,6 +79,8 @@ export interface SheetsSnapshot {
   cells: { sheet: Sheet; cells: CellChange[] }[];
   /** Links that pointed into a sheet, as they were. */
   links: { sheet: Sheet; hyperlinks: Hyperlink[] }[];
+  /** Lists of live rules (see rules.ts) whose formulas named a sheet, as they were. */
+  rules?: RuleLists[];
   definedNames: DefinedName[];
   activeSheet: number;
   removedSheetNames: string[] | undefined;
@@ -136,6 +141,22 @@ export type Op =
       sheet: number;
       comments: SheetComment[] | undefined;
     }
+  | {
+      /**
+       * Replaces the data validations of a sheet (undefined: none). The list is held by reference
+       * and never altered, so that the inverse puts the very list back. What the list may hold is
+       * the business of the commands (see rules.ts).
+       */
+      type: 'setDataValidations';
+      sheet: number;
+      validations: DataValidation[] | undefined;
+    }
+  | {
+      /** Replaces the conditional formats of a sheet (undefined: none); as "setDataValidations". */
+      type: 'setConditionalFormats';
+      sheet: number;
+      formats: ConditionalFormat[] | undefined;
+    }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | {
@@ -148,6 +169,8 @@ export type Op =
       /** Links of other sheets that pointed into the sheet. */
       otherLinks?: { sheet: number; hyperlinks: Hyperlink[] }[];
       definedNames: DefinedName[];
+      /** Lists of rules that were added or changed since the file was read (live rules), as they were: of this sheet, and of sheets whose rules name it. */
+      rules?: RuleLists[];
       /** Roughly how many rows this operation keeps alive for undo; History uses it to bound memory. */
       weight?: number;
     }
@@ -605,8 +628,11 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   });
   // The name that went with the filter would be left naming cells that are gone.
   if (dropped) syncFilterName(workbook, index);
+  // Rules added or changed since the file was read are kept where their cells are; those of the file are
+  // left as the file has them, and are read through the edit from now on.
+  const rules = swapRuleLists(liveRulesMoved(workbook, sheet, refEdit));
 
-  return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, weight };
+  return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), weight };
 }
 
 /**
@@ -1138,6 +1164,9 @@ function renameSheetOp(workbook: Workbook, index: number, name: string): Op {
   const undo = sheetsSnapshot(workbook);
   undo.renamed = { sheet, name: sheet.name, nameInFile: sheet.nameInFile };
   applySheetNameChanges(changes, undo);
+  // Rules of the file name sheets as the file does (see nameInFile below); those changed since name them as they are called.
+  const rules = swapRuleLists(liveRulesRenamed(workbook, (written) => (foldSheetName(written) === old ? name : undefined)));
+  if (rules.length > 0) undo.rules = rules;
   workbook.definedNames = changes.definedNames;
   // What is kept the way the file has it goes on naming the sheet as the file does.
   if (isFileSheet(sheet) && sheet.nameInFile === undefined && sheet.name !== name) sheet.nameInFile = sheet.name;
@@ -1169,6 +1198,8 @@ function deleteSheetOp(workbook: Workbook, index: number): Op {
 
   const undo = sheetsSnapshot(workbook);
   applySheetNameChanges(changes, undo);
+  const rules = swapRuleLists(liveRulesRenamed(workbook, map, sheet));
+  if (rules.length > 0) undo.rules = rules;
   // The names of the sheet go with it; those of the sheets after it follow their sheets.
   const names: DefinedName[] = [];
   let namesChanged = changes.definedNames !== undo.definedNames;
@@ -1361,6 +1392,8 @@ function restoreSheets(workbook: Workbook, index: number, state: SheetsSnapshot,
     change.sheet.hyperlinksModified = true;
     change.sheet.modified = true;
   }
+  const rules = swapRuleLists(state.rules);
+  if (rules.length > 0) undo.rules = rules;
   workbook.sheets = state.sheets;
   workbook.definedNames = state.definedNames;
   workbook.activeSheet = state.activeSheet;
@@ -1467,6 +1500,30 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       sheet.commentsModified = true;
       return { type: 'setComments', sheet: op.sheet, comments: previous };
     }
+    case 'setDataValidations': {
+      const sheet = sheetAt(workbook, op.sheet);
+      if (op.validations !== undefined && !Array.isArray(op.validations)) throw new RangeError('The data validations of a sheet are a list');
+      const previous = sheet.dataValidations;
+      // What the sheet came with, noted once: while the list is that one, the writer leaves the part alone.
+      if (!sheet.validationsRead) sheet.validationsRead = { list: previous };
+      if (op.validations && op.validations.length > 0) sheet.dataValidations = op.validations;
+      else delete sheet.dataValidations;
+      // Not `modified`: no cell changed, so nothing has to be calculated again.
+      sheet.validationsModified = true;
+      return { type: 'setDataValidations', sheet: op.sheet, validations: previous };
+    }
+    case 'setConditionalFormats': {
+      const sheet = sheetAt(workbook, op.sheet);
+      if (op.formats !== undefined && !Array.isArray(op.formats)) throw new RangeError('The conditional formats of a sheet are a list');
+      const previous = sheet.conditionalFormats;
+      // What the sheet came with, noted once: while the list is that one, the writer leaves the part alone.
+      if (!sheet.conditionalRead) sheet.conditionalRead = { list: previous };
+      if (op.formats && op.formats.length > 0) sheet.conditionalFormats = op.formats;
+      else delete sheet.conditionalFormats;
+      // Not `modified`: no cell changed, so nothing has to be calculated again.
+      sheet.conditionalModified = true;
+      return { type: 'setConditionalFormats', sheet: op.sheet, formats: previous };
+    }
     case 'sortRange':
       return sortRows(workbook, op.sheet, op.range, op.order);
     case 'insert':
@@ -1489,7 +1546,8 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       });
       const definedNames = workbook.definedNames;
       workbook.definedNames = op.definedNames;
-      return { type: 'restore', sheet: op.sheet, snapshot, others, otherLinks, definedNames, weight: op.weight };
+      const rules = swapRuleLists(op.rules);
+      return { type: 'restore', sheet: op.sheet, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), weight: op.weight };
     }
     case 'insertSheet':
       return insertSheetOp(workbook, op.sheet, op.name);
@@ -1537,6 +1595,8 @@ function weightOf(ops: Op[]): number {
     else if (op.type === 'setAutoFilter') weight += ((op.show ? op.show.length : 0) + (op.hide ? op.hide.length : 0)) / 16;
     // The list of comments a step replaced is kept, not the comments themselves.
     else if (op.type === 'setComments') weight += (op.comments ? op.comments.length : 0) / 16;
+    else if (op.type === 'setDataValidations') weight += (op.validations ? op.validations.length : 0) / 16;
+    else if (op.type === 'setConditionalFormats') weight += (op.formats ? op.formats.length : 0) / 16;
   }
   return weight;
 }

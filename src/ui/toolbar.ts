@@ -152,6 +152,8 @@ export class Toolbar {
     this.addButton('sortAscending', () => host.view.sort(false));
     this.addButton('sortDescending', () => host.view.sort(true));
     this.addButton('filter', () => host.view.toggleFilter(), true);
+    this.addMenuButton('conditionalFormat', 'menu', () => this.openConditional());
+    this.addDialogButton('validation', () => void host.view.openValidationDialog());
     this.addSeparator();
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
 
@@ -191,7 +193,7 @@ export class Toolbar {
     const typing = view.isEditing || view.isEditingComment || view.isRenaming;
     this.setDisabled('undo', view.readOnly || typing || !view.history.canUndo);
     this.setDisabled('redo', view.readOnly || typing || !view.history.canRedo);
-    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'rowsColumns'];
+    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.sizeSelect.disabled = !editable;
     this.formatSelect.disabled = !editable;
@@ -269,6 +271,13 @@ export class Toolbar {
     this.openers.add(button);
   }
 
+  /** A button that opens a dialog of the view: the dialog takes the focus, so the click is not followed by a command's way back to the grid. */
+  private addDialogButton(key: ButtonKey, open: () => void): void {
+    const button = this.addButton(key, open);
+    button.setAttribute('aria-haspopup', 'dialog');
+    this.openers.add(button);
+  }
+
   private addSelect(className: string): HTMLSelectElement {
     const select = document.createElement('select');
     select.className = `bym-tb-select ${className}`;
@@ -313,6 +322,8 @@ export class Toolbar {
       sortAscending: s.sortAscending,
       sortDescending: s.sortDescending,
       filter: s.filter,
+      validation: s.dataValidation,
+      conditionalFormat: s.conditionalFormat,
       rowsColumns: s.rowsAndColumns,
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {
@@ -462,6 +473,30 @@ export class Toolbar {
       }),
     );
     this.open('borders', s.borders, items);
+  }
+
+  /** The menu of conditional formats: the quick rules (each opens the dialog of a rule), clearing, and the list of rules. */
+  private openConditional(): void {
+    const view = this.host.view;
+    const rules = view.ruleStrings;
+    // A dialog takes the focus itself: its item is not followed by a command's way back to the grid.
+    const dialog = (label: string, what: string): PopoverItem => ({ label, action: () => void view.openConditionalDialog(what) });
+    const quick = rules.quickRules;
+    const items: PopoverItem[] = [
+      dialog(quick.greaterThan, 'greaterThan'),
+      dialog(quick.lessThan, 'lessThan'),
+      dialog(quick.between, 'between'),
+      dialog(quick.equal, 'equal'),
+      dialog(quick.containsText, 'containsText'),
+      dialog(quick.duplicateValues, 'duplicateValues'),
+      dialog(quick.top10, 'top10'),
+      dialog(quick.colorScale, 'colorScale'),
+      dialog(quick.dataBar, 'dataBar'),
+      { label: rules.clearFromSelection, action: () => this.host.run(() => view.clearConditionalRules(view.selection.range)) },
+      { label: rules.clearFromSheet, action: () => this.host.run(() => view.clearConditionalRules()) },
+      dialog(rules.manageRules, 'manage'),
+    ];
+    this.open('conditionalFormat', this.strings.conditionalFormat, items);
   }
 
   private openRowsColumns(): void {

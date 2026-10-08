@@ -38,6 +38,7 @@ import {
   type ColumnRange,
   type ConditionalRule,
   type ConditionalValue,
+  type DataValidation,
   type DrawingAnchor,
   type DrawingMarker,
   type DrawingObject,
@@ -61,10 +62,12 @@ import { ZipArchive } from '../../zip';
 import {
   STYLESHEET_ORDER,
   adjustSheetElement,
+  planDxfs,
   autoFilterXml,
   borderElement,
   colorAttrs,
   colsXml,
+  encodeXstring,
   escapeAttr as attrEscape,
   escapeText as textEscape,
   escapeXstring,
@@ -268,7 +271,7 @@ const element = (name: string, attrs: [string, string][] = [], children: XmlNode
 const isGray125 = (fill: Fill | undefined) => !!fill && fill.type === 'pattern' && fill.pattern === 'gray125';
 
 /** xl/styles.xml from the model; the tables are in the order CT_Stylesheet gives them. */
-function stylesXml(model: StyleSheet, notes: Notes): string {
+function stylesXml(model: StyleSheet, notes: Notes, addedDxfs: XmlElement[] = []): string {
   const defaults = emptyStyleSheet();
   const fonts = model.fonts.length > 0 ? model.fonts : defaults.fonts;
   const borders = model.borders.length > 0 ? model.borders : defaults.borders;
@@ -336,11 +339,12 @@ function stylesXml(model: StyleSheet, notes: Notes): string {
       }),
     ),
   );
-  if (model.dxfs.length > 0) {
+  if (model.dxfs.length > 0 || addedDxfs.length > 0) {
     children.push(
       table(
         'dxfs',
-        model.dxfs.map((dxf) => {
+        // The records of the model, then those the rules that state their own format ask for (see planDxfs()).
+        model.dxfs.concat(addedDxfs).map((dxf) => {
           const copy = portable(dxf);
           if (copy) return copy;
           // The record keeps its place: conditional formats refer to it by position.
@@ -658,10 +662,10 @@ function sheetFormatXml(sheet: Sheet): string {
 
 const sqrefOf = (ranges: CellRange[]) => ranges.filter(validRange).map(rangeName).join(' ');
 
-function conditionalValueXml(value: ConditionalValue, icons: boolean): string {
+function conditionalValueXml(value: ConditionalValue, icons: boolean, prefix = ''): string {
   // The automatic limits of the 2010 extension are the lowest and the highest value here.
   const type = value.type === 'autoMin' ? 'min' : value.type === 'autoMax' ? 'max' : value.type;
-  let out = `<cfvo type="${escapeAttr(type)}"`;
+  let out = `<${prefix}cfvo type="${escapeAttr(type)}"`;
   if (value.value !== undefined) out += ` val="${escapeAttr(value.value)}"`;
   if (icons && !value.gte) out += ' gte="0"';
   return `${out}/>`;
@@ -669,14 +673,19 @@ function conditionalValueXml(value: ConditionalValue, icons: boolean): string {
 
 const colorXml = (name: string, color: Color) => `<${name}${colorAttrs(color)}/>`;
 
-/** One <cfRule>, or '' for a rule only the 2010 extension can state. */
-function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfCount: number, notes: Notes): string {
+/**
+ * One <cfRule>, or '' for a rule only the 2010 extension can state. `dxfId` is the record of
+ * the style sheet that holds its format (undefined: the rule gives none). `extra` is what the
+ * source element of the rule holds beside the fields of the model (attributes as they go into
+ * the start tag, children as text).
+ */
+export function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfId: number | undefined, notes?: Notes, prefix = '', extra?: { attrs: string; children: string }): string {
   if (rule.extended) {
-    notes.add('Conditional format: a rule of the 2010 extension is left out');
+    if (notes) notes.add('Conditional format: a rule of the 2010 extension is left out');
     return '';
   }
-  let out = `<cfRule type="${escapeAttr(rule.type)}"`;
-  if (rule.dxfId !== undefined && isIndex(rule.dxfId, dxfCount)) out += ` dxfId="${rule.dxfId}"`;
+  let out = `<${prefix}cfRule type="${escapeAttr(rule.type)}"`;
+  if (dxfId !== undefined) out += ` dxfId="${dxfId}"`;
   out += ` priority="${priority}"`;
   if (rule.stopIfTrue) out += ' stopIfTrue="1"';
   if (rule.type === 'aboveAverage') {
@@ -692,35 +701,41 @@ function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfCount: n
   if (rule.text !== undefined) out += ` text="${escapeAttr(rule.text)}"`;
   if (rule.timePeriod !== undefined) out += ` timePeriod="${escapeAttr(rule.timePeriod)}"`;
   if (rule.rank !== undefined) out += ` rank="${rule.rank}"`;
+  if (extra) out += extra.attrs;
 
   let inner = '';
-  for (const formula of rule.formulas.slice(0, 3)) inner += `<formula>${escapeText(formula)}</formula>`;
+  for (const formula of rule.formulas.slice(0, 3)) inner += `<${prefix}formula>${escapeText(formula)}</${prefix}formula>`;
   if (rule.colorScale) {
-    inner += '<colorScale>';
-    for (const value of rule.colorScale.values) inner += conditionalValueXml(value, false);
-    for (const color of rule.colorScale.colors) inner += colorXml('color', color);
-    inner += '</colorScale>';
+    inner += `<${prefix}colorScale>`;
+    for (const value of rule.colorScale.values) inner += conditionalValueXml(value, false, prefix);
+    for (const color of rule.colorScale.colors) inner += colorXml(`${prefix}color`, color);
+    inner += `</${prefix}colorScale>`;
   }
   if (rule.dataBar) {
     const bar = rule.dataBar;
-    if (bar.extended) notes.add('Conditional format: what the 2010 extension says about a data bar (border, axis, negative colours) is left out');
-    inner += `<dataBar${bar.minLength !== 10 ? ` minLength="${bar.minLength}"` : ''}${bar.maxLength !== 90 ? ` maxLength="${bar.maxLength}"` : ''}${bar.showValue ? '' : ' showValue="0"'}>`;
-    inner += conditionalValueXml(bar.min, false) + conditionalValueXml(bar.max, false) + colorXml('color', bar.color || { rgb: 'FF638EC6' });
-    inner += '</dataBar>';
+    if (bar.extended && notes) notes.add('Conditional format: what the 2010 extension says about a data bar (border, axis, negative colours) is left out');
+    inner += `<${prefix}dataBar${bar.minLength !== 10 ? ` minLength="${bar.minLength}"` : ''}${bar.maxLength !== 90 ? ` maxLength="${bar.maxLength}"` : ''}${bar.showValue ? '' : ' showValue="0"'}>`;
+    inner += conditionalValueXml(bar.min, false, prefix) + conditionalValueXml(bar.max, false, prefix) + colorXml(`${prefix}color`, bar.color || { rgb: 'FF638EC6' });
+    inner += `</${prefix}dataBar>`;
   }
   if (rule.iconSet) {
     const icons = rule.iconSet;
-    if (icons.custom) notes.add('Conditional format: icons chosen one by one (2010 extension) are written as their set');
-    inner += `<iconSet iconSet="${escapeAttr(icons.set)}"${icons.showValue ? '' : ' showValue="0"'}${icons.reverse ? ' reverse="1"' : ''}>`;
-    for (const value of icons.values) inner += conditionalValueXml(value, true);
-    inner += '</iconSet>';
+    if (icons.custom && notes) notes.add('Conditional format: icons chosen one by one (2010 extension) are written as their set');
+    inner += `<${prefix}iconSet iconSet="${escapeAttr(icons.set)}"${icons.showValue ? '' : ' showValue="0"'}${icons.reverse ? ' reverse="1"' : ''}>`;
+    for (const value of icons.values) inner += conditionalValueXml(value, true, prefix);
+    inner += `</${prefix}iconSet>`;
   }
-  if (rule.dxf) notes.add('Conditional format: a format stated in the rule itself is left out');
-  return inner === '' ? `${out}/>` : `${out}>${inner}</cfRule>`;
+  if (extra) inner += extra.children;
+  return inner === '' ? `${out}/>` : `${out}>${inner}</${prefix}cfRule>`;
 }
 
-/** One <conditionalFormatting> element per format of the sheet that has something to say. */
-function conditionalFormatsXml(sheet: Sheet, dxfCount: number, notes: Notes): string[] {
+/**
+ * One <conditionalFormatting> element per format of the sheet that has something to say. A
+ * format that is as the file has it still has to follow the rows, columns and sheets that
+ * changed since (`moved`: '' when its cells are gone); a format added or changed since is
+ * where it says (see conditionalFormatNow()). `dxfOf` says which record holds the format of a rule.
+ */
+function conditionalFormatsXml(sheet: Sheet, dxfOf: (rule: ConditionalRule) => number | undefined, notes: Notes, moved: (element: string) => string): string[] {
   const out: string[] = [];
   const formats = sheet.conditionalFormats;
   if (!formats || formats.length === 0) return out;
@@ -730,36 +745,62 @@ function conditionalFormatsXml(sheet: Sheet, dxfCount: number, notes: Notes): st
   for (const format of formats) {
     const sqref = sqrefOf(format.ranges);
     let rules = '';
-    for (const rule of format.rules) rules += conditionalRuleXml(rule, rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++highest, dxfCount, notes);
-    if (sqref !== '' && rules !== '') out.push(`<conditionalFormatting sqref="${sqref}">${rules}</conditionalFormatting>`);
+    for (const rule of format.rules) rules += conditionalRuleXml(rule, rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++highest, dxfOf(rule), notes);
+    if (sqref === '' || rules === '') continue;
+    const element = `<conditionalFormatting sqref="${sqref}">${rules}</conditionalFormatting>`;
+    const text = format.live ? element : moved(element);
+    if (text !== '') out.push(text);
   }
   return out;
 }
 
-function dataValidationsXml(sheet: Sheet): string {
-  const validations = (sheet.dataValidations || []).filter((validation) => sqrefOf(validation.ranges) !== '');
-  if (validations.length === 0) return '';
-  let out = `<dataValidations count="${validations.length}">`;
-  for (const validation of validations) {
-    out += '<dataValidation';
-    if (validation.type !== 'none') out += ` type="${escapeAttr(validation.type)}"`;
-    if (validation.errorStyle !== 'stop') out += ` errorStyle="${validation.errorStyle}"`;
-    if (validation.operator !== 'between') out += ` operator="${escapeAttr(validation.operator)}"`;
-    if (validation.allowBlank) out += ' allowBlank="1"';
-    if (validation.hideDropDown) out += ' showDropDown="1"';
-    if (validation.showInputMessage) out += ' showInputMessage="1"';
-    if (validation.showErrorMessage) out += ' showErrorMessage="1"';
-    if (validation.errorTitle !== undefined) out += ` errorTitle="${escapeAttr(validation.errorTitle)}"`;
-    if (validation.error !== undefined) out += ` error="${escapeAttr(validation.error)}"`;
-    if (validation.promptTitle !== undefined) out += ` promptTitle="${escapeAttr(validation.promptTitle)}"`;
-    if (validation.prompt !== undefined) out += ` prompt="${escapeAttr(validation.prompt)}"`;
-    out += ` sqref="${sqrefOf(validation.ranges)}"`;
-    let inner = '';
-    if (validation.formula1 !== undefined) inner += `<formula1>${escapeText(validation.formula1)}</formula1>`;
-    if (validation.formula2 !== undefined) inner += `<formula2>${escapeText(validation.formula2)}</formula2>`;
-    out += inner === '' ? '/>' : `>${inner}</dataValidation>`;
+/**
+ * One <dataValidation> from the model. `extra` is what the source element of the rule holds
+ * beside the fields of the model (attributes as they go into the start tag, children as text).
+ */
+export function dataValidationXml(validation: DataValidation, prefix = '', extra?: { attrs: string; children: string }): string {
+  // The messages are ST_Xstring: what XML cannot carry is written as _xHHHH_, as the reader expects it.
+  const message = (text: string) => escapeAttr(encodeXstring(text));
+  let out = `<${prefix}dataValidation`;
+  if (validation.type !== 'none') out += ` type="${escapeAttr(validation.type)}"`;
+  if (validation.errorStyle !== 'stop') out += ` errorStyle="${validation.errorStyle}"`;
+  if (validation.operator !== 'between') out += ` operator="${escapeAttr(validation.operator)}"`;
+  if (validation.allowBlank) out += ' allowBlank="1"';
+  if (validation.hideDropDown) out += ' showDropDown="1"';
+  if (validation.showInputMessage) out += ' showInputMessage="1"';
+  if (validation.showErrorMessage) out += ' showErrorMessage="1"';
+  if (validation.errorTitle !== undefined) out += ` errorTitle="${message(validation.errorTitle)}"`;
+  if (validation.error !== undefined) out += ` error="${message(validation.error)}"`;
+  if (validation.promptTitle !== undefined) out += ` promptTitle="${message(validation.promptTitle)}"`;
+  if (validation.prompt !== undefined) out += ` prompt="${message(validation.prompt)}"`;
+  if (extra) out += extra.attrs;
+  out += ` sqref="${sqrefOf(validation.ranges)}"`;
+  let inner = '';
+  if (validation.formula1 !== undefined) inner += `<${prefix}formula1>${escapeText(validation.formula1)}</${prefix}formula1>`;
+  if (validation.formula2 !== undefined) inner += `<${prefix}formula2>${escapeText(validation.formula2)}</${prefix}formula2>`;
+  if (extra) inner += extra.children;
+  return inner === '' ? `${out}/>` : `${out}>${inner}</${prefix}dataValidation>`;
+}
+
+/**
+ * <dataValidations> from the model ('' for a sheet without a rule), in the order of the model:
+ * which rule a cell has is the first one that names it. A rule that is as the file has it
+ * still has to follow the rows, columns and sheets that changed since (`moved`: '' when its
+ * cells are gone); a rule added or changed since is where it says (see dataValidationNow()).
+ * Rules of the extension list are among those of the file: written here, their source is
+ * read where it is.
+ */
+function dataValidationsXml(sheet: Sheet, moved: (element: string) => string): string {
+  let rules = '';
+  let count = 0;
+  for (const validation of sheet.dataValidations || []) {
+    if (!validation || !Array.isArray(validation.ranges) || sqrefOf(validation.ranges) === '') continue;
+    const element = validation.live ? dataValidationXml(validation) : moved(dataValidationXml(validation));
+    if (element === '') continue;
+    rules += element;
+    count++;
   }
-  return `${out}</dataValidations>`;
+  return count === 0 ? '' : `<dataValidations count="${count}">${rules}</dataValidations>`;
 }
 
 /** The filter of a sheet without what only makes sense in the part it was read from. */
@@ -1341,7 +1382,7 @@ interface SheetNumbers {
   vmlBlocks: { next: number };
 }
 
-function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media: MediaStore, numbers: SheetNumbers, notes: Notes, selected: boolean): SheetParts {
+function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media: MediaStore, numbers: SheetNumbers, notes: Notes, selected: boolean, dxfOf: (rule: ConditionalRule) => number | undefined): SheetParts {
   const rels = new Rels();
   const out: SheetParts = { xml: '', rels };
   let metrics: SheetMetrics | undefined;
@@ -1462,9 +1503,8 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   const merges = sheet.merges.filter(validRange);
   if (merges.length !== sheet.merges.length) notes.add('Sheet: a merged range outside the sheet is left out', sheet.merges.length - merges.length);
   parts.push(mergeCellsXml({ ...sheet, merges }, ''));
-  for (const format of conditionalFormatsXml(sheet, workbook.styles.dxfs.length, notes)) parts.push(adjustSheetElement(format, ownName, own, foreign, rename));
-  const validations = dataValidationsXml(sheet);
-  if (validations !== '') parts.push(adjustSheetElement(validations, ownName, own, foreign, rename));
+  for (const format of conditionalFormatsXml(sheet, dxfOf, notes, (element) => adjustSheetElement(element, ownName, own, foreign, rename))) parts.push(format);
+  parts.push(dataValidationsXml(sheet, (element) => adjustSheetElement(element, ownName, own, foreign, rename)));
 
   let links = '';
   /** Cells that have a link; the cells of a very large range are noted as far as LINK_CELLS goes. */
@@ -1626,6 +1666,8 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
   // From here to the end nothing is awaited: the count is this build's alone.
   replacedCharacters = 0;
   const numbers: SheetNumbers = { drawing: 0, comments: 0, vmlBlocks: { next: 1 } };
+  // The formats conditional rules state themselves become records of the style sheet.
+  const dxfs = planDxfs(workbook);
   const written: { name: string; parts: SheetParts; drawing: number; comments: number }[] = [];
   let pendingFormulas = false;
   sheets.forEach((sheet, index) => {
@@ -1635,7 +1677,7 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
       notes.add(sheet.kind === 'dialogsheet' ? 'Sheet: a dialog sheet is written as a worksheet' : `Sheet: the content of a ${sheet.kind === 'chartsheet' ? 'chart sheet' : 'macro sheet'} is not in the model; it is written as an empty worksheet`);
     }
     const before = { drawing: numbers.drawing, comments: numbers.comments };
-    const parts = sheetXml(workbook, sheet, strings, media, numbers, notes, index === active);
+    const parts = sheetXml(workbook, sheet, strings, media, numbers, notes, index === active, dxfs.indexOf);
     if (parts.pending) pendingFormulas = true;
     written.push({ name: `xl/worksheets/sheet${index + 1}.xml`, parts, drawing: numbers.drawing > before.drawing ? numbers.drawing : 0, comments: numbers.comments > before.comments ? numbers.comments : 0 });
   });
@@ -1711,7 +1753,7 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
     overrides.push(['xl/theme/theme1.xml', `${TYPE_PREFIX}theme+xml`]);
     bookRels.add(`${NS_REL}/theme`, 'theme/theme1.xml');
   }
-  files.push(['xl/styles.xml', stylesXml(workbook.styles, notes)]);
+  files.push(['xl/styles.xml', stylesXml(workbook.styles, notes, dxfs.added)]);
   overrides.push(['xl/styles.xml', `${TYPE_PREFIX}spreadsheetml.styles+xml`]);
   bookRels.add(`${NS_REL}/styles`, 'styles.xml');
   if (strings.items.length > 0) {

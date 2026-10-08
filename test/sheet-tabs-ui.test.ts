@@ -345,7 +345,7 @@ test('tabs: the refusals of moving, hiding, copying and colouring have words in 
     assert.equal(sheetErrorText('Cannot copy a chartsheet: not supported yet', strings), strings.sheetKindFixed('copy'));
     assert.equal(sheetErrorText('Cannot colour the tab of a chartsheet: not supported yet', strings), strings.sheetKindFixed('color'));
     assert.notEqual(strings.sheetKindFixed('copy'), strings.sheetKindFixed('delete'));
-    assert.match(strings.copyLoss('conditionalFormats', 2), /^2 /);
+    assert.match(strings.copyLoss('conditionalFormatExtensions', 2), /^2 /);
     assert.equal(strings.copyLoss('ctrlProp', 1), 'ctrlProp');
     // What the reader notes of a sheet part has a name in both languages.
     for (const what of ['codeName', 'outlinePr', 'outlineLevels', 'sortState', 'customSheetViews', 'ignoredErrors', 'cellWatches', 'phoneticPr', 'sparklineGroups', 'rowAttributes']) {

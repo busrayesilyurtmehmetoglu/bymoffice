@@ -53,7 +53,7 @@ const isTextFormat = (code: string) => code === '@';
 const MAX_CELL_TEXT = 32767;
 
 /** Whether the workbook has a defined name of this spelling, whatever its case. */
-function hasDefinedName(workbook: Workbook, word: string): boolean {
+export function hasDefinedName(workbook: Workbook, word: string): boolean {
   const names = workbook.definedNames;
   if (!names || names.length === 0) return false;
   const wanted = word.toLowerCase();

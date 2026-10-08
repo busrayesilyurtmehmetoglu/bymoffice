@@ -737,9 +737,9 @@ test.describe('cell menu', () => {
     expect(await contextMenuAt(page, c3.x, c3.y)).toBe(true);
     await expect(menu(page)).toBeVisible();
     expect(await selection(page)).toEqual({ active: 'C3', range: 'C3' });
-    await expect(labels(page)).toHaveText(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert row above', 'Insert column left', 'Delete row', 'Delete column', 'Add note']);
-    await expect(menu(page).locator('[role="separator"]')).toHaveCount(2);
-    await expect(menu(page).locator('[role="menuitem"]')).toHaveCount(9);
+    await expect(labels(page)).toHaveText(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert row above', 'Insert column left', 'Delete row', 'Delete column', 'Add note', 'Data validation\u2026']);
+    await expect(menu(page).locator('[role="separator"]')).toHaveCount(3);
+    await expect(menu(page).locator('[role="menuitem"]')).toHaveCount(10);
     await expect(labels(page).nth(0)).toBeFocused();
 
     // The arrow keys pass over the separator and go round.
@@ -758,7 +758,7 @@ test.describe('cell menu', () => {
     await select(page, 'B2:C4');
     await contextMenuAt(page, c3.x, c3.y);
     expect(await selection(page)).toEqual({ active: 'B2', range: 'B2:C4' });
-    await expect(labels(page)).toHaveText(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert 3 rows above', 'Insert 2 columns left', 'Delete 3 rows', 'Delete 2 columns', 'Add note']);
+    await expect(labels(page)).toHaveText(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert 3 rows above', 'Insert 2 columns left', 'Delete 3 rows', 'Delete 2 columns', 'Add note', 'Data validation\u2026']);
     await labels(page).nth(4).click();
     await expect(menu(page)).toHaveCount(0);
     expect([(await cell(page, 'B2')).value, (await cell(page, 'B5')).value, (await cell(page, 'C6')).value]).toEqual([undefined, 5, 7]);
@@ -774,7 +774,7 @@ test.describe('cell menu', () => {
     // Whole columns have no rows to insert, whole rows no columns.
     await selectColumns(page, 1, 1);
     await contextMenuAt(page, pointIn(box, 2, 1).x, c3.y);
-    await expect(labels(page)).toHaveText(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert column left', 'Delete column', 'Add note']);
+    await expect(labels(page)).toHaveText(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert column left', 'Delete column', 'Add note', 'Data validation\u2026']);
     await page.keyboard.press('Escape');
     await expect(menu(page)).toHaveCount(0);
     await expect(input(page)).toBeFocused();
@@ -866,7 +866,7 @@ test.describe('cell menu', () => {
     await expect(labels(page).nth(1)).toHaveAttribute('aria-disabled', 'true');
     await expect(labels(page).nth(2)).toBeFocused();
     await page.keyboard.press('ArrowUp');
-    await expect(labels(page).nth(8)).toBeFocused();
+    await expect(labels(page).nth(9)).toBeFocused();
     await page.keyboard.press('Home');
     await expect(labels(page).nth(2)).toBeFocused();
     // A press on an unavailable item does nothing and leaves the menu open.
@@ -891,7 +891,7 @@ test.describe('cell menu', () => {
     await view(page, 'view.setReadOnly(false)');
     await select(page, 'B1:B2');
     await contextMenuAt(page, b1.x, b1.y);
-    await expect(labels(page)).toHaveText(['Kes', 'Kopyala', 'Yapıştır', 'İçeriği temizle', 'Üste 2 satır ekle', 'Sola sütun ekle', '2 satırı sil', 'Sütunu sil', 'Not ekle']);
+    await expect(labels(page)).toHaveText(['Kes', 'Kopyala', 'Yapıştır', 'İçeriği temizle', 'Üste 2 satır ekle', 'Sola sütun ekle', '2 satırı sil', 'Sütunu sil', 'Not ekle', 'Veri doğrulama\u2026']);
     await view(page, "view.setLocale('en-US')");
     await contextMenuAt(page, b1.x, b1.y);
     await expect(labels(page).nth(3)).toHaveText('Clear contents');
@@ -1135,12 +1135,12 @@ for (const mode of ['open', 'closed'] as const) {
       const c3 = pointIn(box, 2, 2);
 
       expect(await rightClickAt(page, c3.x, c3.y)).toBe(true);
-      expect(await itemTexts(page)).toEqual(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert row above', 'Insert column left', 'Delete row', 'Delete column', 'Add note']);
+      expect(await itemTexts(page)).toEqual(['Cut', 'Copy', 'Paste', 'Clear contents', 'Insert row above', 'Insert column left', 'Delete row', 'Delete column', 'Add note', 'Data validation\u2026']);
       expect(await focusedText(page)).toBe('Cut');
       await page.keyboard.press('ArrowDown');
       expect(await focusedText(page)).toBe('Copy');
       await page.keyboard.press('End');
-      expect(await focusedText(page)).toBe('Add note');
+      expect(await focusedText(page)).toBe('Data validation\u2026');
       await page.keyboard.press('ArrowDown');
       expect(await focusedText(page)).toBe('Cut');
       await page.keyboard.press('Escape');
@@ -1608,7 +1608,7 @@ test.describe('review: page styles and focus', () => {
         return { x: r.left, y: r.top, width: r.width, height: r.height };
       }),
     );
-    expect(items).toHaveLength(9);
+    expect(items).toHaveLength(10);
     for (let i = 0; i < items.length; i++) {
       expect(items[i].height).toBeLessThan(40);
       expect(items[i].width).toBeLessThan(260);

@@ -233,6 +233,149 @@ export interface UiStrings {
   sheetFormulaUnread(action: 'rename' | 'delete', where: string): string;
   /** Two sheets whose names differ only by the case of their letters: the sheets of such a workbook are not changed. */
   sheetNamesClash(first: string, second: string): string;
+  /** The dialogs that set rules: data validation and conditional formats. */
+  rules: RuleStrings;
+}
+
+/** What the dialogs of data validation say. Kinds and operators are named by the words the file uses for them. */
+export interface RuleStrings {
+  /** The item of the cell menu and the label of the toolbar button; with an ellipsis, since a dialog follows. */
+  validationCommand: string;
+  validationTitle: string;
+  ok: string;
+  cancel: string;
+  close: string;
+  clearAll: string;
+  /** Headings of the three parts of the dialog. */
+  settings: string;
+  inputMessage: string;
+  errorAlert: string;
+  allow: string;
+  /** By ST_DataValidationType: none, whole, decimal, list, date, time, textLength, custom. */
+  types: Record<string, string>;
+  data: string;
+  /** By ST_DataValidationOperator. */
+  operators: Record<string, string>;
+  /** Labels of the value fields, by what the kind of rule asks for. */
+  minimum: string;
+  maximum: string;
+  value: string;
+  startDate: string;
+  endDate: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  time: string;
+  source: string;
+  formula: string;
+  /** Under the source of a list: how items are typed in this locale. */
+  sourceHint(separator: string): string;
+  ignoreBlank: string;
+  inCellDropdown: string;
+  showInputMessage: string;
+  showErrorAlert: string;
+  style: string;
+  /** By the style of the alert: stop, warning, information. */
+  styles: Record<string, string>;
+  title: string;
+  message: string;
+  /** Said in the dialog when the selection has cells of several rules, or some cells with a rule and some without. */
+  mixedSelection: string;
+  /** What the dialog refuses. */
+  needNumber(field: string): string;
+  needWholeNumber(field: string): string;
+  needDate(field: string): string;
+  needTime(field: string): string;
+  needValue(field: string): string;
+  needItems: string;
+  itemWithComma: string;
+  listTooLong(limit: number): string;
+  textTooLong(field: string, limit: number): string;
+  badRuleFormula(field: string): string;
+  /** What the operations refuse. */
+  extensionRule: string;
+  tooManyValidations: string;
+  tooManyRanges: string;
+  formulaBeingTyped: string;
+  /** Said once a rule was set or cleared. */
+  validationSet: string;
+  validationCleared: string;
+
+  // Conditional formats.
+  /** The label of the toolbar button, and of the menu it opens. */
+  conditionalCommand: string;
+  /** Items of that menu; those that open a dialog end with an ellipsis. */
+  quickRules: { greaterThan: string; lessThan: string; between: string; equal: string; containsText: string; duplicateValues: string; top10: string; colorScale: string; dataBar: string };
+  clearFromSelection: string;
+  clearFromSheet: string;
+  manageRules: string;
+  conditionalTitle: string;
+  managerTitle: string;
+  ruleType: string;
+  /** By ST_CfType, the kinds that are only kept (iconSet, timePeriod) included. */
+  conditionalTypes: Record<string, string>;
+  text: string;
+  rank: string;
+  percentOfRange: string;
+  lowestValues: string;
+  averageSide: string;
+  averages: { above: string; below: string };
+  includeAverage: string;
+  stopIfTrue: string;
+  format: string;
+  formatWith: string;
+  presets: Record<string, string>;
+  textColor: string;
+  fillColor: string;
+  bold: string;
+  italic: string;
+  underline: string;
+  strike: string;
+  scaleKind: string;
+  scales: Record<string, string>;
+  lowest: string;
+  midpoint: string;
+  highest: string;
+  barColor: string;
+  showRulesFor: string;
+  scopeSelection: string;
+  scopeSheet: string;
+  appliesTo: string;
+  moveUp: string;
+  moveDown: string;
+  edit: string;
+  deleteRule: string;
+  newRule: string;
+  noRules: string;
+  /** Under a list that does not show every rule. */
+  moreRules(count: number): string;
+  /** The name of one row of the list for assistive technology: "Rule 2: Cell value greater than 5". */
+  ruleRow(place: number, description: string): string;
+  /** How rules are named in the list. */
+  cellValue: string;
+  and: string;
+  textRules: Record<string, string>;
+  topItems(count: number, percent: boolean, bottom: boolean): string;
+  average(above: boolean, equal: boolean): string;
+  formulaIs: string;
+  datesOccurring: string;
+  periods: Record<string, string>;
+  /** What the dialogs and the operations refuse. */
+  needRange: string;
+  badRange: string;
+  needWholeUpTo(field: string, limit: number): string;
+  /** A rule only a newer Excel states: nothing of it is changed. */
+  extensionRuleKept: string;
+  /** A rule a newer Excel states more about (its data bars): what it says is not changed; its cells and its place are, and it can be deleted. */
+  extensionRuleSays: string;
+  orderFixed: string;
+  ruleKindKept: string;
+  tooManyConditional: string;
+  /** Said once rules changed. */
+  ruleAdded: string;
+  ruleChanged: string;
+  ruleDeleted: string;
+  rulesCleared: string;
 }
 
 const rows = (count: number) => (count === 1 ? 'row' : `${count} rows`);
@@ -396,8 +539,7 @@ export const STRINGS_EN: UiStrings = {
   sheetCopiedWithout: (name, what) => `Sheet ${name} was copied without: ${what}`,
   copyLoss: (what, count) => {
     const names: Record<string, [string, string]> = {
-      conditionalFormats: ['conditional format', 'conditional formats'],
-      dataValidations: ['data validation', 'data validations'],
+      conditionalFormatExtensions: ['conditional format setting of a newer Excel', 'conditional format settings of a newer Excel'],
       drawings: ['picture or shape', 'pictures and shapes'],
       threadedComments: ['threaded comment', 'threaded comments'],
       externalLinks: ['link to another place', 'links to other places'],
@@ -435,6 +577,178 @@ export const STRINGS_EN: UiStrings = {
       : `Sheets cannot be ${action === 'rename' ? 'renamed' : 'deleted'} yet in a workbook with ${what === 'pivotTable' ? 'a pivot table' : what === 'chart' ? 'a chart' : what}`,
   sheetFormulaUnread: (action, where) => `The sheet cannot be ${action === 'rename' ? 'renamed' : 'deleted'}: the formula of ${where} cannot be read`,
   sheetNamesClash: (first, second) => `The sheets of this workbook cannot be changed: "${first}" and "${second}" differ only by case`,
+  rules: {
+    validationCommand: 'Data validation\u2026',
+    validationTitle: 'Data validation',
+    ok: 'OK',
+    cancel: 'Cancel',
+    close: 'Close',
+    clearAll: 'Clear all',
+    settings: 'Settings',
+    inputMessage: 'Input message',
+    errorAlert: 'Error alert',
+    allow: 'Allow',
+    types: { none: 'Any value', whole: 'Whole number', decimal: 'Decimal', list: 'List', date: 'Date', time: 'Time', textLength: 'Text length', custom: 'Custom formula' },
+    data: 'Data',
+    operators: {
+      between: 'between',
+      notBetween: 'not between',
+      equal: 'equal to',
+      notEqual: 'not equal to',
+      greaterThan: 'greater than',
+      lessThan: 'less than',
+      greaterThanOrEqual: 'greater than or equal to',
+      lessThanOrEqual: 'less than or equal to',
+    },
+    minimum: 'Minimum',
+    maximum: 'Maximum',
+    value: 'Value',
+    startDate: 'Start date',
+    endDate: 'End date',
+    date: 'Date',
+    startTime: 'Start time',
+    endTime: 'End time',
+    time: 'Time',
+    source: 'Source',
+    formula: 'Formula',
+    sourceHint: (separator) => `Items separated by "${separator}", or cells: =$A$1:$A$5`,
+    ignoreBlank: 'Ignore blank',
+    inCellDropdown: 'In-cell dropdown',
+    showInputMessage: 'Show input message when the cell is selected',
+    showErrorAlert: 'Show error alert after invalid data is entered',
+    style: 'Style',
+    styles: { stop: 'Stop', warning: 'Warning', information: 'Information' },
+    title: 'Title',
+    message: 'Message',
+    mixedSelection: 'The selection contains more than one rule, or cells without one. OK replaces them all with this rule.',
+    needNumber: (field) => `${field}: enter a number or a formula`,
+    needWholeNumber: (field) => `${field}: enter a whole number or a formula`,
+    needDate: (field) => `${field}: enter a date or a formula`,
+    needTime: (field) => `${field}: enter a time or a formula`,
+    needValue: (field) => `${field} is required`,
+    needItems: 'Enter the items of the list, or the cells that hold them',
+    itemWithComma: 'An item of a list cannot contain a comma',
+    listTooLong: (limit) => `The items of a list cannot be longer than ${limit} characters together; use cells for a longer list`,
+    textTooLong: (field, limit) => `${field} cannot be longer than ${limit} characters`,
+    badRuleFormula: (field) => `${field}: the formula cannot be read`,
+    extensionRule: 'A rule kept as it is applies to these cells (its list is on another sheet); it cannot be changed here',
+    tooManyValidations: 'The sheet has too many data validations',
+    tooManyRanges: 'The rule would be left with too many separate ranges',
+    formulaBeingTyped: 'Finish the formula first',
+    validationSet: 'Data validation set',
+    validationCleared: 'Data validation cleared',
+    conditionalCommand: 'Conditional formatting',
+    quickRules: {
+      greaterThan: 'Greater than\u2026',
+      lessThan: 'Less than\u2026',
+      between: 'Between\u2026',
+      equal: 'Equal to\u2026',
+      containsText: 'Text that contains\u2026',
+      duplicateValues: 'Duplicate values\u2026',
+      top10: 'Top 10 items\u2026',
+      colorScale: 'Colour scales\u2026',
+      dataBar: 'Data bars\u2026',
+    },
+    clearFromSelection: 'Clear rules from selected cells',
+    clearFromSheet: 'Clear rules from this sheet',
+    manageRules: 'Manage rules\u2026',
+    conditionalTitle: 'Conditional formatting rule',
+    managerTitle: 'Conditional formatting rules',
+    ruleType: 'Rule type',
+    conditionalTypes: {
+      cellIs: 'Cell value',
+      containsText: 'Text contains',
+      notContainsText: 'Text does not contain',
+      beginsWith: 'Text begins with',
+      endsWith: 'Text ends with',
+      duplicateValues: 'Duplicate values',
+      uniqueValues: 'Unique values',
+      top10: 'Top or bottom values',
+      aboveAverage: 'Above or below average',
+      containsBlanks: 'Blank cells',
+      notContainsBlanks: 'Cells that are not blank',
+      containsErrors: 'Cells with an error',
+      notContainsErrors: 'Cells without an error',
+      expression: 'Formula',
+      colorScale: 'Colour scale',
+      dataBar: 'Data bar',
+      iconSet: 'Icon set',
+      timePeriod: 'Dates occurring',
+    },
+    text: 'Text',
+    rank: 'Number',
+    percentOfRange: 'Percent of the range',
+    lowestValues: 'Lowest values',
+    averageSide: 'Values',
+    averages: { above: 'above the average', below: 'below the average' },
+    includeAverage: 'Include the average itself',
+    stopIfTrue: 'Stop if true',
+    format: 'Format',
+    formatWith: 'Format with',
+    presets: {
+      lightRed: 'Light red fill with dark red text',
+      yellow: 'Yellow fill with dark yellow text',
+      green: 'Green fill with dark green text',
+      keep: 'The format it has',
+      custom: 'Custom format',
+      none: 'No format',
+    },
+    textColor: 'Text colour',
+    fillColor: 'Fill colour',
+    bold: 'Bold',
+    italic: 'Italic',
+    underline: 'Underline',
+    strike: 'Strikethrough',
+    scaleKind: 'Colours',
+    scales: { '2': 'Two colours', '3': 'Three colours' },
+    lowest: 'Lowest',
+    midpoint: 'Midpoint',
+    highest: 'Highest',
+    barColor: 'Bar colour',
+    showRulesFor: 'Show rules for',
+    scopeSelection: 'Current selection',
+    scopeSheet: 'This sheet',
+    appliesTo: 'Applies to',
+    moveUp: 'Move up',
+    moveDown: 'Move down',
+    edit: 'Edit',
+    deleteRule: 'Delete',
+    newRule: 'New rule\u2026',
+    noRules: 'No rules',
+    moreRules: (count) => `${count} more rules are not listed; select fewer cells to see the rules of those`,
+    ruleRow: (place, description) => `Rule ${place}: ${description}`,
+    cellValue: 'Cell value',
+    and: 'and',
+    textRules: { containsText: 'Text contains', notContainsText: 'Text does not contain', beginsWith: 'Text begins with', endsWith: 'Text ends with' },
+    topItems: (count, percent, bottom) => `${bottom ? 'Bottom' : 'Top'} ${count}${percent ? '%' : ''}`,
+    average: (above, equal) => `${above ? 'Above' : 'Below'}${equal ? ' or equal to' : ''} average`,
+    formulaIs: 'Formula',
+    datesOccurring: 'Dates occurring',
+    periods: {
+      today: 'today',
+      yesterday: 'yesterday',
+      tomorrow: 'tomorrow',
+      last7Days: 'in the last 7 days',
+      thisWeek: 'this week',
+      lastWeek: 'last week',
+      nextWeek: 'next week',
+      thisMonth: 'this month',
+      lastMonth: 'last month',
+      nextMonth: 'next month',
+    },
+    needRange: 'Enter the cells the rule applies to',
+    badRange: 'These are not ranges of the sheet; write them like A1:B10',
+    needWholeUpTo: (field, limit) => `${field}: enter a whole number from 1 to ${limit}`,
+    extensionRuleKept: 'This rule has settings of a newer Excel, which are kept as they are; it cannot be changed or deleted here',
+    extensionRuleSays: 'What this rule says has settings of a newer Excel and is kept as it is; its cells and its place can be changed, and it can be deleted',
+    orderFixed: 'The order of the rules of this sheet cannot be changed: one of them is kept as it is, with its place',
+    ruleKindKept: 'A rule of this kind is kept as it is; it can be moved and deleted, not changed',
+    tooManyConditional: 'The sheet has too many conditional formats',
+    ruleAdded: 'Conditional format added',
+    ruleChanged: 'Conditional format changed',
+    ruleDeleted: 'Conditional format deleted',
+    rulesCleared: 'Conditional formats cleared',
+  },
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -605,8 +919,7 @@ export const STRINGS_TR: UiStrings = {
   sheetCopiedWithout: (name, what) => `${name} sayfası kopyalandı; şunlar kopyalanmadı: ${what}`,
   copyLoss: (what, count) => {
     const names: Record<string, string> = {
-      conditionalFormats: 'koşullu biçim',
-      dataValidations: 'veri doğrulama',
+      conditionalFormatExtensions: 'yeni Excel sürümüne özgü koşullu biçim ayarı',
       drawings: 'görsel ya da şekil',
       threadedComments: 'yorum zinciri',
       externalLinks: 'dış bağlantı',
@@ -643,6 +956,178 @@ export const STRINGS_TR: UiStrings = {
       : `${what === 'pivotTable' ? 'Pivot tablo' : what === 'chart' ? 'Grafik' : what === 'form controls' ? 'Form denetimi' : what} içeren çalışma kitabında sayfalar henüz ${action === 'rename' ? 'yeniden adlandırılamıyor' : 'silinemiyor'}`,
   sheetFormulaUnread: (action, where) => `Sayfa ${action === 'rename' ? 'yeniden adlandırılamadı' : 'silinemedi'}: ${where} formülü okunamıyor`,
   sheetNamesClash: (first, second) => `Bu çalışma kitabının sayfaları değiştirilemiyor: "${first}" ve "${second}" adları yalnız harf büyüklüğüyle ayrılıyor`,
+  rules: {
+    validationCommand: 'Veri doğrulama\u2026',
+    validationTitle: 'Veri doğrulama',
+    ok: 'Tamam',
+    cancel: 'İptal',
+    close: 'Kapat',
+    clearAll: 'Tümünü temizle',
+    settings: 'Ayarlar',
+    inputMessage: 'Giriş iletisi',
+    errorAlert: 'Hata uyarısı',
+    allow: 'İzin verilen',
+    types: { none: 'Herhangi bir değer', whole: 'Tam sayı', decimal: 'Ondalık', list: 'Liste', date: 'Tarih', time: 'Saat', textLength: 'Metin uzunluğu', custom: 'Özel formül' },
+    data: 'Veri',
+    operators: {
+      between: 'arasında',
+      notBetween: 'arasında değil',
+      equal: 'eşit',
+      notEqual: 'eşit değil',
+      greaterThan: 'büyük',
+      lessThan: 'küçük',
+      greaterThanOrEqual: 'büyük ya da eşit',
+      lessThanOrEqual: 'küçük ya da eşit',
+    },
+    minimum: 'En az',
+    maximum: 'En çok',
+    value: 'Değer',
+    startDate: 'Başlangıç tarihi',
+    endDate: 'Bitiş tarihi',
+    date: 'Tarih',
+    startTime: 'Başlangıç saati',
+    endTime: 'Bitiş saati',
+    time: 'Saat',
+    source: 'Kaynak',
+    formula: 'Formül',
+    sourceHint: (separator) => `Öğeler "${separator}" ile ayrılır; ya da hücreler: =$A$1:$A$5`,
+    ignoreBlank: 'Boşu yok say',
+    inCellDropdown: 'Hücre içi açılır liste',
+    showInputMessage: 'Hücre seçildiğinde giriş iletisini göster',
+    showErrorAlert: 'Geçersiz veri girildiğinde hata uyarısı göster',
+    style: 'Stil',
+    styles: { stop: 'Dur', warning: 'Uyarı', information: 'Bilgi' },
+    title: 'Başlık',
+    message: 'İleti',
+    mixedSelection: 'Seçim birden çok kural ya da kuralsız hücreler içeriyor. Tamam, hepsinin yerine bu kuralı koyar.',
+    needNumber: (field) => `${field}: bir sayı ya da formül girin`,
+    needWholeNumber: (field) => `${field}: bir tam sayı ya da formül girin`,
+    needDate: (field) => `${field}: bir tarih ya da formül girin`,
+    needTime: (field) => `${field}: bir saat ya da formül girin`,
+    needValue: (field) => `${field} gerekli`,
+    needItems: 'Listenin öğelerini ya da öğeleri tutan hücreleri girin',
+    itemWithComma: 'Liste öğesi virgül içeremez',
+    listTooLong: (limit) => `Liste öğeleri toplam ${limit} karakteri aşamaz; daha uzun liste için hücre kullanın`,
+    textTooLong: (field, limit) => `${field} ${limit} karakterden uzun olamaz`,
+    badRuleFormula: (field) => `${field}: formül okunamıyor`,
+    extensionRule: 'Bu hücrelere olduğu gibi korunan bir kural uygulanıyor (listesi başka sayfada); burada değiştirilemez',
+    tooManyValidations: 'Sayfada çok fazla veri doğrulama kuralı var',
+    tooManyRanges: 'Kural çok fazla ayrı aralığa bölünürdü',
+    formulaBeingTyped: 'Önce formülü bitirin',
+    validationSet: 'Veri doğrulama uygulandı',
+    validationCleared: 'Veri doğrulama temizlendi',
+    conditionalCommand: 'Koşullu biçimlendirme',
+    quickRules: {
+      greaterThan: 'Büyüktür\u2026',
+      lessThan: 'Küçüktür\u2026',
+      between: 'Arasında\u2026',
+      equal: 'Eşittir\u2026',
+      containsText: 'Metin içerir\u2026',
+      duplicateValues: 'Yinelenen değerler\u2026',
+      top10: 'İlk 10 öğe\u2026',
+      colorScale: 'Renk ölçekleri\u2026',
+      dataBar: 'Veri çubukları\u2026',
+    },
+    clearFromSelection: 'Seçili hücrelerden kuralları temizle',
+    clearFromSheet: 'Bu sayfadan kuralları temizle',
+    manageRules: 'Kuralları yönet\u2026',
+    conditionalTitle: 'Koşullu biçimlendirme kuralı',
+    managerTitle: 'Koşullu biçimlendirme kuralları',
+    ruleType: 'Kural türü',
+    conditionalTypes: {
+      cellIs: 'Hücre değeri',
+      containsText: 'Metin içerir',
+      notContainsText: 'Metin içermez',
+      beginsWith: 'Metin şununla başlar',
+      endsWith: 'Metin şununla biter',
+      duplicateValues: 'Yinelenen değerler',
+      uniqueValues: 'Benzersiz değerler',
+      top10: 'İlk ya da son değerler',
+      aboveAverage: 'Ortalamanın üstü ya da altı',
+      containsBlanks: 'Boş hücreler',
+      notContainsBlanks: 'Boş olmayan hücreler',
+      containsErrors: 'Hata içeren hücreler',
+      notContainsErrors: 'Hata içermeyen hücreler',
+      expression: 'Formül',
+      colorScale: 'Renk ölçeği',
+      dataBar: 'Veri çubuğu',
+      iconSet: 'Simge kümesi',
+      timePeriod: 'Tarih dönemi',
+    },
+    text: 'Metin',
+    rank: 'Sayı',
+    percentOfRange: 'Aralığın yüzdesi',
+    lowestValues: 'En düşük değerler',
+    averageSide: 'Değerler',
+    averages: { above: 'ortalamanın üstünde', below: 'ortalamanın altında' },
+    includeAverage: 'Ortalamanın kendisi de',
+    stopIfTrue: 'Doğruysa durdur',
+    format: 'Biçim',
+    formatWith: 'Biçim',
+    presets: {
+      lightRed: 'Açık kırmızı dolgu, koyu kırmızı metin',
+      yellow: 'Sarı dolgu, koyu sarı metin',
+      green: 'Yeşil dolgu, koyu yeşil metin',
+      keep: 'Var olan biçim',
+      custom: 'Özel biçim',
+      none: 'Biçim yok',
+    },
+    textColor: 'Yazı rengi',
+    fillColor: 'Dolgu rengi',
+    bold: 'Kalın',
+    italic: 'İtalik',
+    underline: 'Altı çizili',
+    strike: 'Üstü çizili',
+    scaleKind: 'Renkler',
+    scales: { '2': 'İki renk', '3': 'Üç renk' },
+    lowest: 'En düşük',
+    midpoint: 'Orta nokta',
+    highest: 'En yüksek',
+    barColor: 'Çubuk rengi',
+    showRulesFor: 'Kuralları göster',
+    scopeSelection: 'Geçerli seçim',
+    scopeSheet: 'Bu sayfa',
+    appliesTo: 'Uygulandığı yer',
+    moveUp: 'Yukarı taşı',
+    moveDown: 'Aşağı taşı',
+    edit: 'Düzenle',
+    deleteRule: 'Sil',
+    newRule: 'Yeni kural\u2026',
+    noRules: 'Kural yok',
+    moreRules: (count) => `${count} kural daha listelenmedi; onları görmek için daha az hücre seçin`,
+    ruleRow: (place, description) => `${place}. kural: ${description}`,
+    cellValue: 'Hücre değeri',
+    and: 've',
+    textRules: { containsText: 'Metin içerir', notContainsText: 'Metin içermez', beginsWith: 'Metin şununla başlar', endsWith: 'Metin şununla biter' },
+    topItems: (count, percent, bottom) => `${bottom ? 'Son' : 'İlk'} ${percent ? '%' : ''}${count}`,
+    average: (above, equal) => `Ortalamanın ${above ? 'üstü' : 'altı'}${equal ? ' ya da ortalama' : ''}`,
+    formulaIs: 'Formül',
+    datesOccurring: 'Tarih',
+    periods: {
+      today: 'bugün',
+      yesterday: 'dün',
+      tomorrow: 'yarın',
+      last7Days: 'son 7 gün',
+      thisWeek: 'bu hafta',
+      lastWeek: 'geçen hafta',
+      nextWeek: 'gelecek hafta',
+      thisMonth: 'bu ay',
+      lastMonth: 'geçen ay',
+      nextMonth: 'gelecek ay',
+    },
+    needRange: 'Kuralın uygulanacağı hücreleri girin',
+    badRange: 'Bunlar sayfanın aralıkları değil; A1:B10 gibi yazın',
+    needWholeUpTo: (field, limit) => `${field}: 1 ile ${limit} arasında bir tam sayı girin`,
+    extensionRuleKept: 'Bu kuralın yeni Excel sürümüne özgü ayarları var ve olduğu gibi korunuyor; burada değiştirilemez ya da silinemez',
+    extensionRuleSays: 'Bu kuralın içeriği yeni Excel sürümüne özgü ayarlar taşıyor ve olduğu gibi korunuyor; uygulandığı yer ve sırası değiştirilebilir, kural silinebilir',
+    orderFixed: 'Bu sayfadaki kuralların sırası değiştirilemiyor: biri yeriyle birlikte olduğu gibi korunuyor',
+    ruleKindKept: 'Bu tür kural olduğu gibi korunur; taşınabilir ve silinebilir, değiştirilemez',
+    tooManyConditional: 'Sayfada çok fazla koşullu biçim var',
+    ruleAdded: 'Koşullu biçim eklendi',
+    ruleChanged: 'Koşullu biçim değiştirildi',
+    ruleDeleted: 'Koşullu biçim silindi',
+    rulesCleared: 'Koşullu biçimler temizlendi',
+  },
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */

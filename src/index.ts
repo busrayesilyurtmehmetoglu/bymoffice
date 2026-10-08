@@ -72,6 +72,40 @@ export {
   type InsertSheetOptions,
 } from './ops/sheets';
 export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
+export {
+  CONDITIONAL_TYPES,
+  MAX_SHEET_CONDITIONAL_RULES,
+  MAX_SHEET_VALIDATIONS,
+  MAX_VALIDATION_LIST,
+  MAX_VALIDATION_MESSAGE,
+  MAX_VALIDATION_TITLE,
+  VALIDATION_OPERATORS,
+  VALIDATION_TYPES,
+  addConditionalRule,
+  clearConditionalRules,
+  conditionalFormatNow,
+  conditionalRules,
+  dataValidationNow,
+  moveConditionalRule,
+  removeConditionalRule,
+  ruleFormatOf,
+  ruleSpace,
+  textRuleCell,
+  MAX_DIFFERENTIAL_FORMATS,
+  setValidation,
+  updateConditionalRule,
+  validationProblem,
+  validationsIn,
+  type ConditionalPatch,
+  type ConditionalRuleInfo,
+  type ConditionalSettings,
+  type ConditionalType,
+  type RuleFormat,
+  type RuleSpace,
+  type ValidationOperator,
+  type ValidationSettings,
+  type ValidationType,
+} from './ops/rules';
 export { clearRange, copyRange, cutRange, editTextAt, pasteAt, setCellInput, type CopiedNote, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
 export { MAX_FILTER_VALUES, clearFilter, filterSummary, filterValues, setAutoFilter, setFilterColumn, type FilterCriterion, type FilterValue, type FilterValueList } from './ops/filter';
 export { collationKey, currentRegion, sortRange, type SortKey, type SortOptions } from './ops/sort';
@@ -575,7 +609,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   }
   save = async () => {
     // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
-    if (!view.commitPending()) throw new Error('Cannot save: the note or the sheet name that is being typed cannot be applied');
+    if (!view.commitPending()) throw new Error('Cannot save: the note, the sheet name or the rule that is being edited cannot be applied');
     return file.save();
   };
   container.addEventListener('keydown', onKeyDown);

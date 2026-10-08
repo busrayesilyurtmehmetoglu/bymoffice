@@ -389,8 +389,9 @@ function sheetContent(sheet: Sheet, format: (index: number | undefined) => strin
     // A link without a target leads nowhere and is not written (with a warning); the relationship id is the file's own business.
     links: sheet.hyperlinks.filter((link) => !expected || link.target || link.location).map((link) => [link.range, link.target || undefined, link.location || undefined, link.display, link.tooltip]),
     rows,
-    conditionalFormats: sheet.conditionalFormats,
-    dataValidations: sheet.dataValidations,
+    // Where a rule is in the part it was read from (`src`) is not content.
+    conditionalFormats: sheet.conditionalFormats && sheet.conditionalFormats.map((format) => ({ ...format, src: undefined, rules: format.rules.map((rule) => ({ ...rule, src: undefined })) })),
+    dataValidations: sheet.dataValidations && sheet.dataValidations.map((rule) => ({ ...rule, src: undefined })),
     autoFilter: sheet.autoFilter && { range: sheet.autoFilter.range, columns: sheet.autoFilter.columns.map((column) => ({ ...column, raw: undefined })) },
     drawings,
     comments: (sheet.comments || []).map((comment) => commentContent(comment, metrics, expected)),

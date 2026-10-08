@@ -1,7 +1,9 @@
 // Conditional formats: which format, colour, data bar and icon the rules of a
 // sheet give a cell.
 //
-// The rules are read-only here (the writer copies their source elements). What
+// The rules are never changed here: those of the file are read through the rows,
+// columns and sheets that changed since, those added or changed by editing are
+// where they say (see conditionalFormatNow() in ops/rules.ts). What
 // they need from the cells of their ranges - the smallest and largest number,
 // percentiles, the average, which values repeat - is worked out once per rule
 // and kept until invalidate() is called, and the result for a cell is kept as
@@ -14,10 +16,11 @@
 // apply.
 
 import type { CalcEngine } from '../calc/engine';
-import { adjustAnchoredFormula, adjustFormula, adjustRange, relativeExtent, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
+import { relativeExtent, shiftFormula } from '../calc/refs';
 import { compareScalars, isError, numberToText, textToNumber, type Scalar } from '../calc/values';
 import { resolveColor } from '../model/sheet/color';
-import { MAX_COLS, MAX_ROWS, cellName, fileSheetName, sheetNameMap, type SheetNameMap } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName } from '../model/sheet/types';
+import { conditionalFormatNow, ruleSpace } from '../ops/rules';
 import type {
   BorderEdge,
   Cell,
@@ -634,13 +637,6 @@ function hasFormulaThreshold(rule: ConditionalRule): boolean {
   return !!rule.dataBar && (calculated(rule.dataBar.min) || calculated(rule.dataBar.max));
 }
 
-/**
- * Stands for the name in the file of a sheet that is not in the file: no reference of the
- * file names it (a sheet name holds no control character), references without a sheet name
- * still follow the sheet's own edits.
- */
-const NOT_IN_FILE = '\u0000';
-
 export class ConditionalFormats implements ConditionalSource {
   /** Set while cells were left without their format because the time for formulas ran out; cleared by begin(). */
   pending = false;
@@ -655,9 +651,6 @@ export class ConditionalFormats implements ConditionalSource {
   private sheetsSeen: Sheet[] = [];
   private namesSeen: string[] = [];
   private removedSeen: string[] | undefined;
-  /** The sheet's name in the file, and what the sheet names of the file stand for now (see build()). */
-  private ownName = '';
-  private nameMap: SheetNameMap | undefined;
   private formatsSeen: ConditionalFormat[] | undefined;
   private bounds: CellRange = { top: 0, left: 0, bottom: -1, right: -1 };
   private blocks = new Map<number, Entry[]>();
@@ -807,66 +800,31 @@ export class ConditionalFormats implements ConditionalSource {
     this.combined.clear();
     this.usesFormulas = false;
 
-    // The formulas of the rules are as the file has them and name sheets as the file does: the
-    // edits are matched with those names, and only then are the sheets given the names they have now.
-    const fileName = fileSheetName(sheet);
-    const ownName = fileName === undefined ? NOT_IN_FILE : fileName;
-    const nameMap = sheetNameMap(this.workbook);
-    this.ownName = ownName;
-    this.nameMap = nameMap;
-    const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: ownName }));
-    const foreign: StructuralEdit[] = [];
-    for (const other of sheets) {
-      if (other === sheet || !other.structuralEdits) continue;
-      // Nothing in the file refers to a sheet that is not in it.
-      const name = fileSheetName(other);
-      if (name === undefined) continue;
-      for (const edit of other.structuralEdits) foreign.push({ ...edit, sheetName: name });
-    }
+    // A format of the file is read through the rows and columns moved and the sheets renamed since; a format
+    // that was added or changed since is where it is. One function says which, for everyone who asks.
+    const space = ruleSpace(this.workbook, sheet);
 
     const entries: Entry[] = [];
     const formats = Array.isArray(sheet.conditionalFormats) ? sheet.conditionalFormats : [];
     for (let f = 0; f < formats.length; f++) {
       const format = formats[f];
-      if (!format || !Array.isArray(format.ranges) || !Array.isArray(format.rules)) continue;
-      let ranges = format.ranges.filter((range) => !!range && range.top <= range.bottom && range.left <= range.right);
+      const now = format ? conditionalFormatNow(format, space) : undefined;
+      if (!now) continue;
+      const ranges = now.ranges.filter((range) => !!range && range.top <= range.bottom && range.left <= range.right);
       if (ranges.length === 0) continue;
-      // Formulas are carried through the edits rule by rule, the ranges once for all rules.
-      const texts = format.rules.map((rule) => (rule && Array.isArray(rule.formulas) ? rule.formulas.map(String) : []));
-      const adjust = (edit: StructuralEdit, from: CellRange, to: CellRange) => {
-        const before = { row: from.top, col: from.left };
-        const after = { row: to.top, col: to.left };
-        // Relative references go round the edge of the sheet, as they do when a rule is evaluated.
-        for (const list of texts) for (let i = 0; i < list.length; i++) list[i] = adjustAnchoredFormula(list[i], ownName, edit, before, after, true);
-      };
-      for (const edit of own) {
-        const moved: CellRange[] = [];
-        for (const range of ranges) {
-          const next = adjustRange(range, edit);
-          if (next) moved.push(next);
-        }
-        if (moved.length === 0) {
-          ranges = moved;
-          break;
-        }
-        adjust(edit, ranges[0], moved[0]);
-        ranges = moved;
-      }
-      if (ranges.length === 0) continue;
-      for (const edit of foreign) adjust(edit, ranges[0], ranges[0]);
-      if (nameMap) for (const list of texts) for (let i = 0; i < list.length; i++) list[i] = renameSheetsInFormula(list[i], nameMap);
 
-      for (let r = 0; r < format.rules.length; r++) {
-        const rule = format.rules[r];
+      for (let r = 0; r < now.rules.length; r++) {
+        // The rule with its formulas, and the formulas of its thresholds, as they are now.
+        const rule = now.rules[r];
         const kind = rule ? KINDS.get(rule.type) : undefined;
         if (!rule || kind === undefined) continue;
         const dxfs = styles.dxfFormats;
         const style = styleOfFormat(rule.dxf || (rule.dxfId !== undefined && dxfs ? dxfs[rule.dxfId] : undefined), styles);
-        const moved = own.length > 0 || foreign.length > 0 || nameMap ? this.movedRule(rule, own.concat(foreign)) : rule;
-        const constants = texts[r].map(constantOf);
+        const moved = rule;
+        const formulas = Array.isArray(rule.formulas) ? rule.formulas : [];
+        const constants = formulas.map(constantOf);
         const textRule = kind === K_CONTAINS_TEXT || kind === K_NOT_CONTAINS_TEXT || kind === K_BEGINS_WITH || kind === K_ENDS_WITH;
-        const textOnly =
-          textRule && typeof rule.text === 'string' && (texts[r].length === 0 || isStandardTextFormula(kind, rule.text, texts[r][0], cellName(ranges[0].top, ranges[0].left)));
+        const textOnly = textRule && typeof rule.text === 'string' && (formulas.length === 0 || isStandardTextFormula(kind, rule.text, formulas[0], cellName(ranges[0].top, ranges[0].left)));
         if (!this.usesFormulas && !textOnly && (constants.indexOf(NOT_CONSTANT) >= 0 || hasFormulaThreshold(moved))) this.usesFormulas = true;
         entries.push({
           rule: moved,
@@ -874,7 +832,7 @@ export class ConditionalFormats implements ConditionalSource {
           ranges,
           anchorRow: ranges[0].top,
           anchorCol: ranges[0].left,
-          formulas: texts[r],
+          formulas,
           constants,
           order: entries.length,
           style,
@@ -902,25 +860,6 @@ export class ConditionalFormats implements ConditionalSource {
     this.bounds = bounds;
     this.entries = entries;
     return entries;
-  }
-
-  /** A rule whose thresholds are formulas, with those formulas following the edits and the names of the sheets. */
-  private movedRule(rule: ConditionalRule, edits: StructuralEdit[]): ConditionalRule {
-    const move = (values: ConditionalValue[]): ConditionalValue[] =>
-      values.map((value) => {
-        if (!value || typeof value.value !== 'string' || textToNumber(value.value) !== undefined) return value;
-        let text = value.value;
-        for (const edit of edits) text = adjustFormula(text, this.ownName, edit);
-        if (this.nameMap) text = renameSheetsInFormula(text, this.nameMap);
-        return text === value.value ? value : { ...value, value: text };
-      });
-    if (rule.colorScale && Array.isArray(rule.colorScale.values)) return { ...rule, colorScale: { ...rule.colorScale, values: move(rule.colorScale.values) } };
-    if (rule.iconSet && Array.isArray(rule.iconSet.values)) return { ...rule, iconSet: { ...rule.iconSet, values: move(rule.iconSet.values) } };
-    if (rule.dataBar) {
-      const [min, max] = move([rule.dataBar.min, rule.dataBar.max]);
-      return { ...rule, dataBar: { ...rule.dataBar, min, max } };
-    }
-    return rule;
   }
 
   /** The rules that reach into the block of cells around (row, col), in order of priority. */

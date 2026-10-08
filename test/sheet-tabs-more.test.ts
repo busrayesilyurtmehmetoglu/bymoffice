@@ -408,7 +408,7 @@ test('sheets are copied: cells, formats, sizes, merged cells, links, the view, t
   await checkPackage(await save(doc));
 });
 
-test('sheets are copied: what is kept as the file has it is not copied, and is counted', async () => {
+test('sheets are copied: rules go with the copy; what is kept as the file has it is not copied, and is counted', async () => {
   const bytes = await buildXlsx({
     sheets: [
       {
@@ -426,8 +426,6 @@ test('sheets are copied: what is kept as the file has it is not copied, and is c
   });
   const doc = await load(bytes);
   assert.deepEqual(copySheetLosses(doc.wb, 0), [
-    { what: 'conditionalFormats', count: 1 },
-    { what: 'dataValidations', count: 1 },
     { what: 'externalLinks', count: 1 },
   ]);
   assert.match(canCopySheet(doc.wb, 1) || '', /^Cannot copy a chartsheet: not supported yet$/);
@@ -436,8 +434,10 @@ test('sheets are copied: what is kept as the file has it is not copied, and is c
   await checkPackage(saved);
   const again = await reopen(saved);
   assert.deepEqual(names(again), ['Veri', 'Veri (2)', 'Grafik']);
-  assert.equal(again.sheets[1].conditionalFormats, undefined);
+  // Conditional formats and data validations are copied: the copy has the rules the sheet has.
   assert.equal(again.sheets[0].conditionalFormats!.length, 1);
+  assert.deepEqual(again.sheets[1].conditionalFormats!.map((format) => [format.ranges, format.rules.map((rule) => [rule.type, rule.operator, rule.formulas])]), [[[{ top: 0, left: 0, bottom: 8, right: 0 }], [['cellIs', 'greaterThan', ['0']]]]]);
+  assert.deepEqual(again.sheets[1].dataValidations!.map((rule) => [rule.type, rule.formula1, rule.formula2, rule.ranges]), [['whole', '1', '9', [{ top: 0, left: 1, bottom: 0, right: 1 }]]]);
 });
 
 // --- B5: together ------------------------------------------------------------------------------------

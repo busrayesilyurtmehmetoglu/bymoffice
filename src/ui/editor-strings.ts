@@ -48,6 +48,10 @@ export interface EditorStrings {
   sortAscending: string;
   sortDescending: string;
   filter: string;
+  /** The button that opens the data validation dialog. */
+  dataValidation: string;
+  /** The button that opens the menu of conditional formats. */
+  conditionalFormat: string;
   rowsAndColumns: string;
   insertRowsAbove(count: number): string;
   insertRowsBelow(count: number): string;
@@ -169,6 +173,8 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   sortAscending: 'Sort A to Z',
   sortDescending: 'Sort Z to A',
   filter: 'Filter',
+  dataValidation: 'Data validation',
+  conditionalFormat: 'Conditional formatting',
   rowsAndColumns: 'Rows and columns',
   insertRowsAbove: (count) => `Insert ${rows(count)} above`,
   insertRowsBelow: (count) => `Insert ${rows(count)} below`,
@@ -266,6 +272,8 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   sortAscending: "A'dan Z'ye sırala",
   sortDescending: "Z'den A'ya sırala",
   filter: 'Süzgeç',
+  dataValidation: 'Veri doğrulama',
+  conditionalFormat: 'Koşullu biçimlendirme',
   rowsAndColumns: 'Satırlar ve sütunlar',
   insertRowsAbove: (count) => `Üste ${satir(count)} ekle`,
   insertRowsBelow: (count) => `Alta ${satir(count)} ekle`,

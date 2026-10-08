@@ -805,12 +805,18 @@ function parseConditionalRule(el: XmlElement, extension: boolean): ConditionalRu
 }
 
 /** With a <conditionalFormatting> open tag current (either namespace): reads it and consumes the element. */
-function parseConditionalFormatting(sc: XmlScanner, extension: boolean): ConditionalFormat {
+function parseConditionalFormatting(sc: XmlScanner, extension: boolean, index = -1): ConditionalFormat {
   const el = parseXml(sc.readRaw()).root;
   // The range is an attribute in the main namespace and an <xm:sqref> child in the extension list.
   const sqref = firstElement(el, 'sqref');
   const format: ConditionalFormat = { ranges: parseSqref(sqref ? elementText(sqref) : el.attrs.get('sqref')), rules: [] };
-  for (const child of childElements(el, 'cfRule')) format.rules.push(parseConditionalRule(child, extension));
+  // Where the element and its rules are in the part: how the writer finds them again.
+  if (index >= 0) format.src = index;
+  childElements(el, 'cfRule').forEach((child, at) => {
+    const rule = parseConditionalRule(child, extension);
+    if (index >= 0) rule.src = [index, at];
+    format.rules.push(rule);
+  });
   return format;
 }
 
@@ -1015,11 +1021,16 @@ function parseDataValidation(el: XmlElement, extension: boolean): DataValidation
 }
 
 /** With a <dataValidations> open tag current (either namespace): reads its rules and consumes the element. */
-function parseDataValidations(sc: XmlScanner, out: DataValidation[], extension: boolean): void {
+function parseDataValidations(sc: XmlScanner, out: DataValidation[], extension: boolean, seen?: { count: number }): void {
   eachChild(sc, () => {
-    if (sc.local !== 'dataValidation' || out.length >= MAX_VALIDATIONS) return sc.skip();
+    if (sc.local !== 'dataValidation') return sc.skip();
+    // Every element counts, read or not: the number is how the writer finds the element again.
+    const index = seen ? seen.count++ : -1;
+    if (out.length >= MAX_VALIDATIONS) return sc.skip();
     const rule = parseDataValidation(parseXml(sc.readRaw()).root, extension);
-    if (rule) out.push(rule);
+    if (!rule) return;
+    if (index >= 0) rule.src = index;
+    out.push(rule);
   });
 }
 
@@ -1258,6 +1269,8 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
   const conditional: ConditionalFormat[] = [];
   const extended: ConditionalFormat[] = [];
   const validations: DataValidation[] = [];
+  let formatsSeen = 0;
+  const validationsSeen = { count: 0 };
   if (!sc.selfClosing) {
     while (sc.next()) {
       if (sc.kind === 'close') break;
@@ -1301,7 +1314,7 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           parseHyperlinks(sc, sheet);
           break;
         case 'conditionalFormatting':
-          conditional.push(parseConditionalFormatting(sc, false));
+          conditional.push(parseConditionalFormatting(sc, false, formatsSeen++));
           break;
         case 'autoFilter': {
           const filter = parseAutoFilter(sc);
@@ -1309,7 +1322,7 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           break;
         }
         case 'dataValidations':
-          parseDataValidations(sc, validations, false);
+          parseDataValidations(sc, validations, false, validationsSeen);
           break;
         case 'extLst':
           parseSheetExtensions(sc, extended, validations, sheet);

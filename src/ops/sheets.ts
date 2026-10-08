@@ -7,7 +7,8 @@
 
 import { renameSheetsInFormula } from '../calc/refs';
 import { commentCellNow } from '../render/sheet-drawings';
-import { MAX_COLS, MAX_ROWS, checkSheetName, createSheet, foldSheetName, type Cell, type Color, type DefinedName, type Hyperlink, type Row, type Sheet, type SheetComment, type SheetNameMap, type SheetState, type Workbook } from '../model/sheet/types';
+import { conditionalFormatNow, dataValidationNow, extensionRuleCount, mainPartRule, ruleSpace, ruleWithFormulas } from './rules';
+import { MAX_COLS, MAX_ROWS, checkSheetName, createSheet, foldSheetName, type Cell, type Color, type ConditionalFormat, type ConditionalRule, type DataValidation, type DefinedName, type Hyperlink, type Row, type Sheet, type SheetComment, type SheetNameMap, type SheetState, type Workbook } from '../model/sheet/types';
 import { copySheetProblem, deleteSheetProblem, insertSheetProblem, moveSheetProblem, renameSheetProblem, sheetStateProblem, tabColorProblem, type Op } from './ops';
 
 export interface InsertSheetOptions {
@@ -184,7 +185,8 @@ export function canCopySheet(workbook: Workbook, index: number, options: CopyShe
 /** What a copy of a sheet does not get: the kind of content and how much of it. */
 export interface CopySheetLoss {
   /**
-   * "conditionalFormats", "dataValidations", "drawings" (pictures, shapes, charts),
+   * "conditionalFormatExtensions" (conditional rules the extension list has, or says more
+   * about than the main part: those parts are not copied), "drawings" (pictures, shapes, charts),
    * "threadedComments", "externalLinks" (links to places outside the workbook), "pageBreaks",
    * "rowAttributes" (rows with attributes the model has no field for), the kind of a part
    * around the sheet that the model does not hold ("table", "pivotTable", "formControl", ...),
@@ -211,8 +213,8 @@ export function copySheetLosses(workbook: Workbook, index: number): CopySheetLos
   const add = (what: string, count: number) => {
     if (count > 0) out.push({ what, count });
   };
-  add('conditionalFormats', sheet.conditionalFormats ? sheet.conditionalFormats.length : 0);
-  add('dataValidations', sheet.dataValidations ? sheet.dataValidations.length : 0);
+  // The rules are copied; what the extension list says about them (a rule of its own, the border of a data bar) is not.
+  add('conditionalFormatExtensions', extensionRuleCount(workbook, sheet));
   add('drawings', sheet.drawings ? sheet.drawings.length : 0);
   let threaded = 0;
   for (const comment of sheet.comments || []) if (comment && comment.threaded && commentCellNow(comment, sheet.structuralEdits)) threaded++;
@@ -237,8 +239,9 @@ export function copySheetLosses(workbook: Workbook, index: number): CopySheetLos
  * it and under the name copySheetName() gives. The copy holds what the model holds of the
  * sheet as it is now: cells with their values, formats and formulas, the sizes and formats of
  * rows and columns, merged cells, links to places in the workbook, the filter, how the sheet
- * is shown (frozen panes, zoom) and printed, the colour of its tab, its notes, and the
- * defined names that are local to it (print area, print titles, the range of its filter).
+ * is shown (frozen panes, zoom) and printed, the colour of its tab, its notes, its data
+ * validations and conditional formats (as they apply now), and the defined names that are
+ * local to it (print area, print titles, the range of its filter).
  * A reference without a sheet name is the same text in the copy and reads the copy; one that
  * names the copied sheet names the copy (UNSURE: so does the end of a 3D reference that is
  * the copied sheet); references to other sheets stay. Stored results of formulas are copied
@@ -329,6 +332,35 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
     notes.push(note);
   }
   if (notes.length > 0) copy.comments = notes;
+  // The data validations, as they apply now: in the copy every one of them is a rule of its own (live),
+  // those of the extension list included (their source is named in the rule itself from here on).
+  const space = ruleSpace(workbook, source);
+  const validations: DataValidation[] = [];
+  for (const rule of source.dataValidations || []) {
+    const now = dataValidationNow(rule, space);
+    if (!now) continue;
+    const copied: DataValidation = { ...now, ranges: now.ranges.map((range) => ({ ...range })), live: true };
+    delete copied.src;
+    delete copied.extended;
+    for (const key of ['formula1', 'formula2'] as const) if (typeof copied[key] === 'string') copied[key] = renamed(copied[key] as string);
+    validations.push(copied);
+  }
+  if (validations.length > 0) copy.dataValidations = validations;
+  // The conditional formats, as they apply now, as far as the main part of a sheet states them (see copySheetLosses()).
+  const formats: ConditionalFormat[] = [];
+  for (const format of source.conditionalFormats || []) {
+    const now = conditionalFormatNow(format, space);
+    if (!now) continue;
+    const rules: ConditionalRule[] = [];
+    for (const rule of now.rules) {
+      const kept = rule ? mainPartRule(rule) : undefined;
+      if (!kept) continue;
+      // Every formula of the rule, those of its thresholds included, names the copy where it named the sheet.
+      rules.push(ruleWithFormulas(kept, renamed));
+    }
+    if (rules.length > 0) formats.push({ ranges: now.ranges.map((range) => ({ ...range })), rules, live: true });
+  }
+  if (formats.length > 0) copy.conditionalFormats = formats;
   copy.modified = true;
 
   const names: DefinedName[] = [];

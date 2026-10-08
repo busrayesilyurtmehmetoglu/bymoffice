@@ -127,8 +127,8 @@ test('conditional: every rule type is read with its attributes', () => {
   ]);
   const base = { percent: false, bottom: false, aboveAverage: true, equalAverage: false, stopIfTrue: false };
   assert.deepEqual(formats[0].rules, [
-    { ...base, type: 'cellIs', priority: 3, stopIfTrue: true, dxfId: 0, operator: 'between', formulas: ['1', '$B$2'] },
-    { ...base, type: 'expression', priority: 1, dxfId: 1, formulas: ['$A1>5'] },
+    { ...base, type: 'cellIs', priority: 3, stopIfTrue: true, dxfId: 0, operator: 'between', formulas: ['1', '$B$2'], src: [0, 0] },
+    { ...base, type: 'expression', priority: 1, dxfId: 1, formulas: ['$A1>5'], src: [0, 1] },
   ]);
 
   const rules = formats[1].rules;

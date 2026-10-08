@@ -23,6 +23,8 @@ export type IconName =
   | 'sortAscending'
   | 'sortDescending'
   | 'filter'
+  | 'validation'
+  | 'conditionalFormat'
   | 'rowsColumns';
 
 type Shape = [tag: string, attrs: { [name: string]: string }];
@@ -64,6 +66,10 @@ const ICONS: { [name in IconName]: Shape[] } = {
   sortAscending: [path('M17 5v14 M14 16l3 3 3-3'), path('M4 7h4 M4 12h6 M4 17h8')],
   sortDescending: [path('M17 5v14 M14 16l3 3 3-3'), path('M4 7h8 M4 12h6 M4 17h4')],
   filter: [path('M4 5h16l-6.2 7.4V18l-3.6 1.8v-7.4z')],
+  // Cells of which some stand out: a format that depends on the value.
+  conditionalFormat: [path('M4 5h16v14H4z M4 9.7h16 M4 14.3h16'), path('M6.4 12h6.2', { 'stroke-width': '2.6' })],
+  // A cell with a tick: what may be typed into it.
+  validation: [path('M4 6h16v12H4z'), path('m8.5 12.2 2.4 2.4 4.6-5')],
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
 };
 
