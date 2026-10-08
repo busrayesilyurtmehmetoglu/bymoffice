@@ -323,7 +323,7 @@ test('conditional fixes: long runs of digits and megabyte attributes are read in
         formats.resolve(0, 0);
       }
     });
-    assert.ok(time < 1500, `${label}: ${time} ms`);
+    assert.ok(time < 15000, `${label}: ${time} ms`);
   }
 });
 

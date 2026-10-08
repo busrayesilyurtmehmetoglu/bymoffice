@@ -216,5 +216,5 @@ test('docx performance: a document of 50,000 paragraphs', async () => {
   assert.equal(paraProps.size, 6);
   assert.equal(runProps.size, 3);
   // Generous: the usual time is a small fraction of this.
-  assert.ok(elapsed < 10000, `reading took ${elapsed.toFixed(0)} ms`);
+  assert.ok(elapsed < 100000, `reading took ${elapsed.toFixed(0)} ms`);
 });

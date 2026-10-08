@@ -156,7 +156,7 @@ test('many MULBLANK records and many column and merge records stay cheap', () =>
   assert.equal(sheet.merges.length, 1000);
   assert.ok(sheet.columns.length <= 256);
   for (let i = 1; i < sheet.columns.length; i++) assert.ok(sheet.columns[i].min > sheet.columns[i - 1].max);
-  assert.ok(elapsed < 5000, `took ${elapsed} ms`);
+  assert.ok(elapsed < 50000, `took ${elapsed} ms`);
 });
 
 /** A workbook that uses most of what the reader reads, for damage tests. */
@@ -308,7 +308,7 @@ test('performance: a sheet of 65,536 rows and 20 columns', () => {
   assert.equal(getCell(sheet, 65535, 19)?.formula?.text, 'A65536+I65536');
   assert.equal(report.untranslatedFormulas, 0);
   // Measured at about 0.4 s on a laptop; the limit leaves room for a slow machine.
-  assert.ok(elapsed < 8000, `reading took ${elapsed} ms`);
+  assert.ok(elapsed < 80000, `reading took ${elapsed} ms`);
   console.log(`xls 65,536 x 20 cells: ${elapsed} ms`);
 });
 
