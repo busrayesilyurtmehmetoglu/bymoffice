@@ -1012,12 +1012,21 @@ function adjustRaw(raw: string, name: string, adjuster: Adjuster): string {
  * conditional format, the data validations) after the rows and columns moved in the
  * workbook, by the rules a saved sheet follows: '' when nothing of it is left, the
  * text itself when nothing in it moved. `own` are the edits of the sheet the element
- * belongs to, `foreign` those of the other sheets.
+ * belongs to, `foreign` those of the other sheets, all under the names the file has for the
+ * sheets (`sheetName` as well). `rename` is what those names stand for now, with the names it
+ * answers for; it is applied last.
  */
-export function adjustSheetElement(raw: string, sheetName: string, own: StructuralEdit[], foreign: StructuralEdit[]): string {
-  if (own.length === 0 && foreign.length === 0) return raw;
+export function adjustSheetElement(raw: string, sheetName: string, own: StructuralEdit[], foreign: StructuralEdit[], rename?: { map: SheetNameMap; names: string[] }): string {
+  if (own.length === 0 && foreign.length === 0 && !rename) return raw;
   const name = /^<([^\s/>]+)/.exec(raw);
-  return adjustRaw(raw, name ? name[1] : '', { sheetName, own, foreign, needles: nameNeedles(foreign.map((edit) => edit.sheetName)), changed: false });
+  return adjustRaw(raw, name ? name[1] : '', {
+    sheetName,
+    own,
+    foreign,
+    needles: nameNeedles(foreign.map((edit) => edit.sheetName).concat(rename ? rename.names : [])),
+    rename: rename ? rename.map : undefined,
+    changed: false,
+  });
 }
 
 // --- regenerated parts of the sheet ---------------------------------------------------
@@ -1995,6 +2004,39 @@ function adjustTextLinks(el: XmlElement, edits: SheetStructuralEdit[], sheetName
   for (const node of el.children) if (node.type === 'element' && adjustTextLinks(node, edits, sheetName, others)) changed = true;
   return changed;
 }
+
+/**
+ * A link to a place in the workbook may be written as the target of a relationship: "#Sheet2!A1"
+ * with no target mode (the link of a shape or a picture is always written so; a cell link may be,
+ * in place of a location). The place is a formula and follows what a text link follows: the rows
+ * and columns of its own sheet and of the sheets it names, and then the names of the sheets. The
+ * relationship itself always stays: the part it belongs to names it by its id.
+ * UNSURE: a place on a sheet that is gone is written as "#REF!", a target that leads nowhere;
+ * what the application writes there could not be checked.
+ */
+function adjustPlaceTargets(rels: XmlElement, edits: SheetStructuralEdit[], sheetName: string, others: OtherSheets | undefined): boolean {
+  let changed = false;
+  for (const rel of childrenNamed(rels, 'Relationship')) {
+    const target = rel.attrs.get('Target') || '';
+    if (target.length < 2 || target.charAt(0) !== '#' || rel.attrs.get('TargetMode') === 'External' || !endsWith(rel.attrs.get('Type') || '', '/hyperlink')) continue;
+    let next = target.slice(1);
+    for (const edit of edits) next = adjustFormula(next, sheetName, { ...edit, sheetName });
+    if (others) {
+      for (const edit of others.foreign) next = adjustFormula(next, sheetName, edit);
+      if (others.rename) next = renameSheetsInFormula(next, others.rename);
+    }
+    // An error value starts with the same sign; the target is not given a second one.
+    next = next.charAt(0) === '#' ? next : `#${next}`;
+    if (next !== target) {
+      rel.attrs.set('Target', next);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** True for relationships that may hold a place in the workbook as a target. */
+const mayHoldPlaces = (bytes: Uint8Array) => /Target\s*=\s*["']#/.test(decodeSource(bytes));
 
 /** A drawing part with its anchors moved and its text links brought up to date; the same bytes when nothing changed. */
 function adjustDrawing(bytes: Uint8Array, edits: SheetStructuralEdit[], sheetName: string, others?: OtherSheets): Uint8Array {
@@ -3347,6 +3389,18 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   };
   // Parts taken out of the package by this save; see `removed`.
   const wanted = new Set<string>();
+  // A relationship may spell the name of a part in another case than the archive does. What is
+  // remembered about a part (its bytes, that it was taken out) is kept under the name of the
+  // archive, so that a part that comes back comes back as the entry it was.
+  let spelled: Map<string, string> | undefined;
+  const actualOf = (part: string): string => {
+    if (!spelled) {
+      spelled = new Map();
+      for (const name of removed.keys()) spelled.set(name.toLowerCase(), name);
+      for (const name of pkg.partNames()) spelled.set(name.toLowerCase(), name);
+    }
+    return spelled.get(part.toLowerCase()) || part;
+  };
 
   // The highest block of shape ids a legacy drawing of the file uses; new boxes get their ids from the blocks behind it.
   let topBlock: number | undefined;
@@ -3408,7 +3462,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     let first = true;
     for (const rel of rels) {
       if (!endsWith(typeOf(rel), '/comments') || !internal(rel)) continue;
-      const part = resolveTarget(sheetPart, rel.attrs.get('Target') || '');
+      const part = actualOf(resolveTarget(sheetPart, rel.attrs.get('Target') || ''));
       const original = await peek(part);
       if (!original) continue;
       const staged = edits ? adjustComments(original, edits) : original;
@@ -3434,7 +3488,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     // Their boxes, in the drawing <legacyDrawing> names.
     const legacyId = sheetXml === undefined ? undefined : legacyDrawingId(sheetXml);
     const vmlRel = legacyId === undefined ? undefined : rels.find((rel) => rel.attrs.get('Id') === legacyId && internal(rel));
-    const vmlPart = vmlRel ? resolveTarget(sheetPart, vmlRel.attrs.get('Target') || '') : undefined;
+    const vmlPart = vmlRel ? actualOf(resolveTarget(sheetPart, vmlRel.attrs.get('Target') || '')) : undefined;
     const vmlBytes = vmlPart === undefined ? undefined : await peek(vmlPart);
     if (vmlPart !== undefined && vmlBytes && vmlRel) {
       if (removedCells.size > 0 || plan.added.length > 0) {
@@ -3466,7 +3520,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       for (const other of workbook.sheets) {
         if (other === sheet || other.kind === 'chartsheet' || other.part === '') continue;
         for (const otherRel of await pkg.relationships(other.part)) {
-          if (otherRel.part === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
+          if (otherRel.part !== null && actualOf(otherRel.part) === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
         }
       }
     }
@@ -3650,6 +3704,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       const linkIds = new Set<string>();
       for (const link of sheet.hyperlinks) if (link.rId !== undefined) linkIds.add(link.rId);
       let dropped = false;
+      // Links of cells that are written as a target ("#Sheet2!A1") instead of a location.
+      if (sheetRelsBytes && (edits || others) && mayHoldPlaces(sheetRelsBytes) && adjustPlaceTargets(sheetRels.root, edits || [], fileName, others)) dropped = true;
       for (const rel of childrenNamed(sheetRels.root, 'Relationship')) {
         const type = typeOf(rel);
         const kind = type.slice(type.lastIndexOf('/') + 1);
@@ -3663,7 +3719,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
         const adjust = Object.prototype.hasOwnProperty.call(ANCHORED_PARTS, kind) ? ANCHORED_PARTS[kind] : undefined;
         // Of these parts only a drawing names sheets.
         if (!adjust || !internal(rel) || (!edits && kind !== 'drawing')) continue;
-        const part = resolveTarget(sheet.part, rel.attrs.get('Target') || '');
+        const part = actualOf(resolveTarget(sheet.part, rel.attrs.get('Target') || ''));
         // Written below, moved along and with the notes of the model.
         if (notes && notes.parts.has(part)) continue;
         const original = await peek(part);
@@ -3673,7 +3729,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
           for (const other of workbook.sheets) {
             if (other === sheet || other.kind === 'chartsheet' || other.part === '') continue;
             for (const otherRel of await pkg.relationships(other.part)) {
-              if (otherRel.part === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
+              if (otherRel.part !== null && actualOf(otherRel.part) === part) throw new Error(`Cannot write sheet "${sheet.name}": ${part} is shared with sheet "${other.name}"`);
             }
           }
         }
@@ -3682,6 +3738,17 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
           keep(part, original);
           writes.push([part, adjusted]);
           rewritten.push(part);
+        }
+        if (kind !== 'drawing') continue;
+        // The links of its shapes and pictures to places in the workbook are in its relationships.
+        const partRelsName = relsPartOf(part);
+        const partRelsBytes = await peek(partRelsName);
+        if (!partRelsBytes || !mayHoldPlaces(partRelsBytes)) continue;
+        const partRels = parseXml(partRelsBytes);
+        if (adjustPlaceTargets(partRels.root, edits || [], fileName, others)) {
+          keep(partRelsName, partRelsBytes);
+          writes.push([partRelsName, partRels]);
+          rewritten.push(partRelsName);
         }
       }
       if (notes) {
@@ -3845,9 +3912,10 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const chain = resolveTarget(main, chainRel.attrs.get('Target') || '');
     rels.root.children = rels.root.children.filter((node) => node !== chainRel);
     relsChanged = true;
-    // A modified sheet stays modified, and the chain stays out with it. Without one, undoing may
-    // bring back the sheets of the file, and the chain with them.
-    if (modifiedSheets.length > 0) calcChain = chain;
+    // A modified sheet of the file stays modified, and the chain stays out with it. Without one,
+    // undoing may bring back the sheets of the file as they were, and the chain with them: a sheet
+    // that is not in the file is modified from the start, and goes without a trace.
+    if (modifiedSheets.some((sheet) => sheet.part !== '')) calcChain = chain;
     else if (pkg.hasPart(chain) || removed.has(chain)) wanted.add(chain);
   }
 

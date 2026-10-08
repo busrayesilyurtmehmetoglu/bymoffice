@@ -445,3 +445,61 @@ test('bridge: "author" of a load reaches the view of a workbook, where it is who
     ['bad-message'],
   );
 });
+
+// --- second review -------------------------------------------------------------------
+
+test('review 2: a selection that waits to be told is told by the index its sheet has once the list of sheets changed', async () => {
+  const f = fake();
+  const frames: (() => void)[] = [];
+  f.host.frame = (callback: () => void) => void frames.push(callback);
+  f.bridge = createBridge(f.host);
+  await f.bridge.receive({ type: 'load', id: 'l', data: DATA });
+  f.take();
+  const view = f.host.createView({} as HTMLElement, f.book as any, f.options()) as any;
+  // What the view answers when asked what is selected: the sheet it shows now.
+  view.selection = { range: { top: 4, left: 2, bottom: 4, right: 2 }, active: { row: 4, col: 2 } };
+  // A selection on the third sheet is noted for the next frame...
+  f.options().onSheetChange!(2);
+  f.options().onSelectionChange!({ range: { top: 1, left: 1, bottom: 1, right: 1 }, active: { row: 1, col: 1 } }, 2);
+  f.take();
+  // ...and before that frame a sheet is inserted in front: the sheet that was third is the fourth.
+  view.insertSheet(0, 'First');
+  f.take();
+  for (const callback of frames.splice(0)) callback();
+  const told = f.take().filter((message) => message.type === 'selection');
+  assert.equal(told.length, 1);
+  assert.equal(told[0].sheet, view.activeSheet, 'the index of the list the application knows');
+  assert.deepEqual([told[0].range, told[0].active], ['C5', 'C5']);
+});
+
+test('review 2: save applies what is being typed through commitPending, and saves nothing while a note or a name cannot be applied', async () => {
+  const f = await loaded();
+  const view = f.host.createView({} as HTMLElement, f.book as any, f.options()) as any;
+  let pending = true;
+  view.commitPending = () => {
+    f.calls.push('commitPending');
+    return pending;
+  };
+  await f.bridge.receive({ type: 'save', id: 's' });
+  assert.deepEqual(f.calls, ['commitPending']);
+  assert.deepEqual(
+    f.take().map((message) => [message.type, message.id]),
+    [['saved', 's']],
+  );
+  pending = false;
+  await f.bridge.receive({ type: 'save', id: 't' });
+  const answer = f.take();
+  assert.deepEqual(
+    answer.map((message) => [message.type, message.id, message.code]),
+    [['error', 't', 'save-failed']],
+  );
+  // A view of before the method: its cell editor is written as it was.
+  delete view.commitPending;
+  f.editing = true;
+  f.commitError = new RangeError('The value is not allowed');
+  await f.bridge.receive({ type: 'save', id: 'u' });
+  assert.deepEqual(
+    f.take().map((message) => [message.type, message.id, message.code]),
+    [['error', 'u', 'save-failed']],
+  );
+});

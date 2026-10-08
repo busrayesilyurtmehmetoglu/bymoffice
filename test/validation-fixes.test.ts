@@ -252,11 +252,12 @@ test('validation: a custom rule the engine cannot calculate is not applied; one 
   assert.equal(ok('B2', '5'), false);
   assert.equal(ok('B3', '2'), true);
   assert.equal(ok('B3', '9'), false);
-  assert.equal(ok('B4', '5'), false);
+  // A reference that is gone says nothing about the value (second review): the rule is not applied.
+  assert.equal(ok('B4', '5'), true);
   assert.equal(ok('B5', '5'), false);
 });
 
-test('validation: limits given by formulas - one that cannot be calculated lifts the rule, an error refuses', () => {
+test('validation: limits given by formulas - one that cannot be calculated or gives an error lifts the rule', () => {
   const sheet = sheetOf({ G1: 10, G2: { f: '1/0', v: '#DIV/0!' } });
   (sheet.rows.get(1) as Row).cells[6] = { kind: 'error', value: '#DIV/0!', style: 0, formula: { text: '1/0', type: 'normal' } };
   const wb = bookOf(sheet);
@@ -277,9 +278,11 @@ test('validation: limits given by formulas - one that cannot be calculated lifts
   assert.equal(ok('A3', 'a long text'), true);
   // What can be said without the limits still is: text is not a whole number.
   assert.equal(ok('A1', 'text'), false);
-  assert.equal(ok('B1', '3'), false);
-  assert.equal(ok('B2', '3'), false);
-  assert.equal(ok('B3', 'a'), false);
+  // A limit that is an error value (second review): nothing is refused by it.
+  assert.equal(ok('B1', '3'), true);
+  assert.equal(ok('B2', '3'), true);
+  assert.equal(ok('B3', 'a'), true);
+  assert.equal(ok('B1', 'text'), false);
   assert.equal(ok('B4', '10'), true);
   assert.equal(ok('B4', '11'), false);
   assert.equal(ok('C1', '5'), true);

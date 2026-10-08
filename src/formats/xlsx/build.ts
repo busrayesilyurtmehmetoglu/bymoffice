@@ -25,8 +25,11 @@ import {
   MAX_ROWS,
   cellName,
   emptyStyleSheet,
+  fileSheetName,
+  isFileSheet,
   parseRange,
   rangeName,
+  sheetNameMap,
   type AutoFilter,
   type Cell,
   type CellFormat,
@@ -47,6 +50,7 @@ import {
   type SharedString,
   type Sheet,
   type SheetComment,
+  type SheetNameMap,
   type SheetPageSetup,
   type StyleSheet,
   type Workbook,
@@ -80,6 +84,9 @@ import {
 } from './write';
 
 const encoder = new TextEncoder();
+
+/** In place of a name for a sheet that is not in the file: no formula of the file names it. */
+const NOT_IN_FILE = '\u0000';
 
 const XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 const NS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
@@ -1367,20 +1374,46 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   else parts.push('</sheetData>');
   parts[dimensionAt] = `<dimension ref="${used.top < 0 ? 'A1' : rangeName(used)}"/>`;
 
-  // Conditional formats and validations are kept as the file has them: the rows and columns moved since
-  // (in this sheet, and in the sheets their formulas name) are applied as a save applies them.
-  const editsOf = (of: Sheet): StructuralEdit[] => (of.structuralEdits || []).map((edit) => ({ ...edit, sheetName: of.name }));
-  const own = editsOf(sheet);
+  // Conditional formats and validations are kept as the file has them, sheet names included: the
+  // rows and columns moved since (in this sheet, and in the sheets their formulas name) are matched
+  // with the names the file has, as a save matches them, and then the sheets get the names they
+  // have now in one pass (a sheet that was deleted leaves an error).
+  // UNSURE: a 3D reference in such content may come out differently than the same reference in a
+  // cell when a sheet at its end was deleted and rows moved in its neighbour afterwards: cells are
+  // adjusted one operation after the other, this content by the state of the file at once. Excel
+  // allows no 3D reference in a conditional format or a validation, so it takes a hand-made file.
+  const inFile = workbook.sheets.some(isFileSheet) || (!!workbook.removedSheetNames && workbook.removedSheetNames.length > 0);
+  /** The name content of the file has for a sheet; undefined for a sheet nothing of the file can name. */
+  const fileNameOf = (of: Sheet): string | undefined => {
+    const name = fileSheetName(of);
+    // A workbook none of whose sheets was read from a file (a model put together by hand) is taken as it is.
+    return name === undefined && !inFile ? of.name : name;
+  };
+  const editsOf = (of: Sheet): StructuralEdit[] => {
+    const name = fileNameOf(of);
+    return name === undefined ? [] : (of.structuralEdits || []).map((edit) => ({ ...edit, sheetName: name }));
+  };
+  const ownFileName = fileNameOf(sheet);
+  // References without a sheet name are the sheet's own, whatever it is called.
+  const ownName = ownFileName === undefined ? NOT_IN_FILE : ownFileName;
+  const own: StructuralEdit[] = (sheet.structuralEdits || []).map((edit) => ({ ...edit, sheetName: ownName }));
   let foreign: StructuralEdit[] = [];
   for (const other of workbook.sheets) if (other !== sheet) foreign = foreign.concat(editsOf(other));
+  const nameMap = sheetNameMap(workbook);
+  let rename: { map: SheetNameMap; names: string[] } | undefined;
+  if (nameMap) {
+    const names = (workbook.removedSheetNames || []).slice();
+    for (const other of workbook.sheets) if (isFileSheet(other) && other.nameInFile !== undefined && other.nameInFile !== other.name) names.push(other.nameInFile);
+    rename = { map: nameMap, names };
+  }
 
   if (sheet.autoFilter && validRange(sheet.autoFilter.range)) parts.push(autoFilterXml({ ...sheet, autoFilter: portableFilter(sheet.autoFilter, notes) }, ''));
   const merges = sheet.merges.filter(validRange);
   if (merges.length !== sheet.merges.length) notes.add('Sheet: a merged range outside the sheet is left out', sheet.merges.length - merges.length);
   parts.push(mergeCellsXml({ ...sheet, merges }, ''));
-  for (const format of conditionalFormatsXml(sheet, workbook.styles.dxfs.length, notes)) parts.push(adjustSheetElement(format, sheet.name, own, foreign));
+  for (const format of conditionalFormatsXml(sheet, workbook.styles.dxfs.length, notes)) parts.push(adjustSheetElement(format, ownName, own, foreign, rename));
   const validations = dataValidationsXml(sheet);
-  if (validations !== '') parts.push(adjustSheetElement(validations, sheet.name, own, foreign));
+  if (validations !== '') parts.push(adjustSheetElement(validations, ownName, own, foreign, rename));
 
   let links = '';
   /** Cells that have a link; the cells of a very large range are noted as far as LINK_CELLS goes. */
@@ -1423,8 +1456,8 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   if (pageSetup) {
     parts.push(pageSetup.page);
     // Like conditional formats, the breaks are kept as the file has them and follow the rows and columns moved since.
-    if (pageSetup.rowBreaks !== '') parts.push(adjustSheetElement(pageSetup.rowBreaks, sheet.name, own, foreign));
-    if (pageSetup.colBreaks !== '') parts.push(adjustSheetElement(pageSetup.colBreaks, sheet.name, own, foreign));
+    if (pageSetup.rowBreaks !== '') parts.push(adjustSheetElement(pageSetup.rowBreaks, ownName, own, foreign));
+    if (pageSetup.colBreaks !== '') parts.push(adjustSheetElement(pageSetup.colBreaks, ownName, own, foreign));
   }
 
   if (sheet.drawings && sheet.drawings.length > 0) {

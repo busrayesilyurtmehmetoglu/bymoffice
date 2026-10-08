@@ -451,7 +451,8 @@ test.describe('renaming a sheet', () => {
     await view(page, 'view.focus()');
     await expect(nameField(page)).toHaveCount(0);
     await expect(tabs(page)).toHaveText(['Data', 'Calc', 'NOTES']);
-    expect(await notices(page)).toEqual([{ kind: 'error', message: expect.stringMatching(/^A sheet name has 1 to 31 characters/) }]);
+    // Said once what made the field be left is done with (second review), so that it is not said over.
+    await expect.poll(() => notices(page)).toEqual([{ kind: 'error', message: expect.stringMatching(/^A sheet name has 1 to 31 characters/) }]);
   });
 
   test('the keys of the field stay in the field', async ({ page, hasTouch }) => {

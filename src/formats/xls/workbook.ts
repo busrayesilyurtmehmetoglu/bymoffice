@@ -1125,6 +1125,8 @@ export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook'): XlsRe
     const seen = new Set<number>();
     globals.sheets.forEach((bound, index) => {
       const sheet = createSheet({ name: bound.name, sheetId: index + 1, state: bound.state, kind: SHEET_KINDS[bound.type] || 'worksheet', part: '' });
+      // The format has no parts; the sheet is one of the file all the same (see isFileSheet()).
+      sheet.readFromFile = true;
       sheets.push(sheet);
       // Each sheet has its own substream; one listed twice would be read into memory twice.
       if (seen.has(bound.offset)) throw corrupt(`sheet ${quote(bound.name)} shares its records with another sheet`);

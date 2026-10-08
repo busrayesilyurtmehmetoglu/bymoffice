@@ -436,6 +436,9 @@ function releaseStyle(host: Node): void {
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
+/** Ctrl+S or Cmd+S: the key whoever holds the view saves by. */
+const isSaveKey = (event: KeyboardEvent): boolean => (event.ctrlKey || event.metaKey) && !event.altKey && (event.key === 's' || event.key === 'S');
+
 const coarsePointer = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia('(pointer:coarse)').matches;
 
 /** How often the pages are prepared for printing anew because the workbook changed meanwhile. */
@@ -936,6 +939,9 @@ export class WorkbookView {
     this.showSheet();
     this.draw();
     this.calculateMissing();
+    // A sheet that was asked for is the one a saved file opens on, like one the user chose. Without
+    // the option the model is left as the file made it (a hidden active sheet, an index that is none).
+    if (options.sheet !== undefined) this.noteActiveSheet();
     // A font the application registered or took out: the cells are painted anew (what was measured is forgotten by
     // the measuring itself). Last of all: a constructor that throws leaves no listener behind.
     this.unwatchFonts = onFontsChanged(() => this.schedule());
@@ -1230,8 +1236,9 @@ export class WorkbookView {
     const doc = this.container.ownerDocument || document;
     const win = doc.defaultView;
     if (!win || typeof win.print !== 'function') throw new DocumentPrintError('unavailable', 'Printing is not available here: the window has no print()');
-    // What is being typed is part of what is printed, as leaving the cell would make it.
-    if (this.edit) this.commitEditing();
+    // What is being typed is part of what is printed, as leaving the cell (the note, the tab) would make it.
+    // A note or a name that cannot be taken was said, and its field is open: nothing is printed around it.
+    if (!this.commitPending()) throw new DocumentPrintError('cancelled', 'Printing was cancelled: what is being typed cannot be applied');
     this.notify(this.strings.printPreparing, 'info');
     this.setPrintProgress(job, { done: 0, total: 0 });
     const limits = printLimits(coarsePointer());
@@ -1607,6 +1614,9 @@ export class WorkbookView {
     const sheets = this.workbook.sheets;
     const index = Number.isInteger(show) && show >= 0 && show < sheets.length ? show : Math.max(sheetToShow(sheets, this.sheetIndex), 0);
     const moved = index !== this.sheetIndex || sheets[index] !== this.shown;
+    // A drag or a touch that is under way was begun on the list of sheets as it was (undo by a key in the middle of a resize).
+    this.endDrag();
+    this.endTouch();
     this.lastTap = undefined;
     this.lastTabTap = undefined;
     this.hoverComment = undefined;
@@ -1840,7 +1850,10 @@ export class WorkbookView {
     input.addEventListener('keydown', this.onRenameKey);
     input.addEventListener('input', this.onRenameInput);
     input.addEventListener('blur', this.onRenameBlur);
+    input.addEventListener('compositionstart', this.onFieldComposition);
+    input.addEventListener('compositionend', this.onFieldComposition);
     this.renaming = { sheet, tab, input, box, busy: false };
+    this.emitEditing();
     input.focus({ preventScroll: true });
     input.select();
     const left = box.offsetLeft;
@@ -1884,7 +1897,8 @@ export class WorkbookView {
           return;
         }
         this.closeRename(false);
-        this.notify(message, 'error');
+        // What made the field be left (a press on a cell, on a tab) says something of its own right after.
+        this.notifyLater(message, 'error');
         return;
       }
     }
@@ -1901,13 +1915,19 @@ export class WorkbookView {
     input.removeEventListener('keydown', this.onRenameKey);
     input.removeEventListener('input', this.onRenameInput);
     input.removeEventListener('blur', this.onRenameBlur);
+    input.removeEventListener('compositionstart', this.onFieldComposition);
+    input.removeEventListener('compositionend', this.onFieldComposition);
     if (box.parentNode) box.parentNode.removeChild(box);
     tab.style.display = '';
+    if (this.destroyed) return;
     if (focusTab) tab.focus({ preventScroll: true });
+    this.emitEditing();
   }
 
   private onRenameKey = (event: KeyboardEvent): void => {
-    // The keys of the field are its own (Ctrl+Z undoes what was typed in it): none reaches the shortcuts around it.
+    // Saving is the business of whoever holds the view: the key goes up to it (mount() applies the name first).
+    if (isSaveKey(event)) return;
+    // The other keys of the field are its own (Ctrl+Z undoes what was typed in it): none reaches the shortcuts around it.
     event.stopPropagation();
     // Enter that confirms an input method's candidate is not Enter for the name.
     if (this.destroyed || event.isComposing || event.keyCode === 229) return;
@@ -2580,11 +2600,12 @@ export class WorkbookView {
     input.addEventListener('keydown', this.onNoteKey);
     input.addEventListener('input', this.onNoteInput);
     input.addEventListener('blur', this.onNoteBlur);
-    input.addEventListener('compositionstart', this.onNoteComposition);
-    input.addEventListener('compositionend', this.onNoteComposition);
+    input.addEventListener('compositionstart', this.onFieldComposition);
+    input.addEventListener('compositionend', this.onFieldComposition);
     // As the field holds it: a text field turns every kind of line break into "\n".
     this.noteEdit = { sheet: state.sheet, row: cell.row, col: cell.col, box, input, original: input.value, busy: false };
     this.placeNote();
+    this.emitEditing();
     input.focus({ preventScroll: true });
     try {
       input.setSelectionRange(input.value.length, input.value.length);
@@ -2634,7 +2655,8 @@ export class WorkbookView {
           return;
         }
         this.closeNote(false);
-        this.notify(message, 'error');
+        // What made the field be left (a press on another cell) says something of its own right after.
+        this.notifyLater(message, 'error');
         return;
       }
       note.busy = false;
@@ -2652,12 +2674,13 @@ export class WorkbookView {
     input.removeEventListener('keydown', this.onNoteKey);
     input.removeEventListener('input', this.onNoteInput);
     input.removeEventListener('blur', this.onNoteBlur);
-    input.removeEventListener('compositionstart', this.onNoteComposition);
-    input.removeEventListener('compositionend', this.onNoteComposition);
+    input.removeEventListener('compositionstart', this.onFieldComposition);
+    input.removeEventListener('compositionend', this.onFieldComposition);
     if (box.parentNode) box.parentNode.removeChild(box);
     if (this.destroyed) return;
     if (focusGrid) this.focusInput(false);
     this.schedule();
+    this.emitEditing();
   }
 
   /** Keeps the field of the note beside its cell, inside the view, through scrolling and resizing. */
@@ -2684,7 +2707,9 @@ export class WorkbookView {
   }
 
   private onNoteKey = (event: KeyboardEvent): void => {
-    // The keys of the field are its own (Enter is a new line, Ctrl+Z undoes what was typed in it): none reaches the grid.
+    // Saving is the business of whoever holds the view: the key goes up to it (mount() applies the note first).
+    if (isSaveKey(event)) return;
+    // The other keys of the field are its own (Enter is a new line, Ctrl+Z undoes what was typed in it): none reaches the grid.
     event.stopPropagation();
     // Enter or Escape that belongs to an input method is not for the note.
     if (this.destroyed || event.isComposing || event.keyCode === 229) return;
@@ -2715,8 +2740,12 @@ export class WorkbookView {
     this.finishNote(true, true);
   };
 
-  /** A composition in the field of a note is not one of the grid. */
-  private onNoteComposition = (event: Event): void => {
+  /**
+   * A composition in the field of a note or of a sheet name is not one of the grid: it stays in
+   * the field. (The grid would note that an input method is composing, and a field that is taken
+   * away in the middle of one never reports its end.)
+   */
+  private onFieldComposition = (event: Event): void => {
     event.stopPropagation();
   };
 
@@ -3710,11 +3739,11 @@ export class WorkbookView {
    * usually moves on right after a cell is written, and what is said about the new cell
    * would take the place of this.
    */
-  private notifyLater(message: string): void {
+  private notifyLater(message: string, kind: 'error' | 'info' = 'info'): void {
     if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer);
     this.noticeTimer = setTimeout(() => {
       this.noticeTimer = undefined;
-      if (!this.destroyed) this.notify(message, 'info');
+      if (!this.destroyed) this.notify(message, kind);
     }, 0);
   }
 
@@ -3838,6 +3867,24 @@ export class WorkbookView {
     return true;
   }
 
+  /**
+   * Applies everything that is being typed in the view, as leaving it would: the cell that is
+   * edited, the note in its field, the name of a sheet in its tab. For whoever is about to take
+   * the workbook as it stands (to save it, to print it): mount().save() and the bridge call it.
+   *
+   * Returns true when nothing is left open. A cell whose text cannot be written throws, as
+   * commitEditing() does, and the editor stays open. A note or a name that cannot be taken is
+   * said (in the live region and to onNotice), its field stays open with what was typed, and
+   * the answer is false: the workbook is then not what the user sees, and is not to be saved.
+   */
+  commitPending(): boolean {
+    if (this.destroyed) return true;
+    if (this.edit) this.commitEditing();
+    if (this.renaming) this.finishRename(true);
+    if (this.noteEdit) this.finishNote(true);
+    return !this.edit && !this.renaming && !this.noteEdit;
+  }
+
   /** commitEditing() for keys, pointers and focus changes: a failure is announced and reported as false. */
   private tryCommit(): boolean {
     if (!this.edit) return true;
@@ -3895,7 +3942,10 @@ export class WorkbookView {
   /**
    * Undoes the last change and returns whether there was one. While a cell is
    * edited it only abandons the edit (and returns true): as in Excel, the
-   * steps before it are out of reach until the edit is over.
+   * steps before it are out of reach until the edit is over. While a note or
+   * the name of a sheet is typed in its field it applies what was typed and
+   * does nothing else (true; the next call undoes that); false when it cannot
+   * be applied, and the field stays open. redo() does the same.
    */
   undo(): boolean {
     return this.travel(false);
@@ -4134,15 +4184,13 @@ export class WorkbookView {
       return true;
     }
     this.closeMenu();
-    // A name being typed for a sheet is given up, as a cell being edited is.
-    if (this.renaming) {
-      this.finishRename(false);
-      return true;
-    }
-    // So is a note being typed.
-    if (this.noteEdit) {
-      this.finishNote(false);
-      return true;
+    // A name being typed for a sheet, or a note, is not dropped (the keys of its field undo within
+    // it; this is a button or a call from outside): it is applied, as leaving the field would, and
+    // that is all this call does - the next one undoes it. What cannot be applied stays in its field.
+    if (this.renaming || this.noteEdit) {
+      this.finishRename(true);
+      this.finishNote(true);
+      return !this.renaming && !this.noteEdit;
     }
     const listBefore = this.workbook.sheets;
     const namesBefore = this.workbook.definedNames;
@@ -5310,15 +5358,19 @@ export class WorkbookView {
       if (resize && !touch.consumed && (Math.abs(point.x - touch.x) > DRAG_SLOP || Math.abs(point.y - touch.y) > DRAG_SLOP)) {
         // The finger on a border has started to move: from here on it resizes.
         this.endTouch();
-        if (!this.tryCommit()) return;
+        // What is being typed is written first, on the sheet of its cell; the finger is on the sheet that is shown.
+        if (!this.commitForPress()) return;
         this.endDrag();
-        this.beginResize(pointerId, { x: touch.x, y: touch.y }, resize);
+        // Looked for again: the border found when the finger came down was one of the sheet shown then.
+        const border = this.resizeAt(touch.x, touch.y, RESIZE_REACH_TOUCH);
+        if (!border) return;
+        this.beginResize(pointerId, { x: touch.x, y: touch.y }, border);
         const drag = this.drag as Drag | undefined;
         if (drag) {
           drag.x = point.x;
           drag.y = point.y;
           drag.moved = true;
-          this.showGuide(resize, resize.axis === 'col' ? point.x : point.y);
+          this.showGuide(border, border.axis === 'col' ? point.x : point.y);
         }
         return;
       }

@@ -16,7 +16,7 @@ import type { CalcEngine, CellAddress } from '../calc/engine';
 import { parseFormula, type Node } from '../calc/parse';
 import { adjustAnchoredFormula, adjustRange, renameSheetsInFormula, type StructuralEdit } from '../calc/refs';
 import { isError, type Scalar } from '../calc/values';
-import { MAX_COLS, MAX_ROWS, fileSheetName, getCell, sheetNameMap, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, fileSheetName, foldSheetName, getCell, sheetNameMap, type Cell, type CellRange, type DataValidation, type Row, type Sheet, type Workbook } from '../model/sheet/types';
 import { resolveCellStyle } from '../model/sheet/color';
 import { applyOp, type Op } from '../ops/ops';
 import { foldCase } from '../ops/sort';
@@ -280,6 +280,8 @@ export class DataValidations {
         if (shown !== '') items.push(shown);
         return false;
       });
+      // A source that gives an error value (its sheet was deleted) is a list with nothing in it.
+      if (known === 'error') return { items: [], truncated: false };
       return known === 'unknown' ? undefined : { items, truncated: truncated || known === 'cut' };
     } catch (error) {
       return undefined;
@@ -490,13 +492,13 @@ export class DataValidations {
 
   /** Whether a formula names a cell of this sheet in a reference of its own (not through a name or a function that makes references). */
   private readsCell(root: Node, row: number, col: number): boolean {
-    const own = this.sheet.name.toLowerCase();
+    const own = foldSheetName(this.sheet.name);
     const stack: Node[] = [root];
     while (stack.length > 0) {
       const node = stack.pop() as Node;
       switch (node.type) {
         case 'ref': {
-          if (node.external || node.sheetEnd !== undefined || (node.sheet !== undefined && node.sheet.toLowerCase() !== own)) break;
+          if (node.external || node.sheetEnd !== undefined || (node.sheet !== undefined && foldSheetName(node.sheet) !== own)) break;
           const range = node.range;
           if (row >= range.top && row <= range.bottom && col >= range.left && col <= range.right) return true;
           break;
@@ -519,7 +521,7 @@ export class DataValidations {
 
   /**
    * The number a limit of a rule stands for at a cell; undefined when it cannot be worked
-   * out (the rule is then not applied), NO_LIMIT when its formula gives an error.
+   * out, NO_LIMIT when its formula gives an error (either way the rule is not applied).
    */
   private limit(text: string | undefined, entry: Entry, row: number, col: number): number | typeof NO_LIMIT | undefined {
     if (text === undefined || text.trim() === '') return undefined;
@@ -537,9 +539,11 @@ export class DataValidations {
     const b = two ? this.limit(entry.formula2, entry, row, col) : undefined;
     // A limit that cannot be worked out lifts the rule, whatever the other limit is.
     if (a === undefined || (two && b === undefined)) return undefined;
-    // UNSURE: Excel says of such a rule that it "currently evaluates to an error"; like a custom
-    // formula that gives an error, it is taken to refuse what is typed.
-    if (a === NO_LIMIT || b === NO_LIMIT) return false;
+    // A limit that gives an error value says nothing a value could be compared with: the rule is
+    // not applied. (A limit on a sheet that was deleted is #REF!; refusing would lock the cell.)
+    // UNSURE: Excel says of such a rule that it "currently evaluates to an error"; whether it then
+    // refuses what is typed could not be checked, and nothing is refused where that is not known.
+    if (a === NO_LIMIT || b === NO_LIMIT) return undefined;
     return compare(value, operator, a, b);
   }
 
@@ -549,7 +553,10 @@ export class DataValidations {
     if (value === undefined) return undefined;
     if (typeof value === 'boolean') return value;
     if (typeof value === 'number') return value !== 0;
-    // Text or an error: the formula does not say yes.
+    // A reference that is gone (its sheet was deleted) is not an answer about the value: the
+    // rule is broken, and refusing by it would lock the cell.
+    if (isError(value) && value.error === '#REF!') return undefined;
+    // Text or any other error (MATCH that finds nothing): the formula does not say yes.
     return false;
   }
 
@@ -563,8 +570,9 @@ export class DataValidations {
     if (node.type !== 'ref' || node.external || node.sheetEnd !== undefined) return undefined;
     let sheet = home;
     if (node.sheet !== undefined) {
-      const wanted = node.sheet.toLowerCase();
-      const found = (this.workbook.sheets || []).find((other) => other.name.toLowerCase() === wanted);
+      // Sheets are told apart the way the engine tells them apart ("KASIM" is "Kasım").
+      const wanted = foldSheetName(node.sheet);
+      const found = (this.workbook.sheets || []).find((other) => foldSheetName(other.name) === wanted);
       if (!found) return undefined;
       sheet = found;
     }
@@ -598,7 +606,7 @@ export class DataValidations {
     let home = this.sheet;
     for (let depth = 0; node.type === 'name' && depth < MAX_NAME_DEPTH; depth++) {
       const wanted = node.name.toLowerCase();
-      const scope = node.sheet === undefined ? this.sheetIndex() : (this.workbook.sheets || []).findIndex((other) => other.name.toLowerCase() === (node as { sheet: string }).sheet.toLowerCase());
+      const scope = node.sheet === undefined ? this.sheetIndex() : (this.workbook.sheets || []).findIndex((other) => foldSheetName(other.name) === foldSheetName((node as { sheet: string }).sheet));
       const names = this.workbook.definedNames || [];
       const found = names.find((name) => name.localSheet === scope && name.name.toLowerCase() === wanted) || names.find((name) => name.localSheet === undefined && name.name.toLowerCase() === wanted);
       if (!found) return undefined;
@@ -618,9 +626,10 @@ export class DataValidations {
   /**
    * Calls `visit` with every value of the list of a cell, in order, until it returns true.
    * `text` gives the value as its cell shows it. Returns "unknown" when the source cannot
-   * be read, "cut" when it was too large to be read to its end.
+   * be read, "cut" when it was too large to be read to its end, "error" when it is an error
+   * value (a reference that is gone, say): there is then nothing to judge a value by.
    */
-  private eachSource(entry: Entry, row: number, col: number, visit: (value: Plain, text: () => string) => boolean): 'done' | 'cut' | 'unknown' {
+  private eachSource(entry: Entry, row: number, col: number, visit: (value: Plain, text: () => string) => boolean): 'done' | 'cut' | 'unknown' | 'error' {
     const source = this.source(entry, row, col);
     if (!source) return 'unknown';
     const locale = this.options.locale;
@@ -655,7 +664,17 @@ export class DataValidations {
     const engine = this.engine();
     if (!engine) return 'unknown';
     const found = engine.evaluateRange(source.text, { sheet: this.sheetIndex(), row, col }, { anchor: { row: entry.anchorRow, col: entry.anchorCol }, maxCells: MAX_SOURCE_CELLS });
-    if (!('values' in found) || found.values.length === 0) return 'unknown';
+    if (!('values' in found)) {
+      // #NAME? is what the engine does not know, #VALUE! also what it could not finish, and what
+      // it cannot reach (another workbook) is an error only to it: not known.
+      if (found.error === '#NAME?' || found.error === '#VALUE!') return 'unknown';
+      try {
+        return isBeyondEngine(parseFormula(source.text)) ? 'unknown' : 'error';
+      } catch (error) {
+        return 'unknown';
+      }
+    }
+    if (found.values.length === 0) return 'unknown';
     for (const value of found.values) {
       if (value === null || value === '' || typeof value === 'object') continue;
       const plain = value as Plain;

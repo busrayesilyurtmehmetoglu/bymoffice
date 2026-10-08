@@ -82,13 +82,23 @@ export interface Tracking {
 
 const systemClock = (): Date => new Date();
 
-/** A date and time as xsd:dateTime writes it, with fields that are in range. */
+/**
+ * A date and time as xsd:dateTime writes it (w:date is one): the seconds are part of it, the
+ * day is one its month has in its year, there is no year 0000, and a time zone is "Z" or an
+ * offset of hours and minutes of at most 14:00. Stricter than the type in one place: the hour
+ * 24:00:00, which it allows for the end of a day, is not taken.
+ */
 function isIsoDate(text: string): boolean {
-  const match = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)(?::(\d\d)(?:\.\d{1,9})?)?(?:Z|[+-](\d\d):(\d\d))?$/.exec(text);
+  const match = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d{1,9})?(?:Z|[+-](\d\d):(\d\d))?$/.exec(text);
   if (!match || text.length > 40) return false;
-  const [month, day, hour, minute, second] = [Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6] || 0)];
-  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return false;
-  return match[7] === undefined || (Number(match[7]) <= 14 && Number(match[8]) <= 59);
+  const [year, month, day, hour, minute, second] = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6])];
+  if (year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return false;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = month === 2 ? (leap ? 29 : 28) : month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+  if (day > days) return false;
+  if (match[7] === undefined) return true;
+  const [zoneHours, zoneMinutes] = [Number(match[7]), Number(match[8])];
+  return zoneMinutes <= 59 && (zoneHours < 14 || (zoneHours === 14 && zoneMinutes === 0));
 }
 
 /** Does a command with these options track its changes in this document. */
@@ -116,6 +126,8 @@ export function trackingFor(doc: DocModel, options?: TrackOptions): Tracking | u
 // ------------------------------------------------------------------------ ids
 
 const NEXT_IDS = new WeakMap<DocModel, { next: number }>();
+/** The largest id content brought into a document before its ids were first counted: see noteForeignIds(). */
+const FOREIGN_IDS = new WeakMap<DocModel, number>();
 /** The largest id an annotation can have (a signed 32-bit number, as the reader takes it). */
 const MAX_ID = 0x7fffffff;
 
@@ -137,12 +149,26 @@ function idsOfBlocks(blocks: Block[], note: (id: number | undefined) => void, de
         } else if (inline.type !== 'math' && inline.type !== 'proofError' && inline.type !== 'empty' && inline.type !== 'misc' && inline.type !== 'unknown') note(Number(inline.id));
       }
     } else if (block.type === 'table') {
+      if (block.extras) for (const extra of block.extras) idsOfElement(extra.el, note, 0);
       for (const row of block.rows) {
         if (row.props.inserted) note(row.props.inserted.id);
         if (row.props.deleted) note(row.props.deleted.id);
+        if (row.extras) for (const extra of row.extras) idsOfElement(extra.el, note, 0);
         for (const cell of row.cells) idsOfBlocks(cell.blocks, note, depth + 1);
       }
     }
+  }
+}
+
+/** The ids in an element the model keeps as read (a bookmark between the rows of a table, say). */
+function idsOfElement(el: { attrs: Map<string, string>; children: unknown[] }, note: (id: number | undefined) => void, depth: number): void {
+  if (depth > 64) return;
+  el.attrs.forEach((value, name) => {
+    if (name.slice(name.indexOf(':') + 1) === 'id' && /^\d{1,10}$/.test(value)) note(Number(value));
+  });
+  for (const node of el.children) {
+    const child = node as { type?: string; attrs: Map<string, string>; children: unknown[] };
+    if (child && child.type === 'element') idsOfElement(child, note, depth + 1);
   }
 }
 
@@ -174,24 +200,48 @@ function largestId(doc: DocModel): number {
     });
   }
   if (doc.comments) doc.comments.items.forEach((_comment, id) => note(id));
-  const pattern = /:id="(\d{1,10})"/g;
+  // As a file may write an attribute: either kind of quote, white space around the sign.
+  const pattern = /:id\s*=\s*(?:"(\d{1,10})"|'(\d{1,10})')/g;
   for (const source of sources) {
     if (!source) continue;
     pattern.lastIndex = 0;
-    for (let match = pattern.exec(source); match; match = pattern.exec(source)) note(Number(match[1]));
+    for (let match = pattern.exec(source); match; match = pattern.exec(source)) note(Number(match[1] !== undefined ? match[1] : match[2]));
   }
   for (const blocks of lists) idsOfBlocks(blocks, note, 0);
   return max;
 }
 
 /**
+ * Tells the counter of revision ids about content that comes into the document from elsewhere
+ * (a paste): whatever ids it carries are out of reach for new revisions from here on - also
+ * when the paste is undone and done again later, and whether or not an id was asked for before.
+ * Costs by the size of the content, not of the document.
+ */
+export function noteForeignIds(doc: DocModel, blocks: Block[]): void {
+  let max = 0;
+  idsOfBlocks(
+    blocks,
+    (id) => {
+      if (id !== undefined && id === id && id > max && id <= MAX_ID) max = id;
+    },
+    0,
+  );
+  if (max === 0) return;
+  const state = NEXT_IDS.get(doc);
+  if (state) {
+    if (max >= state.next) state.next = max + 1;
+  } else if (max > (FOREIGN_IDS.get(doc) || 0)) FOREIGN_IDS.set(doc, max);
+}
+
+/**
  * An id for a new revision: larger than every id the document had when it
- * was first asked, and than every id given since. An id is never given
- * twice, also not after the change it was made for is undone.
+ * was first asked, than every id content brought since (noteForeignIds()),
+ * and than every id given since. An id is never given twice, also not after
+ * the change it was made for is undone.
  */
 export function nextRevisionId(doc: DocModel): number {
   let state = NEXT_IDS.get(doc);
-  if (!state) NEXT_IDS.set(doc, (state = { next: largestId(doc) + 1 }));
+  if (!state) NEXT_IDS.set(doc, (state = { next: Math.max(largestId(doc), FOREIGN_IDS.get(doc) || 0) + 1 }));
   if (state.next > MAX_ID) throw new RangeError('The document has no room for another revision');
   return state.next++;
 }

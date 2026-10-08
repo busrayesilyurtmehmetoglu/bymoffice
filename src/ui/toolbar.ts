@@ -186,9 +186,11 @@ export class Toolbar {
     const font = format.font;
     const horizontal = format.alignment.horizontal;
 
-    // Not during an edit either: the view would answer by dropping what was typed.
-    this.setDisabled('undo', view.readOnly || view.isEditing || !view.history.canUndo);
-    this.setDisabled('redo', view.readOnly || view.isEditing || !view.history.canRedo);
+    // Not during an edit either: the view would answer by dropping what was typed. Nor while a note
+    // or the name of a sheet is typed in its field, whose own Ctrl+Z undoes within it.
+    const typing = view.isEditing || view.isEditingComment || view.isRenaming;
+    this.setDisabled('undo', view.readOnly || typing || !view.history.canUndo);
+    this.setDisabled('redo', view.readOnly || typing || !view.history.canRedo);
     const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.sizeSelect.disabled = !editable;

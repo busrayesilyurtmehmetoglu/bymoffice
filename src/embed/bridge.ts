@@ -413,6 +413,17 @@ interface Outgoing {
 }
 
 /** The file that is shown: a workbook in `view`, or a document in `pages`. */
+/**
+ * Applies what is being typed in a workbook view (a cell, a note, the name of a sheet); false
+ * when a note or a name cannot be applied and stays in its field. A cell that cannot be written throws.
+ */
+function commitPendingOf(view: WorkbookView): boolean {
+  if (typeof view.commitPending === 'function') return view.commitPending();
+  // A view of before that method: only its cell editor is known.
+  if (view.isEditing) view.commitEditing();
+  return true;
+}
+
 interface Shown {
   file: OfficeFile;
   view: WorkbookView | undefined;
@@ -870,6 +881,12 @@ export function createBridge(host: BridgeHost): Bridge {
       const json = JSON.stringify(sheets);
       if (json === sheetsSent) return;
       sheetsSent = json;
+      // A selection that waits to be told was noted with the index its sheet had in the list before:
+      // it is told of the sheet that is shown now, by the index that sheet has now.
+      if (selectionDue) {
+        const selection = view.selection;
+        selectionDue = { sheet: view.activeSheet, range: rangeName(selection.range), active: cellName(selection.active.row, selection.active.col) };
+      }
       send({ type: 'sheets', sheets, activeSheet: view.activeSheet });
     };
     const options: SpreadsheetEditorOptions = {
@@ -963,8 +980,9 @@ export function createBridge(host: BridgeHost): Bridge {
     if (!current) return fail('not-loaded', 'No file is open', id);
     let data: string;
     try {
-      // A cell that is being edited is written first, as leaving it would do.
-      if (current.view && current.view.isEditing) current.view.commitEditing();
+      // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
+      // A note or a name that cannot be applied stays in its field, and nothing is saved around it.
+      if (current.view && !commitPendingOf(current.view)) throw new Error('The note or the sheet name that is being typed cannot be applied');
       const pages = current.pages;
       // A composition still under way belongs to the document that is written.
       if (pages && pages.commitEditing) pages.commitEditing();

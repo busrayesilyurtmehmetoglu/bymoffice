@@ -24,6 +24,24 @@
 // inside such wrappers is carried without them. The caller (cutLoses of the
 // editor) refuses a cut that would remove something the fragment lacks.
 //
+// Tracked changes, in full: what is pasted is plain content, in the document
+// it came from as in any other. A copy would otherwise bring revisions under
+// ids, authors and dates of its own, and a second paste would bring them twice.
+//   - Text inside a tracked insertion or move is carried as text; text of a
+//     tracked deletion is not carried (it is not part of what the document
+//     says).
+//   - A paragraph mark that is a tracked insertion, deletion or move is a
+//     plain mark in the copy. For a deleted mark that means the two
+//     paragraphs it would have joined stay two.
+//   - The records of changed formatting are left out: of paragraphs, runs and
+//     paragraph marks, sections, tables, rows and cells (w:pPrChange,
+//     w:rPrChange, w:sectPrChange, w:tblPrChange, w:tblPrExChange,
+//     w:trPrChange, w:tcPrChange, w:tblGridChange, w:numberingChange), and so
+//     are the marks of inserted, deleted and merged rows and cells. The
+//     formatting itself is carried as it is now.
+//   - A cut is a copy: a paragraph that is cut and pasted back has lost these
+//     records. (UNSURE: Word keeps them when tracking is off.)
+//
 // insertFragment() makes the fragment fit the document it goes into:
 //   - relationships of pictures and links are found in the part of the story
 //     or added to it, and the ids in the kept XML follow;
@@ -101,6 +119,7 @@ import {
 } from './position';
 import { freeRelId, rowSpans, takenByDocument, type Taken } from './structure';
 import { cellsBetween, deleteSpan, joinedProps, neighbour, parting, withoutSection } from './text';
+import { noteForeignIds } from './track';
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -150,6 +169,12 @@ export interface DocFragment {
   /** Length of the text it holds, and how deep its tables nest (0: no table). */
   textLength: number;
   tableDepth: number;
+  /**
+   * The copy names more styles or lists than it holds the definitions of (there is a limit).
+   * It can go back into the document it came from, which has them; in another document its
+   * ids would name whatever that document has under them, and it is refused there.
+   */
+  definitionsCut?: boolean;
 }
 
 /** A copy larger than this is not made (the clipboard then holds plain text only). */
@@ -328,6 +353,97 @@ function carryItem(ctx: CopyContext, item: RunItem): RunItem | undefined {
 /** Wrappers that are data and nothing else: they go with the text they hold. */
 const CARRIED_WRAPPERS = new Set<string>(['hyperlink', 'simpleField', 'dir', 'bdo']);
 
+/** Elements that record a tracked change of formatting or of a table, wherever they stand. */
+const REVISION_RECORDS = new Set(['rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange', 'tblPrExChange', 'trPrChange', 'tcPrChange', 'tblGridChange', 'numberingChange', 'cellIns', 'cellDel', 'cellMerge']);
+/** Inside properties these mark what the properties belong to (a paragraph mark, a row, a numbering) as inserted, deleted or moved. */
+const REVISION_MARKS = new Set(['ins', 'del', 'moveFrom', 'moveTo']);
+/** The fields of property bags that hold a tracked change. */
+const REVISION_FIELDS = ['inserted', 'deleted', 'moveFrom', 'moveTo', 'change'];
+
+/** Property bags without their tracked changes, by the bag they were made from: the same bag gives the same object. */
+const PLAIN = new WeakMap<object, object>();
+
+/** A kept element without the records of tracked changes in it; the element itself when it holds none. */
+function plainElement(el: XmlElement, marks: boolean, depth = 0): XmlElement {
+  if (depth > MAX_TREE_DEPTH) return el;
+  let children: XmlElement['children'] | undefined;
+  for (let i = 0; i < el.children.length; i++) {
+    const node = el.children[i];
+    if (node.type !== 'element') {
+      if (children) children.push(node);
+      continue;
+    }
+    const local = localOf(node.name);
+    const next = REVISION_RECORDS.has(local) || (marks && REVISION_MARKS.has(local)) ? undefined : plainElement(node, marks, depth + 1);
+    if (next === node) {
+      if (children) children.push(node);
+      continue;
+    }
+    if (!children) children = el.children.slice(0, i);
+    if (next) children.push(next);
+  }
+  return children ? { ...el, children } : el;
+}
+
+/**
+ * Kept children without the records of tracked changes. `marks`: the children are those of
+ * properties, where <w:ins> and <w:del> are marks too (in a table they would wrap rows).
+ */
+function plainExtras(extras: ExtraXml[] | undefined, marks: boolean): ExtraXml[] | undefined {
+  if (!extras) return undefined;
+  let out: ExtraXml[] | undefined;
+  for (let i = 0; i < extras.length; i++) {
+    const extra = extras[i];
+    const local = localOf(extra.el.name);
+    // The parent itself (index -1) is kept for what it carries; only what is in it goes.
+    const gone = extra.index >= 0 && (REVISION_RECORDS.has(local) || (marks && REVISION_MARKS.has(local)));
+    const el = gone ? undefined : plainElement(extra.el, marks);
+    if (el === extra.el) {
+      if (out) out.push(extra);
+      continue;
+    }
+    if (!out) out = extras.slice(0, i);
+    if (el) out.push({ ...extra, el });
+  }
+  if (!out) return extras;
+  return out.length ? out : undefined;
+}
+
+/**
+ * Properties (of a paragraph, a run, a section, a table, a row, a cell) as a copy carries them:
+ * without what makes them a tracked change. See the head of this module.
+ */
+function plainProps<T extends object>(props: T): T {
+  if ((props as unknown) === EMPTY_PARA_PROPS) return props;
+  const memo = PLAIN.get(props);
+  if (memo) return memo as T;
+  const record = props as unknown as { [name: string]: unknown };
+  let copy: { [name: string]: unknown } | undefined;
+  const set = (name: string, value: unknown) => {
+    if (!copy) copy = { ...record };
+    if (value === undefined) delete copy[name];
+    else copy[name] = value;
+  };
+  for (const name of REVISION_FIELDS) if (record[name] !== undefined) set(name, undefined);
+  if (Array.isArray(record.extras)) {
+    const extras = plainExtras(record.extras as ExtraXml[], true);
+    if (extras !== record.extras) set('extras', extras);
+  }
+  // The properties of the paragraph mark, and the section a paragraph ends.
+  for (const name of ['markProps', 'section']) {
+    const inner = record[name];
+    if (inner && typeof inner === 'object') {
+      const next = plainProps(inner as object);
+      if (next !== inner) set(name, next);
+    }
+  }
+  const out = (copy || record) as unknown as T;
+  PLAIN.set(props, out);
+  // What is plain stays what it is when asked again.
+  if (out !== props) PLAIN.set(out, out);
+  return out;
+}
+
 /** The chain of wrappers of an item as the fragment has it: copies of those it carries, without the others. */
 function carryWrap(ctx: CopyContext, wrap: Wrapper | undefined, depth = 0): Wrapper | undefined {
   if (!wrap || depth > 256) return undefined;
@@ -384,7 +500,7 @@ function carryPieces(ctx: CopyContext, pieces: Piece[], from: number, to: number
         if (--ctx.budget.items < 0) bad('The range holds too much to copy');
         let group = ctx.groups.get(piece.group);
         if (!group) ctx.groups.set(piece.group, (group = {}));
-        carried = { item, props: piece.props, wrap: carryWrap(ctx, piece.wrap), group, index: -1, code: piece.code, len: piece.len };
+        carried = { item, props: piece.props && plainProps(piece.props), wrap: carryWrap(ctx, piece.wrap), group, index: -1, code: piece.code, len: piece.len };
       }
     }
     kept.push(carried);
@@ -418,7 +534,7 @@ function carryPieces(ctx: CopyContext, pieces: Piece[], from: number, to: number
 
 function carryParagraph(ctx: CopyContext, paragraph: Paragraph, pieces: Piece[], from: number, to: number, withMark: boolean): Paragraph {
   if (--ctx.budget.paragraphs < 0) bad('The range holds too much to copy');
-  const props = withMark ? paragraph.props : EMPTY_PARA_PROPS;
+  const props = withMark ? plainProps(paragraph.props) : EMPTY_PARA_PROPS;
   noteParaProps(ctx, props);
   return { type: 'paragraph', props, children: carryPieces(ctx, pieces, from, to) };
 }
@@ -434,8 +550,12 @@ function wholeParagraph(ctx: CopyContext, paragraph: Paragraph): Paragraph {
 /** What goes with a table or a row that is removed whole: its kept children, except the marks of ranges (which stay in the document). */
 function carryExtras(extras: ExtraXml[] | undefined): ExtraXml[] | undefined {
   if (!extras) return undefined;
-  const out = extras.filter((extra) => !extra.wrap && looseMark(extra) === undefined);
-  return out.length ? out : undefined;
+  // And without the record of a changed grid; an element that wraps rows is not looked into.
+  const out = plainExtras(
+    extras.filter((extra) => !extra.wrap && looseMark(extra) === undefined),
+    false,
+  );
+  return out && out.length ? out : undefined;
 }
 
 function carryCell(ctx: CopyContext, cell: TableCell, depth: number, blank: boolean): TableCell {
@@ -448,21 +568,21 @@ function carryCell(ctx: CopyContext, cell: TableCell, depth: number, blank: bool
     let props: ParaProps = EMPTY_PARA_PROPS;
     for (const block of cell.blocks) {
       if (block.type !== 'paragraph') continue;
-      props = withoutSection(block.props);
+      props = plainProps(withoutSection(block.props));
       break;
     }
     if (!paragraph) noteParaProps(ctx, props);
     blocks.push({ type: 'paragraph', props: paragraph ? EMPTY_PARA_PROPS : props, children: [] });
   }
-  const out: TableCell = { props: cell.props, blocks };
+  const out: TableCell = { props: plainProps(cell.props), blocks };
   if (cell.attrs) out.attrs = cell.attrs;
   return out;
 }
 
 function carryRow(row: TableRow, cells: TableCell[], props: RowProps = row.props): TableRow {
-  const out: TableRow = { props, cells };
+  const out: TableRow = { props: plainProps(props), cells };
   if (row.attrs) out.attrs = row.attrs;
-  if (row.tableProps) out.tableProps = row.tableProps;
+  if (row.tableProps) out.tableProps = plainProps(row.tableProps);
   const extras = carryExtras(row.extras);
   if (extras) out.extras = extras;
   return out;
@@ -482,7 +602,7 @@ function wholeTable(ctx: CopyContext, table: Table, depth: number): Table {
       row.cells.map((cell) => carryCell(ctx, cell, depth, false)),
     ),
   );
-  const out: Table = { type: 'table', props: table.props, grid: table.grid.slice(), rows };
+  const out: Table = { type: 'table', props: plainProps(table.props), grid: table.grid.slice(), rows };
   if (table.attrs) out.attrs = table.attrs;
   const extras = carryExtras(table.extras);
   if (extras) out.extras = extras;
@@ -556,7 +676,7 @@ function partTable(ctx: CopyContext, table: Table, takes: (row: number, cell: nu
     // The width the table states is that of all its columns.
     if (props.width && props.width.type !== 'auto') props = { ...props, width: { type: 'auto', value: 0 } };
   }
-  const out: Table = { type: 'table', props, grid, rows };
+  const out: Table = { type: 'table', props: plainProps(props), grid, rows };
   if (table.attrs) out.attrs = table.attrs;
   const extras = whole && picked.length === table.rows.length ? carryExtras(table.extras) : undefined;
   if (extras) out.extras = extras;
@@ -589,7 +709,11 @@ function collectDefinitions(ctx: CopyContext): void {
     if (styles.length) {
       const id = styles.pop() as string;
       const found = doc.styles.styles.get(id);
-      if (!found || out.styles.has(id) || out.styles.size >= MAX_DEFINITIONS) continue;
+      if (!found || out.styles.has(id)) continue;
+      if (out.styles.size >= MAX_DEFINITIONS) {
+        out.definitionsCut = true;
+        continue;
+      }
       out.styles.set(id, found);
       style(found.basedOn);
       style(found.link);
@@ -600,7 +724,11 @@ function collectDefinitions(ctx: CopyContext): void {
     }
     const id = nums.pop() as number;
     const num = doc.numbering.nums.get(id);
-    if (!num || out.nums.has(id) || out.nums.size >= MAX_DEFINITIONS) continue;
+    if (!num || out.nums.has(id)) continue;
+    if (out.nums.size >= MAX_DEFINITIONS) {
+      out.definitionsCut = true;
+      continue;
+    }
     out.nums.set(id, num);
     const abstract = doc.numbering.abstracts.get(num.abstractId);
     if (!abstract || out.abstracts.has(abstract.id)) continue;
@@ -718,7 +846,8 @@ export function fragmentOf(doc: DocModel, range: DocRange): DocFragment {
       out.blocks.push(carryParagraph(ctx, b.paragraph, pieces, 0, caretIndex(pieces, end), false));
       out.openEnd = true;
       if (out.openStart) {
-        out.endProps = b.paragraph.props;
+        out.endProps = plainProps(b.paragraph.props);
+        // Only ever compared with the paragraph a cut left behind, which has whatever tracked changes it had.
         out.joinedProps = joinedProps(a.paragraph, b.paragraph);
         noteParaProps(ctx, out.endProps);
       }
@@ -1365,6 +1494,10 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
   if (nested > 0 && container.length / 3 + nested > MAX_TABLE_DEPTH) bad('The tables would be nested too deep');
 
   const sameDoc = fragment.origin === originOf(doc);
+  // A copy carries no revision; whatever id it holds all the same is not given to a revision made later.
+  noteForeignIds(doc, fragment.blocks);
+  // Part of it would be bound to styles and lists that only share an id with those it was made with.
+  if (!sameDoc && fragment.definitionsCut === true) bad('The copy names more styles or lists than it carries');
   const samePart = sameDoc && fragment.part === host.part;
   const decls: [string, string][] = [];
   const source = declarations(fragment.rootAttrs);

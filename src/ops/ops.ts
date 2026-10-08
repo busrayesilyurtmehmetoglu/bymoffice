@@ -15,6 +15,7 @@ import {
   cellName,
   checkSheetName,
   createSheet,
+  isFileSheet,
   foldSheetName,
   parseCellRef,
   parseRange,
@@ -1044,7 +1045,7 @@ function renameSheetOp(workbook: Workbook, index: number, name: string): Op {
   applySheetNameChanges(changes, undo);
   workbook.definedNames = changes.definedNames;
   // What is kept the way the file has it goes on naming the sheet as the file does.
-  if (sheet.part !== '' && sheet.nameInFile === undefined && sheet.name !== name) sheet.nameInFile = sheet.name;
+  if (isFileSheet(sheet) && sheet.nameInFile === undefined && sheet.name !== name) sheet.nameInFile = sheet.name;
   sheet.name = name;
   workbook.sheetsModified = true;
   return { type: 'restoreSheets', sheet: index, state: undo, weight: changes.count };
@@ -1102,7 +1103,7 @@ function deleteSheetOp(workbook: Workbook, index: number): Op {
       ? { previous: entry.previous === sheet ? beside.previous : entry.previous, next: entry.next === sheet ? beside.next : entry.next }
       : entry,
   );
-  if (sheet.part !== '') {
+  if (isFileSheet(sheet)) {
     workbook.removedSheetNames = (workbook.removedSheetNames || []).concat([sheet.nameInFile !== undefined ? sheet.nameInFile : sheet.name]);
     neighbours = neighbours.concat([beside]);
   }

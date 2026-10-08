@@ -698,7 +698,8 @@ test('the list of a data validation reads a formula source in one call', () => {
   // Relative references move with the cell: the rule is written for G1, and G2 reads A2:A3.
   assert.deepEqual(rules.list(0, 6), { items: ['item 1', 'item 2'], truncated: false });
   assert.deepEqual(rules.list(1, 6), { items: ['item 2', 'item 3'], truncated: false });
-  assert.equal(rules.list(0, 7), undefined, 'a source that is an error cannot be read');
+  // Second review: an error value as the source is a list with nothing in it, and judges nothing.
+  assert.deepEqual(rules.list(0, 7), { items: [], truncated: false }, 'a source that is an error has nothing to offer');
   assert.equal(counted.calls.INDEX, 0);
 });
 

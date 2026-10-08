@@ -186,12 +186,13 @@ test('rows moved in a renamed sheet are matched by the name of the file; a delet
   assert.deepEqual(s.shown(), start);
   assert.deepEqual(s.limits(), ['Sheet3!$A$3', 'Sheet2!$A$1']);
 
-  // Sheet2 goes: what read it is an error and fills nothing; a limit that is an error lets no value pass.
+  // Sheet2 goes: what read it is an error and fills nothing; a list whose source is an error is empty
+  // (second review: and a limit that is an error refuses nothing).
   s.apply(deleteSheet(wb, 1));
   assert.deepEqual(s.shown(), { filled: 'AC', bar: start.bar });
   assert.deepEqual(s.limits(), ['Sheet3!$A$3', '#REF!']);
   assert.equal(s.list(), '#REF!');
-  assert.equal(s.items(), undefined);
+  assert.deepEqual(s.items(), []);
 
   // Sheet3 takes the name "Sheet2". The file's "Sheet2!$A$1" is still the deleted sheet, and the
   // file's "Sheet3!$A$2" is this sheet, with the row inserted before the rename still counted.

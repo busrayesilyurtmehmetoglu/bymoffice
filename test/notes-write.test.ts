@@ -890,3 +890,23 @@ test('review: deleting a note takes one box of its cell along: a form control on
   assert.equal(vml.split('ObjectType="Note"').length - 1, 2, 'one of the two boxes of the cell went');
   assert.ok(vml.includes('_x0000_s1999') && !vml.includes('_x0000_s1126'), 'the first one');
 });
+
+test('review 2: comment parts whose relationships spell their names in another case come back under the names of the archive', async () => {
+  const zip = ZipArchive.read(await drawingWorkbook({ comments: commentsXml(['A'], comment('B2', 0, '<t>tek</t>')), vml: vmlXml(vmlNote(1, 1)) }));
+  const rels = 'xl/worksheets/_rels/sheet1.xml.rels';
+  const before = decoder.decode(await zip.read(rels));
+  const spelled = before.replace('../comments1.xml', '../Comments1.xml').replace('../drawings/vmlDrawing1.vml', '../Drawings/VMLDrawing1.vml');
+  assert.notEqual(spelled, before);
+  zip.set(rels, utf8(spelled));
+  const original = await zip.write();
+  const doc = await load(original);
+  assert.deepEqual(shown(doc.wb.sheets[0]), ['B2 by A: tek']);
+  note(doc, 0, 'B2', undefined);
+  const saved = await save(doc);
+  await checkPackage(saved);
+  assert.ok(names(saved).indexOf('xl/comments1.xml') < 0 && names(saved).indexOf('xl/drawings/vmlDrawing1.vml') < 0);
+  doc.history.undo();
+  const back = await save(doc);
+  assert.deepEqual(names(back), names(original));
+  same(back, original, 'undone');
+});

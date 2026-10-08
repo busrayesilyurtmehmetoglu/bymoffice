@@ -789,6 +789,12 @@ export interface Sheet {
    */
   part: string;
   /**
+   * Set by a reader whose file has no parts (xls) on every sheet it reads: the sheet is one of
+   * the file although `part` is empty. Tells such a sheet from one added since the file was
+   * read: see isFileSheet(). Never set on a sheet that was read from a part.
+   */
+  readFromFile?: boolean;
+  /**
    * The name the sheet has in the file, set when a sheet that was read from the file is first
    * given another name. Content kept the way the file has it (conditional formats, data
    * validations, the source XML) names sheets as the file does: see fileSheetName() and
@@ -970,9 +976,19 @@ export function checkSheetName(name: string): string {
   return name;
 }
 
+/**
+ * Whether a sheet was read from the file, as opposed to added since: it has a part, or its
+ * reader marked it (a file without parts). Content kept the way the file has it can only name
+ * such sheets. Which sheets a writer has to make a part for is another question: that is
+ * `part === ''` alone.
+ */
+export function isFileSheet(sheet: Sheet): boolean {
+  return sheet.part !== '' || sheet.readFromFile === true;
+}
+
 /** The name a sheet has in the file it was read from; undefined for a sheet that is not in the file. */
 export function fileSheetName(sheet: Sheet): string | undefined {
-  if (sheet.part === '') return undefined;
+  if (!isFileSheet(sheet)) return undefined;
   return sheet.nameInFile !== undefined ? sheet.nameInFile : sheet.name;
 }
 
@@ -1018,7 +1034,7 @@ export function sheetNameMap(workbook: Workbook): SheetNameMap | undefined {
     for (const name of removed) names.set(foldSheetName(name), null);
   }
   for (const sheet of workbook.sheets || []) {
-    if (sheet.part === '' || sheet.nameInFile === undefined || sheet.nameInFile === sheet.name) continue;
+    if (!isFileSheet(sheet) || sheet.nameInFile === undefined || sheet.nameInFile === sheet.name) continue;
     if (!names) names = new Map();
     names.set(foldSheetName(sheet.nameInFile), sheet.name);
   }

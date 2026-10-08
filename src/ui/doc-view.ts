@@ -3867,7 +3867,12 @@ export class DocumentView {
   private pasteCopy(copy: StoredCopy, waited: boolean): void {
     if (this.trackingChanges) {
       // Formatting, pictures and tables are not made tracked insertions yet: the text of the copy is, and the user is told.
-      if (!this.editable || !this.range() || copy.text === '') return;
+      if (!this.editable || !this.range()) return;
+      if (copy.text === '') {
+        // A copy without text (a picture alone): nothing of it can be pasted as a tracked insertion, and that is said.
+        this.notify(this.strings.cannotTrackChange, 'info');
+        return;
+      }
       this.pasteText(copy.text);
       this.notify(this.strings.pastedAsText, 'info');
       return;

@@ -44,10 +44,29 @@ Bu dosya [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) düzenini izle
 
 ### Düzeltildi
 
+- **xlsx kaydetme, `calcChain`:** hesap zinciri olan dosyada "sayfa ekle → kaydet → geri al (ya da o sayfayı sil) → kaydet" artık bozuk paket üretmiyor (ilişki `calcChain.xml`'i gösteriyor, parça yoktu); zincir yalnız dosyadaki bir sayfa değişince kalıcı kaldırılır, aksi halde özgün baytlarıyla geri gelir.
+- **`buildXlsx` / `saveAsXlsx`, sayfa adları:** koşullu biçim ve doğrulama kuralları artık `save()`'teki sırayla ayarlanır (dosyadaki adla satır/sütun kaydırma, sonra tek geçişte ad eşlemesi): sayfa yeniden adlandırılıp içinde satır eklenince kural yeni adı ve yeni hücreyi gösterir, silinen sayfa `#REF!` olur. xls'ten okunan modelde de (yeni alan `Sheet.readFromFile`, yeni işlev `isFileSheet`).
+- **Çizim bağlantıları:** şekil/görsellerin "belgede yer" bağlantıları (`drawingN.xml.rels` içinde `Target="#Sayfa!A1"`) ve hedefte yazılmış hücre bağlantıları sayfa yeniden adlandırma, silme ve satır/sütun ekle-silde dosyada güncellenir.
+- **UTF-16 parçalar:** yeniden yazılan parça UTF-8 baytla `encoding="UTF-16"` bildirimi taşımıyor; bildirim `UTF-8` olur (xlsx ve docx).
+- **`OpcPackage.writePart`:** başka türle bildirilmiş parçaya ikinci `Override` eklenmez (var olanın türü güncellenir); `deletePart` + `writePart` ile geri konan parçanın `Override`'ı tanınmayan öznitelikleriyle geri gelir.
+- **Notlar:** ilişkisi parça adını başka harf büyüklüğüyle yazan (`../Comments2.xml`) dosyada son not silinip geri alınınca parça arşivdeki adıyla geri gelir.
+- **Veri doğrulama:** sayfa adları `Kasım`/`KASIM` gibi yazımlarda da eşleşir.
+- **Tablo, yazılanın kaybı:** kaydetme (`mount().save()`, Ctrl/Cmd+S, köprü `save`) yazılmakta olan notu ve sekme adını da dosyaya alır; not/ad alanında Ctrl/Cmd+S tarayıcıya kalmaz. Not ya da ad yazılırken `undo()`/`redo()` yazılanı sessizce atmaz.
+- **Tablo:** başka sayfaya bakarken dokunmatik boyutlandırma yanlış sayfanın sütununu değiştirmez; sayfa işleminin geri alınması süren sürüklemeyi bitirir; alandan çıkarken reddedilen sekme adının/notun bildirimi ezilmez; `sheet` seçeneğiyle açılan görünümün sayfası kaydedilen dosyanın etkin sayfası olur; sekme adı alanındaki IME bileşimi ızgaraya sızmaz.
+- **WebView köprüsü:** bekleyen `selection` iletisi sayfa listesi değişince güncel dizinle gönderilir.
+- **Belge panosu:** kopya artık hiçbir izlenen değişiklik taşımaz (paragraf işaretindeki ekleme/silme, `w:pPrChange`/`w:rPrChange`, satır/hücre/tablo kayıtları); yinelenen revizyon kimliği ve kaynak yazar adı hedefe geçmez. 256'dan çok stil/liste adlayan kopya başka belgeye kısmen değil hiç yapıştırılmaz.
+- **İzleme:** yeni revizyon kimlikleri yapıştırmayla gelen ve tek tırnakla yazılmış kimliklerin de ötesindedir; izleme açıkken yalnız görsel içeren kopyanın yapıştırılamadığı bildirilir.
 - **Görseller:** görünüm kaldırılırken (`destroy`) çözümü süren bir görselin geçici adresi artık çözüm bitince geri veriliyor; önceden hemen geri veriliyor, tarayıcı konsola "yüklenemedi" hatası yazabiliyordu.
 
 ### Değişti
 
+- **Yeni açık yöntem `WorkbookView.commitPending(): boolean`:** yazılmakta olan hücreyi, notu ve sekme adını uygular. `mount().save()` artık bunu çağırır ve **uygulanamayan not/ad varken reddedilir** (önceden yazılan sessizce dışarıda kalarak kaydediliyordu); `print()` aynı durumda `'cancelled'` ile reddedilir.
+- **`WorkbookView.undo()` / `redo()`:** not ya da sekme adı yazılırken yazılanı uygular ve `true` döner (önceden atıyordu); uygulanamıyorsa `false`. Araç çubuğunda Geri al/Yinele bu sırada devre dışıdır. Hücre düzenlemesindeki davranış (bırakma) aynıdır.
+- **`onEditingChange`** not ve sekme adı alanı açılıp kapanınca da çağrılır (`editing` hücre düzenleyicisini anlatmaya devam eder).
+- **Veri doğrulama (davranış):** sınırı hata değeri veren kural ve `#REF!` veren özel formül artık girişi **reddetmez** (silinen sayfaya bakan kural hücreyi kilitliyordu); kaynağı hata olan liste için `DataValidations.list()` `undefined` yerine `{ items: [], truncated: false }` döndürür. Başka hata veren özel formül (`MATCH` → `#N/A`) eskisi gibi reddeder.
+- **Kırıcı, izleme tarihi:** `date` seçeneği saniyesiz (`2026-10-05T10:00`), takvimde olmayan gün ya da `0000` yılı taşıyorsa artık `RangeError`.
+- **`serializeXml`:** bildirimdeki UTF-8 dışı `encoding` değeri `UTF-8` yazılır.
+- Yeni `UiStrings` alanı yoktur (izlemede yapıştırılamayan kopya için var olan `cannotTrackChange` kullanılır).
 - **Satır yüksekliği, Bookman Old Style:** belge Bookman Old Style ister ve metin paketle gelen TeX Gyre Bonum ile çizilirse satır yüksekliği artık tarayıcının font kutusundan değil Bonum dosyalarından okunmuş değerlerden gelir (yüz başına; her tarayıcıda aynı). Başka hiçbir ailenin satır yüksekliği değişmedi.
 - `MountOptions.fonts` artık `false` da alır.
 

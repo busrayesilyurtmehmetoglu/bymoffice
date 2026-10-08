@@ -554,7 +554,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     editor.setReadOnly = () => lockEditor(true);
   }
   save = async () => {
-    if (view.isEditing) view.commitEditing();
+    // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
+    if (!view.commitPending()) throw new Error('Cannot save: the note or the sheet name that is being typed cannot be applied');
     return file.save();
   };
   container.addEventListener('keydown', onKeyDown);

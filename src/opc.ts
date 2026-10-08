@@ -5,7 +5,7 @@
 // are written back untouched.
 
 import { ZipArchive } from './zip';
-import { childElements, parseXml, serializeXml, type XmlDocument } from './xml';
+import { childElements, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from './xml';
 
 const CONTENT_TYPES = '[Content_Types].xml';
 
@@ -51,6 +51,8 @@ export class OpcPackage {
   /** The content types part as the file had it, and what it declares: see save(). */
   private readonly typesBytes: Uint8Array;
   private readonly typesWere: string;
+  /** The override of each deleted part, by its name in lower case: see writePart(). */
+  private readonly dropped = new Map<string, XmlElement>();
 
   private constructor(
     readonly zip: ZipArchive,
@@ -134,24 +136,37 @@ export class OpcPackage {
     return parseXml(await this.readPart(part));
   }
 
-  /** Adds or replaces a part. contentType is only needed for parts not yet declared. */
+  /**
+   * Adds or replaces a part. contentType is only needed for parts not yet declared. A part that
+   * is declared with another type keeps its one declaration, which gets the type given.
+   */
   writePart(part: string, data: Uint8Array | XmlDocument, contentType?: string): void {
     const bytes = data instanceof Uint8Array ? data : encoder.encode(serializeXml(data));
     this.zip.set(this.entryName(part) ?? part.slice(1), bytes);
     if (contentType && this.contentTypeOf(part) !== contentType) {
       const root = this.types.root;
-      const prefix = root.name.includes(':') ? root.name.slice(0, root.name.indexOf(':') + 1) : '';
-      root.children.push({
-        type: 'element',
-        name: `${prefix}Override`,
-        attrs: new Map([
-          ['PartName', part],
-          ['ContentType', contentType],
-        ]),
-        children: [],
-      });
+      const lower = part.toLowerCase();
+      const declared = childElements(root, 'Override').find((override) => (override.attrs.get('PartName') || '').toLowerCase() === lower);
+      // The declaration the part had before it was deleted comes back with everything it said.
+      const override = declared || this.dropped.get(lower);
+      if (override) {
+        override.attrs.set('ContentType', contentType);
+        if (!declared) root.children.push(override);
+      } else {
+        const prefix = root.name.includes(':') ? root.name.slice(0, root.name.indexOf(':') + 1) : '';
+        root.children.push({
+          type: 'element',
+          name: `${prefix}Override`,
+          attrs: new Map([
+            ['PartName', part],
+            ['ContentType', contentType],
+          ]),
+          children: [],
+        });
+      }
       this.typesDirty = true;
     }
+    this.dropped.delete(part.toLowerCase());
   }
 
   /**
@@ -167,9 +182,12 @@ export class OpcPackage {
     if (rels !== undefined) this.zip.delete(rels);
     const lower = part.toLowerCase();
     const root = this.types.root;
-    const kept = root.children.filter(
-      (node) => !(node.type === 'element' && node.name.replace(/^.*:/, '') === 'Override' && (node.attrs.get('PartName') || '').toLowerCase() === lower),
-    );
+    const kept: XmlNode[] = [];
+    for (const node of root.children) {
+      if (node.type === 'element' && node.name.replace(/^.*:/, '') === 'Override' && (node.attrs.get('PartName') || '').toLowerCase() === lower) {
+        if (!this.dropped.has(lower)) this.dropped.set(lower, node);
+      } else kept.push(node);
+    }
     if (kept.length !== root.children.length) {
       root.children = kept;
       this.typesDirty = true;

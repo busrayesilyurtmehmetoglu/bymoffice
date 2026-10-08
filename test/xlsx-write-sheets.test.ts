@@ -182,6 +182,8 @@ async function checkPackage(bytes: Uint8Array): Promise<PackageFacts> {
       const id = rel.attrs.get('Id')!;
       assert.ok(!byId.has(id), `${name}: relationship id ${id} twice`);
       if (rel.attrs.get('TargetMode') === 'External') continue;
+      // A place in the workbook, not a part.
+      if (rel.attrs.get('Target')!.startsWith('#')) continue;
       const part = resolve(source, rel.attrs.get('Target')!);
       assert.ok(parts.has(part), `${name}: ${id} leads to ${part}, which is not there`);
       byId.set(id, { type: rel.attrs.get('Type')!, part });
@@ -1398,4 +1400,105 @@ test('review: a part of a deleted sheet that stays in the package is not left as
   assert.ok(!after.has('xl/worksheets/sheet2.xml') && !after.has('xl/comments1.xml'));
   assert.ok(sameBytes(after.get('xl/drawings/drawing2.xml'), (await content(start)).get('xl/drawings/drawing2.xml')), 'the drawing is the file\'s again');
   assert.ok(after.has('xl/media/image2.png'), 'what the drawing shows stays with it');
+});
+
+// --- second review ---------------------------------------------------------------
+
+test('review 2: a sheet that is not in the file does not cost the file its calculation chain', async () => {
+  const original = await book({ loneSheet2: true, calcChain: true });
+  const before = await checkPackage(original);
+
+  // (a) insert, save, undo, save: the archive that was opened.
+  const doc = await load(original);
+  apply(doc, insertSheet(doc.wb, 1, { locale: 'en' }));
+  const saved = await roundTrip(doc);
+  assert.ok(saved.facts.parts.indexOf('xl/calcChain.xml') < 0, 'the chain counts sheets by their place');
+  doc.history.undo();
+  const back = await roundTrip(doc);
+  assert.deepEqual(back.facts.parts, before.parts);
+  assert.deepEqual(await changedParts(original, back.bytes), []);
+  assert.ok(sameBytes(back.bytes, original), 'the file that was opened, byte for byte');
+
+  // (b) insert, save, delete that sheet, save: a package that holds together, with the chain of the file.
+  const other = await load(original);
+  apply(other, insertSheet(other.wb, 3, { locale: 'en' }));
+  type(other, 3, 'A1', '=1+1');
+  await roundTrip(other);
+  apply(other, deleteSheet(other.wb, 3));
+  const deleted = await roundTrip(other);
+  assert.deepEqual(deleted.facts.parts, before.parts);
+  assert.deepEqual(await changedParts(original, deleted.bytes), []);
+
+  // (c) a cell of the file changes: the chain is gone for good, with its relationship and its content type.
+  const third = await load(original);
+  apply(third, insertSheet(third.wb, 1, { locale: 'en' }));
+  await roundTrip(third);
+  type(third, 0, 'A1', '5');
+  const edited = await roundTrip(third);
+  assert.ok(edited.facts.parts.indexOf('xl/calcChain.xml') < 0);
+  assert.ok(!(await text(edited.bytes, 'xl/_rels/workbook.xml.rels')).includes('calcChain'));
+  assert.ok(!(await text(edited.bytes, '[Content_Types].xml')).includes('calcChain'));
+  third.history.undo();
+  third.history.undo();
+  const after = await roundTrip(third);
+  assert.ok(after.facts.parts.indexOf('xl/calcChain.xml') < 0, 'a modified sheet stays modified');
+  assert.ok(!(await text(after.bytes, 'xl/_rels/workbook.xml.rels')).includes('calcChain'));
+});
+
+/** The book of most tests with links to places in the workbook written as relationship targets: of a shape of Sheet1, and of a cell of Sheet3. */
+async function placesBook(): Promise<Uint8Array> {
+  const zip = ZipArchive.read(await book({ loneSheet2: true }));
+  const drawingRels = 'xl/drawings/_rels/drawing1.xml.rels';
+  zip.set(
+    drawingRels,
+    utf8(
+      decoder
+        .decode(await zip.read(drawingRels))
+        .replace('</Relationships>', `${rel('rIdL', 'hyperlink', '#Sheet3!A2')}${rel('rIdM', 'hyperlink', "#'Sheet2'!$B$3:$C$4")}${rel('rIdN', 'hyperlink', '#Global')}${rel('rIdX', 'hyperlink', '#Sheet3!A2', true)}</Relationships>`),
+    ),
+  );
+  const sheet3 = 'xl/worksheets/sheet3.xml';
+  zip.set(sheet3, utf8(decoder.decode(await zip.read(sheet3)).replace('</sheetData>', '</sheetData><hyperlinks><hyperlink ref="D1" r:id="rIdIn"/></hyperlinks>')));
+  zip.set('xl/worksheets/_rels/sheet3.xml.rels', utf8(relsXml(rel('rIdIn', 'hyperlink', '#Sheet2!A1'))));
+  return zip.write();
+}
+
+const targetsIn = async (bytes: Uint8Array, name: string) => all(parseXml(await ZipArchive.read(bytes).read(name)).root, 'Relationship').map((el) => `${el.attrs.get('Id')}=${el.attrs.get('Target')}`);
+
+test('review 2: relationship targets that are places in the workbook follow renamed and deleted sheets and moved rows', async () => {
+  const original = await placesBook();
+  const DRAWING = 'xl/drawings/_rels/drawing1.xml.rels';
+  const SHEET = 'xl/worksheets/_rels/sheet3.xml.rels';
+  const doc = await load(original);
+  apply(doc, renameSheet(doc.wb, 2, 'Third one'));
+  apply(doc, renameSheet(doc.wb, 1, 'Two'));
+  let bytes = await save(doc);
+  await checkPackage(bytes);
+  // A name and a link to another file are not places of a sheet.
+  assert.deepEqual(await targetsIn(bytes, DRAWING), ['rId1=../media/image1.png', "rIdL=#'Third one'!A2", 'rIdM=#Two!$B$3:$C$4', 'rIdN=#Global', 'rIdX=#Sheet3!A2']);
+  assert.deepEqual(await targetsIn(bytes, SHEET), ['rIdIn=#Two!A1']);
+
+  // Rows move in the sheet a target names.
+  apply(doc, [{ type: 'insert', sheet: 1, axis: 'row', at: 0, count: 2 }]);
+  bytes = await save(doc);
+  await checkPackage(bytes);
+  assert.deepEqual((await targetsIn(bytes, DRAWING)).slice(1, 3), ["rIdL=#'Third one'!A2", 'rIdM=#Two!$B$5:$C$6']);
+  assert.deepEqual(await targetsIn(bytes, SHEET), ['rIdIn=#Two!A3']);
+  doc.history.undo();
+
+  // The sheet is deleted: the relationship stays (the drawing names it by its id) and leads nowhere.
+  apply(doc, deleteSheet(doc.wb, 1));
+  bytes = await save(doc);
+  await checkPackage(bytes);
+  assert.deepEqual((await targetsIn(bytes, DRAWING)).slice(1, 3), ["rIdL=#'Third one'!A2", 'rIdM=#REF!']);
+  assert.deepEqual(await targetsIn(bytes, SHEET), ['rIdIn=#REF!']);
+
+  // Undone to the start: the parts the file had.
+  doc.history.undo();
+  doc.history.undo();
+  doc.history.undo();
+  bytes = await save(doc);
+  assert.deepEqual(names(doc.wb), ['Sheet1', 'Sheet2', 'Sheet3']);
+  const changed = await changedParts(original, bytes);
+  assert.ok(changed.indexOf(DRAWING) < 0 && changed.indexOf(SHEET) < 0, changed.join(' '));
 });

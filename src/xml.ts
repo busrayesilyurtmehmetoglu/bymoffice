@@ -223,9 +223,20 @@ function writeNode(node: XmlNode, out: string[]): void {
   }
 }
 
+/**
+ * The declaration as it has to be written: what serializeXml returns is encoded as UTF-8 by
+ * every caller, so a declaration that names another encoding (the part was read from UTF-16)
+ * names UTF-8. Everything else in it stays as written; a declaration without an encoding gets none.
+ */
+function utf8Declaration(declaration: string): string {
+  return declaration.replace(/(\sencoding\s*=\s*)(["'])([^"']*)\2/, (all, head: string, quote: string, name: string) =>
+    /^utf-?8$/i.test(name) ? all : `${head}${quote}UTF-8${quote}`,
+  );
+}
+
 export function serializeXml(doc: XmlDocument): string {
   const out: string[] = [];
-  if (doc.declaration) out.push(doc.declaration, '\n');
+  if (doc.declaration) out.push(utf8Declaration(doc.declaration), '\n');
   for (const node of doc.leading) writeNode(node, out);
   writeNode(doc.root, out);
   for (const node of doc.trailing) writeNode(node, out);
