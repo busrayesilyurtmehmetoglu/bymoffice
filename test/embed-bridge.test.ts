@@ -1647,3 +1647,146 @@ test('bridge: a merged "changed" does not name a sheet that was deleted while it
   assert.deepEqual(f.sent.filter((m) => m.type === 'changed'), [{ type: 'changed', sheets: [0, 1], canUndo: false, canRedo: false }]);
   bridge.destroy();
 });
+
+// ------------------------------------------- the tracked changes of a document
+
+/** Makes the views of an editable document know about tracked changes: how many there are, and whether tracking is on. */
+function withRevisions(f: Fake, count: number, format = 'docx'): { d: EditableDocument; state: { count: number; tracking: boolean; refuse: boolean } } {
+  const d = withEditableDocument(f, format);
+  const state = { count, tracking: false, refuse: false };
+  for (const name of ['createDocumentView', 'createDocumentEditor'] as const) {
+    const inner = f.host[name] as NonNullable<BridgeHost['createDocumentView']>;
+    f.host[name] = ((container: HTMLElement, doc: never, options: never) => {
+      const view = inner(container, doc, options) as unknown as Record<string, unknown>;
+      view.revisions = () => new Array(state.count).fill({ kind: 'insert' });
+      const resolve = (call: string) => () => {
+        d.calls.push(call);
+        if (state.refuse) return false;
+        state.count = 0;
+        d.views[d.views.length - 1].options.onChange!();
+        return true;
+      };
+      view.acceptAllRevisions = resolve('acceptAll');
+      view.rejectAllRevisions = resolve('rejectAll');
+      view.setTrackChanges = (on: boolean) => {
+        d.calls.push(`track ${on}`);
+        if (state.refuse) return false;
+        state.tracking = on;
+        d.views[d.views.length - 1].options.onChange!();
+        return true;
+      };
+      Object.defineProperty(view, 'trackingChanges', { get: () => state.tracking });
+      return view as never;
+    }) as never;
+  }
+  return { d, state };
+}
+
+test('bridge: `loaded` says how many tracked changes a document has, when it has any', async () => {
+  const f = fake();
+  withRevisions(f, 3);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA });
+  assert.deepEqual(f.sent[1], { type: 'loaded', id: 'l', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, revisions: 3 });
+
+  const g = fake();
+  withRevisions(g, 0);
+  const other = createBridge(g.host);
+  await other.receive({ type: 'load', id: 'l', data: DATA });
+  assert.deepEqual(g.sent[1], { type: 'loaded', id: 'l', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+});
+
+test('bridge: acceptAllRevisions and rejectAllRevisions reach the document; `revisions` says the new count before `changed`, `done` what holds now', async () => {
+  for (const [command, call] of [
+    ['acceptAllRevisions', 'acceptAll'],
+    ['rejectAllRevisions', 'rejectAll'],
+  ]) {
+    const f = fake();
+    const { d, state } = withRevisions(f, 3);
+    const bridge = createBridge(f.host);
+    await bridge.receive({ type: 'load', data: DATA });
+    const from = f.sent.length;
+    await bridge.receive({ type: command, id: 'a' });
+    assert.ok(d.calls.indexOf(call) >= 0, command);
+    assert.deepEqual(f.sent.slice(from), [
+      { type: 'revisions', count: 0, trackChanges: false },
+      { type: 'changed', sheets: [], canUndo: false, canRedo: false },
+      { type: 'done', id: 'a', command, revisions: 0, trackChanges: false },
+    ]);
+    // A change of the document that leaves the count as it is says nothing about the changes.
+    const next = f.sent.length;
+    d.views[0].options.onChange!();
+    assert.deepEqual(f.sent.slice(next), [{ type: 'changed', sheets: [], canUndo: false, canRedo: false }]);
+    // An edit that makes a tracked change does.
+    state.count = 1;
+    d.views[0].options.onChange!();
+    assert.deepEqual(f.sent.slice(next + 1), [
+      { type: 'revisions', count: 1, trackChanges: false },
+      { type: 'changed', sheets: [], canUndo: false, canRedo: false },
+    ]);
+    // A view that refuses (a protection): the answer says that nothing changed.
+    state.refuse = true;
+    await bridge.receive({ type: command, id: 'b' });
+    assert.deepEqual(f.sent[f.sent.length - 1], { type: 'done', id: 'b', command, revisions: 1, trackChanges: false });
+  }
+});
+
+test('bridge: setTrackChanges turns tracking on and off and needs `on`', async () => {
+  const f = fake();
+  const { d, state } = withRevisions(f, 0);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  const from = f.sent.length;
+  await bridge.receive({ type: 'setTrackChanges', on: true, id: 't' });
+  assert.ok(d.calls.indexOf('track true') >= 0);
+  assert.deepEqual(f.sent.slice(from), [
+    { type: 'revisions', count: 0, trackChanges: true },
+    { type: 'changed', sheets: [], canUndo: false, canRedo: false },
+    { type: 'done', id: 't', command: 'setTrackChanges', revisions: 0, trackChanges: true },
+  ]);
+  // Where it cannot be turned off, the answer says that it is still on.
+  state.refuse = true;
+  await bridge.receive({ type: 'setTrackChanges', on: false, id: 'u' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'done', id: 'u', command: 'setTrackChanges', revisions: 0, trackChanges: true });
+  await bridge.receive({ type: 'setTrackChanges', id: 'v' });
+  assert.equal((f.sent[f.sent.length - 1] as { code?: string }).code, 'bad-message');
+  await bridge.receive({ type: 'setTrackChanges', on: 'yes', id: 'w' });
+  assert.equal((f.sent[f.sent.length - 1] as { code?: string }).code, 'bad-message');
+});
+
+test('bridge: the commands of the tracked changes without a file, with a workbook, and with a document that stays read-only', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  for (const type of ['acceptAllRevisions', 'rejectAllRevisions', 'setTrackChanges']) {
+    await bridge.receive({ type, on: true, id: 'n' });
+    assert.deepEqual([(f.sent[f.sent.length - 1] as { code?: string }).code, (f.sent[f.sent.length - 1] as { id?: string }).id], ['not-loaded', 'n'], type);
+  }
+  await bridge.receive({ type: 'load', data: DATA });
+  for (const type of ['acceptAllRevisions', 'rejectAllRevisions', 'setTrackChanges']) {
+    await bridge.receive({ type, on: true, id: 'w' });
+    assert.equal((f.sent[f.sent.length - 1] as { code?: string }).code, 'no-document', type);
+  }
+  // An RTF file that was not converted cannot be edited: neither can its changes be resolved.
+  const g = fake();
+  const { d } = withRevisions(g, 2, 'rtf');
+  const other = createBridge(g.host);
+  await other.receive({ type: 'load', data: DATA });
+  assert.equal((g.sent[1] as { revisions?: number }).revisions, 2);
+  for (const type of ['acceptAllRevisions', 'rejectAllRevisions', 'setTrackChanges']) {
+    await other.receive({ type, on: true, id: 'r' });
+    assert.equal((g.sent[g.sent.length - 1] as { code?: string }).code, 'read-only', type);
+  }
+  assert.deepEqual(d.calls.filter((call) => /acceptAll|rejectAll|track/.test(call)), []);
+  // So is a document that was opened read-only.
+  const h = fake();
+  const opened = withRevisions(h, 2);
+  const third = createBridge(h.host);
+  await third.receive({ type: 'load', data: DATA, readOnly: true });
+  await third.receive({ type: 'acceptAllRevisions', id: 'r' });
+  assert.equal((h.sent[h.sent.length - 1] as { code?: string }).code, 'read-only');
+  // Editing turned on, it works.
+  await third.receive({ type: 'setReadOnly', readOnly: false });
+  await third.receive({ type: 'acceptAllRevisions', id: 's' });
+  assert.deepEqual(h.sent[h.sent.length - 1], { type: 'done', id: 's', command: 'acceptAllRevisions', revisions: 0, trackChanges: false });
+  assert.ok(opened.d.calls.indexOf('acceptAll') >= 0);
+});

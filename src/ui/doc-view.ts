@@ -16,7 +16,7 @@
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
 import * as ops from '../ops/doc/index';
-import type { DocEdit, DocPosition, DocRange, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
+import type { DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
 import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
 import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
@@ -243,6 +243,8 @@ const clamp = (value: number, low: number, high: number): number => (value < low
 const isApple = (): boolean => typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
 
 const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+const placeOrder = ops.placeOrder;
 
 const copyPosition = (position: DocPosition): DocPosition => {
   const copy: DocPosition = { story: position.story, path: position.path.slice(), offset: position.offset };
@@ -722,6 +724,14 @@ export class DocumentView {
   private handleFixed: DocPosition | undefined;
   private inputPlace = '';
   private viewport: { addEventListener(type: string, listener: () => void): void; removeEventListener(type: string, listener: () => void): void } | undefined;
+  /** The list of tracked changes, for the number of changes of the document it was made at. */
+  private revisionList: { at: number; value: ops.DocRevisions } | undefined;
+  /** Every tracked change, where the document has more than the list holds. */
+  private revisionsAll: { at: number; list: DocRevision[] } | undefined;
+  /** The change goToRevision() selected last, while the selection is still the one it made. */
+  private pointed: { at: number; anchor: DocPosition; focus: DocPosition; index: number } | undefined;
+  /** The place the pointer was over when the tool tip of the pages was last worked out. */
+  private hoverKey = '';
   /** The protection of the document that keeps the view read-only, whatever is asked of it. */
   private readonly lock: 'readOnly' | 'comments' | 'forms' | undefined;
   /** The user was told why the document cannot be edited. */
@@ -1375,6 +1385,7 @@ export class DocumentView {
     input.addEventListener('focus', this.onFocus);
     input.addEventListener('blur', this.onBlur);
     strip.addEventListener('click', this.onStripClick);
+    strip.addEventListener('mousemove', this.onHover);
     strip.addEventListener('dblclick', this.onDoubleClick);
     strip.addEventListener(this.pointerEvents ? 'pointerdown' : 'mousedown', this.onPointerDown as EventListener);
     window.addEventListener('resize', this.onResize);
@@ -1417,6 +1428,7 @@ export class DocumentView {
     input.removeEventListener('focus', this.onFocus);
     input.removeEventListener('blur', this.onBlur);
     strip.removeEventListener('click', this.onStripClick);
+    strip.removeEventListener('mousemove', this.onHover);
     strip.removeEventListener('dblclick', this.onDoubleClick);
     strip.removeEventListener('pointerdown', this.onPointerDown as EventListener);
     strip.removeEventListener('mousedown', this.onPointerDown as EventListener);
@@ -2817,6 +2829,299 @@ export class DocumentView {
     return ops.isTracking(this.document);
   }
 
+  /**
+   * Whether tracking cannot be turned off: a protection of the document
+   * enforces tracked changes, or the options of the view asked for tracking
+   * (what an application turns on, its user does not turn off).
+   */
+  get trackingEnforced(): boolean {
+    return enforcedProtection(this.document) === 'trackedChanges' || ops.forcesTracking(this.document);
+  }
+
+  /**
+   * Turns the tracking of changes on or off: the setting of the document,
+   * which is saved with it. A step that can be undone. False when nothing was
+   * changed: in a read-only view, and where tracking cannot be turned off
+   * (see `trackingEnforced`), which is said.
+   */
+  setTrackChanges(on: boolean): boolean {
+    if (!this.editable || this.destroyed) return false;
+    this.typing.commit();
+    const before = this.getSelection();
+    let edit: DocEdit;
+    try {
+      edit = ops.setTrackRevisions(this.document, on === true, this.range());
+      if (edit.ops.length === 0) return false;
+      this.history.seal();
+      this.history.applyEdit(edit, before);
+      this.history.seal();
+    } catch (error) {
+      this.refuse(error);
+      return false;
+    }
+    this.pendingFormat = undefined;
+    this.changed(before ? edit.selection : undefined);
+    this.notify(this.strings.trackingTurned(on === true), 'info');
+    return true;
+  }
+
+  // -------------------------------------------------------- tracked changes
+
+  private listedRevisions(): ops.DocRevisions {
+    const cached = this.revisionList;
+    if (cached && cached.at === this.changes) return cached.value;
+    const value = ops.listRevisions(this.document);
+    this.revisionList = { at: this.changes, value };
+    return value;
+  }
+
+  /**
+   * Every tracked change of the document: the list of revisions() where that
+   * holds them all, and a list without a limit where the document has more
+   * (made once for each state of the document). What the selection touches
+   * and what a step arrives at are looked up here, so that a change beyond
+   * the limit of the list can be resolved and stepped to like any other.
+   */
+  private everyRevision(): DocRevision[] {
+    const listed = this.listedRevisions();
+    if (!listed.more) return listed.list;
+    const cached = this.revisionsAll;
+    if (cached && cached.at === this.changes) return cached.list;
+    const list = ops.listRevisions(this.document, { limit: Infinity }).list;
+    this.revisionsAll = { at: this.changes, list };
+    return list;
+  }
+
+  /** Whether the document has more tracked changes than revisions() lists. */
+  get moreRevisions(): boolean {
+    return this.listedRevisions().more;
+  }
+
+  /**
+   * The tracked changes of the document in reading order (the body, then
+   * headers and footers, then notes), at most ops.REVISION_LIST_LIMIT of
+   * them. Each describes the document as it is now: after an edit, ask again.
+   */
+  revisions(): DocRevision[] {
+    return this.listedRevisions().list.slice();
+  }
+
+  /** What a change is, in the words of the view: "Inserted by Ann, 2026-10-01 09:00: text". */
+  describeRevision(revision: DocRevision): string {
+    const date = revision.date;
+    const shown = date !== undefined && /^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(date) ? `${date.slice(0, 10)} ${date.slice(11, 16)}` : date;
+    return this.strings.revisionDescription(revision.kind, revision.author, shown, revision.text);
+  }
+
+  /** Places in the list of the changes the selection touches. */
+  private selectedRevisionIndexes(list: DocRevision[]): number[] {
+    const range = this.range();
+    if (!range) return [];
+    const pointed = this.pointed;
+    if (pointed && pointed.at === this.changes && pointed.index < list.length && ops.samePosition(pointed.anchor, range.anchor) && ops.samePosition(pointed.focus, range.focus)) return [pointed.index];
+    return ops.revisionsTouching(list, range);
+  }
+
+  /**
+   * The changes accept and reject work on without an argument: the one
+   * goToRevision() selected; else every change a selection runs over; else
+   * the one change the caret is in (on the border of two, the first of them).
+   */
+  selectedRevisions(): DocRevision[] {
+    const list = this.everyRevision();
+    return this.selectedRevisionIndexes(list).map((index) => list[index]);
+  }
+
+  /**
+   * Selects a tracked change and brings it into view: the one at a place of
+   * the list (from 0), or the next or the previous one from the selection,
+   * around the ends of the document. What the change is, is said (live
+   * region and onNotice). False when there is no such change.
+   */
+  goToRevision(target: number | 'next' | 'previous'): boolean {
+    return this.stepToRevision(target, '');
+  }
+
+  private stepToRevision(target: number | 'next' | 'previous', said: string): boolean {
+    if (this.destroyed) return false;
+    this.typing.commit();
+    const list = this.everyRevision();
+    if (list.length === 0) {
+      if (target === 'next' || target === 'previous') this.notify(this.strings.noRevisions, 'info');
+      return false;
+    }
+    let index: number;
+    let wrapped: 'first' | 'last' | undefined;
+    if (target === 'next' || target === 'previous') {
+      const range = this.range();
+      const pointed = this.pointed;
+      // From the change that was stepped to last, while the selection is still the one that step made; else from where the selection is.
+      const current = range && pointed && pointed.at === this.changes && pointed.index < list.length && ops.samePosition(pointed.anchor, range.anchor) && ops.samePosition(pointed.focus, range.focus) ? pointed.index : -1;
+      const step = ops.revisionStep(list, range, target, current);
+      if (!step) return false;
+      index = step.index;
+      wrapped = step.wrapped;
+    } else {
+      if (typeof target !== 'number' || Math.floor(target) !== target || target < 0 || target >= list.length) return false;
+      index = target;
+    }
+    // A change the engine only keeps may name a place that holds no text: the next one that can be shown is taken.
+    for (let tries = 0; tries < list.length; tries++) {
+      const revision = list[index];
+      try {
+        this.setSelection({ anchor: revision.start, focus: revision.end });
+      } catch (error) {
+        if (!(error instanceof RangeError) || typeof target === 'number') return false;
+        index = target === 'next' ? (index + 1) % list.length : (index + list.length - 1) % list.length;
+        continue;
+      }
+      const range = this.range();
+      if (range) this.pointed = { at: this.changes, anchor: copyPosition(range.anchor), focus: copyPosition(range.focus), index };
+      const step = this.strings.revisionStep(index + 1, this.countedRevisions(), this.describeRevision(revision), wrapped);
+      this.notify(step, 'info', said === '' ? step : `${said} ${step}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Accepts a tracked change: the one at a place of the list (from 0), one of
+   * the changes revisions() gave, or - without an argument - the changes the
+   * selection touches. One step of the history. With `advance` the next
+   * change is selected afterwards. False when nothing was changed: no such
+   * change, a read-only view, a change that cannot be resolved or that the
+   * document no longer has, a protection that is enforced; the reason is said.
+   */
+  acceptRevision(target?: number | DocRevision, advance = false): boolean {
+    return this.resolveRevisions('accept', target, advance);
+  }
+
+  /** Rejects a tracked change; see acceptRevision(). */
+  rejectRevision(target?: number | DocRevision, advance = false): boolean {
+    return this.resolveRevisions('reject', target, advance);
+  }
+
+  /** Accepts every tracked change. What cannot be resolved stays, and how many changes that were is said. False when nothing was changed. */
+  acceptAllRevisions(): boolean {
+    return this.resolveRevisions('accept', 'all', false);
+  }
+
+  /** Rejects every tracked change; see acceptAllRevisions(). */
+  rejectAllRevisions(): boolean {
+    return this.resolveRevisions('reject', 'all', false);
+  }
+
+  /** How many tracked changes the document has, as it is said: "2000+" when there are more than the list holds. */
+  private countedRevisions(): string {
+    const listed = this.listedRevisions();
+    return listed.more ? `${listed.list.length}+` : String(listed.list.length);
+  }
+
+  private resolveRevisions(verdict: 'accept' | 'reject', target: number | DocRevision | 'all' | undefined, advance: boolean): boolean {
+    if (!this.editable || this.destroyed) return false;
+    this.typing.commit();
+    const list = this.everyRevision();
+    const before = this.getSelection();
+    let edit: DocEdit;
+    let resolved = 1;
+    let skipped = 0;
+    let sections = 0;
+    try {
+      if (target === 'all' || target === undefined) {
+        if (list.length === 0) {
+          this.notify(this.strings.noRevisions, 'info');
+          return false;
+        }
+        let filter: ((revision: DocRevision) => boolean) | undefined;
+        let keep = this.range();
+        let single: DocRevision | undefined;
+        if (target === undefined) {
+          const indexes = this.selectedRevisionIndexes(list);
+          if (indexes.length === 0) {
+            this.notify(this.strings.noRevisionHere, 'info');
+            return false;
+          }
+          const chosen = new Set<number>(indexes);
+          filter = (revision) => chosen.has(revision.index);
+          // One change: the caret goes where that change leaves it. Several: to where the first of them began.
+          if (indexes.length === 1) single = list[indexes[0]];
+          else keep = ops.collapsed(list[indexes[0]].start);
+        }
+        if (single) {
+          const one = verdict === 'accept' ? ops.acceptRevision(this.document, single) : ops.rejectRevision(this.document, single);
+          edit = one;
+          sections = one.sectionsRemoved;
+        } else {
+          const all = verdict === 'accept' ? ops.acceptAll(this.document, filter, keep) : ops.rejectAll(this.document, filter, keep);
+          edit = all;
+          resolved = all.resolved;
+          skipped = all.skipped;
+          sections = all.sectionsRemoved;
+        }
+      } else {
+        let revision: DocRevision | undefined;
+        if (typeof target === 'number') revision = Math.floor(target) === target && target >= 0 ? list[target] : undefined;
+        else if (target && typeof target === 'object') revision = target;
+        if (!revision) return false;
+        const one = verdict === 'accept' ? ops.acceptRevision(this.document, revision) : ops.rejectRevision(this.document, revision);
+        edit = one;
+        sections = one.sectionsRemoved;
+      }
+      if (edit.ops.length === 0) {
+        // Nothing could be resolved.
+        this.notify(skipped > 0 ? this.strings.cannotResolveRevision : this.strings.noRevisionHere, 'info');
+        return false;
+      }
+      this.history.seal();
+      this.history.applyEdit(edit, before);
+      this.history.seal();
+    } catch (error) {
+      this.refuse(error);
+      return false;
+    }
+    this.pendingFormat = undefined;
+    this.changed(edit.selection);
+    const left = this.listedRevisions().list.length;
+    const said = this.strings.revisionsResolved(verdict, resolved, this.countedRevisions(), skipped, sections);
+    this.notify(said, 'info');
+    if (advance && left > 0) this.stepToRevision('next', said);
+    return true;
+  }
+
+  /** The tracked change under a point of the window: an insertion, or text whose formatting was changed. */
+  private revisionUnder(clientX: number, clientY: number): DocRevision | undefined {
+    const point = this.pagePoint(clientX, clientY);
+    const hit = point ? this.hitAt(point.page, point.x, point.y) : undefined;
+    if (!point || !hit) return undefined;
+    const item = hit.item;
+    const box = this.measurer.metrics(item.font);
+    // On the text itself, not merely nearest to it.
+    if (point.x < item.x || point.x > item.x + item.width || point.y < item.y - box.ascent || point.y > item.y + box.descent) return undefined;
+    const at = DocumentView.positionOf(item, Math.min(hit.offset, Math.max(0, item.text.length - 1)));
+    const list = this.everyRevision();
+    for (let i = 0; i < list.length; i++) {
+      const revision = list[i];
+      if (revision.story !== at.story || placeOrder(revision.start, revision.end) === 0) continue;
+      if (placeOrder(revision.start, at) <= 0 && placeOrder(revision.end, at) > 0) return revision;
+    }
+    return undefined;
+  }
+
+  /** The pages say what the change under the pointer is, as their tool tip. */
+  private onHover = (event: MouseEvent): void => {
+    if (this.destroyed || this.dragging || event.buttons !== 0) return;
+    const key = `${this.changes}:${Math.round(event.clientX / 4)}:${Math.round(event.clientY / 4)}`;
+    if (key === this.hoverKey) return;
+    this.hoverKey = key;
+    let title = '';
+    // A document without changes costs nothing here.
+    if (this.listedRevisions().list.length > 0) {
+      const revision = this.revisionUnder(event.clientX, event.clientY);
+      if (revision) title = this.describeRevision(revision);
+    }
+    if (this.strip.title !== title) this.strip.title = title;
+  };
+
   /** Says, once, why the document cannot be edited. */
   private tellLock(): void {
     if (this.lockTold || this.lock === undefined) return;
@@ -3123,7 +3428,22 @@ export class DocumentView {
   /** A place that cannot be edited is not an error of the program: said, and nothing happens. */
   private refuse(error: unknown): void {
     if (!(error instanceof RangeError)) throw error;
-    this.notify(error.message === ops.TRACK_UNSUPPORTED ? this.strings.cannotTrackChange : this.strings.cannotEditHere, 'info');
+    const s = this.strings;
+    const message = error.message;
+    this.notify(
+      message === ops.TRACK_UNSUPPORTED
+        ? s.cannotTrackChange
+        : message === ops.REVISIONS_PROTECTED
+          ? s.revisionsProtected
+          : message === ops.REVISION_UNSUPPORTED
+            ? s.cannotResolveRevision
+            : message === ops.REVISION_GONE
+              ? s.revisionGone
+              : message === ops.TRACK_ENFORCED
+                ? s.cannotStopTracking
+                : s.cannotEditHere,
+      'info',
+    );
   }
 
   /** First (-1) or last (1) place of the story the caret is in. */
@@ -4321,8 +4641,9 @@ export class DocumentView {
     }
   }
 
-  private notify(message: string, kind: 'error' | 'info'): void {
-    this.live.textContent = message;
+  /** Tells the user something: `spoken` is what the live region says when that is more than the message. */
+  private notify(message: string, kind: 'error' | 'info', spoken = message): void {
+    this.live.textContent = spoken;
     if (this.options.onNotice) this.options.onNotice({ message, kind });
   }
 }

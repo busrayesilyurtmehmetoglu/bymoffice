@@ -448,6 +448,60 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       expectNoOutsideRequests(bridge.requests);
     });
 
+    test('the tracked changes of a docx: their number in loaded, accept all, tracking on and off, and what is typed while it is on', async ({ page, isMobile }) => {
+      const who = (id: number, author: string) => ` w:id="${id}" w:author="${author}" w:date="2026-10-01T09:00:00Z"`;
+      const run = (text: string) => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
+      const body = `<w:p>${run('One ')}<w:ins${who(1, 'Ann')}>${run('two ')}</w:ins><w:del${who(2, 'Bob')}><w:r><w:delText xml:space="preserve">three </w:delText></w:r></w:del>${run('four.')}</w:p>${p('Second paragraph.')}`;
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 'd1', data: base64(await docx(body)), author: 'Me' });
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, revisions: 2 });
+
+      await bridge.send({ type: 'rejectAllRevisions', id: 'r' });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'r', command: 'rejectAllRevisions', revisions: 0, trackChanges: false });
+      // The count is told before the change it comes with.
+      const told = (await bridge.messages()).filter((message) => message.type === 'revisions' || message.type === 'changed');
+      expect(told).toEqual([
+        { type: 'revisions', count: 0, trackChanges: false },
+        { type: 'changed', sheets: [], canUndo: true, canRedo: false },
+      ]);
+      await bridge.send({ type: 'save', id: 's1' });
+      await bridge.waitFor('saved');
+      expect((await textOfSaved(bridge, 0)).text).toBe('One three four.\nSecond paragraph.');
+
+      // Undone, the two changes are back; accepted, the text is the other one.
+      await bridge.send({ type: 'undo', id: 'u' });
+      expect(await bridge.waitFor('revisions', 2)).toEqual({ type: 'revisions', count: 2, trackChanges: false });
+      await bridge.send({ type: 'acceptAllRevisions', id: 'a' });
+      expect(await bridge.waitFor('done', 3)).toEqual({ type: 'done', id: 'a', command: 'acceptAllRevisions', revisions: 0, trackChanges: false });
+      await bridge.send({ type: 'save', id: 's2' });
+      await bridge.waitFor('saved', 2);
+      expect((await textOfSaved(bridge, 1)).text).toBe('One two four.\nSecond paragraph.');
+
+      // Tracking on: what is typed is a tracked change, and the application hears of it.
+      await bridge.send({ type: 'setTrackChanges', id: 't', on: true });
+      expect(await bridge.waitFor('done', 4)).toEqual({ type: 'done', id: 't', command: 'setTrackChanges', revisions: 0, trackChanges: true });
+      await typeIntoDocument(page, bridge.editor, 'X', isMobile);
+      expect(await bridge.waitFor('revisions', 5)).toEqual({ type: 'revisions', count: 1, trackChanges: true });
+      await bridge.send({ type: 'setTrackChanges', id: 't2', on: false });
+      expect(await bridge.waitFor('done', 5)).toEqual({ type: 'done', id: 't2', command: 'setTrackChanges', revisions: 1, trackChanges: false });
+      await bridge.send({ type: 'save', id: 's3' });
+      await bridge.waitFor('saved', 3);
+      const saved = Buffer.from(await bridge.savedData(2), 'base64');
+      const xml = new TextDecoder().decode(await ZipArchive.read(new Uint8Array(saved)).read('word/document.xml'));
+      expect(xml).toMatch(/<w:ins w:id="\d+" w:author="Me" w:date="[^"]+"><w:r><w:t>X<\/w:t><\/w:r><\/w:ins>/);
+      expect(xml.split('<w:ins ').length).toBe(2);
+
+      // A workbook has no tracked changes to resolve.
+      await bridge.send({ type: 'load', id: 'x', data: base64(await smallWorkbook()) });
+      await bridge.waitFor('loaded', 2);
+      await bridge.send({ type: 'acceptAllRevisions', id: 'n' });
+      expect(await bridge.waitFor('error')).toMatchObject({ type: 'error', id: 'n', code: 'no-document' });
+      const all = await bridge.messages();
+      expect(all.filter((message) => message.notAString || message.type === 'error')).toHaveLength(1);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
     test('a docx is edited: typing sends changed, undo and redo work, the saved file holds the text', async ({ page, isMobile }) => {
       const bridge = await start(page, mode);
       await bridge.waitFor('ready');

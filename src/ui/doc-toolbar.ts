@@ -1,6 +1,7 @@
 // The toolbar of the document editor: undo and redo, the paragraph style, the
 // font and its size, character and paragraph formatting, lists, tables, a
-// picture, a link, a page break. It has the looks and the keys of the
+// picture, a link, a page break, and the tracked changes: tracking on and off,
+// the change before and after, accept, reject, and a menu for all of them. It has the looks and the keys of the
 // spreadsheet editor's toolbar: its buttons are a single Tab stop with the
 // arrow keys moving between them, each list is a Tab stop of its own, and a
 // command ends with the focus back in the document.
@@ -46,7 +47,13 @@ type ButtonKey =
   | 'rowsColumns'
   | 'insertPicture'
   | 'insertLink'
-  | 'pageBreak';
+  | 'pageBreak'
+  | 'trackChanges'
+  | 'previousChange'
+  | 'nextChange'
+  | 'acceptChange'
+  | 'rejectChange'
+  | 'changesMenu';
 
 const SHARED_ICONS: { [key: string]: IconName } = {
   undo: 'undo',
@@ -180,6 +187,14 @@ export class DocToolbar {
     this.addMenuButton('insertPicture', 'dialog', () => this.fileInput.click());
     this.addMenuButton('insertLink', 'dialog', () => this.openLink());
     this.addButton('pageBreak', () => view().insertPageBreak());
+    this.addSeparator();
+    // The tracked changes: Word's order. Accept and reject go on to the next change, as they do there.
+    this.addButton('trackChanges', () => view().setTrackChanges(!view().trackingChanges), true);
+    this.addButton('previousChange', () => view().goToRevision('previous'));
+    this.addButton('nextChange', () => view().goToRevision('next'));
+    this.addButton('acceptChange', () => view().acceptRevision(undefined, true));
+    this.addButton('rejectChange', () => view().rejectRevision(undefined, true));
+    this.addMenuButton('changesMenu', 'menu', () => this.openChangesMenu());
 
     // The picture button only opens the browser's own file dialog: it has nothing that stays open.
     const pictureButton = this.buttons.insertPicture as HTMLButtonElement;
@@ -249,6 +264,7 @@ export class DocToolbar {
     this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;
     if (!editable) this.closePopover();
+    this.updateChanges(editable);
 
     const pressed = (key: ButtonKey, name: keyof RangeFormat, value: unknown) => this.setPressed(key, mixed.indexOf(name) >= 0 ? 'mixed' : format !== undefined && format[name] === value ? 'true' : 'false');
     pressed('bold', 'bold', true);
@@ -271,6 +287,35 @@ export class DocToolbar {
     if (format && format.highlight !== undefined) for (const entry of HIGHLIGHTS) if (entry[0] === format.highlight) highlight = entry[1];
     this.paintBar(this.bars.highlight, highlight);
     this.keepTabStop();
+  }
+
+  /** The buttons of the tracked changes: what the document holds, what the selection touches, what its protection allows. */
+  private updateChanges(editable: boolean): void {
+    const view = this.host.view;
+    const s = this.strings;
+    const count = editable ? view.revisions().length : 0;
+    const selected = editable && count > 0 ? view.selectedRevisions() : [];
+    // An enforced protection allows no change to be accepted or rejected (Word does not either).
+    const locked = view.protection !== undefined;
+    const enforced = view.trackingEnforced;
+    this.setDisabled('trackChanges', !editable || enforced);
+    this.setPressed('trackChanges', view.trackingChanges ? 'true' : 'false');
+    this.setTitle('trackChanges', enforced ? `${s.trackChanges} (${s.trackingEnforced})` : s.trackChanges);
+    this.setDisabled('previousChange', count === 0);
+    this.setDisabled('nextChange', count === 0);
+    this.setDisabled('acceptChange', locked || !selected.some((revision) => revision.canAccept));
+    this.setDisabled('rejectChange', locked || !selected.some((revision) => revision.canReject));
+    this.setDisabled('changesMenu', locked || count === 0);
+    // What the buttons would work on: the name of an author is set as text.
+    const about = locked ? ` (${s.changesProtected})` : selected.length === 1 ? `: ${view.describeRevision(selected[0])}` : '';
+    this.setTitle('acceptChange', s.acceptChange + about);
+    this.setTitle('rejectChange', s.rejectChange + about);
+    if (this.popover && this.popover.anchor === this.buttons.changesMenu && (locked || count === 0)) this.closePopover();
+  }
+
+  private setTitle(key: ButtonKey, title: string): void {
+    const button = this.buttons[key];
+    if (button && button.title !== title) button.title = title;
   }
 
   closePopover(): void {
@@ -454,6 +499,12 @@ export class DocToolbar {
       insertPicture: s.insertPicture,
       insertLink: withShortcut(s.insertLink, 'K'),
       pageBreak: s.pageBreak,
+      trackChanges: s.trackChanges,
+      previousChange: s.previousChange,
+      nextChange: s.nextChange,
+      acceptChange: s.acceptChange,
+      rejectChange: s.rejectChange,
+      changesMenu: s.allChanges,
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {
       const button = this.buttons[key];
@@ -624,6 +675,16 @@ export class DocToolbar {
     add(s.deleteRow, () => view.deleteRow());
     add(s.deleteColumn, () => view.deleteColumn());
     this.open('rowsColumns', s.tableRowsColumns, items);
+  }
+
+  private openChangesMenu(): void {
+    const s = this.strings;
+    const view = this.host.view;
+    const items: PopoverItem[] = [
+      { label: s.acceptAllChanges, action: () => this.host.run(() => view.acceptAllRevisions()) },
+      { label: s.rejectAllChanges, action: () => this.host.run(() => view.rejectAllRevisions()) },
+    ];
+    this.open('changesMenu', s.allChanges, items);
   }
 
   private open(key: ButtonKey, label: string, items: PopoverItem[], swatches?: PopoverItem[], columns?: number): void {

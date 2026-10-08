@@ -63,6 +63,12 @@ export function setTracking(doc: DocModel, setup: TrackingSetup): void {
   SETUPS.set(doc, { ...setup });
 }
 
+/** Did the application ask for the changes of this document to be tracked whatever the document says (setTracking with `force`). */
+export function forcesTracking(doc: DocModel): boolean {
+  const setup = SETUPS.get(doc);
+  return setup !== undefined && setup.force === true;
+}
+
 const two = (value: number): string => (value < 10 ? '0' : '') + value;
 
 /** A moment as w:date holds it: UTC, to the second. */
@@ -670,3 +676,107 @@ export function withFreshChanges(props: ParaProps, tracking: Tracking): ParaProp
 }
 
 export const isDeletedMark = (props: ParaProps): boolean => props.markProps !== undefined && props.markProps.deleted !== undefined;
+
+// ------------------------------------------------------- one id, one element
+
+const changeId = (change: XmlElement): number | undefined => {
+  let id: number | undefined;
+  change.attrs.forEach((value, name) => {
+    if (id === undefined && name.slice(name.indexOf(':') + 1) === 'id' && /^\d{1,10}$/.test(value)) id = Number(value);
+  });
+  return id;
+};
+
+function renumberedChange(doc: DocModel, change: XmlElement): XmlElement {
+  const attrs = new Map(change.attrs);
+  let done = false;
+  attrs.forEach((_value, name) => {
+    if (!done && name.slice(name.indexOf(':') + 1) === 'id') {
+      attrs.set(name, String(nextRevisionId(doc)));
+      done = true;
+    }
+  });
+  return { ...change, attrs };
+}
+
+/**
+ * The blocks an edit puts into the document, with every tracked change in
+ * their paragraphs an element of its own: what the edit split in two (a run
+ * whose formatting was changed, an insertion, a deletion or a move something
+ * was put into, a paragraph that carries a change of its formatting or of its
+ * mark) would otherwise be written as two elements with one id. The second
+ * of two such elements gets a new id. Holds for every edit, tracked or not.
+ * Paragraphs inside the tables of the blocks are not looked at. Returns the
+ * list itself when nothing had to change.
+ */
+export function distinctRevisions(doc: DocModel, blocks: Block[]): Block[] {
+  let out: Block[] | undefined;
+  /** The ids the elements written so far have. */
+  const seen = new Set<number>();
+  const taken = (id: number | undefined): boolean => {
+    if (id === undefined) return false;
+    if (seen.has(id)) return true;
+    seen.add(id);
+    return false;
+  };
+  for (let b = 0; b < blocks.length; b++) {
+    const block = blocks[b];
+    if (block.type !== 'paragraph') continue;
+    let children: Inline[] | undefined;
+    /** The wrappers around the inline before, and what stands for each in the element that is open. */
+    let previous = new Set<Wrapper>();
+    const alias = new Map<Wrapper, Wrapper>();
+    for (let i = 0; i < block.children.length; i++) {
+      const inline = block.children[i];
+      let next = inline;
+      const chain: Wrapper[] = [];
+      for (let w = inline.wrap; w && chain.length < MAX_WRAPPER_CHAIN; w = w.parent) chain.push(w);
+      let use: Wrapper | undefined;
+      // Outermost first: a wrapper that was not around the inline before begins a new element here.
+      for (let k = chain.length - 1; k >= 0; k--) {
+        const w = chain[k];
+        if (previous.has(w)) {
+          use = alias.get(w) || w;
+          continue;
+        }
+        const fresh = isRevision(w) && taken(w.id);
+        if (fresh || use !== w.parent) {
+          const copy = { ...w } as Wrapper;
+          if (use) copy.parent = use;
+          else delete copy.parent;
+          if (fresh) (copy as RevisionWrapper).id = nextRevisionId(doc);
+          alias.set(w, copy);
+          use = copy;
+        } else {
+          alias.delete(w);
+          use = w;
+        }
+      }
+      previous = new Set<Wrapper>(chain);
+      if (use !== inline.wrap) next = { ...inline, wrap: use } as Inline;
+      if (next.type === 'run' && next.props.change && taken(changeId(next.props.change))) {
+        next = { ...next, props: { ...next.props, change: renumberedChange(doc, next.props.change) } };
+      }
+      if (next !== inline) {
+        if (!children) children = block.children.slice();
+        children[i] = next;
+      }
+    }
+    let props = block.props;
+    if (props.change && taken(changeId(props.change))) props = { ...props, change: renumberedChange(doc, props.change) };
+    let mark = props.markProps;
+    if (mark) {
+      const before = mark;
+      if (mark.change && taken(changeId(mark.change))) mark = { ...mark, change: renumberedChange(doc, mark.change) };
+      for (const key of MARK_FLAGS) {
+        const info: RevisionInfo | undefined = mark[key];
+        if (info && taken(info.id)) mark = { ...mark, [key]: { ...info, id: nextRevisionId(doc) } };
+      }
+      if (mark !== before) props = { ...props, markProps: mark };
+    }
+    if (!children && props === block.props) continue;
+    if (!out) out = blocks.slice();
+    out[b] = { ...block, children: children || block.children, props };
+  }
+  return out || blocks;
+}

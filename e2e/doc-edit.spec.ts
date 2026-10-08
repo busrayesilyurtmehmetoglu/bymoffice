@@ -680,7 +680,8 @@ test.describe('document editor: formatting', () => {
     await page.keyboard.press('ArrowRight');
     await expect(toolbarButton(page, 'italic')).toBeFocused();
     await page.keyboard.press('End');
-    await expect(toolbarButton(page, 'pageBreak')).toBeFocused();
+    // The last button that can be pressed: the document has no tracked changes, so that is the one that turns tracking on.
+    await expect(toolbarButton(page, 'trackChanges')).toBeFocused();
     await page.keyboard.press('Escape');
     await expect(input(page)).toBeFocused();
     await page.evaluate(() => (window as any).__mounted.editor.setLocale('en'));

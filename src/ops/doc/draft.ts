@@ -8,7 +8,7 @@ import type { Block, DocModel, Paragraph, RunItem, Story, Table, TableCell, Wrap
 import { applyDocOp, checkSplice, splicedBlocks, type DocOp } from './ops';
 import { READ_ONLY } from './pieces';
 import { collapsed, inTextBox, storyOf, type DocPosition, type DocRange } from './position';
-import { TRACK_UNSUPPORTED, trackingFor, type TrackOptions, type Tracking } from './track';
+import { TRACK_UNSUPPORTED, distinctRevisions, trackingFor, type TrackOptions, type Tracking } from './track';
 
 export { tableContextOf } from './position';
 
@@ -157,8 +157,10 @@ export class Draft {
    * wrapper as it was are bound to the same copy, so one command leaves one
    * wrapper however many of its blocks it changes.
    */
-  replace(story: string, path: number[], at: number, remove: number, insert: Block[]): void {
+  replace(story: string, path: number[], at: number, remove: number, incoming: Block[]): void {
     if (inTextBox(path)) bad('The content of a text box cannot be edited');
+    // No two elements of what goes in share the id of a tracked change (see distinctRevisions).
+    const insert = Array.isArray(incoming) ? distinctRevisions(this.doc, incoming) : incoming;
     const top = storyOf(this.doc, story).blocks;
     if (path.length === 0) {
       for (let i = at; i < at + remove && i < top.length; i++) if (inAlternate(top[i].wrap)) bad(READ_ONLY);

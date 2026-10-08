@@ -14,9 +14,13 @@
 //     definition or style that exists in the part is not rewritten. The parts
 //     are looked at when a story is written or the numbering says it was
 //     modified.
-//   - Settings, theme, font table and the document properties are left
-//     alone. The page and word counts in docProps/app.xml go stale with an
-//     edit; Word computes them again when it opens the file.
+//   - Of the settings only <w:trackRevisions> is written, when the model
+//     tracks changes and the file does not or the other way round: the
+//     element is put in at its place or taken out, and nothing else in the
+//     part changes. A document without a settings part gets one.
+//   - Theme, font table and the document properties are left alone. The
+//     page and word counts in docProps/app.xml go stale with an edit; Word
+//     computes them again when it opens the file.
 //   - Writing does not change the model.
 //
 // The package remembers what was written into it. A part that an earlier
@@ -73,6 +77,7 @@ import { parseXml, serializeXml, type XmlDocument, type XmlElement } from '../..
 import { ZipArchive } from '../../zip';
 import { DEFAULT_AUTHOR, largestAnnotationId } from '../../ops/doc/track';
 import { resolveColor, resolveFont } from './resolve';
+import { parseOnOff } from './common';
 import { decodePart } from './source';
 import type { BodyContext } from './write-body';
 import {
@@ -243,6 +248,84 @@ interface SaveState {
 
 const SAVES = new WeakMap<OpcPackage, SaveState>();
 
+/**
+ * The bytes of a part with stretches of its text replaced. The places are
+ * those of the text as decodePart() gives it (no byte order mark, line ends
+ * as "\n"); the text that is changed is the one the file holds, in its own
+ * encoding, so nothing but the stretches differs from the bytes given.
+ */
+function splicedPart(original: Uint8Array, splices: { start: number; end: number; text: string }[]): Uint8Array {
+  const little = original[0] === 0xff && original[1] === 0xfe;
+  const big = original[0] === 0xfe && original[1] === 0xff;
+  const raw = new TextDecoder(little ? 'utf-16le' : big ? 'utf-16be' : 'utf-8', { ignoreBOM: true }).decode(original);
+  // Where each place of the normalized text is in the raw one.
+  const sorted = splices.slice().sort((a, b) => a.start - b.start);
+  let out = '';
+  let rawAt = raw.charCodeAt(0) === 0xfeff ? 1 : 0;
+  let at = 0;
+  let copied = 0;
+  /** Moves on to a place of the normalized text and returns where that is in the raw text. */
+  const seek = (target: number): number => {
+    while (at < target && rawAt < raw.length) {
+      // "\r\n" is one character of the normalized text.
+      if (raw.charCodeAt(rawAt) === 13 && raw.charCodeAt(rawAt + 1) === 10) rawAt++;
+      rawAt++;
+      at++;
+    }
+    return rawAt;
+  };
+  for (const splice of sorted) {
+    const start = seek(splice.start);
+    const end = seek(splice.end);
+    out += raw.slice(copied, start) + splice.text;
+    copied = end;
+  }
+  out += raw.slice(copied);
+  if (!little && !big) return new TextEncoder().encode(out);
+  const bytes = new Uint8Array(out.length * 2);
+  for (let i = 0; i < out.length; i++) {
+    const c = out.charCodeAt(i);
+    bytes[i * 2 + (little ? 0 : 1)] = c & 0xff;
+    bytes[i * 2 + (little ? 1 : 0)] = c >> 8;
+  }
+  return bytes;
+}
+
+/** The children of <w:settings> the schema puts before <w:trackRevisions>. */
+const BEFORE_TRACK_REVISIONS = new Set<string>([
+  'writeProtection',
+  'view',
+  'zoom',
+  'removePersonalInformation',
+  'removeDateAndTime',
+  'doNotDisplayPageBoundaries',
+  'displayBackgroundShape',
+  'printPostScriptOverText',
+  'printFractionalCharacterWidth',
+  'printFormsData',
+  'embedTrueTypeFonts',
+  'embedSystemFonts',
+  'saveSubsetFonts',
+  'saveFormsData',
+  'mirrorMargins',
+  'alignBordersAndEdges',
+  'bordersDoNotSurroundHeader',
+  'bordersDoNotSurroundFooter',
+  'gutterAtTop',
+  'hideSpellingErrors',
+  'hideGrammaticalErrors',
+  'activeWritingStyle',
+  'proofState',
+  'formsDesign',
+  'attachedTemplate',
+  'linkStyles',
+  'stylePaneFormatFilter',
+  'stylePaneSortMethod',
+  'documentType',
+  'mailMerge',
+  'revisionView',
+]);
+
 /** The relationships part of a part, as the file had it, with what is added to it. */
 class RelsEdit {
   readonly doc: XmlDocument;
@@ -370,11 +453,72 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     for (const rel of made.values()) rels.add(rel.id, rel.type, rel.target, rel.external);
   }
 
+  // The one setting an edit changes: whether changes are tracked. The settings part is written when the model
+  // says otherwise than the file does, and then nothing in it changes but <w:trackRevisions>.
+  const dir = main.slice(0, main.lastIndexOf('/') + 1);
+  let tracking: { part: string; data: Uint8Array; contentType?: string; relate: boolean } | undefined;
+  {
+    const wanted = doc.settings.trackRevisions === true;
+    const rels = new RelsEdit(await originalOf(relsPartOf(main)));
+    const existing = rels.partOf(main, '/settings');
+    const part = existing || dir + 'settings.xml';
+    const original = await originalOf(part);
+    if (!original) {
+      if (wanted) {
+        const attrs = generatedRootAttrs(doc.strict);
+        const ctx = createBodyContext(part, attrs, new Map(), shared);
+        let text = XML_DECLARATION + `<${ctx.w}settings`;
+        for (const [name, value] of attrs) text += ` ${name}="${value}"`;
+        text += `><${ctx.w}trackRevisions/></${ctx.w}settings>`;
+        tracking = { part, data: encodePart(text), contentType: CONTENT_TYPES.settings, relate: !existing };
+      }
+    } else {
+      const source = decodePart(original);
+      const scan = scanPart(source);
+      const ctx = scan ? createBodyContext(part, scan.rootAttrs, new Map(), shared) : undefined;
+      // The setting as the reader reads it: the last element that states a value counts.
+      let stated = false;
+      const marks: { start: number; end: number }[] = [];
+      let place = scan ? scan.contentStart : 0;
+      if (scan && ctx) {
+        for (const child of scan.children) {
+          if (child.kind === 'trackRevisions') {
+            marks.push(child);
+            let val: string | undefined;
+            for (const [name, value] of child.attrs) {
+              const colon = name.indexOf(':');
+              if ((colon < 0 || name.slice(0, colon + 1) === ctx.w) && name.slice(colon + 1) === 'val') val = value;
+            }
+            const value = parseOnOff(val);
+            if (value !== undefined) stated = value;
+          } else if (BEFORE_TRACK_REVISIONS.has(child.kind)) place = child.end;
+        }
+      }
+      if (!scan || !ctx) {
+        // What the file says cannot be told: it is left as it is.
+        if (wanted && report) report.warnings.push(`${part} could not be followed; the tracking of changes was not written to it`);
+      } else if (stated !== wanted) {
+        const element = `<${ctx.w}trackRevisions/>`;
+        // Places in the text as the scanner read it; the bytes are changed at the same places of the text as it
+        // was written, so that a byte order mark and the line ends of the file stay what they were.
+        const splices: { start: number; end: number; text: string }[] = [];
+        if (scan.selfClosing) splices.push({ start: scan.contentStart - 2, end: scan.contentStart, text: `>${element}</${scan.rootName}>` });
+        else if (!marks.length) splices.push({ start: place, end: place, text: element });
+        // Every statement of the setting goes; the new one takes the place of the first.
+        else for (let i = 0; i < marks.length; i++) splices.push({ start: marks[i].start, end: marks[i].end, text: i === 0 && wanted ? element : '' });
+        tracking = { part, data: splicedPart(original, splices), relate: false };
+      }
+    }
+  }
+
   // Nothing to do for a document that was not edited and never written.
-  if (!stories && !doc.numbering.modified && !saved.written.size) return;
+  if (!stories && !doc.numbering.modified && !saved.written.size && !tracking) return;
 
   const mainRels = await relsFor(main);
-  const dir = main.slice(0, main.lastIndexOf('/') + 1);
+  if (tracking) {
+    writes.set(tracking.part, { data: tracking.data, contentType: tracking.contentType });
+    if (tracking.relate) mainRels.add(mainRels.freeId(), ns.rel + 'settings', relativeTarget(main, tracking.part), false);
+  }
 
   const kindOf = (ctx: BodyContext, name: string): string => {
     // Attribute names of the part: the WordprocessingML prefix or none.

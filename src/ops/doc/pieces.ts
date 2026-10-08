@@ -280,7 +280,7 @@ export const isStaleHint = (piece: Piece): boolean =>
 export const isStructural = (piece: Piece): boolean => piece.item !== undefined && (piece.code || piece.item.type === 'fieldChar' || piece.item.type === 'instrText');
 
 /** A wrapper chain without the wrapper `gone`; wrappers inside it are copied, once each. */
-function withoutWrapper(wrap: Wrapper | undefined, gone: Wrapper, memo: Map<Wrapper, Wrapper | undefined>): Wrapper | undefined {
+export function withoutWrapper(wrap: Wrapper | undefined, gone: Wrapper, memo: Map<Wrapper, Wrapper | undefined>): Wrapper | undefined {
   if (!wrap) return undefined;
   if (wrap === gone) return wrap.parent;
   if (memo.has(wrap)) return memo.get(wrap);
@@ -446,6 +446,26 @@ export function markRunProps(mark: RunProps | undefined): RunProps {
   return Object.keys(out).length ? out : EMPTY_RUN_PROPS;
 }
 
+const UNCHANGED = new WeakMap<RunProps, RunProps>();
+
+/**
+ * Run formatting as new text takes it over from its neighbour: without the
+ * record that the neighbour's formatting was changed (<w:rPrChange>), which
+ * says who changed that text and is no formatting. The same properties give
+ * the same object, so that what is typed next joins what was typed before.
+ */
+function withoutChange(props: RunProps): RunProps {
+  if (props.change === undefined) return props;
+  let out = UNCHANGED.get(props);
+  if (!out) {
+    const copy: RunProps = { ...props };
+    delete copy.change;
+    out = Object.keys(copy).length ? copy : EMPTY_RUN_PROPS;
+    UNCHANGED.set(props, out);
+  }
+  return out;
+}
+
 /** Wrappers whose formatting belongs to what they hold: text typed beside them does not take it over. */
 const isContainer = (w: Wrapper): boolean => w.kind === 'hyperlink' || w.kind === 'simpleField' || w.kind === 'sdt';
 
@@ -478,14 +498,14 @@ export function inheritedProps(pieces: Piece[], index: number, mark: RunProps | 
   let passed = false;
   for (let i = index - 1; i >= 0; i--) {
     if (!text(pieces[i])) continue;
-    if (!apart(i)) return pieces[i].props;
+    if (!apart(i)) return withoutChange(pieces[i].props);
     passed = true;
   }
   if (!passed) {
     for (let i = index; i < pieces.length; i++) {
       if (!text(pieces[i])) continue;
       if (apart(i)) break;
-      return pieces[i].props;
+      return withoutChange(pieces[i].props);
     }
   }
   return markRunProps(mark);

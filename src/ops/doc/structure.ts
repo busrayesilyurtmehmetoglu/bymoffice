@@ -170,7 +170,7 @@ export function insertRow(doc: DocModel, position: DocPosition, where: 'above' |
 }
 
 /** What removed rows or cells leave behind (see harvestBlocks): inlines for a paragraph that stays, and blocks without content. */
-interface Leftover {
+export interface Leftover {
   inlines: Inline[];
   blocks: Block[];
 }
@@ -199,7 +199,7 @@ function cellWith(cell: TableCell, left: Leftover, atEnd: boolean): TableCell {
 }
 
 /** A row whose first cell (`atEnd`: last cell) takes over what removed content left behind. */
-function rowWith(row: TableRow, left: Leftover, atEnd: boolean): TableRow {
+export function rowWith(row: TableRow, left: Leftover, atEnd: boolean): TableRow {
   if (row.cells.length === 0 || (left.inlines.length === 0 && left.blocks.length === 0)) return row;
   const cells = row.cells.slice();
   const c = atEnd ? cells.length - 1 : 0;

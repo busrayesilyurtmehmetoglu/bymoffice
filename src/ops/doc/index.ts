@@ -21,4 +21,28 @@ export {
 } from './format';
 export { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertImage, insertRow, insertTable, type InsertImageOptions, type NewImage } from './structure';
 export { FRAGMENT_LIMITS, MAX_TABLE_DEPTH, fragmentHasContent, fragmentNeeds, fragmentOf, insertFragment, originOf, type DocFragment, type FragmentMedia, type InsertFragmentOptions } from './fragment';
-export { DEFAULT_AUTHOR, TRACK_UNSUPPORTED, isTracking, nextRevisionId, revisionDate, setTracking, type TrackOptions, type TrackingSetup } from './track';
+export { DEFAULT_AUTHOR, TRACK_UNSUPPORTED, forcesTracking, isTracking, nextRevisionId, revisionDate, setTracking, type TrackOptions, type TrackingSetup } from './track';
+export {
+  REVISIONS_PROTECTED,
+  REVISION_GONE,
+  REVISION_LIST_LIMIT,
+  REVISION_UNSUPPORTED,
+  TRACK_ENFORCED,
+  acceptAll,
+  acceptRevision,
+  listRevisions,
+  placeOrder,
+  rejectAll,
+  rejectRevision,
+  revisionCounters,
+  revisionStep,
+  revisionsOf,
+  revisionsTouching,
+  setTrackRevisions,
+  type DocRevision,
+  type DocRevisions,
+  type ListRevisionsOptions,
+  type RevisionEdit,
+  type RevisionKind,
+  type RevisionsEdit,
+} from './revisions';

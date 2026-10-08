@@ -9,7 +9,7 @@
 // back by reference, source spans and all, and restores `modified`, so that
 // "edit, undo, save" writes the bytes that were read.
 
-import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, DocStyles, Note, NumInstance, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
+import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, DocStyles, Note, NumInstance, SectionProps, SourceSpan, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
 import { storyOf, type StoryHandle } from './position';
 
 /** `modified` flag to set after an operation: true when missing, null to remove the flag. */
@@ -56,7 +56,16 @@ export type DocOp =
    * never changed in place, so that what depends on the styles (the layout)
    * sees a new object.
    */
-  | { type: 'setStyles'; styles: DocStyles };
+  | { type: 'setStyles'; styles: DocStyles }
+  /**
+   * Puts other properties in the place of those of the last section of the
+   * body (Body.section). Without `span` the section has no place in the
+   * source any more and is written from the model; the inverse carries the
+   * span the section had, so that undoing gives the text of the file back.
+   */
+  | { type: 'setBodySection'; section: SectionProps; span?: SourceSpan; modified?: Flag }
+  /** Turns the "track changes" setting of the document (DocSettings.trackRevisions) on or off. */
+  | { type: 'setTrackRevisions'; on: boolean };
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -230,6 +239,23 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
       const before = doc.styles;
       doc.styles = next;
       return { type: 'setStyles', styles: before };
+    }
+    case 'setBodySection': {
+      const body = doc.body;
+      if (!op.section || typeof op.section !== 'object' || !body.section) return bad('The body has no section to replace');
+      const inverse: DocOp = { type: 'setBodySection', section: body.section };
+      if (body.sectionSpan) inverse.span = body.sectionSpan;
+      body.section = op.section;
+      if (op.span) body.sectionSpan = op.span;
+      else delete body.sectionSpan;
+      inverse.modified = setFlag(body, op.modified);
+      return inverse;
+    }
+    case 'setTrackRevisions': {
+      if (typeof op.on !== 'boolean' || !doc.settings) return bad('Tracking is either on or off');
+      const before = doc.settings.trackRevisions === true;
+      doc.settings.trackRevisions = op.on;
+      return { type: 'setTrackRevisions', on: before };
     }
     case 'setMedia': {
       if (typeof op.name !== 'string' || op.name === '') return bad('A picture needs a name');

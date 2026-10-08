@@ -115,6 +115,28 @@ export interface UiStrings {
   cannotTrackChange: string;
   /** Said once for a document whose protection keeps it read-only; `kind` is "readOnly", "comments" or "forms". */
   protectedDocument(kind: string): string;
+  // Tracked changes.
+  /**
+   * What a tracked change is: `kind` is a kind of DocRevision ("insert", "delete", "moveFrom", "moveTo", "format",
+   * "paragraphFormat", "tableFormat", "sectionFormat", "other"); the author, the date and the text come from the file.
+   */
+  revisionDescription(kind: string, author: string | undefined, date: string | undefined, text: string): string;
+  /** Said when a change is stepped to: its number, how many there are, what it is, and whether the step went round to the first or the last one. */
+  revisionStep(number: number, count: string, description: string, wrapped?: 'first' | 'last'): string;
+  noRevisions: string;
+  /** Accept or reject was asked for and the selection touches no change. */
+  noRevisionHere: string;
+  /**
+   * Said after changes were accepted or rejected: how many, how many the document still has (a number as text; "2000+"
+   * when there are more than are counted), how many could not be resolved, and how many section breaks went with
+   * the paragraph marks that were removed.
+   */
+  revisionsResolved(verdict: 'accept' | 'reject', resolved: number, left: string, skipped: number, sections: number): string;
+  cannotResolveRevision: string;
+  revisionGone: string;
+  revisionsProtected: string;
+  trackingTurned(on: boolean): string;
+  cannotStopTracking: string;
   /** Said after a copy was pasted as text alone because changes are tracked. */
   pastedAsText: string;
   cannotCutObjects: string;
@@ -303,6 +325,31 @@ export const STRINGS_EN: UiStrings = {
       : kind === 'forms'
         ? 'This document is protected: only its form fields may be filled in. It is shown read-only'
         : 'This document is protected against changes. It is shown read-only',
+  revisionDescription: (kind, author, date, text) => {
+    const what: { [kind: string]: string } = {
+      insert: 'Inserted',
+      delete: 'Deleted',
+      moveFrom: 'Moved from here',
+      moveTo: 'Moved here',
+      format: 'Formatting changed',
+      paragraphFormat: 'Paragraph formatting changed',
+      tableFormat: 'Table formatting changed',
+      sectionFormat: 'Page layout changed',
+    };
+    return `${what[kind] || 'A change that can only be kept'}${author !== undefined && author !== '' ? ` by ${author}` : ''}${date ? `, ${date}` : ''}${text !== '' ? `: ${text}` : ''}`;
+  },
+  revisionStep: (number, count, description, wrapped) => `${wrapped === 'first' ? 'Back at the first change. ' : wrapped === 'last' ? 'At the last change. ' : ''}Change ${number} of ${count}. ${description}`,
+  noRevisions: 'The document has no tracked changes',
+  noRevisionHere: 'There is no tracked change here',
+  revisionsResolved: (verdict, resolved, left, skipped, sections) =>
+    `${verdict === 'accept' ? 'Accepted' : 'Rejected'} ${resolved} ${resolved === 1 ? 'change' : 'changes'}. ${left === '0' ? 'No changes left.' : `${left} ${left === '1' ? 'change' : 'changes'} left.`}` +
+    (skipped > 0 ? ` ${skipped} ${skipped === 1 ? 'change' : 'changes'} could not be ${verdict === 'accept' ? 'accepted' : 'rejected'} and ${skipped === 1 ? 'was' : 'were'} left as ${skipped === 1 ? 'it is' : 'they are'}.` : '') +
+    (sections > 0 ? ` ${sections} section ${sections === 1 ? 'break was' : 'breaks were'} removed with ${sections === 1 ? 'its paragraph mark' : 'their paragraph marks'}.` : ''),
+  cannotResolveRevision: 'This change cannot be accepted or rejected yet; nothing was changed',
+  revisionGone: 'The change is no longer in the document',
+  revisionsProtected: 'The protection of this document does not allow changes to be accepted or rejected',
+  trackingTurned: (on) => (on ? 'Changes are tracked from now on' : 'Changes are no longer tracked'),
+  cannotStopTracking: 'Tracking cannot be turned off in this document',
   pastedAsText: 'Changes are tracked in this document: the copy was pasted as text, without its formatting and pictures',
   cannotCutObjects: 'The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place',
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
@@ -487,6 +534,31 @@ export const STRINGS_TR: UiStrings = {
       : kind === 'forms'
         ? 'Bu belge korumalı: yalnız form alanları doldurulabilir. Salt okunur gösteriliyor'
         : 'Bu belge değişikliğe karşı korumalı. Salt okunur gösteriliyor',
+  revisionDescription: (kind, author, date, text) => {
+    const what: { [kind: string]: string } = {
+      insert: 'Eklendi',
+      delete: 'Silindi',
+      moveFrom: 'Buradan taşındı',
+      moveTo: 'Buraya taşındı',
+      format: 'Biçim değişti',
+      paragraphFormat: 'Paragraf biçimi değişti',
+      tableFormat: 'Tablo biçimi değişti',
+      sectionFormat: 'Sayfa düzeni değişti',
+    };
+    return `${what[kind] || 'Yalnız korunabilen bir değişiklik'}${author !== undefined && author !== '' ? ` (${author})` : ''}${date ? `, ${date}` : ''}${text !== '' ? `: ${text}` : ''}`;
+  },
+  revisionStep: (number, count, description, wrapped) => `${wrapped === 'first' ? 'İlk değişikliğe dönüldü. ' : wrapped === 'last' ? 'Son değişikliğe gelindi. ' : ''}Değişiklik ${number} / ${count}. ${description}`,
+  noRevisions: 'Belgede izlenen değişiklik yok',
+  noRevisionHere: 'Burada izlenen bir değişiklik yok',
+  revisionsResolved: (verdict, resolved, left, skipped, sections) =>
+    `${resolved} değişiklik ${verdict === 'accept' ? 'kabul edildi' : 'reddedildi'}. ${left === '0' ? 'Değişiklik kalmadı.' : `${left} değişiklik kaldı.`}` +
+    (skipped > 0 ? ` ${skipped} değişiklik ${verdict === 'accept' ? 'kabul edilemedi' : 'reddedilemedi'}, olduğu gibi bırakıldı.` : '') +
+    (sections > 0 ? ` ${sections} bölüm sonu, paragraf işaretiyle birlikte kaldırıldı.` : ''),
+  cannotResolveRevision: 'Bu değişiklik henüz kabul ya da reddedilemiyor; hiçbir şey değiştirilmedi',
+  revisionGone: 'Değişiklik artık belgede yok',
+  revisionsProtected: 'Bu belgenin koruması değişikliklerin kabul ya da reddedilmesine izin vermiyor',
+  trackingTurned: (on) => (on ? 'Değişiklikler artık izleniyor' : 'Değişiklikler artık izlenmiyor'),
+  cannotStopTracking: 'Bu belgede izleme kapatılamaz',
   pastedAsText: 'Bu belgede değişiklikler izleniyor: kopya biçimi ve görselleri olmadan, metin olarak yapıştırıldı',
   cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (dipnot, denklem, metin kutusu, içerik denetimi, izlenen değişiklik); yerinde bırakıldı',
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',

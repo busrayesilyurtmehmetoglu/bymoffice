@@ -78,7 +78,13 @@ export type DocIconName =
   | 'insertTable'
   | 'insertPicture'
   | 'insertLink'
-  | 'pageBreak';
+  | 'pageBreak'
+  | 'trackChanges'
+  | 'previousChange'
+  | 'nextChange'
+  | 'acceptChange'
+  | 'rejectChange'
+  | 'changesMenu';
 
 const DOC_ICONS: { [name in DocIconName]: Shape[] } = {
   highlight: [path('m14.5 4 4.5 4.5-7.5 7.5H7v-4.5z'), path('M12.5 6 17 10.5'), bar],
@@ -91,6 +97,15 @@ const DOC_ICONS: { [name in DocIconName]: Shape[] } = {
   insertPicture: [path('M4 5h16v14H4z'), path('m4 16 4.5-4.5 4 4 2.5-2.5 5 5'), path('M15.5 9.5h.01', { 'stroke-width': '2.75' })],
   insertLink: [path('M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1'), path('M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1')],
   pageBreak: [path('M6 3v5h12V3 M6 21v-5h12v5'), path('M3 12h2 M8 12h2 M14 12h2 M19 12h2')],
+  // A page with a pencil: what is written is marked.
+  trackChanges: [path('M13 4H6v16h12v-9'), path('m19.5 3.5 1.5 1.5-7 7-2.5 1 1-2.5z'), path('M9 16h6')],
+  // A page with an arrow up, and down: the change before, the change after.
+  previousChange: [path('M6 20V4h8l4 4v12z'), path('M12 17v-7 M9 13l3-3 3 3')],
+  nextChange: [path('M6 20V4h8l4 4v12z'), path('M12 10v7 M9 14l3 3 3-3')],
+  acceptChange: [path('M6 20V4h8l4 4v12z'), path('m9 13.5 2.2 2.2 4-4.4')],
+  rejectChange: [path('M6 20V4h8l4 4v12z'), path('m9.5 11.5 5 5 M14.5 11.5l-5 5')],
+  // Two pages and a tick: all of the changes.
+  changesMenu: [path('M8 20V7h7l3 3v10z'), path('M5 17V4h8'), path('m10.5 14.5 1.8 1.8 3-3.4')],
 };
 
 export function createDocIcon(name: DocIconName): SVGSVGElement {

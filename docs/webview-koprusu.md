@@ -81,6 +81,8 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 | `setSheetState` | `index`, `state` (`"visible"`, `"hidden"`, `"veryHidden"`); isteğe bağlı `id` | Sayfayı gizler ya da gösterir (görünür son sayfa gizlenemez) |
 | `copySheet` | `index`; isteğe bağlı `id`, `at` (kopyanın yeri; verilmezse hemen arkası), `name` (verilmezse `Ad (2)`) | Sayfanın kopyasını ekler ve gösterir |
 | `setTabColor` | `index`; isteğe bağlı `id`, `color` (`"#RRGGBB"`; verilmezse ya da `null` ise renk kaldırılır) | Sekme rengini değiştirir |
+| `acceptAllRevisions`, `rejectAllRevisions` | isteğe bağlı `id` | Belgedeki izlenen değişikliklerin tümünü kabul ya da reddeder (tek geri alma adımı). Çözülemeyen türler ve korumalı belge değişmez. Yanıt: `done` (`revisions`: kalan değişiklik sayısı, `trackChanges`: izleme açık mı) ya da `error` |
+| `setTrackChanges` | `on` (boolean); isteğe bağlı `id` | Belgenin "değişiklikleri izle" ayarını açar ya da kapatır (geri alınabilir; `save` ile dosyaya yazılır). Kapatılamayan belgede (uygulanan `trackedChanges` koruması, ya da `load.trackChanges: true`) hiçbir şey değişmez; `load.trackChanges: true` ile izlenen belgede `on: true` da dosyanın ayarına dokunmaz (izleme zaten açıktır). Yanıt: `done` (`revisions`, `trackChanges`: **şimdi geçerli olan** durum) ya da `error` |
 | `close` | isteğe bağlı `id` | Dosyayı kapatır, süren yüklemeyi iptal eder, boş duruma döner. Dosya yokken de hata vermez |
 | `hello` | — | Sayfa `ready`'yi yeniden gönderir |
 
@@ -147,13 +149,14 @@ Yazdırma (`print`):
 | İleti | Alanlar | Ne zaman |
 |---|---|---|
 | `ready` | `version` | Sayfa yüklendi, ileti alabilir. Bir kez gönderilir |
-| `loaded` | `id`?, `format`, `kind`? (`"document"`, yalnız belgede), `sheets: [{ name, state, kind }]` (belgede `[]`), `activeSheet`, `readOnly`? (`true`: dosya yazılamayan bir biçimde ya da korumalı, hep salt okunur), `convertedFrom`?, `warnings`? (`string[]`), yalnız belgede: `protection`? (`"readOnly"` / `"comments"` / `"forms"` / `"trackedChanges"`: belgenin uyguladığı koruma), `protectionExceptions`? (`true`: belgede korumadan muaf aralıklar var; uygulanmazlar), `trackChanges`? (`true`: düzenlemeler izleniyor) | `load` başarılı |
+| `loaded` | `id`?, `format`, `kind`? (`"document"`, yalnız belgede), `sheets: [{ name, state, kind }]` (belgede `[]`), `activeSheet`, `readOnly`? (`true`: dosya yazılamayan bir biçimde ya da korumalı, hep salt okunur), `convertedFrom`?, `warnings`? (`string[]`), yalnız belgede: `protection`? (`"readOnly"` / `"comments"` / `"forms"` / `"trackedChanges"`: belgenin uyguladığı koruma), `protectionExceptions`? (`true`: belgede korumadan muaf aralıklar var; uygulanmazlar), `trackChanges`? (`true`: düzenlemeler izleniyor), `revisions`? (belgedeki izlenen değişiklik sayısı; yalnız sıfırdan büyükse) | `load` başarılı |
 | `changed` | `sheets: number[]` (değişen sayfalar; belgede hep `[]`), `canUndo`, `canRedo` | Çalışma kitabı ya da belge her değiştiğinde (geri al/yinele dahil) |
 | `saved` | `id`?, `data` (base64), `name`?, `format`? ve `convertedFrom`? (yalnız dönüştürülerek açılmış dosyada, ikisi birlikte) | `save` başarılı |
 | `selection` | `sheet`, `range` (`"A1:B2"`, tek hücrede `"A1"`), `active` (`"A1"`) | Seçim değişince; **kare başına en çok bir kez**, yalnız o karedeki son seçim, bir öncekiyle aynıysa gönderilmez. Bekleyen seçim iletisi sayfa listesi değişirse (`sheets`) gösterilen sayfanın **yeni** diziniyle ve o sayfanın seçimiyle gönderilir |
+| `revisions` | `count` (belgedeki izlenen değişiklik sayısı; en çok 2.000 sayılır), `trackChanges` (izleme açık mı) | Yalnız belgede: sayı ya da izleme durumu son bildirilenden farklı olunca (yazma, kabul/ret, geri al, `setTrackChanges`, kullanıcının araç çubuğundan yaptığı). Aynı değişikliğin `changed` iletisinden **önce** gelir. Başlangıç değeri `loaded` iletisindedir |
 | `sheet` | `index`, `name` | Gösterilen sayfa (sekme) değişince |
 | `sheets` | `sheets: [{ name, state, kind, tabColor? }]` (`loaded.sheets` ile aynı biçim, listenin tamamı), `activeSheet` (gösterilen sayfanın dizini) | Sayfa listesi değişince: sayfa eklendi, silindi, taşındı, kopyalandı, gizlendi/gösterildi, adı ya da sekme rengi değişti — komutla, kullanıcının sekme şeridinden ya da bunların geri alınması/yinelenmesiyle. Aynı değişikliğin `sheet` ve `changed` iletilerinden **önce** gelir. Belgede gelmez |
-| `done` | `id`, `command`, `readOnly`? (`true`: `setReadOnly(false)` istendi ama dosya salt okunur kalıyor) | `id` taşıyan `setReadOnly`, `setLocale`, `undo`, `redo`, `print`, `insertSheet`, `renameSheet`, `deleteSheet`, `moveSheet`, `setSheetState`, `copySheet`, `setTabColor`, `close` başarılı (`print`'te: yazdırma penceresi kapandı; `insertSheet` ve `copySheet`'te ek olarak `index`, `name`) |
+| `done` | `id`, `command`, `readOnly`? (`true`: `setReadOnly(false)` istendi ama dosya salt okunur kalıyor), `revisions`? ve `trackChanges`? (yalnız `acceptAllRevisions`, `rejectAllRevisions`, `setTrackChanges` yanıtında: komuttan sonraki değişiklik sayısı ve izleme durumu) | `id` taşıyan `setReadOnly`, `setLocale`, `undo`, `redo`, `print`, `acceptAllRevisions`, `rejectAllRevisions`, `setTrackChanges`, `insertSheet`, `renameSheet`, `deleteSheet`, `moveSheet`, `setSheetState`, `copySheet`, `setTabColor`, `close` başarılı (`print`'te: yazdırma penceresi kapandı; `insertSheet` ve `copySheet`'te ek olarak `index`, `name`) |
 | `link` | `url` | Belgede bir bağlantı etkinleştirildi (Bölüm 7) |
 | `error` | `id`?, `code`, `message` | Aşağıdaki durumlarda |
 
@@ -177,8 +180,9 @@ Yazdırma (`print`):
 | Kod | Anlam |
 |---|---|
 | `bad-message` | İleti sözleşmeye uymuyor: bozuk JSON, bilinmeyen `type`, eksik ya da yanlış türde alan, geçersiz base64, izin verilmeyen `url` (iframe içinde her `url`), `data`/`url`/`blank`'ten birden fazlası ya da hiçbiri, `"docx"`/`"xlsx"` dışında bir `blank`, olmayan sayfa dizini. Ayrıca bir komut (`undo` vb.) beklenmedik biçimde başarısız olursa da bu kod döner |
-| `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale`, `print` ya da bir sayfa komutu (`insertSheet`, `renameSheet`, `deleteSheet`, `moveSheet`, `setSheetState`, `copySheet`, `setTabColor`) gönderildi ama açık dosya yok |
-| `read-only` | Sayfa komutu gönderildi ama görünüm salt okunur |
+| `not-loaded` | `save`, `undo`, `redo`, `setReadOnly`, `setLocale`, `print`, `acceptAllRevisions`, `rejectAllRevisions`, `setTrackChanges` ya da bir sayfa komutu (`insertSheet`, `renameSheet`, `deleteSheet`, `moveSheet`, `setSheetState`, `copySheet`, `setTabColor`) gönderildi ama açık dosya yok |
+| `read-only` | Sayfa komutu gönderildi ama görünüm salt okunur; ya da `acceptAllRevisions` / `rejectAllRevisions` / `setTrackChanges` gönderildi ama belge salt okunur (öyle açıldı, `setReadOnly(true)` denildi, ya da yazılamayan bir biçimde) |
+| `no-document` | `acceptAllRevisions`, `rejectAllRevisions` ya da `setTrackChanges` gönderildi ama açık dosya bir tablo |
 | `no-sheet` | Sayfa komutu gönderildi ama açık dosya bir belge, ya da verilen dizinde sayfa yok |
 | `sheet-refused` | Sayfa komutunu görünüm reddetti; `message` nedeni görünümün dilinde verir (kullanıcıya gösterilebilir) |
 | `print-unavailable` | `print` gönderildi ama yazdırılamıyor: pencerede `print()` yok (ya da sayfayı barındıran uygulamanın verdiği görünüm yazdıramıyor) |

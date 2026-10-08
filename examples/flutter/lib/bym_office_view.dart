@@ -83,6 +83,16 @@ class BymOfficeChange {
   final bool canRedo;
 }
 
+/// A `revisions` message, and what the commands of the tracked changes answer:
+/// how many tracked changes the document has and whether its changes are tracked.
+/// NOT COMPILED: written against the contract, never built or run with Flutter.
+class BymOfficeRevisions {
+  const BymOfficeRevisions({required this.count, required this.trackChanges});
+
+  final int count;
+  final bool trackChanges;
+}
+
 /// A `selection` message. [range] and [active] are cell names such as "A1:B2" and "A1".
 class BymOfficeSelection {
   const BymOfficeSelection({required this.sheet, required this.range, required this.active});
@@ -162,6 +172,7 @@ class BymOfficeController {
   final StreamController<BymOfficeSelection> _selections = StreamController<BymOfficeSelection>.broadcast();
   final StreamController<BymOfficeSheetChange> _sheets = StreamController<BymOfficeSheetChange>.broadcast();
   final StreamController<BymOfficeSheetList> _sheetLists = StreamController<BymOfficeSheetList>.broadcast();
+  final StreamController<BymOfficeRevisions> _revisions = StreamController<BymOfficeRevisions>.broadcast();
   final StreamController<BymOfficeException> _errors = StreamController<BymOfficeException>.broadcast();
   final StreamController<String> _links = StreamController<String>.broadcast();
   int _nextId = 0;
@@ -176,6 +187,10 @@ class BymOfficeController {
 
   /// The list of sheets changed; never sent for a document.
   Stream<BymOfficeSheetList> get onSheetsChanged => _sheetLists.stream;
+
+  /// The number of tracked changes of the document, or whether its changes are
+  /// tracked, changed; never sent for a workbook. (NOT COMPILED, see BymOfficeRevisions.)
+  Stream<BymOfficeRevisions> get onRevisionsChanged => _revisions.stream;
 
   /// A link in a document was activated; the page never opens it itself.
   Stream<String> get onLink => _links.stream;
@@ -319,6 +334,24 @@ class BymOfficeController {
   /// Sets the colour of a tab ("#RRGGBB"); null removes it.
   Future<void> setTabColor(int index, String? color) => _request(<String, dynamic>{'type': 'setTabColor', 'index': index, 'color': color});
 
+  // NOT COMPILED: the three commands below (tracked changes of a document) were
+  // written against the contract and have not been built or run with Flutter.
+  // They fail with the code "no-document" for a workbook and "read-only" for a
+  // document that cannot be edited. A document whose protection is enforced
+  // answers without having changed anything: the answer says what holds.
+
+  BymOfficeRevisions _revisionsOf(Map<String, dynamic> answer) =>
+      BymOfficeRevisions(count: (answer['revisions'] as num? ?? 0).toInt(), trackChanges: answer['trackChanges'] == true);
+
+  /// Accepts every tracked change of the document; completes with what is left.
+  Future<BymOfficeRevisions> acceptAllRevisions() async => _revisionsOf(await _request(<String, dynamic>{'type': 'acceptAllRevisions'}));
+
+  /// Rejects every tracked change of the document; completes with what is left.
+  Future<BymOfficeRevisions> rejectAllRevisions() async => _revisionsOf(await _request(<String, dynamic>{'type': 'rejectAllRevisions'}));
+
+  /// Turns the tracking of changes on or off; completes with what holds afterwards.
+  Future<BymOfficeRevisions> setTrackChanges(bool on) async => _revisionsOf(await _request(<String, dynamic>{'type': 'setTrackChanges', 'on': on}));
+
   /// Closes the file in the page, detaches from the WebView and fails whatever
   /// is still waiting. Requests made afterwards fail at once.
   void dispose() {
@@ -336,6 +369,7 @@ class BymOfficeController {
     _selections.close();
     _sheets.close();
     _sheetLists.close();
+    _revisions.close();
     _errors.close();
     _links.close();
   }
@@ -411,6 +445,8 @@ class BymOfficeController {
           range: message['range'] as String,
           active: message['active'] as String,
         ));
+      case 'revisions':
+        _revisions.add(BymOfficeRevisions(count: (message['count'] as num).toInt(), trackChanges: message['trackChanges'] == true));
       case 'sheet':
         _sheets.add(BymOfficeSheetChange(index: (message['index'] as num).toInt(), name: message['name'] as String? ?? ''));
       case 'sheets':

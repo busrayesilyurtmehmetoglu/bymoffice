@@ -28,7 +28,8 @@ export type BridgeErrorCode =
   | 'print-failed'
   | 'read-only'
   | 'no-sheet'
-  | 'sheet-refused';
+  | 'sheet-refused'
+  | 'no-document';
 
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
 export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
@@ -58,6 +59,15 @@ export interface BridgeDocumentView {
    * dialog was closed. An error with `code: 'unavailable'` says that the window cannot print.
    */
   print?(options?: { dpi?: number }): Promise<unknown>;
+  /** The tracked changes of the document: their number is what the application is told. */
+  revisions?(): unknown[];
+  /** Accept or reject every tracked change; a view that cannot (a protection) changes nothing. */
+  acceptAllRevisions?(): unknown;
+  rejectAllRevisions?(): unknown;
+  /** Turns the tracking of changes on or off; a view that cannot changes nothing. */
+  setTrackChanges?(on: boolean): unknown;
+  /** Whether the changes made in the view are tracked. */
+  readonly trackingChanges?: boolean;
 }
 
 export interface BridgeHost {
@@ -432,6 +442,19 @@ function commitPendingOf(view: WorkbookView): boolean {
   return true;
 }
 
+/** What a document view says of its tracked changes; undefined for a view that knows nothing of them. */
+function revisionState(pages: BridgeDocumentView): { count: number; tracking: boolean } | undefined {
+  if (typeof pages.revisions !== 'function') return undefined;
+  let count = 0;
+  try {
+    const list = pages.revisions();
+    count = Array.isArray(list) ? list.length : 0;
+  } catch {
+    count = 0;
+  }
+  return { count, tracking: pages.trackingChanges === true };
+}
+
 interface Shown {
   file: OfficeFile;
   view: WorkbookView | undefined;
@@ -441,6 +464,10 @@ interface Shown {
   locked: boolean;
   /** The format the file had before it was converted to be edited. */
   convertedFrom: string | undefined;
+  /** A document: it is shown read-only now (it was loaded so, or `setReadOnly` said so). */
+  readOnly?: boolean;
+  /** A document: what the application was last told about its tracked changes, as "count tracking". */
+  revisionsSent?: string;
 }
 
 /** The message handling of the bridge page, with everything it needs from the page handed in. */
@@ -834,6 +861,10 @@ export function createBridge(host: BridgeHost): Bridge {
         if (protection !== undefined) out.protection = protection;
         if (protection !== undefined && hasPermissionRanges(doc)) out.protectionExceptions = true;
         if (!locked && (trackChanges === true || tracksChanges(doc))) out.trackChanges = true;
+        // How many tracked changes it has, when it has any.
+        const state = shown && shown.pages ? revisionState(shown.pages) : undefined;
+        if (state && state.count > 0) out.revisions = state.count;
+        if (shown && state) shown.revisionsSent = `${state.count} ${state.tracking}`;
       }
       send(out);
     };
@@ -847,6 +878,15 @@ export function createBridge(host: BridgeHost): Bridge {
         onChange: () => {
           // Nothing is said for a view that is not there yet or that was closed.
           if (!pages || !shown || shown.pages !== pages) return;
+          // The tracked changes first, when their number or the tracking is not what was told last.
+          const state = revisionState(pages);
+          if (state) {
+            const key = `${state.count} ${state.tracking}`;
+            if (key !== shown.revisionsSent) {
+              shown.revisionsSent = key;
+              send({ type: 'revisions', count: state.count, trackChanges: state.tracking });
+            }
+          }
           send({ type: 'changed', sheets: [], canUndo: pages.canUndo === true, canRedo: pages.canRedo === true });
         },
         // The page must not be replaced by what a link points to: the application decides what to do with it.
@@ -866,7 +906,7 @@ export function createBridge(host: BridgeHost): Bridge {
         setState('error', 'corrupt');
         return fail('corrupt', errorText(error), id);
       }
-      shown = { file, view: undefined, pages, name, locked, convertedFrom };
+      shown = { file, view: undefined, pages, name, locked, convertedFrom, readOnly: locked || readOnly === true };
       setLocale(locale);
       setState('open');
       loaded(0, [], true);
@@ -938,6 +978,33 @@ export function createBridge(host: BridgeHost): Bridge {
     const list = sheetList(workbook);
     sheetsSent = JSON.stringify(list);
     loaded(view.activeSheet, list, false);
+  };
+
+  /**
+   * Accepts or rejects every tracked change of the document that is shown, or turns its
+   * tracking on or off. What results is told by `revisions` and `changed` when anything
+   * changed; the answer says what holds afterwards, also when the view changed nothing
+   * (a protection that is enforced, tracking that cannot be turned off).
+   */
+  const reviseDocument = (type: 'acceptAllRevisions' | 'rejectAllRevisions' | 'setTrackChanges', message: Message, id: string | undefined) => {
+    const on = type === 'setTrackChanges' ? field<boolean>(message, 'on', 'boolean', true) : undefined;
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const pages = shown.pages;
+    if (!pages) return fail('no-document', 'The open file is not a document', id);
+    if (shown.locked || shown.readOnly === true) return fail('read-only', 'The document is read-only', id);
+    if (type === 'setTrackChanges') {
+      if (pages.setTrackChanges) pages.setTrackChanges(on === true);
+    } else if (type === 'acceptAllRevisions') {
+      if (pages.acceptAllRevisions) pages.acceptAllRevisions();
+    } else if (pages.rejectAllRevisions) pages.rejectAllRevisions();
+    if (id === undefined) return;
+    const out: Message = { type: 'done', id, command: type };
+    const state = revisionState(pages);
+    if (state) {
+      out.revisions = state.count;
+      out.trackChanges = state.tracking;
+    }
+    send(out);
   };
 
   /**
@@ -1124,6 +1191,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'print') return print(fields, id);
       if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
+      if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
       }
@@ -1140,6 +1208,7 @@ export function createBridge(host: BridgeHost): Bridge {
         const value = shown.locked ? true : (readOnly as boolean);
         if (view) view.setReadOnly(value);
         else if (pages && pages.setReadOnly) pages.setReadOnly(value);
+        if (pages) shown.readOnly = value;
       } else if (type === 'setLocale') {
         if (view) view.setLocale(locale as string);
         else if (pages && pages.setLocale) pages.setLocale(locale as string);

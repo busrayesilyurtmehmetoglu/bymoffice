@@ -90,6 +90,20 @@ export interface EditorStrings {
   linkAddress: string;
   applyLink: string;
   pageBreak: string;
+  // Tracked changes of a document.
+  trackChanges: string;
+  /** Added to the label of the tracking button where tracking cannot be turned off. */
+  trackingEnforced: string;
+  previousChange: string;
+  nextChange: string;
+  acceptChange: string;
+  rejectChange: string;
+  /** Added to the labels of accept and reject where the protection of the document allows neither. */
+  changesProtected: string;
+  /** The button that opens the menu with "accept all" and "reject all". */
+  allChanges: string;
+  acceptAllChanges: string;
+  rejectAllChanges: string;
 }
 
 /**
@@ -193,6 +207,16 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   linkAddress: 'Address',
   applyLink: 'Apply',
   pageBreak: 'Page break',
+  trackChanges: 'Track changes',
+  trackingEnforced: 'cannot be turned off in this document',
+  previousChange: 'Previous change',
+  nextChange: 'Next change',
+  acceptChange: 'Accept change',
+  rejectChange: 'Reject change',
+  changesProtected: 'the protection of this document does not allow it',
+  allChanges: 'All changes',
+  acceptAllChanges: 'Accept all changes',
+  rejectAllChanges: 'Reject all changes',
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -280,6 +304,16 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   linkAddress: 'Adres',
   applyLink: 'Uygula',
   pageBreak: 'Sayfa sonu',
+  trackChanges: 'Değişiklikleri izle',
+  trackingEnforced: 'bu belgede kapatılamaz',
+  previousChange: 'Önceki değişiklik',
+  nextChange: 'Sonraki değişiklik',
+  acceptChange: 'Değişikliği kabul et',
+  rejectChange: 'Değişikliği reddet',
+  changesProtected: 'bu belgenin koruması izin vermiyor',
+  allChanges: 'Tüm değişiklikler',
+  acceptAllChanges: 'Tüm değişiklikleri kabul et',
+  rejectAllChanges: 'Tüm değişiklikleri reddet',
 };
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */
