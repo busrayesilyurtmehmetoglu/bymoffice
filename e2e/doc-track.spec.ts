@@ -96,6 +96,25 @@ const revisions = (page: Page): Promise<[string, string, string, string][]> =>
 const commandKey = (page: Page) => page.evaluate(() => (/Mac|iPhone|iPad|iPod/.test(navigator.platform) ? 'Meta' : 'Control'));
 const toolbarButton = (page: Page, command: string) => page.locator(`#host .bym-doc-toolbar [data-command="${command}"]`);
 
+/** Fires a cut at the field for typing, the way the browser does for the keys, and returns the text it put on the clipboard. */
+const fireCut = (page: Page): Promise<string> =>
+  page.evaluate(() => {
+    const target = document.querySelector('#host .bym-doc-input')!;
+    const data = new DataTransfer();
+    let event: Event | undefined;
+    try {
+      event = new ClipboardEvent('cut', { clipboardData: data, bubbles: true, cancelable: true });
+    } catch {
+      event = undefined;
+    }
+    if (!event || (event as ClipboardEvent).clipboardData !== data) {
+      event = new Event('cut', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'clipboardData', { value: data });
+    }
+    target.dispatchEvent(event);
+    return data.getData('text/plain');
+  });
+
 test.describe('tracked changes', () => {
   test('what is typed is a tracked insertion: in the model, on the page and in the saved file, with the author and the date', async ({ page }) => {
     await mountEdit(page, await sample(p('First paragraph.') + p('Second one.')));
@@ -367,6 +386,195 @@ test.describe('tracked changes', () => {
     await page.keyboard.type('X');
     await settled(page);
     expect(await revisions(page)).toEqual([['ins', 'Author', DATE, 'X']]);
+  });
+
+  test('a cut over an own insertion keeps the field, the link, the control and the tag in it; undo gives the file back', async ({ page }) => {
+    const wrapped =
+      `<w:fldSimple w:instr=" DOCPROPERTY Title ">${r('field')}</w:fldSimple>` +
+      `<w:hyperlink r:id="rIdL">${r('link')}</w:hyperlink>` +
+      `<w:sdt><w:sdtPr><w:alias w:val="Control"/><w:id w:val="4242"/></w:sdtPr><w:sdtContent>${r('control')}</w:sdtContent></w:sdt>` +
+      `<w:smartTag w:uri="urn:example" w:element="tag">${r('tagged')}</w:smartTag>`;
+    const bytes = await docx(p(`<w:ins w:id="7" w:author="Ada" w:date="2020-01-01T00:00:00Z">${wrapped}</w:ins>`) + p('end'), {
+      styles: STYLES,
+      settings: TRACK,
+      rels: [['rIdL', 'hyperlink', 'https://example.org/', true]],
+    });
+    await mountEdit(page, bytes, { author: 'Ada' });
+    const before = await savedXml(page);
+    await select(page, [0], 0, 'fieldlinkcontroltagged'.length);
+    const cut = await fireCut(page);
+    await settled(page);
+    expect(cut).toBe('fieldlinkcontroltagged');
+    expect(await paragraphs(page)).toEqual(['', 'end']);
+    expect(await notices(page)).toEqual([]);
+    const xml = await savedXml(page);
+    for (const kept of ['<w:fldSimple w:instr=" DOCPROPERTY Title ">', '<w:hyperlink r:id="rIdL">', '<w:alias w:val="Control"/>', '<w:id w:val="4242"/>', '<w:smartTag w:uri="urn:example" w:element="tag">']) expect(xml).toContain(kept);
+    for (const text of ['field', 'link', 'control', 'tagged']) expect(xml).toContain(`>${text}</w:delText>`);
+    // The file opens again with the same content.
+    await reopen(page, { author: 'Ada' });
+    expect(await paragraphs(page)).toEqual(['', 'end']);
+    expect(await savedXml(page)).toBe(xml);
+    // And the cut undone is the file that was opened.
+    await mountEdit(page, bytes, { author: 'Ada' });
+    await select(page, [0], 0, 'fieldlinkcontroltagged'.length);
+    await fireCut(page);
+    await page.evaluate(() => (window as any).__view.undo());
+    expect(await savedXml(page)).toBe(before);
+  });
+
+  test('a cut over an own paragraph mark between differently formatted paragraphs keeps both paragraphs, and pasting back keeps their formatting', async ({ page }) => {
+    const styles = STYLES + '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:rPr><w:b/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:rPr><w:i/></w:rPr></w:style>';
+    const own = (id: number, text: string) => `<w:ins w:id="${id}" w:author="Ada" w:date="2020-01-01T00:00:00Z">${r(text)}</w:ins>`;
+    const mark = '<w:rPr><w:ins w:id="20" w:author="Ada" w:date="2020-01-01T00:00:00Z"/></w:rPr>';
+    const bytes = await docx(p(own(7, 'Hello'), `<w:pStyle w:val="Heading1"/>${mark}`) + p(own(8, 'World'), '<w:pStyle w:val="Quote"/><w:jc w:val="center"/>') + p('end'), { styles, settings: TRACK });
+    await mountEdit(page, bytes, { author: 'Ada' });
+    await page.evaluate(() => {
+      const view = (window as any).__view;
+      view.setSelection({ anchor: { story: 'body', path: [0], offset: 3 }, focus: { story: 'body', path: [1], offset: 2 } });
+      view.focus();
+    });
+    await settled(page);
+    expect(await fireCut(page)).toBe('lo\nWo');
+    await settled(page);
+    const formats = () => page.evaluate(() => (window as any).__view.document.body.blocks.map((block: any) => [block.props.style, block.props.align]));
+    expect(await paragraphs(page)).toEqual(['Hel', 'rld', 'end']);
+    expect((await formats()).slice(0, 2)).toEqual([
+      ['Heading1', undefined],
+      ['Quote', 'center'],
+    ]);
+    await page.evaluate(() => (window as any).__view.insertText('lo\nWo'));
+    await settled(page);
+    const texts = await paragraphs(page);
+    const after = await formats();
+    expect(texts[0]).toBe('Hello');
+    expect(after[0]).toEqual(['Heading1', undefined]);
+    // The paragraph that was a quote is one still.
+    expect(after[texts.indexOf('rld')]).toEqual(['Quote', 'center']);
+    expect(await notices(page)).toEqual([]);
+  });
+});
+
+test.describe('the caret around deleted text', () => {
+  const del = (text: string) => `<w:del w:id="1" w:author="Ann" w:date="2020-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">${text}</w:delText></w:r></w:del>`;
+  /** Several lines of deleted text on any of the screens the tests run on. */
+  const GONE = 'deleted words that fill their line '.repeat(9);
+  const LIVE = 'live text that is shown ';
+
+  /** The caret as the page shows it, and where the model has it. */
+  const caret = async (page: Page) => {
+    await settled(page);
+    return page.evaluate(() => {
+      const view = (window as any).__view;
+      const element = document.querySelector('#host .bym-doc-caret') as HTMLElement | null;
+      const rect = element && element.isConnected ? element.getBoundingClientRect() : null;
+      const focus = view.getSelection().focus;
+      return { block: focus.path[0] as number, offset: focus.offset as number, top: rect ? rect.top : NaN, middle: rect ? rect.top + rect.height / 2 : NaN, x: rect ? rect.left + rect.width / 2 : NaN };
+    });
+  };
+
+  /** The lines of the first page that show nothing but deleted text, as rectangles of the window. */
+  const deletedLines = (page: Page) =>
+    page.evaluate(() => {
+      const view = (window as any).__view;
+      const rect = document.querySelector('#host .bym-doc-page[data-page="1"]')!.getBoundingClientRect();
+      const laid = view.pages[0];
+      const sx = rect.width / laid.width;
+      const sy = rect.height / laid.height;
+      return (laid.items as any[])
+        .filter((item) => item.type === 'mark' && item.source.path[0] === 1 && item.length === 0 && !item.last)
+        .map((mark) => ({ top: rect.top + mark.y * sy, bottom: rect.top + (mark.y + mark.height) * sy, left: rect.left + 60 * sx, offset: mark.source.offset as number }));
+    });
+
+  for (const where of ['middle', 'end', 'start'] as const) {
+    test(`Up and Down pass over lines of deleted text in the ${where} of a paragraph and never stay where they are`, async ({ page }) => {
+      const content = where === 'middle' ? r(LIVE) + del(GONE) + r('after the deletion') : where === 'end' ? r(LIVE) + del(GONE) : del(GONE) + r(LIVE);
+      await mountEdit(page, await sample(p('first para') + p(content) + p('last para')));
+      expect((await deletedLines(page)).length).toBeGreaterThanOrEqual(1);
+      await select(page, [2], 0);
+      const up = [await caret(page)];
+      for (let i = 0; i < 8 && up[up.length - 1].block !== 0; i++) {
+        await page.keyboard.press('ArrowUp');
+        const now = await caret(page);
+        // Every press moves the caret up on the page.
+        expect(now.top).toBeLessThan(up[up.length - 1].top - 1);
+        up.push(now);
+      }
+      expect(up[up.length - 1].block).toBe(0);
+      // Through the lines the paragraph has a place on (its first and its last, where the deletion is in the
+      // middle or at the end), and over all the others.
+      const through = up.map((at) => at.block).slice(1, -1);
+      expect(through.every((block) => block === 1)).toBe(true);
+      expect(through.length).toBeGreaterThanOrEqual(1);
+      if (where !== 'start') expect(through.length).toBe(2);
+      const down = [await caret(page)];
+      for (let i = 0; i < 8 && down[down.length - 1].block !== 2; i++) {
+        await page.keyboard.press('ArrowDown');
+        const now = await caret(page);
+        expect(now.top).toBeGreaterThan(down[down.length - 1].top + 1);
+        down.push(now);
+      }
+      expect(down.map((at) => at.block)).toEqual(up.map((at) => at.block).reverse());
+      // With Shift the selection grows the same way.
+      await page.keyboard.down('Shift');
+      for (let i = 0; i < up.length - 1; i++) await page.keyboard.press('ArrowUp');
+      await page.keyboard.up('Shift');
+      const range = await page.evaluate(() => (window as any).__view.getSelection());
+      expect([range.anchor.path[0], range.focus.path[0]]).toEqual([2, 0]);
+    });
+  }
+
+  test('a press on a line of deleted text puts the caret on that line; the keys leave it and typing goes after the deletion', async ({ page }) => {
+    await mountEdit(page, await sample(p('first para') + p(r(LIVE) + del(GONE) + r('after the deletion')) + p('last para')));
+    const lines = await deletedLines(page);
+    expect(lines.length).toBeGreaterThanOrEqual(1);
+    for (const line of lines) {
+      await page.mouse.click(line.left, (line.top + line.bottom) / 2);
+      const at = await caret(page);
+      expect([at.block, at.offset]).toEqual([1, LIVE.length]);
+      // Drawn on the line that was pressed, not on a line beside it.
+      expect(at.middle).toBeGreaterThan(line.top);
+      expect(at.middle).toBeLessThan(line.bottom);
+    }
+    const last = lines[lines.length - 1];
+    await page.keyboard.press('ArrowUp');
+    expect((await caret(page)).top).toBeLessThan(lines[0].top);
+    // (Further along the line each time: presses at one spot would be a double and a triple click.)
+    await page.mouse.click(last.left + 60, (last.top + last.bottom) / 2);
+    await page.keyboard.press('ArrowDown');
+    expect((await caret(page)).top).toBeGreaterThan(last.bottom - 1);
+    await page.mouse.click(last.left + 120, (last.top + last.bottom) / 2);
+    expect((await caret(page)).middle).toBeGreaterThan(last.top);
+    await page.keyboard.type('X');
+    await settled(page);
+    expect((await paragraphs(page))[1]).toBe(LIVE + 'Xafter the deletion');
+  });
+
+  test('the caret before deleted text that ends the line stands where typed text appears', async ({ page }) => {
+    await mountEdit(page, await sample(p(r('keep') + del(' gone')) + p('end')));
+    await select(page, [0], 4);
+    const before = await caret(page);
+    // To the right of the deleted text.
+    const struck = await page.evaluate(() => {
+      const view = (window as any).__view;
+      const rect = document.querySelector('#host .bym-doc-page[data-page="1"]')!.getBoundingClientRect();
+      const sx = rect.width / view.pages[0].width;
+      const item = (view.pages[0].items as any[]).filter((entry) => entry.type === 'text' && entry.deleted)[0];
+      return { left: rect.left + item.x * sx, right: rect.left + (item.x + item.width) * sx };
+    });
+    expect(struck.right).toBeGreaterThan(struck.left + 5);
+    expect(Math.abs(before.x - struck.right)).toBeLessThan(2);
+    await page.keyboard.type('X');
+    await settled(page);
+    expect((await paragraphs(page))[0]).toBe('keepX');
+    // The letter is where the caret stood.
+    const typed = await page.evaluate(() => {
+      const view = (window as any).__view;
+      const rect = document.querySelector('#host .bym-doc-page[data-page="1"]')!.getBoundingClientRect();
+      const sx = rect.width / view.pages[0].width;
+      const item = (view.pages[0].items as any[]).filter((entry) => entry.type === 'text' && entry.text === 'X')[0];
+      return rect.left + item.x * sx;
+    });
+    expect(Math.abs(typed - before.x)).toBeLessThan(2);
   });
 });
 

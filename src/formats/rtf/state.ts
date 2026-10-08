@@ -68,6 +68,12 @@ export interface Chp {
   border: Border | undefined;
   deleted: boolean;
   inserted: boolean;
+  /** Who inserted ("\revauth") and who deleted ("\revauthdel") the text: an index into the revision table; -1 when not said. */
+  revAuth: number;
+  revAuthDel: number;
+  /** When ("\revdttm", "\revdttmdel"), as a DTTM; 0 when not said. */
+  revDttm: number;
+  revDttmDel: number;
   /** Run properties made from this state, by the paragraph style and direction they were made for. */
   cache: Map<string, RunProps> | undefined;
 }
@@ -114,6 +120,10 @@ export function defaultChp(): Chp {
     border: undefined,
     deleted: false,
     inserted: false,
+    revAuth: -1,
+    revAuthDel: -1,
+    revDttm: 0,
+    revDttmDel: 0,
     cache: undefined,
   };
 }

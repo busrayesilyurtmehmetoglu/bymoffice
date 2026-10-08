@@ -45,6 +45,11 @@ export const D_OBJECT = 31;
 /** A drawing object of Word 95 ("\do"). */
 export const D_DO = 32;
 
+/** The table of the authors of tracked changes ("\revtbl"): a group for each name. */
+export const D_REVTBL = 33;
+/** One name of that table. */
+export const D_REVAUTHOR = 34;
+
 /** Destinations that only gather text (a name, a value). */
 export const isCollector = (dest: number): boolean =>
   dest === D_FALT ||
@@ -56,6 +61,7 @@ export const isCollector = (dest: number): boolean =>
   dest === D_BKMKEND ||
   dest === D_ATNID ||
   dest === D_ATNAUTHOR ||
+  dest === D_REVAUTHOR ||
   dest === D_ATRFSTART ||
   dest === D_ATRFEND ||
   dest === D_ATNREF;
@@ -84,7 +90,6 @@ export const SKIPPED = [
   'template',
   'generator',
   'filetbl',
-  'revtbl',
   'rsidtbl',
   'protusertbl',
   'passwordhash',

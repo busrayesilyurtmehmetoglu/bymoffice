@@ -87,3 +87,77 @@ test('a decode that ends before destroy gives its address back then, and destroy
     assert.deepEqual(state.revoked, state.made);
   });
 });
+
+// ------------------------------------------------------- the bitmap decoder
+
+interface FakeBitmap {
+  width: number;
+  height: number;
+  closed: number;
+  close(): void;
+}
+
+/** A createImageBitmap that answers when the test says so, with a bitmap of the given size. */
+async function withBitmaps(width: number, height: number, run: (state: { bitmaps: FakeBitmap[]; release: (() => void)[] }) => Promise<void>): Promise<void> {
+  const scope = globalThis as unknown as Record<string, unknown>;
+  const saved = scope.createImageBitmap;
+  const state = { bitmaps: [] as FakeBitmap[], release: [] as (() => void)[] };
+  scope.createImageBitmap = () =>
+    new Promise<FakeBitmap>((resolve) => {
+      state.release.push(() => {
+        const bitmap: FakeBitmap = {
+          width,
+          height,
+          closed: 0,
+          close() {
+            this.closed++;
+          },
+        };
+        state.bitmaps.push(bitmap);
+        resolve(bitmap);
+      });
+    });
+  try {
+    await run(state);
+  } finally {
+    scope.createImageBitmap = saved;
+  }
+}
+
+// The second size is a decoder that ignores the size it was asked for: the store would draw such a bitmap down.
+for (const [width, height] of [
+  [4, 4],
+  [64, 64],
+]) {
+  test(`destroy during a bitmap decode: the bitmap of ${width}x${height} that arrives afterwards is closed, once`, async () => {
+    await withBitmaps(width, height, async (state) => {
+      const loaded: string[] = [];
+      const store = new ImageStore({ readPart: async () => png(4, 4, [200, 0, 0]) }, 64 * 1024 * 1024, (part) => loaded.push(part));
+      assert.equal(store.get('/word/media/a.png', 4, 4), undefined);
+      await until(() => state.release.length === 1);
+      store.destroy();
+      state.release[0]();
+      await until(() => state.bitmaps.length === 1 && state.bitmaps[0].closed > 0);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(state.bitmaps[0].closed, 1);
+      assert.deepEqual(loaded, []);
+      assert.equal(store.bytes, 0);
+    });
+  });
+}
+
+test('a bitmap decoded before destroy is closed by destroy, once', async () => {
+  await withBitmaps(4, 4, async (state) => {
+    const loaded: string[] = [];
+    const store = new ImageStore({ readPart: async () => png(4, 4, [200, 0, 0]) }, 64 * 1024 * 1024, (part) => loaded.push(part));
+    store.get('/word/media/a.png', 4, 4);
+    await until(() => state.release.length === 1);
+    state.release[0]();
+    await until(() => loaded.length === 1);
+    assert.equal(state.bitmaps[0].closed, 0);
+    store.destroy();
+    assert.equal(state.bitmaps[0].closed, 1);
+    store.destroy();
+    assert.equal(state.bitmaps[0].closed, 1);
+  });
+});

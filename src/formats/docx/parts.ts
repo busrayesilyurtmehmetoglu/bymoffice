@@ -13,7 +13,7 @@ import {
 } from '../../model/doc/types';
 import { localName, type XmlDocument, type XmlElement } from '../../xml';
 import { parseThemeColors } from '../xlsx/styles';
-import { anyAttr, attr, boolAttr, kindOf, onOff, relAttr, utwipsAttr, type PartContext } from './common';
+import { anyAttr, attr, kindOf, onOff, parseOnOff, relAttr, utwipsAttr, type PartContext } from './common';
 
 /** More fonts than this in a font table is not a genuine file. */
 export const MAX_FONTS = 20000;
@@ -91,6 +91,14 @@ export function schemeSlot(settings: DocSettings, name: string): string | undefi
 }
 
 /** Reads the root element of the settings part. */
+const PROTECTION_KINDS: { [lower: string]: string } = { none: 'none', readonly: 'readOnly', comments: 'comments', trackedchanges: 'trackedChanges', forms: 'forms' };
+
+/** w:edit of a protection as the schema spells it, whatever case the file wrote it in; a kind that is not known stays as written. */
+function protectionKind(edit: string): string {
+  const known = PROTECTION_KINDS[edit.trim().toLowerCase()];
+  return known !== undefined ? known : edit;
+}
+
 export function parseSettings(ctx: PartContext, root: XmlElement | undefined): DocSettings {
   const settings = defaultSettings();
   if (!root) return settings;
@@ -112,10 +120,15 @@ export function parseSettings(ctx: PartContext, root: XmlElement | undefined): D
         break;
       }
       case 'documentProtection': {
-        // The first one counts; the part itself is never rewritten, so nothing of a second one is lost.
-        if (settings.protection) break;
+        // The first one that is enforced counts, or the first one when none is (an empty element in front must not
+        // take the lock off); the part itself is never rewritten, so nothing of the others is lost.
+        if (settings.protection && settings.protection.enforced) break;
         const edit = attr(ctx, node, 'edit');
-        settings.protection = { edit: edit === undefined ? '' : edit, enforced: boolAttr(ctx, node, 'enforcement') === true, xml: node };
+        const enforcement = attr(ctx, node, 'enforcement');
+        // Read as loosely as files write them: "TRUE", "On", " 1 ", "TrackedChanges".
+        const enforced = enforcement !== undefined && parseOnOff(enforcement.trim().toLowerCase()) === true;
+        if (settings.protection && !enforced) break;
+        settings.protection = { edit: edit === undefined ? '' : protectionKind(edit), enforced, xml: node };
         break;
       }
       case 'writeProtection':

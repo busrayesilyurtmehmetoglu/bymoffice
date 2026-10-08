@@ -501,6 +501,20 @@ function revisionStyle(style: RunStyle, gone: boolean, author: string | undefine
  * drawings and note marks in it are not shown.
  */
 function walkDeleted(walk: Walk, run: Run, style: RunStyle): void {
+  // The marks of a field are not shown, but a deleted mark still ends the field it belongs to: a field whose
+  // result and end were deleted (its beginning was not) would otherwise stay open to the end of the paragraph and
+  // hide the text after it. A field that was deleted whole begins and ends in deletions, and closes only itself.
+  // (An end that is not deleted is never taken for the end of a deleted beginning: see walkItems.)
+  for (let i = 0; i < run.content.length; i++) {
+    const item = run.content[i];
+    if (item.type !== 'fieldChar') continue;
+    if (item.charType === 'begin') walk.gone++;
+    else if (item.charType === 'end') {
+      if (walk.gone > 0) walk.gone--;
+      else if (walk.skip) walk.skip--;
+      else walk.fields.pop();
+    }
+  }
   if (run.fieldCode === true || walk.skip || walk.simple) return;
   const builder = walk.builder;
   for (let i = 0; i < run.content.length; i++) {
@@ -522,6 +536,8 @@ interface Walk {
   fields: (string | undefined)[];
   /** Depth of fields inside a live field whose cached result is being passed over; 0 when not. */
   skip: number;
+  /** Fields that began in deleted text and have not ended yet. */
+  gone: number;
   /** The simple field wrapper the last inline was in, whether its content is being passed over, and its link. */
   simpleSeen: Wrapper | undefined;
   simple: Wrapper | undefined;
@@ -908,7 +924,7 @@ export function prepareParagraph(
   }
 
   const builder = new Builder(ctx);
-  const walk: Walk = { builder, inline: 0, offset: 0, fields: [], skip: 0, simpleSeen: undefined, simple: undefined, simpleLink: undefined, drawings: 0, floats: [] };
+  const walk: Walk = { builder, inline: 0, offset: 0, fields: [], skip: 0, gone: 0, simpleSeen: undefined, simple: undefined, simpleLink: undefined, drawings: 0, floats: [] };
   walkInlines({ ctx, para, story, path, where, depth, fields, markStyle: mark }, walk, para.children);
   prep.atoms = builder.atoms;
   prep.live = builder.live;

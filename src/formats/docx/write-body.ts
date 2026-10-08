@@ -23,6 +23,7 @@
 // document text.
 
 import type {
+  RevisionInfo,
   Block,
   DrawingAnchor,
   DrawingItem,
@@ -96,6 +97,11 @@ export interface BodyContext extends PropsContext {
    */
   controls: Set<Wrapper>;
   splitControls: { count: number };
+  /**
+   * The id and the author to write for a tracked change the model holds without one of them (a model read from a
+   * doc or RTF file, where one change may be many elements). Called once for every element that is written.
+   */
+  revision?(info: RevisionInfo): { id: number; author: string };
 }
 
 // ------------------------------------------------------------------- escaping
@@ -399,8 +405,14 @@ function wrapperTag(ctx: BodyContext, wrapper: Wrapper, out: string[]): string |
     case 'moveFrom':
     case 'moveTo':
       name = w + wrapper.kind;
-      if (wrapper.id !== undefined) attrs.push([a + 'id', String(wrapper.id)]);
-      if (wrapper.author !== undefined) attrs.push([a + 'author', wrapper.author]);
+      if (ctx.revision && !ctx.plain && (wrapper.id === undefined || wrapper.author === undefined)) {
+        // The schema asks for both: an element without them is one Word refuses.
+        const filled = ctx.revision(wrapper);
+        attrs.push([a + 'id', String(filled.id)], [a + 'author', filled.author]);
+      } else {
+        if (wrapper.id !== undefined) attrs.push([a + 'id', String(wrapper.id)]);
+        if (wrapper.author !== undefined) attrs.push([a + 'author', wrapper.author]);
+      }
       if (wrapper.date !== undefined) attrs.push([a + 'date', wrapper.date]);
       break;
     case 'simpleField':

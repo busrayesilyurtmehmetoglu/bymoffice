@@ -390,7 +390,8 @@ test('a text box with a picture keeps both; a picture that is not available leav
 
 test('tracked changes, fields, bookmarks and tables of a model without a package', async () => {
   const inserted: Wrapper = { kind: 'ins', id: 1, author: 'A', date: '2024-01-01T00:00:00Z' };
-  const deleted: Wrapper = { kind: 'del', author: 'B' };
+  // (With an id: a revision without one is given one, see the tests of the third review.)
+  const deleted: Wrapper = { kind: 'del', id: 2, author: 'B' };
   const source = model([
     {
       type: 'paragraph',

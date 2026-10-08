@@ -444,6 +444,54 @@ test.describe('document view', () => {
     await expect.poll(async () => (await state(page)).page, { timeout: 60_000 }).toBe(200);
   });
 
+  test('a layout for fonts that arrive keeps the place in the page the reader is at', async ({ page }) => {
+    await mountDoc(page, await manyPagesDocx(60), { zoom: 1 });
+    await laidOut(page);
+    const scrollTop = () => page.evaluate(() => document.querySelector('#host .bym-doc-scroller')!.scrollTop);
+    const scrollBy = (dy: number) =>
+      page.evaluate((delta) => {
+        document.querySelector('#host .bym-doc-scroller')!.scrollTop += delta;
+      }, dy);
+    // In the middle of the first page, and in the middle of a page further on.
+    for (const first of [1, 31]) {
+      await page.evaluate((n) => (window as any).__docView.goToPage(n), first);
+      await settled(page);
+      await scrollBy(170);
+      await settled(page);
+      const before = await scrollTop();
+      expect(before).toBeGreaterThan(100);
+      await page.evaluate(() => (window as any).__docView.relayout());
+      await laidOut(page);
+      await settled(page);
+      expect(Math.abs((await scrollTop()) - before)).toBeLessThanOrEqual(1);
+      // And when the browser says that fonts were loaded.
+      await page.evaluate(() => {
+        const view = (window as any).__docView;
+        (window as any).__relaid = false;
+        const relayout = view.relayout.bind(view);
+        view.relayout = () => {
+          (window as any).__relaid = true;
+          view.relayout = relayout;
+          relayout();
+        };
+        document.fonts.dispatchEvent(new Event('loadingdone'));
+      });
+      await page.waitForFunction(() => (window as any).__relaid === true);
+      await laidOut(page);
+      await settled(page);
+      expect(Math.abs((await scrollTop()) - before)).toBeLessThanOrEqual(1);
+      expect((await state(page)).pageCount).toBe(60);
+    }
+    // goToPage() still shows a page from its top.
+    await page.evaluate(() => (window as any).__docView.goToPage(12));
+    await settled(page);
+    const top = await scrollTop();
+    await page.evaluate(() => (window as any).__docView.relayout());
+    await laidOut(page);
+    await settled(page);
+    expect(Math.abs((await scrollTop()) - top)).toBeLessThanOrEqual(1);
+  });
+
   test('performance: 5,000 paragraphs show their first page quickly', async ({ page }) => {
     test.setTimeout(180_000);
     const bytes = await longDocx(5000);

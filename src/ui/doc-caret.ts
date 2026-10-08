@@ -16,15 +16,23 @@ export interface Place {
 
 /**
  * Which of two lines a place on the border between them belongs to: the
- * start of the second one (the default), or the end of the first.
+ * start of the second one (the default), or the end of the first. A number
+ * names a line between the two that has no place of its own (it shows
+ * nothing but deleted text): the one with that index among such lines of the
+ * paragraph on its page. A number no line answers to means the start.
  */
-export type Affinity = 'start' | 'end';
+export type Affinity = 'start' | 'end' | number;
 
 /** One line of a paragraph on a page, with the text items that lie on it, in the order of their offsets. */
 export interface PageLine {
   mark: LineMark;
   texts: TextItem[];
+  /** The deleted text the line shows (TextItem.deleted), from left to right. It has no place in the text. */
+  struck?: TextItem[];
 }
+
+/** A line that covers no offset and does not end its paragraph: the place at its offset belongs to the lines around it. */
+const isGhost = (line: PageLine): boolean => line.mark.length === 0 && !line.mark.last;
 
 export interface LineAt {
   /** Index of the page. */
@@ -71,11 +79,27 @@ export class DocLines {
     if (index) return index;
     index = { lines: [], byParagraph: new Map(), minBlock: -1, maxBlock: -1 };
     const items = page.items;
+    /** The deleted text since the last mark: a line comes with its text before its mark. */
+    let struck: TextItem[] = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
+      if (item.type === 'text') {
+        if (item.deleted && !item.repeat && item.rotation === undefined && item.text.length > 0) struck.push(item);
+        continue;
+      }
+      if (item.type !== 'mark') continue;
+      const pending = struck;
+      struck = [];
       // Copies of header rows and lines turned in a cell are not places of the text.
-      if (item.type !== 'mark' || item.repeat || item.rotation !== undefined) continue;
+      if (item.repeat || item.rotation !== undefined) continue;
       const line: PageLine = { mark: item, texts: [] };
+      for (let k = 0; k < pending.length; k++) {
+        // On the baseline of this line, or it is not of this line after all.
+        const text = pending[k];
+        if (text.y < item.y - 0.5 || text.y > item.y + item.height + 0.5) continue;
+        (line.struck || (line.struck = [])).push(text);
+      }
+      if (line.struck) line.struck.sort((a, b) => a.x - b.x);
       index.lines.push(line);
       const key = paragraphKey(item.source.story, item.source.path);
       const list = index.byParagraph.get(key);
@@ -178,6 +202,11 @@ export class DocLines {
       }
       if (page < 0) return undefined;
     }
+    if (typeof affinity === 'number') {
+      // The line a press named, while the page still has it.
+      const named = this.ghost(this.index(pages[page]).byParagraph.get(key) as PageLine[], place.offset, affinity);
+      if (named) return { page, line: named };
+    }
     // From the page found to the one that holds the offset: a paragraph may go on over pages.
     for (let guard = 0; guard < count; guard++) {
       const lines = this.index(pages[page]).byParagraph.get(key) as PageLine[];
@@ -203,6 +232,30 @@ export class DocLines {
       return { page, line: last };
     }
     return undefined;
+  }
+
+  /** The line with index `n` among the lines of a paragraph on a page that have no place of their own, if it is at `offset`. */
+  private ghost(lines: PageLine[], offset: number, n: number): PageLine | undefined {
+    let seen = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (!isGhost(lines[i])) continue;
+      if (seen++ === n) return lines[i].mark.source.offset === offset ? lines[i] : undefined;
+    }
+    return undefined;
+  }
+
+  /** The affinity that names a line: its number when it has no place of its own. */
+  private naming(page: number, line: PageLine, affinity: Affinity): Affinity {
+    if (!isGhost(line)) return affinity;
+    const found = this.pages()[page];
+    const lines = found ? this.index(found).byParagraph.get(paragraphKey(line.mark.source.story, line.mark.source.path)) : undefined;
+    if (!lines) return affinity;
+    let n = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i] === line) return n;
+      if (isGhost(lines[i])) n++;
+    }
+    return affinity;
   }
 
   /** The box of a caret at a place. */
@@ -246,7 +299,14 @@ export class DocLines {
       // Something without a place in the text (a note mark) lies between: the caret is after it.
       x = right.x;
       item = right;
-    } else x = leftEdge !== undefined ? leftEdge : right ? right.x : mark.x;
+    } else {
+      x = leftEdge !== undefined ? leftEdge : right ? right.x : mark.x;
+      // Deleted text that follows on the line, with no text after it there: what is typed at the place goes
+      // after the deletion, so that is where the caret stands.
+      if (leftEdge !== undefined && !right && at.line.struck) {
+        for (const gone of at.line.struck) if (gone.x >= leftEdge - 0.5 && gone.x + gone.width > x) x = gone.x + gone.width;
+      }
+    }
     if (!item && boxRight !== -Infinity) x = place.before === true ? boxLeft : boxRight;
     if (item) {
       const box = this.measurer.metrics(item.font);
@@ -338,7 +398,34 @@ export class DocLines {
     const line = this.lineAt(page, x, y, accept);
     if (!line) return undefined;
     const found = this.placeAt(line, x);
-    return { place: found.place, affinity: found.affinity, line, box: found.box };
+    // A line of nothing but deleted text: the place is the one of the lines around it, shown on this line.
+    return { place: found.place, affinity: found.box ? found.affinity : this.naming(page, line, found.affinity), line, box: found.box };
+  }
+
+  /**
+   * Where an arrow key goes from a line: the place nearest to x in the next
+   * line above (direction -1) or below (1) that has a place of its own. A
+   * line that shows nothing but deleted text has none (its place is drawn on
+   * another line, which may be the one the key came from), so it is passed
+   * over.
+   */
+  verticalPlace(from: LineAt, direction: 1 | -1, x: number, accept?: (mark: LineMark) => boolean): (LineAt & { place: Place; affinity: Affinity }) | undefined {
+    let here = from;
+    for (let steps = 0; steps < MAX_SCAN; steps++) {
+      const next = this.vertical(here, direction, x, accept);
+      if (!next) return undefined;
+      const owned = this.ownPlace(next, x);
+      if (owned) return { page: next.page, line: next.line, place: owned.place, affinity: owned.affinity };
+      here = next;
+    }
+    return undefined;
+  }
+
+  /** The place of a line nearest to x, when a caret at it is drawn on that line. */
+  ownPlace(at: LineAt, x: number): { place: Place; affinity: Affinity } | undefined {
+    const found = this.placeAt(at.line, x);
+    const back = this.lineOf(found.place, found.affinity, at.page);
+    return back && back.line !== at.line ? undefined : { place: found.place, affinity: found.affinity };
   }
 
   /**

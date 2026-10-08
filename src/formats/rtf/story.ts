@@ -8,12 +8,13 @@ import type { FormatContext } from './state';
 
 export type StoryKind = 'body' | 'header' | 'footnote' | 'comment' | 'textbox';
 
-/** What the text being added is: shown text, the code of a field, or text of a tracked deletion. */
+/** What the text being added is: shown text, the code of a field, text of a tracked deletion, or the code of a field in one. */
 export const TEXT_SHOWN = 0;
 export const TEXT_CODE = 1;
 export const TEXT_DELETED = 2;
+export const TEXT_CODE_DELETED = 3;
 
-const TEXT_TYPES = ['text', 'instrText', 'deletedText'] as const;
+const TEXT_TYPES = ['text', 'instrText', 'deletedText', 'instrText'] as const;
 
 export class Story {
   readonly assembler: TableAssembler;
@@ -56,7 +57,8 @@ export class Story {
   private flushText(): void {
     if (!this.text) return;
     const run = this.run!;
-    run.content.push({ type: TEXT_TYPES[this.textKind], text: this.text } as RunItem);
+    if (this.textKind === TEXT_CODE_DELETED) run.content.push({ type: 'instrText', text: this.text, deleted: true });
+    else run.content.push({ type: TEXT_TYPES[this.textKind], text: this.text } as RunItem);
     this.text = '';
   }
 
@@ -102,9 +104,9 @@ export class Story {
   }
 
   /** Adds an item in a run of its own, as a field mark has it in a docx file. */
-  addAlone(item: RunItem, props: RunProps, full: RunProps): Run {
+  addAlone(item: RunItem, props: RunProps, full: RunProps, wrap?: Wrapper): Run {
     this.endRun();
-    const run = this.open(props, full, undefined);
+    const run = this.open(props, full, wrap);
     run.content.push(item);
     this.endRun();
     return run;

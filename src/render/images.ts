@@ -151,7 +151,6 @@ export class ImageStore {
   private reserved = 0;
   /** Decodes of large pictures run one after the other. */
   private heavy: Promise<unknown> = Promise.resolve();
-  private urls: string[] = [];
   private destroyed = false;
   /** Counts the passes of the view; a picture used in the current pass is never dropped. */
   pass = 0;
@@ -224,7 +223,6 @@ export class ImageStore {
     this.queue.length = 0;
     // A picture that is still being decoded keeps its address until the decode ends (see decode): taking it
     // away under the image element is a failed load, which browsers report on the console.
-    this.urls.length = 0;
     this.total = 0;
   }
 
@@ -356,8 +354,24 @@ export class ImageStore {
         const bitmap = smaller
           ? await createImageBitmap(blob, { resizeWidth: (target as { width: number }).width, resizeHeight: (target as { height: number }).height, resizeQuality: 'medium' })
           : await createImageBitmap(blob);
-        const close = () => bitmap.close();
-        return this.fitted(bitmap, bitmap.width, bitmap.height, close, target, limit);
+        let closed = false;
+        const close = () => {
+          if (closed) return;
+          closed = true;
+          bitmap.close();
+        };
+        // A store that was destroyed while the decoder worked has no use for the bitmap, and draws nothing with it.
+        if (this.destroyed) {
+          close();
+          return null;
+        }
+        try {
+          return this.fitted(bitmap, bitmap.width, bitmap.height, close, target, limit);
+        } catch (error) {
+          // Whatever went wrong while it was drawn smaller, the bitmap is given back; the image element is tried next.
+          close();
+          throw error;
+        }
       } catch {
         // Some browsers decode fewer formats here than in an image element.
       }
@@ -365,12 +379,9 @@ export class ImageStore {
     if (this.destroyed || typeof Image !== 'function' || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return null;
     return new Promise((resolve) => {
       const url = URL.createObjectURL(blob);
-      this.urls.push(url);
       const element = new Image();
       const finish = (ok: boolean) => {
         element.onload = element.onerror = null;
-        const index = this.urls.indexOf(url);
-        if (index >= 0) this.urls.splice(index, 1);
         // The decoded picture stays usable after its address is given back; a store that was destroyed
         // meanwhile gives it back here too.
         URL.revokeObjectURL(url);

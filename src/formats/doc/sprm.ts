@@ -402,7 +402,10 @@ export function languageTag(lid: number): string | undefined {
   return LANGUAGES[lid] || 'x-lcid-' + lid.toString(16);
 }
 
-/** A DTTM (MS-DOC 2.9.71) as ISO 8601 text; undefined when it holds no date. */
+/**
+ * A DTTM (MS-DOC 2.9.71) as ISO 8601 text; undefined when it holds no date. UNSURE: a DTTM is local time without a
+ * zone; it is written with "Z", as Word does when it saves such a file as docx.
+ */
 export function dttm(value: number): string | undefined {
   if (value === 0) return undefined;
   const minute = value & 0x3f;
@@ -411,6 +414,9 @@ export function dttm(value: number): string | undefined {
   const month = (value >>> 16) & 0x0f;
   const year = ((value >>> 20) & 0x1ff) + 1900;
   if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59) return undefined;
+  // A day the month does not have is no date either: what is written is an xsd:dateTime.
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  if (day > (month === 2 ? (leap ? 29 : 28) : month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31)) return undefined;
   const two = (n: number) => (n < 10 ? '0' : '') + n;
   return `${year}-${two(month)}-${two(day)}T${two(hour)}:${two(minute)}:00Z`;
 }

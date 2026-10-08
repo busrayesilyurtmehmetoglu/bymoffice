@@ -10,12 +10,15 @@
 //   - text taken out stays, in a `del` wrapper innermost around its run, its
 //     text as <w:delText> items; the mark of a paragraph that was joined to
 //     the next says `deleted`, and the two paragraphs stay two;
-//   - text (and tabs and line breaks) the same author put in as a tracked
-//     insertion is taken out for good, as Word does: nobody needs the history
-//     of a change to a change. Everything else in such an insertion (a note
-//     reference, a field, a picture, an equation) is deleted like anything
-//     else, inside the insertion, so that nothing but typed text ever leaves
-//     a document that tracks its changes. An editor without a name owns no
+//   - text (and tabs and line breaks) that sits directly in a tracked
+//     insertion of the same author is taken out for good, as Word does:
+//     nobody needs the history of a change to a change. Everything else in
+//     such an insertion (a note reference, a field, a picture, an equation,
+//     and text inside a simple field, a link, a content control or a smart
+//     tag) is deleted like anything else, inside the insertion, so that
+//     nothing but typed text ever leaves a document that tracks its changes,
+//     and no element that held it goes with it. The mark of a paragraph the
+//     author made goes for good only between two paragraphs formatted alike. An editor without a name owns no
 //     insertion: the stand-in name is also what Word writes for anybody whose
 //     name was removed from a file.
 // Content in a `del` wrapper is not content any more: it takes no offsets
@@ -23,7 +26,7 @@
 
 import { tracksChanges, type Block, type DocModel, type Inline, type ParaProps, type RevisionInfo, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
 import type { XmlElement } from '../../xml';
-import { fieldPairs, makeRun, removedPieces, type Piece } from './pieces';
+import { fieldPairs, makeRun, removedPieces, sameProps, type Piece } from './pieces';
 
 /** What a command throws for a change it cannot make as a tracked one: the change is not made at all. */
 export const TRACK_UNSUPPORTED = 'This change cannot be tracked yet';
@@ -131,6 +134,9 @@ const FOREIGN_IDS = new WeakMap<DocModel, number>();
 /** The largest id an annotation can have (a signed 32-bit number, as the reader takes it). */
 const MAX_ID = 0x7fffffff;
 
+/** Wrappers around one inline that are looked at for ids. */
+const MAX_WRAPPER_CHAIN = 4096;
+
 function idsOfBlocks(blocks: Block[], note: (id: number | undefined) => void, depth: number): void {
   if (depth > 64) return;
   const ofProps = (props: RunProps | undefined): void => {
@@ -142,8 +148,9 @@ function idsOfBlocks(blocks: Block[], note: (id: number | undefined) => void, de
     else if (block.type === 'paragraph') {
       ofProps(block.props.markProps);
       for (const inline of block.children) {
-        // The chain is as deep as the source nesting, which the reader limits.
-        for (let w = inline.wrap; w; w = w.parent) if (w.kind === 'ins' || w.kind === 'del' || w.kind === 'moveFrom' || w.kind === 'moveTo') note(w.id);
+        // The chain is as deep as the source nesting, which the reader limits; a model made by hand may hold one that never ends.
+        let steps = 0;
+        for (let w = inline.wrap; w && steps < MAX_WRAPPER_CHAIN; w = w.parent, steps++) if (w.kind === 'ins' || w.kind === 'del' || w.kind === 'moveFrom' || w.kind === 'moveTo') note(w.id);
         if (inline.type === 'run') {
           for (const item of inline.content) if (item.type === 'commentReference') note(item.id);
         } else if (inline.type !== 'math' && inline.type !== 'proofError' && inline.type !== 'empty' && inline.type !== 'misc' && inline.type !== 'unknown') note(Number(inline.id));
@@ -178,7 +185,7 @@ function idsOfElement(el: { attrs: Map<string, string>; children: unknown[] }, n
  * searched, which also finds the ids in what the model keeps as XML; the
  * model is searched as well, for parts without a source.
  */
-function largestId(doc: DocModel): number {
+export function largestAnnotationId(doc: DocModel): number {
   let max = 0;
   const note = (id: number | undefined): void => {
     if (id !== undefined && id === id && id > max && id <= MAX_ID) max = id;
@@ -241,7 +248,7 @@ export function noteForeignIds(doc: DocModel, blocks: Block[]): void {
  */
 export function nextRevisionId(doc: DocModel): number {
   let state = NEXT_IDS.get(doc);
-  if (!state) NEXT_IDS.set(doc, (state = { next: Math.max(largestId(doc), FOREIGN_IDS.get(doc) || 0) + 1 }));
+  if (!state) NEXT_IDS.set(doc, (state = { next: Math.max(largestAnnotationId(doc), FOREIGN_IDS.get(doc) || 0) + 1 }));
   if (state.next > MAX_ID) throw new RangeError('The document has no room for another revision');
   return state.next++;
 }
@@ -489,13 +496,42 @@ export function strikePieces(tracking: Tracking, pieces: Piece[], from: number, 
   const flags = removedPieces(pieces, from, to);
   const author = tracking.author;
   const fields = tracking.named ? fieldPairs(pieces).owner : undefined;
-  /** Typed text of this author's own insertion: the only thing that goes for good. */
-  const own = (q: number): boolean => {
+  /**
+   * Typed text that sits directly in this author's own insertion: the only thing that goes for
+   * good. Text in anything else inside the insertion (a simple field, a link, a content control,
+   * a smart tag) is deleted where it is, so that what holds it stays.
+   */
+  const candidate = (q: number): boolean => {
     const piece = pieces[q];
     const item = piece.item;
-    if (!fields || !item || piece.code || fields[q] >= 0 || !inOwnInsertion(piece.wrap, author)) return false;
+    const wrap = piece.wrap;
+    if (!fields || !item || piece.code || fields[q] >= 0 || !wrap || wrap.kind !== 'ins' || wrap.author !== author) return false;
     return item.type === 'text' || item.type === 'tab' || (item.type === 'break' && item.kind === 'line');
   };
+  const gone: boolean[] = [];
+  let anyGone = false;
+  for (let q = 0; q < pieces.length; q++) {
+    gone.push(flags[q] && candidate(q));
+    if (gone[q]) anyGone = true;
+  }
+  if (anyGone) {
+    // An insertion typed into a link or a control must not take that with it: every wrapper around
+    // the insertion has to hold something that stays, or the text stays too, deleted.
+    const held = new Set<Wrapper>();
+    const hold = (wrap: Wrapper | undefined): void => {
+      for (let w = wrap; w && !held.has(w); w = w.parent) held.add(w);
+    };
+    for (let q = 0; q < pieces.length; q++) if (!gone[q]) hold(pieces[q].wrap);
+    for (let q = 0; q < pieces.length; q++) {
+      if (!gone[q]) continue;
+      let safe = true;
+      for (let w = (pieces[q].wrap as Wrapper).parent; w && safe; w = w.parent) if (!held.has(w)) safe = false;
+      if (safe) continue;
+      gone[q] = false;
+      hold(pieces[q].wrap);
+    }
+  }
+  const own = (q: number): boolean => gone[q];
   const out: Piece[] = [];
   let changed = false;
   /** The deletion of this author the piece before ends in. */
@@ -581,7 +617,30 @@ export function withPlainMark(props: ParaProps): ParaProps {
   return withMarkFlagsOf(props, {});
 }
 
-/** Was the mark of a paragraph inserted by this author as a tracked change: joining it to the next takes the mark out for good. */
+const withoutRevisionFlags = (mark: RunProps | undefined): RunProps | undefined => {
+  if (!mark) return undefined;
+  const out: RunProps = { ...mark };
+  for (const key of MARK_FLAGS) delete out[key];
+  return Object.keys(out).length ? out : undefined;
+};
+
+/**
+ * Would joining the paragraph of `first` onto the one of `second` lose no formatting: the two
+ * are formatted alike (style, list, alignment, indents, the formatting of their marks, kept
+ * XML), whatever their marks say of revisions, and the first ends no section. Kept XML is alike
+ * only when it is the same object.
+ */
+export function joinsWithoutLoss(first: ParaProps, second: ParaProps): boolean {
+  if (first.section !== undefined) return false;
+  const a: ParaProps = { ...first };
+  const b: ParaProps = { ...second };
+  delete a.markProps;
+  delete b.markProps;
+  delete b.section;
+  return sameProps(a, b) && sameProps(withoutRevisionFlags(first.markProps), withoutRevisionFlags(second.markProps));
+}
+
+/** Was the mark of a paragraph inserted by this author as a tracked change: joining it to a paragraph formatted alike takes the mark out for good. */
 export function isOwnMark(props: ParaProps, tracking: Tracking): boolean {
   const mark = props.markProps;
   return tracking.named && mark !== undefined && mark.inserted !== undefined && mark.inserted.author === tracking.author;

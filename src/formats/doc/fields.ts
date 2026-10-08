@@ -59,6 +59,8 @@ export function linkDocFields(blocks: Block[]): void {
         else if (item.charType === 'separate') stack[stack.length - 1] = true;
         else stack.pop();
       } else if (item.type === 'text' && stack.length && !stack[stack.length - 1]) item = { type: 'instrText', text: item.text };
+      // The code of a field that was deleted as a tracked change is deleted code (<w:delInstrText>), not deleted text.
+      else if (item.type === 'deletedText' && stack.length && !stack[stack.length - 1]) item = { type: 'instrText', text: item.text, deleted: true };
       content[kept++] = item;
     }
     content.length = kept;

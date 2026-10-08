@@ -156,24 +156,30 @@ test('RTF: a protection applies when the file enforces it, or names it the old w
   assert.equal(of('\\protlevel3'), undefined);
 });
 
-/** A document properties structure (Dop) of 84 bytes with the given bytes set. */
-function dop(bytes: [offset: number, value: number][]): Uint8Array {
-  const out = new Uint8Array(84);
+/** A document properties structure (Dop) of 84 bytes, or of `length`, with the given bytes set. */
+function dop(bytes: [offset: number, value: number][], length = 84): Uint8Array {
+  const out = new Uint8Array(length);
   for (const [offset, value] of bytes) out[offset] = value;
   return out;
 }
 
-test('doc: the protection bits of the document properties lock only together with the bit that enables protection', () => {
-  const of = (bytes: [number, number][]) => simpleDoc('text\r').table(FC.Dop, dop(bytes)).read().settings.protection;
+test('doc: each protection bit of the document properties locks by itself', () => {
+  const of = (bytes: [number, number][], length?: number) => simpleDoc('text\r').table(FC.Dop, dop(bytes, length)).read().settings.protection;
   assert.equal(of([]), undefined);
-  // fProtEnabled (byte 7, 0x02) alone: forms.
+  // fLockRev (byte 7, 0x40): tracked changes; fLockAtn (byte 6, 0x10): comments; fProtEnabled (byte 7, 0x02): forms.
+  assert.deepEqual(of([[7, 0x40]]), { edit: 'trackedChanges', enforced: true });
+  assert.deepEqual(of([[6, 0x10]]), { edit: 'comments', enforced: true });
   assert.deepEqual(of([[7, 0x02]]), { edit: 'forms', enforced: true });
-  // With fLockAtn (byte 6, 0x10): comments; with fLockRev (byte 7, 0x40): tracked changes.
+  // Together: tracked changes before comments before forms.
+  assert.deepEqual(of([[6, 0x10], [7, 0x42]]), { edit: 'trackedChanges', enforced: true });
   assert.deepEqual(of([[6, 0x10], [7, 0x02]]), { edit: 'comments', enforced: true });
   assert.deepEqual(of([[7, 0x42]]), { edit: 'trackedChanges', enforced: true });
-  // The lock bits without it: kept, not applied.
-  assert.deepEqual(of([[6, 0x10]]), { edit: 'comments', enforced: false });
-  assert.deepEqual(of([[7, 0x40]]), { edit: 'trackedChanges', enforced: false });
+  // Dop2003 (616 bytes and more): fTreatLockAtnAsReadOnly (byte 594, 0x01) makes the comment lock a read-only one.
+  assert.deepEqual(of([[6, 0x10], [594, 0x01]], 616), { edit: 'readOnly', enforced: true });
+  assert.deepEqual(of([[6, 0x10]], 616), { edit: 'comments', enforced: true });
+  // The bit alone locks nothing, and a shorter structure has no such bit.
+  assert.equal(of([[594, 0x01]], 616), undefined);
+  assert.deepEqual(of([[6, 0x10], [594, 0x01]], 600), { edit: 'comments', enforced: true });
   // Neighbouring bits are not protection: fMirrorMargins (byte 6, 0x20), fEmbedFonts (byte 7, 0x80), fRevMarking (byte 5, 0x80).
   const other = simpleDoc('text\r').table(FC.Dop, dop([[5, 0x80], [6, 0x20], [7, 0x80]])).read().settings;
   assert.equal(other.protection, undefined);

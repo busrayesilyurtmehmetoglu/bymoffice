@@ -4,7 +4,7 @@
 
 import { paragraphText, EMPTY_PARA_PROPS, type Block, type CellProps, type DocModel, type ParaProps, type Paragraph, type RunItem, type RunProps, type Table, type TableCell, type TableRow, type Wrapper } from '../../model/doc/types';
 import { buildEdit, tableContextOf, type DocEdit, type DocEditOptions, type Draft } from './draft';
-import { TRACK_UNSUPPORTED, afterCut, insertionLike, insertionWrap, isDeletedMark, isOwnMark, strikePieces, withFreshChanges, withMarkFlagsOf, withMarkRevision, withPlainMark, type Tracking } from './track';
+import { TRACK_UNSUPPORTED, afterCut, insertionLike, insertionWrap, isDeletedMark, isOwnMark, joinsWithoutLoss, strikePieces, withFreshChanges, withMarkFlagsOf, withMarkRevision, withPlainMark, type Tracking } from './track';
 import { inList, patchRunProps, withoutNumbering, type RunFormatPatch } from './format';
 import {
   atomFollows,
@@ -408,12 +408,21 @@ export function deleteSpan(draft: Draft, start: DocPosition, end: DocPosition): 
   return { story, path: previous, offset: resolvePosition(doc, { story, path: previous, offset: 0 }).length };
 }
 
+/** The properties of the first paragraph after block `index`, up to block `last` (which is one). */
+function nextParagraphProps(blocks: Block[], index: number, last: number): ParaProps {
+  for (let i = index + 1; i <= last; i++) {
+    const block = blocks[i];
+    if (block.type === 'paragraph') return block.props;
+  }
+  return EMPTY_PARA_PROPS;
+}
+
 /**
  * deleteSpan() where changes are tracked. What the range holds stays, as
  * tracked deletions, and so do its paragraphs: the mark of each paragraph
  * the range runs past says that it was deleted. What the author of the
- * change had put in as a tracked insertion goes for good, text and paragraph
- * marks alike. A range that takes cells of a table, or a table, is refused:
+ * change had put directly into a tracked insertion goes for good, text and,
+ * between paragraphs formatted alike, paragraph marks. A range that takes cells of a table, or a table, is refused:
  * deleting those is a change of the table that is not tracked yet.
  */
 function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocPosition): DocPosition {
@@ -466,8 +475,10 @@ function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocP
       content = open.pieces.concat(afterCut(open.pieces, content, track));
       changed = true;
     }
-    if (i < last && isOwnMark(block.props, track)) {
-      // The mark was a tracked insertion of this author: it goes, and the next paragraph continues this one.
+    if (i < last && isOwnMark(block.props, track) && joinsWithoutLoss(block.props, nextParagraphProps(blocks, i, last))) {
+      // The mark was a tracked insertion of this author, between two paragraphs formatted alike: it goes, and the
+      // next paragraph continues this one. Between paragraphs that differ it is deleted like any other mark, so
+      // that the second keeps its formatting.
       open = { first: open ? open.first : block, pieces: content };
       any = true;
       continue;
@@ -645,7 +656,7 @@ function strikeMark(draft: Draft, track: Tracking, story: string, container: num
   const a = blocks[first] as Paragraph;
   const b = blocks[second] as Paragraph;
   const length = paragraphLength(a);
-  if (isOwnMark(a.props, track)) {
+  if (isOwnMark(a.props, track) && joinsWithoutLoss(a.props, b.props)) {
     const head = flatten(a);
     const pieces = head.concat(afterCut(head, flatten(b), track));
     const out: Block[] = [paragraphWith(a, rebuild(pieces), withMarkFlagsOf(joinedProps(a, b), b.props))];

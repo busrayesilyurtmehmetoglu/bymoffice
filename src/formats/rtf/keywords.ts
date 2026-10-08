@@ -57,6 +57,12 @@ charFlag('v', 'hidden');
 charFlag('noproof', 'noProof');
 charFlag('deleted', 'deleted');
 charFlag('revised', 'inserted');
+// Who made a tracked change and when. These say nothing about how text looks, and the reader keeps them apart from
+// the formatting: see RtfReader.wrapper().
+charNumber('revauth', 'revAuth');
+charNumber('revauthdel', 'revAuthDel');
+charNumber('revdttm', 'revDttm');
+charNumber('revdttmdel', 'revDttmDel');
 
 const halfPoints = (param: number): number => (param < 1 ? 1 : param > 3276 ? 3276 : param);
 
@@ -643,10 +649,6 @@ export const IGNORED = [
   'rsid',
   'rsidroot',
   'styrsid',
-  'revauth',
-  'revdttm',
-  'revauthdel',
-  'revdttmdel',
   'crauth',
   'crdate',
   // How the document is shown and checked, and what other versions of Word should do with it.

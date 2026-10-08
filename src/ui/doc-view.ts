@@ -668,6 +668,8 @@ export class DocumentView {
   private reportedCount = 0;
   /** A page asked for before it was laid out (from 0). */
   private pendingPage: number | undefined;
+  /** With `pendingPage`: where in that page the view began (page px from its top) before a new layout, to begin there again; undefined for the top of the page. */
+  private pendingWithin: number | undefined;
   private quietFocus = false;
 
   private selection: { anchor: TextPosition; focus: TextPosition } | 'all' | undefined;
@@ -959,6 +961,7 @@ export class DocumentView {
     if (this.destroyed) return;
     if (typeof page !== 'number' || !(page >= 1)) throw new RangeError('The page number must be 1 or more');
     const index = Math.floor(page) - 1;
+    this.pendingWithin = undefined;
     if (index >= this.pages.length && !this.done) {
       this.pendingPage = index;
       this.scrollToPage(this.pages.length - 1);
@@ -1052,20 +1055,26 @@ export class DocumentView {
   relayout(): void {
     if (this.destroyed) return;
     const page = Math.max(0, this.mostVisible());
+    // Where the reader is: the page most in view, and how far into it the view begins. The new layout shows
+    // the same place again (fonts that arrive must not take a reader back to the top of the page), and the
+    // strip keeps its height until the pages are there, so that the browser does not scroll in between.
+    const within = this.pages.length > 0 && this.scale > 0 ? (this.virtualY() - this.pageTop(page)) / this.scale : undefined;
+    const height = this.pages.length > 0 ? this.totalHeight() : 0;
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
     this.layoutTimer = undefined;
     this.painter.clear();
     this.layoutEpoch++;
     // Places in the text are places of the model: an editor keeps its caret.
     if (!this.editable) this.selection = undefined;
-    this.hold = 0;
+    this.hold = height;
     this.unmountAll();
     this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
     this.pages = this.engine.pages;
     this.offsets = [0];
     this.done = false;
     this.failed = false;
-    this.pendingPage = page > 0 ? page : undefined;
+    this.pendingPage = within !== undefined ? page : undefined;
+    this.pendingWithin = within;
     this.runLayout(FIRST_SLICE_MS);
     // At once, so that the pages are not gone for a frame.
     this.update();
@@ -1443,6 +1452,8 @@ export class DocumentView {
     } catch {
       // The pages laid out so far stay; the rest of the document is not shown.
       this.failed = true;
+      // Nothing more comes: the strip is as high as its pages.
+      this.hold = 0;
       this.notify(this.strings.documentLayoutFailed, 'error');
       this.update();
       return;
@@ -1485,8 +1496,15 @@ export class DocumentView {
     this.sizeStrip();
     if (this.pendingPage !== undefined && (this.pendingPage < pages.length || this.done)) {
       const target = Math.min(this.pendingPage, pages.length - 1);
+      const within = target === this.pendingPage ? this.pendingWithin : undefined;
       this.pendingPage = undefined;
-      this.scrollToPage(target);
+      this.pendingWithin = undefined;
+      if (within === undefined || target < 0) this.scrollToPage(target);
+      else {
+        // The place in the page the view was at before the layout was made anew.
+        this.setVirtualY(this.pageTop(target) + within * this.scale);
+        this.update();
+      }
     }
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
     this.layoutTimer = this.done ? undefined : setTimeout(this.runLayout, 0);
@@ -4086,7 +4104,8 @@ export class DocumentView {
     if (!box) return;
     const x = this.targetX !== undefined ? this.targetX : box.x;
     const accept = (mark: LineMark) => mark.source.story === range.focus.story && outsideBoxes(mark);
-    let line: PageLine | undefined;
+    // A line that shows nothing but deleted text has no place of its own: a key never stops on one.
+    let found: { place: DocPosition; affinity: Affinity } | undefined;
     if (screen) {
       // The line a screen away, as far as the pages laid out reach.
       const distance = Math.max(LINE_SCROLL, this.height - LINE_SCROLL) / this.scale;
@@ -4095,18 +4114,13 @@ export class DocumentView {
       let page = box.page;
       while (page > 0 && this.offsets[page] > y) page--;
       while (page < this.pages.length - 1 && this.offsets[page + 1] <= y) page++;
-      line = this.lines.lineAt(page, x, y - this.offsets[page], accept);
-      if (line === box.line) line = undefined;
+      const line = this.lines.lineAt(page, x, y - this.offsets[page], accept);
+      if (line && line !== box.line) found = this.lines.ownPlace({ page, line }, x) || this.lines.verticalPlace({ page, line }, direction, x, accept);
     }
-    if (!line) {
-      const next = this.lines.vertical(box, direction, x, accept);
-      line = next ? next.line : undefined;
-    }
+    if (!found) found = this.lines.verticalPlace(box, direction, x, accept);
     let target: { position: DocPosition; affinity: Affinity } | undefined;
-    if (line) {
-      const found = this.lines.placeAt(line, x);
-      target = this.settle(found.place, found.affinity);
-    } else {
+    if (found) target = this.settle(found.place, found.affinity);
+    else {
       // No line further on: the very start or end of the text.
       const edge = this.storyEdge(direction);
       if (edge) target = { position: edge, affinity: 'start' };
@@ -4125,7 +4139,9 @@ export class DocumentView {
     if (!at) return;
     const source = at.line.mark.source;
     const offset = direction === -1 ? source.offset : lineEnd(at.line);
-    const settled = this.settle({ story: source.story, path: source.path, offset }, direction === 1 && !at.line.mark.last ? 'end' : 'start');
+    // On a line a press named (it shows nothing but deleted text) both edges are the place the caret is at.
+    const side: Affinity = typeof this.affinity === 'number' && at.line.mark.length === 0 ? this.affinity : direction === 1 && !at.line.mark.last ? 'end' : 'start';
+    const settled = this.settle({ story: source.story, path: source.path, offset }, side);
     if (!settled) return;
     this.moveTo(settled.position, settled.affinity, extend, false);
     this.announceCaret('line');

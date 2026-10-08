@@ -97,6 +97,9 @@ const SECTION_MARK = 0x0c;
  * size in memory.
  */
 const MAX_PARAGRAPHS = 2000000;
+/** Bytes of the document properties up to Word 2002, and with what Word 2003 added (MS-DOC 2.7.7, 2.7.8). */
+const DOP2002_SIZE = 594;
+const DOP2003_SIZE = 616;
 
 export interface ReadDocOptions {
   /** Paragraphs the document may have before it is refused; 2,000,000 when missing. A host with little memory may lower it. */
@@ -179,6 +182,8 @@ class DocReader {
   private readonly inverted = new WeakMap<CharProps, Map<string, RunProps>>();
   /** What the reader made each set of run properties of the model from, to make them again inside a table with a style. */
   private readonly runSource = new WeakMap<RunProps, CharProps>();
+  /** Run properties of a paragraph mark that was deleted or inserted, by the character properties and the properties without that. */
+  private readonly revisedMarks = new WeakMap<CharProps, Map<RunProps, RunProps>>();
   private readonly toggleLevels = new Map<string, ToggleLevel | null>();
   private readonly tableParas = new WeakMap<ParaProps, Map<string, ParaProps>>();
 
@@ -288,13 +293,19 @@ class DocReader {
     settings.autoHyphenation = (u8(b, at + 5) & 0x10) !== 0;
     settings.trackRevisions = (u8(b, at + 5) & 0x80) !== 0;
     settings.mirrorMargins = (u8(b, at + 6) & 0x20) !== 0;
-    // DopBase: fProtEnabled says that the document is protected; fLockRev and fLockAtn say for what (tracked changes,
-    // comments; neither: form fields). The lock bits without fProtEnabled are kept and not applied, so that no
-    // document is locked on the word of one bit. UNSURE: not compared with files Word protected; a read-only
-    // protection is in a later part of the Dop and is not read.
-    const enabled = (u8(b, at + 7) & 0x02) !== 0;
-    const lock = (u8(b, at + 7) & 0x40) !== 0 ? 'trackedChanges' : (u8(b, at + 6) & 0x10) !== 0 ? 'comments' : enabled ? 'forms' : undefined;
-    if (lock !== undefined) settings.protection = { edit: lock, enforced: enabled };
+    // DopBase (MS-DOC 2.7.2): three bits, each a protection by itself. fLockRev: only tracked changes may be made;
+    // fLockAtn: only comments; fProtEnabled: only form fields. Dop2003.fTreatLockAtnAsReadOnly says that fLockAtn
+    // stands for a read-only protection. UNSURE: when more than one bit is set, the order here (tracked changes,
+    // then comments, then forms) decides; not compared with files Word protected. UNSURE: the place of
+    // fTreatLockAtnAsReadOnly (the first bit after the 594 bytes of a Dop2002) is from the specification as
+    // remembered; a wrong place would name a comment protection read-only or the other way round, and both
+    // open locked here.
+    const lockRev = (u8(b, at + 7) & 0x40) !== 0;
+    const lockAtn = (u8(b, at + 6) & 0x10) !== 0;
+    const protEnabled = (u8(b, at + 7) & 0x02) !== 0;
+    const atnReadOnly = size >= DOP2003_SIZE && (u8(b, at + DOP2002_SIZE) & 0x01) !== 0;
+    const lock = lockRev ? 'trackedChanges' : lockAtn ? (atnReadOnly ? 'readOnly' : 'comments') : protEnabled ? 'forms' : undefined;
+    if (lock !== undefined) settings.protection = { edit: lock, enforced: true };
     const tab = u16(b, at + 10);
     if (tab > 0 && tab <= 31680) settings.defaultTabStop = tab;
     return settings;
@@ -476,7 +487,7 @@ class DocReader {
           const mark = block.props.markProps;
           const source = mark ? this.runSource.get(mark) : undefined;
           if (!mark || !source) continue;
-          const again = this.runProps(source, block.props, style);
+          const again = mark.deleted || mark.inserted ? this.revisedMark(this.runProps(source, block.props, style), source) : this.runProps(source, block.props, style);
           if (again === mark) continue;
           // Paragraph properties are shared between paragraphs: a changed copy is shared the same way.
           let byKey = this.tableParas.get(block.props);
@@ -488,6 +499,25 @@ class DocReader {
       }
     }
   };
+
+  /**
+   * The run properties of a paragraph mark that the character properties say was deleted or inserted: the
+   * properties with that revision. Shared, like every bag of properties, between the marks that are alike.
+   */
+  private revisedMark(mark: RunProps, source: CharProps): RunProps {
+    if (!source.deleted && !source.inserted) return mark;
+    let known = this.revisedMarks.get(source);
+    if (!known) this.revisedMarks.set(source, (known = new Map()));
+    let out = known.get(mark);
+    if (!out) {
+      out = { ...mark };
+      if (source.deleted) out.deleted = source.deleted;
+      if (source.inserted) out.inserted = source.inserted;
+      known.set(mark, out);
+      this.runSource.set(out, source);
+    }
+    return out;
+  }
 
   private finalPara(info: ParaInfo, mark: RunProps, section: SectionProps | undefined): ParaProps {
     let props = info.props;
@@ -543,7 +573,12 @@ class DocReader {
       // The paragraph ends the sections whose last character it holds: one, unless the file has sections without text.
       let section: SectionProps | undefined;
       if (main) while (ending < this.sectionEnds.length && this.sectionEnds[ending] <= markCp) section = this.sections[ending++];
-      const paragraph: Paragraph = { type: 'paragraph', props: this.finalPara(info, this.runProps(markRun, info.props), section), children };
+      // A paragraph mark is a character: one that was deleted or inserted as a tracked change says so. UNSURE: the
+      // mark that ends a cell is left as it is; a deleted one belongs to a deleted row, which the reader has no
+      // model for.
+      let markProps = this.runProps(markRun, info.props);
+      if (ends && code !== CELL_MARK) markProps = this.revisedMark(markProps, markRun);
+      const paragraph: Paragraph = { type: 'paragraph', props: this.finalPara(info, markProps, section), children };
       assembler.add(paragraph, info, ends ? code : 0);
       last = paragraph;
       start = cp + 1;

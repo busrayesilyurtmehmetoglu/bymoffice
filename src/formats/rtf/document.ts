@@ -58,6 +58,7 @@ import {
   type ParaProps,
   type Paragraph,
   type Run,
+  type RevisionInfo,
   type RunItem,
   type RunProps,
   type SectionProps,
@@ -67,7 +68,7 @@ import {
   type Wrapper,
 } from '../../model/doc/types';
 import { MediaStore } from '../doc/drawings';
-import { languageTag } from '../doc/sprm';
+import { dttm, languageTag } from '../doc/sprm';
 import { linkFields } from '../docx/body';
 import { resolveParaProps, resolveRunProps } from '../docx/resolve';
 import { charsetCodepage, decodeByte, decodePair, decodeRange, isDoubleByte, isKnownRtfCodepage, isLeadByte, SYMBOL_CODEPAGE } from './codepage';
@@ -91,7 +92,7 @@ import {
   type FormatContext,
   type Pap,
 } from './state';
-import { Story, TEXT_CODE, TEXT_DELETED, TEXT_SHOWN, type StoryKind } from './story';
+import { Story, TEXT_CODE, TEXT_CODE_DELETED, TEXT_DELETED, TEXT_SHOWN, type StoryKind } from './story';
 import type { TableBudget } from './tables';
 import { MAX_STYLES, buildStyles, newRawStyle, styleWord, type RawStyle, type StyleSheet } from './styles';
 import { RtfTokenizer, hexValue, T_BIN, T_CLOSE, T_EOF, T_HEX, T_OPEN, T_SYMBOL, T_TEXT, T_WORD } from './tokenizer';
@@ -110,6 +111,8 @@ const MAX_OPEN = 64;
 const MAX_COLLECT = 4096;
 const MAX_FONTS = 10000;
 const MAX_COLORS = 10000;
+/** Names the table of the authors of tracked changes may have, as in the doc reader. */
+const MAX_AUTHORS = 10000;
 /** Pictures and text boxes one shape shows, those of the shapes grouped in it included. */
 const MAX_SHAPE_PARTS = 256;
 /** "\ucN": bytes after a "\u" that stand for it in old readers. */
@@ -200,6 +203,7 @@ const C_ROW_PROPS = 25;
 const C_FONT_ALT = 26;
 const C_PANOSE = 27;
 const C_DISCARD = 28;
+const C_REV_AUTHOR = 29;
 
 /** What a group saves and restores. */
 interface State {
@@ -277,6 +281,7 @@ const DESTINATIONS = new Set<string>(
   D.SKIPPED.concat(Object.keys(HEADERS), Object.keys(SEPARATORS), [
     'fonttbl',
     'colortbl',
+    'revtbl',
     'stylesheet',
     'listtable',
     'list',
@@ -363,6 +368,9 @@ interface OpenField {
   /** The formatting in full of the first text of the code and of the result. */
   code: RunProps | undefined;
   result: RunProps | undefined;
+  /** The tracked change that text is in, for the mark that ends the field: undefined when it is in none. */
+  codeWrap: Wrapper | undefined;
+  resultWrap: Wrapper | undefined;
 }
 
 export class RtfReader {
@@ -455,8 +463,12 @@ export class RtfReader {
   private readonly runPool = new Map<string, RunProps>();
   private readonly paraPool = new Map<string, ParaProps>();
   private readonly paraFinal = new WeakMap<ParaProps, Map<RunProps, ParaProps>>();
-  private readonly deletion: Wrapper = { kind: 'del' };
-  private readonly insertion: Wrapper = { kind: 'ins' };
+  /** The names of the revision table ("\revtbl"), by their index. */
+  private readonly authors: string[] = [];
+  /** The wrappers of tracked changes, by kind, author and date: text of one change that follows each other shares one. */
+  private readonly revisions = new Map<string, Wrapper>();
+  /** Run properties of a paragraph mark that was inserted or deleted, by the properties without that and the change. */
+  private readonly revisedMarks = new Map<RunProps, Map<string, RunProps>>();
 
   constructor(bytes: Uint8Array, options: ReadRtfOptions) {
     const limit = options.maxParagraphs;
@@ -715,8 +727,46 @@ export class RtfReader {
 
   // --------------------------------------------------------------------- text
 
+  /**
+   * Who made a tracked change and when: the name the revision table has at the index (the file's own "Unknown"
+   * included) and the date the DTTM holds. Neither is made up: an index the table does not have gives no author,
+   * a DTTM that is no date gives none.
+   */
+  private revisionInfo(author: number, date: number): RevisionInfo {
+    const info: RevisionInfo = {};
+    const name = author >= 0 ? this.authors[author] : undefined;
+    // An entry without a name is no author.
+    if (name) info.author = name;
+    const when = dttm(date);
+    if (when !== undefined) info.date = when;
+    return info;
+  }
+
+  /** The tracked change the character formatting says text is in. Deleted text that was inserted before shows as deleted. */
   private wrapper(chp: Chp): Wrapper | undefined {
-    return chp.deleted ? this.deletion : chp.inserted ? this.insertion : undefined;
+    if (!chp.deleted && !chp.inserted) return undefined;
+    const author = chp.deleted ? chp.revAuthDel : chp.revAuth;
+    const date = chp.deleted ? chp.revDttmDel : chp.revDttm;
+    const key = (chp.deleted ? 'd' : 'i') + author + ':' + date;
+    let wrap = this.revisions.get(key);
+    if (!wrap) this.revisions.set(key, (wrap = { kind: chp.deleted ? 'del' : 'ins', ...this.revisionInfo(author, date) }));
+    return wrap;
+  }
+
+  /** The run properties of a paragraph mark, with what the character formatting at the mark says of a tracked change to it. */
+  private markProps(mark: RunProps, chp: Chp): RunProps {
+    if (!chp.deleted && !chp.inserted) return mark;
+    const key = (chp.deleted ? 'd' + chp.revAuthDel + ':' + chp.revDttmDel : '') + (chp.inserted ? 'i' + chp.revAuth + ':' + chp.revDttm : '');
+    let known = this.revisedMarks.get(mark);
+    if (!known) this.revisedMarks.set(mark, (known = new Map()));
+    let out = known.get(key);
+    if (!out) {
+      out = { ...mark };
+      if (chp.deleted) out.deleted = this.revisionInfo(chp.revAuthDel, chp.revDttmDel);
+      if (chp.inserted) out.inserted = this.revisionInfo(chp.revAuth, chp.revDttm);
+      known.set(key, out);
+    }
+    return out;
   }
 
   /** Adds text to the story being read. */
@@ -725,46 +775,53 @@ export class RtfReader {
     const st = this.st;
     const chp = st.chp;
     const style = this.paraStyle();
-    const kind = st.code ? TEXT_CODE : chp.deleted ? TEXT_DELETED : TEXT_SHOWN;
+    const kind = st.code ? (chp.deleted ? TEXT_CODE_DELETED : TEXT_CODE) : chp.deleted ? TEXT_DELETED : TEXT_SHOWN;
     const full = this.fullRun(chp, st.rtl);
-    if (this.fields.length) this.fieldText(full);
-    this.story.addText(text, kind, this.runPropsFor(chp, st.rtl, style), full, this.wrapper(chp));
+    const wrap = this.wrapper(chp);
+    if (this.fields.length) this.fieldText(full, wrap);
+    this.story.addText(text, kind, this.runPropsFor(chp, st.rtl, style), full, wrap);
   }
 
   /**
    * Text of the innermost open field arrives in the formatting `full`. The marks of a field are made before its
    * text, in the formatting around the field; Word gives them that of the text they stand next to: the mark that
-   * begins the field that of its code, the one that separates code and result that of the result.
+   * begins the field that of its code, the one that separates code and result that of the result. The same goes
+   * for a tracked change: a field whose code and result were deleted has deleted marks, wherever in the groups of
+   * the field the file says so.
    */
-  private fieldText(full: RunProps): void {
+  private fieldText(full: RunProps, wrap: Wrapper | undefined): void {
     const field = this.fields[this.fields.length - 1];
     // Text of another story inside the field (a note in its result) is not text of the field.
     if (!field.begin || field.begin.story !== this.story) return;
     if (this.st.code) {
       if (field.code || field.separated) return;
       field.code = full;
-      if (field.begin) this.restyle(field.begin, full);
+      field.codeWrap = wrap;
+      if (field.begin) this.restyle(field.begin, full, wrap);
     } else if (field.separated && !field.result) {
       field.result = full;
-      if (field.separate) this.restyle(field.separate, full);
+      field.resultWrap = wrap;
+      if (field.separate) this.restyle(field.separate, full, wrap);
     }
   }
 
-  /** Gives a field mark another formatting, when the paragraph it is in is still being read. */
-  private restyle(mark: MarkRef, full: RunProps): void {
+  /** Gives a field mark another formatting (and tracked change), when the paragraph it is in is still being read. */
+  private restyle(mark: MarkRef, full: RunProps, wrap: Wrapper | undefined): void {
     const story = mark.story;
     if (story !== this.story || story.paragraphs !== mark.serial || story.runs[mark.index] !== mark.run || story.styleUsed === undefined) return;
     story.fulls[mark.index] = full;
     mark.run.props = this.pooled(this.runPool, diffRunProps(full, this.runBase(story.styleUsed, full.style)), EMPTY_RUN_PROPS);
+    if (wrap) mark.run.wrap = wrap;
+    else delete mark.run.wrap;
   }
 
-  /** A field mark in a run of its own, in the formatting in effect. */
-  private fieldMark(charType: 'begin' | 'separate' | 'end', chp: Chp, rtl: boolean, full: RunProps | undefined): MarkRef {
+  /** A field mark in a run of its own, in the formatting in effect and in the tracked change `wrap`. */
+  private fieldMark(charType: 'begin' | 'separate' | 'end', chp: Chp, rtl: boolean, full: RunProps | undefined, wrap: Wrapper | undefined): MarkRef {
     const story = this.story;
     const style = this.paraStyle();
     const used = full || this.fullRun(chp, rtl);
     const props = full ? this.pooled(this.runPool, diffRunProps(full, this.runBase(style, full.style)), EMPTY_RUN_PROPS) : this.runPropsFor(chp, rtl, style);
-    const run = story.addAlone({ type: 'fieldChar', charType }, props, used);
+    const run = story.addAlone({ type: 'fieldChar', charType }, props, used, wrap);
     return { run, story, serial: story.paragraphs, index: story.runs.length - 1 };
   }
 
@@ -774,8 +831,9 @@ export class RtfReader {
     if (st.dest !== D.D_NORMAL) return undefined;
     const chp = st.chp;
     const full = this.fullRun(chp, st.rtl);
-    if (this.fields.length) this.fieldText(full);
-    return this.story.addItem(item, this.runPropsFor(chp, st.rtl, this.paraStyle()), full, this.wrapper(chp));
+    const wrap = this.wrapper(chp);
+    if (this.fields.length) this.fieldText(full, wrap);
+    return this.story.addItem(item, this.runPropsFor(chp, st.rtl, this.paraStyle()), full, wrap);
   }
 
   /** Text as decoded: where it goes depends on what the group is. */
@@ -981,7 +1039,8 @@ export class RtfReader {
         current.runs[i].props = this.pooled(this.runPool, diffRunProps(full, this.runBase(style, full.style)), EMPTY_RUN_PROPS);
       }
     }
-    const mark = this.runPropsFor(st.chp, st.rtl, style);
+    // The mark is a character like any other: one that was deleted or inserted says so.
+    const mark = this.markProps(this.runPropsFor(st.chp, st.rtl, style), st.chp);
     this.dropPending(current);
     // The number a writer puts in front of the text shows only where the file has no list for the paragraph.
     const numbered = pap.list > 0 && this.knownLists.has(pap.list);
@@ -1277,6 +1336,11 @@ export class RtfReader {
       st.closer = C_STYLE;
       st.payload = this.rawStyle = newRawStyle();
       this.buffers.push('');
+    } else if (parent.dest === D.D_REVTBL) {
+      // Every group of the table is a name.
+      st.dest = D.D_REVAUTHOR;
+      st.closer = C_REV_AUTHOR;
+      this.buffers.push('');
     } else if (parent.dest === D.D_UPR) st.dest = D.D_UPR_CHILD;
     else if (parent.dest === D.D_SKIP) this.tk.skipGroup();
   }
@@ -1370,6 +1434,9 @@ export class RtfReader {
         return true;
       case 'colortbl':
         st.dest = D.D_COLORTBL;
+        return true;
+      case 'revtbl':
+        st.dest = D.D_REVTBL;
         return true;
       case 'stylesheet':
         this.setCloser(C_STYLESHEET, undefined);
@@ -1475,9 +1542,10 @@ export class RtfReader {
           this.skipRest();
           return true;
         }
-        const begin = this.fieldMark('begin', st.chp, st.rtl, undefined);
+        // A field in a group that was deleted or inserted has its marks in that change, like its text.
+        const begin = this.fieldMark('begin', st.chp, st.rtl, undefined, this.wrapper(st.chp));
         this.setCloser(C_FIELD, undefined);
-        this.fields.push({ separated: false, begin, separate: undefined, code: undefined, result: undefined });
+        this.fields.push({ separated: false, begin, separate: undefined, code: undefined, result: undefined, codeWrap: undefined, resultWrap: undefined });
         st.dest = D.D_FIELD;
         return true;
       }
@@ -1493,7 +1561,7 @@ export class RtfReader {
         const field = this.fields[this.fields.length - 1];
         if (field && !field.separated) {
           field.separated = true;
-          field.separate = this.fieldMark('separate', st.chp, st.rtl, undefined);
+          field.separate = this.fieldMark('separate', st.chp, st.rtl, undefined, this.wrapper(st.chp));
         }
         return true;
       }
@@ -1732,7 +1800,8 @@ export class RtfReader {
         // The mark that ends a field has the formatting of its result, or of its code when it has none; that of the
         // text around the field when it has neither.
         const parent = this.stack[this.depth - 1] || st;
-        this.fieldMark('end', parent.chp, parent.rtl, field ? field.result || field.code : undefined);
+        const text = field ? field.result || field.code : undefined;
+        this.fieldMark('end', parent.chp, parent.rtl, text, field && text ? (field.result ? field.resultWrap : field.codeWrap) : this.wrapper(parent.chp));
         return;
       }
       case C_NOTE: {
@@ -1815,6 +1884,14 @@ export class RtfReader {
       case C_COMMENT_AUTHOR:
         this.commentAuthor = this.collected().trim();
         return;
+      case C_REV_AUTHOR: {
+        // A name ends with a semicolon; a table that grows past its limit keeps the names it has.
+        let name = this.collected();
+        const end = name.lastIndexOf(';');
+        if (end >= 0) name = name.slice(0, end);
+        if (this.authors.length < MAX_AUTHORS) this.authors.push(name.trim().slice(0, 255));
+        return;
+      }
       case C_RANGE_START:
       case C_RANGE_END: {
         const key = this.collected().trim();

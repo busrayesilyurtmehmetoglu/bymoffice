@@ -58,7 +58,12 @@ import {
   type DocRelationship,
   type ImageRef,
   type Note,
+  type ParaProps,
+  type RevisionInfo,
+  type RowProps,
   type RunFonts,
+  type RunItem,
+  type RunProps,
   type Story,
   type StoryCollection,
   type Wrapper,
@@ -66,6 +71,7 @@ import {
 import type { OpcPackage } from '../../opc';
 import { parseXml, serializeXml, type XmlDocument, type XmlElement } from '../../xml';
 import { ZipArchive } from '../../zip';
+import { DEFAULT_AUTHOR, largestAnnotationId } from '../../ops/doc/track';
 import { resolveColor, resolveFont } from './resolve';
 import { decodePart } from './source';
 import type { BodyContext } from './write-body';
@@ -581,16 +587,182 @@ function withSeparators(collection: StoryCollection<Note> | undefined): StoryCol
   return { ...collection, items };
 }
 
+/** The ids given to tracked changes that had none, and how many were written under the stand-in author. */
+interface RevisionFill {
+  next: number;
+  defaulted: number;
+}
+
+/** The largest id a w:id may hold (a signed 32-bit number). */
+const MAX_REVISION_ID = 0x7fffffff;
+
+/** What is written for a tracked change the model holds without an id or an author: both, as the schema asks. */
+function completeRevision(info: RevisionInfo, fill: RevisionFill): { id: number; author: string } {
+  let id = info.id;
+  if (id === undefined) {
+    if (fill.next > MAX_REVISION_ID) throw new Error('Cannot write the document: it has no room for the ids of its tracked changes');
+    id = fill.next++;
+  }
+  let author = info.author;
+  if (author === undefined) {
+    author = DEFAULT_AUTHOR;
+    fill.defaulted++;
+  }
+  return { id, author };
+}
+
+const MARK_REVISIONS = ['inserted', 'deleted', 'moveFrom', 'moveTo'] as const;
+
+/** Mark or row properties whose tracked changes all have an id and an author; the object itself when they do already. */
+function completeProps<T extends RunProps | RowProps>(props: T, fill: RevisionFill): T {
+  let out: T | undefined;
+  for (const key of MARK_REVISIONS) {
+    const info = (props as RunProps)[key];
+    if (!info || (info.id !== undefined && info.author !== undefined)) continue;
+    if (!out) out = { ...props };
+    (out as RunProps)[key] = { ...info, ...completeRevision(info, fill) };
+  }
+  return out || props;
+}
+
+/** Tables in tables in text boxes that are followed; deeper ones are written as they are. */
+const MAX_FILL_DEPTH = 64;
+
+/**
+ * The blocks with an id and an author on every tracked change of a paragraph
+ * mark and of a table row (those of text boxes included). Property bags are
+ * shared between paragraphs, and an id is not: each paragraph and row whose
+ * change lacks one gets properties of its own. The list itself is returned
+ * when nothing was missing.
+ */
+function completeMarks(blocks: Block[], fill: RevisionFill, depth: number): Block[] {
+  if (depth > MAX_FILL_DEPTH) return blocks;
+  let out: Block[] | undefined;
+  const put = (index: number, block: Block): void => {
+    if (!out) out = blocks.slice();
+    out[index] = block;
+  };
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    if (block.type === 'paragraph') {
+      let props: ParaProps = block.props;
+      const mark = props.markProps;
+      if (mark) {
+        const filled = completeProps(mark, fill);
+        if (filled !== mark) props = { ...props, markProps: filled };
+      }
+      let children = block.children;
+      for (let c = 0; c < block.children.length; c++) {
+        const inline = block.children[c];
+        if (inline.type !== 'run') continue;
+        let content: RunItem[] | undefined;
+        for (let k = 0; k < inline.content.length; k++) {
+          const item = inline.content[k] as RunItem & { textBoxes?: Block[][] };
+          if (!item.textBoxes) continue;
+          let boxes: Block[][] | undefined;
+          for (let b = 0; b < item.textBoxes.length; b++) {
+            const inner = completeMarks(item.textBoxes[b], fill, depth + 1);
+            if (inner === item.textBoxes[b]) continue;
+            if (!boxes) boxes = item.textBoxes.slice();
+            boxes[b] = inner;
+          }
+          if (!boxes) continue;
+          if (!content) content = inline.content.slice();
+          content[k] = { ...item, textBoxes: boxes } as RunItem;
+        }
+        if (!content) continue;
+        if (children === block.children) children = block.children.slice();
+        children[c] = { ...inline, content };
+      }
+      if (props !== block.props || children !== block.children) put(i, { ...block, props, children });
+    } else if (block.type === 'table') {
+      let rows = block.rows;
+      for (let r = 0; r < block.rows.length; r++) {
+        const row = block.rows[r];
+        const props = completeProps(row.props, fill);
+        let cells = row.cells;
+        for (let c = 0; c < row.cells.length; c++) {
+          const inner = completeMarks(row.cells[c].blocks, fill, depth + 1);
+          if (inner === row.cells[c].blocks) continue;
+          if (cells === row.cells) cells = row.cells.slice();
+          cells[c] = { ...row.cells[c], blocks: inner };
+        }
+        if (props === row.props && cells === row.cells) continue;
+        if (rows === block.rows) rows = block.rows.slice();
+        rows[r] = { ...row, props, cells };
+      }
+      if (rows !== block.rows) put(i, { ...block, rows });
+    }
+  }
+  return out || blocks;
+}
+
+/** A story with completeMarks() applied to its blocks; the story itself when nothing was missing. */
+function completeStory<T extends { blocks: Block[] }>(story: T, fill: RevisionFill): T {
+  const blocks = completeMarks(story.blocks, fill, 0);
+  return blocks === story.blocks ? story : { ...story, blocks };
+}
+
+function completeCollection<T extends { blocks: Block[] }>(collection: StoryCollection<T> | undefined, fill: RevisionFill): StoryCollection<T> | undefined {
+  if (!collection) return undefined;
+  let items: Map<number, T> | undefined;
+  for (const [id, item] of collection.items) {
+    const filled = completeStory(item, fill);
+    if (filled === item) continue;
+    if (!items) items = new Map(collection.items);
+    items.set(id, filled);
+  }
+  return items ? { ...collection, items } : collection;
+}
+
+/**
+ * The model with an id and an author on every tracked change of a paragraph
+ * mark and of a table row. A header that several sections share stays one
+ * story. The model itself when nothing was missing (as for every model read
+ * from a docx that Word wrote).
+ */
+function withCompleteMarks(doc: DocModel, fill: RevisionFill): DocModel {
+  const body = completeStory(doc.body, fill);
+  const shared = new Map<Story, Story>();
+  const stories = (map: Map<string, Story>): Map<string, Story> => {
+    let out: Map<string, Story> | undefined;
+    for (const [id, story] of map) {
+      let filled = shared.get(story);
+      if (!filled) shared.set(story, (filled = completeStory(story, fill)));
+      if (filled === story) continue;
+      if (!out) out = new Map(map);
+      out.set(id, filled);
+    }
+    return out || map;
+  };
+  const headers = stories(doc.headers);
+  const footers = stories(doc.footers);
+  const footnotes = completeCollection(doc.footnotes, fill);
+  const endnotes = completeCollection(doc.endnotes, fill);
+  const comments = completeCollection(doc.comments, fill);
+  if (body === doc.body && headers === doc.headers && footers === doc.footers && footnotes === doc.footnotes && endnotes === doc.endnotes && comments === doc.comments) return doc;
+  const out: DocModel = { ...doc, body, headers, footers };
+  if (footnotes) out.footnotes = footnotes;
+  if (endnotes) out.endnotes = endnotes;
+  if (comments) out.comments = comments;
+  return out;
+}
+
 /**
  * A new docx package with the content of the model. Meant for models read
  * from binary doc and RTF files, which have no package; a model read from a
  * docx file can be given too, with `options.pictures` for its images.
  */
-export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): Promise<Uint8Array> {
+export async function buildDocx(model: DocModel, options: BuildDocxOptions = {}): Promise<Uint8Array> {
   const report = options.report;
   const warn = (text: string) => {
     if (report) report.warnings.push(text);
   };
+  // Tracked changes of a doc or RTF file have no ids, and not always an author; the schema asks for both. The
+  // ids go on from the largest one the model has, first to the marks of paragraphs and rows, then to the
+  // elements around runs as they are written.
+  const revisions: RevisionFill = { next: largestAnnotationId(model) + 1, defaulted: 0 };
+  const doc = withCompleteMarks(model, revisions);
   const strict = doc.strict;
   const ns = strict ? STRICT_NS : TRANSITIONAL_NS;
   const rootAttrs = generatedRootAttrs(strict);
@@ -717,6 +889,7 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
     ctx.color = color;
     ctx.fonts = fonts;
     ctx.generated = lost;
+    ctx.revision = (info) => completeRevision(info, revisions);
     ctx.headerRef = (list, id) => headerIds.get(list + '\n' + id);
     ctx.image = (ref: ImageRef): string | undefined => {
       if (story.rootName !== '' && rels.has(ref.rId)) return ref.rId;
@@ -814,6 +987,7 @@ export async function buildDocx(doc: DocModel, options: BuildDocxOptions = {}): 
     if (lost.groups) warn(`${lost.groups} group(s) of shapes were written with every part over the whole area of the group, without outlines and fills`);
     if (lost.pictures) warn(`${lost.pictures} picture(s) whose data is not available were written as empty frames`);
     if (lost.links) warn(`${lost.links} link(s) with an address that is not followed were written as plain text`);
+    if (revisions.defaulted) warn(`${revisions.defaulted} tracked change(s) were carried over without their authors: they are written under the name "${DEFAULT_AUTHOR}"`);
     if (lost.theme) warn('The theme was not carried over: theme colours and theme fonts were written as the plain values they stand for');
     for (const name of zip.names()) report.parts.push('/' + name);
   }
