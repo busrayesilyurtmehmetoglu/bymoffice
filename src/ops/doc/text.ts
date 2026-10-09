@@ -4,7 +4,7 @@
 
 import { paragraphText, EMPTY_PARA_PROPS, type Block, type CellProps, type DocModel, type ParaProps, type Paragraph, type RunItem, type RunProps, type Table, type TableCell, type TableRow, type Wrapper } from '../../model/doc/types';
 import { buildEdit, tableContextOf, type DocEdit, type DocEditOptions, type Draft } from './draft';
-import { TRACK_UNSUPPORTED, afterCut, insertionLike, insertionWrap, isDeletedMark, isOwnMark, joinsWithoutLoss, strikePieces, withFreshChanges, withMarkFlagsOf, withMarkRevision, withPlainMark, type Tracking } from './track';
+import { TRACK_UNSUPPORTED, afterCut, insertionLike, insertionWrap, isDeletedMark, isOwnMark, joinsWithoutLoss, plainProps, strikePieces, withFreshChanges, withMarkFlagsOf, withMarkRevision, withMarkRevisionsOf, withPlainMark, type Tracking } from './track';
 import { inList, patchRunProps, withoutNumbering, type RunFormatPatch } from './format';
 import {
   atomFollows,
@@ -67,18 +67,39 @@ export function withoutSection(props: ParaProps): ParaProps {
 }
 
 /**
+ * Properties of the paragraph an edit that is not tracked ends where there was no end before:
+ * the first half of a paragraph that is cut in two. It is formatted like the paragraph, ends no
+ * section, and its mark is nobody's revision: what the mark of the paragraph says of itself as
+ * a tracked change (inserted, deleted, moved), the records of changed formatting (of the
+ * paragraph, of its mark) and the tracked changes in what the properties keep as XML (a changed
+ * list number) all stay with the half that keeps the mark the file had, which is the second.
+ * Otherwise one change of the file would be two in the list, and rejecting or accepting it
+ * would undo what the user did.
+ */
+export function newMarkProps(props: ParaProps): ParaProps {
+  const out = plainProps(withoutSection(props));
+  return Object.keys(out).length ? out : EMPTY_PARA_PROPS;
+}
+
+/**
  * Properties of the paragraph two paragraphs become when the mark between
  * them goes. UNSURE: in the file format the surviving mark is the second
  * one, and old versions of Word gave the joined paragraph its formatting;
  * current Word keeps the formatting of the first paragraph unless that one is
  * empty. That is the rule here. The section break of the second paragraph
  * always stays: it is the end of the joined paragraph.
+ *
+ * Whatever the formatting, the mark that stays is the second one, and what a
+ * mark says of itself as a tracked change is no formatting: the joined
+ * paragraph has the revisions of the mark of the second paragraph (inserted,
+ * deleted, moved, and the record of a change of the formatting of the mark).
+ * Those of the first mark go with it; the user removed that mark.
  */
 export function joinedProps(first: Paragraph, last: Paragraph): ParaProps {
   if (paragraphLength(first) === 0) return last.props;
   const section = last.props.section;
   const base = withoutSection(first.props);
-  return section === undefined ? base : { ...base, section };
+  return withMarkRevisionsOf(section === undefined ? base : { ...base, section }, last.props);
 }
 
 /**
@@ -546,7 +567,7 @@ function insertAt(draft: Draft, position: DocPosition, text: string, format: Run
     return sided(doc, { story, path: position.path.slice(), offset: offset + lines[0].length }, side);
   }
   // Every line but the last ends a paragraph formatted like this one; the section break stays with the last.
-  const inner = withoutSection(paragraph.props);
+  const inner = newMarkProps(paragraph.props);
   const out: Block[] = [paragraphWith(paragraph, rebuild(head), inner)];
   for (let i = 1; i < lines.length - 1; i++) out.push(paragraphWith(paragraph, rebuild(textPieces(lines[i], props, wrap, {})), inner, false));
   const lastLine = lines[lines.length - 1];
@@ -879,13 +900,15 @@ export function splitParagraph(doc: DocModel, position: DocPosition, options?: D
         second = next.id === styles.defaultIds.paragraph ? {} : { style: next.id };
         if (paragraph.props.section) second.section = paragraph.props.section;
         if (Object.keys(second).length === 0) second = EMPTY_PARA_PROPS;
+        // The mark at the end is still the one the paragraph had: what it says of itself as a tracked change stays.
+        second = withMarkRevisionsOf(second, paragraph.props);
       }
     }
     const container = position.path.slice(0, -1);
     const blockIndex = position.path[position.path.length - 1];
     // The second half is a new paragraph: it does not take the identity (w14:paraId) of the first.
     draft.replace(position.story, container, blockIndex, 1, [
-      paragraphWith(paragraph, rebuild(pieces.slice(0, index)), withoutSection(paragraph.props)),
+      paragraphWith(paragraph, rebuild(pieces.slice(0, index)), newMarkProps(paragraph.props)),
       paragraphWith(paragraph, rebuild(pieces.slice(index)), second, false),
     ]);
     return sided(doc, { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 }, position.before === true);
@@ -924,7 +947,7 @@ export function insertPageBreak(doc: DocModel, position: DocPosition, options?: 
     const blockIndex = position.path[position.path.length - 1];
     const firstProps = withoutSection(paragraph.props);
     draft.replace(position.story, container, blockIndex, 1, [
-      paragraphWith(paragraph, rebuild(head), track ? withMarkRevision(withFreshChanges(withPlainMark(firstProps), track), 'inserted', track.revision()) : firstProps),
+      paragraphWith(paragraph, rebuild(head), track ? withMarkRevision(withFreshChanges(withPlainMark(firstProps), track), 'inserted', track.revision()) : newMarkProps(firstProps)),
       paragraphWith(paragraph, rebuild(track ? afterCut(head, pieces.slice(index), track) : pieces.slice(index)), paragraph.props, false),
     ]);
     return sided(doc, { story: position.story, path: container.concat([blockIndex + 1]), offset: 0 }, position.before === true);
@@ -957,7 +980,7 @@ export function placeBlock(draft: Draft, position: DocPosition, block: Block): n
     const pieces = flatten(at.paragraph);
     const cut = caretIndex(pieces, position);
     draft.replace(position.story, container, index, 1, [
-      paragraphWith(at.paragraph, rebuild(pieces.slice(0, cut)), withoutSection(at.paragraph.props)),
+      paragraphWith(at.paragraph, rebuild(pieces.slice(0, cut)), newMarkProps(at.paragraph.props)),
       paragraphWith(at.paragraph, rebuild(pieces.slice(cut)), at.paragraph.props, false),
     ]);
     index++;

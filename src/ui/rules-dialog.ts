@@ -685,6 +685,7 @@ export class Dialog {
   private primary: (() => void) | undefined;
   private invalid: HTMLElement | undefined;
   private closed = false;
+  private pristine: string | undefined;
 
   constructor(options: DialogOptions) {
     this.onClose = options.onClose;
@@ -875,6 +876,32 @@ export class Dialog {
     if (!this.closed && this.primary) this.primary();
   }
 
+  /** What every field of the dialog holds, as one text: equal for two moments exactly when no field differs. */
+  private fieldState(): string {
+    const fields = this.panel.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input, select, textarea');
+    let out = '';
+    for (let i = 0; i < fields.length; i++) {
+      const field = fields[i];
+      const checked = field instanceof HTMLInputElement && (field.type === 'checkbox' || field.type === 'radio') ? (field.checked ? '1' : '0') : '';
+      out += `${field.value.length}:${field.value}${checked}\u0001`;
+    }
+    return out;
+  }
+
+  /** Remembers what the fields hold now as what the dialog was opened with (see `changed`). */
+  markPristine(): void {
+    this.pristine = this.fieldState();
+  }
+
+  /**
+   * Whether a field of the dialog holds something else than when it was opened. A dialog
+   * with OK and Cancel in which nothing was changed can be closed by whoever needs the
+   * workbook as it stands; one with changes is the user's to confirm or to give up.
+   */
+  get changed(): boolean {
+    return !this.closed && this.pristine !== undefined && this.fieldState() !== this.pristine;
+  }
+
   private focusable(): HTMLElement[] {
     const found = this.panel.querySelectorAll<HTMLElement>('button, input, select, textarea, [tabindex]');
     const out: HTMLElement[] = [];
@@ -1053,6 +1080,7 @@ export class ValidationDialog {
     dialog.addAction(strings.cancel, () => dialog.close()).setAttribute('data-bym-action', 'cancel');
     dialog.addAction(strings.ok, () => attempt(() => options.onApply(this.fields())), 'primary').setAttribute('data-bym-action', 'ok');
     dialog.focusFirst();
+    dialog.markPristine();
   }
 
   /** What the fields hold now. */
@@ -1233,6 +1261,7 @@ export class ConditionalDialog {
     const first = controls[options.focus !== undefined ? options.focus : firstFieldOf(options.fields.type)];
     if (first && first.getClientRects().length > 0) first.focus({ preventScroll: true });
     else dialog.focusFirst();
+    dialog.markPristine();
   }
 
   /** What the fields hold now. */
@@ -1317,10 +1346,12 @@ export interface ConditionalManagerOptions {
   scope: 'selection' | 'sheet';
   coarse?: boolean;
   /**
-   * The rules to show, in the order they are applied in (no more than MAX_MANAGER_ROWS of
-   * them), and how many there are in all; asked again after every change.
+   * The rules to show, in the order they are applied in: those from place `from` on (no more
+   * than MAX_MANAGER_ROWS of them), how many there are in all, and the rule right before and
+   * right after the ones shown (what the first can be moved above and the last below); asked
+   * again after every change.
    */
-  rows(scope: 'selection' | 'sheet'): { rows: ManagerRow[]; total: number };
+  rows(scope: 'selection' | 'sheet', from: number): { rows: ManagerRow[]; total: number; before?: ManagerRow; after?: ManagerRow };
   /** Each changes the workbook at once, as one undo step; an error is shown in the dialog. */
   onMove(index: number, to: number): void;
   onRanges(index: number, ranges: string): void;
@@ -1333,6 +1364,22 @@ export interface ConditionalManagerOptions {
   onClose(): void;
 }
 
+/**
+ * Which of `total` rules a list shows that begins at place `from` and shows `size` at a time:
+ * the place it really begins at (a multiple of `size`, and one a rule is at unless there is
+ * none), where it ends, and where the lists before and after it begin (undefined: there is none).
+ */
+export function managerPage(total: number, from: number, size: number = MAX_MANAGER_ROWS): { from: number; to: number; previous?: number; next?: number } {
+  const count = total > 0 && total === Math.floor(total) ? total : 0;
+  const step = size >= 1 ? Math.floor(size) : 1;
+  let start = from > 0 && from === from ? Math.floor(from / step) * step : 0;
+  if (start >= count) start = count > 0 ? Math.floor((count - 1) / step) * step : 0;
+  const out: { from: number; to: number; previous?: number; next?: number } = { from: start, to: Math.min(start + step, count) };
+  if (start > 0) out.previous = start - step;
+  if (out.to < count) out.next = out.to;
+  return out;
+}
+
 /** The list of the conditional rules of the selection or the sheet: their order, their cells, and the way to each rule's own dialog. */
 export class ConditionalManager {
   readonly dialog: Dialog;
@@ -1340,6 +1387,8 @@ export class ConditionalManager {
   private readonly scope: HTMLSelectElement;
   private readonly list: HTMLDivElement;
   private shown: ManagerRow[] = [];
+  /** The place of the first rule shown: the list shows MAX_MANAGER_ROWS at a time. */
+  private from = 0;
 
   constructor(options: ConditionalManagerOptions) {
     this.options = options;
@@ -1353,7 +1402,10 @@ export class ConditionalManager {
     ]);
     scope.value = options.scope;
     dialog.addField(dialog.body, strings.showRulesFor, scope, 'scope');
-    scope.addEventListener('change', () => this.render());
+    scope.addEventListener('change', () => {
+      this.from = 0;
+      this.render();
+    });
     this.scope = scope;
     const list = document.createElement('div');
     list.className = 'bym-dialog-rules';
@@ -1372,6 +1424,18 @@ export class ConditionalManager {
     const active = root.activeElement as HTMLInputElement | null;
     if (active && active.getAttribute('data-bym-field') === 'ranges' && this.list.contains(active) && !this.applyRanges(active)) return;
     this.dialog.close();
+  }
+
+  /** Whether cells were typed for a rule of the list and not applied yet (they are applied when their field is left). */
+  get pending(): boolean {
+    if (!this.dialog.isOpen) return false;
+    const fields = this.list.querySelectorAll<HTMLInputElement>('input[data-bym-field="ranges"]');
+    for (let i = 0; i < fields.length; i++) {
+      const index = Number(fields[i].getAttribute('data-bym-index'));
+      const row = this.shown.filter((item) => item.index === index)[0];
+      if (row && !fields[i].readOnly && fields[i].value !== row.ranges) return true;
+    }
+    return false;
   }
 
   private scopeValue(): 'selection' | 'sheet' {
@@ -1408,7 +1472,14 @@ export class ConditionalManager {
   /** Lists the rules again; `focus` names the control that keeps the focus, by the rule it belongs to. */
   private render(focus?: { index: number; action: string }): void {
     const strings = this.options.strings;
-    const found = this.options.rows(this.scopeValue());
+    let found = this.options.rows(this.scopeValue(), this.from);
+    let page = managerPage(found.total, this.from);
+    if (page.from !== this.from) {
+      // The rules the list began at are gone (deleted, or no longer of the selection): the last ones there are.
+      this.from = page.from;
+      found = this.options.rows(this.scopeValue(), this.from);
+      page = managerPage(found.total, this.from);
+    }
     const rows = found.rows.length > MAX_MANAGER_ROWS ? found.rows.slice(0, MAX_MANAGER_ROWS) : found.rows;
     this.shown = rows;
     const list = this.list;
@@ -1475,13 +1546,14 @@ export class ConditionalManager {
         if (focus && focus.index === row.index && focus.action === name) target = el;
         return el;
       };
-      const before = rows[at - 1];
-      const after = rows[at + 1];
+      // The first and the last rule shown have their neighbours in the lists before and after.
+      const before = at > 0 ? rows[at - 1] : found.before;
+      const after = at < rows.length - 1 ? rows[at + 1] : found.after;
       button('up', strings.moveUp, row.movable && !!before && before.movable, () => {
-        if (this.attempt(() => this.options.onMove(row.index, before.index))) this.render({ index: before.index, action: 'up' });
+        if (before && this.attempt(() => this.options.onMove(row.index, before.index))) this.render({ index: before.index, action: 'up' });
       }, '\u2191');
       button('down', strings.moveDown, row.movable && !!after && after.movable, () => {
-        if (this.attempt(() => this.options.onMove(row.index, after.index))) this.render({ index: after.index, action: 'down' });
+        if (after && this.attempt(() => this.options.onMove(row.index, after.index))) this.render({ index: after.index, action: 'down' });
       }, '\u2193');
       button('edit', strings.edit, row.editable, () => this.leave(() => this.options.onEdit(row.index, this.scopeValue())));
       button('delete', strings.deleteRule, row.removable, () => {
@@ -1493,11 +1565,37 @@ export class ConditionalManager {
       if (focus && focus.index === row.index && focus.action === 'stopIfTrue') target = stop;
     });
     if (found.total > rows.length) {
+      // More rules than one list holds: which of them these are, and the way to the others.
       const more = document.createElement('div');
       more.className = 'bym-dialog-hint';
       more.setAttribute('data-bym-field', 'more');
-      more.textContent = strings.moreRules(found.total - rows.length);
+      more.textContent = strings.rulesShown(this.from + 1, this.from + rows.length, found.total);
       list.appendChild(more);
+      const turn = document.createElement('div');
+      turn.className = 'bym-dialog-rule-tools';
+      const pageButton = (name: string, label: string, to: number | undefined) => {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.className = 'bym-dialog-button';
+        el.textContent = label;
+        el.setAttribute('data-bym-action', name);
+        el.disabled = to === undefined;
+        el.addEventListener('click', () => {
+          if (to === undefined) return;
+          // Cells typed for a rule of this list are applied before it is left; what cannot be applied keeps it.
+          const fields = list.querySelectorAll<HTMLInputElement>('input[data-bym-field="ranges"]');
+          for (let i = 0; i < fields.length; i++) if (!this.applyRanges(fields[i])) return;
+          this.dialog.showError('');
+          this.from = to;
+          this.render({ index: -1, action: name });
+        });
+        turn.appendChild(el);
+        if (focus && focus.action === name) target = el;
+      };
+      pageButton('previous-page', strings.previousRules(MAX_MANAGER_ROWS), page.previous);
+      pageButton('next-page', strings.nextRules(Math.min(MAX_MANAGER_ROWS, found.total - page.to)), page.next);
+      list.appendChild(turn);
+      this.list.scrollTop = 0;
     }
     if (!focus) return;
     // The control that was used keeps the focus where it can; else the dialog still has it.

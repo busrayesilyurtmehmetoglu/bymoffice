@@ -9,7 +9,7 @@
 
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { MAX_COLS, MAX_ROWS, cellName, columnName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { resolveUiStrings, type UiStrings } from './strings';
@@ -67,7 +67,7 @@ import {
   ConditionalManager,
   DIALOG_STYLE,
   FieldError,
-  MAX_MANAGER_ROWS,
+  managerPage,
   ValidationDialog,
   validationChange,
   conditionalFields,
@@ -682,6 +682,21 @@ function resolveLocale(locale: string | FormatLocale | undefined): FormatLocale 
   return getLocale(locale !== undefined ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
 }
 
+
+/**
+ * Whether a copy of cells taken when the sheets had the names `namesThen` (folded, see
+ * foldSheetName()) no longer fits the workbook: a sheet of then is gone or has another name,
+ * so a formula of the copy may name what is not there any more. Sheets that were added, moved,
+ * hidden or coloured since change nothing the copy says. True for a copy nothing is known of.
+ */
+export function copyOutdated(namesThen: readonly string[] | undefined, sheets: readonly { name: string }[]): boolean {
+  if (!namesThen) return true;
+  const now = new Set<string>();
+  for (const sheet of sheets) now.add(foldSheetName(sheet.name));
+  for (const name of namesThen) if (!now.has(name)) return true;
+  return false;
+}
+
 /**
  * Column width in pixels -> the width in characters a file stores for it: the
  * inverse of columnWidthToPixels(), in the 1/256 steps files use.
@@ -809,7 +824,15 @@ export class WorkbookView {
   /** The note being typed: a field in the place of the box that shows the note of its cell. */
   private noteEdit: { sheet: Sheet; row: number; col: number; box: HTMLDivElement; input: HTMLTextAreaElement; original: string; busy: boolean } | undefined;
   /** The dialog that is open over the view (data validation, conditional formats), with the sheet it is about. */
-  private rulesDialog: { sheet: Sheet; submit(): void; close(): void } | undefined;
+  /**
+   * The dialog of rules that is open: `changed` says whether the user changed anything in it since it was
+   * opened (for the list of rules: typed cells for a rule that are not applied yet), `say` shows a message in it.
+   */
+  private rulesDialog: { sheet: Sheet; submit(): void; close(): void; changed(): boolean; say(message: string): void } | undefined;
+  /** Set while a dialog of rules applies its own change: the one change that does not have to settle the dialog first. */
+  private applyingRules = false;
+  /** The names (folded) the sheets had when the selection was last copied: see copyOutdated(). */
+  private copiedNames: string[] | undefined;
   /** Set while a dialog is closed by the view itself: it then does not hand over to the dialog it was opened from. */
   private leavingDialog = false;
   /** Sheets about which it was said that some of their drawings or comments are not shown. */
@@ -1707,9 +1730,14 @@ export class WorkbookView {
     this.hoverComment = undefined;
     // The marks are kept by the index of their sheet.
     this.marksDirty = true;
-    // What was copied holds formulas that name sheets as they were: a paste takes the text instead.
-    this.copied = undefined;
-    this.copyId = '';
+    // What was copied holds formulas that name sheets as they were: once a sheet of then is gone or has another
+    // name, a paste takes the text instead. A sheet that only moved, was hidden, coloured, added or copied changes
+    // nothing a copied formula says, and the copy stays what it is.
+    if (copyOutdated(this.copiedNames, sheets)) {
+      this.copied = undefined;
+      this.copiedNames = undefined;
+      this.copyId = '';
+    }
     this.sheetIndex = index;
     this.shown = sheets[index];
     if (kind === 'rename') {
@@ -3356,13 +3384,13 @@ export class WorkbookView {
    * Sets the data validation of a range of the shown sheet, as one undo step: afterwards
    * `rule` is the rule of every cell of the range. The cells are taken out of the rules they
    * were in, which stay for their other cells. Without a rule (undefined, or "any value" with
-   * no input message) the cells are left without one. What is being typed is applied first.
-   * Does nothing in a read-only view. Throws RangeError for a rule that cannot be stated (see
+   * no input message) the cells are left without one. What is being typed is applied first;
+   * nothing is done while that cannot be applied, or while a dialog of rules is open in which
+   * something was changed (see commitPending()). Does nothing in a read-only view. Throws RangeError for a rule that cannot be stated (see
    * setValidation() of the operations) and for cells under a rule of the extension list.
    */
   setValidation(range: CellRange, rule: ValidationSettings | undefined): void {
     if (this.destroyed || this.locked) return;
-    if (this.rulesDialog) this.rulesDialog.close();
     if (!this.commitPending()) return;
     this.applyOps(setValidationOps(this.workbook, this.sheetIndex, range, rule));
   }
@@ -3381,6 +3409,8 @@ export class WorkbookView {
       this.notify(this.strings.rules.formulaBeingTyped, 'error');
       return false;
     }
+    // A tab that is being dragged is let go where it was: the dialog takes every pointer from here on.
+    this.endTabDrag();
     this.closeMenu();
     if (!this.tryCommit()) return false;
     this.finishRename(true);
@@ -3407,7 +3437,7 @@ export class WorkbookView {
       // The dialog belongs to the sheet it was opened on.
       if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
       const had = validationsIn(this.workbook, this.sheetIndex, range).length > 0;
-      const done = this.applyOps(setValidationOps(this.workbook, this.sheetIndex, range, rule));
+      const done = this.applyFromDialog(setValidationOps(this.workbook, this.sheetIndex, range, rule));
       if (!done) return;
       const left = validationsIn(this.workbook, this.sheetIndex, range).length > 0;
       this.live.textContent = left ? strings.rules.validationSet : had ? strings.rules.validationCleared : '';
@@ -3435,7 +3465,7 @@ export class WorkbookView {
         if (!this.destroyed) this.focusInput(true);
       },
     });
-    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => dialog.dialog.close() };
+    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => dialog.dialog.close(), changed: () => dialog.dialog.changed, say: (message) => dialog.dialog.showError(message) };
     return true;
   }
 
@@ -3500,10 +3530,12 @@ export class WorkbookView {
     this.applyOps(clearConditionalRulesOps(this.workbook, this.sheetIndex, range));
   }
 
-  /** What every command on rules starts with: nothing in a read-only view, no dialog left open, what is typed applied. */
+  /**
+   * What every command on rules starts with: nothing in a read-only view, what is typed applied, and no dialog
+   * of rules left open - one in which nothing was changed is closed, one with changes refuses the command.
+   */
   private beginRules(): boolean {
     if (this.destroyed || this.locked) return false;
-    if (this.rulesDialog) this.rulesDialog.close();
     return this.commitPending();
   }
 
@@ -3531,6 +3563,8 @@ export class WorkbookView {
       this.notify(this.strings.rules.formulaBeingTyped, 'error');
       return false;
     }
+    // A tab that is being dragged is let go where it was: the dialog takes every pointer from here on.
+    this.endTabDrag();
     this.closeMenu();
     if (!this.tryCommit()) return false;
     this.finishRename(true);
@@ -3542,7 +3576,18 @@ export class WorkbookView {
   private applyRules(sheet: Sheet, ops: Op[], said: string): void {
     // A dialog belongs to the sheet it was opened on.
     if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
-    if (this.applyOps(ops)) this.live.textContent = said;
+    if (this.applyFromDialog(ops)) this.live.textContent = said;
+  }
+
+  /** applyOps() for the dialog of rules that is open: its own change is the one that does not have to settle it first. */
+  private applyFromDialog(ops: Op[]): boolean {
+    const nested = this.applyingRules;
+    this.applyingRules = true;
+    try {
+      return this.applyOps(ops);
+    } finally {
+      this.applyingRules = nested;
+    }
   }
 
   /** The dialog of one rule: a new one of the kind `what` names, or the rule at that index. `back` is the list to come back to. */
@@ -3600,7 +3645,7 @@ export class WorkbookView {
         else this.focusInput(true);
       },
     });
-    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => this.dismiss(() => dialog.dialog.close()) };
+    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => this.dismiss(() => dialog.dialog.close()), changed: () => dialog.dialog.changed, say: (message) => dialog.dialog.showError(message) };
     return true;
   }
 
@@ -3629,12 +3674,12 @@ export class WorkbookView {
     const range = { ...state.range };
     const strings = this.strings;
     const date1904 = this.workbook.date1904 === true;
-    const rows = (shown: 'selection' | 'sheet'): { rows: ManagerRow[]; total: number } => {
+    const rows = (shown: 'selection' | 'sheet', from: number): { rows: ManagerRow[]; total: number; before?: ManagerRow; after?: ManagerRow } => {
       if (this.workbook.sheets[this.sheetIndex] !== sheet) return { rows: [], total: 0 };
       const listed = conditionalRulesOf(this.workbook, this.sheetIndex, shown === 'selection' ? range : undefined);
-      // No more rows than a list can be worked with: the rest is counted.
-      const first = listed.length > MAX_MANAGER_ROWS ? listed.slice(0, MAX_MANAGER_ROWS) : listed;
-      const made = first.map((info): ManagerRow => {
+      // No more rows than a list can be worked with at a time: the list shows them in runs of that many.
+      const page = managerPage(listed.length, from);
+      const row = (info: ConditionalRuleInfo): ManagerRow => {
         // A rule only a newer Excel states is not touched; one it states more about keeps what it says, and can go or go elsewhere.
         const kept = info.rule.extended === true;
         const paired = !kept && info.rule.extId !== undefined;
@@ -3649,8 +3694,12 @@ export class WorkbookView {
           adjustable: !kept,
           reason: kept ? strings.rules.extensionRuleKept : paired ? strings.rules.extensionRuleSays : !info.movable ? strings.rules.orderFixed : !info.editable ? strings.rules.ruleKindKept : undefined,
         };
-      });
-      return { rows: made, total: listed.length };
+      };
+      const out: { rows: ManagerRow[]; total: number; before?: ManagerRow; after?: ManagerRow } = { rows: listed.slice(page.from, page.to).map(row), total: listed.length };
+      // The neighbours of the first and the last rule shown: what they can be moved above and below.
+      if (page.from > 0) out.before = row(listed[page.from - 1]);
+      if (page.to < listed.length) out.after = row(listed[page.to]);
+      return out;
     };
     const manager = new ConditionalManager({
       parent: this.options.focusScope || this.root,
@@ -3675,7 +3724,7 @@ export class WorkbookView {
         if (!this.destroyed) this.focusInput(true);
       },
     });
-    this.rulesDialog = { sheet, submit: () => manager.submit(), close: () => manager.dialog.close() };
+    this.rulesDialog = { sheet, submit: () => manager.submit(), close: () => manager.dialog.close(), changed: () => manager.pending, say: (message) => manager.dialog.showError(message) };
     return true;
   }
 
@@ -3963,6 +4012,8 @@ export class WorkbookView {
     const state = this.state();
     const sheet = state.sheet;
     if (sheet.kind !== 'worksheet') return;
+    // A dialog of rules with changes is not given up for this: the command is refused (see settleDialog()).
+    if (!this.settleDialog()) return;
     this.closeMenu();
     if (sheet.autoFilter) {
       this.applyOps(setAutoFilter(this.workbook, this.sheetIndex, undefined));
@@ -3987,6 +4038,8 @@ export class WorkbookView {
     const state = this.state();
     const sheet = state.sheet;
     if (sheet.kind !== 'worksheet') return;
+    // A dialog of rules with changes is not given up for this: the command is refused (see settleDialog()).
+    if (!this.settleDialog()) return;
     this.closeMenu();
     const { active } = state;
     const filter = sheet.autoFilter;
@@ -4689,28 +4742,47 @@ export class WorkbookView {
   /**
    * Applies everything that is being typed in the view, as leaving it would: the cell that is
    * edited, the note in its field, the name of a sheet in its tab. For whoever is about to take
-   * the workbook as it stands (to save it, to print it): mount().save() and the bridge call it.
+   * the workbook as it stands (to save it, to print it) or to change it from outside:
+   * mount().save() and the bridge call it, and so does every method of the view that changes
+   * the workbook.
    *
    * Returns true when nothing is left open. A cell whose text cannot be written throws, as
    * commitEditing() does, and the editor stays open. A note or a name that cannot be taken is
    * said (in the live region and to onNotice), its field stays open with what was typed, and
    * the answer is false: the workbook is then not what the user sees, and is not to be saved.
-   * A dialog of rules that is open is applied the way its OK button applies it; fields it
-   * cannot take are said in the dialog, which stays open, and the answer is false as well.
+   *
+   * A dialog of rules (data validation, a conditional format, the list of rules) is no field
+   * that is being typed: it has OK and Cancel, and what it holds is the user's to confirm. One
+   * in which nothing was changed since it was opened is closed, as Cancel closes it. One with
+   * changes stays open, nothing of it is applied, that is said (in the dialog, in the live
+   * region and to onNotice), and the answer is false.
    */
   commitPending(): boolean {
     if (this.destroyed) return true;
     if (this.edit) this.commitEditing();
     if (this.renaming) this.finishRename(true);
     if (this.noteEdit) this.finishNote(true);
-    // A dialog that is open is applied as its OK button applies it, and nothing takes its place (the dialog of a
-    // rule does not hand back to the list it was opened from); what it cannot take keeps it open. The list of
-    // rules has nothing waiting - each of its changes was applied as it was made - but the cells being typed.
-    if (this.rulesDialog) {
-      const open = this.rulesDialog;
-      this.dismiss(() => open.submit());
+    const settled = this.settleDialog();
+    return settled && !this.edit && !this.renaming && !this.noteEdit;
+  }
+
+  /**
+   * What is done about a dialog of rules that is open when the workbook is about to be taken or changed from
+   * outside the dialog: closed when nothing was changed in it, left open and said otherwise (see commitPending()).
+   * Returns whether no dialog is open afterwards.
+   */
+  private settleDialog(): boolean {
+    const open = this.rulesDialog;
+    if (!open) return true;
+    if (open.changed()) {
+      const message = this.strings.rules.dialogOpen;
+      open.say(message);
+      this.notify(message, 'error');
+      return false;
     }
-    return !this.edit && !this.renaming && !this.noteEdit && !this.rulesDialog;
+    // It does not hand back to the list it was opened from.
+    this.dismiss(() => open.close());
+    return !this.rulesDialog;
   }
 
   /** commitEditing() for keys, pointers and focus changes: a failure is announced and reported as false. */
@@ -4774,7 +4846,8 @@ export class WorkbookView {
    * steps before it are out of reach until the edit is over. While a note or
    * the name of a sheet is typed in its field it applies what was typed and
    * does nothing else (true; the next call undoes that); false when it cannot
-   * be applied, and the field stays open. redo() does the same.
+   * be applied, and the field stays open. While a dialog of rules is open it
+   * does nothing at all (false). redo() does the same.
    */
   undo(): boolean {
     return this.travel(false);
@@ -4792,6 +4865,7 @@ export class WorkbookView {
     this.copyId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     const copied = { ...plain, html: plain.html.replace('<table>', `<table data-bym-copy="${this.copyId}">`) };
     this.copied = copied;
+    this.copiedNames = this.workbook.sheets.map((sheet) => foldSheetName(sheet.name));
     return copied;
   }
 
@@ -4962,11 +5036,15 @@ export class WorkbookView {
 
   /**
    * Applies operations to the shown sheet as one undo step and brings the view
-   * up to date. Returns false when there was nothing to apply. An operation
+   * up to date. Returns false when there was nothing to apply, and when a
+   * dialog of rules with changes is open (see settleDialog()). An operation
    * that throws leaves the workbook and the view as they were.
    */
   private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }): boolean {
     if (ops.length === 0) return false;
+    // A dialog of rules that is open shows the workbook as it was when it was opened (the range it is for, the place
+    // of its rule): a change from outside it closes it when nothing was changed in it, and is refused otherwise.
+    if (this.rulesDialog && !this.applyingRules && !this.settleDialog()) return false;
     // A note that is being typed is a step of its own, before this one.
     this.finishNote(true, true);
     const sheets: number[] = [];
@@ -5011,6 +5089,8 @@ export class WorkbookView {
 
   private travel(redo: boolean): boolean {
     if (this.destroyed || this.locked) return false;
+    // A dialog of rules is modal: while it is open no step is taken back or made again (a button, a call from outside).
+    if (this.rulesDialog) return false;
     // A tab that is being dragged is let go where it was: the step may change the list it was dragged in.
     this.endTabDrag();
     if (this.edit) {
@@ -5020,14 +5100,10 @@ export class WorkbookView {
     // A name being typed for a sheet, or a note, is not dropped (the keys of its field undo within
     // it; this is a button or a call from outside): it is applied, as leaving the field would, and
     // that is all this call does - the next one undoes it. What cannot be applied stays in its field.
-    if (this.renaming || this.noteEdit || this.rulesDialog) {
+    if (this.renaming || this.noteEdit) {
       this.finishRename(true);
       this.finishNote(true);
-      if (this.rulesDialog) {
-        const open = this.rulesDialog;
-        this.dismiss(() => open.submit());
-      }
-      return !this.renaming && !this.noteEdit && !this.rulesDialog;
+      return !this.renaming && !this.noteEdit;
     }
     this.closeMenu();
     const listBefore = this.workbook.sheets;

@@ -12,7 +12,7 @@ import { builtinFormatId, formatCell, isoToSerial } from '../format/cell-format'
 import { LOCALE_EN, type FormatLocale } from '../format/locale';
 import { serialToDate } from '../format/number-format';
 import { resolveCellStyle } from '../model/sheet/color';
-import { MAX_COLS, MAX_ROWS, type AutoFilter, type Cell, type CellRange, type FilterColumn, type FilterCondition, type FilterDateGroup, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, type AutoFilter, type Cell, type CellRange, type FilterColumn, type FilterCondition, type FilterDateGroup, type Row, type Sheet, type Workbook } from '../model/sheet/types';
 import type { EditOptions } from './commands';
 import type { Op } from './ops';
 import { SORT_BLANK, SORT_TEXT, collationKey, foldCase, sortValueOf } from './sort';
@@ -282,10 +282,34 @@ function matcherOf(scope: Scope, column: FilterColumn, col: number): Matcher | n
   }
 }
 
+const hasCell = (row: Row | undefined): boolean => row !== undefined && row.cells.some(() => true);
+
+/** Rows looked at one by one from the bottom before the rows of the sheet are gone through instead. */
+const DESCENT_LIMIT = 1024;
+
+/**
+ * The index of the last row that holds a cell, at or above `from`; -1 when there is none.
+ * Sheet.rowCount is not that: it is where the cells of the sheet once ended, and it does not
+ * shrink when cells are cleared, while the file saved from the sheet has no rows there any
+ * more. What a filter does must not depend on which of the two it is asked of, so it measures
+ * by the cells there are. A row without cells (one that only has a height) holds nothing;
+ * a cell that only carries a format is a cell, as in the file.
+ */
+export function lastFilledRow(sheet: Sheet, from: number = MAX_ROWS - 1): number {
+  const start = Math.min(Math.floor(from), sheet.rowCount - 1, MAX_ROWS - 1);
+  if (!(start >= 0)) return -1;
+  for (let r = start, steps = 0; r >= 0 && steps < DESCENT_LIMIT; r--, steps++) if (hasCell(sheet.rows.get(r))) return r;
+  if (start < DESCENT_LIMIT) return -1;
+  // A long empty stretch (a sheet that was emptied): the rows there are, whatever their order.
+  let last = -1;
+  for (const [index, row] of sheet.rows) if (index > last && index <= start && hasCell(row)) last = index;
+  return last;
+}
+
 /** The rows under the header of a filter that can hold cells; undefined when there are none. */
 export function filterDataRows(sheet: Sheet, filter: AutoFilter): { top: number; bottom: number } | undefined {
   const top = filter.range.top + 1;
-  const bottom = Math.min(filter.range.bottom, sheet.rowCount - 1, MAX_ROWS - 1);
+  const bottom = lastFilledRow(sheet, filter.range.bottom);
   return top <= bottom ? { top, bottom } : undefined;
 }
 
@@ -368,7 +392,7 @@ export function setAutoFilter(workbook: Workbook, sheetIndex: number, range: Cel
     const top = Math.max(Math.floor(range.top), 0);
     const left = Math.max(Math.floor(range.left), 0);
     // Whole columns are cut down to the rows that hold something.
-    const bottom = Math.min(Math.floor(range.bottom), Math.max(sheet.rowCount - 1, top), MAX_ROWS - 1);
+    const bottom = Math.min(Math.floor(range.bottom), Math.max(lastFilledRow(sheet), top), MAX_ROWS - 1);
     const right = Math.min(Math.floor(range.right), MAX_COLS - 1);
     if (!(top <= bottom && left <= right)) throw new RangeError('Invalid filter range');
     next = { range: { top, left, bottom, right }, columns: [] };

@@ -47,6 +47,7 @@ import {
   type ParaProps,
   type Paragraph,
   type RangeMark,
+  type RevisionInfo,
   type Run,
   type RunItem,
   type RunProps,
@@ -616,7 +617,9 @@ class DocReader {
     const pieces = this.pieces.pieces;
     let cp = from;
     let pieceIndex = from < to ? this.pieces.pieceAt(from) : -1;
-    let revision: { key: CharProps; wrap: Wrapper } | undefined;
+    /** The tracked changes the run before was in: runs of one change that follow each other share its wrapper, as the runs in one <w:ins> do. */
+    let open: { insKey?: string; ins?: Wrapper; delKey?: string; del?: Wrapper } | undefined;
+    const keyOf = (info: RevisionInfo): string => (info.author === undefined ? '' : 'a' + info.author) + '\u0001' + (info.date === undefined ? '' : info.date);
     while (cp < to && pieceIndex >= 0 && pieceIndex < pieces.length) {
       const piece = pieces[pieceIndex];
       const width = piece.compressed ? 1 : 2;
@@ -638,19 +641,27 @@ class DocReader {
         for (const content of splitAtFieldMarks(all)) {
           const item: Run = { type: 'run', props: this.runProps(info, para), content };
           if (info.deleted || info.inserted) {
-            // Runs of one tracked change that follow each other share the wrapper, as the runs in one <w:del> do.
-            if (!revision || revision.key !== info) {
-              const wrap: Wrapper = info.deleted ? { kind: 'del', ...info.deleted } : { kind: 'ins', ...info.inserted };
-              revision = { key: info, wrap };
-            }
-            item.wrap = revision.wrap;
+            // Text that was inserted and then deleted is in both changes: the deletion inside the insertion, each
+            // with its own author and date, as a docx file has it.
+            let ins: Wrapper | undefined;
+            const insKey = info.inserted ? keyOf(info.inserted) : undefined;
+            if (info.inserted) ins = open && open.ins && open.insKey === insKey ? open.ins : { kind: 'ins', ...info.inserted };
+            let del: Wrapper | undefined;
+            const delKey = info.deleted ? keyOf(info.deleted) : undefined;
             if (info.deleted) {
+              if (open && open.del && open.delKey === delKey && open.del.parent === ins) del = open.del;
+              else {
+                del = { kind: 'del', ...info.deleted };
+                if (ins) del.parent = ins;
+              }
               for (let i = 0; i < content.length; i++) {
                 const entry = content[i];
                 if (entry.type === 'text') content[i] = { type: 'deletedText', text: entry.text };
               }
             }
-          } else revision = undefined;
+            open = { insKey, ins, delKey, del };
+            item.wrap = del || ins;
+          } else open = undefined;
           out.push(item);
         }
         cp = end;

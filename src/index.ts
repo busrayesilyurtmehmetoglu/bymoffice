@@ -609,7 +609,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   }
   save = async () => {
     // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
-    if (!view.commitPending()) throw new Error('Cannot save: the note, the sheet name or the rule that is being edited cannot be applied');
+    if (!view.commitPending()) throw new Error('Cannot save: a note or a sheet name that is being typed cannot be applied, or a dialog of rules is open with changes (confirm or close it first)');
     return file.save();
   };
   container.addEventListener('keydown', onKeyDown);

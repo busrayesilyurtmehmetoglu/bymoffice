@@ -430,10 +430,18 @@ interface Outgoing {
   file: number;
 }
 
+/** What a command on sheets is refused with when the view was asked and did nothing, for a reason it did not give. */
+const NOT_DONE = 'The view did not change its sheets';
+
+/** What a command is refused with while something in the view is still open that could not be applied or closed. */
+const STILL_EDITING = 'A note or a sheet name that is being typed cannot be applied, or a dialog of rules is open with changes: apply or close it first';
+
 /** The file that is shown: a workbook in `view`, or a document in `pages`. */
 /**
- * Applies what is being typed in a workbook view (a cell, a note, the name of a sheet); false
- * when a note or a name cannot be applied and stays in its field. A cell that cannot be written throws.
+ * Applies what is being typed in a workbook view (a cell, a note, the name of a sheet) and closes
+ * a dialog of rules in which nothing was changed; false when a note or a name cannot be applied
+ * and stays in its field, or a dialog of rules is open with changes. A cell that cannot be
+ * written throws.
  */
 function commitPendingOf(view: WorkbookView): boolean {
   if (typeof view.commitPending === 'function') return view.commitPending();
@@ -1029,14 +1037,20 @@ export function createBridge(host: BridgeHost): Bridge {
     if (at !== undefined && at > count) return fail('no-sheet', `A sheet cannot be inserted at index ${at}: there are ${count} sheets`, id);
     const answer: Message = { type: 'done', id, command: type };
     try {
+      // What is being typed is applied first, as the view itself does it. What cannot be applied (and a dialog of
+      // rules with changes) stays open, the view does nothing to its sheets then, and "done" would be a lie.
+      if (!commitPendingOf(view)) return fail('sheet-refused', STILL_EDITING, id);
       if (type === 'insertSheet') {
         const placed = view.insertSheet(at, name);
-        if (placed < 0) return fail('read-only', 'The file is read-only', id);
+        // The view was asked and did nothing: it is not read-only (that was looked at), so it refused.
+        if (placed < 0) return fail('sheet-refused', NOT_DONE, id);
         const entry = view.workbook && Array.isArray(view.workbook.sheets) ? view.workbook.sheets[placed] : undefined;
         answer.index = placed;
         if (entry) answer.name = entry.name;
-      } else if (type === 'renameSheet') view.renameSheet(index as number, name as string);
-      else view.deleteSheet(index as number);
+      } else if (type === 'renameSheet') {
+        // False from here on means the sheet has that name already: nothing to do is done.
+        view.renameSheet(index as number, name as string);
+      } else if (view.deleteSheet(index as number) === false) return fail('sheet-refused', NOT_DONE, id);
     } catch (error) {
       // The reason in the words the view has for it, in its language; the code is the same for every refusal.
       let text: string;
@@ -1079,6 +1093,9 @@ export function createBridge(host: BridgeHost): Bridge {
     if (at !== undefined && at > count) return fail('no-sheet', `A sheet cannot be inserted at index ${at}: there are ${count} sheets`, id);
     const answer: Message = { type: 'done', id, command: type };
     try {
+      // As in changeSheets(): nothing is said to be done that the view did not do.
+      if (!commitPendingOf(view)) return fail('sheet-refused', STILL_EDITING, id);
+      // False from these three means the sheet is where, how or of the colour that was asked for already.
       if (type === 'moveSheet') view.moveSheet(index, to as number);
       else if (type === 'setSheetState') view.setSheetState(index, state as 'visible' | 'hidden' | 'veryHidden');
       else if (type === 'setTabColor') view.setTabColor(index, color);
@@ -1087,7 +1104,7 @@ export function createBridge(host: BridgeHost): Bridge {
         if (at !== undefined) options.at = at;
         if (name !== undefined) options.name = name;
         const placed = view.copySheet(index, options);
-        if (placed < 0) return fail('read-only', 'The file is read-only', id);
+        if (placed < 0) return fail('sheet-refused', NOT_DONE, id);
         const entry = view.workbook && Array.isArray(view.workbook.sheets) ? view.workbook.sheets[placed] : undefined;
         answer.index = placed;
         if (entry) answer.name = entry.name;
@@ -1112,7 +1129,8 @@ export function createBridge(host: BridgeHost): Bridge {
     try {
       // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
       // A note or a name that cannot be applied stays in its field, and nothing is saved around it.
-      if (current.view && !commitPendingOf(current.view)) throw new Error('The note or the sheet name that is being typed cannot be applied');
+      // Nor is anything saved under a dialog of rules that is open with changes: those are the user's to confirm.
+      if (current.view && !commitPendingOf(current.view)) throw new Error(STILL_EDITING);
       const pages = current.pages;
       // A composition still under way belongs to the document that is written.
       if (pages && pages.commitEditing) pages.commitEditing();

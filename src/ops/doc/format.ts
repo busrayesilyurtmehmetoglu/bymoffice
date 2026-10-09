@@ -653,6 +653,15 @@ export function withoutNumbering(doc: DocModel, props: ParaProps, where: TableCo
   delete out.numbering;
   const fromStyle = resolveParaProps(doc, out, where).numbering;
   if (fromStyle && fromStyle.numId !== undefined && fromStyle.numId !== 0) out.numbering = { numId: 0 };
+  else if (out.extras) {
+    // The <w:numPr> the model kept for what it could not read of it (a recorded change of the number) would be
+    // written back as it is, list and all, once no field stands for it: it goes with the numbering.
+    const extras = out.extras.filter((extra) => extra.index < 0 || extra.el.name.slice(extra.el.name.indexOf(':') + 1) !== 'numPr');
+    if (extras.length !== out.extras.length) {
+      if (extras.length) out.extras = extras;
+      else delete out.extras;
+    }
+  }
   if (sameProps(out, props)) return props;
   return Object.keys(out).length ? out : EMPTY_PARA_PROPS;
 }

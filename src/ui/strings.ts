@@ -297,6 +297,8 @@ export interface RuleStrings {
   tooManyValidations: string;
   tooManyRanges: string;
   formulaBeingTyped: string;
+  /** Said when something needs the workbook as it stands while a dialog of rules is open with changes in it. */
+  dialogOpen: string;
   /** Said once a rule was set or cleared. */
   validationSet: string;
   validationCleared: string;
@@ -348,7 +350,11 @@ export interface RuleStrings {
   newRule: string;
   noRules: string;
   /** Under a list that does not show every rule. */
-  moreRules(count: number): string;
+  /** A list of rules that shows a part of them: the places of the first and the last shown, and how many there are. */
+  rulesShown(first: number, last: number, total: number): string;
+  /** The buttons that show the rules after and before the ones shown; `count` is how many that are. */
+  nextRules(count: number): string;
+  previousRules(count: number): string;
   /** The name of one row of the list for assistive technology: "Rule 2: Cell value greater than 5". */
   ruleRow(place: number, description: string): string;
   /** How rules are named in the list. */
@@ -556,6 +562,8 @@ export const STRINGS_EN: UiStrings = {
       outlinePr: ['outline setting', 'outline settings'],
       outlineLevels: ['setting of outline levels', 'settings of outline levels'],
       codeName: ['code name', 'code names'],
+      legacyDrawingHF: ['set of header and footer pictures', 'sets of header and footer pictures'],
+      picture: ['background picture', 'background pictures'],
     };
     const known = Object.prototype.hasOwnProperty.call(names, what) ? names[what] : undefined;
     return known ? `${count} ${count === 1 ? known[0] : known[1]}` : what;
@@ -635,6 +643,7 @@ export const STRINGS_EN: UiStrings = {
     tooManyValidations: 'The sheet has too many data validations',
     tooManyRanges: 'The rule would be left with too many separate ranges',
     formulaBeingTyped: 'Finish the formula first',
+    dialogOpen: 'Confirm or close the open rule dialog first',
     validationSet: 'Data validation set',
     validationCleared: 'Data validation cleared',
     conditionalCommand: 'Conditional formatting',
@@ -715,7 +724,9 @@ export const STRINGS_EN: UiStrings = {
     deleteRule: 'Delete',
     newRule: 'New rule\u2026',
     noRules: 'No rules',
-    moreRules: (count) => `${count} more rules are not listed; select fewer cells to see the rules of those`,
+    rulesShown: (first, last, total) => `Rules ${first} to ${last} of ${total}`,
+    nextRules: (count) => `Next ${count}`,
+    previousRules: (count) => `Previous ${count}`,
     ruleRow: (place, description) => `Rule ${place}: ${description}`,
     cellValue: 'Cell value',
     and: 'and',
@@ -936,6 +947,8 @@ export const STRINGS_TR: UiStrings = {
       outlinePr: 'anahat ayarı',
       outlineLevels: 'anahat düzeyi ayarı',
       codeName: 'kod adı',
+      legacyDrawingHF: 'üstbilgi/altbilgi görsel takımı',
+      picture: 'arka plan görseli',
     };
     return Object.prototype.hasOwnProperty.call(names, what) ? `${count} ${names[what]}` : what;
   },
@@ -1014,6 +1027,7 @@ export const STRINGS_TR: UiStrings = {
     tooManyValidations: 'Sayfada çok fazla veri doğrulama kuralı var',
     tooManyRanges: 'Kural çok fazla ayrı aralığa bölünürdü',
     formulaBeingTyped: 'Önce formülü bitirin',
+    dialogOpen: 'Önce açık kural kutusunu onaylayın ya da kapatın',
     validationSet: 'Veri doğrulama uygulandı',
     validationCleared: 'Veri doğrulama temizlendi',
     conditionalCommand: 'Koşullu biçimlendirme',
@@ -1094,7 +1108,9 @@ export const STRINGS_TR: UiStrings = {
     deleteRule: 'Sil',
     newRule: 'Yeni kural\u2026',
     noRules: 'Kural yok',
-    moreRules: (count) => `${count} kural daha listelenmedi; onları görmek için daha az hücre seçin`,
+    rulesShown: (first, last, total) => `${total} kuralın ${first}\u2013${last}. olanları`,
+    nextRules: (count) => `Sonraki ${count}`,
+    previousRules: (count) => `Önceki ${count}`,
     ruleRow: (place, description) => `${place}. kural: ${description}`,
     cellValue: 'Hücre değeri',
     and: 've',

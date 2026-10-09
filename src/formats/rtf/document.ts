@@ -742,15 +742,31 @@ export class RtfReader {
     return info;
   }
 
-  /** The tracked change the character formatting says text is in. Deleted text that was inserted before shows as deleted. */
+  /**
+   * The tracked change the character formatting says text is in. Text that was inserted and then deleted is in
+   * both: a deletion inside the insertion, as a docx file has it, each with its own author and date, so that
+   * rejecting both takes the text out and accepting the insertion alone leaves it deleted. The objects handed out
+   * here stand for "this kind, author and date"; a paragraph gives every stretch of its text one of its own when
+   * it ends (Story.takeParagraph).
+   */
   private wrapper(chp: Chp): Wrapper | undefined {
     if (!chp.deleted && !chp.inserted) return undefined;
-    const author = chp.deleted ? chp.revAuthDel : chp.revAuth;
-    const date = chp.deleted ? chp.revDttmDel : chp.revDttm;
-    const key = (chp.deleted ? 'd' : 'i') + author + ':' + date;
-    let wrap = this.revisions.get(key);
-    if (!wrap) this.revisions.set(key, (wrap = { kind: chp.deleted ? 'del' : 'ins', ...this.revisionInfo(author, date) }));
-    return wrap;
+    let key = '';
+    let wrap: Wrapper | undefined;
+    if (chp.inserted) {
+      key = 'i' + chp.revAuth + ':' + chp.revDttm;
+      wrap = this.revisions.get(key);
+      if (!wrap) this.revisions.set(key, (wrap = { kind: 'ins', ...this.revisionInfo(chp.revAuth, chp.revDttm) }));
+    }
+    if (!chp.deleted) return wrap;
+    key += 'd' + chp.revAuthDel + ':' + chp.revDttmDel;
+    let del = this.revisions.get(key);
+    if (!del) {
+      del = { kind: 'del', ...this.revisionInfo(chp.revAuthDel, chp.revDttmDel) };
+      if (wrap) del.parent = wrap;
+      this.revisions.set(key, del);
+    }
+    return del;
   }
 
   /** The run properties of a paragraph mark, with what the character formatting at the mark says of a tracked change to it. */

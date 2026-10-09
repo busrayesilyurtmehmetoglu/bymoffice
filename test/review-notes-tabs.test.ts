@@ -208,8 +208,10 @@ test('review: whatever a copy of a sheet does not get is counted, by its kind', 
   const doc = await load(await guarded());
   const losses = copySheetLosses(doc.wb, 0);
   const kinds = losses.map((loss) => loss.what).sort();
-  assert.deepEqual(kinds, ['cellWatches', 'codeName', 'customSheetViews', 'ignoredErrors', 'outlineLevels', 'outlinePr', 'phoneticPr', 'rowAttributes', 'sortState', 'sparklineGroups']);
-  assert.deepEqual(losses.find((loss) => loss.what === 'rowAttributes'), { what: 'rowAttributes', count: 1 });
+  // The row with thickBot is not among them: an attribute without a namespace goes into the copy as the file has it
+  // (fourth review; it was counted as lost before, and was).
+  assert.deepEqual(kinds, ['cellWatches', 'codeName', 'customSheetViews', 'ignoredErrors', 'outlineLevels', 'outlinePr', 'phoneticPr', 'sortState', 'sparklineGroups']);
+  assert.deepEqual(doc.wb.sheets[0].rows.get(0)!.attrs, [['thickBot', '1']]);
   // Protection is not among them: it is copied.
   assert.ok(kinds.indexOf('sheetProtection') < 0 && kinds.indexOf('protectedRanges') < 0);
 

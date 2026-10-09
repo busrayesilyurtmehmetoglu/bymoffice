@@ -18,7 +18,7 @@
 //   - Of conditional formats, what only the 2010 extension can say is left out.
 //   - Of the page setup, a value a file cannot state is left out.
 
-import { shiftFormula, type StructuralEdit } from '../../calc/refs';
+import { adjustReferenceText, shiftFormula, type StructuralEdit } from '../../calc/refs';
 import { createSheetMetrics, type SheetMetrics } from '../../layout/sheet-metrics';
 import {
   MAX_COLS,
@@ -27,6 +27,7 @@ import {
   emptyStyleSheet,
   fileSheetName,
   isFileSheet,
+  parseCellRef,
   parseRange,
   rangeName,
   sheetNameMap,
@@ -53,6 +54,8 @@ import {
   type SheetComment,
   type SheetNameMap,
   type SheetPageSetup,
+  type SheetProtection,
+  type SheetStructuralEdit,
   type StyleSheet,
   type Workbook,
 } from '../../model/sheet/types';
@@ -634,9 +637,62 @@ function keptAttrs(attrs: [string, string][] | undefined): string {
   return out;
 }
 
-/** <sheetProtection> and <protectedRanges> from the model: '' for a sheet that has neither. */
+/**
+ * The protection of a sheet with its open ranges (<protectedRange sqref>) where the rows and
+ * columns inserted and deleted since the sheet was read put them: Sheet.protection is as the
+ * file has it, and the writer moves the ranges of the file by the same rule. A range all of
+ * whose cells were deleted is gone; everything else of a range (its name, the hash of its
+ * password, its security descriptors) is as it was. The protection itself when nothing moved.
+ * What a copy of the sheet gets (copySheet()), and what a sheet written from the model says.
+ */
+export function protectionNow(protection: SheetProtection, edits: readonly SheetStructuralEdit[] | undefined, sheetName: string): SheetProtection {
+  if (!protection.ranges || !edits || edits.length === 0) return protection;
+  const ranges: NonNullable<SheetProtection['ranges']> = [];
+  let changed = false;
+  for (const range of protection.ranges) {
+    let gone = false;
+    let attrs = range.attrs;
+    for (let i = 0; i < range.attrs.length && !gone; i++) {
+      const [name, value] = range.attrs[i];
+      if (name !== 'sqref' || typeof value !== 'string') continue;
+      let next = value;
+      for (const edit of edits) {
+        if (next === '') break;
+        next = adjustReferenceText(next, sheetName, { ...edit, sheetName });
+      }
+      if (next === value) continue;
+      if (next === '') gone = true;
+      else {
+        if (attrs === range.attrs) attrs = range.attrs.slice();
+        attrs[i] = [name, collapsedCells(next)];
+      }
+    }
+    if (gone || attrs !== range.attrs) changed = true;
+    if (!gone) ranges.push(attrs === range.attrs ? range : { ...range, attrs });
+  }
+  if (!changed) return protection;
+  const out: SheetProtection = { ...protection };
+  if (ranges.length > 0) out.ranges = ranges;
+  else delete out.ranges;
+  return out;
+}
+
+/** "B2:B2" -> "B2" for each reference of a list, as the writer states a range that shrank to one cell. */
+function collapsedCells(list: string): string {
+  if (list.indexOf(':') < 0) return list;
+  const refs = list.split(' ');
+  for (let i = 0; i < refs.length; i++) {
+    const colon = refs[i].indexOf(':');
+    if (colon <= 0) continue;
+    const first = refs[i].slice(0, colon);
+    if (first === refs[i].slice(colon + 1) && parseCellRef(first)) refs[i] = first;
+  }
+  return refs.join(' ');
+}
+
+/** <sheetProtection> and <protectedRanges> from the model, the ranges where they are now: '' for a sheet that has neither. */
 function protectionXml(sheet: Sheet): string {
-  const protection = sheet.protection;
+  const protection = sheet.protection ? protectionNow(sheet.protection, sheet.structuralEdits, sheet.name) : undefined;
   if (!protection) return '';
   let out = protection.attrs ? `<sheetProtection${keptAttrs(protection.attrs)}/>` : '';
   let ranges = '';

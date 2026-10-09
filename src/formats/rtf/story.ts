@@ -16,6 +16,46 @@ export const TEXT_CODE_DELETED = 3;
 
 const TEXT_TYPES = ['text', 'instrText', 'deletedText', 'instrText'] as const;
 
+/** Wrappers around one inline that are followed. */
+const MAX_CHAIN = 64;
+
+/**
+ * Gives every stretch of inlines that follow each other in a tracked change a wrapper object of its own, as the
+ * elements of a docx file are: the reader hands out one object for a kind, an author and a date, wherever in the
+ * file they come, and two changes that stand apart must not be one object (resolving one would resolve the
+ * other). A deletion inside an insertion keeps the insertion of the inlines around it.
+ */
+export function separateRevisions(children: Inline[]): void {
+  /** For the wrappers around the inline before: the object that stands for each in this stretch. */
+  let open = new Map<Wrapper, Wrapper>();
+  for (const inline of children) {
+    if (!inline.wrap) {
+      if (open.size) open = new Map();
+      continue;
+    }
+    const chain: Wrapper[] = [];
+    for (let w: Wrapper | undefined = inline.wrap; w && chain.length < MAX_CHAIN; w = w.parent) chain.push(w);
+    const next = new Map<Wrapper, Wrapper>();
+    let parent: Wrapper | undefined;
+    // Outermost first: a wrapper goes on only inside the wrapper it was in.
+    for (let k = chain.length - 1; k >= 0; k--) {
+      const source = chain[k];
+      const known = open.get(source);
+      let own: Wrapper;
+      if (known && known.parent === parent) own = known;
+      else {
+        own = { ...source };
+        if (parent) own.parent = parent;
+        else delete own.parent;
+      }
+      next.set(source, own);
+      parent = own;
+    }
+    inline.wrap = parent;
+    open = next;
+  }
+}
+
 export class Story {
   readonly assembler: TableAssembler;
   readonly row: RowState;
@@ -157,6 +197,7 @@ export class Story {
     this.styleUsed = undefined;
     this.hasRuns = false;
     this.paragraphs++;
+    separateRevisions(children);
     return { type: 'paragraph', props, children: children.length ? children.slice() : [] };
   }
 

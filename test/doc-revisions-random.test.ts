@@ -27,7 +27,7 @@ import {
 } from '../src/ops/doc/index';
 import { OpcPackage } from '../src/opc';
 import { parseXml } from '../src/xml';
-import { STYLES, checkInvariants, dice, docPicture, paragraphAt, paragraphPaths, run, texts } from './doc-ops-fixtures';
+import { NUMBERING, STYLES, checkInvariants, dice, docPicture, paragraphAt, paragraphPaths, run, texts } from './doc-ops-fixtures';
 import { buildDocx as buildSpec, type DocxSpec } from './docx-fixtures';
 import { schemaOrderViolations } from './docx-write-helpers.test';
 
@@ -55,7 +55,8 @@ interface Made {
   revisions: number;
 }
 
-export function generate(seed: number): Made {
+/** `listed`: now and then a paragraph is an item of a list whose number was changed, which the model only keeps (as XML in its properties). */
+export function generate(seed: number, listed = false): Made {
   const d: Dice = dice(seed);
   let id = 100;
   let serial = 0;
@@ -148,7 +149,8 @@ export function generate(seed: number): Made {
     pieces.push({ mark: mark.state });
     // Paragraphs are formatted differently, so that which of two joined paragraphs gives its formatting shows.
     const jc = d.chance(0.7) ? `<w:jc w:val="${d.pick(['center', 'right', 'both', 'left'])}"/>` : '';
-    return `<w:p>${jc || mark.xml ? `<w:pPr>${jc}${mark.xml}</w:pPr>` : ''}${xml}</w:p>`;
+    const list = listed && d.chance(0.3) ? `<w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/><w:numberingChange${who(d.pick(AUTHORS))} w:original="1."/></w:numPr>` : '';
+    return `<w:p>${list || jc || mark.xml ? `<w:pPr>${list}${jc}${mark.xml}</w:pPr>` : ''}${xml}</w:p>`;
   };
 
   const table = (pieces: Piece[]): string => {
@@ -211,6 +213,7 @@ export function generate(seed: number): Made {
   const spec: DocxSpec = {
     body: body + '<w:sectPr><w:headerReference w:type="default" r:id="rId7"/><w:pgSz w:w="9000" w:h="9000"/></w:sectPr>',
     styles: STYLES,
+    ...(listed ? { numbering: NUMBERING } : {}),
     headers: { rId7: header },
     footnotes:
       '<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote><w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>' +
@@ -246,7 +249,7 @@ async function open(spec: DocxSpec): Promise<Opened> {
 }
 
 const PARTS = ['/word/document.xml', '/word/header1.xml', '/word/footnotes.xml'];
-const REVISION = /<w:(ins|del|moveFrom|moveTo|rPrChange|pPrChange)\b([^>]*)>/g;
+const REVISION = /<w:(ins|del|moveFrom|moveTo|rPrChange|pPrChange|numberingChange)\b([^>]*)>/g;
 
 /** Writes the document and checks what a reader of the file would: well formed, in schema order, changes with id and author, ids unique, no plain text in a deletion. */
 async function checkWritten(o: Opened, label: string): Promise<string> {
@@ -344,7 +347,8 @@ test('random revisions: one by one in a random order gives what "all" gives for 
 
 test('random revisions: editing with tracking on, mixed with accepting and rejecting', async () => {
   for (const seed of SEEDS.slice(0, 8)) {
-    const made = generate(seed);
+    // With changed list numbers: every paragraph break in such an item makes a second paragraph with the record.
+    const made = generate(seed, true);
     const o = await open({ ...made.spec, settings: '<w:trackRevisions/>' });
     const d = dice(seed * 13 + 5);
     const me = { author: 'Me', date: '2026-10-08T10:00:00Z' };
@@ -380,11 +384,16 @@ test('random revisions: editing with tracking on, mixed with accepting and rejec
       await checkWritten(o, `seed ${seed} step ${step}`);
     }
     assert.ok(done > 20 && resolved > 5, `seed ${seed}: ${done} edits, ${resolved} resolved`);
-    // What is left can all be accepted.
+    // What is left can all be accepted, but for the changed list numbers, which are only kept.
+    const kept = revisionsOf(o.doc).filter((revision) => revision.kind === 'other').length;
     const rest = acceptAll(o.doc);
-    assert.equal(rest.skipped, 0, `seed ${seed}`);
+    assert.equal(rest.skipped, kept, `seed ${seed}`);
     run(o.history, rest);
-    assert.deepEqual(revisionsOf(o.doc), [], `seed ${seed}`);
+    assert.deepEqual(
+      revisionsOf(o.doc).filter((revision) => revision.kind !== 'other'),
+      [],
+      `seed ${seed}`,
+    );
     const xml = await checkWritten(o, `seed ${seed} end`);
     assert.ok(!/<w:(ins|del|rPrChange|delText)\b/.test(xml), `seed ${seed}`);
     while (o.history.canUndo) o.history.undo();

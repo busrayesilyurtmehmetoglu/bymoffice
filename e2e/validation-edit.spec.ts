@@ -506,13 +506,23 @@ test.describe('editing data validation', () => {
     expect(
       await page.evaluate(() => (window as any).__editor.view.workbook.sheets[0].dataValidations.map((rule: any) => [rule.src, rule.live === true, rule.formula1, rule.errorTitle ?? null])),
     ).toEqual([[0, false, '1', 'Quantity'], [1, true, '"Yes,No"', 'Pick']]);
-    // While the dialog is open, saving applies it; what it cannot take keeps it open.
+    // Fourth review: saving does not press OK. A dialog with changes stays open and nothing of it is applied,
+    // whether its fields could be taken or not; the user confirms, and then nothing is left open.
     await select(page, 'C2');
     expect(await open(page)).toBe(true);
     await fill(page, { type: 'whole', operator: 'equal', value1: 'x' });
     expect(await page.evaluate(() => (window as any).__editor.view.commitPending() as boolean)).toBe(false);
     await expect(dialog(page)).toBeVisible();
     await fill(page, { value1: '4' });
+    expect(await page.evaluate(() => (window as any).__editor.view.commitPending() as boolean)).toBe(false);
+    await expect(dialog(page)).toBeVisible();
+    await expect(dialog(page).locator('[role="alert"]')).toHaveText('Confirm or close the open rule dialog first');
+    expect(await ruleAt(page, 'C2')).not.toBe('C2|whole|equal|4|');
+    await action(page, 'ok').click();
+    await expect(dialog(page)).toHaveCount(0);
+    expect(await ruleAt(page, 'C2')).toBe('C2|whole|equal|4|');
+    // Opened again and only looked at: saving closes it.
+    expect(await open(page)).toBe(true);
     expect(await page.evaluate(() => (window as any).__editor.view.commitPending() as boolean)).toBe(true);
     await expect(dialog(page)).toHaveCount(0);
     expect(await ruleAt(page, 'C2')).toBe('C2|whole|equal|4|');

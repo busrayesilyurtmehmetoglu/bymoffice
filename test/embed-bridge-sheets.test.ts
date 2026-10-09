@@ -632,3 +632,79 @@ test('bridge sheets: the new commands refuse what is not in the contract, an ind
   await none.bridge.receive({ type: 'setTabColor', id: 'h', index: 0 });
   assert.equal(none.take().pop().code, 'not-loaded');
 });
+
+test('review 4 (B3): a command on sheets the view did not carry out is not answered with "done"', async () => {
+  const f = await loaded();
+  const view = f.host.createView({} as HTMLElement, f.book as any, f.options()) as any;
+  // A view in which something stays open that cannot be applied (a note, a name, a dialog of rules with changes):
+  // like WorkbookView, every command on sheets asks commitPending() first and does nothing when it says no.
+  let open = true;
+  view.commitPending = () => {
+    f.calls.push('commitPending');
+    return !open;
+  };
+  for (const name of ['renameSheet', 'deleteSheet', 'moveSheet', 'setSheetState', 'setTabColor']) {
+    const real = view[name];
+    view[name] = (...args: unknown[]) => (view.commitPending() ? real(...args) : false);
+  }
+  for (const name of ['insertSheet', 'copySheet']) {
+    const real = view[name];
+    view[name] = (...args: unknown[]) => (view.commitPending() ? real(...args) : -1);
+  }
+  const commands: Record<string, unknown>[] = [
+    { type: 'renameSheet', index: 2, name: 'Remarks' },
+    { type: 'deleteSheet', index: 2 },
+    { type: 'moveSheet', from: 0, to: 2 },
+    { type: 'setSheetState', index: 2, state: 'hidden' },
+    { type: 'setTabColor', index: 0, color: '#FF0000' },
+    { type: 'insertSheet' },
+    { type: 'copySheet', index: 0 },
+  ];
+  for (const command of commands) {
+    await f.bridge.receive({ ...command, id: 'x' });
+    const sent = f.take();
+    assert.deepEqual(
+      sent.map((message) => [message.type, message.id, message.code]),
+      [['error', 'x', 'sheet-refused']],
+      String(command.type),
+    );
+    assert.match(sent[0].message, /dialog of rules|being typed/, String(command.type));
+  }
+  // Nothing was done to the list.
+  assert.deepEqual(f.book.sheets, LIST);
+  // Once nothing is open the same commands are done, and said to be.
+  open = false;
+  for (const command of commands.slice(0, 1).concat(commands.slice(2))) {
+    await f.bridge.receive({ ...command, id: 'y' });
+    const sent = f.take();
+    assert.deepEqual([sent[sent.length - 1].type, sent[sent.length - 1].command], ['done', command.type], String(command.type));
+  }
+});
+
+test('review 4 (B3): "nothing to do" is still done: the name, the place, the state the sheet has', async () => {
+  const f = await loaded();
+  for (const command of [
+    { type: 'renameSheet', index: 0, name: 'Data' },
+    { type: 'moveSheet', from: 1, to: 1 },
+    { type: 'setSheetState', index: 1, state: 'hidden' },
+  ]) {
+    await f.bridge.receive({ ...command, id: 'z' });
+    assert.deepEqual(f.take(), [{ type: 'done', id: 'z', command: command.type }], command.type);
+  }
+});
+
+test('review 4 (B3): a view that is not read-only and still places no sheet is refused, not called read-only', async () => {
+  const f = await loaded();
+  const view = f.host.createView({} as HTMLElement, f.book as any, f.options()) as any;
+  view.insertSheet = () => -1;
+  view.copySheet = () => -1;
+  view.deleteSheet = () => false;
+  for (const command of [{ type: 'insertSheet' }, { type: 'copySheet', index: 0 }, { type: 'deleteSheet', index: 0 }]) {
+    await f.bridge.receive({ ...command, id: 'n' });
+    assert.deepEqual(
+      f.take().map((message) => [message.type, message.code]),
+      [['error', 'sheet-refused']],
+      command.type,
+    );
+  }
+});

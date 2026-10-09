@@ -872,15 +872,18 @@ export interface Sheet {
   /**
    * How the sheet is protected (<sheetProtection>), and the ranges that are open in a
    * protected sheet (<protectedRanges>), as the file states them. Not applied and not changed
-   * by edits: a save of the file copies the source elements; a copy of the sheet and a file
-   * built from the model get them from here.
+   * by edits: a save of the file copies the source elements (and moves the ranges with the
+   * rows and columns inserted and deleted since, see structuralEdits); a copy of the sheet
+   * and a sheet written from the model get them from here with the ranges moved the same
+   * way (protectionNow() of the xlsx builder).
    */
   protection?: SheetProtection;
   /**
    * Local names of what the sheet part holds beside what the model has a field for, one entry
    * per element (or attribute) found: "sortState", "customSheetViews", "ignoredErrors",
    * "cellWatches", "phoneticPr", "sparklineGroups" (of the extension list), "outlinePr" and
-   * "codeName" (of <sheetPr>), "outlineLevels" (of <sheetFormatPr>), ... Names only: the content
+   * "codeName" (of <sheetPr>), "outlineLevels" (of <sheetFormatPr>), "legacyDrawingHF" (the
+   * pictures of headers and footers), "picture" (the background picture), ... Names only: the content
    * stays in the part and is written back from there. A copy of the sheet does not get it,
    * which is what the list is for (see copySheetLosses()).
    */

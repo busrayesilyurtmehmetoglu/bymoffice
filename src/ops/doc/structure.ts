@@ -44,7 +44,8 @@ import {
   type Piece,
 } from './pieces';
 import { asRange, containerBlocks, inTextBox, orderRange, paragraphIn, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
-import { placeBlock } from './text';
+import { newMarkProps, placeBlock } from './text';
+import { plainProps } from './track';
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -71,17 +72,16 @@ export function rowSpans(row: TableRow): [number, number][] {
   return out;
 }
 
-/** An empty paragraph formatted like the first paragraph of a cell: what a new cell beside it holds. */
+/**
+ * An empty paragraph formatted like the first paragraph of a cell: what a new cell beside it
+ * holds. It is new: of the tracked changes of that paragraph (of its mark, of its formatting) it
+ * has none.
+ */
 function emptyLike(cell: TableCell | undefined): Paragraph {
   if (cell) {
     for (const block of cell.blocks) {
       if (block.type !== 'paragraph') continue;
-      let props = block.props;
-      if (props.section) {
-        props = { ...props };
-        delete props.section;
-      }
-      return { type: 'paragraph', props, children: [] };
+      return { type: 'paragraph', props: newMarkProps(block.props), children: [] };
     }
   }
   return { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] };
@@ -125,8 +125,6 @@ function cellStart(doc: DocModel, site: CellSite, row: number, cell: number): Do
   return { story: site.story, path, offset: 0 };
 }
 
-const ROW_REVISION = ['inserted', 'deleted', 'change'] as const;
-
 /**
  * Inserts a row above or below the row a position is in. The new row has the
  * cells of that row, empty, with their formatting; where the row is crossed
@@ -142,8 +140,8 @@ export function insertRow(doc: DocModel, position: DocPosition, where: 'above' |
     const below = table.rows[site.row + 1];
     const belowSpans = below ? rowSpans(below) : [];
     const cells: TableCell[] = ref.cells.map((cell, c) => {
-      const props: CellProps = { ...cell.props };
-      delete props.change;
+      // A new cell: formatted like the one beside it, without the tracked changes that one records.
+      const props: CellProps = { ...plainProps(cell.props) };
       let continues = false;
       if (where === 'above') continues = cell.props.vMerge === 'continue';
       else if (cell.props.vMerge !== undefined && below) {
@@ -153,12 +151,11 @@ export function insertRow(doc: DocModel, position: DocPosition, where: 'above' |
       else delete props.vMerge;
       return { props, blocks: [emptyLike(cell)] };
     });
-    const props: RowProps = { ...ref.props };
-    for (const key of ROW_REVISION) delete props[key];
+    const props: RowProps = { ...plainProps(ref.props) };
     // Only the rows at the top of a table repeat on every page.
     if (where === 'below') delete props.header;
     const row: TableRow = { props, cells };
-    if (ref.tableProps) row.tableProps = ref.tableProps;
+    if (ref.tableProps) row.tableProps = plainProps(ref.tableProps);
     const at = where === 'above' ? site.row : site.row + 1;
     const wrap = wrapBetween(at > 0 ? table.rows[at - 1].wrap : undefined, at < table.rows.length ? table.rows[at].wrap : undefined);
     if (wrap) row.wrap = wrap;
@@ -324,9 +321,8 @@ export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' 
       if (place < before) return { ...row, props: { ...row.props, gridBefore: before + 1 } };
       const spans = rowSpans(row);
       const fresh = (model: TableCell): TableCell => {
-        const props: CellProps = { ...model.props };
+        const props: CellProps = { ...plainProps(model.props) };
         delete props.gridSpan;
-        delete props.change;
         delete props.hMerge;
         if (props.width) props.width = { type: 'dxa', value: width };
         return { props, blocks: [emptyLike(model)] };

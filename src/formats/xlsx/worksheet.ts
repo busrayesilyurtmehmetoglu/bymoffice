@@ -1365,11 +1365,16 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
         case 'protectedRanges':
           parseProtectedRanges(sc, sheet);
           break;
+        case 'legacyDrawingHF':
+        case 'picture':
+          // The pictures of headers and footers and the picture behind the cells: their parts are of kinds the
+          // drawings and the notes have too (a VML drawing, an image), so it is the element that says they are there.
+          unmodelled(sheet, sc.local);
+          sc.skip();
+          break;
         case 'drawing':
         case 'legacyDrawing':
-        case 'legacyDrawingHF':
         case 'tableParts':
-        case 'picture':
         case 'oleObjects':
         case 'controls':
           // What these lead to is in parts of its own, and is known by them (Sheet.anchored, the drawings, the comments).

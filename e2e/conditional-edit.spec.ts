@@ -507,7 +507,9 @@ test.describe('editing conditional formats', () => {
     }
   });
 
-  test('saving while a dialog is open: the rule that is being edited is applied and the dialogs are gone; what cannot be applied stays', async ({ page }) => {
+  // Fourth review: a dialog of rules is no field that is being typed. Before, commitPending() pressed its OK
+  // button (and so did undo); now a dialog nothing was changed in is closed, and one with changes stays open.
+  test('saving while a dialog is open: one nothing was changed in is closed, one with changes stays open and nothing of it is applied', async ({ page }) => {
     await mount(page, await ruled());
     expect(await view(page, 'view.openConditionalDialog("manage")')).toBe(true);
     await field(page, 'scope', 'conditional-rules').selectOption('sheet');
@@ -516,29 +518,35 @@ test.describe('editing conditional formats', () => {
     await expect(manager(page)).toHaveCount(0);
     expect(await view(page, 'view.isDialogOpen')).toBe(false);
 
-    expect(await view(page, 'view.openConditionalDialog("manage")')).toBe(true);
-    await field(page, 'scope', 'conditional-rules').selectOption('sheet');
-    await row(page, 1).locator('[data-bym-action="edit"]').click();
-    await fill(page, { value1: '' });
-    // What the dialog cannot take keeps it open, and the workbook is not to be saved as it is.
-    expect(await view(page, 'view.commitPending()')).toBe(false);
-    await expect(dialog(page)).toBeVisible();
-    await expect(alert(page)).toHaveText('Value is required');
-    await fill(page, { value1: '7' });
-    // Applied, and nothing comes back in its place: the list it was opened from stays closed.
+    // The dialog of a rule, opened from the list and only looked at: closed, and the list does not come back.
+    await row0Edit(page);
     expect(await view(page, 'view.commitPending()')).toBe(true);
     await expect(dialog(page)).toHaveCount(0);
     await expect(manager(page)).toHaveCount(0);
     expect(await view(page, 'view.isDialogOpen')).toBe(false);
-    expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|D1:D4|cellIs|2|greaterThan 7']);
     expect(await gridHasFocus(page)).toBe(true);
-    // Undo goes through the same door: the first press applies what is typed, the next one undoes it.
+
     await row0Edit(page);
-    await fill(page, { value1: '8' });
-    expect(await view(page, 'view.undo()')).toBe(true);
+    await fill(page, { value1: '7' });
+    // Changed: the dialog stays open with what was typed, the rule is what it was, and the workbook is not to be saved.
+    expect(await view(page, 'view.commitPending()')).toBe(false);
+    await expect(dialog(page)).toBeVisible();
+    await expect(field(page, 'value1')).toHaveValue('7');
+    await expect(alert(page)).toHaveText('Confirm or close the open rule dialog first');
+    expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|D1:D4|cellIs|2|greaterThan 2']);
+    // Undo does nothing under the dialog.
+    expect(await view(page, 'view.undo()')).toBe(false);
+    await expect(dialog(page)).toBeVisible();
+    expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|D1:D4|cellIs|2|greaterThan 2']);
+    // The user confirms; the list the dialog was opened from comes back, as it does after OK.
+    await action(page, 'ok').click();
     await expect(dialog(page)).toHaveCount(0);
+    expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|D1:D4|cellIs|2|greaterThan 7']);
+    await expect(manager(page)).toBeVisible();
+    expect(await view(page, 'view.commitPending()')).toBe(true);
     await expect(manager(page)).toHaveCount(0);
-    expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|D1:D4|cellIs|2|greaterThan 8']);
+    expect(await view(page, 'view.undo()')).toBe(true);
+    expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|D1:D4|cellIs|2|greaterThan 2']);
   });
 
   test('a rule that is opened and closed with OK is not changed: no step, and the file is the one that was opened', async ({ page }) => {
@@ -574,7 +582,8 @@ test.describe('editing conditional formats', () => {
     await expect(dialog(page, 'validation')).toHaveCount(0);
   });
 
-  test('a sheet with very many rules: the list shows the first of them and says how many more there are', async ({ page }) => {
+  // Fourth review: the rules after the first 200 are shown too, in runs of 200 (they could not be reached before).
+  test('a sheet with very many rules: the list shows 200 of them at a time and says which', async ({ page }) => {
     let rulesXml = '';
     for (let i = 1; i <= 20000; i++) rulesXml += `<cfRule type="cellIs" priority="${i}" operator="equal"><formula>${i}</formula></cfRule>`;
     const bytes = await buildXlsx({ sheets: [{ name: 'Data', xml: worksheetXml(`${CELLS}<conditionalFormatting sqref="A1:A4">${rulesXml}</conditionalFormatting>`) }], styles: STYLES });
@@ -583,13 +592,18 @@ test.describe('editing conditional formats', () => {
     await field(page, 'scope', 'conditional-rules').selectOption('sheet');
     const shown = () => manager(page).locator('[data-bym-rule]').count();
     expect(await shown()).toBe(200);
-    await expect(manager(page).locator('[data-bym-field="more"]')).toHaveText('19800 more rules are not listed; select fewer cells to see the rules of those');
+    await expect(manager(page).locator('[data-bym-field="more"]')).toHaveText('Rules 1 to 200 of 20000');
     // A change builds the same bounded list again.
     await row(page, 0).locator('[data-bym-action="delete"]').click();
     expect(await shown()).toBe(200);
-    await expect(manager(page).locator('[data-bym-field="more"]')).toContainText('19799');
+    await expect(manager(page).locator('[data-bym-field="more"]')).toHaveText('Rules 1 to 200 of 19999');
     await expect(row(page, 0).locator('.bym-dialog-rule-text')).toHaveText('Cell value equal to 2');
-    expect(await manager(page).locator('.bym-dialog-rules > *').count()).toBeLessThanOrEqual(201);
+    // The rows, the line that says which they are, and the buttons to the other runs.
+    expect(await manager(page).locator('.bym-dialog-rules > *').count()).toBeLessThanOrEqual(202);
+    await action(page, 'next-page', 'conditional-rules').click();
+    expect(await shown()).toBe(200);
+    await expect(manager(page).locator('[data-bym-field="more"]')).toHaveText('Rules 201 to 400 of 19999');
+    await expect(row(page, 0).locator('.bym-dialog-rule-text')).toHaveText('Cell value equal to 202');
     await page.keyboard.press('Escape');
   });
 

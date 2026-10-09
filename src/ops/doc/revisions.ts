@@ -80,7 +80,7 @@ import { flatten, harvestRow, paragraphWith, rebuild, withoutWrapper, type Harve
 import { collapsed, itemsLength, paragraphIn, paragraphLength, resolvePosition, storyOf, type DocPosition, type DocRange, type StoryHandle } from './position';
 import { rowSpans, rowWith, type Leftover } from './structure';
 import { neighbour } from './text';
-import { forcesTracking } from './track';
+import { forcesTracking, plainProps } from './track';
 
 /** What accepting or rejecting throws in a document whose protection is enforced: Word allows neither there. */
 export const REVISIONS_PROTECTED = 'The protection of the document does not allow changes to be accepted or rejected';
@@ -964,7 +964,9 @@ class Resolver {
     if (!change) return props;
     if (verdict === 'accept') return without(props, 'change', EMPTY_RUN_PROPS);
     const ctx = this.ctx();
-    const old = readRunProps(ctx, childOf(ctx, change, 'rPr'));
+    // The record is read as formatting and nothing else: a file that puts a tracked change into it (an inserted mark,
+    // a record of its own) does not get one made of it.
+    const old = plainProps(readRunProps(ctx, childOf(ctx, change, 'rPr')));
     // What says that the mark itself is a change is no formatting: it stays.
     let out: RunProps | undefined;
     for (const flag of MARK_FLAGS) {
@@ -980,9 +982,17 @@ class Resolver {
     if (!change) return props;
     if (verdict === 'accept') return without(props, 'change', EMPTY_PARA_PROPS);
     const ctx = this.ctx();
-    const old = readParaProps(ctx, childOf(ctx, change, 'pPr'));
-    // The record holds neither the mark nor the section: those are the present ones.
-    if (props.markProps === undefined && props.section === undefined) return old;
+    const read = readParaProps(ctx, childOf(ctx, change, 'pPr'));
+    // The record holds neither the mark nor the section: those are the present ones. A file that puts them into the
+    // record all the same (the schema has no place for them there), or a tracked change, gets none of it applied.
+    let old = read;
+    if (read.markProps !== undefined || read.section !== undefined) {
+      old = { ...read };
+      delete old.markProps;
+      delete old.section;
+    }
+    old = plainProps(old);
+    if (props.markProps === undefined && props.section === undefined) return Object.keys(old).length ? old : EMPTY_PARA_PROPS;
     const out: ParaProps = { ...old };
     if (props.markProps !== undefined) out.markProps = props.markProps;
     if (props.section !== undefined) out.section = props.section;
@@ -995,7 +1005,7 @@ class Resolver {
     if (verdict === 'accept') return without(props, 'change', {});
     const ctx = this.ctx();
     const inner = childOf(ctx, change, 'sectPr');
-    const out: SectionProps = inner ? { ...readSectionProps(ctx, inner) } : {};
+    const out: SectionProps = inner ? { ...plainProps(readSectionProps(ctx, inner)) } : {};
     // The record does not name the headers and footers.
     if (props.headers !== undefined) out.headers = props.headers;
     if (props.footers !== undefined) out.footers = props.footers;
@@ -1007,7 +1017,7 @@ class Resolver {
     if (!change) return props;
     if (verdict === 'accept') return without(props, 'change', {});
     const ctx = this.ctx();
-    return readTableProps(ctx, childOf(ctx, change, 'tblPr') || childOf(ctx, change, 'tblPrEx'));
+    return plainProps(readTableProps(ctx, childOf(ctx, change, 'tblPr') || childOf(ctx, change, 'tblPrEx')));
   }
 
   private rowProps(props: RowProps, verdict: Verdict): RowProps {
@@ -1015,7 +1025,7 @@ class Resolver {
     if (!change) return props;
     if (verdict === 'accept') return without(props, 'change', {});
     const ctx = this.ctx();
-    const out: RowProps = { ...readRowProps(ctx, childOf(ctx, change, 'trPr')) };
+    const out: RowProps = { ...plainProps(readRowProps(ctx, childOf(ctx, change, 'trPr'))) };
     if (props.inserted !== undefined) out.inserted = props.inserted;
     if (props.deleted !== undefined) out.deleted = props.deleted;
     return out;
@@ -1026,7 +1036,7 @@ class Resolver {
     if (!change) return props;
     if (verdict === 'accept') return without(props, 'change', {});
     const ctx = this.ctx();
-    return readCellProps(ctx, childOf(ctx, change, 'tcPr'));
+    return plainProps(readCellProps(ctx, childOf(ctx, change, 'tcPr')));
   }
 
   // ----------------------------------------------------------- paragraphs

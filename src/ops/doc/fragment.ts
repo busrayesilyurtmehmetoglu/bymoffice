@@ -118,8 +118,8 @@ import {
   type DocRange,
 } from './position';
 import { freeRelId, rowSpans, takenByDocument, type Taken } from './structure';
-import { cellsBetween, deleteSpan, joinedProps, neighbour, parting, withoutSection } from './text';
-import { noteForeignIds } from './track';
+import { cellsBetween, deleteSpan, joinedProps, neighbour, newMarkProps, parting, withoutSection } from './text';
+import { noteForeignIds, plainExtras, plainProps } from './track';
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -352,97 +352,6 @@ function carryItem(ctx: CopyContext, item: RunItem): RunItem | undefined {
 
 /** Wrappers that are data and nothing else: they go with the text they hold. */
 const CARRIED_WRAPPERS = new Set<string>(['hyperlink', 'simpleField', 'dir', 'bdo']);
-
-/** Elements that record a tracked change of formatting or of a table, wherever they stand. */
-const REVISION_RECORDS = new Set(['rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange', 'tblPrExChange', 'trPrChange', 'tcPrChange', 'tblGridChange', 'numberingChange', 'cellIns', 'cellDel', 'cellMerge']);
-/** Inside properties these mark what the properties belong to (a paragraph mark, a row, a numbering) as inserted, deleted or moved. */
-const REVISION_MARKS = new Set(['ins', 'del', 'moveFrom', 'moveTo']);
-/** The fields of property bags that hold a tracked change. */
-const REVISION_FIELDS = ['inserted', 'deleted', 'moveFrom', 'moveTo', 'change'];
-
-/** Property bags without their tracked changes, by the bag they were made from: the same bag gives the same object. */
-const PLAIN = new WeakMap<object, object>();
-
-/** A kept element without the records of tracked changes in it; the element itself when it holds none. */
-function plainElement(el: XmlElement, marks: boolean, depth = 0): XmlElement {
-  if (depth > MAX_TREE_DEPTH) return el;
-  let children: XmlElement['children'] | undefined;
-  for (let i = 0; i < el.children.length; i++) {
-    const node = el.children[i];
-    if (node.type !== 'element') {
-      if (children) children.push(node);
-      continue;
-    }
-    const local = localOf(node.name);
-    const next = REVISION_RECORDS.has(local) || (marks && REVISION_MARKS.has(local)) ? undefined : plainElement(node, marks, depth + 1);
-    if (next === node) {
-      if (children) children.push(node);
-      continue;
-    }
-    if (!children) children = el.children.slice(0, i);
-    if (next) children.push(next);
-  }
-  return children ? { ...el, children } : el;
-}
-
-/**
- * Kept children without the records of tracked changes. `marks`: the children are those of
- * properties, where <w:ins> and <w:del> are marks too (in a table they would wrap rows).
- */
-function plainExtras(extras: ExtraXml[] | undefined, marks: boolean): ExtraXml[] | undefined {
-  if (!extras) return undefined;
-  let out: ExtraXml[] | undefined;
-  for (let i = 0; i < extras.length; i++) {
-    const extra = extras[i];
-    const local = localOf(extra.el.name);
-    // The parent itself (index -1) is kept for what it carries; only what is in it goes.
-    const gone = extra.index >= 0 && (REVISION_RECORDS.has(local) || (marks && REVISION_MARKS.has(local)));
-    const el = gone ? undefined : plainElement(extra.el, marks);
-    if (el === extra.el) {
-      if (out) out.push(extra);
-      continue;
-    }
-    if (!out) out = extras.slice(0, i);
-    if (el) out.push({ ...extra, el });
-  }
-  if (!out) return extras;
-  return out.length ? out : undefined;
-}
-
-/**
- * Properties (of a paragraph, a run, a section, a table, a row, a cell) as a copy carries them:
- * without what makes them a tracked change. See the head of this module.
- */
-function plainProps<T extends object>(props: T): T {
-  if ((props as unknown) === EMPTY_PARA_PROPS) return props;
-  const memo = PLAIN.get(props);
-  if (memo) return memo as T;
-  const record = props as unknown as { [name: string]: unknown };
-  let copy: { [name: string]: unknown } | undefined;
-  const set = (name: string, value: unknown) => {
-    if (!copy) copy = { ...record };
-    if (value === undefined) delete copy[name];
-    else copy[name] = value;
-  };
-  for (const name of REVISION_FIELDS) if (record[name] !== undefined) set(name, undefined);
-  if (Array.isArray(record.extras)) {
-    const extras = plainExtras(record.extras as ExtraXml[], true);
-    if (extras !== record.extras) set('extras', extras);
-  }
-  // The properties of the paragraph mark, and the section a paragraph ends.
-  for (const name of ['markProps', 'section']) {
-    const inner = record[name];
-    if (inner && typeof inner === 'object') {
-      const next = plainProps(inner as object);
-      if (next !== inner) set(name, next);
-    }
-  }
-  const out = (copy || record) as unknown as T;
-  PLAIN.set(props, out);
-  // What is plain stays what it is when asked again.
-  if (out !== props) PLAIN.set(out, out);
-  return out;
-}
 
 /** The chain of wrappers of an item as the fragment has it: copies of those it carries, without the others. */
 function carryWrap(ctx: CopyContext, wrap: Wrapper | undefined, depth = 0): Wrapper | undefined {
@@ -1611,7 +1520,7 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
   let offset = 0;
   let after = false;
   if (openEnd) {
-    if (!openStart && headUsed) out.push(paragraphWith(paragraph, rebuild(head), withoutSection(paragraph.props)));
+    if (!openStart && headUsed) out.push(paragraphWith(paragraph, rebuild(head), newMarkProps(paragraph.props)));
     for (const block of middle) out.push(block);
     const inner = inside(pastePieces(ctx, last as Paragraph), base);
     let props = paragraph.props;
@@ -1629,7 +1538,7 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
       for (const block of middle) out.push(block);
       after = true;
     } else {
-      if (!openStart && headUsed) out.push(paragraphWith(paragraph, rebuild(head), withoutSection(paragraph.props)));
+      if (!openStart && headUsed) out.push(paragraphWith(paragraph, rebuild(head), newMarkProps(paragraph.props)));
       for (const block of middle) out.push(block);
       // The paragraph itself when nothing of it is before the caret: it keeps its place in the source of the story.
       target = head.length === 0 ? paragraph : paragraphWith(paragraph, rebuild(tail), paragraph.props, false);

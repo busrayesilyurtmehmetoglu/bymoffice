@@ -6,6 +6,7 @@
 // names and links that name the sheet) is worked out when they are applied.
 
 import { renameSheetsInFormula } from '../calc/refs';
+import { protectionNow } from '../formats/xlsx/build';
 import { commentCellNow } from '../render/sheet-drawings';
 import { conditionalFormatNow, dataValidationNow, extensionRuleCount, mainPartRule, ruleSpace, ruleWithFormulas } from './rules';
 import { MAX_COLS, MAX_ROWS, checkSheetName, createSheet, foldSheetName, type Cell, type Color, type ConditionalFormat, type ConditionalRule, type DataValidation, type DefinedName, type Hyperlink, type Row, type Sheet, type SheetComment, type SheetNameMap, type SheetState, type Workbook } from '../model/sheet/types';
@@ -188,11 +189,13 @@ export interface CopySheetLoss {
    * "conditionalFormatExtensions" (conditional rules the extension list has, or says more
    * about than the main part: those parts are not copied), "drawings" (pictures, shapes, charts),
    * "threadedComments", "externalLinks" (links to places outside the workbook), "pageBreaks",
-   * "rowAttributes" (rows with attributes the model has no field for), the kind of a part
+   * "rowAttributes" (rows with attributes of another namespace than the sheet's own, the hint
+   * x14ac:dyDescent aside; attributes without a namespace are copied), the kind of a part
    * around the sheet that the model does not hold ("table", "pivotTable", "formControl", ...),
    * or the name of something in the sheet part itself that the model does not hold
    * (Sheet.unmodelled: "sortState", "customSheetViews", "ignoredErrors", "cellWatches",
-   * "sparklineGroups", "outlinePr", "codeName", "outlineLevels", ...).
+   * "sparklineGroups", "outlinePr", "codeName", "outlineLevels", "legacyDrawingHF" (the pictures
+   * of headers and footers), "picture" (the background picture), ...).
    */
   what: string;
   count: number;
@@ -227,11 +230,37 @@ export function copySheetLosses(workbook: Workbook, index: number): CopySheetLos
   const names = new Map<string, number>();
   for (const name of sheet.unmodelled || []) if (typeof name === 'string') names.set(name, (names.get(name) || 0) + 1);
   for (const [name, count] of names) if (!out.some((loss) => loss.what === name)) add(name, count);
-  // Attributes of rows that are kept as the file has them (they may be of a namespace the new part does not declare).
+  // Attributes of rows that are kept as the file has them: those of a namespace of their own are not copied (the
+  // new part does not declare it). The hints Excel puts on every row are no content.
   let rowAttributes = 0;
-  for (const row of sheet.rows.values()) if (row.attrs && row.attrs.length > 0) rowAttributes++;
+  const lost = new Map<NonNullable<Row['attrs']>, boolean>();
+  for (const row of sheet.rows.values()) {
+    const attrs = row.attrs;
+    if (!attrs || attrs.length === 0) continue;
+    // Equal lists are one object in a sheet as it was read: each is looked at once.
+    let loses = lost.get(attrs);
+    if (loses === undefined) {
+      loses = attrs.some((pair) => !portableRowAttr(pair) && !isRowHint(pair));
+      lost.set(attrs, loses);
+    }
+    if (loses) rowAttributes++;
+  }
   add('rowAttributes', rowAttributes);
   return out;
+}
+
+/** Can a kept attribute of a row be written into a sheet part that declares no namespace but its own. */
+function portableRowAttr(pair: [name: string, value: string]): boolean {
+  return Array.isArray(pair) && typeof pair[0] === 'string' && typeof pair[1] === 'string' && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(pair[0]) && pair[0] !== 'xmlns';
+}
+
+/**
+ * Is a kept attribute of a row a hint that says nothing about the sheet: the descent of the
+ * font of the row (x14ac:dyDescent), which Excel writes on every row and works out again.
+ */
+function isRowHint(pair: [name: string, value: string]): boolean {
+  const name = Array.isArray(pair) && typeof pair[0] === 'string' ? pair[0] : '';
+  return name.slice(name.indexOf(':') + 1) === 'dyDescent' && name.indexOf(':') > 0;
 }
 
 /**
@@ -262,10 +291,14 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
   for (const other of workbook.sheets) if (other.sheetId > sheetId) sheetId = other.sheetId;
   const copy = createSheet({ name, sheetId: sheetId + 1, state: 'visible', kind: 'worksheet', part: '' });
 
+  // The rows and columns moved since the sheet was read: what the model keeps as the file has it is read through them.
+  const space = ruleSpace(workbook, source);
   const own = foldSheetName(source.name);
   const map: SheetNameMap = (written) => (foldSheetName(written) === own ? name : undefined);
   const renamed = (text: string): string => (text.indexOf('!') < 0 ? text : renameSheetsInFormula(text, map));
 
+  /** The attributes each list of kept row attributes gives the copy: equal lists of the file are one object, and stay one. */
+  const rowAttrs = new Map<NonNullable<Row['attrs']>, NonNullable<Row['attrs']>>();
   // Cells are never altered in place: the copy shares every cell whose formula does not name the sheet.
   for (const [rowIndex, row] of source.rows) {
     if (!(rowIndex >= 0 && rowIndex < MAX_ROWS)) continue;
@@ -279,8 +312,13 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
       cells[col] = { ...cell, formula: { ...formula, text } };
     });
     const next: Row = { ...row, cells: cells || row.cells.slice() };
-    // Attributes kept from the file may be of a namespace the new part does not declare.
-    delete next.attrs;
+    // Attributes kept from the file: those of a namespace of their own stay behind (the new part does not declare it).
+    if (row.attrs) {
+      let attrs = rowAttrs.get(row.attrs);
+      if (!attrs) rowAttrs.set(row.attrs, (attrs = row.attrs.filter(portableRowAttr)));
+      if (attrs.length > 0) next.attrs = attrs;
+      else delete next.attrs;
+    }
     copy.rows.set(rowIndex, next);
   }
   copy.rowCount = source.rowCount;
@@ -301,8 +339,8 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
   if (source.baseColWidth !== undefined) copy.baseColWidth = source.baseColWidth;
   copy.view = { ...source.view, tabSelected: false };
   if (source.tabColor) copy.tabColor = { ...source.tabColor };
-  // A protected sheet has a protected copy: the element is never changed, so it is shared.
-  if (source.protection) copy.protection = source.protection;
+  // A protected sheet has a protected copy, with the ranges that are open in it where they are now.
+  if (source.protection) copy.protection = protectionNow(source.protection, source.structuralEdits, source.name);
   if (source.autoFilter) {
     // What the file has beside the fields of the model (ids, extensions) belongs to the filter of the file.
     const filter = { ...source.autoFilter };
@@ -334,7 +372,6 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
   if (notes.length > 0) copy.comments = notes;
   // The data validations, as they apply now: in the copy every one of them is a rule of its own (live),
   // those of the extension list included (their source is named in the rule itself from here on).
-  const space = ruleSpace(workbook, source);
   const validations: DataValidation[] = [];
   for (const rule of source.dataValidations || []) {
     const now = dataValidationNow(rule, space);

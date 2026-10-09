@@ -24,7 +24,7 @@
 // Content in a `del` wrapper is not content any more: it takes no offsets
 // (see position.ts) and no command touches it again.
 
-import { tracksChanges, type Block, type DocModel, type Inline, type ParaProps, type RevisionInfo, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
+import { EMPTY_PARA_PROPS, tracksChanges, type Block, type DocModel, type ExtraXml, type Inline, type ParaProps, type RevisionInfo, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
 import type { XmlElement } from '../../xml';
 import { fieldPairs, makeRun, removedPieces, sameProps, type Piece } from './pieces';
 
@@ -494,8 +494,10 @@ function joinStruck(pieces: Piece[]): Piece[] {
  * The pieces with the content of [from, to) deleted as a tracked change:
  * what removePieces() would take is put into a deletion (and takes no
  * offsets any more), except for the text, tabs and line breaks this author
- * had inserted as a tracked change, which go. `changed` is false when there
- * was nothing to delete.
+ * had inserted as a tracked change, which go - unless a link, a control or
+ * the like around the insertion would be left with nothing: then all of the
+ * author's text in it stays, deleted. `changed` is false when there was
+ * nothing to delete.
  */
 export function strikePieces(tracking: Tracking, pieces: Piece[], from: number, to: number): { pieces: Piece[]; changed: boolean } {
   if (from >= to) return { pieces, changed: false };
@@ -522,19 +524,24 @@ export function strikePieces(tracking: Tracking, pieces: Piece[], from: number, 
   }
   if (anyGone) {
     // An insertion typed into a link or a control must not take that with it: every wrapper around
-    // the insertion has to hold something that stays, or the text stays too, deleted.
+    // the insertion has to hold something that stays, or the text stays too, deleted. The answer is
+    // one for each wrapper, whatever the runs of the text are: a wrapper that would be left with
+    // nothing keeps all of the text it holds, as a deletion, and from one that keeps something else
+    // all of it goes. (Key by key that means: the characters go for good until the last one, which
+    // stays, deleted.)
     const held = new Set<Wrapper>();
-    const hold = (wrap: Wrapper | undefined): void => {
-      for (let w = wrap; w && !held.has(w); w = w.parent) held.add(w);
-    };
-    for (let q = 0; q < pieces.length; q++) if (!gone[q]) hold(pieces[q].wrap);
+    for (let q = 0; q < pieces.length; q++) {
+      if (gone[q]) continue;
+      for (let w = pieces[q].wrap; w && !held.has(w); w = w.parent) held.add(w);
+    }
     for (let q = 0; q < pieces.length; q++) {
       if (!gone[q]) continue;
-      let safe = true;
-      for (let w = (pieces[q].wrap as Wrapper).parent; w && safe; w = w.parent) if (!held.has(w)) safe = false;
-      if (safe) continue;
-      gone[q] = false;
-      hold(pieces[q].wrap);
+      let steps = 0;
+      for (let w = (pieces[q].wrap as Wrapper).parent; w && steps < MAX_WRAPPER_CHAIN; w = w.parent, steps++) {
+        if (held.has(w)) continue;
+        gone[q] = false;
+        break;
+      }
     }
   }
   const own = (q: number): boolean => gone[q];
@@ -662,17 +669,88 @@ function freshChange(change: XmlElement, tracking: Tracking): XmlElement {
 }
 
 /**
+ * Kept children with the ids of the tracked changes in them replaced: `renew` is asked for
+ * every id and answers with the id to write instead, or with undefined to leave it. The list
+ * itself when nothing changes.
+ */
+function renumberedExtras(extras: ExtraXml[] | undefined, renew: (id: number) => number | undefined): ExtraXml[] | undefined {
+  if (!extras) return extras;
+  const walk = (el: XmlElement, depth: number): XmlElement => {
+    if (depth > MAX_PLAIN_DEPTH) return el;
+    let attrs: Map<string, string> | undefined;
+    const local = localOfName(el.name);
+    if (REVISION_RECORDS.has(local) || REVISION_MARKS.has(local)) {
+      el.attrs.forEach((value, name) => {
+        if (attrs || localOfName(name) !== 'id' || !/^\d{1,10}$/.test(value)) return;
+        const next = renew(Number(value));
+        if (next === undefined) return;
+        attrs = new Map(el.attrs);
+        attrs.set(name, String(next));
+      });
+    }
+    let children: XmlElement['children'] | undefined;
+    for (let i = 0; i < el.children.length; i++) {
+      const node = el.children[i];
+      if (node.type !== 'element') continue;
+      const next = walk(node, depth + 1);
+      if (next === node) continue;
+      if (!children) children = el.children.slice();
+      children[i] = next;
+    }
+    if (!attrs && !children) return el;
+    return { ...el, attrs: attrs || el.attrs, children: children || el.children };
+  };
+  let out: ExtraXml[] | undefined;
+  for (let i = 0; i < extras.length; i++) {
+    const el = walk(extras[i].el, 0);
+    if (el === extras[i].el) continue;
+    if (!out) out = extras.slice();
+    out[i] = { ...extras[i], el };
+  }
+  return out || extras;
+}
+
+/**
  * Paragraph properties for a second paragraph with the same properties: the
- * formatting changes they keep as XML (of the paragraph and of its mark) get
- * ids of their own, so that no id is in the file twice.
+ * formatting changes they keep (of the paragraph and of its mark, and the
+ * changes inside what they keep as XML, a changed list number say) get ids
+ * of their own, so that no id is in the file twice.
  */
 export function withFreshChanges(props: ParaProps, tracking: Tracking): ParaProps {
   const mark = props.markProps;
-  if (!props.change && !(mark && mark.change)) return props;
+  const renew = (): number => tracking.revision().id as number;
+  const extras = renumberedExtras(props.extras, renew);
+  const markExtras = mark ? renumberedExtras(mark.extras, renew) : undefined;
+  if (!props.change && !(mark && mark.change) && extras === props.extras && !(mark && markExtras !== mark.extras)) return props;
   const out: ParaProps = { ...props };
   if (props.change) out.change = freshChange(props.change, tracking);
-  if (mark && mark.change) out.markProps = { ...mark, change: freshChange(mark.change, tracking) };
+  if (extras !== props.extras) out.extras = extras;
+  if (mark && (mark.change || markExtras !== mark.extras)) {
+    const next: RunProps = { ...mark };
+    if (mark.change) next.change = freshChange(mark.change, tracking);
+    if (markExtras !== mark.extras) next.extras = markExtras;
+    out.markProps = next;
+  }
   return out;
+}
+
+/**
+ * Paragraph properties whose mark is, as a tracked change, what the mark of `from` is: the
+ * revisions it says of itself (inserted, deleted, moved) and the record of a change of its
+ * formatting. The formatting itself stays what `props` has.
+ */
+export function withMarkRevisionsOf(props: ParaProps, from: ParaProps): ParaProps {
+  const flagged = withMarkFlagsOf(props, from);
+  const have = flagged.markProps ? flagged.markProps.change : undefined;
+  const want = from.markProps ? from.markProps.change : undefined;
+  if (have === want) return flagged;
+  const mark: RunProps = { ...(flagged.markProps || {}) };
+  if (want) mark.change = want;
+  else delete mark.change;
+  const out: ParaProps = { ...flagged };
+  if (Object.keys(mark).length) out.markProps = mark;
+  else delete out.markProps;
+  return Object.keys(out).length ? out : EMPTY_PARA_PROPS;
 }
 
 export const isDeletedMark = (props: ParaProps): boolean => props.markProps !== undefined && props.markProps.deleted !== undefined;
@@ -704,12 +782,18 @@ function renumberedChange(doc: DocModel, change: XmlElement): XmlElement {
  * their paragraphs an element of its own: what the edit split in two (a run
  * whose formatting was changed, an insertion, a deletion or a move something
  * was put into, a paragraph that carries a change of its formatting or of its
- * mark) would otherwise be written as two elements with one id. The second
- * of two such elements gets a new id. Holds for every edit, tracked or not.
- * Paragraphs inside the tables of the blocks are not looked at. Returns the
- * list itself when nothing had to change.
+ * mark, or one inside the properties it keeps as XML) would otherwise be
+ * written as two elements with one id. The second of two such elements gets a
+ * new id. Holds for every edit, tracked or not. Paragraphs inside the tables
+ * of the blocks are not looked at.
+ *
+ * `untouched` are the blocks among them that the document has already, as
+ * they are: the writer copies those from the source of their part, so they
+ * are never changed here (a file that came with an id twice keeps it there),
+ * and the ids they have are taken for all the others. Returns the list itself
+ * when nothing had to change.
  */
-export function distinctRevisions(doc: DocModel, blocks: Block[]): Block[] {
+export function distinctRevisions(doc: DocModel, blocks: Block[], untouched?: Set<Block>): Block[] {
   let out: Block[] | undefined;
   /** The ids the elements written so far have. */
   const seen = new Set<number>();
@@ -719,9 +803,38 @@ export function distinctRevisions(doc: DocModel, blocks: Block[]): Block[] {
     seen.add(id);
     return false;
   };
+  const noteExtras = (extras: ExtraXml[] | undefined): void => {
+    renumberedExtras(extras, (id) => {
+      seen.add(id);
+      return undefined;
+    });
+  };
+  if (untouched && untouched.size) {
+    for (const block of blocks) {
+      if (block.type !== 'paragraph' || !untouched.has(block)) continue;
+      for (const inline of block.children) {
+        let steps = 0;
+        for (let w = inline.wrap; w && steps < MAX_WRAPPER_CHAIN; w = w.parent, steps++) if (isRevision(w) && w.id !== undefined) seen.add(w.id);
+        if (inline.type === 'run' && inline.props.change) taken(changeId(inline.props.change));
+      }
+      const props = block.props;
+      if (props.change) taken(changeId(props.change));
+      noteExtras(props.extras);
+      const mark = props.markProps;
+      if (mark) {
+        if (mark.change) taken(changeId(mark.change));
+        for (const key of MARK_FLAGS) {
+          const info: RevisionInfo | undefined = mark[key];
+          if (info) taken(info.id);
+        }
+        noteExtras(mark.extras);
+      }
+    }
+  }
+  const renew = (id: number): number | undefined => (taken(id) ? nextRevisionId(doc) : undefined);
   for (let b = 0; b < blocks.length; b++) {
     const block = blocks[b];
-    if (block.type !== 'paragraph') continue;
+    if (block.type !== 'paragraph' || (untouched && untouched.has(block))) continue;
     let children: Inline[] | undefined;
     /** The wrappers around the inline before, and what stands for each in the element that is open. */
     let previous = new Set<Wrapper>();
@@ -764,6 +877,8 @@ export function distinctRevisions(doc: DocModel, blocks: Block[]): Block[] {
     }
     let props = block.props;
     if (props.change && taken(changeId(props.change))) props = { ...props, change: renumberedChange(doc, props.change) };
+    const extras = renumberedExtras(props.extras, renew);
+    if (extras !== props.extras) props = { ...props, extras };
     let mark = props.markProps;
     if (mark) {
       const before = mark;
@@ -772,6 +887,8 @@ export function distinctRevisions(doc: DocModel, blocks: Block[]): Block[] {
         const info: RevisionInfo | undefined = mark[key];
         if (info && taken(info.id)) mark = { ...mark, [key]: { ...info, id: nextRevisionId(doc) } };
       }
+      const markExtras = renumberedExtras(mark.extras, renew);
+      if (markExtras !== mark.extras) mark = { ...mark, extras: markExtras };
       if (mark !== before) props = { ...props, markProps: mark };
     }
     if (!children && props === block.props) continue;
@@ -779,4 +896,121 @@ export function distinctRevisions(doc: DocModel, blocks: Block[]): Block[] {
     out[b] = { ...block, children: children || block.children, props };
   }
   return out || blocks;
+}
+
+// ------------------------------------------------- properties without changes
+
+const MAX_PLAIN_DEPTH = 300;
+const localOfName = (name: string): string => name.slice(name.indexOf(':') + 1);
+
+/** Elements that record a tracked change of formatting or of a table, wherever they stand. */
+const REVISION_RECORDS = new Set(['rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange', 'tblPrExChange', 'trPrChange', 'tcPrChange', 'tblGridChange', 'numberingChange', 'cellIns', 'cellDel', 'cellMerge']);
+/** Inside properties these mark what the properties belong to (a paragraph mark, a row, a numbering) as inserted, deleted or moved. */
+const REVISION_MARKS = new Set(['ins', 'del', 'moveFrom', 'moveTo']);
+/** The fields of property bags that hold a tracked change. */
+const REVISION_FIELDS = ['inserted', 'deleted', 'moveFrom', 'moveTo', 'change'];
+
+/** Property bags without their tracked changes, by the bag they were made from: the same bag gives the same object. */
+const PLAIN = new WeakMap<object, object>();
+
+/** A kept element without the records of tracked changes in it; the element itself when it holds none. */
+function plainElement(el: XmlElement, marks: boolean, depth = 0): XmlElement {
+  if (depth > MAX_PLAIN_DEPTH) return el;
+  let children: XmlElement['children'] | undefined;
+  for (let i = 0; i < el.children.length; i++) {
+    const node = el.children[i];
+    if (node.type !== 'element') {
+      if (children) children.push(node);
+      continue;
+    }
+    const local = localOfName(node.name);
+    const next = REVISION_RECORDS.has(local) || (marks && REVISION_MARKS.has(local)) ? undefined : plainElement(node, marks, depth + 1);
+    if (next === node) {
+      if (children) children.push(node);
+      continue;
+    }
+    if (!children) children = el.children.slice(0, i);
+    if (next) children.push(next);
+  }
+  return children ? { ...el, children } : el;
+}
+
+/**
+ * Kept children without the records of tracked changes. `marks`: the children are those of
+ * properties, where <w:ins> and <w:del> are marks too (in a table they would wrap rows).
+ */
+export function plainExtras(extras: ExtraXml[] | undefined, marks: boolean): ExtraXml[] | undefined {
+  if (!extras) return undefined;
+  let out: ExtraXml[] | undefined;
+  for (let i = 0; i < extras.length; i++) {
+    const extra = extras[i];
+    const local = localOfName(extra.el.name);
+    // The parent itself (index -1) is kept for what it carries; only what is in it goes.
+    const gone = extra.index >= 0 && (REVISION_RECORDS.has(local) || (marks && REVISION_MARKS.has(local)));
+    const el = gone ? undefined : plainElement(extra.el, marks);
+    if (el === extra.el) {
+      if (out) out.push(extra);
+      continue;
+    }
+    if (!out) out = extras.slice(0, i);
+    // A list number that was kept for the change recorded in it is, without that, what the fields of the model say.
+    if (el && !(extra.partial === true && isPlainNumPr(el))) out.push({ ...extra, el });
+  }
+  if (!out) return extras;
+  return out.length ? out : undefined;
+}
+
+/** Is the element a <w:numPr> that says nothing but a level and a list: all of it is in ParaProps.numbering then. */
+function isPlainNumPr(el: XmlElement): boolean {
+  if (localOfName(el.name) !== 'numPr' || el.attrs.size) return false;
+  const seen = new Set<string>();
+  for (const node of el.children) {
+    if (node.type !== 'element') return false;
+    const local = localOfName(node.name);
+    if ((local !== 'ilvl' && local !== 'numId') || seen.has(local) || node.children.length || node.attrs.size !== 1) return false;
+    let value: string | undefined;
+    node.attrs.forEach((text, name) => {
+      if (localOfName(name) === 'val') value = text;
+    });
+    if (value === undefined || !/^\d{1,10}$/.test(value)) return false;
+    seen.add(local);
+  }
+  return true;
+}
+
+/**
+ * Properties (of a paragraph, a run, a section, a table, a row, a cell) as a copy carries them:
+ * without what makes them a tracked change (see the head of fragment.ts). It is also what the
+ * properties of anything an edit makes anew are: a new paragraph mark, a new row, a new cell.
+ */
+export function plainProps<T extends object>(props: T): T {
+  if ((props as unknown) === EMPTY_PARA_PROPS) return props;
+  const memo = PLAIN.get(props);
+  if (memo) return memo as T;
+  const record = props as unknown as { [name: string]: unknown };
+  let copy: { [name: string]: unknown } | undefined;
+  const set = (name: string, value: unknown) => {
+    if (!copy) copy = { ...record };
+    if (value === undefined) delete copy[name];
+    else copy[name] = value;
+  };
+  for (const name of REVISION_FIELDS) if (record[name] !== undefined) set(name, undefined);
+  if (Array.isArray(record.extras)) {
+    const extras = plainExtras(record.extras as ExtraXml[], true);
+    if (extras !== record.extras) set('extras', extras);
+  }
+  // The properties of the paragraph mark, and the section a paragraph ends.
+  for (const name of ['markProps', 'section']) {
+    const inner = record[name];
+    if (inner && typeof inner === 'object') {
+      const next = plainProps(inner as object);
+      // A mark that was nothing but a revision is a mark without properties.
+      if (next !== inner) set(name, name === 'markProps' && Object.keys(next).length === 0 ? undefined : next);
+    }
+  }
+  const out = (copy || record) as unknown as T;
+  PLAIN.set(props, out);
+  // What is plain stays what it is when asked again.
+  if (out !== props) PLAIN.set(out, out);
+  return out;
 }

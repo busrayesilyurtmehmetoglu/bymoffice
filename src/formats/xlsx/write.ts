@@ -2066,6 +2066,12 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
   const rootStart = nextTag(s, 0);
   let cursor = startTagEnd(s, rootStart);
   const out: string[] = [fixDeclaration(s.slice(0, rootStart)), s.slice(rootStart, cursor)];
+  /**
+   * What of `out` is not the source as it stands: the index of the piece, and the stretch of the source it stands
+   * for (none, for something put in). With it a part that has a byte order mark or line ends of two characters is
+   * written with every byte that did not change (see exactSheet()).
+   */
+  const made: { index: number; start: number; end: number }[] = [];
 
   const writer: CellWriter = { prefix, shared: workbook.sharedStrings, styledColumns: sheet.columns.filter((range) => !!range.style), overrides: options.overrides };
   const fresh = !!options.fresh;
@@ -2131,6 +2137,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
         // The formats of the model, behind every such element of the source.
         const added = state.conditional ? liveConditionalXml(prefix, state.conditional) : '';
         if (added !== '') {
+          made.push({ index: out.length, start: cursor, end: cursor });
           out.push(added);
           state.changed = true;
         }
@@ -2140,6 +2147,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
         // The rules of a part that has no element for them, once every place such an element could be at was passed.
         const added = state.validations ? newValidations(prefix, state.validations) : '';
         if (added !== '') {
+          made.push({ index: out.length, start: cursor, end: cursor });
           out.push(added);
           state.changed = true;
         }
@@ -2147,6 +2155,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
       }
       const text = regenerated.get(local);
       if (text === undefined) continue;
+      made.push({ index: out.length, start: cursor, end: cursor });
       out.push(text);
       regenerated.delete(local);
       if (text !== '') state.changed = true;
@@ -2161,6 +2170,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
     if (rank >= 0) flush(rank);
     out.push(s.slice(cursor, start));
     const emitted = writeChild(sc, s, start, sheet, writer, adjuster, regenerated, state, rawOnly);
+    made.push({ index: out.length, start, end: emitted.end });
     out.push(emitted.text);
     cursor = emitted.end;
   }
@@ -2184,7 +2194,37 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
       originalLinks(state.linksRaw, own),
     );
   }
-  return encoder.encode(out.join(''));
+  return hasExactBytes(original) ? exactSheet(original, s, out, made) : encoder.encode(out.join(''));
+}
+
+/** Does a part hold bytes its text as the scanner sees it does not: a byte order mark of UTF-8, or a carriage return. */
+function hasExactBytes(bytes: Uint8Array): boolean {
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return true;
+  return bytes.indexOf(0x0d) >= 0;
+}
+
+/**
+ * The rewritten sheet part as bytes, for a part with a byte order mark or line ends of two
+ * characters: what the pieces in `made` say in place of the stretches of the source they stand
+ * for, and every other byte of the part as it is. Of a piece that stands for a stretch only
+ * the middle that differs is replaced, so an element in which one rule changed keeps the line
+ * ends around that rule. (Without this the whole part was written from the text the scanner
+ * sees, which has neither the mark nor the two-character line ends.)
+ */
+function exactSheet(original: Uint8Array, s: string, out: string[], made: { index: number; start: number; end: number }[]): Uint8Array {
+  const splices: Splice[] = [];
+  for (const piece of made) {
+    const text = out[piece.index];
+    const length = piece.end - piece.start;
+    const most = Math.min(text.length, length);
+    let head = 0;
+    while (head < most && text.charCodeAt(head) === s.charCodeAt(piece.start + head)) head++;
+    if (head === length && head === text.length) continue;
+    let tail = 0;
+    while (tail < most - head && text.charCodeAt(text.length - 1 - tail) === s.charCodeAt(piece.end - 1 - tail)) tail++;
+    splices.push({ start: piece.start + head, end: piece.end - tail, text: text.slice(head, text.length - tail) });
+  }
+  return spliceExact(original, splices);
 }
 
 /** One worksheet part regenerated from its original bytes and the model. */

@@ -602,6 +602,7 @@ export function makeRun(pieces: Piece[], from: number, to: number): Run {
 /** The inlines of a paragraph from its pieces. */
 export function rebuild(pieces: Piece[]): Inline[] {
   const out: Inline[] = [];
+  let standIns = false;
   let k = 0;
   while (k < pieces.length) {
     const piece = pieces[k];
@@ -625,8 +626,33 @@ export function rebuild(pieces: Piece[]): Inline[] {
       if (last.wrap) merged.wrap = last.wrap;
       out[out.length - 1] = merged;
     } else out.push(next);
+    if (next.type === 'empty') standIns = true;
   }
-  return out;
+  return standIns ? withoutStaleStandIns(out) : out;
+}
+
+/**
+ * The inlines without the stand-ins of empty wrappers that are empty no more. A wrapper without
+ * content (an empty content control) has a stand-in inline, so that it has a place in its
+ * paragraph; when content of the same wrapper comes to stand beside it (two paragraphs that
+ * shared the control are joined again, something is put into it) the file has one element with
+ * that content, and the stand-in stands for nothing. Works in place and returns the list.
+ */
+function withoutStaleStandIns(inlines: Inline[]): Inline[] {
+  const carries = (inline: Inline | undefined, wrapper: Wrapper): boolean => {
+    let steps = 0;
+    for (let w = inline ? inline.wrap : undefined; w && steps < 4096; w = w.parent, steps++) if (w === wrapper) return true;
+    return false;
+  };
+  for (let i = 0; i < inlines.length; i++) {
+    const inline = inlines[i];
+    if (inline.type !== 'empty' || !inline.wrap) continue;
+    // Another stand-in of the same wrapper beside it, or content in it.
+    if (!carries(inlines[i - 1], inline.wrap) && !carries(inlines[i + 1], inline.wrap)) continue;
+    inlines.splice(i, 1);
+    i--;
+  }
+  return inlines;
 }
 
 /** A paragraph like `paragraph` with other content (and properties): a new object without a source span. */

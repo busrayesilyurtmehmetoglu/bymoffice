@@ -4,7 +4,7 @@
 // back and hands out the recorded operations; the caller applies them through
 // a DocHistory. A command that throws leaves the document as it was.
 
-import type { Block, DocModel, Paragraph, RunItem, Story, Table, TableCell, Wrapper } from '../../model/doc/types';
+import type { Block, DocModel, Paragraph, RunItem, Story, Table, TableCell, TableRow, Wrapper } from '../../model/doc/types';
 import { applyDocOp, checkSplice, splicedBlocks, type DocOp } from './ops';
 import { READ_ONLY } from './pieces';
 import { collapsed, inTextBox, storyOf, type DocPosition, type DocRange } from './position';
@@ -160,8 +160,8 @@ export class Draft {
   replace(story: string, path: number[], at: number, remove: number, incoming: Block[]): void {
     if (inTextBox(path)) bad('The content of a text box cannot be edited');
     // No two elements of what goes in share the id of a tracked change (see distinctRevisions).
-    const insert = Array.isArray(incoming) ? distinctRevisions(this.doc, incoming) : incoming;
     const top = storyOf(this.doc, story).blocks;
+    const insert = Array.isArray(incoming) ? distinctRevisions(this.doc, incoming, this.standing(top, path, at, remove, incoming)) : incoming;
     if (path.length === 0) {
       for (let i = at; i < at + remove && i < top.length; i++) if (inAlternate(top[i].wrap)) bad(READ_ONLY);
       checkSplice(top, at, remove, insert);
@@ -204,6 +204,27 @@ export class Draft {
     if (remove === 1 && insert.length === 1) cell.blocks[at] = insert[0];
     else if (insert.length <= SPLICE_LIMIT) cell.blocks.splice(at, remove, ...insert);
     else cell.blocks = splicedBlocks(cell.blocks, at, remove, insert);
+  }
+
+  /**
+   * The blocks among `incoming` that are in the list they go into already, as they are: a command that replaces a
+   * stretch of blocks hands back the ones it did not change. Undefined when there is none.
+   */
+  private standing(top: Block[], path: number[], at: number, remove: number, incoming: Block[]): Set<Block> | undefined {
+    if (!(remove > 0) || !(at >= 0)) return undefined;
+    let blocks: Block[] | undefined = top;
+    for (let i = 0; i < path.length && blocks; i += 3) {
+      const table: Block | undefined = blocks[path[i]];
+      const row: TableRow | undefined = table && table.type === 'table' ? table.rows[path[i + 1]] : undefined;
+      const cell: TableCell | undefined = row ? row.cells[path[i + 2]] : undefined;
+      blocks = cell ? cell.blocks : undefined;
+    }
+    if (!blocks) return undefined;
+    const old = new Set<Block>();
+    for (let i = at; i < at + remove && i < blocks.length; i++) old.add(blocks[i]);
+    let out: Set<Block> | undefined;
+    for (const block of incoming) if (old.has(block)) (out || (out = new Set<Block>())).add(block);
+    return out;
   }
 
   /** A copy of a table with a list of rows of its own, and no source span. */
