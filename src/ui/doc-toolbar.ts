@@ -14,6 +14,7 @@ import { withShortcut, type EditorStrings } from './editor-strings';
 import type { DocumentView } from './doc-view';
 import { ICON_BAR_CLASS, createDocIcon, createIcon, type DocIconName, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
+import type { SaveCommand } from './save-command';
 import { onFontsChanged, registeredFonts } from '../render/fonts';
 import { embeddedFontNames } from '../render/embedded-fonts';
 
@@ -24,9 +25,12 @@ export interface DocShellHost {
   readonly root: HTMLElement;
   /** Runs a command of the view; afterwards the focus goes back to the document (unless it is to be kept) and the toolbar is brought up to date. */
   run(action: () => void, keepFocus?: boolean): void;
+  /** With it the toolbar starts with a Save button. */
+  readonly save?: SaveCommand;
 }
 
 type ButtonKey =
+  | 'save'
   | 'undo'
   | 'redo'
   | 'bold'
@@ -56,6 +60,7 @@ type ButtonKey =
   | 'changesMenu';
 
 const SHARED_ICONS: { [key: string]: IconName } = {
+  save: 'save',
   undo: 'undo',
   redo: 'redo',
   bold: 'bold',
@@ -156,6 +161,11 @@ export class DocToolbar {
     this.element = element;
 
     const view = () => host.view;
+    const save = host.save;
+    if (save) {
+      this.addButton('save', () => save.run()).setAttribute('aria-busy', 'false');
+      this.addSeparator();
+    }
     this.addButton('undo', () => view().undo());
     this.addButton('redo', () => view().redo());
     this.addSeparator();
@@ -246,6 +256,15 @@ export class DocToolbar {
 
     this.setDisabled('undo', !view.canUndo);
     this.setDisabled('redo', !view.canRedo);
+    const save = this.host.save;
+    const saveButton = this.buttons.save;
+    if (save && saveButton) {
+      // Dimmed while there is nothing to save, busy while a save is under way (a press then saves once more
+      // when something was changed meanwhile). The whole toolbar is gone from a document that is read-only.
+      this.setDisabled('save', !editable || !(save.dirty || save.saving));
+      const busy = save.saving ? 'true' : 'false';
+      if (saveButton.getAttribute('aria-busy') !== busy) saveButton.setAttribute('aria-busy', busy);
+    }
     const others: ButtonKey[] = [
       'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'highlight', 'alignLeft', 'alignCenter', 'alignRight', 'alignJustify',
       'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak',
@@ -478,6 +497,7 @@ export class DocToolbar {
     const s = this.strings;
     this.element.setAttribute('aria-label', s.toolbar);
     const labels: { [key in ButtonKey]: string } = {
+      save: withShortcut(s.save, 'S'),
       undo: withShortcut(s.undo, 'Z'),
       redo: withShortcut(s.redo, 'Y'),
       bold: withShortcut(s.bold, 'B'),

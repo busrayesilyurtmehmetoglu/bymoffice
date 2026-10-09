@@ -5,6 +5,7 @@
 import type { BorderPreset } from '../ops/format';
 
 export type IconName =
+  | 'save'
   | 'undo'
   | 'redo'
   | 'print'
@@ -37,6 +38,8 @@ const path = (d: string, extra?: { [name: string]: string }): Shape => ['path', 
 const bar: Shape = ['rect', { class: ICON_BAR_CLASS, x: '3.5', y: '18', width: '17', height: '4', rx: '1', stroke: 'none', fill: 'currentColor' }];
 
 const ICONS: { [name in IconName]: Shape[] } = {
+  // A disk: its label, its shutter, the notch of its corner.
+  save: [path('M5 4h11l3 3v13H5z'), path('M8 4v5h7V4'), path('M8 20v-6h8v6')],
   undo: [path('M9 14 4 9l5-5'), path('M4 9h10a6 6 0 0 1 0 12h-3')],
   redo: [path('m15 14 5-5-5-5'), path('M20 9H10a6 6 0 0 0 0 12h3')],
   // The printer of the document bar.

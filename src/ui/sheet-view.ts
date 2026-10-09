@@ -4860,6 +4860,16 @@ export class WorkbookView {
     return sheetErrorText(message, strings) || strings.actionFailed;
   }
 
+  /**
+   * Says something to the user on behalf of whoever holds the view (that the workbook was saved,
+   * or why it was not): in the live region and to onNotice, as the view's own messages are.
+   * The text is shown as text. Does nothing in a view that was destroyed.
+   */
+  showNotice(message: string, kind: 'error' | 'info' = 'info'): void {
+    if (this.destroyed) return;
+    this.notify(String(message), kind === 'error' ? 'error' : 'info');
+  }
+
   /** Says something to the user: in the live region, and to the host page if it listens. */
   private notify(message: string, kind: 'error' | 'info'): void {
     this.live.textContent = message;

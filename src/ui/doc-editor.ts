@@ -11,10 +11,16 @@ import { DocToolbar, type DocShellHost } from './doc-toolbar';
 import type { DocumentPrintOptions, DocumentPrintResult } from './doc-print';
 import { DocumentView, type DocumentViewOptions } from './doc-view';
 import { getEditorStrings, type EditorStrings } from './editor-strings';
+import type { SaveCommand } from './save-command';
 
 export interface DocumentEditorOptions extends DocumentViewOptions {
   /** Show the formatting toolbar (while the document can be edited) and the bar with the zoom and the page number. Default true. */
   toolbar?: boolean;
+  /**
+   * What saves the document: with it the toolbar has a Save button. mount()
+   * hands it in for its `saveTo` option.
+   */
+  saveCommand?: SaveCommand;
 }
 
 // The same custom properties and classes as the spreadsheet editor has, so that the two look alike and a
@@ -47,6 +53,7 @@ const STYLE_TEXT = [
   // Part of the selection has it, part has not.
   '.bym-tb-btn[aria-pressed="mixed"]{background:var(--bym-hover)}',
   '.bym-tb-btn:disabled,.bym-tb-select:disabled{opacity:.38;cursor:default;background-color:transparent}',
+  '.bym-tb-btn[aria-busy="true"]{cursor:progress}',
   '.bym-tb-btn:focus,.bym-tb-select:focus{outline:2px solid var(--bym-accent);outline-offset:-2px}',
   '.bym-tb-btn:focus:not(:focus-visible){outline:none}',
   '.bym-tb-sep{display:block;width:1px;height:20px;margin:0 5px;background:var(--bym-border)}',
@@ -115,6 +122,8 @@ export class DocumentEditor {
   private strings: EditorStrings;
   private frame = 0;
   private destroyed = false;
+  /** Ends the watch on the save command. */
+  private unwatchSave: (() => void) | undefined;
 
   constructor(container: HTMLElement, doc: DocModel, options: DocumentEditorOptions = {}) {
     this.strings = getEditorStrings(typeof options.locale === 'string' ? options.locale : browserLanguage());
@@ -135,6 +144,7 @@ export class DocumentEditor {
       },
       root,
       run: (action, keepFocus) => this.run(action, keepFocus === true),
+      save: options.saveCommand,
     };
     if (options.toolbar !== false) {
       this.toolbar = new DocToolbar(host, this.strings);
@@ -176,6 +186,8 @@ export class DocumentEditor {
     }
     window.addEventListener('resize', this.onResize);
     root.addEventListener('keydown', this.onKeyDown);
+    // The Save button follows what there is to save.
+    if (options.saveCommand && this.toolbar) this.unwatchSave = options.saveCommand.watch(() => this.refresh());
     this.sync();
   }
 
@@ -210,6 +222,8 @@ export class DocumentEditor {
     this.frame = 0;
     window.removeEventListener('resize', this.onResize);
     this.root.removeEventListener('keydown', this.onKeyDown);
+    if (this.unwatchSave) this.unwatchSave();
+    this.unwatchSave = undefined;
     if (this.toolbar) this.toolbar.destroy();
     this.view.destroy();
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);

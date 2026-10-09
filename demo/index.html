@@ -43,6 +43,8 @@
       .warn { color: var(--warn); background: var(--warn-bg); }
       #grid { height: 560px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #doc { height: 640px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+      #saveto-editor { height: 460px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+      #saveto-editor[hidden] { display: none; }
       #status { font-weight: 600; overflow-wrap: anywhere; }
       #summary { font-size: 13px; color: var(--muted); }
       pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 420px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -151,6 +153,32 @@
           Üst çubuktan ya da Ctrl/Cmd ile birlikte + / − / 0 tuşlarıyla yakınlaştırın. Köprüler Ctrl/Cmd+tık ile yeni sekmede açılır.
           Düzenlemeler henüz dosyaya kaydedilmiyor olabilir (kaydetme bağlantısı ayrı bir görev).
         </p>
+      </section>
+
+      <section id="saveto-section">
+        <h2>Aynı yere kaydetme (<code>saveTo</code>)</h2>
+        <p class="muted">
+          Burada üretilen boş bir dosya bu sayfayı sunan yerel sunucuya (<code>/e2e/saved/…</code>, yalnız bellekte tutulur) konur ve
+          <code>BymOffice.mount(el, { file: adres, saveTo: … })</code> ile açılır. Araç çubuğunun başındaki Kaydet düğmesi ve Ctrl/Cmd+S dosyayı
+          alındığı adrese geri yollar. Yukarıda bıraktığınız dosyalar bu denemeye girmez, hiçbir yere gönderilmez.
+        </p>
+        <div class="row" style="margin: 0 0 10px">
+          <label>Hedef
+            <select id="saveto-target">
+              <option value="same">saveTo: true (alındığı adres, PUT + If-Match)</option>
+              <option value="function">saveTo: işlev (bellekte tutar)</option>
+              <option value="failing">saveTo: sunucu 503 yanıtlar</option>
+            </select>
+          </label>
+          <button id="saveto-xlsx">Boş xlsx ile dene</button>
+          <button id="saveto-docx">Boş docx ile dene</button>
+          <button id="saveto-conflict" disabled title="Sunucudaki kopyayı değiştirir: sonraki kayıt 412 alır, üzerine yazılmaz.">Sunucudaki kopyayı değiştir (412)</button>
+          <button id="saveto-overwrite" disabled title="mounted.saveNow({ overwrite: true }): If-Match göndermeden, sunucudaki kopyanın üzerine kaydeder.">Üzerine yaz</button>
+          <button id="saveto-check" disabled>Sunucudaki kopyayı oku</button>
+        </div>
+        <p class="muted" id="saveto-state">Henüz açılmadı.</p>
+        <p class="muted" id="saveto-notice"></p>
+        <div id="saveto-editor" hidden></div>
       </section>
 
       <section>
@@ -627,6 +655,97 @@
         link.download = selected.name;
         link.click();
         URL.revokeObjectURL(url);
+      });
+
+      // Saving to where the file came from: a blank file is put on the server that serves this page, and
+      // mounted from that address with the `saveTo` option.
+      let saveToMounted = null;
+      let saveToAddress = '';
+      /** What a function given as `saveTo` was last handed. */
+      let saveToKept = null;
+      const saveToState = (state) => {
+        $('saveto-state').textContent =
+          (state.saving ? 'Kaydediliyor…' : state.error ? `Kaydedilemedi: ${state.error}` : state.dirty ? 'Kaydedilmemiş değişiklik var.' : state.lastSavedAt ? `Kaydedildi (${new Date(state.lastSavedAt).toLocaleTimeString('tr-TR')}).` : 'Değişiklik yok.') +
+          ` — dirty: ${state.dirty}, saving: ${state.saving}`;
+      };
+      const tryLocation = location.protocol === 'http:' || location.protocol === 'https:';
+      // A name of its own for every page that is opened: two pages do not save over each other.
+      const saveToName = `demo-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+      for (const kind of ['xlsx', 'docx']) {
+        $(`saveto-${kind}`).addEventListener('click', async () => {
+          const host = $('saveto-editor');
+          if (saveToMounted) saveToMounted.destroy();
+          saveToMounted = null;
+          saveToKept = null;
+          $('saveto-notice').textContent = '';
+          if (!tryLocation) return void ($('saveto-state').textContent = 'Bu deneme sayfa bir sunucudan açıldığında çalışır: pnpm demo.');
+          const target = $('saveto-target').value;
+          saveToAddress = `/e2e/saved/${saveToName}.${kind}`;
+          try {
+            const seeded = await fetch(saveToAddress, { method: 'PUT', body: await BymOffice.createBlank(kind, { locale: 'tr' }) });
+            if (!seeded.ok) throw new Error(`HTTP ${seeded.status}`);
+            host.hidden = false;
+            saveToMounted = await BymOffice.mount(host, {
+              file: saveToAddress,
+              locale: 'tr',
+              saveTo:
+                target === 'same'
+                  ? true
+                  : target === 'failing'
+                    ? { url: `${saveToAddress}?status=503` }
+                    : (bytes, info) => {
+                        saveToKept = { bytes, info };
+                      },
+              onSaveState: saveToState,
+              onNotice: (notice) => {
+                $('saveto-notice').textContent = notice.message;
+              },
+            });
+            window.__saveTo = saveToMounted;
+            saveToState({ dirty: false, saving: false });
+            $('saveto-conflict').disabled = false;
+            $('saveto-overwrite').disabled = false;
+            $('saveto-check').disabled = false;
+          } catch (error) {
+            host.hidden = true;
+            $('saveto-state').textContent = `Açılamadı: ${error.message}`;
+          }
+        });
+      }
+      $('saveto-conflict').addEventListener('click', async () => {
+        // Someone else saves the file: the ETag the editor holds no longer names what the server has.
+        const kind = saveToAddress.endsWith('docx') ? 'docx' : 'xlsx';
+        const answer = await fetch(saveToAddress, { method: 'PUT', body: await BymOffice.createBlank(kind, { locale: 'en' }) });
+        $('saveto-notice').textContent = answer.ok ? 'Sunucudaki kopya değiştirildi: bir değişiklik yapıp kaydedin.' : `Değiştirilemedi: HTTP ${answer.status}`;
+      });
+      $('saveto-overwrite').addEventListener('click', () => {
+        // The user's answer to "the file on the server is not the one you opened": keep mine.
+        if (saveToMounted) saveToMounted.saveNow({ overwrite: true });
+      });
+      $('saveto-check').addEventListener('click', async () => {
+        try {
+          let bytes;
+          let from = 'Sunucudaki kopya';
+          if ($('saveto-target').value === 'function' && saveToKept) {
+            bytes = saveToKept.bytes;
+            from = `İşleve verilen son dosya (${saveToKept.info.format})`;
+          } else {
+            const answer = await fetch(saveToAddress);
+            if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
+            bytes = new Uint8Array(await answer.arrayBuffer());
+          }
+          const file = await BymOffice.open(bytes);
+          let text;
+          if (file.kind === 'document') text = BymOffice.documentText(await file.document()).slice(0, 200);
+          else {
+            const workbook = await file.workbook();
+            const cell = BymOffice.getCell(workbook.sheets[0], 0, 0);
+            text = `${workbook.sheets[0].name}!A1 = ${cell ? BymOffice.cellText(cell) : '(boş)'}`;
+          }
+          $('saveto-notice').textContent = `${from}: ${number(bytes.length)} bayt, ${file.format} — ${text}`;
+        } catch (error) {
+          $('saveto-notice').textContent = `Okunamadı: ${error.message}`;
+        }
       });
 
       convertButton.addEventListener('click', async () => {

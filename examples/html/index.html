@@ -61,8 +61,16 @@
       new    "docx" or "xlsx": start from an empty file instead of fetching one
       convert  "1": open doc, RTF and xls files for editing by converting them to docx / xlsx.
                The saved file is then of the new format: the request says which in the
-               X-Bym-Format header, and the name shown gets the new extension.
+               X-Bym-Format header (and the old one in X-Bym-Converted-From), and the name
+               shown gets the new extension.
       name   the file name shown, and used for a download
+
+      Saving is the editor's own: the page only says where to (the `saveTo` option of mount()).
+      The Save button is in the editor's toolbar, Ctrl+S / Cmd+S does the same, the request
+      carries the bytes with the media type of their format, and leaving the page with changes
+      that were not saved asks first. When the address the file is saved to is the one it was
+      fetched from and the server sent an ETag with it, the request carries If-Match, and the
+      server can refuse to overwrite somebody else's changes with 412.
 
       Inside an <iframe> the page tells its parent what happens:
         { source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message?, format?, convertedFrom? }
@@ -81,7 +89,6 @@
       <span id="status" role="status"></span>
       <!-- Opens the browser's print dialog, which can also save a PDF. -->
       <button id="print" type="button" hidden>Print</button>
-      <button id="save" type="button" hidden>Save</button>
     </div>
     <div id="editor"></div>
 
@@ -93,13 +100,11 @@
         var lang = params.get('lang') === 'tr' ? 'tr' : 'en';
         var readOnly = params.get('mode') === 'view';
         var text = {
-          en: { print: 'Print', save: 'Save', saving: 'Saving…', saved: 'Saved', changed: 'Not saved', loading: 'Loading…', failed: 'The file could not be saved', notHere: 'Only files of this site can be opened', nothing: 'No file was given' },
-          tr: { print: 'Yazdır', save: 'Kaydet', saving: 'Kaydediliyor…', saved: 'Kaydedildi', changed: 'Kaydedilmedi', loading: 'Yükleniyor…', failed: 'Dosya kaydedilemedi', notHere: 'Yalnız bu sitenin dosyaları açılabilir', nothing: 'Dosya verilmedi' },
+          en: { print: 'Print', saving: 'Saving…', saved: 'Saved', changed: 'Not saved', loading: 'Loading…', notHere: 'Only files of this site can be opened', nothing: 'No file was given' },
+          tr: { print: 'Yazdır', saving: 'Kaydediliyor…', saved: 'Kaydedildi', changed: 'Kaydedilmedi', loading: 'Yükleniyor…', notHere: 'Yalnız bu sitenin dosyaları açılabilir', nothing: 'Dosya verilmedi' },
         }[lang];
 
         var statusEl = document.getElementById('status');
-        var saveButton = document.getElementById('save');
-        saveButton.textContent = text.save;
         var printButton = document.getElementById('print');
         printButton.textContent = text.print;
         document.documentElement.lang = lang;
@@ -153,60 +158,37 @@
         if (!fresh && !fileUrl) return fail(text.nothing);
 
         var mounted;
-        var saving = false;
-        // Counts the changes, so that a save knows whether it holds the last of them.
-        var changes = 0;
-        var savedAt = 0;
-        function changed() {
-          changes++;
-          status(text.changed);
-          tell('changed');
+        // No server to send it to: the browser downloads the file. A function is the page saving by itself.
+        function download(bytes) {
+          var link = document.createElement('a');
+          link.href = URL.createObjectURL(new Blob([bytes]));
+          link.download = name;
+          link.click();
+          setTimeout(function () {
+            URL.revokeObjectURL(link.href);
+          }, 1000);
         }
-        // Leaving the page with changes the server does not have asks first.
-        window.addEventListener('beforeunload', function (event) {
-          if (!readOnly && changes !== savedAt) {
-            event.preventDefault();
-            event.returnValue = '';
+        // What the editor says about saving: the page shows it, and tells its parent.
+        var savedAt;
+        var failure;
+        function saveState(state) {
+          if (state.saving) return status(text.saving);
+          if (state.error) {
+            if (state.error !== failure) fail(state.error);
+            failure = state.error;
+            return;
           }
-        });
-
-        function save() {
-          if (!mounted || saving || readOnly) return;
-          saving = true;
-          status(text.saving);
-          var holds = changes;
-          mounted
-            .save()
-            .then(function (bytes) {
-              if (!saveUrl) {
-                // No server to send it to: the browser downloads the file.
-                var link = document.createElement('a');
-                link.href = URL.createObjectURL(new Blob([bytes]));
-                link.download = name;
-                link.click();
-                setTimeout(function () {
-                  URL.revokeObjectURL(link.href);
-                }, 1000);
-                return;
-              }
-              // The format of what is sent: not the one of the file that was fetched when it was converted.
-              return fetch(saveUrl, { method: 'PUT', body: bytes, headers: { 'Content-Type': 'application/octet-stream', 'X-Bym-Format': mounted.file.format }, credentials: 'same-origin' }).then(function (response) {
-                if (!response.ok) throw new Error('HTTP ' + response.status);
-              });
-            })
-            .then(function () {
-              savedAt = holds;
-              // What was typed while the file was on its way is not in it: the page still has something to save.
-              if (changes !== holds) return status(text.changed);
-              status(text.saved);
-              tell('saved');
-            })
-            .catch(function (error) {
-              fail(text.failed + ' (' + (error && error.message) + ')');
-            })
-            .then(function () {
-              saving = false;
-            });
+          failure = undefined;
+          // What was typed while the file was on its way is not in it: there is still something to save.
+          if (state.dirty) return status(text.changed);
+          if (state.lastSavedAt !== undefined && state.lastSavedAt !== savedAt) {
+            savedAt = state.lastSavedAt;
+            status(text.saved);
+            tell('saved');
+          }
+        }
+        function changed() {
+          tell('changed');
         }
 
         status(text.loading);
@@ -219,19 +201,19 @@
               locale: lang,
               readOnly: readOnly,
               convert: params.get('convert') === '1',
-              onSave: function () {
-                // Ctrl+S / Cmd+S in the editor: the same as the button.
-                save();
-              },
+              // Where "Save" in the toolbar and Ctrl+S / Cmd+S send the file. A file that cannot be
+              // written (doc, RTF or xls that was not converted) has no Save, whatever is said here.
+              // allowConverted: with convert=1 the server of this page expects a docx / xlsx where a doc, RTF or xls
+              // was (it reads X-Bym-Format); without it a converted file is not saved to the address it came from.
+              // A redirect (a session that ran out) is never followed: the save fails, and the status line says so.
+              saveTo: readOnly ? false : saveUrl ? { url: saveUrl, allowConverted: true } : download,
+              onSaveState: saveState,
               // A workbook reports its changes through onChange, a document through onDocumentChange.
               onChange: changed,
               onDocumentChange: changed,
               onNotice: function (notice) {
                 noticed = true;
                 status(notice.message, notice.kind);
-              },
-              onError: function (error) {
-                fail(String((error && error.message) || error));
               },
             });
           })
@@ -244,11 +226,6 @@
               document.getElementById('name').textContent = name;
               document.title = name;
             }
-            // Formats that cannot be written back (doc, xls, RTF) are shown read-only by the editor itself.
-            var writable = result.file.format === 'docx' || result.file.format === 'xlsx';
-            if (!writable) readOnly = true;
-            saveButton.hidden = readOnly;
-            saveButton.addEventListener('click', save);
             // Documents and workbooks can be printed, read-only or not.
             printButton.hidden = false;
             printButton.addEventListener('click', function () {

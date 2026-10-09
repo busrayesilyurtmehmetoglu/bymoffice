@@ -11,6 +11,9 @@ Tek bir `.js` dosyası olarak dağıtılır, çalışma zamanı bağımlılığ�
   const file = await BymOffice.open(blobOrBytes); // biçim içerikten algılanır
   file.format;            // 'docx' | 'xlsx' | 'doc' | 'xls'
   const bytes = await file.save();
+
+  // Editör: dosyayı adresinden açar, düzenletir ve Kaydet düğmesi / Ctrl+S ile aynı adrese geri kaydeder.
+  await BymOffice.mount(document.getElementById('editor'), { file: '/files/42', saveTo: true });
 </script>
 ```
 

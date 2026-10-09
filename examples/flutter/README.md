@@ -58,6 +58,18 @@ editor.onError.listen((error) => print('${error.code}: ${error.message}'));
 // Kaydetme: düzenlenmiş dosyanın baytları.
 final Uint8List saved = await editor.save();
 
+// Kullanıcının kaydetmesi: `userSaves: true` ile sayfanın araç çubuğunda Kaydet düğmesi çıkar ve
+// Ctrl/Cmd+S çalışır; dosya `onUserSave` ile gelir, uygulama saklayıp sonucu bildirir (derlenmedi).
+await editor.load(bytes, name: 'rapor.xlsx', toolbar: true, userSaves: true);
+editor.onUserSave.listen((file) async {
+  try {
+    await upload(file.bytes, file.format);          // file.format: 'docx' | 'xlsx'; file.convertedFrom dönüştürüldüyse
+    await editor.saveResult(file, true);            // aynı kaydın kimliğiyle (file.saveId); sayfa "Kaydedildi" der
+  } catch (_) {
+    await editor.saveResult(file, false, message: 'Sunucuya ulaşılamadı');   // sayfa "Dosya kaydedilemedi (…)" der
+  }
+});
+
 await editor.undo();
 await editor.setReadOnly(true);
 

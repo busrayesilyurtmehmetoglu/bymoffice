@@ -4,6 +4,8 @@
 
 export interface EditorStrings {
   toolbar: string;
+  /** The Save button, shown when the editor was given somewhere to save to. */
+  save: string;
   undo: string;
   redo: string;
   print: string;
@@ -132,6 +134,7 @@ const columns = (count: number) => (count === 1 ? 'column' : `${count} columns`)
 
 export const EDITOR_STRINGS_EN: EditorStrings = {
   toolbar: 'Formatting',
+  save: 'Save',
   undo: 'Undo',
   redo: 'Redo',
   print: 'Print',
@@ -230,6 +233,7 @@ const sutun = (count: number) => (count === 1 ? 'sütun' : `${count} sütun`);
 
 export const EDITOR_STRINGS_TR: EditorStrings = {
   toolbar: 'Biçimlendirme',
+  save: 'Kaydet',
   undo: 'Geri al',
   redo: 'Yinele',
   print: 'Yazdır',

@@ -16,6 +16,8 @@ import type { DocumentViewOptions } from '../ui/doc-view';
 import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { SheetPrintOptions } from '../ui/sheet-print';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
+import { resolveUiStrings } from '../ui/strings';
+import { SaveController, SaveError, type SaveInfo } from './save-to';
 
 export type BridgeErrorCode =
   | 'unsupported'
@@ -68,6 +70,8 @@ export interface BridgeDocumentView {
   setTrackChanges?(on: boolean): unknown;
   /** Whether the changes made in the view are tracked. */
   readonly trackingChanges?: boolean;
+  /** Says something to the user: that the document was saved, or why it was not. */
+  showNotice?(message: string, kind?: 'error' | 'info'): void;
 }
 
 export interface BridgeHost {
@@ -116,6 +120,8 @@ export interface BridgeHost {
   maxFetchBytes?: number;
   /** Characters of undelivered messages kept before `saved` messages are given up. Default 64 M. */
   maxPendingChars?: number;
+  /** How long the page waits for the `saveResult` of a save the user started. Default 60 s. */
+  saveResultTimeoutMs?: number;
   /**
    * Registers a font of a `load` with `fonts`; resolves when the font can be
    * used. Default: the engine's registerFont().
@@ -301,6 +307,10 @@ const MAX_RETRIES = 200;
 const DEFAULT_FETCH_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_FETCH_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_PENDING_CHARS = 64 * 1024 * 1024;
+/** An application stores the file somewhere, which can take a while on a slow connection. */
+const DEFAULT_SAVE_RESULT_TIMEOUT_MS = 60000;
+/** What an application says of a save that failed is shown to the user: one line of it. */
+const MAX_RESULT_MESSAGE_CHARS = 200;
 
 /** Messages that say how things are now: of those waiting for a channel only the newest of each kind is kept. */
 const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet' || type === 'sheets';
@@ -476,6 +486,10 @@ interface Shown {
   readOnly?: boolean;
   /** A document: what the application was last told about its tracked changes, as "count tracking". */
   revisionsSent?: string;
+  /** A `load` with `save`: what the Save button and Ctrl+S of the page run. */
+  saver?: SaveController;
+  /** The language the file was loaded with or `setLocale` chose: what a save is spoken of in. */
+  locale?: string;
 }
 
 /** The message handling of the bridge page, with everything it needs from the page handed in. */
@@ -485,6 +499,7 @@ export function createBridge(host: BridgeHost): Bridge {
   const fetchTimeout = host.fetchTimeoutMs === undefined ? DEFAULT_FETCH_TIMEOUT_MS : host.fetchTimeoutMs;
   const maxFetchBytes = host.maxFetchBytes === undefined ? DEFAULT_MAX_FETCH_BYTES : host.maxFetchBytes;
   const maxPendingChars = host.maxPendingChars === undefined ? DEFAULT_MAX_PENDING_CHARS : host.maxPendingChars;
+  const saveResultTimeout = host.saveResultTimeoutMs === undefined ? DEFAULT_SAVE_RESULT_TIMEOUT_MS : host.saveResultTimeoutMs;
 
   let shown: Shown | undefined;
   /** How many sheets the workbook that is shown has now; undefined while none is shown. */
@@ -513,6 +528,10 @@ export function createBridge(host: BridgeHost): Bridge {
   let selectionSent = '';
   /** The list of sheets as the application was last told (in `loaded` or `sheets`), as JSON; '' while no workbook is shown. */
   let sheetsSent = '';
+  /** The save of the user that the application has been handed and has not answered with `saveResult` yet. */
+  let awaited: { saveId: string; resolve(): void; reject(error: unknown): void } | undefined;
+  /** Counts the saves of the user: each `saved` that comes from one names itself, and its `saveResult` names it back. */
+  let userSaves = 0;
 
   const deliver = (json: string): boolean => {
     try {
@@ -642,6 +661,9 @@ export function createBridge(host: BridgeHost): Bridge {
     if (!shown) return;
     fileSerial++;
     const view = shown.view || shown.pages;
+    // A save that waits for its result is of a file that is gone: nothing is said about it any more.
+    if (shown.saver) shown.saver.destroy();
+    awaited = undefined;
     shown = undefined;
     sheetCount = undefined;
     if (view) view.destroy();
@@ -760,6 +782,7 @@ export function createBridge(host: BridgeHost): Bridge {
     const toolbar = field<boolean>(message, 'toolbar', 'boolean', false);
     const author = field<string>(message, 'author', 'string', false);
     const trackChanges = field<boolean>(message, 'trackChanges', 'boolean', false);
+    const userSaves = field<boolean>(message, 'save', 'boolean', false);
     if (author !== undefined && author.length > 255) throw new BadMessage('"author" is too long');
     if ((data === undefined ? 0 : 1) + (url === undefined ? 0 : 1) + (blank === undefined ? 0 : 1) !== 1) {
       throw new BadMessage('"load" needs exactly one of "data", "url" and "blank"');
@@ -877,6 +900,8 @@ export function createBridge(host: BridgeHost): Bridge {
       out.activeSheet = activeSheet;
       // The file is shown read-only whatever was asked for, and `setReadOnly` will not change that.
       if (locked) out.readOnly = true;
+      // The page has a Save button and takes Ctrl+S: the application will be handed what the user saves.
+      if (shown && shown.saver) out.save = true;
       if (convertedFrom !== undefined) out.convertedFrom = convertedFrom;
       if (warnings !== undefined) out.warnings = warnings;
       if (doc) {
@@ -901,6 +926,7 @@ export function createBridge(host: BridgeHost): Bridge {
         onChange: () => {
           // Nothing is said for a view that is not there yet or that was closed.
           if (!pages || !shown || shown.pages !== pages) return;
+          if (shown.saver) shown.saver.changed();
           // The tracked changes first, when their number or the tracking is not what was told last.
           const state = revisionState(pages);
           if (state) {
@@ -921,15 +947,18 @@ export function createBridge(host: BridgeHost): Bridge {
       if (locale !== undefined) documentOptions.locale = locale;
       if (author !== undefined) documentOptions.author = author;
       if (trackChanges === true) documentOptions.trackChanges = true;
+      const saver = userSaves === true && !locked ? userSaver() : undefined;
+      if (saver) documentOptions.saveCommand = saver;
       const create = (toolbar === true && host.createDocumentEditor) || (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>);
       closeShown();
       try {
         pages = create.call(host, host.container, doc, documentOptions);
       } catch (error) {
+        if (saver) saver.destroy();
         setState('error', 'corrupt');
         return fail('corrupt', errorText(error), id);
       }
-      shown = { file, view: undefined, pages, name, locked, convertedFrom, readOnly: locked || readOnly === true };
+      shown = { file, view: undefined, pages, name, locked, convertedFrom, readOnly: locked || readOnly === true, saver, locale };
       setLocale(locale);
       setState('open');
       loaded(0, [], true);
@@ -963,6 +992,7 @@ export function createBridge(host: BridgeHost): Bridge {
     const options: SpreadsheetEditorOptions = {
       onChange: (change) => {
         if (!view) return;
+        if (shown && shown.view === view && shown.saver) shown.saver.changed();
         tellSheets();
         send({ type: 'changed', sheets: change.sheets, canUndo: view.history.canUndo, canRedo: view.history.canRedo });
       },
@@ -986,15 +1016,18 @@ export function createBridge(host: BridgeHost): Bridge {
     // Who the notes added to cells are by.
     if (author !== undefined) options.author = author;
 
+    const saver = userSaves === true && !locked ? userSaver() : undefined;
+    if (saver) options.saveCommand = saver;
     const createSheet = (toolbar === true && host.createEditor) || host.createView;
     closeShown();
     try {
       view = createSheet.call(host, host.container, workbook, options);
     } catch (error) {
+      if (saver) saver.destroy();
       setState('error', 'corrupt');
       return fail('corrupt', errorText(error), id);
     }
-    shown = { file, view, pages: undefined, name, locked, convertedFrom };
+    shown = { file, view, pages: undefined, name, locked, convertedFrom, saver, locale };
     sheetCount = () => (Array.isArray(book.sheets) ? book.sheets.length : Infinity);
     setLocale(locale);
     setState('open');
@@ -1137,23 +1170,122 @@ export function createBridge(host: BridgeHost): Bridge {
     if (id !== undefined) send(answer);
   };
 
+  /** The file that is shown as bytes, with what is being typed in it. */
+  const writeShown = async (current: Shown): Promise<Uint8Array> => {
+    // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
+    // A note or a name that cannot be applied stays in its field, and nothing is saved around it.
+    // Nor is anything saved under a dialog of rules that is open with changes: those are the user's to confirm.
+    if (current.view && !commitPendingOf(current.view)) throw new Error(STILL_EDITING);
+    const pages = current.pages;
+    // A composition still under way belongs to the document that is written.
+    if (pages && pages.commitEditing) pages.commitEditing();
+    const changes = pages ? pages.changeCount : undefined;
+    const bytes = await current.file.save();
+    // A change made while the file was written is not in these bytes.
+    if (pages && pages.markSaved && pages.changeCount === changes) pages.markSaved();
+    return bytes;
+  };
+
+  /**
+   * What the Save button and Ctrl+S of the page run for a `load` with `save`: the application is
+   * handed the file in a `saved` message that says it comes from the user, and answers with
+   * `saveResult` when it has stored it. Until then the page shows the save as under way; without
+   * an answer in time it has failed.
+   */
+  function userSaver(): SaveController {
+    const mine: SaveController = new SaveController({
+      target: {
+        kind: 'function',
+        save: (bytes: Uint8Array, info: SaveInfo) =>
+          new Promise<void>((resolve, reject) => {
+            // Never the id of a save before it, of this file or of another: an answer that comes late names a save that is gone.
+            const saveId = `u${++userSaves}`;
+            const waiting = { saveId, resolve, reject };
+            const out: Message = { type: 'saved', by: 'user', saveId, data: base64Encode(bytes), format: info.format };
+            if (info.name !== undefined) out.name = info.name;
+            if (info.convertedFrom !== undefined) out.convertedFrom = info.convertedFrom;
+            awaited = waiting;
+            send(out);
+            timer(() => {
+              if (awaited !== waiting) return;
+              awaited = undefined;
+              reject(new SaveError('timeout', `The application did not answer the save within ${Math.round(saveResultTimeout / 1000)} s`));
+            }, saveResultTimeout);
+          }),
+      },
+      writable: () => shown !== undefined && shown.saver === mine && !shown.locked,
+      commit: () => {
+        const current = shown;
+        if (!current || current.saver !== mine) return false;
+        if (!current.view) {
+          // A composition still under way is a change of its own: it is ended before the changes are counted.
+          if (current.pages && current.pages.commitEditing) current.pages.commitEditing();
+          return true;
+        }
+        try {
+          return commitPendingOf(current.view);
+        } catch (error) {
+          // A cell whose text cannot be written: the editor stays open, and the user is told why.
+          const view = current.view;
+          const text = typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
+          if (typeof view.showNotice === 'function') view.showNotice(text, 'error');
+          return false;
+        }
+      },
+      bytes: () => {
+        const current = shown;
+        if (!current || current.saver !== mine) return Promise.reject(new Error('No file is open'));
+        return writeShown(current);
+      },
+      info: () => {
+        const current = shown;
+        const out: SaveInfo = { format: (current ? current.file.format : 'docx') as SaveInfo['format'] };
+        if (current && current.name !== undefined) out.name = current.name;
+        if (current && current.convertedFrom !== undefined) out.convertedFrom = current.convertedFrom as SaveInfo['convertedFrom'];
+        return out;
+      },
+      strings: () => resolveUiStrings(shown ? shown.locale : undefined),
+      // The clock of the page, as everything else here uses it.
+      timer: (callback, ms) => {
+        let off = false;
+        timer(() => {
+          if (!off) callback();
+        }, ms);
+        return () => {
+          off = true;
+        };
+      },
+      notice: (text, kind) => {
+        const current = shown;
+        if (!current || current.saver !== mine) return;
+        const view = current.view || current.pages;
+        if (view && typeof view.showNotice === 'function') view.showNotice(text, kind);
+      },
+    });
+    return mine;
+  }
+
+  /** The application's answer to a `saved` message that came from the user. */
+  const saveResult = (message: Message, id: string | undefined) => {
+    const saveId = field<string>(message, 'saveId', 'string', true);
+    const ok = field<boolean>(message, 'ok', 'boolean', true);
+    const text = field<string>(message, 'message', 'string', false);
+    const waiting = awaited;
+    // Only the save that waits now is answered, and only by its own id: a result that comes after the page
+    // stopped waiting, twice, or for a file that was closed must not be taken for the result of the next save.
+    if (!waiting || waiting.saveId !== saveId) return fail('bad-message', 'No save with this "saveId" is waiting for a result', id);
+    awaited = undefined;
+    if (ok === true) waiting.resolve();
+    else waiting.reject(new Error(text === undefined ? '' : text.slice(0, MAX_RESULT_MESSAGE_CHARS)));
+    done('saveResult', id);
+  };
+
   const save = async (id: string | undefined) => {
     const current = shown;
     if (!current) return fail('not-loaded', 'No file is open', id);
     let data: string;
     try {
-      // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
-      // A note or a name that cannot be applied stays in its field, and nothing is saved around it.
-      // Nor is anything saved under a dialog of rules that is open with changes: those are the user's to confirm.
-      if (current.view && !commitPendingOf(current.view)) throw new Error(STILL_EDITING);
-      const pages = current.pages;
-      // A composition still under way belongs to the document that is written.
-      if (pages && pages.commitEditing) pages.commitEditing();
-      const changes = pages ? pages.changeCount : undefined;
-      const bytes = await current.file.save();
-      // A change made while the file was written is not in these bytes.
-      if (pages && pages.markSaved && pages.changeCount === changes) pages.markSaved();
-      data = base64Encode(bytes);
+      data = base64Encode(await writeShown(current));
     } catch (error) {
       return fail('save-failed', errorText(error), id);
     }
@@ -1245,6 +1377,7 @@ export function createBridge(host: BridgeHost): Bridge {
       } else if (type === 'setLocale') {
         if (view) view.setLocale(locale as string);
         else if (pages && pages.setLocale) pages.setLocale(locale as string);
+        shown.locale = locale;
         setLocale(locale);
       } else if (type === 'undo') {
         if (view) view.undo();
@@ -1260,12 +1393,16 @@ export function createBridge(host: BridgeHost): Bridge {
     }
   };
 
-  /** `hello` and `close` do not wait for their turn: they must work while a load hangs. */
+  /**
+   * `hello` and `close` do not wait for their turn: they must work while a load hangs. Nor does
+   * `saveResult`: it answers a save of the file that is shown now, not of the one a load that waits will show.
+   */
   const handleNow = (fields: Message, type: string) => {
     let id: string | undefined;
     try {
       id = idOf(fields);
       if (type === 'hello') return send({ type: 'ready', version: host.version });
+      if (type === 'saveResult') return saveResult(fields, id);
       supersede('the file was closed');
       closeShown();
       setState('empty');
@@ -1274,6 +1411,18 @@ export function createBridge(host: BridgeHost): Bridge {
       fail('bad-message', errorText(error), id);
     }
   };
+
+  /** Ctrl+S or Cmd+S in the editor of a `load` with `save`: what the Save button does, and not the browser's "save page". */
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (destroyed || !shown || !shown.saver) return;
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || (event.key !== 's' && event.key !== 'S')) return;
+    event.preventDefault();
+    shown.saver.run();
+  };
+  const keyTarget = host.container as { addEventListener?: unknown; removeEventListener?: unknown } | undefined;
+  const listensToKeys = !!keyTarget && typeof keyTarget.addEventListener === 'function' && typeof keyTarget.removeEventListener === 'function';
+  // While the event goes down: a dialog or a field inside the editor that keeps its keys to itself does not hide this one.
+  if (listensToKeys) host.container.addEventListener('keydown', onKeyDown, true);
 
   const start = () => {
     if (started || destroyed) return;
@@ -1297,9 +1446,9 @@ export function createBridge(host: BridgeHost): Bridge {
         fields = undefined;
       }
       const type = fields && fields.type;
-      if (fields && (type === 'hello' || type === 'close')) {
+      if (fields && (type === 'hello' || type === 'close' || type === 'saveResult')) {
         // A `hello` that is the first thing to arrive has just been answered by start().
-        if (type === 'close' || announced) handleNow(fields, type as string);
+        if (type !== 'hello' || announced) handleNow(fields, type as string);
         return Promise.resolve();
       }
       // A new load overtakes the one before it, whether that one is fetching or still waiting.
@@ -1311,6 +1460,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (destroyed) return;
       supersede('the bridge was destroyed');
       closeShown();
+      if (listensToKeys) host.container.removeEventListener('keydown', onKeyDown, true);
       destroyed = true;
       pending.length = 0;
       pendingChars = 0;

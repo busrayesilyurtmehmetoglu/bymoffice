@@ -4651,6 +4651,16 @@ export class DocumentView {
     }
   }
 
+  /**
+   * Says something to the user on behalf of whoever holds the view (that the document was saved,
+   * or why it was not): in the live region and to onNotice, as the view's own messages are.
+   * The text is shown as text. Does nothing in a view that was destroyed.
+   */
+  showNotice(message: string, kind: 'error' | 'info' = 'info'): void {
+    if (this.destroyed) return;
+    this.notify(String(message), kind === 'error' ? 'error' : 'info');
+  }
+
   /** Tells the user something: `spoken` is what the live region says when that is more than the message. */
   private notify(message: string, kind: 'error' | 'info', spoken = message): void {
     this.live.textContent = spoken;

@@ -10,6 +10,7 @@ import type { CellRange, Sheet, Workbook } from '../model/sheet/types';
 import type { GridSelection } from '../render/grid';
 import { getEditorStrings, type EditorStrings } from './editor-strings';
 import { FormulaBar } from './formula-bar';
+import type { SaveCommand } from './save-command';
 import type { DocumentPrintResult } from './doc-print';
 import type { SheetPrintOptions } from './sheet-print';
 import { WorkbookView, type WorkbookViewOptions } from './sheet-view';
@@ -23,6 +24,11 @@ export interface SpreadsheetEditorOptions extends WorkbookViewOptions {
   formulaBar?: boolean;
   /** Show the status bar. Default true. */
   statusBar?: boolean;
+  /**
+   * What saves the workbook: with it the toolbar has a Save button (not while
+   * the view is read-only). mount() hands it in for its `saveTo` option.
+   */
+  saveCommand?: SaveCommand;
 }
 
 // Colours are custom properties of the editor's root, so that a host page (or
@@ -58,9 +64,12 @@ const STYLE_TEXT = [
   '.bym-tb-btn:active{background:var(--bym-active)}',
   '.bym-tb-btn[aria-pressed="true"],.bym-tb-btn[aria-expanded="true"]{background:var(--bym-accent-soft);color:var(--bym-accent-text)}',
   '.bym-tb-btn:disabled,.bym-tb-select:disabled{opacity:.38;cursor:default;background-color:transparent}',
+  '.bym-tb-btn[aria-busy="true"]{cursor:progress}',
   '.bym-tb-btn:focus,.bym-tb-select:focus{outline:2px solid var(--bym-accent);outline-offset:-2px}',
   '.bym-tb-btn:focus:not(:focus-visible){outline:none}',
   '.bym-tb-sep{display:block;width:1px;height:20px;margin:0 5px;background:var(--bym-border)}',
+  // The Save button of a view that is read-only: the rules above would show what is only marked as hidden.
+  '.bym-tb-btn[hidden],.bym-tb-sep[hidden]{display:none}',
   // The arrow of a list is drawn with two gradients: no image, and it takes the text colour.
   '.bym-tb-select{display:block;height:var(--bym-control);padding:0 22px 0 8px;border:0;border-radius:var(--bym-radius);color:var(--bym-text);',
   'cursor:pointer;background-color:transparent;',
@@ -169,6 +178,8 @@ export class SpreadsheetEditor {
   private printProgress = '';
   private frame = 0;
   private destroyed = false;
+  /** Ends the watch on the save command. */
+  private unwatchSave: (() => void) | undefined;
 
   constructor(container: HTMLElement, workbook: Workbook, options: SpreadsheetEditorOptions = {}) {
     this.strings = getEditorStrings(typeof options.locale === 'string' ? options.locale : browserLanguage());
@@ -191,6 +202,7 @@ export class SpreadsheetEditor {
       },
       root,
       run: (action, keepFocus) => this.run(action, keepFocus === true),
+      save: options.saveCommand,
     };
     if (options.toolbar !== false) {
       this.toolbar = new Toolbar(host, this.strings);
@@ -264,6 +276,8 @@ export class SpreadsheetEditor {
 
     window.addEventListener('resize', this.onResize);
     root.addEventListener('keydown', this.onKeyDown);
+    // The Save button follows what there is to save.
+    if (options.saveCommand && this.toolbar) this.unwatchSave = options.saveCommand.watch(() => this.refresh());
     this.sync();
   }
 
@@ -302,6 +316,8 @@ export class SpreadsheetEditor {
     this.frame = 0;
     window.removeEventListener('resize', this.onResize);
     this.root.removeEventListener('keydown', this.onKeyDown);
+    if (this.unwatchSave) this.unwatchSave();
+    this.unwatchSave = undefined;
     if (this.toolbar) this.toolbar.destroy();
     if (this.formulaBar) this.formulaBar.destroy();
     if (this.statusBar) this.statusBar.destroy();

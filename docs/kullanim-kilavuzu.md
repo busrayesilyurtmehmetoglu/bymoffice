@@ -69,6 +69,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Parola korumalı dosyalar | Yok; `UnsupportedFileError` fırlatılır |
 | Excel'de grafik ve pivot tablo gösterimi (yerinde yer tutucu görünür); görsel/şekil ekleme, taşıma, boyutlandırma; dikdörtgen, elips ve çizgi dışındaki şekil geometrileri; gradyan/desen dolgu, gölge | Yok; dosyada korunur |
 | Hücre notlarında: iş parçacıklı yorumu (Excel 365 "yorum"; yazışma) düzenleme, silme ve yanıtlama; yeni yazışma başlatma; not kutusunu taşıma/boyutlandırma ve "hep göster" ayarını değiştirme; notta zengin metin (kalın, renk); yorum zincirinin kopyalanması ve satırıyla sıralanması; editör araç çubuğunda not düğmesi; köprüde not komutu; xls'e yazma | Yok. İş parçacıklı yorumu olan hücrede not komutları nedeniyle birlikte devre dışıdır ve yorum dosyada bayt bayt kalır. Biçimli bir notun metni düzenlenirse not **tek biçimli düz metin** olur (düzenlenmeyen notların biçimi korunur). Yorum zinciri içeren aralık sıralanmaz; kopyalanan/kesilen hücrenin yorum zinciri yerinde kalır. Hücre içeriğini silmek (Delete) notu silmez |
+| Aynı yere kaydetmede (`saveTo`): kendiliğinden (zamanlı) kaydetme; 412'den sonra sunucudaki dosyayı yeniden yükleme ya da birleştirme, görünümün içinde "üzerine yaz" düğmesi (API: `saveNow({ overwrite: true })`); yanıtı gelmeyen kayıttan sonra ETag'i yenileme; başarısız kaydı kendiliğinden yeniden deneme; yükleme ilerlemesi; işlev kaydedicinin 10 dakikalık sınırını değiştirme; "farklı kaydet" / indirme düğmesi; `onSaveState.error` için makinece okunur kod (kod `onError`'daki `SaveError.code`'dadır) | Yok. `onChange` içinden `saveNow()` çağırarak kendiliğinden kaydetme kurulabilir; indirme için işlev kaydedici yazılır (`examples/html`) |
 | npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
 | 4 GB ve üzeri arşiv yazma | Yok |
 
@@ -184,7 +185,10 @@ Bir dosyayı açar ve `container` içinde gösterir: xlsx ve xls tablo düzenley
 | `fonts` | Dosya gösterilmeden önce kaydedilecek fontlar: `registerFont()`'a verilen nesnelerin dizisi (bkz. "Fontlar"). Yüklenmeleri en çok 3 saniye beklenir, böylece dosya baştan bu fontlarla dizilir. Yüklenemeyen font dosyanın açılmasını engellemez: `onNotice` ile bildirilir (`kind: 'error'`); süre dolduğunda hâlâ yüklenen font da bildirilir (`kind: 'info'`) ve geldiğinde görünüm kendiliğinden yeniden dizilir. Fontlar görünüm kaldırılınca kayıtlı kalır. `false`: paketle gelen fontu kapatır (`fontsUrl: null` ile aynı) |
 | `fontsUrl` | Paketle gelen fontun (TeX Gyre Bonum; bkz. "Fontlar", 4. madde) klasörünün adresi: paketin `dist/fonts/` klasörü nereye konduysa orası. Verilmezse betiğin yanındaki `fonts/` klasörü kullanılır. Motoru ES modülü olarak (`import`) ya da bir paketleyiciyle (Vite, webpack…) kullanıyorsanız **vermeniz gerekir**. `null` fontu kapatır. Ayar sayfa genelindedir (`BymOffice.fonts.configure({ baseUrl })` ile aynı şey) ve görünüm kaldırılınca kalır |
 | `convert` | `true` ise yazılamayan biçimler (doc, RTF, xls) **dönüştürülerek düzenlenebilir açılır**: doc ve RTF docx'e, xls xlsx'e çevrilir; gösterilen, düzenlenen ve `save()` ile alınan dosya yeni biçimdedir. Dönüş değerinde `conversion: { from, to, warnings }` bulunur ve `onNotice` ile bildirilir (bildirimin dili görünümlerle aynı kuralla seçilir: `locale` bir dil etiketiyse o, verilmemişse ya da nesneyse tarayıcının dili). `readOnly: true` ile birlikte verilirse dönüştürme yapılmaz. Varsayılan `false`: bu dosyalar olduğu gibi, salt okunur gösterilir |
-| `onSave(bytes)` | Kullanıcı görünümde Ctrl+S / Cmd+S'e basınca dosyanın baytlarıyla çağrılır; verilmezse kısayol tarayıcıya bırakılır. Hata olursa `onError(error)` çağrılır |
+| `saveTo` | Dosyanın **kaydedileceği yer**: `true` (alındığı adres), bir adres, bir istek nesnesi ya da bir işlev. Verilince araç çubuğunda Kaydet düğmesi çıkar, Ctrl/Cmd+S ve `mounted.saveNow()` dosyayı oraya kaydeder. Ayrıntı: "Aynı yere kaydetme (`saveTo`)" |
+| `onSaveState({ dirty, saving, lastSavedAt?, error? })` | `saveTo` ile: kaydetme durumu her değiştiğinde çağrılır |
+| `warnOnLeave` | `saveTo` ile: kaydedilmemiş değişiklik varken sayfadan ayrılınırsa tarayıcı sorar. Varsayılan `true`; `false` kapatır |
+| `onSave(bytes)` | `saveTo` yokken: kullanıcı görünümde Ctrl+S / Cmd+S'e basınca dosyanın baytlarıyla çağrılır; ikisi de verilmezse kısayol tarayıcıya bırakılır. `saveTo` ile birlikte: başarılı her kayıttan **sonra**, gönderilen baytlarla çağrılır. Hata olursa `onError(error)` çağrılır (`saveTo` ile: bir `SaveError`) |
 | `onSelectionChange(selection, sheetIndex)` | Seçim değişince çağrılır (açılışta ve sayfa değişiminde çağrılmaz) |
 | `onSheetChange(sheetIndex)` | Gösterilen sayfa değişince çağrılır |
 
@@ -293,6 +297,148 @@ Doğrulama: her değişiklikte, gerçek dosyalardan oluşan bir havuzda "düzenl
 
 Değişen satırlar yeniden üretilirken şunlar o satırlarda korunmaz (dokunulmayan satırlarda korunur): `spans` ipucu, hücrelerin fonetik (furigana) metni, zengin metinde `outline`/`shadow` gibi nadir font ayrıntıları.
 
+### Aynı yere kaydetme (`saveTo`)
+
+Bir adresten açılan dosya düzenlenir ve **aynı adrese** geri kaydedilir; kaydetme kodunu sayfanız yazmaz. CDN'den tek `<script>` ile en kısa hali:
+
+```html
+<div id="editor" style="height: 600px"></div>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js"></script>
+<script>
+  BymOffice.mount(document.getElementById('editor'), { file: '/files/42', saveTo: true });
+</script>
+```
+
+(Paket henüz yayımlanmadığı için CDN adresi yerine şimdilik kendi sunucunuzdaki `dist/bymoffice.min.js` kullanılır.) ES modülüyle aynıdır: `import { mount } from 'bymoffice'; await mount(el, { file: '/files/42', saveTo: true });`
+
+`saveTo` verildiğinde:
+
+- **Kaydet düğmesi** tablo ve belge araç çubuğunun başında görünür (erişilebilir adı "Kaydet (Ctrl+S)" / "Save (Ctrl+S)", Mac'te "⌘S"). Kaydedilecek değişiklik yokken soluktur (`disabled`); kayıt sürerken meşguldür (`aria-busy="true"`); görünüm salt okunurken ve yazılamayan dosyada hiç görünmez. `toolbar: false` ise düğme yoktur, klavye ve API çalışır.
+- **Ctrl+S / Cmd+S** aynı işi yapar; tarayıcının "sayfayı kaydet" penceresi açılmaz (kaydedilecek şey yokken de; hücre düzenleyicide, not alanında ya da açık bir kural kutusunda yazarken de — tuş, editörün içindeki alanlar onu görmeden önce yakalanır).
+- **`mounted.saveNow(options?): Promise<boolean>`** aynı işi programdan yapar: kaydedildiyse `true`, kaydedilecek bir şey yoksa da `true` (istek gönderilmez); kaydedilemediyse `false` (neden `onNotice`, `onSaveState` ve `onError` ile bildirilir). Hiç reddetmez. `saveTo` verilmemişse hep `false` döner. `saveNow({ overwrite: true })` sunucudaki dosyanın **üzerine yazar** (`If-Match` göndermez): yalnız kullanıcının açık kararıyla, bir çakışmadan (412) sonra çağrılır (aşağıda "Çakışma").
+- **`mounted.hasUnsavedChanges`**: kaydedilmemiş değişiklik var mı (geri al ve yinele de değişikliktir). `saveTo` verilmemişse "açıldığından beri değişti mi" anlamına gelir (`save()` çağırmak bunu sıfırlamaz).
+- **Yazılmakta olan da kaydedilir:** önce `commitPending()` çağrılır (açık hücre, not, sekme adı; belgede süren IME bileşimi). Uygulanamıyorsa hiçbir şey gönderilmez; neden görünümde söylenir, `onSaveState` `error` taşır ve `saveNow()` `false` döner. Düğme, hücreye yazılmaya başlandığı anda etkinleşir.
+- **Kayıt sürerken yazılan "kaydedildi" sayılmaz:** kaydedilen an ile şimdiki an ayrı tutulur; istek dönünce dosya hâlâ "kaydedilmemiş" görünür. **Çift gönderim yoktur:** kayıt sürerken yeniden basılırsa ve arada bir şey değişmediyse aynı kaydın sonucu beklenir; değiştiyse süren kayıt bitince bir kez daha kaydedilir.
+- **Sayfadan ayrılma:** kaydedilmemiş değişiklik varken tarayıcı sorar (`beforeunload`; `warnOnLeave: false` kapatır). Dinleyici `destroy()` ile kalkar.
+- **`destroy()`** süren isteği iptal eder; ardından hiçbir bildirim gelmez. `mounted.destroy()` ile `mounted.editor.destroy()` aynı işi yapar: ikisi de tuş dinleyicisini ve sayfadan ayrılma sorusunu kaldırır.
+- Düğmeye klavyeyle (odak düğmedeyken Enter/Boşluk) basıldığında odak ızgaraya/belgeye döner; kayıt bitip düğme solunca odak kaybolmaz.
+
+`saveTo` değerleri:
+
+| Değer | Anlam |
+|---|---|
+| `true` | Dosyanın alındığı adres. `file` bir adres (dizge) olmalıdır |
+| `'/files/42'` | O adres: `http:` / `https:` ya da sayfaya göre göreli |
+| `{ url?, method?, headers?, credentials?, timeoutMs?, allowConverted? }` | İstek: `url` verilmezse dosyanın alındığı adres; `method` `'PUT'` (varsayılan) ya da `'POST'`; `headers` isteğe eklenecek başlıklar (CSRF belirteci, `Authorization`…); `credentials` `'omit'`, `'same-origin'` (varsayılan; dosya alınırken de böyledir) ya da `'include'`; `timeoutMs` isteğin en uzun süresi (varsayılan 120.000 = 2 dakika); `allowConverted` dönüştürülmüş dosyanın özgün adresine kaydedilmesine izin (varsayılan `false`; aşağıda "Dönüştürülen eski biçimler") |
+| `(bytes, info) => void \| Promise<void>` | Kendi kaydediciniz: `info` = `{ format: 'docx' \| 'xlsx', convertedFrom?, name? }`. Çözülürse (ya da bir şey döndürmezse) kaydedildi; reddeder ya da hata fırlatırsa kaydedilemedi |
+| `false`, verilmemiş | Kaydetme yok (bugüne dek olduğu gibi: `onSave` + Ctrl/Cmd+S ya da `mounted.save()`) |
+
+Geçersiz değer **`mount()`'u `TypeError` ile reddettirir**, hiçbir şey getirilmeden ve gösterilmeden: bayt/Blob olarak verilen dosyada `true` (ya da `url`'siz istek), `http(s):` olmayan adres (`javascript:`, `data:`, `file:`, `blob:`; kullanıcı adı/parola içeren adres; boş dizge), `PUT`/`POST` dışında yöntem, geçersiz `credentials`, pozitif sayı olmayan `timeoutMs`, boolean olmayan `allowConverted`, başlık adında ya da değerinde izin verilmeyen karakter. Başlık değerleri **Latin-1** metin olmalıdır (U+00FF'e kadar; satır sonu ve denetim karakteri yok, sekme olur): `'X-User': 'Büşra'` reddedilir (`ş` Latin-1'de yok) — böyle değerleri `encodeURIComponent` ile kodlayın. `__proto__` adlı başlık da reddedilir. Adres ve başlıklar yalnız bu seçenekten okunur; dosyadan ya da kullanıcıdan gelen hiçbir değer adres ya da başlık olmaz.
+
+**Sunucunun karşılaması gereken istek:**
+
+```
+PUT /files/42
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+X-Bym-Format: xlsx
+X-Bym-Converted-From: xls        (yalnız dönüştürülerek açılan dosyada)
+If-Match: "abc123"               (yalnız dosya bu adresten ETag ile alındıysa)
+
+<dosyanın baytları>
+```
+
+- **Gövde** dosyanın kendisidir (çok parçalı form değildir). `Content-Type` biçimin MIME türüdür: docx `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, xlsx `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`. `headers` ile aynı adı verirseniz sizinki geçerli olur (ad büyük/küçük harf ayırmadan karşılaştırılır).
+- **`X-Bym-Format`** her zaman vardır: `docx` ya da `xlsx`. **`X-Bym-Converted-From`** (`doc`, `rtf`, `xls`) yalnız `convert: true` ile dönüştürülmüş dosyada: sunucu, eski biçimli dosyanın yerine **yeni biçimli** bir dosya geldiğini bundan anlar (adı ve türü güncellemek sunucunun işidir).
+- **Yanıt:** her 2xx "kaydedildi" demektir. Yanıtın gövdesi **okunmaz** (büyüklüğü belleği etkilemez).
+- **Yönlendirme izlenmez:** sunucu kayıt isteğini 3xx ile yanıtlarsa (oturumu dolmuş bir uygulamanın giriş sayfasına yönlendirmesi gibi) kayıt **başarısızdır**: "Dosya kaydedilmedi: sunucu isteği başka bir adrese yönlendirdi; oturumunuzun süresi dolmuş olabilir" (`SaveError.code === 'redirected'`). İstek `redirect: 'manual'` ile gönderilir; böylece dosyanın baytları ve verdiğiniz başlıklar da yönlendirilen adrese (başka bir kökene) taşınmaz. Kayıt adresiniz gerçekten yönlendiriyorsa `saveTo`'ya son adresi verin.
+- **ETag / `If-Match`:** dosya alınırken sunucu güçlü bir `ETag` verdiyse ve dosya **alındığı adrese** kaydediliyorsa istek `If-Match` taşır; sunucu, dosya o arada başkası tarafından değiştirildiyse **412** dönerek üzerine yazılmasını önleyebilir. Başarılı yanıt yeni `ETag` verirse sonraki kayıt onunla gönderilir; vermezse sonraki kayıtlar `If-Match`'siz gider (eski değer artık geçersizdir). Dosya alınırken **yönlendirme olduysa** ETag tutulmaz ve `If-Match` gönderilmez (o ETag yanıtın geldiği adresindir; `saveTo: true` ise sizin verdiğiniz, yönlendirmeden önceki adrese kaydeder). Zayıf ETag (`W/"…"`) gönderilmez: `If-Match` onunla hiç eşleşmez. Başka bir adrese kaydederken (`saveTo: '/başka'`) `If-Match` gönderilmez. Başka kökene kaydediyorsanız sunucunun `ETag` başlığını `Access-Control-Expose-Headers` ile açması ve `If-Match` / `X-Bym-*` başlıklarına ön denetimde (`OPTIONS`) izin vermesi gerekir.
+- **Kimlik bilgisi:** varsayılan `same-origin`: çerezler yalnız sayfanın kendi kökenine gider, başka kökene hiçbir kimlik bilgisi gönderilmez; gerekiyorsa `credentials: 'include'` ya da bir `Authorization` başlığı verin. Oturumu ve yetkiyi sunucunuz denetler.
+- **Zaman aşımı:** istek 2 dakika içinde bitmezse iptal edilir; `saveTo: { timeoutMs }` ile değiştirilir. Süre yalnız yanıt beklemeyi değil **dosyanın yüklenmesini de** kapsar (tarayıcı ikisini ayırt ettirmez); varsayılan bu yüzden uzundur: 10 MB'lık bir dosya 1 Mbit/sn bağlantıda ~80 saniyede yüklenir.
+- **Çakışma (412) ve "üzerine yaz":** 412'den sonra hiçbir kayıt kendiliğinden üzerine yazmaz; Kaydet'e yeniden basmak yine 412 alır. Çıkış yolu sayfanızdadır: `onError`'da `error.code === 'conflict'` gelince kullanıcıya sorun ve "benimkini tut" derse `mounted.saveNow({ overwrite: true })` çağırın (istek `If-Match` taşımaz; sunucudaki içerik ezilir, sürüm tutulmaz). Başarılı olursa yanıttaki yeni `ETag` ile sonraki kayıtlar yine korunur.
+- **Yanıtı gelmeyen kayıt:** zaman aşımı ya da ağ kopması, sunucunun dosyayı yazmadığı anlamına gelmez. Sunucu yazdıysa elinizdeki ETag artık eskidir ve sonraki kayıt 412 alır; motor bunu ayırt edemez ve ETag'i kendiliğinden yenilemez. Bildirim bu yüzden iki olasılığı da söyler ("başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir") ve çıkış yolu yine `saveNow({ overwrite: true })`'dur.
+
+| Durum | Kullanıcıya bildirim (`onNotice`, durum çubuğu) | `SaveError.code` |
+|---|---|---|
+| 2xx | "Kaydedildi" (`kind: 'info'`) | — |
+| 412 | "Dosya kaydedilmedi: sunucudaki dosya sizin açtığınızdan farklı (başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir)" — üzerine yazılmaz | `conflict` |
+| 3xx (yönlendirme) | "Dosya kaydedilmedi: sunucu isteği başka bir adrese yönlendirdi; oturumunuzun süresi dolmuş olabilir" — izlenmez | `redirected` |
+| dönüştürülmüş dosya, izin yok | "Bu dosyadaki değişiklikler buraya kaydedilemez: dosya docx biçimine çevrildi ve sayfa bunun özgün dosyanın yerine kaydedilmesine izin vermedi" — istek gönderilmez | `converted` |
+| 401, 403 | "Dosya kaydedilmedi: kaydetme yetkiniz yok" | `denied` |
+| 423 | "Dosya kaydedilmedi: kilitli" | `locked` |
+| başka durum | "Dosya kaydedilemedi (HTTP 500)" | `http` |
+| ağ hatası | "Dosya kaydedilemedi: sunucuya ulaşılamadı" | `network` |
+| zaman aşımı | "Dosya kaydedilemedi: zamanında yanıt gelmedi" | `timeout` |
+| işlev reddetti / hata fırlattı | "Dosya kaydedilemedi (…)": hatanın iletisinin ilk 200 karakteri, tek satır | `refused` |
+| istek hiç kurulamadı (`fetch` hemen hata fırlattı) | "Dosya kaydedilemedi" | `refused` |
+| dosya yazılamadı | "Dosya kaydedilemedi" | `write` |
+| yazılmakta olan uygulanamadı | (görünüm nedenini kendi söyler) | `pending` |
+
+Bildirimler görünümün dilindedir (TR/EN), metin olarak gösterilir (HTML olarak basılmaz) ve dosyanın içeriğinden hiçbir şey taşımaz. Tabloda durum çubuğunda da görünür. Hata olduğunda değişiklikler kaydedilmemiş sayılmaya devam eder ve kullanıcı yeniden deneyebilir.
+
+**Durumu izleme:**
+
+```js
+const mounted = await BymOffice.mount(el, {
+  file: '/files/42',
+  saveTo: { headers: { 'X-CSRF-TOKEN': token } },      // url verilmedi: dosyanın alındığı adres, PUT
+  onSaveState: ({ dirty, saving, lastSavedAt, error }) => {
+    label.textContent = saving ? 'Kaydediliyor…' : error ? error : dirty ? 'Kaydedilmedi' : lastSavedAt ? 'Kaydedildi' : '';
+  },
+  onError: (error) => {                                 // BymOffice.SaveError: code, status?
+    if (error.code === 'conflict') offerReload();
+  },
+});
+await mounted.saveNow();          // true: kaydedildi ya da kaydedilecek şey yoktu
+mounted.hasUnsavedChanges;        // false
+```
+
+`onSaveState` yalnız durum değişince çağrılır: `dirty` kaydedilmemiş değişiklik var, `saving` kayıt sürüyor, `lastSavedAt` son başarılı kaydın zamanı (ms), `error` son kaydın neden başarısız olduğu (görünümün dilinde; yeni bir kayıt başlayınca ya da başarılı olunca kalkar).
+
+**Dönüştürülen eski biçimler:** doc, RTF ve xls kendi biçimlerine yazılamaz. `convert` verilmeden açılırlarsa salt okunurdurlar: Kaydet düğmesi yoktur ve `saveNow()` `false` döner (özgün baytlar hiçbir zaman geri gönderilmez). `convert: true` ile açılırlarsa kaydedilen dosya **docx / xlsx**'tir; istek `X-Bym-Format: docx` ve `X-Bym-Converted-From: doc` taşır, işlev kaydedicide `info.convertedFrom` doludur ve `info.name` yeni uzantıyı alır (`rapor.doc` → `rapor.docx`). **Özgün dosyanın adresine kendiliğinden kaydedilmez:** `saveTo: true` (ya da adresi dosyanın alındığı adresle aynı olan dizge/istek) `.doc` adresine docx içeriği yazardı ve başlığı okumayan bir sunucuda bu geri dönüşsüz olurdu. Sunucunuz bunu bekliyorsa açıkça söyleyin: `saveTo: { allowConverted: true }`. Söylenmediyse Kaydet düğmesi görünür, ama dosya açılırken `onNotice` (`kind: 'error'`) durumu bildirir ve her kayıt denemesi aynı bildirimle, hiçbir istek gönderilmeden başarısız olur (`SaveError.code === 'converted'`). Başka bir adrese kaydetme ve işlev kaydedici bu kısıtın dışındadır. Düzenlemeye kapalı korumalı belge (bkz. "Belge koruması ve değişiklik izleme") de kaydedilmez.
+
+**Kendi kaydedicinizi yazma (işlev):** IndexedDB, `postMessage`, kendi API istemciniz, çok parçalı form… Motor yalnız baytları ve ne olduklarını verir, başarıyı sizin sözünüzden öğrenir:
+
+```js
+await BymOffice.mount(el, {
+  file: bytes,                                  // adres olması gerekmez
+  saveTo: async (bytes, info) => {              // info: { format, convertedFrom?, name? }
+    const form = new FormData();
+    form.append('file', new Blob([bytes]), info.name || `dosya.${info.format}`);
+    const response = await fetch('/upload', { method: 'POST', body: form });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);   // "Dosya kaydedilemedi (HTTP 500)"
+  },
+});
+```
+
+`info.name`, dosya bir adresten alındıysa yolun son parçası, `File` olarak verildiyse onun adıdır; bayt olarak verilen dosyada yoktur. İşlev 10 dakika içinde çözülmez ya da reddetmezse kayıt zaman aşımıyla başarısız sayılır (düğme sonsuza dek meşgul kalmasın diye); daha kısa bir sınır istiyorsanız işlevin içinde kendiniz koyun. Sınır dolduktan sonra işlevin çözülmesi hiçbir şeyi değiştirmez.
+
+**Yalnız `onSave` kullananlar için bir şey değişmez:** `saveTo` verilmedikçe düğme çıkmaz, Ctrl/Cmd+S eskisi gibi `onSave(bytes)`'ı çağırır.
+
+**WebView köprüsünde karşılığı:** `load` iletisine `save: true` eklenir; kullanıcı kaydedince sayfa uygulamaya `by: "user"` taşıyan bir `saved` iletisi gönderir ve uygulama `saveResult` ile yanıtlar ([webview-koprusu.md](webview-koprusu.md), "Kullanıcının kaydetmesi").
+
+Bilinmesi gerekenler:
+
+- Kaydetme kullanıcının isteğiyle olur; kendiliğinden (zamanlı) kaydetme yoktur. Kendiniz kuracaksanız `saveNow()`'ı **her değişiklikte çağırmayın**: tabloda `onChange` formül hesabının her dilimi bittiğinde de gelir ve her biri ayrı bir `PUT` üretir (süren kayıt bitince bir sonraki başlar). Bunun yerine gecikmeli kaydedin:
+
+  ```js
+  let timer;
+  const mounted = await BymOffice.mount(el, {
+    file: '/files/42',
+    saveTo: true,
+    onSaveState: ({ dirty, saving, error }) => {
+      clearTimeout(timer);
+      // Son değişiklikten 5 sn sonra; hata varken kendiliğinden yeniden deneme yok.
+      if (dirty && !saving && !error) timer = setTimeout(() => mounted.saveNow(), 5000);
+    },
+  });
+  ```
+
+  (`onSaveState` yalnız durum değişince çağrılır; zaten "kaydedilmemiş" olan dosyadaki yeni değişiklikler zamanlayıcıyı yeniden başlatmaz. Bu örnek sınanmadı.)
+- 412'den sonra motor dosyayı kendiliğinden yeniden yüklemez ve birleştirmez: kullanıcının değişiklikleri görünümde kalır, ne yapılacağına sayfanız karar verir (`onError` → `code: 'conflict'`; üzerine yazmak için `saveNow({ overwrite: true })`). Görünümün kendisinde "üzerine yaz" düğmesi yoktur (bildirimler yalnız metindir).
+- Görünüm sonradan salt okunur yapılırsa (`editor.setReadOnly(true)`) düğme gizlenir; o ana dek yapılmış değişiklikler Ctrl/Cmd+S ve `saveNow()` ile yine kaydedilebilir.
+- Kaydedilmemiş değişiklik sayımı değişiklik adımlarına göredir: kaydettikten sonra bir şey yazıp geri almak (ya da geri alıp yinelemek) dosyayı "kaydedilmiş" durumuna döndürmez (geri alma da bir değişikliktir; tutucu yön: gereksiz bir kayıt olur, kayıp olmaz).
+- UNSURE: gerçek bir sunucu çatısıyla (Laravel, .NET…), başka kökene kayıtla (CORS ön denetimi) ve gerçek mobil cihazlarda denenmedi; testler yerel bir sınama sunucusuna karşı çalışır. `beforeunload` sorusunu tarayıcı yalnız kullanıcı sayfayla etkileşmişse gösterir, iOS Safari ve WebView'ler hiç göstermeyebilir.
+
 ### Eski biçimleri düzenleme: `convert`
 
 ```js
@@ -341,7 +487,7 @@ const mounted = await BymOffice.mount(container, { file: docx, locale: 'tr' });
 
 ### Bir uygulamaya gömme: `examples/html/index.html`
 
-Sunucu tarafı ne olursa olsun (PHP, .NET, Node…) çalışan, çatı gerektirmeyen tek sayfa: dosyayı sitenin kendi adresinden alır, editörde gösterir, kaydedilince baytları `PUT` ile geri yollar. Sekmede ya da `<iframe>` içinde açılır:
+Sunucu tarafı ne olursa olsun (PHP, .NET, Node…) çalışan, çatı gerektirmeyen tek sayfa: dosyayı sitenin kendi adresinden alır, editörde gösterir, kaydedilince baytları `PUT` ile geri yollar. Kaydetmeyi sayfa değil motor yapar: sayfa yalnız `saveTo` seçeneğiyle nereye kaydedileceğini söyler ("Aynı yere kaydetme (`saveTo`)"). Sekmede ya da `<iframe>` içinde açılır:
 
 ```
 examples/html/index.html?file=/files/42/download&save=/files/42&name=rapor.xlsx&lang=tr
@@ -356,12 +502,13 @@ examples/html/index.html?new=docx&save=/files&name=yazi.docx      yeni, boş bel
 | `mode` | `edit` (varsayılan) ya da `view` |
 | `lang` | `tr` ya da `en`: editörün ve yeni dosyanın dili |
 | `new` | `docx` ya da `xlsx`: dosya almak yerine boş dosyayla başlar |
-| `convert` | `1`: doc, RTF ve xls dosyalarını docx/xlsx'e çevirerek düzenlenebilir açar; ad yeni uzantıyı alır, `PUT` isteği biçimi `X-Bym-Format` başlığında bildirir |
+| `convert` | `1`: doc, RTF ve xls dosyalarını docx/xlsx'e çevirerek düzenlenebilir açar; ad yeni uzantıyı alır, `PUT` isteği biçimi `X-Bym-Format`, eski biçimi `X-Bym-Converted-From` başlığında bildirir |
 | `name` | Gösterilen ve indirmede kullanılan dosya adı |
 
-- Kaydet düğmesi ve Ctrl/Cmd+S aynı işi yapar. Dosya yoldayken yazılan şey "kaydedildi" sayılmaz: durum "Kaydedilmedi" kalır ve `saved` iletisi gitmez. Kaydedilmemiş değişiklik varken sayfadan çıkılırsa tarayıcı sorar. doc, xls ve RTF kendi biçimlerine yazılamadığı için salt okunur gösterilir ve Kaydet gizlenir.
+- Örnek sayfa `saveTo: { url, allowConverted: true }` verir: `convert=1` ile açılan dosyanın yeni biçimde aynı adrese kaydedilmesini sunucusunun beklediğini söyler (sunucunuz `X-Bym-Format` başlığını okumuyorsa `allowConverted`'ı kaldırın). Sunucu kaydı yönlendirirse (oturum dolmuş) durum satırı bunu söyler; yönlendirme izlenmez.
+- Kaydet düğmesi **editörün araç çubuğundadır** (sayfanın kendi düğmesi yoktur); Ctrl/Cmd+S aynı işi yapar. Sayfa durumu (`Kaydediliyor…`, `Kaydedildi`, `Kaydedilmedi`, hata) `onSaveState` ile gösterir. Dosya yoldayken yazılan şey "kaydedildi" sayılmaz: durum "Kaydedilmedi" kalır ve `saved` iletisi gitmez. Kaydedilmemiş değişiklik varken sayfadan çıkılırsa tarayıcı sorar. doc, xls ve RTF kendi biçimlerine yazılamadığı için salt okunur gösterilir ve Kaydet düğmesi çıkmaz. `save` adresi dosyanın alındığı adresle aynıysa ve sunucu `ETag` verdiyse istek `If-Match` taşır. İstek `Content-Type` olarak biçimin MIME türünü taşır.
 - `<iframe>` içindeyken sayfa üst sayfaya (yalnız aynı kökte) `{ source: 'bymoffice', type: 'ready' | 'changed' | 'saved' | 'error', message?, format?, convertedFrom? }` iletileri yollar.
-- Başka kökten adresler reddedilir: sayfa yalnız kendi sitesinden dosya alır ve yalnız oraya yollar. Sunucunuz `PUT` isteğinde oturumu ve yetkiyi kendi denetlemelidir; CSRF belirteci gerekiyorsa `fetch` çağrısına başlık olarak ekleyin.
+- Başka kökten adresler reddedilir: sayfa yalnız kendi sitesinden dosya alır ve yalnız oraya yollar. Sunucunuz `PUT` isteğinde oturumu ve yetkiyi kendi denetlemelidir; CSRF belirteci gerekiyorsa `saveTo: { url, headers: { 'X-CSRF-TOKEN': … } }` ile başlık olarak ekleyin.
 - Sayfayı kendi projenize kopyalayıp `<script src>` adresini kendi sunucunuza ya da CDN'e çevirin. React ve Vue için ayrı örnek yoktur; `mount()` çağrısı bir `ref`'e bağlanmış kapsayıcıyla aynı şekilde kullanılır ve bileşen kaldırılırken `mounted.destroy()` çağrılır (bu kullanım sınanmadı).
 
 ### xls dosyasını xlsx olarak kaydetme
@@ -1160,11 +1307,12 @@ Sayfada yapabilecekleriniz:
 - Bir xls dosyası seçiliyken "xlsx olarak indir" ile `saveAsXlsx()` çıktısını indirmek.
 - "Örnek xlsx üret ve aç" ile elinizde dosya olmadan denemek.
 - "Boş docx oluştur ve aç" / "Boş xlsx oluştur ve aç" ile `createBlank()` çıktısını açmak.
+- **"Aynı yere kaydetme (`saveTo`)"** bölümünde `saveTo`'yu denemek: "Boş xlsx ile dene" / "Boş docx ile dene" burada üretilen boş bir dosyayı sayfayı sunan yerel sunucuya koyar (`/e2e/saved/demo-….xlsx`, her sayfa açılışında ayrı bir ad; yalnız bellekte tutulur, sunucu durunca gider) ve `mount({ file: adres, saveTo })` ile açar. "Hedef" listesi üç yolu seçtirir: alındığı adres (`saveTo: true`, `PUT` + `If-Match`), işlev kaydedici (baytları sayfada tutar), ve hep 503 dönen adres (hata bildirimi). "Sunucudaki kopyayı değiştir (412)" dosyayı başkası kaydetmiş gibi değiştirir: sonraki kayıt 412 alır ve üzerine yazılmaz; "Üzerine yaz" `saveNow({ overwrite: true })` çağırır. "Sunucudaki kopyayı oku" kaydedileni yeniden açıp ilk hücreyi/metni gösterir. Bu bölüm yalnız `pnpm demo` ile (sayfa sunucudan açılınca) çalışır.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
 - **"Font dosyası"** ile kendi font dosyanızı (ttf, otf, woff, woff2) yanındaki alana yazdığınız belge font adının (varsayılan `Bookman Old Style`) yerine kaydetmek (`registerFont`); açık belge ve tablo kendiliğinden yeniden dizilir. "Fontları kaldır" kayıtları siler.
 - **"Paketle gelen font"** kutusu TeX Gyre Bonum'u açıp kapatır (`BymOffice.fonts.configure({ baseUrl: null })`); yanındaki satır durumunu ve dosyaların isteneceği adresi gösterir. Bookman Old Style kullanan bir belge açınca "yüklendi" olur.
 
-Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez.
+Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez. Tek istisna `saveTo` denemesidir: orada **yalnız sayfanın kendi ürettiği boş dosya** ve ona yazdıklarınız, sayfayı sunan yerel sınama sunucusuna (`127.0.0.1`) gönderilir; sürükleyip bıraktığınız dosyalar o bölüme girmez.
 
 ## 7. Geliştirme komutları
 

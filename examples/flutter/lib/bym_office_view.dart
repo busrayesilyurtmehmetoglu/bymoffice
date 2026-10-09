@@ -60,16 +60,31 @@ class BymOfficeDocument {
   final List<String> warnings;
 }
 
-/// The answer to a `save`.
+/// The answer to a `save`, or the file the user saved in the page (see
+/// [BymOfficeController.onUserSave]).
 class BymOfficeSavedFile {
-  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom});
+  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom, this.name, this.byUser = false, this.saveId});
 
   final Uint8List bytes;
 
-  /// Set, with [convertedFrom], only for a file that was converted when it was
-  /// loaded: the bytes are a file of this format, not of the one that was given.
+  /// For the answer to a `save`: set, with [convertedFrom], only for a file
+  /// that was converted when it was loaded (the bytes are a file of this
+  /// format, not of the one that was given). Always set when [byUser].
   final String? format;
   final String? convertedFrom;
+
+  /// The name the file was loaded with, when it was given one.
+  final String? name;
+
+  /// True for a file the user saved with the Save button or Ctrl/Cmd+S of the
+  /// page: the application stores it and answers with
+  /// [BymOfficeController.saveResult].
+  final bool byUser;
+
+  /// Set when [byUser]: names this save. [BymOfficeController.saveResult] sends
+  /// it back, so that a result that arrives late is never taken for the result
+  /// of a later save.
+  final String? saveId;
 }
 
 /// A `changed` message: the workbook or the document was edited (or an edit
@@ -175,6 +190,7 @@ class BymOfficeController {
   final StreamController<BymOfficeRevisions> _revisions = StreamController<BymOfficeRevisions>.broadcast();
   final StreamController<BymOfficeException> _errors = StreamController<BymOfficeException>.broadcast();
   final StreamController<String> _links = StreamController<String>.broadcast();
+  final StreamController<BymOfficeSavedFile> _userSaves = StreamController<BymOfficeSavedFile>.broadcast();
   int _nextId = 0;
   bool _disposed = false;
 
@@ -195,6 +211,23 @@ class BymOfficeController {
   /// A link in a document was activated; the page never opens it itself.
   Stream<String> get onLink => _links.stream;
 
+  /// The user saved in the page (the Save button of its toolbar, or Ctrl/Cmd+S):
+  /// only for a file loaded with `userSaves: true`. The listener stores the
+  /// bytes and then calls [saveResult]; until it does, the page shows the save
+  /// as under way, and after a minute without an answer as failed.
+  /// (NOT COMPILED: written against the contract, never built.)
+  Stream<BymOfficeSavedFile> get onUserSave => _userSaves.stream;
+
+  /// Tells the page what became of the file the user saved ([file] as it came
+  /// from [onUserSave]): [ok] when it was stored; otherwise the page says that
+  /// it could not be saved, with [message] (one short line, shown as text)
+  /// when one is given. A result for a save the page no longer waits for (it
+  /// took more than a minute, or the file was closed) changes nothing.
+  Future<void> saveResult(BymOfficeSavedFile file, bool ok, {String? message}) {
+    _checkAlive();
+    return _post(<String, dynamic>{'type': 'saveResult', 'saveId': file.saveId, 'ok': ok, if (message != null) 'message': message});
+  }
+
   /// Every `error` message, including those that also fail a request.
   Stream<BymOfficeException> get onError => _errors.stream;
 
@@ -203,7 +236,9 @@ class BymOfficeController {
   /// [convert] opens doc, RTF and xls files for editing by converting them to
   /// docx and xlsx: the answer then names the new format and the old one, and
   /// what [save] returns is a file of the new format. [toolbar] shows a
-  /// document with the formatting toolbar above its pages.
+  /// document with the formatting toolbar above its pages. [userSaves] gives
+  /// the page a Save button (in the toolbar) and makes Ctrl/Cmd+S save: the
+  /// file then arrives on [onUserSave].
   Future<BymOfficeDocument> load(
     Uint8List bytes, {
     String? name,
@@ -212,18 +247,19 @@ class BymOfficeController {
     int? sheet,
     bool? convert,
     bool? toolbar,
+    bool? userSaves,
   }) async {
     _checkAlive();
     // Base64 of a large file takes a while; keep it off the UI thread.
     final String data = await compute(base64Encode, bytes);
-    return _load(<String, dynamic>{'data': data}, name: name, locale: locale, readOnly: readOnly, sheet: sheet, convert: convert, toolbar: toolbar);
+    return _load(<String, dynamic>{'data': data}, name: name, locale: locale, readOnly: readOnly, sheet: sheet, convert: convert, toolbar: toolbar, userSaves: userSaves);
   }
 
   /// Starts with a new, empty file instead of opening one. [kind] is "docx"
   /// or "xlsx"; [locale] also chooses the paper size and the name of the sheet.
-  Future<BymOfficeDocument> loadBlank(String kind, {String? name, String? locale, bool? readOnly, bool? toolbar}) {
+  Future<BymOfficeDocument> loadBlank(String kind, {String? name, String? locale, bool? readOnly, bool? toolbar, bool? userSaves}) {
     _checkAlive();
-    return _load(<String, dynamic>{'blank': kind}, name: name, locale: locale, readOnly: readOnly, toolbar: toolbar);
+    return _load(<String, dynamic>{'blank': kind}, name: name, locale: locale, readOnly: readOnly, toolbar: toolbar, userSaves: userSaves);
   }
 
   Future<BymOfficeDocument> _load(
@@ -234,6 +270,7 @@ class BymOfficeController {
     int? sheet,
     bool? convert,
     bool? toolbar,
+    bool? userSaves,
   }) async {
     final Map<String, dynamic> answer = await _request(<String, dynamic>{
       'type': 'load',
@@ -244,6 +281,7 @@ class BymOfficeController {
       if (sheet != null) 'sheet': sheet,
       if (convert != null) 'convert': convert,
       if (toolbar != null) 'toolbar': toolbar,
+      if (userSaves != null) 'save': userSaves,
     });
     return BymOfficeDocument(
       format: answer['format'] as String,
@@ -372,6 +410,7 @@ class BymOfficeController {
     _revisions.close();
     _errors.close();
     _links.close();
+    _userSaves.close();
   }
 
   void _checkAlive() {
@@ -429,8 +468,21 @@ class BymOfficeController {
       case 'ready':
         // Sent again after every `hello`; only the first one counts.
         if (!_ready.isCompleted) _ready.complete(message['version'] as String? ?? '');
-      case 'loaded':
       case 'saved':
+        // A file the user saved in the page has no id: it answers no request.
+        if (message['by'] == 'user') {
+          _userSaves.add(BymOfficeSavedFile(
+            bytes: base64Decode(message['data'] as String),
+            format: message['format'] as String?,
+            convertedFrom: message['convertedFrom'] as String?,
+            name: message['name'] as String?,
+            byUser: true,
+            saveId: message['saveId'] as String?,
+          ));
+        } else if (id is String) {
+          _pending[id]?.complete(message);
+        }
+      case 'loaded':
       case 'done':
         if (id is String) _pending[id]?.complete(message);
       case 'changed':

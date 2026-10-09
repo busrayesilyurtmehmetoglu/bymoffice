@@ -32,6 +32,7 @@ class _EditorPageState extends State<EditorPage> {
   final BymOfficeController _editor = BymOfficeController();
   late final StreamSubscription<BymOfficeChange> _changes;
   late final StreamSubscription<BymOfficeException> _errors;
+  late final StreamSubscription<BymOfficeSavedFile> _userSaves;
   String? _name;
   bool _dirty = false;
   bool _canUndo = false;
@@ -48,12 +49,24 @@ class _EditorPageState extends State<EditorPage> {
       });
     });
     _errors = _editor.onError.listen((BymOfficeException error) => _show('${error.code}: ${error.message}'));
+    // The Save button of the page's toolbar and Ctrl/Cmd+S: the page hands the file over, the application
+    // stores it and says what became of it. (NOT COMPILED: written against the contract, never built.)
+    _userSaves = _editor.onUserSave.listen((BymOfficeSavedFile file) async {
+      try {
+        final bool stored = await _store(file.bytes);
+        await _editor.saveResult(file, stored, message: stored ? null : 'Kaydetme iptal edildi');
+        if (stored) setState(() => _dirty = false);
+      } catch (error) {
+        await _editor.saveResult(file, false, message: 'Dosya yazılamadı');
+      }
+    });
   }
 
   @override
   void dispose() {
     _changes.cancel();
     _errors.cancel();
+    _userSaves.cancel();
     _editor.dispose();
     super.dispose();
   }
@@ -73,7 +86,7 @@ class _EditorPageState extends State<EditorPage> {
     if (picked == null || bytes == null) return;
     try {
       // Old formats are converted so that they can be edited; documents get the formatting toolbar.
-      final BymOfficeDocument opened = await _editor.load(bytes, name: picked.files.single.name, locale: 'tr', convert: true, toolbar: true);
+      final BymOfficeDocument opened = await _editor.load(bytes, name: picked.files.single.name, locale: 'tr', convert: true, toolbar: true, userSaves: true);
       String name = picked.files.single.name;
       if (opened.convertedFrom != null) {
         // "report.doc" is now a docx: only the extension of the old format is replaced.
@@ -91,14 +104,21 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
+  /// Writes the file where the user chooses; false when the user gave up.
+  Future<bool> _store(Uint8List bytes) async {
+    // UNVERIFIED: on mobile file_picker writes `bytes` itself; on desktop it
+    // returns the chosen path and the application writes the file.
+    final String? path = await FilePicker.platform.saveFile(fileName: _name ?? 'workbook.xlsx', bytes: bytes);
+    if (path == null) return false;
+    if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) await File(path).writeAsBytes(bytes);
+    return true;
+  }
+
+  /// The application's own Save button: asks the page for the bytes.
   Future<void> _save() async {
     try {
       final Uint8List bytes = await _editor.save();
-      // UNVERIFIED: on mobile file_picker writes `bytes` itself; on desktop it
-      // returns the chosen path and the application writes the file.
-      final String? path = await FilePicker.platform.saveFile(fileName: _name ?? 'workbook.xlsx', bytes: bytes);
-      if (path == null) return;
-      if (Platform.isMacOS || Platform.isWindows || Platform.isLinux) await File(path).writeAsBytes(bytes);
+      if (!await _store(bytes)) return;
       setState(() => _dirty = false);
       _show('Kaydedildi');
     } on BymOfficeException {

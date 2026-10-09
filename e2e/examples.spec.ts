@@ -20,6 +20,9 @@ async function server(page: Page, bytes?: Uint8Array): Promise<{ saved: Buffer[]
   return { saved };
 }
 
+/** The Save button: the editor's own, in its toolbar (the page only says where the file is saved to). */
+const SAVE = '#editor .bym-toolbar [data-command="save"]';
+
 const ready = (page: Page) => page.waitForFunction(() => (window as any).bymEditor !== undefined, undefined, { timeout: 60_000 });
 
 /** Opens bytes with the engine of the page and says what is in them. */
@@ -40,14 +43,14 @@ test.describe('example page: a file of the site in the editor', () => {
     await page.goto(`${PAGE}?new=docx&save=/files/save&name=letter.docx&lang=tr`);
     await ready(page);
     await expect(page.locator('#name')).toHaveText('letter.docx');
-    await expect(page.locator('#save')).toHaveText('Kaydet');
+    await expect(page.locator(SAVE)).toHaveAttribute('aria-label', /^Kaydet \(/);
     await page.evaluate(() => {
       const view = (window as any).bymEditor.view;
       view.setSelection({ story: 'body', path: [0], offset: 0 });
       view.insertText('Merhaba dünya');
     });
     await expect(page.locator('#status')).toHaveText('Kaydedilmedi');
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await expect(page.locator('#status')).toHaveText('Kaydedildi');
     expect(saved.length).toBe(1);
     expect(await contentOf(page, saved[0])).toEqual({ format: 'docx', text: 'Merhaba dünya' });
@@ -60,7 +63,7 @@ test.describe('example page: a file of the site in the editor', () => {
     await ready(page);
     await page.evaluate(() => (window as any).bymEditor.view.setCellInput(0, 0, '42'));
     await expect(page.locator('#status')).toHaveText('Kaydedilmedi');
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await expect(page.locator('#status')).toHaveText('Kaydedildi');
     expect(saved.length).toBe(1);
     expect(await contentOf(page, saved[0])).toEqual({ format: 'xlsx', text: 'Sayfa1!A1=42' });
@@ -70,7 +73,7 @@ test.describe('example page: a file of the site in the editor', () => {
     const { saved } = await server(page, await createBlank('docx'));
     await page.goto(`${PAGE}?file=/files/sample&save=/files/save&name=read.docx&mode=view`);
     await ready(page);
-    await expect(page.locator('#save')).toBeHidden();
+    await expect(page.locator(SAVE)).toBeHidden();
     const changed = await page.evaluate(() => {
       const view = (window as any).bymEditor.view;
       view.setSelection({ story: 'body', path: [0], offset: 0 });
@@ -84,9 +87,9 @@ test.describe('example page: a file of the site in the editor', () => {
     const { saved } = await server(page, await createBlank('xlsx', { sheetName: 'Data' }));
     await page.goto(`${PAGE}?file=/files/sample&save=/files/save&name=data.xlsx`);
     await ready(page);
-    await expect(page.locator('#save')).toHaveText('Save');
+    await expect(page.locator(SAVE)).toHaveAttribute('aria-label', /^Save \(/);
     await page.evaluate(() => (window as any).bymEditor.view.setCellInput(0, 0, 'hello'));
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await expect(page.locator('#status')).toHaveText('Saved');
     expect(await contentOf(page, saved[0])).toEqual({ format: 'xlsx', text: 'Data!A1=hello' });
   });
@@ -109,18 +112,18 @@ test.describe('example page: a file of the site in the editor', () => {
         view.insertText(value);
       }, text);
     await type('first ');
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await expect(page.locator('#status')).toHaveText('Saving…');
     await expect.poll(() => saved.length).toBe(1);
     // The request is under way: a second press sends nothing, and more is typed.
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await type('second ');
     release();
     await expect(page.locator('#status')).toHaveText('Not saved');
     expect(saved.length).toBe(1);
     expect((await contentOf(page, saved[0])).text).toBe('first ');
     held = Promise.resolve();
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await expect(page.locator('#status')).toHaveText('Saved');
     expect(saved.length).toBe(2);
     expect((await contentOf(page, saved[1])).text).toBe('second first ');
@@ -156,13 +159,13 @@ test.describe('example page: a file of the site in the editor', () => {
     // Without it the file is shown as it is, read-only.
     await page.goto(`${PAGE}?file=/files/sample&save=/files/save&name=old.rtf`);
     await ready(page);
-    await expect(page.locator('#save')).toBeHidden();
+    await expect(page.locator(SAVE)).toBeHidden();
     await expect(page.locator('#name')).toHaveText('old.rtf');
 
     await page.goto(`${PAGE}?file=/files/sample&save=/files/save&name=old.rtf&convert=1&lang=tr`);
     await ready(page);
     await expect(page.locator('#name')).toHaveText('old.docx');
-    await expect(page.locator('#save')).toBeVisible();
+    await expect(page.locator(SAVE)).toBeVisible();
     // The notice of the conversion is still there once the page is ready.
     await expect(page.locator('#status')).toHaveText('Bu rtf dosyası düzenlenebilmesi için docx biçimine çevrildi; docx olarak kaydedilir');
     await page.evaluate(() => {
@@ -170,7 +173,7 @@ test.describe('example page: a file of the site in the editor', () => {
       view.setSelection({ story: 'body', path: [0], offset: 0 });
       view.insertText('New and ');
     });
-    await page.locator('#save').click();
+    await page.locator(SAVE).click();
     await expect(page.locator('#status')).toHaveText('Kaydedildi');
     expect(formats).toEqual(['docx']);
     expect(await contentOf(page, saved[0])).toEqual({ format: 'docx', text: 'New and Old text' });
@@ -224,7 +227,7 @@ test.describe('example page: a file of the site in the editor', () => {
       view.setSelection({ story: 'body', path: [0], offset: 0 });
       view.insertText('New ');
     });
-    await frame.locator('#save').click();
+    await frame.locator(SAVE).click();
     await waitFor('saved');
     expect((await messages()).map((message) => [message.type, message.format, message.convertedFrom])).toEqual([
       ['ready', 'docx', 'rtf'],
@@ -329,7 +332,7 @@ test.describe('example page: a file of the site in the editor', () => {
       view.setSelection({ story: 'body', path: [0], offset: 0 });
       view.insertText('From the frame');
     });
-    await frame.locator('#save').click();
+    await frame.locator(SAVE).click();
     await page.waitForFunction(() => (window as any).__messages.includes('saved'));
     expect(await page.evaluate(() => (window as any).__messages)).toEqual(['ready', 'changed', 'saved']);
     expect(saved.length).toBe(1);

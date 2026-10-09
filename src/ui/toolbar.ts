@@ -11,6 +11,7 @@ import type { BorderPreset } from '../ops/format';
 import { EDITOR_STRINGS_EN, EDITOR_STRINGS_TR, withShortcut, type EditorStrings } from './editor-strings';
 import { ICON_BAR_CLASS, createBorderIcon, createIcon, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
+import type { SaveCommand } from './save-command';
 import type { WorkbookView } from './sheet-view';
 
 /** What the parts of the shell need from the editor that holds them. */
@@ -24,6 +25,8 @@ export interface ShellHost {
    * kept where it is) and the shell is brought up to date.
    */
   run(action: () => void, keepFocus?: boolean): void;
+  /** With it the toolbar starts with a Save button, which is not there while the view is read-only. */
+  readonly save?: SaveCommand;
 }
 
 const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36];
@@ -101,6 +104,8 @@ export class Toolbar {
   private readonly sizeSelect: HTMLSelectElement;
   private readonly formatSelect: HTMLSelectElement;
   private readonly bars: { textColor?: SVGElement; fillColor?: SVGElement } = {};
+  /** The line after the Save button: it goes when the button does. */
+  private saveSeparator: HTMLElement | undefined;
   /** Font sizes the size list holds now; it is rebuilt only when this changes. */
   private sizeKey = '';
   private customShown = false;
@@ -123,6 +128,11 @@ export class Toolbar {
     element.tabIndex = -1;
     this.element = element;
 
+    const save = host.save;
+    if (save) {
+      this.addButton('save', () => save.run()).setAttribute('aria-busy', 'false');
+      this.saveSeparator = this.addSeparator();
+    }
     this.addButton('undo', () => host.view.undo());
     this.addButton('redo', () => host.view.redo());
     // Works in a read-only view as well; what goes wrong is said by the view.
@@ -193,6 +203,7 @@ export class Toolbar {
     const typing = view.isEditing || view.isEditingComment || view.isRenaming;
     this.setDisabled('undo', view.readOnly || typing || !view.history.canUndo);
     this.setDisabled('redo', view.readOnly || typing || !view.history.canRedo);
+    this.updateSave(typing);
     const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.sizeSelect.disabled = !editable;
@@ -215,6 +226,25 @@ export class Toolbar {
     this.paintBar(this.bars.textColor, this.textColorOf(format) || '#000000');
     this.paintBar(this.bars.fillColor, this.fillColorOf(format));
     this.keepTabStop();
+  }
+
+  /**
+   * The Save button: gone from a view that is read-only, dimmed while there is nothing to save, busy
+   * while a save is under way. What is being typed counts as something to save: saving applies it first.
+   */
+  private updateSave(typing: boolean): void {
+    const save = this.host.save;
+    const button = this.buttons.save;
+    if (!save || !button) return;
+    const hidden = this.host.view.readOnly;
+    if (button.hidden !== hidden) {
+      button.hidden = hidden;
+      if (this.saveSeparator) this.saveSeparator.hidden = hidden;
+    }
+    // A press while a save is under way is taken: it saves once more when something was changed meanwhile.
+    this.setDisabled('save', hidden || !(save.dirty || save.saving || typing));
+    const busy = save.saving ? 'true' : 'false';
+    if (button.getAttribute('aria-busy') !== busy) button.setAttribute('aria-busy', busy);
   }
 
   /** Marks the Print button as busy while the pages of a print job are prepared. */
@@ -285,12 +315,13 @@ export class Toolbar {
     return select;
   }
 
-  private addSeparator(): void {
+  private addSeparator(): HTMLElement {
     const separator = document.createElement('span');
     separator.className = 'bym-tb-sep';
     separator.setAttribute('role', 'separator');
     separator.setAttribute('aria-orientation', 'vertical');
     this.element.appendChild(separator);
+    return separator;
   }
 
   private barOf(key: ButtonKey): SVGElement | undefined {
@@ -303,6 +334,7 @@ export class Toolbar {
     const s = this.strings;
     this.element.setAttribute('aria-label', s.toolbar);
     const labels: { [key in ButtonKey]: string } = {
+      save: withShortcut(s.save, 'S'),
       undo: withShortcut(s.undo, 'Z'),
       redo: withShortcut(s.redo, 'Y'),
       // The same label as the button of the document bar.

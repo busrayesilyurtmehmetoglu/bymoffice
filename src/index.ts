@@ -21,6 +21,7 @@ import { DocumentEditor } from './ui/doc-editor';
 import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import type { SheetPrintOptions } from './ui/sheet-print';
 import { OpcPackage } from './opc';
+import { SaveController, fileETag, locksSaving, nameFromUrl, resolveSaveTarget, saveInfoOf, watchLeaving, type SaveNowOptions, type SaveState, type SaveTo } from './embed/save-to';
 
 export { CfbFile, type CfbEntry } from './cfb';
 export { OpcPackage, type Relationship } from './opc';
@@ -146,6 +147,8 @@ export { EMBEDDED_FONT_FACES, EMBEDDED_FONT_FAMILY, configureEmbeddedFonts, embe
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
+export type { SaveCommand } from './ui/save-command';
+export { SaveError, type SaveErrorCode, type SaveInfo, type SaveNowOptions, type SaveState, type SaveTo, type SaveToFunction, type SaveToRequest } from './embed/save-to';
 export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
 export { defaultPaperFor, headerFooterFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPagePaint, type SheetPlanOptions, type SheetPrintOptions } from './ui/sheet-print';
 export {
@@ -343,15 +346,59 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
   throw new UnsupportedFileError('Not a Word or Excel file');
 }
 
-export interface MountOptions extends SpreadsheetEditorOptions {
+export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveCommand'> {
   /** The file itself, or a URL to fetch it from. The format is detected from the content. */
   file: Uint8Array | ArrayBuffer | Blob | string;
   /**
-   * Called with the file's bytes when the user saves with Ctrl+S or Cmd+S in
-   * the view. Without it the shortcut is left to the browser.
+   * Where the file is saved to, by the Save button of the toolbar, by Ctrl+S
+   * or Cmd+S in the view and by saveNow():
+   *
+   * - `true`: the address the file was fetched from (`file` must be an address);
+   * - an address: http: or https:, or one relative to the page;
+   * - a request, `{ url, method, headers, credentials, timeoutMs, allowConverted }`:
+   *   `url` defaults to the address the file was fetched from, `method` to
+   *   "PUT", `credentials` to "same-origin" (what the file is fetched with),
+   *   `timeoutMs` to two minutes;
+   * - a function `(bytes, info)`: the application saves by itself, and the
+   *   save has failed when it throws or rejects (or takes more than ten minutes).
+   *
+   * A redirect is not followed: a save the server answers with one has
+   * failed. A file that was converted to be edited (`convert`) is not saved
+   * to the address its original was fetched from unless the request says
+   * `allowConverted: true`: onNotice says so when the file is opened, and a
+   * save fails with SaveError "converted". Another address and a function
+   * take the converted file as it is.
+   *
+   * The request carries the bytes with the media type of their format,
+   * `X-Bym-Format` ("docx" or "xlsx"), `X-Bym-Converted-From` for a file that
+   * was converted to be edited, and `If-Match` with the ETag the file came
+   * with when it is saved to where it was fetched from (not when the file was
+   * fetched through a redirect). Any 2xx answer means
+   * saved; its body is not read. What goes wrong is told to onNotice, to
+   * onSaveState and, as a SaveError, to onError.
+   *
+   * Nothing is saved, and there is no button, for a file that cannot be
+   * written (doc, RTF and xls that were not converted, a document whose
+   * protection allows no editing); the button is not shown while the view is
+   * read-only. `false` is the same as leaving the option out. mount() rejects
+   * with TypeError for a value that cannot be saved to: `true` for a file
+   * given as bytes, an address of another scheme, another method.
+   */
+  saveTo?: SaveTo | false;
+  /** With `saveTo`: called whenever there is something else to say about saving. */
+  onSaveState?(state: SaveState): void;
+  /**
+   * With `saveTo`: leaving the page with changes that were not saved asks the
+   * user first (the browser's own question). Default true.
+   */
+  warnOnLeave?: boolean;
+  /**
+   * Without `saveTo`: called with the file's bytes when the user saves with
+   * Ctrl+S or Cmd+S in the view; without either the shortcut is left to the
+   * browser. With `saveTo`: called with the bytes after every save that succeeded.
    */
   onSave?(bytes: Uint8Array): void;
-  /** Called when saving from the shortcut fails. */
+  /** Called when saving fails: with a SaveError when `saveTo` is given, otherwise with what the writer threw. */
   onError?(error: unknown): void;
   /**
    * Opens the formats that cannot be written back (doc, RTF, xls) for
@@ -463,7 +510,18 @@ export interface MountedSpreadsheet {
    * WorkbookView.print(). Resolves when the dialog was closed.
    */
   print(options?: SheetPrintOptions): Promise<DocumentPrintResult>;
-  /** Removes the view from the container. */
+  /**
+   * Saves the file to MountOptions.saveTo, as the Save button does: what is
+   * being typed is applied first. Resolves to true when it was saved, also
+   * when there was nothing to save; to false when it could not be (onNotice
+   * and onSaveState say why), and always to false without `saveTo`. Never rejects.
+   * `{ overwrite: true }` saves over whatever the server holds (no `If-Match`):
+   * the user's answer to a SaveError "conflict".
+   */
+  saveNow(options?: SaveNowOptions): Promise<boolean>;
+  /** Whether changes were made that saveNow() has not saved: with `saveTo`, what the Save button shows. */
+  readonly hasUnsavedChanges: boolean;
+  /** Removes the view from the container; the same as `editor.destroy()`. */
   destroy(): void;
 }
 
@@ -489,7 +547,18 @@ export interface MountedDocument {
    * also save it as a PDF): see DocumentView.print(). Resolves when the dialog was closed.
    */
   print(options?: DocumentPrintOptions): Promise<DocumentPrintResult>;
-  /** Removes the view from the container. */
+  /**
+   * Saves the file to MountOptions.saveTo, as the Save button does: what is
+   * being typed is applied first. Resolves to true when it was saved, also
+   * when there was nothing to save; to false when it could not be (onNotice
+   * and onSaveState say why), and always to false without `saveTo`. Never rejects.
+   * `{ overwrite: true }` saves over whatever the server holds (no `If-Match`):
+   * the user's answer to a SaveError "conflict".
+   */
+  saveNow(options?: SaveNowOptions): Promise<boolean>;
+  /** Whether changes were made that saveNow() has not saved: with `saveTo`, what the Save button shows. */
+  readonly hasUnsavedChanges: boolean;
+  /** Removes the view from the container; the same as `editor.destroy()`. */
   destroy(): void;
 }
 
@@ -513,10 +582,22 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   // The fonts load while the file is fetched and read. This never rejects: a font is no reason not to show a file.
   const fontsSettled: Promise<FontFailure[]> = Array.isArray(options.fonts) ? settleFonts(options.fonts, FONT_WAIT_MS) : Promise.resolve([]);
   let input = options.file;
+  // Where the page is: what a relative address is resolved against.
+  const base = typeof document !== 'undefined' && typeof document.baseURI === 'string' ? document.baseURI : undefined;
+  // Before anything is fetched: a `saveTo` that cannot be saved to is a mistake of the page, and is told at once.
+  const saveTarget = options.saveTo === undefined || options.saveTo === false || options.saveTo === null ? undefined : resolveSaveTarget(options.saveTo, typeof input === 'string' ? input : undefined, base);
+  /** The ETag the file came with: what a save to the same address is sent with. */
+  let etag: string | null = null;
+  let fileName: string | undefined;
   if (typeof input === 'string') {
+    fileName = nameFromUrl(input, base);
     const response = await fetch(input);
     if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
+    // Not the ETag of an answer that came from another address than the one that is saved to.
+    etag = fileETag(response);
     input = await response.arrayBuffer();
+  } else if (typeof Blob !== 'undefined' && input instanceof Blob && typeof (input as { name?: unknown }).name === 'string') {
+    fileName = (input as unknown as { name: string }).name || undefined;
   }
   let file = await open(input);
   let conversion: MountConversion | undefined;
@@ -542,11 +623,67 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     }
     if (conversion) options.onNotice({ message: strings.openedConverted(conversion.from, conversion.to), kind: 'info' });
     else if (notConverted !== undefined) options.onNotice({ message: strings.notConverted(notConverted), kind: 'error' });
+    // Said before anything is typed: what is changed in this file has nowhere to go (see MountOptions.saveTo).
+    if (conversion && controller && controller.blockedConversion) options.onNotice({ message: strings.saveConvertedNotAllowed(conversion.to), kind: 'error' });
   };
   let save: () => Promise<Uint8Array>;
+  // What the two kinds of view answer differently; set once the view is there.
+  let commit: () => boolean = () => true;
+  let locked: () => boolean = () => false;
+  let notice: (message: string, kind: 'error' | 'info') => void = () => undefined;
+  const info = () => saveInfoOf(file.format, conversion, fileName);
+  const controller = saveTarget
+    ? new SaveController({
+        target: saveTarget,
+        writable: () => (file.format === 'docx' || file.format === 'xlsx') && !locked(),
+        commit: () => commit(),
+        bytes: () => save(),
+        info,
+        strings: () => resolveUiStrings(options.locale),
+        notice: (message, kind) => notice(message, kind),
+        onState: options.onSaveState,
+        onSaved: options.onSave,
+        onError: options.onError,
+        etag,
+      })
+    : undefined;
+  /** Without `saveTo`: whether anything was changed at all. */
+  let touched = false;
+  const changed = () => {
+    touched = true;
+    if (controller) controller.changed();
+  };
+  const saveNow = (saveOptions?: SaveNowOptions): Promise<boolean> => (controller ? controller.saveNow(saveOptions) : Promise.resolve(false));
+  const unsaved = (): boolean => (controller ? controller.dirty : touched);
+  /** Ends the watch on the page being left. */
+  let unwatchLeave: (() => void) | undefined;
+  /**
+   * Ties what mount() holds to the life of the editor: its destroy() (which is also the result's) takes the key
+   * listener and the question before leaving away and gives up a save that is under way, whoever calls it.
+   */
+  const tie = (editor: { destroy(): void }): (() => void) => {
+    // While the event goes down, before any field inside the editor can keep it to itself (a dialog of
+    // rules, the field of a note or of a link do): otherwise the browser would open its "save page" there.
+    container.addEventListener('keydown', onKeyDown, true);
+    // Leaving the page with changes nobody holds asks first.
+    if (controller && options.warnOnLeave !== false && typeof window !== 'undefined') unwatchLeave = watchLeaving(window, () => controller.dirty);
+    const destroyEditor = editor.destroy.bind(editor);
+    let over = false;
+    editor.destroy = () => {
+      if (!over) {
+        over = true;
+        container.removeEventListener('keydown', onKeyDown, true);
+        if (unwatchLeave) unwatchLeave();
+        if (controller) controller.destroy();
+      }
+      destroyEditor();
+    };
+    return () => editor.destroy();
+  };
   const onKeyDown = (event: KeyboardEvent) => {
-    if (!options.onSave || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || (event.key !== 's' && event.key !== 'S')) return;
+    if ((!controller && !options.onSave) || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || (event.key !== 's' && event.key !== 'S')) return;
     event.preventDefault();
+    if (controller) return void controller.saveNow();
     save().then(options.onSave, (error) => {
       if (options.onError) options.onError(error);
       else throw error;
@@ -567,7 +704,11 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       onPageChange: options.onPageChange,
       onNotice: options.onNotice,
       onLinkClick: options.onLinkClick,
-      onChange: options.onDocumentChange,
+      onChange: () => {
+        changed();
+        if (options.onDocumentChange) options.onDocumentChange();
+      },
+      saveCommand: controller,
       trackChanges: options.trackChanges,
       author: options.author,
       now: options.now,
@@ -589,14 +730,30 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       if (view.changeCount === changes) view.markSaved();
       return bytes;
     };
-    container.addEventListener('keydown', onKeyDown);
-    const destroy = () => {
-      container.removeEventListener('keydown', onKeyDown);
-      editor.destroy();
+    commit = () => {
+      view.commitEditing();
+      return true;
     };
+    // A protection that allows no editing: nothing is written back.
+    locked = () => locksSaving(view.protection);
+    notice = (message, kind) => view.showNotice(message, kind);
+    const destroy = tie(editor);
     converted();
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
-    const mounted: MountedDocument = { kind: 'document', file, document: model, view, editor, save, print, destroy };
+    const mounted: MountedDocument = {
+      kind: 'document',
+      file,
+      document: model,
+      view,
+      editor,
+      save,
+      print,
+      saveNow,
+      get hasUnsavedChanges() {
+        return unsaved();
+      },
+      destroy,
+    };
     if (conversion) mounted.conversion = conversion;
     if (view.trackingChanges) mounted.trackChanges = true;
     const enforced = view.protection;
@@ -606,7 +763,16 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
 
   const workbook = await file.workbook();
   // An xls file cannot be written yet: it is shown read-only, so that no edit is lost on saving.
-  const editor = new SpreadsheetEditor(container, workbook, file.format === 'xls' ? { ...options, readOnly: true } : options);
+  const sheetOptions: SpreadsheetEditorOptions = {
+    ...options,
+    onChange: (change) => {
+      changed();
+      if (options.onChange) options.onChange(change);
+    },
+    saveCommand: controller,
+  };
+  if (file.format === 'xls') sheetOptions.readOnly = true;
+  const editor = new SpreadsheetEditor(container, workbook, sheetOptions);
   const view = editor.view;
   if (file.format === 'xls') {
     // Nothing may turn editing on: saving would give the original bytes and the edits would be lost.
@@ -620,14 +786,33 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     if (!view.commitPending()) throw new Error('Cannot save: a note or a sheet name that is being typed cannot be applied, or a dialog of rules is open with changes (confirm or close it first)');
     return file.save();
   };
-  container.addEventListener('keydown', onKeyDown);
-  const destroy = () => {
-    container.removeEventListener('keydown', onKeyDown);
-    editor.destroy();
+  commit = () => {
+    try {
+      return view.commitPending();
+    } catch (error) {
+      // A cell whose text cannot be written: the editor stays open, and the view says why.
+      view.showNotice(view.localizeError(error), 'error');
+      return false;
+    }
   };
+  notice = (message, kind) => view.showNotice(message, kind);
+  const destroy = tie(editor);
   converted();
   const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);
-  return conversion
-    ? { kind: 'spreadsheet', file, conversion, workbook, view, editor, save, print, destroy }
-    : { kind: 'spreadsheet', file, workbook, view, editor, save, print, destroy };
+  const mounted: MountedSpreadsheet = {
+    kind: 'spreadsheet',
+    file,
+    workbook,
+    view,
+    editor,
+    save,
+    print,
+    saveNow,
+    get hasUnsavedChanges() {
+      return unsaved();
+    },
+    destroy,
+  };
+  if (conversion) mounted.conversion = conversion;
+  return mounted;
 }
