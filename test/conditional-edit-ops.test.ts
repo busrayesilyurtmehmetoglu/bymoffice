@@ -310,10 +310,10 @@ test('sorting, pasting, merging and notes leave the rules where they are; the fo
   apply(doc, sortRange(doc.wb, 0, range('A1:B3'), [{ col: 0, descending: false }], { header: false }));
   assert.deepEqual(now(doc.wb), before);
   assert.deepEqual(['A1', 'A2', 'A3'].map((ref) => styleAt(doc, ref) !== undefined), [false, true, true]);
-  // A copy carries values and formats; it brings no rule, and the rules where it lands stay.
+  // Pasted text brings no rule, and the rules where it lands stay. (Copied cells bring theirs: see paste-rules.test.ts.)
   const copied = copyRange(doc.wb, 0, range('A3:B3'));
-  apply(doc, pasteAt(doc.wb, 0, range('D1'), copied.text, copied).ops);
-  apply(doc, pasteAt(doc.wb, 0, range('A1'), copied.text, copied).ops);
+  apply(doc, pasteAt(doc.wb, 0, range('D1'), copied.text).ops);
+  apply(doc, pasteAt(doc.wb, 0, range('A1'), copied.text).ops);
   assert.deepEqual(now(doc.wb), before);
   assert.equal(styleAt(doc, 'D1'), undefined);
   assert.notEqual(styleAt(doc, 'A1'), undefined, 'the pasted 9 is above 4');

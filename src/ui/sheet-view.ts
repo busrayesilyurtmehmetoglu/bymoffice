@@ -4891,15 +4891,20 @@ export class WorkbookView {
     if (this.destroyed || this.locked) return;
     this.commitEditing();
     const value = String(text);
-    if (value === '') return;
+    const own = html !== undefined && this.copied !== undefined && this.copyId !== '' && String(html).indexOf(`data-bym-copy="${this.copyId}"`) >= 0;
+    // No text is nothing to paste - but for a copy of this view whose cells are empty and have a note or a rule
+    // (a list to choose from, say), which shows no text at all.
+    if (value === '' && !(own && this.copied && (this.copied.rules !== undefined || this.copied.notes !== undefined))) return;
     const state = this.state();
     if (state.sheet.kind !== 'worksheet') return;
-    const own = html !== undefined && this.copied !== undefined && this.copyId !== '' && String(html).indexOf(`data-bym-copy="${this.copyId}"`) >= 0;
     const result = pasteAt(this.workbook, this.sheetIndex, state.range, value, own ? this.copied : undefined, { locale: this.locale });
     const after = { active: { row: result.range.top, col: result.range.left }, range: result.range };
     if (!this.applyOps(result.ops, after)) this.restoreSelection(after);
-    // The cells were pasted; notes that could not go with them are said, not refused.
-    if (result.skippedNotes) this.notifyLater(this.strings.notesNotPasted(result.skippedNotes));
+    // The cells were pasted; notes and rules that could not go with them are said, not refused.
+    const said: string[] = [];
+    if (result.skippedNotes) said.push(this.strings.notesNotPasted(result.skippedNotes));
+    if (result.skippedRules) said.push(this.strings.rulesNotPasted(result.skippedRules));
+    if (said.length > 0) this.notifyLater(said.join('; '));
   }
 
   insertRows(at: number, count: number): void {
@@ -5904,20 +5909,47 @@ export class WorkbookView {
     });
   }
 
-  /** Paste from the menu: only the asynchronous clipboard can be read without a paste event, and only as text. */
+  /**
+   * Paste from the menu: only the asynchronous clipboard can be read without a paste event.
+   * Where it hands out the kinds of content it holds (read()), the HTML is taken with the text,
+   * so that a copy of this view is known by its mark and comes with its formats, notes and
+   * rules; elsewhere the text alone is read, and pasted as if typed.
+   */
   private menuPaste(): void {
     const unavailable = () => {
       if (!this.destroyed) this.notify(this.strings.pasteWithKeyboard, 'info');
     };
     const clipboard = navigator.clipboard;
-    if (!clipboard || typeof clipboard.readText !== 'function') {
+    if (!clipboard || (typeof clipboard.readText !== 'function' && typeof clipboard.read !== 'function')) {
       unavailable();
       return;
     }
+    const paste = (text: string, html?: string) => {
+      if (!this.destroyed) this.attempt(() => this.paste(text, html));
+    };
+    const asText = () => {
+      if (typeof clipboard.readText !== 'function') unavailable();
+      else clipboard.readText().then((text) => paste(text), unavailable);
+    };
     try {
-      clipboard.readText().then((text) => {
-        if (!this.destroyed) this.attempt(() => this.paste(text));
-      }, unavailable);
+      if (typeof clipboard.read !== 'function') {
+        asText();
+        return;
+      }
+      const textOf = (item: ClipboardItem, type: string): Promise<string | undefined> =>
+        item.types.indexOf(type) < 0 ? Promise.resolve(undefined) : item.getType(type).then((blob) => (typeof blob.text === 'function' ? blob.text() : new Response(blob).text()));
+      clipboard
+        .read()
+        .then((items) => {
+          const item = items[0];
+          if (!item) return paste('');
+          return Promise.all([textOf(item, 'text/plain'), textOf(item, 'text/html')]).then(([text, html]) => paste(text === undefined ? '' : text, html));
+        })
+        .then(undefined, (error: unknown) => {
+          // Refused is refused: asking a second time would show the browser's question twice.
+          if (error && (error as { name?: string }).name === 'NotAllowedError') unavailable();
+          else asText();
+        });
     } catch {
       unavailable();
     }

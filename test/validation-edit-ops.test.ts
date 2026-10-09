@@ -296,11 +296,11 @@ test('sorting, pasting, merging and notes leave the rules where they are', async
   apply(doc, sortRange(doc.wb, 0, range('A1:B3'), [{ col: 0, descending: false }], { header: false }));
   assert.equal(doc.wb.sheets[0].rows.get(0)!.cells[0].value, 1);
   assert.deepEqual(now(doc.wb), before);
-  // A copy carries values and formats; the rules of the cells it lands on stay, and it brings none.
+  // Pasted text brings no rule, and the rules of the cells it lands on stay. (Copied cells bring theirs: see paste-rules.test.ts.)
   const copied = copyRange(doc.wb, 0, range('A1:B1'));
-  apply(doc, pasteAt(doc.wb, 0, range('D1'), copied.text, copied).ops);
+  apply(doc, pasteAt(doc.wb, 0, range('D1'), copied.text).ops);
   assert.deepEqual(now(doc.wb), before);
-  apply(doc, pasteAt(doc.wb, 0, range('B2'), copied.text, copied).ops);
+  apply(doc, pasteAt(doc.wb, 0, range('B2'), copied.text).ops);
   assert.deepEqual(now(doc.wb), before);
   // A merged cell is the range it is; a rule set on part of it is set on that part.
   apply(doc, [{ type: 'setMerges', sheet: 0, merges: [range('F1:G2')] }]);

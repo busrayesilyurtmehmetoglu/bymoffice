@@ -12,6 +12,7 @@ import { resolveCellStyle } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { rowRunsWithout, rowsHiddenByFilter } from './filter';
 import { DEFAULT_NOTE_AUTHOR, MAX_SHEET_NOTES, cellNow, clearNotes, notesBlocked } from './notes';
+import { copiedRulesExtent, copyRules, cutRules, pasteRules, type CopiedRules } from './rules';
 import { ensureCellFormat, ensureNumberFormat, explicitFormula, sharedMasters, type CellChange, type Op, type SharedMasters } from './ops';
 
 export interface EditOptions {
@@ -173,6 +174,12 @@ export interface CopiedRange {
    * where a new note gets it. Threaded comments are not copied. Missing when there is none.
    */
   notes?: CopiedNote[];
+  /**
+   * The data validations and conditional formats of the copied cells, as they applied when
+   * the cells were copied (see copyRules()). Missing when the cells have none: a paste then
+   * leaves the cells it writes without a rule, as it does every cell the copy has no rule for.
+   */
+  rules?: CopiedRules;
 }
 
 /** A note of a copied cell. */
@@ -236,6 +243,10 @@ export function copyRange(workbook: Workbook, sheetIndex: number, range: CellRan
   // The notes of the selection itself: a note may be on an empty cell beyond the cells that were copied.
   const notes = copiedNotes(sheet, range.top, range.left, bottom, Math.min(range.bottom, MAX_ROWS - 1), Math.min(range.right, MAX_COLS - 1), rows);
   if (notes.length > 0) copied.notes = notes;
+  // The rules of the selection itself as well: cells that are still empty are often the ones with a rule.
+  const last = Math.min(range.bottom, MAX_ROWS - 1);
+  const rules = copyRules(workbook, sheetIndex, { top: range.top, left: range.left, bottom: Math.max(last, bottom), right: Math.max(right, Math.min(range.right, MAX_COLS - 1)) }, filtered.length > 0 ? rowsHiddenByFilter(sheet, range.top, Math.max(last, bottom)) : filtered);
+  if (rules) copied.rules = rules;
   return copied;
 }
 
@@ -286,8 +297,9 @@ function copiedNotes(sheet: Sheet, top: number, left: number, bottom: number, la
 
 /**
  * Cuts a range: its contents are removed as clearRange() removes them, and the notes on its
- * cells go with them (a note is cut and pasted with its cell). Formats stay. Like clearRange()
- * it leaves the rows alone that the filter of the sheet hides.
+ * cells go with them (a note is cut and pasted with its cell), and so do their data validation
+ * and their conditional formats (see cutRules()). Formats stay. Like clearRange() it leaves the
+ * rows alone that the filter of the sheet hides.
  */
 export function cutRange(workbook: Workbook, sheetIndex: number, range: CellRange): Op[] {
   const sheet = workbook.sheets[sheetIndex];
@@ -302,7 +314,13 @@ export function cutRange(workbook: Workbook, sheetIndex: number, range: CellRang
   // Notes may be on cells beyond the used part: the range itself is looked at, without the rows the filter hides.
   const hidden = filtered.length > 0 ? new Set(filtered) : undefined;
   const notes = hidden ? clearNotesExcept(workbook, sheetIndex, range, hidden) : clearNotes(workbook, sheetIndex, range);
-  return ops.concat(notes);
+  // The rules likewise: those of the range itself, without the rows the filter hides.
+  const top = Math.max(0, range.top);
+  const last = Math.min(range.bottom, MAX_ROWS - 1);
+  const across = { left: Math.max(0, range.left), right: Math.min(range.right, MAX_COLS - 1) };
+  const shown = filtered.length > 0 ? rowRunsWithout(top, last, rowsHiddenByFilter(sheet, top, last)) : [{ top, bottom: last }];
+  const rules = top <= last && across.left <= across.right ? cutRules(workbook, sheetIndex, shown.map((run) => ({ top: run.top, bottom: run.bottom, ...across }))) : [];
+  return ops.concat(notes, rules);
 }
 
 function clearNotesExcept(workbook: Workbook, sheetIndex: number, range: CellRange, hidden: Set<number>): Op[] {
@@ -324,6 +342,13 @@ export interface PasteResult {
    * of the sheet cannot be changed. The cells were pasted all the same. Missing when none.
    */
   skippedNotes?: number;
+  /**
+   * How many rules (data validations, conditional formats) the paste could not do as they are
+   * where the cells come from: rules of the copy that did not come, or came without what the
+   * extension list of the file says of them, and rules that stayed on the cells though the
+   * copy has none there (see pasteRules()). The cells were pasted all the same. Missing when none.
+   */
+  skippedRules?: number;
 }
 
 /**
@@ -331,7 +356,9 @@ export interface PasteResult {
  * the clipboard, the cells are pasted with their formats and their formulas
  * moved along; otherwise the text is parsed as typed input, field by field.
  * A selection that is a whole multiple of the copied block is filled with
- * repeats of it, as in Excel.
+ * repeats of it, as in Excel. Copied cells bring their data validation and
+ * their conditional formats, which take the place of those of the cells that
+ * are written (see pasteRules()); pasted text changes no rule.
  */
 export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellRange, text: string, copied?: CopiedRange, options: EditOptions = {}): PasteResult {
   const sheet = workbook.sheets[sheetIndex];
@@ -357,6 +384,12 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
       if (note.row >= height) height = note.row + 1;
       if (note.col >= width) width = note.col + 1;
     }
+  }
+  // And so may its rules: cells that are still empty are often the ones with a rule.
+  if (internal && copied && copied.rules) {
+    const extent = copiedRulesExtent(copied.rules);
+    height = Math.max(height, extent.height);
+    width = Math.max(width, extent.width);
   }
 
   const selHeight = selection.bottom - selection.top + 1;
@@ -419,6 +452,11 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
     const pasted = pasteNotes(sheet, sheetIndex, copied.notes, selection, height, width, bottom, right, merges.length > 0 ? covered : undefined);
     if (pasted.op) result.ops.push(pasted.op);
     if (pasted.skipped > 0) result.skippedNotes = pasted.skipped;
+  }
+  if (internal && copied) {
+    const pasted = pasteRules(workbook, sheetIndex, copied.rules, result.range, height, width);
+    for (const op of pasted.ops) result.ops.push(op);
+    if (pasted.skipped > 0) result.skippedRules = pasted.skipped;
   }
   return result;
 }

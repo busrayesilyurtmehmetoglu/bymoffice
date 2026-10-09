@@ -211,6 +211,11 @@ export interface UiStrings {
   copyLoss(what: string, count: number): string;
   /** Said after a paste that left notes out (their cells have a conversation, or the notes of the sheet cannot be changed). */
   notesNotPasted(count: number): string;
+  /**
+   * Said after a paste that could not do rules (data validations, conditional formats) as they are where the cells
+   * come from: rules of the copy that did not come, and rules that stayed on the cells though the copy has none there.
+   */
+  rulesNotPasted(count: number): string;
   cannotHideLastSheet: string;
   cannotSortThreaded: string;
   /** Label of the field a sheet is renamed in. */
@@ -569,6 +574,10 @@ export const STRINGS_EN: UiStrings = {
     return known ? `${count} ${count === 1 ? known[0] : known[1]}` : what;
   },
   notesNotPasted: (count) => (count === 1 ? 'One note was not pasted: its cell cannot take a note' : `${count} notes were not pasted: their cells cannot take notes`),
+  rulesNotPasted: (count) =>
+    count === 1
+      ? 'One data validation or conditional format could not be pasted as it is where the cells come from: it is of a kind that is kept as the file has it'
+      : `${count} data validations or conditional formats could not be pasted as they are where the cells come from: they are of a kind that is kept as the file has it`,
   cannotHideLastSheet: 'The last visible sheet cannot be hidden',
   cannotSortThreaded: 'A range with a threaded comment cannot be sorted yet',
   sheetName: 'Sheet name',
@@ -953,6 +962,7 @@ export const STRINGS_TR: UiStrings = {
     return Object.prototype.hasOwnProperty.call(names, what) ? `${count} ${names[what]}` : what;
   },
   notesNotPasted: (count) => `${count} not yapıştırılmadı: hücresi not alamıyor`,
+  rulesNotPasted: (count) => `${count} veri doğrulama ya da koşullu biçim kuralı kaynaktaki gibi yapıştırılamadı: bu tür kurallar dosyadaki haliyle korunur`,
   cannotHideLastSheet: 'Görünen son sayfa gizlenemez',
   cannotSortThreaded: 'Yorum zinciri içeren aralık henüz sıralanamıyor',
   sheetName: 'Sayfa adı',

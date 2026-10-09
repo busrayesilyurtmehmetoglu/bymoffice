@@ -1453,3 +1453,690 @@ export function extensionRuleCount(workbook: Workbook, sheet: Sheet): number {
   }
   return count;
 }
+
+// ---------------------------------------------------------------------------
+// Rules that go with copied cells
+
+/** A data validation of copied cells, cut down to those cells. */
+export interface CopiedValidation {
+  /** The cells of the copy the rule applies to: rows and columns count from the first row of the copy and its first cell. */
+  ranges: CellRange[];
+  /** The cell of the sheet the formulas are written for: the one the first of `ranges` starts at. */
+  anchor: { row: number; col: number };
+  rule: Omit<DataValidation, 'ranges'>;
+  /** What the rule says, whatever cells it has (see pasteRules()): two rules with the same key are the same rule. */
+  key: string;
+}
+
+/** The rules of one conditional format of copied cells, cut down to those cells. */
+export interface CopiedConditional {
+  /** As CopiedValidation.ranges. */
+  ranges: CellRange[];
+  anchor: { row: number; col: number };
+  /** The rules as they applied when they were copied, with what ties them to the file: a paste that adds them takes that off. */
+  rules: ConditionalRule[];
+  /** As CopiedValidation.key, one for each of `rules`. */
+  keys: string[];
+}
+
+/**
+ * A rule of copied cells that a copy cannot take along: one that only the extension list of
+ * the file has, or one with a formula that cannot be read to its end. Such a rule is kept as
+ * it is wherever it is; a paste knows by this what the cells it writes ought to have had.
+ */
+export interface CopiedLeft {
+  kind: 'validation' | 'conditional';
+  ranges: CellRange[];
+  key: string;
+}
+
+/**
+ * The data validations and conditional formats of copied cells, as they applied when the
+ * cells were copied. `left` are the rules of the cells that are not among them.
+ */
+export interface CopiedRules {
+  validations: CopiedValidation[];
+  conditional: CopiedConditional[];
+  left: CopiedLeft[];
+}
+
+/** A formula of a rule that a live rule can hold: one whose sheet names can be read (see checkLiveFormulas()). */
+const followsSheets = (text: string | undefined) => typeof text !== 'string' || text.indexOf('!') < 0 || !formulaNamesSheetsUnread(text);
+
+/** A data validation that is kept as it is: one of the extension list, or one that could not follow the sheets it names. */
+const fixedValidation = (now: DataValidation) => now.extended === true || !followsSheets(now.formula1) || !followsSheets(now.formula2);
+/** The same for a conditional format: one rule of that kind keeps the whole format as it is. */
+const fixedFormat = (now: ConditionalFormat) => now.rules.some((rule) => !!rule && (rule.extended === true || !ruleFormulaTexts(rule).every(followsSheets)));
+
+const VALIDATION_FORMULAS = ['formula1', 'formula2'] as const;
+
+/**
+ * What a rule says, apart from the cells it has: its formulas as they would be written for
+ * A1. Two rules of a sheet with the same key say the same for every cell.
+ */
+function validationKey(rule: Omit<DataValidation, 'ranges'>, anchor: { row: number; col: number }): string {
+  return stable(SETTING_KEYS.map((key) => (key === 'formula1' || key === 'formula2' ? (typeof rule[key] === 'string' ? shiftFormula(rule[key] as string, -anchor.row, -anchor.col, true) : null) : rule[key] === undefined ? null : rule[key])).concat([rule.extended === true]));
+}
+
+/** The same for a conditional rule: all of it but its place in the file and in the order. */
+function conditionalKey(rule: ConditionalRule, anchor: { row: number; col: number }): string {
+  return stable({ ...rule, src: undefined, priority: 0, formulas: rule.formulas.map((text) => shiftFormula(text, -anchor.row, -anchor.col, true)) });
+}
+
+const firstCell = (ranges: readonly CellRange[]) => ({ row: ranges[0].top, col: ranges[0].left });
+
+/**
+ * Ranges that cover the same cells with fewer rectangles: two that share a whole side become
+ * one, until none do. Each stands where the first of its parts stood in the list. The ranges
+ * are taken not to overlap.
+ */
+export function joinedRanges(ranges: readonly CellRange[]): CellRange[] {
+  if (ranges.length < 2) return ranges.slice();
+  let list = ranges.map((range, at) => ({ top: range.top, left: range.left, bottom: range.bottom, right: range.right, at }));
+  for (let joined = true; joined; ) {
+    joined = false;
+    for (const down of [true, false]) {
+      list.sort(down ? (a, b) => a.left - b.left || a.right - b.right || a.top - b.top : (a, b) => a.top - b.top || a.bottom - b.bottom || a.left - b.left);
+      const out: typeof list = [];
+      for (const item of list) {
+        const last = out[out.length - 1];
+        if (last && (down ? last.left === item.left && last.right === item.right && last.bottom + 1 === item.top : last.top === item.top && last.bottom === item.bottom && last.right + 1 === item.left)) {
+          if (down) last.bottom = item.bottom;
+          else last.right = item.right;
+          if (item.at < last.at) last.at = item.at;
+          joined = true;
+        } else out.push(item);
+      }
+      list = out;
+    }
+  }
+  return list.sort((a, b) => a.at - b.at).map((item) => ({ top: item.top, left: item.left, bottom: item.bottom, right: item.right }));
+}
+
+/**
+ * The part of ranges of the sheet that is in a copy, in the rows and columns of the copy, and
+ * the cell of the sheet its first piece starts at. `runs` are the rows of the sheet that were
+ * copied, in order, each with the row of the copy it starts at (rows that a filter hides are
+ * left out of a copy). Undefined when no cell of the ranges was copied.
+ */
+function clippedToCopy(ranges: readonly CellRange[], left: number, right: number, runs: readonly { top: number; bottom: number; at: number }[]): { ranges: CellRange[]; anchor: { row: number; col: number } } | undefined {
+  const out: CellRange[] = [];
+  let anchor: { row: number; col: number } | undefined;
+  for (const range of ranges) {
+    const from = Math.max(range.left, left);
+    const to = Math.min(range.right, right);
+    if (from > to) continue;
+    let last: CellRange | undefined;
+    for (const run of runs) {
+      if (run.top > range.bottom) break;
+      const top = Math.max(range.top, run.top);
+      const bottom = Math.min(range.bottom, run.bottom);
+      if (top > bottom) continue;
+      if (!anchor) anchor = { row: top, col: from };
+      const piece = { top: run.at + (top - run.top), left: from - left, bottom: run.at + (bottom - run.top), right: to - left };
+      // Rows on either side of rows that were left out stand next to each other in the copy: a range gives one piece.
+      if (last && last.bottom + 1 === piece.top) last.bottom = piece.bottom;
+      else out.push((last = piece));
+    }
+  }
+  return anchor ? { ranges: out, anchor } : undefined;
+}
+
+/**
+ * The rules that go with a copy of `range` (a selection of the sheet): the data validations
+ * and the conditional formats that apply to its cells now, each cut down to those cells and
+ * with its formulas written for the first of them. `hidden` are the rows of the range that
+ * are not copied (sorted). Undefined when the cells have no rule.
+ */
+export function copyRules(workbook: Workbook, sheetIndex: number, range: CellRange, hidden: readonly number[] = []): CopiedRules | undefined {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet || ((!sheet.dataValidations || sheet.dataValidations.length === 0) && (!sheet.conditionalFormats || sheet.conditionalFormats.length === 0))) return undefined;
+  const top = Math.max(0, range.top);
+  const left = Math.max(0, range.left);
+  const bottom = Math.min(range.bottom, MAX_ROWS - 1);
+  const right = Math.min(range.right, MAX_COLS - 1);
+  if (top > bottom || left > right) return undefined;
+  const runs: { top: number; bottom: number; at: number }[] = [];
+  let at = 0;
+  let next = top;
+  const run = (last: number) => {
+    if (last < next) return;
+    runs.push({ top: next, bottom: last, at });
+    at += last - next + 1;
+  };
+  for (const row of hidden) {
+    if (row < next || row > bottom) continue;
+    run(row - 1);
+    next = row + 1;
+  }
+  run(bottom);
+
+  const space = ruleSpace(workbook, sheet);
+  const selection = [{ top, left, bottom, right }];
+  const copied: CopiedRules = { validations: [], conditional: [], left: [] };
+  for (const rule of sheet.dataValidations || []) {
+    const now = dataValidationNow(rule, space);
+    if (!now || !rangesIntersect(now.ranges, selection)) continue;
+    const part = clippedToCopy(now.ranges, left, right, runs);
+    if (!part) continue;
+    const key = validationKey(now, firstCell(now.ranges));
+    if (fixedValidation(now)) {
+      copied.left.push({ kind: 'validation', ranges: part.ranges, key });
+      continue;
+    }
+    const dRow = part.anchor.row - now.ranges[0].top;
+    const dCol = part.anchor.col - now.ranges[0].left;
+    const taken = {} as Record<string, unknown>;
+    for (const name of SETTING_KEYS) if (now[name] !== undefined) taken[name] = name === 'formula1' || name === 'formula2' ? shiftFormula(now[name] as string, dRow, dCol, true) : now[name];
+    copied.validations.push({ ranges: part.ranges, anchor: part.anchor, rule: taken as unknown as Omit<DataValidation, 'ranges'>, key });
+  }
+  for (const format of sheet.conditionalFormats || []) {
+    const now = conditionalFormatNow(format, space);
+    if (!now || !rangesIntersect(now.ranges, selection)) continue;
+    const part = clippedToCopy(now.ranges, left, right, runs);
+    if (!part) continue;
+    const rules = now.rules.filter((rule) => !!rule);
+    const keys = rules.map((rule) => conditionalKey(rule, firstCell(now.ranges)));
+    if (fixedFormat(now)) {
+      for (const key of keys) copied.left.push({ kind: 'conditional', ranges: part.ranges, key });
+      continue;
+    }
+    const to = { top: part.anchor.row, left: part.anchor.col, bottom: part.anchor.row, right: part.anchor.col };
+    if (rules.length > 0) copied.conditional.push({ ranges: part.ranges, anchor: part.anchor, rules: rules.map((rule) => reanchored(rule, now.ranges[0], to)), keys });
+  }
+  return copied.validations.length > 0 || copied.conditional.length > 0 || copied.left.length > 0 ? copied : undefined;
+}
+
+/** How many rows and columns the rules of a copy reach over, counted from its first cell. */
+export function copiedRulesExtent(copied: CopiedRules | undefined): { height: number; width: number } {
+  let height = 0;
+  let width = 0;
+  if (copied) {
+    for (const item of (copied.validations as { ranges: CellRange[] }[]).concat(copied.conditional, copied.left)) {
+      for (const range of item.ranges) {
+        if (range.bottom >= height) height = range.bottom + 1;
+        if (range.right >= width) width = range.right + 1;
+      }
+    }
+  }
+  return { height, width };
+}
+
+const TOO_MANY_RANGES = 'The rule would be left with too many separate ranges';
+const tooManyRanges = (error: unknown) => error instanceof RangeError && error.message === TOO_MANY_RANGES;
+
+/**
+ * Where ranges of a copy are once the copy is pasted over `area`, a block of `height` rows
+ * and `width` columns repeated from the first cell of the area on: one range where the
+ * repeats of a range touch. Cells beyond the area are left out. Undefined for more ranges
+ * than a rule holds.
+ */
+function tiledRanges(ranges: readonly CellRange[], area: CellRange, height: number, width: number): CellRange[] | undefined {
+  // A copy that is pasted once has the ranges it has, however many.
+  const limit = Math.max(MAX_RULE_RANGES, ranges.length);
+  const spans = (from: number, to: number, start: number, end: number, step: number): [number, number][] | undefined => {
+    const out: [number, number][] = [];
+    for (let at = start; at + from <= end; at += Math.max(1, step)) {
+      const first = at + from;
+      const last = Math.min(at + to, end);
+      const before = out[out.length - 1];
+      if (before && before[1] + 1 >= first) before[1] = Math.max(before[1], last);
+      else out.push([first, last]);
+      if (out.length > limit) return undefined;
+    }
+    return out;
+  };
+  let out: CellRange[] = [];
+  for (const range of ranges) {
+    const rows = spans(range.top, range.bottom, area.top, area.bottom, height);
+    const cols = spans(range.left, range.right, area.left, area.right, width);
+    if (!rows || !cols || rows.length * cols.length + out.length > limit) return undefined;
+    const pieces: CellRange[] = [];
+    for (const [top, bottom] of rows) for (const [left, right] of cols) pieces.push({ top, left, bottom, right });
+    // Cells a rule names twice are in it once.
+    if (out.length === 0) out = pieces;
+    else {
+      try {
+        out = out.concat(subtractRanges(pieces, out));
+      } catch (error) {
+        if (!tooManyRanges(error)) throw error;
+        return undefined;
+      }
+    }
+  }
+  return out;
+}
+
+/** Whether every cell of `ranges` is a cell of `within`. */
+const rangesWithin = (ranges: readonly CellRange[], within: readonly CellRange[]) => subtractRanges(ranges, within).length === 0;
+
+/** The cells of `ranges` that are cells of `areas`. */
+function rangesInside(ranges: readonly CellRange[], areas: readonly CellRange[]): CellRange[] {
+  const out: CellRange[] = [];
+  for (const range of ranges) {
+    for (const area of areas) {
+      if (!intersects(range, area)) continue;
+      out.push({ top: Math.max(range.top, area.top), left: Math.max(range.left, area.left), bottom: Math.min(range.bottom, area.bottom), right: Math.min(range.right, area.right) });
+    }
+  }
+  return out;
+}
+
+/** A rule that stays where it is, whatever is pasted: what it says, the cells it has, and those of them that are pasted over. */
+interface Staying {
+  key: string;
+  ranges: CellRange[];
+  inside: CellRange[];
+}
+
+/**
+ * How many rules a paste could not do as they are where the cells come from: rules of the
+ * copy that did not come (`left`, placed where the copy is pasted) and rules that stayed
+ * though the cells they are on are copies of cells without them. A rule that stayed on cells
+ * whose copy has that very rule is neither.
+ */
+function countUndone(staying: readonly Staying[], left: readonly { key: string; ranges: CellRange[] | undefined }[]): number {
+  let count = 0;
+  const within = (ranges: readonly CellRange[], others: readonly CellRange[]) => {
+    try {
+      return rangesWithin(ranges, others);
+    } catch (error) {
+      if (!tooManyRanges(error)) throw error;
+      return false;
+    }
+  };
+  for (const rule of staying) if (!left.some((item) => item.key === rule.key && !!item.ranges && within(rule.inside, item.ranges))) count++;
+  for (const item of left) if (!item.ranges || !staying.some((rule) => rule.key === item.key && within(item.ranges as CellRange[], rule.ranges))) count++;
+  return count;
+}
+
+/** The rules a copy left behind, of one kind, where the copy is pasted; without ranges for a rule that would have too many. */
+function leftPlaced(copied: CopiedRules | undefined, kind: CopiedLeft['kind'], areas: readonly CellRange[], height: number, width: number): { key: string; ranges: CellRange[] | undefined }[] {
+  const out: { key: string; ranges: CellRange[] | undefined }[] = [];
+  for (const item of copied ? copied.left : []) if (item.kind === kind) out.push({ key: item.key, ranges: tiledRanges(item.ranges, areas[0], height, width) });
+  return out;
+}
+
+/** The rule of the file a changed rule came from, when the rule says again what that one says for the same cells; undefined otherwise. */
+function validationAsRead(sheet: Sheet, rule: DataValidation, space: RuleSpace): DataValidation | undefined {
+  if (rule.src === undefined || !sheet.validationsRead) return undefined;
+  for (const read of sheet.validationsRead.list || []) {
+    if (!read || read.live || read.src !== rule.src) continue;
+    const now = dataValidationNow(read, space);
+    return now && sameRanges(now.ranges, rule.ranges) && sameSettings(now, rule) && now.extended === rule.extended ? read : undefined;
+  }
+  return undefined;
+}
+
+/** The same for a conditional format all of whose rules came from one element of the file. */
+function formatAsRead(sheet: Sheet, format: ConditionalFormat, space: RuleSpace): ConditionalFormat | undefined {
+  const first = format.rules[0];
+  if (!first || !first.src || !sheet.conditionalRead) return undefined;
+  for (const read of sheet.conditionalRead.list || []) {
+    if (!read || read.live || read.rules.length !== format.rules.length || !read.rules[0] || !read.rules[0].src || read.rules[0].src[0] !== first.src[0]) continue;
+    const now = conditionalFormatNow(read, space);
+    if (!now || !sameRanges(now.ranges, format.ranges)) return undefined;
+    // Its place in the order is given anew when the list is put together.
+    return now.rules.every((rule, i) => !!rule && !!format.rules[i] && stable({ ...rule, priority: 0 }) === stable({ ...format.rules[i], priority: 0 })) ? read : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The data validations of a sheet once a copy with the rules `wanted` is pasted over `areas`
+ * (without a copy: once the cells of the areas are taken out of every rule), and how many
+ * rules could not be done (see countUndone()). The list of the sheet itself when no rule changes.
+ */
+function validationsPasted(workbook: Workbook, sheet: Sheet, copied: CopiedRules | undefined, areas: readonly CellRange[], height: number, width: number): { list: DataValidation[] | undefined; skipped: number } {
+  const space = ruleSpace(workbook, sheet);
+  const current = sheet.dataValidations || [];
+  const wanted = copied ? copied.validations : [];
+  const left = leftPlaced(copied, 'validation', areas, height, width);
+  if (current.length === 0 && wanted.length === 0) return { list: sheet.dataValidations, skipped: left.length };
+  const nows = current.map((rule) => dataValidationNow(rule, space));
+  // The cells of a rule that is kept as it is keep that rule, and get no other.
+  const staying: Staying[] = [];
+  let fixed: CellRange[] = [];
+  for (const now of nows) {
+    if (!now || !fixedValidation(now) || !rangesIntersect(now.ranges, areas)) continue;
+    staying.push({ key: validationKey(now, firstCell(now.ranges)), ranges: now.ranges, inside: rangesInside(now.ranges, areas) });
+    fixed = fixed.concat(now.ranges);
+  }
+  let skipped = countUndone(staying, left);
+  const free = fixed.length > 0 ? subtractRanges(areas, fixed) : areas.slice();
+  // A cell has one rule: the first of the copy that names it.
+  let claimed: CellRange[] = [];
+  const pasted: { ranges: CellRange[]; rule: Omit<DataValidation, 'ranges'>; key: string; taken: boolean }[] = [];
+  for (const item of wanted) {
+    const all = tiledRanges(item.ranges, areas[0], height, width);
+    if (!all) {
+      skipped++;
+      continue;
+    }
+    const ranges = fixed.length > 0 || claimed.length > 0 ? subtractRanges(all, fixed.concat(claimed)) : all;
+    if (ranges.length === 0) continue;
+    claimed = claimed.concat(ranges);
+    const rule = { ...item.rule };
+    for (const name of VALIDATION_FORMULAS) if (typeof rule[name] === 'string') rule[name] = shiftFormula(rule[name] as string, ranges[0].top - item.anchor.row, ranges[0].left - item.anchor.col, true);
+    pasted.push({ ranges, rule, key: item.key, taken: false });
+  }
+  if (free.length === 0) return { list: sheet.dataValidations, skipped };
+
+  // The rule the copy brings may be one the sheet has (for the cells that were copied, say): that one then has the
+  // cells as well, as in Excel, and no second rule says the same. A rule that has exactly these cells comes first.
+  const byKey = new Map<string, (typeof pasted)[number][]>();
+  for (const item of pasted) {
+    const list = byKey.get(item.key);
+    if (list) list.push(item);
+    else byKey.set(item.key, [item]);
+  }
+  const parts = nows.map((now) => {
+    if (!now || fixedValidation(now)) return undefined;
+    const touched = rangesIntersect(now.ranges, free);
+    const candidates = byKey.size > 0 ? byKey.get(validationKey(now, firstCell(now.ranges))) : undefined;
+    if (!touched && !candidates) return undefined;
+    const kept = touched ? subtractRanges(now.ranges, free) : now.ranges;
+    return { now, touched, kept, inside: touched ? rangesInside(now.ranges, free) : [], candidates, same: undefined as (typeof pasted)[number] | undefined, exact: false };
+  });
+  for (const exact of [true, false]) {
+    for (const part of parts) {
+      if (!part || part.same || !part.candidates || (exact && !part.touched)) continue;
+      for (const item of part.candidates) {
+        if (item.taken || (exact && !(rangesWithin(part.inside, item.ranges) && rangesWithin(item.ranges, part.inside)))) continue;
+        item.taken = true;
+        part.exact = exact;
+        part.same = item;
+        break;
+      }
+    }
+  }
+  const changed = new Map<number, DataValidation | undefined>();
+  parts.forEach((part, at) => {
+    // The cells it has there are the cells it gets: it stays the rule it is, as the file has it.
+    if (!part || part.exact || (!part.touched && !part.same)) return;
+    const now = part.now;
+    const ranges = joinedRanges(part.same ? part.kept.concat(part.same.ranges) : part.kept);
+    if (ranges.length === 0) {
+      changed.set(at, undefined);
+      return;
+    }
+    if (ranges.length > Math.max(MAX_RULE_RANGES, now.ranges.length)) throw new RangeError(TOO_MANY_RANGES);
+    const next: DataValidation = { ...now, ranges, live: true };
+    // The formulas are written for the first cell of the rule, which may be another one now.
+    const dRow = ranges[0].top - now.ranges[0].top;
+    const dCol = ranges[0].left - now.ranges[0].left;
+    if (dRow !== 0 || dCol !== 0) for (const name of VALIDATION_FORMULAS) if (typeof next[name] === 'string') next[name] = shiftFormula(next[name] as string, dRow, dCol, true);
+    // Cut and pasted back, it is the rule of the file again.
+    changed.set(at, validationAsRead(sheet, next, space) || next);
+  });
+  const added = pasted.filter((item) => !item.taken);
+  if (changed.size === 0 && added.length === 0) return { list: sheet.dataValidations, skipped };
+  const next: DataValidation[] = [];
+  current.forEach((rule, at) => {
+    if (!changed.has(at)) next.push(rule);
+    else if (changed.get(at)) next.push(changed.get(at) as DataValidation);
+  });
+  // Behind the rules of the main part and before those of the extension list, which is where a file has them.
+  let at = next.length;
+  while (at > 0 && next[at - 1].extended) at--;
+  next.splice(at, 0, ...added.map((item): DataValidation => ({ ...item.rule, ranges: item.ranges, live: true })));
+  if (next.length > MAX_SHEET_VALIDATIONS) throw new RangeError('The sheet has too many data validations');
+  return { list: next.length > 0 ? next : undefined, skipped };
+}
+
+/**
+ * The operation that makes the conditional formats of a sheet what they are once a copy with
+ * the formats of `copied` is pasted over `areas` (without a copy: once the cells of the areas
+ * are taken out of every rule), and how many rules could not be done (see countUndone()). A
+ * format that is kept as it is (see fixedFormat()) stays with all its cells.
+ *
+ * What holds afterwards: the rules that apply to a cell that was pasted over are, in the order
+ * they are applied in, those of the cell it is a copy of; and for no other cell does the order
+ * of its rules change. A rule the sheet has is given the cells only where that holds.
+ */
+function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet, copied: CopiedRules | undefined, areas: readonly CellRange[], height: number, width: number): { ops: Op[]; skipped: number } {
+  const current = sheet.conditionalFormats || [];
+  const wanted = copied ? copied.conditional : [];
+  const left = leftPlaced(copied, 'conditional', areas, height, width);
+  if (current.length === 0 && wanted.length === 0) return { ops: [], skipped: left.length };
+  let skipped = 0;
+  // The rules of the copy one by one, in the order they are applied in where they come from; those of one format share their ranges.
+  let pasted: { ranges: CellRange[]; rule: ConditionalRule; key: string; same: string | undefined }[] = [];
+  for (const item of wanted) {
+    const ranges = tiledRanges(item.ranges, areas[0], height, width);
+    if (!ranges) {
+      skipped += item.rules.length;
+      continue;
+    }
+    if (ranges.length === 0) continue;
+    const from = { top: item.anchor.row, left: item.anchor.col, bottom: item.anchor.row, right: item.anchor.col };
+    item.rules.forEach((rule, i) => pasted.push({ ranges, rule: reanchored(rule, from, ranges[0]), key: item.keys[i], same: undefined }));
+  }
+  pasted = pasted
+    .map((item, order) => ({ item, order }))
+    .sort((a, b) => {
+      const pa = priorityOf(a.item.rule);
+      const pb = priorityOf(b.item.rule);
+      return pa === pb ? a.order - b.order : pa < pb ? -1 : 1;
+    })
+    .map((entry) => entry.item);
+
+  const slots = slotsInOrder(workbook, sheet);
+  const renumber = canRenumber(slots);
+  const space = ruleSpace(workbook, sheet);
+  const staying: Staying[] = [];
+  const parts = current.map((format) => {
+    const now = conditionalFormatNow(format, space);
+    if (!now) return undefined;
+    const touched = rangesIntersect(now.ranges, areas);
+    if (fixedFormat(now)) {
+      if (touched) for (const rule of now.rules) if (rule) staying.push({ key: conditionalKey(rule, firstCell(now.ranges)), ranges: now.ranges, inside: rangesInside(now.ranges, areas) });
+      return undefined;
+    }
+    return { now, touched, kept: undefined as CellRange[] | undefined, inside: touched ? rangesInside(now.ranges, areas) : [] };
+  });
+  skipped += countUndone(staying, left);
+
+  // The rule the copy brings may be one the sheet has (for the cells that were copied, say): that one then has the
+  // cells as well, as in Excel, and no second rule says the same. A rule that has exactly these cells comes first.
+  const order = new Map<string, number>();
+  const taken = new Map<string, (typeof pasted)[number]>();
+  if (pasted.length > 0) {
+    const byKey = new Map<string, { place: string; f: number }[]>();
+    slots.forEach((slot, at) => {
+      const place = `${slot.f}:${slot.r}`;
+      order.set(place, at);
+      if (!parts[slot.f]) return;
+      const key = conditionalKey(slot.rule, firstCell(slot.ranges));
+      const list = byKey.get(key);
+      if (list) list.push({ place, f: slot.f });
+      else byKey.set(key, [{ place, f: slot.f }]);
+    });
+    for (const exact of [true, false]) {
+      for (const item of pasted) {
+        if (item.same !== undefined) continue;
+        for (const found of byKey.get(item.key) || []) {
+          if (taken.has(found.place)) continue;
+          if (exact) {
+            const part = parts[found.f] as { touched: boolean; inside: CellRange[] };
+            if (!part.touched || !(rangesWithin(part.inside, item.ranges) && rangesWithin(item.ranges, part.inside))) continue;
+          }
+          item.same = found.place;
+          taken.set(found.place, item);
+          break;
+        }
+      }
+    }
+    // The rules that are new to the sheet are applied before all it has (after them in a sheet whose numbers stay).
+    // A rule of the sheet gets the cells only if every rule of the copy that shares a cell with it then still comes
+    // before or after it as it does in the copy.
+    const at = (item: (typeof pasted)[number]) => order.get(item.same as string) as number;
+    const drop = (item: (typeof pasted)[number]) => {
+      taken.delete(item.same as string);
+      item.same = undefined;
+    };
+    if (taken.size > 0) {
+      if (renumber) {
+        for (let j = pasted.length - 1; j >= 0; j--) {
+          const item = pasted[j];
+          if (item.same === undefined) continue;
+          for (let l = j + 1; l < pasted.length; l++) {
+            const later = pasted[l];
+            if ((later.same !== undefined && at(item) < at(later)) || !(later.ranges === item.ranges || rangesIntersect(later.ranges, item.ranges))) continue;
+            drop(item);
+            break;
+          }
+        }
+      } else {
+        for (let j = 0; j < pasted.length; j++) {
+          const item = pasted[j];
+          if (item.same === undefined) continue;
+          for (let i = 0; i < j; i++) {
+            const earlier = pasted[i];
+            if ((earlier.same !== undefined && at(earlier) < at(item)) || !(earlier.ranges === item.ranges || rangesIntersect(earlier.ranges, item.ranges))) continue;
+            drop(item);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const replaced = new Map<number, ConditionalFormat>();
+  const gone = new Set<string>();
+  const moved = new Map<string, Placed>();
+  const sized = (ranges: CellRange[], had: number) => {
+    if (ranges.length > Math.max(MAX_RULE_RANGES, had)) throw new RangeError(TOO_MANY_RANGES);
+    return ranges;
+  };
+  parts.forEach((part, f) => {
+    if (!part) return;
+    const now = part.now;
+    const rules = now.rules.map((rule, r) => ({ rule, r, same: taken.get(`${f}:${r}`) })).filter((entry) => !!entry.rule);
+    const found = rules.filter((entry) => entry.same);
+    if (rules.length === 0 || (found.length === 0 && !part.touched)) return;
+    const kept = part.touched ? subtractRanges(now.ranges, areas) : now.ranges;
+    const whole = (ranges: CellRange[]): ConditionalFormat => {
+      const format: ConditionalFormat = { ...now, ranges, rules: now.rules.map((rule) => (rule ? reanchored(rule, now.ranges[0], ranges[0]) : rule)), live: true };
+      // Cut and pasted back, it is the format of the file again.
+      return formatAsRead(sheet, format, space) || format;
+    };
+    const first = found.length > 0 ? (found[0].same as (typeof pasted)[number]).ranges : [];
+    if (found.length === rules.length && found.every((entry) => (entry.same as (typeof pasted)[number]).ranges === first)) {
+      // All its rules get the same cells: the format stays one format. With the cells it has there already, it stays as the file has it.
+      if (part.touched && rangesWithin(part.inside, first) && rangesWithin(first, part.inside)) return;
+      replaced.set(f, whole(sized(joinedRanges(kept.concat(first)), now.ranges.length)));
+      return;
+    }
+    // Rule by rule: one that gets cells of the copy becomes a format of its own, the others keep what is left.
+    for (const entry of rules) {
+      const key = `${f}:${entry.r}`;
+      if (entry.same) {
+        const ranges = sized(joinedRanges(kept.concat(entry.same.ranges)), now.ranges.length);
+        moved.set(key, { f, r: entry.r, rule: reanchored(entry.rule, now.ranges[0], ranges[0]), detach: ranges });
+      } else if (kept.length === 0) gone.add(key);
+    }
+    if (part.touched && kept.length > 0 && found.length < rules.length) replaced.set(f, whole(kept));
+  });
+  // The rules that are new to the sheet, in the order of the copy.
+  const added: Placed[] = [];
+  for (const item of pasted) {
+    if (item.same !== undefined) continue;
+    const plain = mainPartRule(item.rule);
+    if (!plain) continue;
+    // What the extension list says about the rule it was copied from stays with that one.
+    if (item.rule.extId !== undefined || (item.rule.iconSet && item.rule.iconSet.custom)) skipped++;
+    added.push({ f: -1, r: -1, rule: plain, detach: item.ranges });
+  }
+  if (replaced.size === 0 && gone.size === 0 && moved.size === 0 && added.length === 0) return { ops: [], skipped };
+  const removed = slots.filter((slot) => gone.has(`${slot.f}:${slot.r}`));
+  const stayed = slots
+    .filter((slot) => !gone.has(`${slot.f}:${slot.r}`))
+    .map((slot): Placed => {
+      const format = replaced.get(slot.f);
+      return moved.get(`${slot.f}:${slot.r}`) || (format ? { f: slot.f, r: slot.r, rule: format.rules[slot.r] } : stay(slot, sheet));
+    });
+  // As a rule that is added, the rules of the copy are the first to be applied - except in a sheet whose numbers stay.
+  // (UNSURE: where Excel puts pasted rules in the order was not looked up.)
+  if (renumber) return { ops: conditionalOp(sheetIndex, workbook, sheet, added.concat(stayed), true, removed, replaced), skipped };
+  let highest = 0;
+  for (const format of current) for (const other of format.rules) if (other && other.priority < Infinity && other.priority > highest) highest = Math.floor(other.priority);
+  for (const item of added) item.rule = { ...item.rule, priority: ++highest };
+  return { ops: conditionalOp(sheetIndex, workbook, sheet, stayed.concat(added), false, removed, replaced), skipped };
+}
+
+/**
+ * What a paste of copied cells does to the rules of the cells it writes: `area` is the range
+ * that was pasted over, the copy a block of `height` rows and `width` columns that is repeated
+ * from its first cell on. As Excel's "paste all" does, the cells get the data validation and
+ * the conditional formats of the cells they are copies of - and lose their own, also where
+ * the copy has none. (UNSURE: taken from how Excel is described to behave, not compared with
+ * it. The same is not done for notes, see pasteNotes().) Formulas move as those of cells do:
+ * relative references by the distance of the paste, anchored ones not at all. `area` is what
+ * the cells, notes and rules of the copy reach over: where a selection was copied that goes on
+ * beyond that (empty cells without a rule), the cells under the rest of it keep their rules
+ * (UNSURE: Excel takes the whole selection).
+ *
+ * A rule the sheet has already (the same rule for the cells beside, say) is given the cells
+ * instead of being made a second time, and a paste that changes no rule gives no operation.
+ * Rules that are kept as they are - those only the extension list has, those with a formula
+ * that cannot be read to its end - are neither made nor taken away: the cells under such a
+ * data validation keep it, a conditional format with such a rule stays as it is. A rule that
+ * would have more ranges than a rule holds is not pasted, and where the rules that are there
+ * would be left with so many, the rules of that kind all stay as they are. None of this
+ * refuses the paste: `skipped` counts the rules that could not be done as they are where the
+ * cells come from - those of the copy that did not come (or came without what the extension
+ * list says of them), and those that stayed though the copy has none there. Throws RangeError
+ * only for a sheet that would hold more rules, or a workbook more formats, than a file can.
+ */
+export function pasteRules(workbook: Workbook, sheetIndex: number, copied: CopiedRules | undefined, area: CellRange, height: number, width: number): { ops: Op[]; skipped: number } {
+  const sheet = workbook.sheets[sheetIndex];
+  const all = copied ? copied.left.length + copied.validations.length + copied.conditional.reduce((sum, item) => sum + item.rules.length, 0) : 0;
+  if (!sheet || sheet.kind !== 'worksheet') return { ops: [], skipped: all };
+  const target = targetRanges(area);
+  return rulesPasted(workbook, sheetIndex, sheet, copied, target, height, width);
+}
+
+function rulesPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet, copied: CopiedRules | undefined, areas: CellRange[], height: number, width: number): { ops: Op[]; skipped: number } {
+  let ops: Op[] = [];
+  let skipped = 0;
+  // Where the rules that are there cannot be cut (too many ranges would be left), they all stay: nothing is lost, and it is said.
+  const undone = (kind: CopiedLeft['kind'], count: number) => Math.max(1, count + (copied ? copied.left.filter((item) => item.kind === kind).length : 0));
+  try {
+    const validations = validationsPasted(workbook, sheet, copied, areas, height, width);
+    skipped += validations.skipped;
+    if (validations.list !== sheet.dataValidations) ops.push({ type: 'setDataValidations', sheet: sheetIndex, validations: validations.list });
+  } catch (error) {
+    if (!tooManyRanges(error)) throw error;
+    skipped += undone('validation', copied ? copied.validations.length : 0);
+  }
+  try {
+    const conditional = conditionalPasted(workbook, sheetIndex, sheet, copied, areas, height, width);
+    skipped += conditional.skipped;
+    ops = ops.concat(conditional.ops);
+  } catch (error) {
+    if (!tooManyRanges(error)) throw error;
+    skipped += undone('conditional', copied ? copied.conditional.reduce((sum, item) => sum + item.rules.length, 0) : 0);
+  }
+  return { ops, skipped };
+}
+
+/**
+ * Takes the cells of ranges out of the rules of a sheet, as a cut does: their data validation
+ * and their conditional formats go with them (a paste of the copy puts them where the cells
+ * go). Rules that are kept as they are stay (see pasteRules()): the cells are cut all the
+ * same, and no rule is lost.
+ */
+export function cutRules(workbook: Workbook, sheetIndex: number, ranges: readonly CellRange[]): Op[] {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet || sheet.kind !== 'worksheet' || ranges.length === 0) return [];
+  if ((!sheet.dataValidations || sheet.dataValidations.length === 0) && (!sheet.conditionalFormats || sheet.conditionalFormats.length === 0)) return [];
+  let target: CellRange[];
+  try {
+    target = targetRanges(ranges);
+  } catch (error) {
+    if (!(error instanceof RangeError)) throw error;
+    return [];
+  }
+  return rulesPasted(workbook, sheetIndex, sheet, undefined, target, 1, 1).ops;
+}
