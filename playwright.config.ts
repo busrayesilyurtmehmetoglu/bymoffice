@@ -2,6 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 const PORT = Number(process.env.E2E_PORT ?? 4317);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const TRACE = process.env.E2E_TRACE === '1';
 
 export default defineConfig({
   testDir: 'e2e',
@@ -18,8 +19,13 @@ export default defineConfig({
   outputDir: 'test-results',
   use: {
     baseURL: BASE_URL,
-    trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
+    // A trace records a screenshot of the window after every action of every
+    // test, kept or not. On macOS WebKit takes each one through the window
+    // server, and thousands of them in one run have brought the window server
+    // down, and the whole desktop session with it. Nothing is captured unless
+    // asked for: E2E_TRACE=1 with the one spec being looked into.
+    trace: TRACE ? 'retain-on-failure' : 'off',
+    screenshot: TRACE ? 'only-on-failure' : 'off',
   },
   webServer: {
     command: 'node e2e/server.mjs',
