@@ -60,6 +60,7 @@ import {
   type DocMedia,
   type DocModel,
   type DocRelationship,
+  type FontInfo,
   type ImageRef,
   type Note,
   type ParaProps,
@@ -520,12 +521,6 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     if (tracking.relate) mainRels.add(mainRels.freeId(), ns.rel + 'settings', relativeTarget(main, tracking.part), false);
   }
 
-  const kindOf = (ctx: BodyContext, name: string): string => {
-    // Attribute names of the part: the WordprocessingML prefix or none.
-    const colon = name.indexOf(':');
-    return colon < 0 || name.slice(0, colon + 1) === ctx.w ? name.slice(colon + 1) : name;
-  };
-
   // Numbering definitions and styles the model has and their parts lack are added to the text of those parts.
   const additions = async (
     suffix: string,
@@ -537,7 +532,12 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     secondBefore: string[],
   ): Promise<void> => {
     const existing = mainRels.partOf(main, suffix);
-    const part = existing || dir + fileName;
+    let part = existing || dir + fileName;
+    if (!existing) {
+      // A part of that name the document does not relate to is not this part: it is left alone, and the new one gets a free name.
+      const dot = fileName.lastIndexOf('.');
+      for (let n = 2; n < 1000 && (await originalOf(part)); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
+    }
     const original = await originalOf(part);
     if (!original) {
       // No such part in the file: a new one, when the model has anything to put into it.
@@ -559,8 +559,18 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
       return;
     }
     const ctx = createBodyContext(part, scan.rootAttrs, new Map(), shared);
+    // Every prefix the root gives the namespace of the part: the reader takes an attribute under any of them.
+    const uris = new Map<string, string>();
+    for (const [name, value] of scan.rootAttrs) if (name.slice(0, 6) === 'xmlns:') uris.set(name.slice(6) + ':', value);
+    const own = uris.get(ctx.w);
+    const named = (name: string): string => {
+      const colon = name.indexOf(':');
+      if (colon < 0) return name;
+      const prefix = name.slice(0, colon + 1);
+      return prefix === ctx.w || (own !== undefined && uris.get(prefix) === own) ? name.slice(colon + 1) : name;
+    };
     const made = produce(ctx, (kind, attribute, value) =>
-      scan.children.some((child) => child.kind === kind && child.attrs.some(([name, text]) => text === value && kindOf(ctx, name) === attribute)),
+      scan.children.some((child) => child.kind === kind && child.attrs.some(([name, text]) => text === value && named(name) === attribute)),
     );
     if (!made) return;
     // The first kind goes before the first child that has to follow it, the second kind before the first that has to follow that.
@@ -571,10 +581,12 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     };
     const split = before(firstBefore);
     const tail = Math.max(split, before(secondBefore));
-    let text: string;
-    if (scan.selfClosing) text = `${source.slice(0, scan.contentStart - 2)}>${made.first}${made.second}</${scan.rootName}>${source.slice(scan.contentStart)}`;
-    else text = source.slice(0, split) + made.first + source.slice(split, tail) + made.second + source.slice(tail);
-    writes.set(part, { data: encodePart(text), contentType: pkg.contentTypeOf(part) === undefined ? contentType : undefined });
+    // The bytes are changed at these places alone: a byte order mark and the line ends of the file stay what they were.
+    let splices: { start: number; end: number; text: string }[];
+    if (scan.selfClosing) splices = [{ start: scan.contentStart - 2, end: scan.contentStart, text: `>${made.first}${made.second}</${scan.rootName}>` }];
+    else if (split === tail) splices = [{ start: split, end: split, text: made.first + made.second }];
+    else splices = [{ start: split, end: split, text: made.first }, { start: tail, end: tail, text: made.second }];
+    writes.set(part, { data: splicedPart(original, splices.filter((splice) => splice.text !== '')), contentType: pkg.contentTypeOf(part) === undefined ? contentType : undefined });
   };
 
   await additions(
@@ -607,6 +619,24 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     [],
     [],
   );
+  // Fonts the model knows and the font table of the file does not name (a paste from another document brought them).
+  if (doc.fonts.size) {
+    await additions(
+      '/fontTable',
+      'fontTable.xml',
+      CONTENT_TYPES.fontTable,
+      'fonts',
+      (ctx, has) => {
+        const added = new Map<string, FontInfo>();
+        doc.fonts.forEach((font, name) => {
+          if (!has('font', 'name', name)) added.set(name, font);
+        });
+        return added.size ? { first: '', second: fontTableText(ctx, added) } : undefined;
+      },
+      [],
+      [],
+    );
+  }
 
   // Pictures the model carries and the file did not have.
   if (doc.media) {

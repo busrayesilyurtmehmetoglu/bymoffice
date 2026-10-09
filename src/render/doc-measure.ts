@@ -242,7 +242,8 @@ function fontSize(size: number): number {
 /** Measures text for DocLayout on a canvas and names the CSS fonts to paint it with. */
 export class CanvasTextMeasurer implements TextMeasurer {
   private context: MeasureContext | undefined;
-  private readonly hints: { get(name: string): FontHint | undefined } | undefined;
+  private readonly hints: { get(name: string): FontHint | undefined; readonly size?: number } | undefined;
+  private hinted: number | undefined;
   private readonly hasFamily: ((family: string) => boolean) | undefined;
   private current: string | undefined;
   private families = new Map<string, string>();
@@ -386,8 +387,11 @@ export class CanvasTextMeasurer implements TextMeasurer {
   /** A font was registered or removed since the family lists were built: they and everything measured with them are forgotten. */
   private sync(): void {
     const now = fontsVersion();
-    if (now === this.registered) return;
+    // The font table of the document got or lost an entry (a paste brought fonts): the lists built without it are stale too.
+    const hinted = this.hints ? this.hints.size : undefined;
+    if (now === this.registered && hinted === this.hinted) return;
     this.registered = now;
+    this.hinted = hinted;
     this.families.clear();
     this.byFont = new WeakMap();
     this.clear();

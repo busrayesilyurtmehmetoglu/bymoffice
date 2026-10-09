@@ -93,6 +93,8 @@ import {
   type RowProps,
   type Run,
   type RunItem,
+  type FontInfo,
+  type RunFonts,
   type RunProps,
   type Table,
   type TableCell,
@@ -156,6 +158,12 @@ export interface DocFragment {
   /** The namespaces the roots of the styles part and of the numbering part declare: what the prefixes in the kept trees of the definitions stand for. */
   styleNamespaces: AttrList;
   numberingNamespaces: AttrList;
+  /**
+   * What the font table of its document says of the fonts the fragment and
+   * its definitions name, by font name. Font files embedded in that document
+   * are not carried. Missing in a fragment made without it.
+   */
+  fonts?: Map<string, FontInfo>;
   /**
    * For a range from one paragraph into another: the properties of the
    * paragraph it ends in, whose end is not part of the copy, and the
@@ -289,6 +297,7 @@ interface CopyContext {
   groups: Map<object, object>;
   styleIds: Set<string>;
   numIds: Set<number>;
+  fontNames: Set<string>;
   budget: { paragraphs: number; items: number; cells: number };
 }
 
@@ -382,8 +391,22 @@ function carryWrap(ctx: CopyContext, wrap: Wrapper | undefined, depth = 0): Wrap
   return out;
 }
 
+const FONT_SLOTS: (keyof RunFonts)[] = ['ascii', 'hAnsi', 'eastAsia', 'cs'];
+
+/** The names of fonts run properties state (theme fonts have no entry of their own in a font table). */
+function eachFont(props: RunProps | undefined, visit: (name: string) => void): void {
+  const fonts = props ? props.fonts : undefined;
+  if (!fonts) return;
+  for (const slot of FONT_SLOTS) {
+    const name = fonts[slot];
+    if (typeof name === 'string' && name !== '') visit(name);
+  }
+}
+
 function noteRunProps(ctx: CopyContext, props: RunProps | undefined): void {
-  if (props && props.style !== undefined) ctx.styleIds.add(props.style);
+  if (!props) return;
+  if (props.style !== undefined) ctx.styleIds.add(props.style);
+  eachFont(props, (name) => ctx.fontNames.add(name));
 }
 
 function noteParaProps(ctx: CopyContext, props: ParaProps): void {
@@ -613,6 +636,7 @@ function collectDefinitions(ctx: CopyContext): void {
   const style = (id: string | undefined) => {
     if (id !== undefined && !out.styles.has(id)) styles.push(id);
   };
+  const font = (name: string) => ctx.fontNames.add(name);
   // Each turn takes one name off a list; what it adds is bounded by the number of definitions kept.
   while (styles.length || nums.length) {
     if (styles.length) {
@@ -624,6 +648,8 @@ function collectDefinitions(ctx: CopyContext): void {
         continue;
       }
       out.styles.set(id, found);
+      eachFont(found.run, font);
+      if (found.conditions) found.conditions.forEach((condition) => eachFont(condition.run, font));
       style(found.basedOn);
       style(found.link);
       style(found.next);
@@ -644,9 +670,24 @@ function collectDefinitions(ctx: CopyContext): void {
     out.abstracts.set(abstract.id, abstract);
     style(abstract.numStyleLink);
     style(abstract.styleLink);
-    abstract.levels.forEach((level) => style(level.paraStyle));
-    num.overrides.forEach((override) => style(override.level ? override.level.paraStyle : undefined));
+    abstract.levels.forEach((level) => {
+      style(level.paraStyle);
+      eachFont(level.run, font);
+    });
+    num.overrides.forEach((override) => {
+      if (!override.level) return;
+      style(override.level.paraStyle);
+      eachFont(override.level.run, font);
+    });
   }
+  // What the document says of the fonts that were named; a font it says nothing of is a name and no more, there as here.
+  ctx.fontNames.forEach((name) => {
+    const info = doc.fonts instanceof Map ? doc.fonts.get(name) : undefined;
+    if (!info || out.fonts === undefined || out.fonts.size >= MAX_DEFINITIONS) return;
+    // Without its files: they belong to the package they are in, by relationships of its font table.
+    const copy = plainFont(name, info);
+    if (copy) out.fonts.set(name, copy);
+  });
 }
 
 function measure(blocks: Block[], depth = 0): number {
@@ -691,6 +732,7 @@ export function fragmentOf(doc: DocModel, range: DocRange): DocFragment {
     styles: new Map(),
     abstracts: new Map(),
     nums: new Map(),
+    fonts: new Map(),
     styleNamespaces: partNamespaces(doc.styles) || declarations(host.rootAttrs),
     numberingNamespaces: partNamespaces(doc.numbering) || declarations(host.rootAttrs),
     textLength: 0,
@@ -705,6 +747,7 @@ export function fragmentOf(doc: DocModel, range: DocRange): DocFragment {
     groups: new Map(),
     styleIds: new Set(),
     numIds: new Set(),
+    fontNames: new Set(),
     budget: { paragraphs: FRAGMENT_LIMITS.paragraphs, items: FRAGMENT_LIMITS.items, cells: FRAGMENT_LIMITS.cells },
   };
   // Inside a text box the paths are followed from the box on.
@@ -833,6 +876,8 @@ interface PasteContext {
   addStyles: Map<string, DocStyle>;
   addAbstracts: [number, AbstractNum][];
   addNums: [number, NumInstance][];
+  /** Fonts that what is pasted names and the font table of the document does not have, as the fragment brought them. */
+  addFonts: Map<string, FontInfo>;
   seenStyles: Set<string>;
   taken: Taken | undefined;
   drawing: number;
@@ -1099,6 +1144,39 @@ function adaptWrap(ctx: PasteContext, wrap: Wrapper | undefined, depth = 0): Wra
   return out;
 }
 
+/** As many fonts as the reader of a font table takes (MAX_FONTS of the docx reader). */
+const FONT_TABLE_LIMIT = 20000;
+const FONT_FIELDS: ('altName' | 'panose' | 'charset' | 'family' | 'pitch')[] = ['altName', 'panose', 'charset', 'family', 'pitch'];
+const MAX_FONT_FIELD = 255;
+
+/**
+ * An entry of a font table as a fragment may bring it: an object of its own
+ * with the name and those of the fields that are short texts. A fragment is
+ * made elsewhere; what it holds is not taken as it is.
+ */
+function plainFont(name: string, info: FontInfo | undefined): FontInfo | undefined {
+  if (!info || typeof info !== 'object' || info.name !== name || name.length > MAX_FONT_FIELD) return undefined;
+  const out: FontInfo = { name };
+  for (const field of FONT_FIELDS) {
+    const value = info[field];
+    if (typeof value === 'string' && value.length <= MAX_FONT_FIELD) out[field] = value;
+  }
+  return out;
+}
+
+/** Brings what the fragment knows of the fonts run properties name, where the font table of the document does not have them. */
+function ensureFonts(ctx: PasteContext, props: RunProps | undefined): void {
+  const known = ctx.fragment.fonts;
+  if (!(known instanceof Map) || !known.size) return;
+  eachFont(props, (name) => {
+    if (ctx.addFonts.has(name) || ctx.doc.fonts.has(name)) return;
+    // A table a reader would refuse is not made.
+    if (ctx.doc.fonts.size + ctx.addFonts.size >= FONT_TABLE_LIMIT) return;
+    const info = plainFont(name, known.get(name));
+    if (info) ctx.addFonts.set(name, info);
+  });
+}
+
 /** Brings the definition of a style along when the document has no style of that id. */
 function ensureStyle(ctx: PasteContext, id: string | undefined, depth = 0): void {
   if (id === undefined || ctx.seenStyles.has(id) || depth > MAX_DEFINITIONS) return;
@@ -1115,6 +1193,8 @@ function ensureStyle(ctx: PasteContext, id: string | undefined, depth = 0): void
     if (para !== copy.para) copy = { ...copy, para };
   }
   ctx.addStyles.set(id, copy);
+  ensureFonts(ctx, style.run);
+  if (style.conditions) style.conditions.forEach((condition) => ensureFonts(ctx, condition.run));
   ensureStyle(ctx, style.basedOn, depth + 1);
   ensureStyle(ctx, style.link, depth + 1);
   ensureStyle(ctx, style.next, depth + 1);
@@ -1149,11 +1229,18 @@ function mapNum(ctx: PasteContext, id: number): number {
         ctx.addAbstracts.push([abstractId, { ...adaptValue(lists, abstract), id: abstractId }]);
         ensureStyle(ctx, abstract.numStyleLink);
         ensureStyle(ctx, abstract.styleLink);
-        abstract.levels.forEach((level) => ensureStyle(ctx, level.paraStyle));
+        abstract.levels.forEach((level) => {
+          ensureStyle(ctx, level.paraStyle);
+          ensureFonts(ctx, level.run);
+        });
       }
     }
     entry[1] = { ...adaptValue(lists, num), id: mapped, abstractId };
-    num.overrides.forEach((override) => ensureStyle(ctx, override.level ? override.level.paraStyle : undefined));
+    num.overrides.forEach((override) => {
+      if (!override.level) return;
+      ensureStyle(ctx, override.level.paraStyle);
+      ensureFonts(ctx, override.level.run);
+    });
   }
   ctx.nums.set(id, mapped);
   return mapped;
@@ -1165,7 +1252,10 @@ function adaptParaProps(ctx: PasteContext, props: ParaProps, sections = ctx.sect
   const key = sections ? 1 : 0;
   if (memo && memo[key]) return memo[key] as ParaProps;
   ensureStyle(ctx, props.style);
-  if (props.markProps) ensureStyle(ctx, props.markProps.style);
+  if (props.markProps) {
+    ensureStyle(ctx, props.markProps.style);
+    ensureFonts(ctx, props.markProps);
+  }
   let out = props;
   if (ctx.decls.length) {
     // Property by property: the memo of the bag itself holds its adapted forms.
@@ -1202,6 +1292,7 @@ function adaptParaProps(ctx: PasteContext, props: ParaProps, sections = ctx.sect
 
 function adaptRunProps(ctx: PasteContext, props: RunProps): RunProps {
   ensureStyle(ctx, props.style);
+  ensureFonts(ctx, props);
   return adaptValue(ctx, props);
 }
 
@@ -1437,6 +1528,7 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
     addStyles: new Map(),
     addAbstracts: [],
     addNums: [],
+    addFonts: new Map(),
     seenStyles: new Set(),
     taken: undefined,
     drawing: 0,
@@ -1480,6 +1572,11 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
       draft.apply({ type: 'setStyles', styles: next });
     }
     if (ctx.addAbstracts.length || ctx.addNums.length) draft.apply({ type: 'setNumbering', abstracts: ctx.addAbstracts, nums: ctx.addNums });
+    if (ctx.addFonts.size) {
+      const fonts: [string, FontInfo][] = [];
+      ctx.addFonts.forEach((info, name) => fonts.push([name, info]));
+      draft.apply({ type: 'setFonts', fonts });
+    }
   };
 
   if (blocks.length === 1 && openStart && openEnd) {

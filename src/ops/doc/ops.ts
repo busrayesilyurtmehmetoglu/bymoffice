@@ -9,7 +9,7 @@
 // back by reference, source spans and all, and restores `modified`, so that
 // "edit, undo, save" writes the bytes that were read.
 
-import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, DocStyles, Note, NumInstance, SectionProps, SourceSpan, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
+import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, DocStyles, FontInfo, Note, NumInstance, SectionProps, SourceSpan, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
 import { storyOf, type StoryHandle } from './position';
 
 /** `modified` flag to set after an operation: true when missing, null to remove the flag. */
@@ -65,7 +65,9 @@ export type DocOp =
    */
   | { type: 'setBodySection'; section: SectionProps; span?: SourceSpan; modified?: Flag }
   /** Turns the "track changes" setting of the document (DocSettings.trackRevisions) on or off. */
-  | { type: 'setTrackRevisions'; on: boolean };
+  | { type: 'setTrackRevisions'; on: boolean }
+  /** Adds, replaces or (null) removes entries of the font table, by font name. The table itself stays the object it is. */
+  | { type: 'setFonts'; fonts: [name: string, value: FontInfo | null][] };
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -256,6 +258,29 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
       const before = doc.settings.trackRevisions === true;
       doc.settings.trackRevisions = op.on;
       return { type: 'setTrackRevisions', on: before };
+    }
+    case 'setFonts': {
+      const fonts = doc.fonts;
+      if (!Array.isArray(op.fonts) || !(fonts instanceof Map)) return bad('Entries of the font table are needed');
+      for (const entry of op.fonts) {
+        if (!Array.isArray(entry) || typeof entry[0] !== 'string' || entry[0] === '') return bad('A font needs a name');
+        const value = entry[1];
+        if (value === null) continue;
+        if (!value || typeof value !== 'object' || value.name !== entry[0]) return bad('An entry of the font table carries the name it is kept under');
+        for (const field of ['altName', 'panose', 'charset', 'family', 'pitch'] as const) {
+          if (value[field] !== undefined && typeof value[field] !== 'string') return bad('What a font table says of a font is text');
+        }
+        if (value.embedded !== undefined && !(value.embedded instanceof Map)) return bad('The embedded files of a font are kept by face');
+      }
+      const before: [string, FontInfo | null][] = [];
+      // Undone last first, so that a name given twice ends up as it began.
+      for (const [name, value] of op.fonts) {
+        const old = fonts.get(name);
+        before.unshift([name, old === undefined ? null : old]);
+        if (value === null) fonts.delete(name);
+        else fonts.set(name, value);
+      }
+      return { type: 'setFonts', fonts: before };
     }
     case 'setMedia': {
       if (typeof op.name !== 'string' || op.name === '') return bad('A picture needs a name');

@@ -662,6 +662,8 @@ export class DocumentView {
   private unwatchEmbeddedFont: (() => void) | undefined;
   /** Fonts arrived while a composition or a drag was under way: the layout is due when it ends. */
   private fontsDue = false;
+  /** The entries the font table of the document had when it was last laid out from the start. */
+  private fontEntries = -1;
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
@@ -1535,6 +1537,7 @@ export class DocumentView {
     let progress: LayoutProgress;
     try {
       this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
+      this.fontEntries = this.document.fonts.size;
       this.pages = this.engine.pages;
       this.offsets = [0];
       this.done = false;
@@ -1560,7 +1563,12 @@ export class DocumentView {
     const started = Date.now();
     try {
       // A change of very many blocks (the whole document made bold) is laid out in slices like a document that is opened.
-      progress = this.failed ? undefined : this.engine.edited({ milliseconds: EDIT_LAYOUT_MS });
+      // A paste that brought an entry of the font table (or its undo) changes what stands in for a font
+      // everywhere it is named, not only in what was edited: everything is laid out again.
+      const entries = this.document.fonts.size;
+      const fontsMoved = this.fontEntries >= 0 && entries !== this.fontEntries;
+      this.fontEntries = entries;
+      progress = this.failed || fontsMoved ? undefined : this.engine.edited({ milliseconds: EDIT_LAYOUT_MS });
     } catch {
       progress = undefined;
     }
