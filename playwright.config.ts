@@ -15,6 +15,8 @@ export default defineConfig({
   // A flaky test is a bug to investigate, never something to retry away.
   retries: 0,
   timeout: 30_000,
+  // Ends the run while the machine still has memory left (see the file).
+  globalSetup: './e2e/memory-guard.ts',
   reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
   outputDir: 'test-results',
   use: {
