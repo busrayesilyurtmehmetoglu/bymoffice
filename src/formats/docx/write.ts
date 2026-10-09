@@ -78,7 +78,7 @@ import { parseXml, serializeXml, type XmlDocument, type XmlElement } from '../..
 import { ZipArchive } from '../../zip';
 import { DEFAULT_AUTHOR, largestAnnotationId } from '../../ops/doc/track';
 import { resolveColor, resolveFont } from './resolve';
-import { parseOnOff } from './common';
+import { WORD_NAMESPACES, parseOnOff } from './common';
 import { decodePart } from './source';
 import type { BodyContext } from './write-body';
 import {
@@ -537,6 +537,10 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
       // A part of that name the document does not relate to is not this part: it is left alone, and the new one gets a free name.
       const dot = fileName.lastIndexOf('.');
       for (let n = 2; n < 1000 && (await originalOf(part)); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
+      if (await originalOf(part)) {
+        if (report) report.warnings.push(`No free name was found for a new ${fileName}; nothing was added`);
+        return;
+      }
     }
     const original = await originalOf(part);
     if (!original) {
@@ -562,17 +566,33 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     // Every prefix the root gives the namespace of the part: the reader takes an attribute under any of them.
     const uris = new Map<string, string>();
     for (const [name, value] of scan.rootAttrs) if (name.slice(0, 6) === 'xmlns:') uris.set(name.slice(6) + ':', value);
-    const own = uris.get(ctx.w);
     const named = (name: string): string => {
       const colon = name.indexOf(':');
       if (colon < 0) return name;
       const prefix = name.slice(0, colon + 1);
-      return prefix === ctx.w || (own !== undefined && uris.get(prefix) === own) ? name.slice(colon + 1) : name;
+      const uri = uris.get(prefix);
+      // The reader takes the transitional and the strict namespace alike.
+      return prefix === ctx.w || (uri !== undefined && WORD_NAMESPACES.indexOf(uri) >= 0) ? name.slice(colon + 1) : name;
     };
-    const made = produce(ctx, (kind, attribute, value) =>
-      scan.children.some((child) => child.kind === kind && child.attrs.some(([name, text]) => text === value && named(name) === attribute)),
-    );
+    // What the part has, gathered once: asked for every definition of the model.
+    let there: Set<string> | undefined;
+    const made = produce(ctx, (kind, attribute, value) => {
+      if (!there) {
+        there = new Set();
+        for (const child of scan.children) for (const [name, text] of child.attrs) there.add(child.kind + '\u0000' + named(name) + '\u0000' + text);
+      }
+      return there.has(kind + '\u0000' + attribute + '\u0000' + value);
+    });
     if (!made) return;
+    if (!(original[0] === 0xff && original[1] === 0xfe) && !(original[0] === 0xfe && original[1] === 0xff)) {
+      // Bytes that are no UTF-8 (a part in another encoding) would not come back as they are from the text they were read as.
+      try {
+        new TextDecoder('utf-8', { fatal: true }).decode(original);
+      } catch {
+        if (report) report.warnings.push(`${part} is not UTF-8; nothing was added to it`);
+        return;
+      }
+    }
     // The first kind goes before the first child that has to follow it, the second kind before the first that has to follow that.
     const end = scan.closeStart === undefined ? scan.contentStart : scan.closeStart;
     const before = (kinds: string[]): number => {

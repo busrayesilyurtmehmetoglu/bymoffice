@@ -31,6 +31,8 @@ const NAMESPACES: [uri: string, prefix: string][] = [
 ];
 
 export const STRICT_W_NAMESPACE = 'http://purl.oclc.org/ooxml/wordprocessingml/main';
+/** Every namespace the reader takes for WordprocessingML. */
+export const WORD_NAMESPACES: readonly string[] = NAMESPACES.filter((entry) => entry[1] === 'w').map((entry) => entry[0]);
 
 /** State shared by all parts of one document. */
 export interface ReaderState {

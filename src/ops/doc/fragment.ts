@@ -354,6 +354,8 @@ function carryDrawing(ctx: CopyContext, item: DrawingItem): DrawingItem | undefi
 const PLAIN_ITEMS = new Set<string>(['text', 'tab', 'break', 'noBreakHyphen', 'softHyphen', 'symbol', 'positionalTab', 'pageNumber', 'separator', 'continuationSeparator', 'instrText', 'fieldChar']);
 
 function carryItem(ctx: CopyContext, item: RunItem): RunItem | undefined {
+  // A symbol names the font it is a character of.
+  if (item.type === 'symbol' && typeof item.font === 'string' && item.font !== '') ctx.fontNames.add(item.font);
   if (PLAIN_ITEMS.has(item.type)) return item;
   if (item.type === 'drawing') return carryDrawing(ctx, item);
   return undefined;
@@ -1104,6 +1106,7 @@ function adaptDrawing(ctx: PasteContext, item: DrawingItem): DrawingItem {
 }
 
 function adaptItem(ctx: PasteContext, item: RunItem): RunItem {
+  if (item.type === 'symbol' && typeof item.font === 'string') ensureFont(ctx, item.font);
   if (item.type === 'drawing') return adaptDrawing(ctx, item);
   if (item.type === 'fieldChar') return adaptValue(ctx, item);
   return item;
@@ -1166,15 +1169,17 @@ function plainFont(name: string, info: FontInfo | undefined): FontInfo | undefin
 
 /** Brings what the fragment knows of the fonts run properties name, where the font table of the document does not have them. */
 function ensureFonts(ctx: PasteContext, props: RunProps | undefined): void {
+  eachFont(props, (name) => ensureFont(ctx, name));
+}
+
+function ensureFont(ctx: PasteContext, name: string): void {
   const known = ctx.fragment.fonts;
-  if (!(known instanceof Map) || !known.size) return;
-  eachFont(props, (name) => {
-    if (ctx.addFonts.has(name) || ctx.doc.fonts.has(name)) return;
-    // A table a reader would refuse is not made.
-    if (ctx.doc.fonts.size + ctx.addFonts.size >= FONT_TABLE_LIMIT) return;
-    const info = plainFont(name, known.get(name));
-    if (info) ctx.addFonts.set(name, info);
-  });
+  if (!(known instanceof Map) || !known.size || name === '') return;
+  if (ctx.addFonts.has(name) || ctx.doc.fonts.has(name)) return;
+  // A table a reader would refuse is not made.
+  if (ctx.doc.fonts.size + ctx.addFonts.size >= FONT_TABLE_LIMIT) return;
+  const info = plainFont(name, known.get(name));
+  if (info) ctx.addFonts.set(name, info);
 }
 
 /** Brings the definition of a style along when the document has no style of that id. */

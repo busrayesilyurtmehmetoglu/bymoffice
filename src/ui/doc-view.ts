@@ -769,6 +769,7 @@ export class DocumentView {
     this.images = new ImageStore(pictures, coarse ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, this.onImageLoad);
     // A document that cannot be laid out at all throws here, before anything is added to the container.
     this.engine = new DocLayout(doc, this.measurer, this.layoutOptions());
+    this.fontEntries = doc.fonts.size;
     this.pages = this.engine.pages;
     this.lines = new DocLines(() => this.pages, this.measurer);
 
@@ -1081,6 +1082,7 @@ export class DocumentView {
     this.hold = height;
     this.unmountAll();
     this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
+    this.fontEntries = this.document.fonts.size;
     this.pages = this.engine.pages;
     this.offsets = [0];
     this.done = false;

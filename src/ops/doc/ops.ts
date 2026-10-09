@@ -66,7 +66,11 @@ export type DocOp =
   | { type: 'setBodySection'; section: SectionProps; span?: SourceSpan; modified?: Flag }
   /** Turns the "track changes" setting of the document (DocSettings.trackRevisions) on or off. */
   | { type: 'setTrackRevisions'; on: boolean }
-  /** Adds, replaces or (null) removes entries of the font table, by font name. The table itself stays the object it is. */
+  /**
+   * Adds, replaces or (null) removes entries of the font table, by font name. The table itself stays the object it is.
+   * Of this the writer of a docx file takes the entries its font table does not name, together with another edit;
+   * an entry replaced or removed stays in the file as it was.
+   */
   | { type: 'setFonts'; fonts: [name: string, value: FontInfo | null][] };
 
 const bad = (message: string): never => {

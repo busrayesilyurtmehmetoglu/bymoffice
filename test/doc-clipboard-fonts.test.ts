@@ -327,3 +327,65 @@ test('review: a part named like a font table that the document does not relate t
   assert.ok(decoder.decode((await target.pkg.readPart('/word/fontTable2.xml'))!).includes('<w:font w:name="Fancy Face">'));
   assert.deepEqual([...(await reread(target)).fonts.keys()], ['Fancy Face']);
 });
+
+// ----------------------------------------------------------- second review
+
+test('second review: the font of a symbol comes with the symbol', async () => {
+  const symbol = '<w:r><w:sym w:font="Sign Face" w:char="F050"/></w:r>';
+  const source = await open({ body: para(run('a') + symbol + run('b')), fontTable: font('Sign Face', '<w:charset w:val="02"/>') });
+  const target = await open({ body: para(run('here')) });
+  const fragment = fragmentOf(source.doc, range(at(0, 0), at(0, 3)));
+  assert.deepEqual([...fragment.fonts!.keys()], ['Sign Face']);
+  paste(target.doc, fragment, at(0, 4));
+  assert.deepEqual(target.doc.fonts.get('Sign Face'), { name: 'Sign Face', charset: '02' });
+  assert.deepEqual([...(await reread(target)).fonts.keys()], ['Sign Face']);
+});
+
+test('second review: a font named under a prefix of the other WordprocessingML namespace is a font the file has', async () => {
+  const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const table = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:fonts xmlns:w="${W}" xmlns:s="http://purl.oclc.org/ooxml/wordprocessingml/main"><s:font s:name="Own Face"/></w:fonts>`;
+  const target = await open({ body: para(run('here', 'Own Face')), parts: [['word/fontTable.xml', table]], fontTable: '' });
+  assert.deepEqual([...target.doc.fonts.keys()], ['Own Face']);
+  const history = new DocHistory(target.doc);
+  history.applyEdit(insertFragment(target.doc, at(0, 4), fragmentOf(target.doc, range(at(0, 0), at(0, 2)))), undefined);
+  history.seal();
+  assert.equal(await written(target), table);
+});
+
+test('second review: a font table that is not UTF-8 is not written to; the other bytes of it are not lost for a font', async () => {
+  const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const text = `<?xml version="1.0" encoding="windows-1254"?><w:fonts xmlns:w="${W}"><w:font w:name="Owný"/></w:fonts>`;
+  const bytes = Uint8Array.from(text, (c) => c.charCodeAt(0));
+  const source = await open(SOURCE);
+  const target = await open({ body: para(run('here')), parts: [['word/fontTable.xml', bytes]], fontTable: '' });
+  paste(target.doc, fragmentOf(source.doc, range(at(0, 0), at(0, 11))), at(0, 4));
+  const report = { parts: [] as string[], warnings: [] as string[], copiedBlocks: 0, writtenBlocks: 0, droppedCharacters: 0 };
+  await writeDocx(target.pkg, target.doc, { report: report as never });
+  assert.deepEqual(await target.pkg.readPart('/word/fontTable.xml'), bytes);
+  assert.ok(report.warnings.some((warning) => warning.includes('not UTF-8')), report.warnings.join('; '));
+});
+
+test('second review: a font table of very many fonts is looked through once for a save', async () => {
+  let table = '';
+  for (let i = 0; i < 20000; i++) table += `<w:font w:name="F${i}"/>`;
+  const target = await open({ body: para(run('here')), fontTable: table });
+  const before = await target.pkg.readPart('/word/fontTable.xml');
+  const history = new DocHistory(target.doc);
+  history.applyEdit(insertFragment(target.doc, at(0, 4), fragmentOf(target.doc, range(at(0, 0), at(0, 2)))), undefined);
+  history.seal();
+  const started = Date.now();
+  await writeDocx(target.pkg, target.doc);
+  // A guard against the quadratic search (3.5 s here before), not a measurement.
+  assert.ok(Date.now() - started < 2000, `saved in ${Date.now() - started} ms`);
+  assert.deepEqual(await target.pkg.readPart('/word/fontTable.xml'), before);
+});
+
+test('second review: a full font table is still read again after a paste that could not add to it', async () => {
+  let table = '';
+  for (let i = 0; i < 20000; i++) table += `<w:font w:name="F${i}"/>`;
+  const source = await open(SOURCE);
+  const target = await open({ body: para(run('here')), fontTable: table });
+  paste(target.doc, fragmentOf(source.doc, range(at(0, 0), at(0, 11))), at(0, 4));
+  assert.equal(target.doc.fonts.size, 20000);
+  assert.equal((await reread(target)).fonts.size, 20000);
+});
