@@ -448,6 +448,12 @@ export function rowXml(writer: CellWriter, index: number, row: Row | undefined):
 }
 
 /** Every row of the model, in order. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 function allRowsXml(writer: CellWriter, sheet: Sheet, out: string[]): void {
   const indexes = Array.from(sheet.rows.keys());
   if (writer.overrides) for (const index of writer.overrides.keys()) if (!sheet.rows.has(index)) indexes.push(index);
@@ -4628,6 +4634,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
 
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
+  /** Sheets marked as modified whose part came out as the bytes of the file. */
+  const asInFile = new Set<Sheet>();
 
   // The style sheet is written while the model added formats to it (for good: a format that is no
   // longer used stays in the tables) or a rule needs a record of its own. A save that needs neither
@@ -4757,7 +4765,10 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       const bytes = await originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
       const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
-      writes.push([sheet.part, (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written]);
+      const next = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
+      // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation.
+      if (sameBytes(next, bytes)) asInFile.add(sheet);
+      writes.push([sheet.part, next]);
       rewritten.push(sheet.part);
     }
 
@@ -4974,25 +4985,39 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
 
   // A calculation chain that no longer matches the formulas makes the application report the file
   // as damaged; without one it simply builds a new chain.
-  const recalculate = modifiedSheets.length > 0 || reordered;
-  let calcChain: string | undefined;
+  // Rows put in or taken out below the cells of a sheet leave its part as it is and still move what the defined
+  // names point at: the sheets are the sheets of the file only while the names say what the file says, in its order.
+  const fileNames: (string | undefined)[] = [];
+  const gather = (el: XmlElement, depth: number): void => {
+    for (const node of el.children) {
+      if (node.type !== 'element') continue;
+      if (localName(node.name) === 'definedName') fileNames.push(textOf(node));
+      else if (depth === 0 && localName(node.name) === 'definedNames') gather(node, 1);
+    }
+  };
+  gather(book.root, 0);
+  const namesAsInFile = fileNames.length === workbook.definedNames.length && workbook.definedNames.every((name, index) => name.value === fileNames[index]);
+  const changedSheets = namesAsInFile ? modifiedSheets.filter((sheet) => !asInFile.has(sheet)) : modifiedSheets;
+  const recalculate = changedSheets.length > 0 || reordered;
   const chainRel = recalculate ? withType('/calcChain') : undefined;
   if (chainRel) {
-    const chain = resolveTarget(main, chainRel.attrs.get('Target') || '');
+    // Under the name the archive has it by, so that it comes back as the entry it was.
+    const chain = actualOf(resolveTarget(main, chainRel.attrs.get('Target') || ''));
     rels.root.children = rels.root.children.filter((node) => node !== chainRel);
     relsChanged = true;
-    // A modified sheet of the file stays modified, and the chain stays out with it. Without one,
-    // undoing may bring back the sheets of the file as they were, and the chain with them: a sheet
-    // that is not in the file is modified from the start, and goes without a trace.
-    if (modifiedSheets.some((sheet) => sheet.part !== '')) calcChain = chain;
-    else if (pkg.hasPart(chain) || removed.has(chain)) wanted.add(chain);
+    // A relationship that calls the workbook or a sheet its chain (a damaged or a hostile file) takes no part with it.
+    const lower = chain.toLowerCase();
+    const needed = lower === main.toLowerCase() || workbook.sheets.some((sheet) => sheet.part !== '' && sheet.part.toLowerCase() === lower);
+    // Taken out so that it can come back: once every edit is undone the sheets are the sheets of the file
+    // again (see asInFile), nothing asks for a new calculation, and the chain of the file fits them.
+    if (!needed && (pkg.hasPart(chain) || removed.has(chain))) wanted.add(chain);
   }
 
   // Parts that were taken out and belong to the workbook again go back in first, as the file had them.
   const restores: PartWrite[] = [];
   const restored: string[] = [];
   for (const [part, contentType] of removed) {
-    if (wanted.has(part) || part === calcChain) continue;
+    if (wanted.has(part)) continue;
     const bytes = originals.get(part);
     if (bytes) restores.push([part, bytes, contentType]);
     const partRels = originals.get(relsPartOf(part));
@@ -5050,16 +5075,10 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   for (const [part, data, contentType] of writes) pkg.writePart(part, data, contentType);
   for (const [part] of removals) pkg.deletePart(part);
   for (const part of deletions) pkg.deletePart(part);
-  if (calcChain !== undefined) pkg.deletePart(calcChain);
 
   for (const [part, list] of movedNow) moved.set(part, list);
   for (const part of restored) removed.delete(part);
   for (const [part, contentType] of removals) removed.set(part, contentType);
-  if (calcChain !== undefined && removed.has(calcChain)) {
-    // Gone for good from here on: its bytes need not be kept.
-    removed.delete(calcChain);
-    originals.delete(calcChain);
-  }
   added.clear();
   for (const [sheet, part] of addedNow) added.set(sheet, part);
   noted.clear();

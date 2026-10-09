@@ -497,9 +497,12 @@ test('sheets: after a rename, formulas, names, rules, validations, extension rul
   const back = await roundTrip(doc);
   assert.deepEqual(names(back.wb), ['Sheet1', 'Sheet2', 'Sheet3']);
   same(picture(back.wb), picture(await reopen(original)), 'the model after undo');
-  // The sheets whose formulas were rewritten stay marked as modified and are written from the model; nothing else is touched.
+  // The sheets whose formulas were rewritten stay marked as modified and are written from the model. A part that comes
+  // out as the bytes of the file is no change, and a workbook without one asks for no new calculation: nothing but
+  // those sheets can differ, and the workbook part only together with one of them.
   const touched = await changedParts(original, back.bytes);
-  assert.ok(touched.indexOf('xl/workbook.xml') >= 0 && touched.every((part) => ['xl/workbook.xml', 'xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml'].indexOf(part) >= 0), touched.join());
+  assert.ok(touched.every((part) => ['xl/workbook.xml', 'xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml'].indexOf(part) >= 0), touched.join());
+  assert.ok(touched.indexOf('xl/workbook.xml') < 0 || touched.length > 1, touched.join());
 });
 
 test('sheets: a sheet that is only named by raw content of an unmodified sheet makes that sheet be written', async () => {
@@ -1429,7 +1432,8 @@ test('review 2: a sheet that is not in the file does not cost the file its calcu
   assert.deepEqual(deleted.facts.parts, before.parts);
   assert.deepEqual(await changedParts(original, deleted.bytes), []);
 
-  // (c) a cell of the file changes: the chain is gone for good, with its relationship and its content type.
+  // (c) a cell of the file changes: the chain goes, with its relationship and its content type, and is back with the
+  // file as it was once the change is undone.
   const third = await load(original);
   apply(third, insertSheet(third.wb, 1, { locale: 'en' }));
   await roundTrip(third);
@@ -1441,8 +1445,9 @@ test('review 2: a sheet that is not in the file does not cost the file its calcu
   third.history.undo();
   third.history.undo();
   const after = await roundTrip(third);
-  assert.ok(after.facts.parts.indexOf('xl/calcChain.xml') < 0, 'a modified sheet stays modified');
-  assert.ok(!(await text(after.bytes, 'xl/_rels/workbook.xml.rels')).includes('calcChain'));
+  assert.deepEqual(after.facts.parts, before.parts, 'the chain is a part of the workbook again');
+  assert.deepEqual(await changedParts(original, after.bytes), [], 'every part is as the file had it');
+  assert.ok(sameBytes(after.bytes, original), 'the file that was opened, byte for byte');
 });
 
 /** The book of most tests with links to places in the workbook written as relationship targets: of a shape of Sheet1, and of a cell of Sheet3. */
