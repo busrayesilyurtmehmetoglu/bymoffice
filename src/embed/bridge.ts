@@ -313,7 +313,7 @@ const DEFAULT_SAVE_RESULT_TIMEOUT_MS = 60000;
 const MAX_RESULT_MESSAGE_CHARS = 200;
 
 /** Messages that say how things are now: of those waiting for a channel only the newest of each kind is kept. */
-const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet' || type === 'sheets';
+const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet' || type === 'sheets' || type === 'saveState';
 
 /** Longest name of a sheet a message may carry. What a sheet may be called is the view's to say; this only bounds what is looked at. */
 const MAX_NAME_CHARS = 255;
@@ -1260,6 +1260,14 @@ export function createBridge(host: BridgeHost): Bridge {
         if (!current || current.saver !== mine) return;
         const view = current.view || current.pages;
         if (view && typeof view.showNotice === 'function') view.showNotice(text, kind);
+      },
+      // What the page knows and the application cannot count for itself: whether the file as it is now is the file
+      // the application was last handed and said it stored. (A change made while the bytes were written is in no
+      // `saved` message; a history that was cut can be undone to its end and still not be the file that was opened.)
+      onState: (state) => {
+        const current = shown;
+        if (!current || current.saver !== mine) return;
+        send({ type: 'saveState', dirty: state.dirty, saving: state.saving });
       },
     });
     return mine;

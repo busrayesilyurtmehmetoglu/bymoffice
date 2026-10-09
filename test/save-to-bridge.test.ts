@@ -99,11 +99,13 @@ function fake(): Fake {
 }
 
 const DATA = base64Encode(new Uint8Array([80, 75, 3, 4]));
-const types = (f: Fake) => f.sent.map((message) => message.type);
+/** What the page sent, without its reports of the state of the save (those have a test of their own). */
+const told = (f: Fake) => f.sent.filter((message) => message.type !== 'saveState');
+const types = (f: Fake) => told(f).map((message) => message.type);
 const settle = async () => {
   for (let i = 0; i < 40; i++) await Promise.resolve();
 };
-const last = (f: Fake) => f.sent[f.sent.length - 1];
+const last = (f: Fake) => told(f)[told(f).length - 1];
 /** The id of the last save the user started: what its `saveResult` names. */
 const lastId = (f: Fake): string => {
   const saves = f.sent.filter((message) => message.type === 'saved' && message.by === 'user');
@@ -465,4 +467,48 @@ test('bridge: a converted file handed over by the user names both formats', asyn
   // Without convert the same file cannot be written, and has no command.
   await bridge.receive({ type: 'load', data: base64Encode(xls), save: true });
   assert.equal(f.views[1].saveCommand, undefined);
+});
+
+test('bridge: the page says whether the file is saved: saveState follows changes, saves and their results, and nothing else is counted for it', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, save: true });
+  const command = f.views[0].saveCommand as SaveCommand;
+  const states = () => f.sent.filter((message) => message.type === 'saveState').map((message) => `${message.dirty} ${message.saving}`);
+  assert.deepEqual(states(), [], 'a file that was opened and not changed is said nothing about');
+
+  f.views[0].onChange!({ sheets: [0] });
+  assert.deepEqual(states(), ['true false']);
+  command.run();
+  await settle();
+  assert.deepEqual(states(), ['true false', 'true true']);
+  // Changed while the application stores the file: the result makes it stored, the file as it is now is not.
+  f.views[0].onChange!({ sheets: [0] });
+  await bridge.receive({ type: 'saveResult', saveId: lastId(f), ok: true });
+  await settle();
+  const after = states();
+  assert.equal(after[after.length - 1].split(' ')[0], 'true', `still unsaved: ${after.join(' | ')}`);
+
+  // The save of that change, answered: saved.
+  for (let i = 0; i < 3 && command.saving; i++) await settle();
+  if (!command.saving) command.run();
+  await settle();
+  await bridge.receive({ type: 'saveResult', saveId: lastId(f), ok: true });
+  await settle();
+  assert.equal(states()[states().length - 1], 'false false');
+
+  // A result that is not ok leaves it unsaved.
+  f.views[0].onChange!({ sheets: [0] });
+  command.run();
+  await settle();
+  await bridge.receive({ type: 'saveResult', saveId: lastId(f), ok: false, message: 'no' });
+  await settle();
+  assert.equal(states()[states().length - 1], 'true false');
+
+  // A load without save says nothing of it.
+  const g = fake();
+  const other = createBridge(g.host);
+  await other.receive({ type: 'load', data: DATA });
+  g.views[0].onChange!({ sheets: [0] });
+  assert.equal(g.sent.filter((message) => message.type === 'saveState').length, 0);
 });
