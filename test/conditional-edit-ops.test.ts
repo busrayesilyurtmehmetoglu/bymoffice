@@ -49,9 +49,9 @@ test('the rules of a sheet are listed in order of priority, with what can be don
     [2, 'colorScale', 'B1:B5', true, true, true],
     // A data bar that has more to say in the extension list: what it says stays; it can be moved, put elsewhere and deleted.
     [3, 'dataBar', 'C1:C5', false, true, true],
-    // Kinds that are kept and not made here: they can be moved and deleted.
-    [4, 'iconSet', 'D1:D5', false, true, true],
-    [5, 'timePeriod', 'D1:D5', false, true, true],
+    // An icon set of the main part and a time period are made and changed here like the others (see rules-iconset-date.test.ts).
+    [4, 'iconSet', 'D1:D5', true, true, true],
+    [5, 'timePeriod', 'D1:D5', true, true, true],
   ]);
   assert.equal(rules[1].format!.fill!.type, 'pattern');
   assert.deepEqual(conditionalRules(doc.wb, 0, range('B2:C2')).map((info) => info.index), [2, 3]);
@@ -123,8 +123,10 @@ test('every kind of rule that can be made, with the formulas Excel writes for it
 test('what a rule cannot say is refused', async () => {
   const doc = await load({ bare: true });
   const add = (settings: Parameters<typeof addConditionalRule>[3]) => addConditionalRule(doc.wb, 0, range('A1'), settings);
-  assert.throws(() => add({ type: 'iconSet' as 'cellIs' }), /kind of rule/);
-  assert.throws(() => add({ type: 'timePeriod' as 'cellIs' }), /kind of rule/);
+  assert.throws(() => add({ type: 'somethingNew' as 'cellIs' }), /kind of rule/);
+  assert.throws(() => add({ type: 'iconSet', iconSet: '3Stars' as '3Arrows' }), /icon set is not known/);
+  assert.throws(() => add({ type: 'timePeriod' }), /needs a period/);
+  assert.throws(() => add({ type: 'timePeriod', timePeriod: 'someday' as 'today' }), /period is not known/);
   assert.throws(() => add({ type: 'cellIs', operator: 'sideways' as 'equal', formulas: ['1'] }), /operator/);
   assert.throws(() => add({ type: 'cellIs', operator: 'equal' }), /needs a value/);
   assert.throws(() => add({ type: 'cellIs', operator: 'between', formulas: ['1'] }), /needs two values/);
@@ -170,9 +172,7 @@ test('a rule is changed: where it applies, whether it stops the others, what it 
 
 test('a rule whose format had more than colours keeps the rest when the colours change', async () => {
   const doc = await load();
-  // The time period rule has format 2: italic, a size, a green fill, an alignment, a border. It is not made here, so it is not changed here.
-  assert.throws(() => updateConditionalRule(doc.wb, 0, 5, { rule: { type: 'duplicateValues' } }), /cannot be changed/);
-  // Give format 2 to a rule that can be changed, by a file that says so.
+  // Format 2 (that of the time period rule) has italic, a size, a green fill, an alignment, a border: it is given to a "cell value" rule, by a file that says so.
   doc.wb.sheets[0].conditionalFormats![0].rules[0].dxfId = 2;
   apply(doc, updateConditionalRule(doc.wb, 0, 1, { rule: { type: 'cellIs', operator: 'greaterThan', formulas: ['$H$1'], format: { fill: '#FFC7CE', bold: true } } }));
   const info = conditionalRules(doc.wb, 0)[1];

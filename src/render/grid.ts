@@ -1459,7 +1459,7 @@ const STAR_HALF = [STAR[0], STAR[1], 0.5, STAR[11], STAR[12], STAR[13], STAR[14]
 const CHECK = [0.2, 0.55, 0.42, 0.76, 0.8, 0.26];
 
 /** A check mark, a cross or an exclamation mark, drawn into the box at (x, y). */
-function drawSymbol(frame: Frame, shape: string, color: string, x: number, y: number, size: number): void {
+function drawSymbol(frame: Pick<Frame, 'ctx' | 'painter'>, shape: string, color: string, x: number, y: number, size: number): void {
   const { ctx, painter } = frame;
   const weight = Math.max(size * 0.16, 1.5);
   if (shape === 'check') strokeLine(ctx, x, y, size, CHECK, color, weight);
@@ -1474,7 +1474,7 @@ function drawSymbol(frame: Frame, shape: string, color: string, x: number, y: nu
 }
 
 /** Draws one icon of an icon set into a square of `size` pixels at (x, y). Vector shapes only. */
-function drawIcon(frame: Frame, icon: IconGlyph, x: number, y: number, size: number): void {
+function drawIcon(frame: Pick<Frame, 'ctx' | 'painter'>, icon: IconGlyph, x: number, y: number, size: number): void {
   const { ctx, painter } = frame;
   const color = safeColor(icon.color) || ICON_DARK;
   const cx = x + size / 2;
@@ -1572,6 +1572,14 @@ function drawIcon(frame: Frame, icon: IconGlyph, x: number, y: number, size: num
       strokeLine(ctx, x, y, size, STAR.concat([STAR[0], STAR[1]]), color, 1);
       break;
   }
+}
+
+/**
+ * Draws one icon of an icon set into a square of `size` pixels at (x, y) of any canvas, the
+ * way the grid draws it in a cell: what a dialog shows the sets with.
+ */
+export function paintIcon(ctx: CanvasRenderingContext2D, icon: IconGlyph, x: number, y: number, size: number): void {
+  drawIcon({ ctx, painter: new TextPainter(ctx) }, icon, x, y, size);
 }
 
 // ---------------------------------------------------------------------------

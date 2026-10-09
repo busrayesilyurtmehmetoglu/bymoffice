@@ -30,6 +30,7 @@ import {
   type Color,
   type ConditionalFormat,
   type ConditionalRule,
+  type ConditionalValue,
   type DataValidation,
   type DifferentialFormat,
   type ColumnRange,
@@ -56,7 +57,7 @@ import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../../render/
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { parseColor } from './styles';
-import { conditionalRuleXml, dataValidationXml, freshSheetParts } from './build';
+import { conditionalRuleXml, dataValidationXml, freshSheetParts, type RuleExtra } from './build';
 
 const encoder = new TextEncoder();
 
@@ -1538,6 +1539,8 @@ function nameNeedles(names: string[]): string[] {
 const RULE_ATTRS = ['type', 'dxfId', 'priority', 'stopIfTrue', 'aboveAverage', 'percent', 'bottom', 'operator', 'text', 'timePeriod', 'rank', 'stdDev', 'equalAverage'];
 /** Children of <cfRule> the model has a field for. */
 const RULE_CHILDREN = ['formula', 'colorScale', 'dataBar', 'iconSet'];
+/** Attributes of <iconSet> the model has a field for; every other one of a source element is kept (`percent`). */
+const ICON_SET_ATTRS = ['iconSet', 'showValue', 'reverse'];
 
 /**
  * What a sheet whose conditional formats were changed asks of its <conditionalFormatting>
@@ -1653,6 +1656,57 @@ function collectConditionalSources(s: string, plan: ConditionalPlan): void {
   }
 }
 
+/**
+ * What the source element of a colour scale, a data bar or an icon set holds beside the fields
+ * of the model, into `extra`: of each threshold its other attributes and its children (while
+ * the element has as many thresholds as the model: thresholds that were given anew are
+ * written as they are), and of an icon set its other attributes and the elements among its
+ * thresholds.
+ */
+function keptThresholds(source: XmlElement, values: ConditionalValue[], icons: boolean, extra: RuleExtra): void {
+  const nodes: XmlElement[] = [];
+  const between: string[] = [''];
+  for (const node of source.children) {
+    if (node.type !== 'element') continue;
+    if (localName(node.name) === 'cfvo') {
+      nodes.push(node);
+      between.push('');
+    } else if (icons) between[between.length - 1] += elementText(node);
+  }
+  if (icons) {
+    let attrs = '';
+    for (const [name, value] of source.attrs) if (ICON_SET_ATTRS.indexOf(name) < 0) attrs += ` ${name}="${escapeAttr(value)}"`;
+    extra.icons = attrs;
+    extra.iconsBetween = between;
+  }
+  if (nodes.length !== values.length) return;
+  extra.cfvo = (index, written) => {
+    const node = nodes[index];
+    const value = values[index];
+    // A value stated in an element of its own (the extension list writes it so) is not one of the main part.
+    if (!node || !value || node.children.some((child) => child.type === 'element' && localName(child.name) === 'f')) return written;
+    const type = value.type === 'autoMin' ? 'min' : value.type === 'autoMax' ? 'max' : value.type;
+    const flag = node.attrs.get('gte');
+    const gte = flag === undefined || !/^(0|false)$/.test(flag.trim());
+    if ((node.attrs.get('type') || 'num') === type && node.attrs.get('val') === value.value && (!icons || gte === (value.gte !== false))) return elementText(node);
+    // What changed is written anew, in the place it has in the element; the rest of the element stays.
+    const attrs = new Map<string, string>();
+    for (const [name, text] of node.attrs) {
+      if (name === 'type') attrs.set(name, type);
+      else if (name === 'val') {
+        if (value.value !== undefined) attrs.set(name, value.value);
+      } else if (name === 'gte' && icons) {
+        if (value.gte === false) attrs.set(name, '0');
+        else if (gte) attrs.set(name, text);
+      } else attrs.set(name, text);
+    }
+    if (!attrs.has('type')) attrs.set('type', type);
+    if (!attrs.has('val') && value.value !== undefined) attrs.set('val', value.value);
+    if (icons && value.gte === false && !attrs.has('gte')) attrs.set('gte', '0');
+    return elementText({ type: 'element', name: node.name, attrs, children: node.children });
+  };
+}
+
 /** A rule written from the model; one that came from the file keeps what its source holds beside the fields of the model. */
 function liveRuleXml(rule: ConditionalRule, prefix: string, plan: ConditionalPlan): string {
   const priority = rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++plan.highest;
@@ -1677,9 +1731,21 @@ function liveRuleXml(rule: ConditionalRule, prefix: string, plan: ConditionalPla
   const root = parseXml(source).root;
   let attrs = '';
   for (const [name, value] of root.attrs) if (RULE_ATTRS.indexOf(name) < 0) attrs += ` ${name}="${escapeAttr(value)}"`;
-  let children = '';
-  for (const node of root.children) if (node.type === 'element' && RULE_CHILDREN.indexOf(localName(node.name)) < 0) children += elementText(node);
-  return conditionalRuleXml(rule, priority, plan.dxfOf(rule), undefined, prefix, { attrs, children });
+  const extra: RuleExtra = { attrs, children: '' };
+  // The element that states what the rule still states: its thresholds are those of the model, one for one.
+  const holder = rule.iconSet ? 'iconSet' : rule.colorScale ? 'colorScale' : rule.dataBar ? 'dataBar' : '';
+  const values = rule.iconSet ? rule.iconSet.values : rule.colorScale ? rule.colorScale.values : rule.dataBar ? [rule.dataBar.min, rule.dataBar.max] : [];
+  let held = false;
+  for (const node of root.children) {
+    if (node.type !== 'element') continue;
+    const local = localName(node.name);
+    if (RULE_CHILDREN.indexOf(local) < 0) extra.children += elementText(node);
+    else if (local === holder && !held) {
+      held = true;
+      keptThresholds(node, values, holder === 'iconSet', extra);
+    }
+  }
+  return conditionalRuleXml(rule, priority, plan.dxfOf(rule), undefined, prefix, extra);
 }
 
 /** The formats of the model as elements, in its order; '' when there is none. */

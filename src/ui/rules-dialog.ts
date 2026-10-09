@@ -15,14 +15,17 @@
 import { parseFormula } from '../calc/parse';
 import { cellEditText, parseCellInput } from '../edit/input';
 import { formulaFromLocal, formulaToLocal } from '../edit/formula-locale';
+import { ICON_SETS, type IconGlyph } from '../format/conditional';
 import type { FormatLocale } from '../format/locale';
 import { MAX_COLS, MAX_ROWS, parseCellRef, parseRange, rangeName, type CellRange, type Color, type ConditionalRule, type DataValidation } from '../model/sheet/types';
 import {
   CONDITIONAL_TYPES,
+  ICON_SET_NAMES,
   MAX_CONDITIONAL_TEXT,
   MAX_VALIDATION_LIST,
   MAX_VALIDATION_MESSAGE,
   MAX_VALIDATION_TITLE,
+  TIME_PERIODS,
   VALIDATION_OPERATORS,
   VALIDATION_TYPES,
   ruleFormatOf,
@@ -31,11 +34,14 @@ import {
   type ConditionalRuleInfo,
   type ConditionalSettings,
   type ConditionalType,
+  type IconSetName,
   type RuleFormat,
+  type TimePeriod,
   type ValidationOperator,
   type ValidationSettings,
   type ValidationType,
 } from '../ops/rules';
+import { paintIcon } from '../render/grid';
 import type { RuleStrings } from './strings';
 
 // ---------------------------------------------------------------------------
@@ -308,6 +314,12 @@ export interface ConditionalFields {
   color3: string;
   /** dataBar. */
   barColor: string;
+  /** iconSet: the name of the set as the file has it, its icons the other way round, and the icon without the value. */
+  iconSet: string;
+  reverse: boolean;
+  iconOnly: boolean;
+  /** timePeriod: the period as the file names it ("today", "last7Days", ...). */
+  period: string;
 }
 
 /** The formats the dialog offers, as Excel offers them. */
@@ -317,8 +329,25 @@ export const FORMAT_PRESETS: Record<string, { fill: string; color: string }> = {
   green: { fill: '#C6EFCE', color: '#006100' },
 };
 
-/** Kinds of rule that give a format of their own choosing (the others colour by themselves). */
-export const hasFormat = (type: string): boolean => type !== 'colorScale' && type !== 'dataBar';
+/** Kinds of rule that give a format of their own choosing (the others colour by themselves, or show an icon). */
+export const hasFormat = (type: string): boolean => type !== 'colorScale' && type !== 'dataBar' && type !== 'iconSet';
+
+/** The icon sets the dialog offers: those a rule is made with, as far as they can be drawn. */
+export const offeredIconSets = (): string[] => (ICON_SET_NAMES as readonly string[]).filter((name) => ICON_SETS.has(name));
+
+/**
+ * The icons a set shows, from the icon of the lowest values to that of the highest. A set that
+ * is not known is shown as the grid shows it: as the plainest set of its size.
+ */
+export function iconsOfSet(name: string, reverse: boolean): IconGlyph[] {
+  let set = ICON_SETS.get(name);
+  if (!set) {
+    const size = Number(String(name).charAt(0));
+    set = ICON_SETS.get(size === 4 ? '4TrafficLights' : size === 5 ? '5Quarters' : '3TrafficLights1') as readonly IconGlyph[];
+  }
+  const icons = set.slice();
+  return reverse ? icons.reverse() : icons;
+}
 
 const plainColor = (color: Color | undefined): string | undefined => (color && typeof color.rgb === 'string' && /^[0-9A-Fa-f]{6,8}$/.test(color.rgb) ? `#${color.rgb.slice(-6).toUpperCase()}` : undefined);
 
@@ -377,6 +406,10 @@ export function conditionalFields(info: ConditionalRuleInfo | undefined, locale:
     color2: '#FFEB84',
     color3: '#63BE7B',
     barColor: '#638EC6',
+    iconSet: '3TrafficLights1',
+    reverse: false,
+    iconOnly: false,
+    period: 'today',
   };
   if (!info) return fields;
   const rule = info.rule;
@@ -409,6 +442,12 @@ export function conditionalFields(info: ConditionalRuleInfo | undefined, locale:
     if (last) fields.color3 = last;
   }
   if (rule.dataBar) fields.barColor = colorOf(rule.dataBar.color) || fields.barColor;
+  if (rule.iconSet) {
+    fields.iconSet = typeof rule.iconSet.set === 'string' ? rule.iconSet.set : fields.iconSet;
+    fields.reverse = rule.iconSet.reverse === true;
+    fields.iconOnly = rule.iconSet.showValue === false;
+  }
+  if (rule.type === 'timePeriod') fields.period = typeof rule.timePeriod === 'string' ? rule.timePeriod : '';
 
   // The format: none, one of those offered when it says exactly that and nothing else, or "the format the rule has" -
   // with what the fields can show of it, for whoever goes on to change it.
@@ -451,7 +490,7 @@ export function formatFromFields(fields: ConditionalFields): RuleFormat | null |
   return format;
 }
 
-const CONTENT_FIELDS = ['type', 'operator', 'value1', 'value2', 'text', 'rank', 'percent', 'bottom', 'average', 'equalAverage', 'scale', 'color1', 'color2', 'color3', 'barColor'] as const;
+const CONTENT_FIELDS = ['type', 'operator', 'value1', 'value2', 'text', 'rank', 'percent', 'bottom', 'average', 'equalAverage', 'scale', 'color1', 'color2', 'color3', 'barColor', 'iconSet', 'reverse', 'iconOnly', 'period'] as const;
 const FORMAT_FIELDS = ['preset', 'useColor', 'color', 'useFill', 'fill', 'bold', 'italic', 'underline', 'strike'] as const;
 
 /**
@@ -573,6 +612,16 @@ export function conditionalFromFields(fields: ConditionalFields, locale: FormatL
     case 'dataBar':
       settings.colors = [fields.barColor];
       break;
+    case 'iconSet':
+      // The name as the rule has it: a set that is not made here stays the set of the rule it is on, and is refused for any other.
+      settings.iconSet = fields.iconSet as IconSetName;
+      settings.reverse = fields.reverse === true;
+      settings.showValue = fields.iconOnly !== true;
+      break;
+    case 'timePeriod':
+      if (fields.period === '') throw new FieldError(strings.needValue(strings.period), 'period');
+      settings.timePeriod = fields.period as TimePeriod;
+      break;
     default:
     // The other kinds say everything by being what they are.
   }
@@ -606,6 +655,8 @@ export function describeRule(rule: ConditionalRule, strings: RuleStrings, locale
       return `${strings.formulaIs}: =${formulaToLocal(typeof rule.formulas[0] === 'string' ? rule.formulas[0] : '', locale)}`;
     case 'timePeriod':
       return `${strings.datesOccurring}: ${named(strings.periods, rule.timePeriod, rule.timePeriod || '')}`;
+    case 'iconSet':
+      return rule.iconSet && typeof rule.iconSet.set === 'string' ? `${strings.conditionalTypes.iconSet}: ${named(strings.iconSets, rule.iconSet.set, rule.iconSet.set)}` : strings.conditionalTypes.iconSet;
     default:
       return named(strings.conditionalTypes, rule.type, rule.type);
   }
@@ -1149,6 +1200,13 @@ export interface ConditionalDialogOptions {
   onClose(): void;
 }
 
+/** The picture of an icon set in the dialog: up to five icons in a row, in CSS pixels. */
+export const PREVIEW_ICON = 20;
+export const PREVIEW_GAP = 8;
+export const PREVIEW_PADDING = 4;
+const PREVIEW_WIDTH = 2 * PREVIEW_PADDING + 5 * PREVIEW_ICON + 4 * PREVIEW_GAP;
+const PREVIEW_HEIGHT = 2 * PREVIEW_PADDING + PREVIEW_ICON;
+
 /** The field a kind of rule is typed into first. */
 function firstFieldOf(type: string): string {
   if (type === 'cellIs' || type === 'expression') return 'value1';
@@ -1157,6 +1215,8 @@ function firstFieldOf(type: string): string {
   if (type === 'aboveAverage') return 'average';
   if (type === 'colorScale') return 'scale';
   if (type === 'dataBar') return 'barColor';
+  if (type === 'iconSet') return 'iconSet';
+  if (type === 'timePeriod') return 'period';
   return 'preset';
 }
 
@@ -1166,6 +1226,8 @@ export class ConditionalDialog {
   private readonly strings: RuleStrings;
   private readonly controls: Record<string, HTMLInputElement | HTMLSelectElement>;
   private readonly rows: Record<string, HTMLElement>;
+  /** Shows the icons of the set that is chosen. */
+  private readonly preview: HTMLCanvasElement;
 
   constructor(options: ConditionalDialogOptions) {
     const strings = options.strings;
@@ -1212,6 +1274,28 @@ export class ConditionalDialog {
     colour('color2', strings.midpoint);
     colour('color3', strings.highest);
     colour('barColor', strings.barColor);
+    // The names are those of the file; one that is not offered (the rule that is edited has it) is listed under its own name, as text.
+    const named = (offered: readonly string[], own: string, labels: Record<string, string>) =>
+      (offered.indexOf(own) < 0 ? offered.concat([own]) : offered).map((name) => [name, Object.prototype.hasOwnProperty.call(labels, name) ? labels[name] : name] as [string, string]);
+    list('iconSet', strings.iconStyle, named(offeredIconSets(), options.fields.iconSet, strings.iconSets));
+    const preview = document.createElement('canvas');
+    preview.className = 'bym-dialog-icons';
+    preview.setAttribute('data-bym-field', 'iconPreview');
+    preview.setAttribute('role', 'img');
+    preview.setAttribute('aria-label', strings.iconPreview);
+    preview.style.cssText = `display:block;flex:none;width:${PREVIEW_WIDTH}px;height:${PREVIEW_HEIGHT}px`;
+    const previewRow = document.createElement('div');
+    previewRow.className = 'bym-dialog-row';
+    const spacer = document.createElement('div');
+    spacer.className = 'bym-dialog-label';
+    previewRow.appendChild(spacer);
+    previewRow.appendChild(preview);
+    body.appendChild(previewRow);
+    rows.iconPreview = previewRow;
+    this.preview = preview;
+    check('reverse', strings.reverseIcons);
+    check('iconOnly', strings.iconOnly);
+    list('period', strings.period, named(TIME_PERIODS, options.fields.type === 'timePeriod' ? options.fields.period : TIME_PERIODS[0], strings.periods));
 
     const format = dialog.section(strings.format);
     rows.format = format;
@@ -1237,7 +1321,7 @@ export class ConditionalDialog {
       else if (control instanceof HTMLInputElement && control.type === 'color') control.value = String(fields[name]).toLowerCase();
       else control.value = String(fields[name]);
     }
-    for (const name of ['type', 'operator', 'preset', 'scale', 'useColor', 'useFill']) controls[name].addEventListener('change', () => this.arrange());
+    for (const name of ['type', 'operator', 'preset', 'scale', 'useColor', 'useFill', 'iconSet', 'reverse']) controls[name].addEventListener('change', () => this.arrange());
     this.arrange();
 
     dialog.addAction(strings.cancel, () => dialog.close()).setAttribute('data-bym-action', 'cancel');
@@ -1300,6 +1384,11 @@ export class ConditionalDialog {
       color2: type === 'colorScale' && c.scale.value === '3',
       color3: type === 'colorScale',
       barColor: type === 'dataBar',
+      iconSet: type === 'iconSet',
+      iconPreview: type === 'iconSet',
+      reverse: type === 'iconSet',
+      iconOnly: type === 'iconSet',
+      period: type === 'timePeriod',
       format: hasFormat(type),
       useColor: custom,
       color: custom && (c.useColor as HTMLInputElement).checked,
@@ -1313,6 +1402,21 @@ export class ConditionalDialog {
     for (const name of Object.keys(shown)) this.rows[name].style.display = shown[name] ? '' : 'none';
     const label = this.rows.value1.getElementsByTagName('label')[0];
     if (label) label.textContent = type === 'expression' ? this.strings.formula : two ? this.strings.minimum : this.strings.value;
+    if (type === 'iconSet') this.paintPreview();
+  }
+
+  /** Draws the icons of the chosen set, the icon of the lowest values first. Shapes only: nothing of the file is drawn as text. */
+  private paintPreview(): void {
+    const canvas = this.preview;
+    const ctx = typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null;
+    if (!ctx) return;
+    const dpr = typeof window !== 'undefined' && window.devicePixelRatio > 0 ? Math.min(window.devicePixelRatio, 4) : 1;
+    canvas.width = Math.round(PREVIEW_WIDTH * dpr);
+    canvas.height = Math.round(PREVIEW_HEIGHT * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    const icons = iconsOfSet(this.controls.iconSet.value, (this.controls.reverse as HTMLInputElement).checked);
+    icons.forEach((icon, at) => paintIcon(ctx, icon, PREVIEW_PADDING + at * (PREVIEW_ICON + PREVIEW_GAP), PREVIEW_PADDING, PREVIEW_ICON));
   }
 }
 

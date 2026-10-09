@@ -3543,7 +3543,7 @@ export class WorkbookView {
    * Opens a dialog of conditional formats over the view. `what` says which: "manage" the list
    * of rules (of the selection, or of the sheet); a number the dialog of that rule (see
    * conditionalRules()); anything else the dialog of a new rule for the selection - a kind of
-   * rule ("cellIs", "containsText", "top10", "colorScale", "dataBar", ...) or one of the
+   * rule ("cellIs", "containsText", "top10", "colorScale", "dataBar", "iconSet", "timePeriod", ...) or one of the
    * comparisons "greaterThan", "lessThan", "between", "equal". What is being typed is applied
    * first. Returns false when there is no dialog: a read-only view, a sheet without cells, a
    * formula that is being typed, something typed that cannot be applied, a rule that cannot
@@ -4589,6 +4589,8 @@ export class WorkbookView {
     if (/^A rule of the kind ".*" cannot be changed here/.test(message)) return rules.ruleKindKept;
     if (message === 'The sheet has too many conditional formats') return rules.tooManyConditional;
     if (message === 'The rule needs a text to look for') return rules.needValue(rules.text);
+    if (message === 'The rule needs a period' || message === 'This period is not known') return rules.needValue(rules.period);
+    if (message === 'This icon set is not known, or is not made here') return rules.needValue(rules.iconStyle);
     if ((match = /^The number of a top or bottom rule is a whole number between 1 and (\d+)$/.exec(message))) return rules.needWholeUpTo(rules.rank, Number(match[1]));
     if (/: the rule there is one of the extension list/.test(message)) return rules.extensionRule;
     if (message === 'The sheet has too many data validations') return rules.tooManyValidations;

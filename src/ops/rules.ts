@@ -15,8 +15,9 @@
 // evaluation, the writer and the builder of a new file all ask them.
 
 import { parseFormula } from '../calc/parse';
-import { adjustAnchoredFormula, adjustFormula, adjustRange, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
+import { adjustAnchoredFormula, adjustFormula, adjustRange, formulaNamesSheetsUnread, formulaReferences, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { textToNumber } from '../calc/values';
+import { ICON_SETS } from '../format/conditional';
 import { resolveColor } from '../model/sheet/color';
 import {
   MAX_COLS,
@@ -723,7 +724,7 @@ export const MAX_SHEET_CONDITIONAL_RULES = 65534;
 /** Longest text a rule looks for in a cell. */
 export const MAX_CONDITIONAL_TEXT = 255;
 
-/** The kinds of rule that are made and changed here. Icon sets and time periods are kept, listed, moved and deleted. */
+/** The kinds of rule that are made and changed here. Every other kind of a file is kept, listed, moved and deleted. */
 export const CONDITIONAL_TYPES = [
   'cellIs',
   'containsText',
@@ -741,8 +742,40 @@ export const CONDITIONAL_TYPES = [
   'expression',
   'colorScale',
   'dataBar',
+  'iconSet',
+  'timePeriod',
 ] as const;
 export type ConditionalType = (typeof CONDITIONAL_TYPES)[number];
+
+/**
+ * The icon sets a rule is made with: those the main part of a sheet can name (ST_IconSetType).
+ * The sets of the 2010 extension ("3Stars", "3Triangles", "5Boxes") and icons chosen one by
+ * one are kept where a file has them, and not made here.
+ */
+export const ICON_SET_NAMES = [
+  '3Arrows',
+  '3ArrowsGray',
+  '3Flags',
+  '3TrafficLights1',
+  '3TrafficLights2',
+  '3Signs',
+  '3Symbols',
+  '3Symbols2',
+  '4Arrows',
+  '4ArrowsGray',
+  '4RedToBlack',
+  '4Rating',
+  '4TrafficLights',
+  '5Arrows',
+  '5ArrowsGray',
+  '5Rating',
+  '5Quarters',
+] as const;
+export type IconSetName = (typeof ICON_SET_NAMES)[number];
+
+/** The periods a "dates occurring" rule is made with (ST_TimePeriod). */
+export const TIME_PERIODS = ['yesterday', 'today', 'tomorrow', 'last7Days', 'lastWeek', 'thisWeek', 'nextWeek', 'lastMonth', 'thisMonth', 'nextMonth'] as const;
+export type TimePeriod = (typeof TIME_PERIODS)[number];
 
 /** What a rule does to the cells it matches: colours as "#RRGGBB". Only what is stated is applied on top of the format of the cell. */
 export interface RuleFormat {
@@ -786,6 +819,17 @@ export interface ConditionalSettings {
   format?: RuleFormat | null;
   /** colorScale: two or three colours, from the lowest value to the highest; dataBar: the colour of the bar. */
   colors?: string[];
+  /**
+   * iconSet: the set (default "3TrafficLights1"), whether its icons go the other way round, and
+   * whether the value is shown beside the icon (default true). A new rule shares the range out
+   * evenly, in percent (0/33/67, 0/25/50/75, 0/20/40/60/80); a rule that is changed keeps the
+   * thresholds it has while the set has as many icons as before.
+   */
+  iconSet?: IconSetName;
+  reverse?: boolean;
+  showValue?: boolean;
+  /** timePeriod: the period the date of a cell is in. */
+  timePeriod?: TimePeriod;
 }
 
 /** One rule of a sheet, for whoever lists them. */
@@ -1038,11 +1082,80 @@ export function textRuleCell(rule: Pick<ConditionalRule, 'type' | 'text' | 'form
 }
 
 /**
+ * The formula Excel writes beside the `timePeriod` of a rule, for the cell `cell` ("A1"). The
+ * rule is evaluated by its period (see inTimePeriod() of the conditional formats); the formula
+ * is what a reader without the attribute goes by.
+ *
+ * UNSURE (not compared with Excel): the two part ways for a date that a cell holds as text.
+ * The rule looks at numbers only; the formula takes "45000" and "3/15/2023" for the dates
+ * they read as. Should Excel go by the formula, it fills such cells and this engine does not.
+ *
+ * UNSURE (not compared with Excel): `cell` is the first cell of the first range of the rule,
+ * as for every formula of a rule here. LibreOffice writes and reads such formulas for the
+ * top-left corner of all the ranges together, which is another cell when the first range is
+ * not the one that begins there.
+ */
+function periodFormula(period: string, cell: string): string | undefined {
+  switch (period) {
+    case 'today':
+      return `FLOOR(${cell},1)=TODAY()`;
+    case 'yesterday':
+      return `FLOOR(${cell},1)=TODAY()-1`;
+    case 'tomorrow':
+      return `FLOOR(${cell},1)=TODAY()+1`;
+    case 'last7Days':
+      return `AND(TODAY()-FLOOR(${cell},1)<=6,FLOOR(${cell},1)<=TODAY())`;
+    // UNSURE: the formulas of all ten periods are, letter for letter, what other libraries write for them (exceljs all of them,
+    // XlsxWriter eight); they were not compared with a file saved by Excel.
+    case 'lastWeek':
+      return `AND(TODAY()-ROUNDDOWN(${cell},0)>=(WEEKDAY(TODAY())),TODAY()-ROUNDDOWN(${cell},0)<(WEEKDAY(TODAY())+7))`;
+    case 'thisWeek':
+      return `AND(TODAY()-ROUNDDOWN(${cell},0)<=WEEKDAY(TODAY())-1,ROUNDDOWN(${cell},0)-TODAY()<=7-WEEKDAY(TODAY()))`;
+    case 'nextWeek':
+      return `AND(ROUNDDOWN(${cell},0)-TODAY()>(7-WEEKDAY(TODAY())),ROUNDDOWN(${cell},0)-TODAY()<(15-WEEKDAY(TODAY())))`;
+    case 'lastMonth':
+      return `AND(MONTH(${cell})=MONTH(EDATE(TODAY(),0-1)),YEAR(${cell})=YEAR(EDATE(TODAY(),0-1)))`;
+    case 'thisMonth':
+      return `AND(MONTH(${cell})=MONTH(TODAY()),YEAR(${cell})=YEAR(TODAY()))`;
+    case 'nextMonth':
+      return `AND(MONTH(${cell})=MONTH(EDATE(TODAY(),0+1)),YEAR(${cell})=YEAR(EDATE(TODAY(),0+1)))`;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * The cell the formula of a "dates occurring" rule is written for, as the formula spells it
+ * ("B2", "$B2", ...): the first reference of the formula, when that is the first cell of the
+ * rule and nothing else (no range, no sheet name). Whatever else the formula says does not
+ * matter: a formula of another producer, or one with spaces of its own, names its cell all
+ * the same. The plain name of the cell for any other formula, and for a rule without one.
+ */
+function periodRuleCell(rule: Pick<ConditionalRule, 'formulas'>, anchor: { row: number; col: number }): string {
+  const plain = cellText(anchor.row, anchor.col);
+  const written = typeof rule.formulas[0] === 'string' ? rule.formulas[0] : undefined;
+  if (written === undefined) return plain;
+  const first = formulaReferences(written)[0];
+  if (!first || first.kind !== 'cell' || first.start !== first.bodyStart || first.write(false, false) !== plain) return plain;
+  return first.write(first.absCol, first.absRow);
+}
+
+/** The thresholds a new icon set starts with, as Excel's do: the range shared out evenly, in percent. */
+function iconThresholds(count: number): ConditionalValue[] {
+  const out: ConditionalValue[] = [];
+  for (let i = 0; i < count; i++) out.push({ type: 'percent', value: String(count === 3 ? [0, 33, 67][i] : Math.round((100 * i) / count)), gte: true });
+  return out;
+}
+
+/** Kinds of rule that show what they find by themselves (a colour, a bar, an icon) and give no format. */
+const formatsItself = (type: string) => type === 'colorScale' || type === 'dataBar' || type === 'iconSet';
+
+/**
  * The rule the settings stand for, for a rule whose first cell is `anchor`. `base` is the rule
  * that is changed. While the kind of rule stays, the settings are a patch on it: what they do
  * not state, and what they state as the rule has it, stays as the rule has it - with everything
- * the settings have no word for (the thresholds of a scale or a bar, the lengths of a bar, a
- * number of deviations, the spelling of a formula). Its place in the file and the record of
+ * the settings have no word for (the thresholds of a scale, a bar or an icon set, the lengths of
+ * a bar, a number of deviations, the spelling of a formula). Its place in the file and the record of
  * its format stay in any case. Throws RangeError for what a rule cannot say.
  */
 function ruleFromSettings(settings: ConditionalSettings, anchor: { row: number; col: number }, base: ConditionalRule | undefined, styles: StyleSheet, read: ColorReader): ConditionalRule {
@@ -1151,11 +1264,41 @@ function ruleFromSettings(settings: ConditionalSettings, anchor: { row: number; 
       rule.dataBar = { min: { type: 'min', gte: true }, max: { type: 'max', gte: true }, color, showValue: true, minLength: 10, maxLength: 90, extended: false, gradient: true, negativeFillSameAsPositive: false, negativeBorderSameAsPositive: true, axisPosition: 'automatic', direction: 'context' };
       break;
     }
+    case 'iconSet': {
+      const kept = same && same.iconSet ? same.iconSet : undefined;
+      const name = settings.iconSet !== undefined ? settings.iconSet : kept ? kept.set : '3TrafficLights1';
+      const reverse = settings.reverse !== undefined ? settings.reverse === true : kept ? kept.reverse === true : false;
+      const showValue = settings.showValue !== undefined ? settings.showValue !== false : kept ? kept.showValue !== false : true;
+      if (kept && kept.set === name) {
+        // The set it has, whatever that is: its thresholds stay as the file states them.
+        if (kept.reverse !== reverse || kept.showValue !== showValue) rule.iconSet = { ...kept, reverse, showValue };
+        break;
+      }
+      const icons = (ICON_SET_NAMES as readonly string[]).indexOf(name) >= 0 ? ICON_SETS.get(name) : undefined;
+      if (!icons) throw new RangeError('This icon set is not known, or is not made here');
+      // As many icons as there were: where one ends and the next begins stays. Icons chosen one by one are of the set that goes.
+      const values = kept && !kept.custom && kept.values.length === icons.length ? kept.values : iconThresholds(icons.length);
+      rule.iconSet = { set: name, values, showValue, reverse };
+      break;
+    }
+    case 'timePeriod': {
+      const period = settings.timePeriod !== undefined ? settings.timePeriod : same && typeof same.timePeriod === 'string' ? same.timePeriod : undefined;
+      if (period === undefined) throw new RangeError('The rule needs a period');
+      // The period the rule has: the rule as it is, with the formula as it is written.
+      if (same && same.timePeriod === period) break;
+      // Written for the cell the old formula named, the way it named it ("$A1").
+      const formula = (TIME_PERIODS as readonly string[]).indexOf(period) >= 0 ? periodFormula(period, same ? periodRuleCell(same, anchor) : cell) : undefined;
+      if (formula === undefined) throw new RangeError('This period is not known');
+      rule.timePeriod = period;
+      rule.formulas = [formula];
+      break;
+    }
     default:
     // duplicateValues and uniqueValues say everything by their kind.
   }
-  // Scales and bars colour by themselves; every other rule gives the format it is told, or keeps the one it has.
-  if (type === 'colorScale' || type === 'dataBar') return withFormat(rule, null, styles, read);
+  // Scales, bars and icons show what they find by themselves: a rule that becomes one, and a new one, has no format. One that is
+  // one already keeps the record a file names on it (nobody shows it, and nobody is to take it away).
+  if (formatsItself(type)) return same ? rule : withFormat(rule, null, styles, read);
   return settings.format === undefined ? rule : withFormat(rule, settings.format, styles, read);
 }
 
@@ -1327,7 +1470,7 @@ export function updateConditionalRule(workbook: Workbook, sheetIndex: number, in
   let rule = slot.rule;
   // What it says is stated for the cells it has; where it applies comes after.
   if (patch.rule !== undefined) rule = ruleFromSettings(patch.rule, { row: slot.ranges[0].top, col: slot.ranges[0].left }, rule, workbook.styles, read);
-  if (patch.format !== undefined && !(patch.rule !== undefined && patch.rule.format !== undefined) && rule.type !== 'colorScale' && rule.type !== 'dataBar') rule = withFormat(rule, patch.format, workbook.styles, read);
+  if (patch.format !== undefined && !(patch.rule !== undefined && patch.rule.format !== undefined) && !formatsItself(rule.type)) rule = withFormat(rule, patch.format, workbook.styles, read);
   if (patch.stopIfTrue !== undefined && (patch.stopIfTrue === true) !== rule.stopIfTrue) rule = { ...rule, stopIfTrue: patch.stopIfTrue === true };
   const moved = !sameRanges(ranges, slot.ranges);
   if (moved) rule = reanchored(rule, slot.ranges[0], ranges[0]);

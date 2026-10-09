@@ -1116,6 +1116,8 @@ export class ConditionalFormats implements ConditionalSource {
         return value === ERROR_CELL;
       case K_NOT_CONTAINS_ERRORS:
         return value !== ERROR_CELL;
+      // By the period, not by the formula the file has beside it, and for numbers only. UNSURE (not compared with Excel): the
+      // formula would take a date that is kept as text ("45000", "3/15/2023") for that date; see periodFormula() of the rules.
       case K_TIME_PERIOD:
         return typeof value === 'number' && inTimePeriod(rule.timePeriod, dayOf(value, this.workbook.date1904 === true), this.today());
       case K_TOP10: {

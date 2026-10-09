@@ -298,21 +298,21 @@ test.describe('editing conditional formats', () => {
     await expect(field(page, 'scope', 'conditional-rules')).toHaveValue('selection');
     expect(await rowTexts(page)).toEqual(['Cell value greater than 4']);
     await field(page, 'scope', 'conditional-rules').selectOption('sheet');
-    expect(await rowTexts(page)).toEqual(['Cell value greater than 4', 'Icon set', 'Cell value greater than 2']);
+    expect(await rowTexts(page)).toEqual(['Cell value greater than 4', 'Icon set: 3 arrows (coloured)', 'Cell value greater than 2']);
     await expect(row(page, 0).locator('[data-bym-field="ranges"]')).toHaveValue('A1:A4');
-    // An icon set is kept as it is: it can be moved and deleted, not changed.
-    await expect(row(page, 1).locator('[data-bym-action="edit"]')).toBeDisabled();
+    // An icon set of the main part is changed like any other rule (see rules-iconset-date.spec.ts).
+    await expect(row(page, 1).locator('[data-bym-action="edit"]')).toBeEnabled();
     await expect(row(page, 1).locator('[data-bym-action="delete"]')).toBeEnabled();
     await expect(row(page, 0).locator('[data-bym-action="up"]')).toBeDisabled();
     await expect(row(page, 2).locator('[data-bym-action="down"]')).toBeDisabled();
 
     await row(page, 0).locator('[data-bym-action="down"]').click();
-    expect(await rowTexts(page)).toEqual(['Icon set', 'Cell value greater than 4', 'Cell value greater than 2']);
+    expect(await rowTexts(page)).toEqual(['Icon set: 3 arrows (coloured)', 'Cell value greater than 4', 'Cell value greater than 2']);
     expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|A1:A4|cellIs|2|greaterThan 4', '2|D1:D4|cellIs|3|greaterThan 2']);
     // The button that was pressed is still the one in focus, for the next press.
     expect(await focusedField(page)).toBe('down');
     await row(page, 2).locator('[data-bym-action="up"]').click();
-    expect(await rowTexts(page)).toEqual(['Icon set', 'Cell value greater than 2', 'Cell value greater than 4']);
+    expect(await rowTexts(page)).toEqual(['Icon set: 3 arrows (coloured)', 'Cell value greater than 2', 'Cell value greater than 4']);
 
     // Where a rule applies is typed; what is no range is said and not taken.
     const cells = row(page, 2).locator('[data-bym-field="ranges"]');
@@ -340,7 +340,7 @@ test.describe('editing conditional formats', () => {
     await fill(page, { operator: 'lessThan', value1: '6', preset: 'green' });
     await action(page, 'ok').click();
     await expect(manager(page)).toBeVisible();
-    expect(await rowTexts(page)).toEqual(['Icon set', 'Cell value greater than 2', 'Cell value less than 6']);
+    expect(await rowTexts(page)).toEqual(['Icon set: 3 arrows (coloured)', 'Cell value greater than 2', 'Cell value less than 6']);
     expect(await fills(page, 0, 4)).toEqual([GREEN, GREEN, WHITE, GREEN]);
 
     await row(page, 0).locator('[data-bym-action="delete"]').click();
@@ -369,14 +369,14 @@ test.describe('editing conditional formats', () => {
     await mount(page, await ruled(true));
     expect(await view(page, 'view.openConditionalDialog("manage")')).toBe(true);
     await field(page, 'scope', 'conditional-rules').selectOption('sheet');
-    expect(await rowTexts(page)).toEqual(['Icon set', 'Cell value greater than 2', 'Icon set']);
+    expect(await rowTexts(page)).toEqual(['Icon set: 3 arrows (coloured)', 'Cell value greater than 2', 'Icon set: 3 stars']);
     for (const name of ['up', 'down', 'edit', 'delete']) await expect(row(page, 2).locator(`[data-bym-action="${name}"]`)).toBeDisabled();
     await expect(row(page, 2).locator('[data-bym-field="ranges"]')).toHaveAttribute('readonly', '');
     await expect(row(page, 2).locator('[data-bym-action="delete"]')).toHaveAttribute('title', /newer Excel/);
     // Its number is kept, and with it the order of all.
     await expect(row(page, 0).locator('[data-bym-action="down"]')).toBeDisabled();
     await row(page, 1).locator('[data-bym-action="delete"]').click();
-    expect(await rowTexts(page)).toEqual(['Icon set', 'Icon set']);
+    expect(await rowTexts(page)).toEqual(['Icon set: 3 arrows (coloured)', 'Icon set: 3 stars']);
     await page.keyboard.press('Escape');
     expect(await view(page, 'view.removeConditionalRule(1)').catch((error: Error) => error.message)).toMatch(/extension list/);
     expect(await rules(page)).toEqual(['0|D1:D4|iconSet|1', '1|C1:C4|iconSet|3']);

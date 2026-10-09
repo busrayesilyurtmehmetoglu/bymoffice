@@ -319,7 +319,7 @@ export interface RuleStrings {
   conditionalTitle: string;
   managerTitle: string;
   ruleType: string;
-  /** By ST_CfType, the kinds that are only kept (iconSet, timePeriod) included. */
+  /** By ST_CfType. */
   conditionalTypes: Record<string, string>;
   text: string;
   rank: string;
@@ -344,6 +344,14 @@ export interface RuleStrings {
   midpoint: string;
   highest: string;
   barColor: string;
+  /** Icon sets: the label of the list of sets, the sets by their name in the file (those of the 2010 extension included), and what the picture beside the list is. */
+  iconStyle: string;
+  iconSets: Record<string, string>;
+  iconPreview: string;
+  reverseIcons: string;
+  iconOnly: string;
+  /** The label of the list of periods of a "dates occurring" rule. */
+  period: string;
   showRulesFor: string;
   scopeSelection: string;
   scopeSheet: string;
@@ -723,6 +731,33 @@ export const STRINGS_EN: UiStrings = {
     midpoint: 'Midpoint',
     highest: 'Highest',
     barColor: 'Bar colour',
+    iconStyle: 'Icon style',
+    iconSets: {
+      '3Arrows': '3 arrows (coloured)',
+      '3ArrowsGray': '3 arrows (grey)',
+      '3Flags': '3 flags',
+      '3TrafficLights1': '3 traffic lights',
+      '3TrafficLights2': '3 traffic lights (rimmed)',
+      '3Signs': '3 signs',
+      '3Symbols': '3 symbols (circled)',
+      '3Symbols2': '3 symbols',
+      '3Stars': '3 stars',
+      '3Triangles': '3 triangles',
+      '4Arrows': '4 arrows (coloured)',
+      '4ArrowsGray': '4 arrows (grey)',
+      '4RedToBlack': 'Red to black',
+      '4Rating': '4 ratings',
+      '4TrafficLights': '4 traffic lights',
+      '5Arrows': '5 arrows (coloured)',
+      '5ArrowsGray': '5 arrows (grey)',
+      '5Rating': '5 ratings',
+      '5Quarters': '5 quarters',
+      '5Boxes': '5 boxes',
+    },
+    iconPreview: 'The icons of the set, from the lowest values to the highest',
+    reverseIcons: 'Reverse the order of the icons',
+    iconOnly: 'Show the icon only',
+    period: 'Period',
     showRulesFor: 'Show rules for',
     scopeSelection: 'Current selection',
     scopeSheet: 'This sheet',
@@ -1108,6 +1143,33 @@ export const STRINGS_TR: UiStrings = {
     midpoint: 'Orta nokta',
     highest: 'En yüksek',
     barColor: 'Çubuk rengi',
+    iconStyle: 'Simge stili',
+    iconSets: {
+      '3Arrows': '3 ok (renkli)',
+      '3ArrowsGray': '3 ok (gri)',
+      '3Flags': '3 bayrak',
+      '3TrafficLights1': '3 trafik ışığı',
+      '3TrafficLights2': '3 trafik ışığı (çerçeveli)',
+      '3Signs': '3 işaret',
+      '3Symbols': '3 simge (daire içinde)',
+      '3Symbols2': '3 simge',
+      '3Stars': '3 yıldız',
+      '3Triangles': '3 üçgen',
+      '4Arrows': '4 ok (renkli)',
+      '4ArrowsGray': '4 ok (gri)',
+      '4RedToBlack': 'Kırmızıdan siyaha',
+      '4Rating': '4 derecelendirme',
+      '4TrafficLights': '4 trafik ışığı',
+      '5Arrows': '5 ok (renkli)',
+      '5ArrowsGray': '5 ok (gri)',
+      '5Rating': '5 derecelendirme',
+      '5Quarters': '5 çeyrek',
+      '5Boxes': '5 kutu',
+    },
+    iconPreview: 'Kümenin simgeleri, en düşük değerlerden en yükseğe',
+    reverseIcons: 'Simge sırasını ters çevir',
+    iconOnly: 'Yalnız simgeyi göster',
+    period: 'Dönem',
     showRulesFor: 'Kuralları göster',
     scopeSelection: 'Geçerli seçim',
     scopeSheet: 'Bu sayfa',

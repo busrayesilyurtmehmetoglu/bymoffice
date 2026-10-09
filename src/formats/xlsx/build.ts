@@ -729,13 +729,34 @@ function conditionalValueXml(value: ConditionalValue, icons: boolean, prefix = '
 
 const colorXml = (name: string, color: Color) => `<${name}${colorAttrs(color)}/>`;
 
+/** What the source element of a rule holds beside the fields of the model, for conditionalRuleXml(). */
+export interface RuleExtra {
+  /** Attributes of the <cfRule>, as they go into the start tag. */
+  attrs: string;
+  /** Children of the <cfRule>, as text. */
+  children: string;
+  /** Attributes of its <iconSet>, as they go into the start tag. */
+  icons?: string;
+  /**
+   * Children of its <iconSet> that are no thresholds, as text: those before the first <cfvo>,
+   * before the second, ..., and behind the last.
+   */
+  iconsBetween?: string[];
+  /**
+   * The threshold at `index` of its colour scale, data bar or icon set, given the element the
+   * model alone would write: the source element where it says the same, or that element with
+   * what changed.
+   */
+  cfvo?(index: number, written: string): string;
+}
+
 /**
  * One <cfRule>, or '' for a rule only the 2010 extension can state. `dxfId` is the record of
  * the style sheet that holds its format (undefined: the rule gives none). `extra` is what the
  * source element of the rule holds beside the fields of the model (attributes as they go into
- * the start tag, children as text).
+ * the start tag, children as text; see RuleExtra for what it holds of a scale, a bar or an icon set).
  */
-export function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfId: number | undefined, notes?: Notes, prefix = '', extra?: { attrs: string; children: string }): string {
+export function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfId: number | undefined, notes?: Notes, prefix = '', extra?: RuleExtra): string {
   if (rule.extended) {
     if (notes) notes.add('Conditional format: a rule of the 2010 extension is left out');
     return '';
@@ -759,11 +780,14 @@ export function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfI
   if (rule.rank !== undefined) out += ` rank="${rule.rank}"`;
   if (extra) out += extra.attrs;
 
+  const threshold = (index: number, written: string) => (extra && extra.cfvo ? extra.cfvo(index, written) : written);
   let inner = '';
   for (const formula of rule.formulas.slice(0, 3)) inner += `<${prefix}formula>${escapeText(formula)}</${prefix}formula>`;
   if (rule.colorScale) {
     inner += `<${prefix}colorScale>`;
-    for (const value of rule.colorScale.values) inner += conditionalValueXml(value, false, prefix);
+    rule.colorScale.values.forEach((value, i) => {
+      inner += threshold(i, conditionalValueXml(value, false, prefix));
+    });
     for (const color of rule.colorScale.colors) inner += colorXml(`${prefix}color`, color);
     inner += `</${prefix}colorScale>`;
   }
@@ -771,14 +795,22 @@ export function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfI
     const bar = rule.dataBar;
     if (bar.extended && notes) notes.add('Conditional format: what the 2010 extension says about a data bar (border, axis, negative colours) is left out');
     inner += `<${prefix}dataBar${bar.minLength !== 10 ? ` minLength="${bar.minLength}"` : ''}${bar.maxLength !== 90 ? ` maxLength="${bar.maxLength}"` : ''}${bar.showValue ? '' : ' showValue="0"'}>`;
-    inner += conditionalValueXml(bar.min, false, prefix) + conditionalValueXml(bar.max, false, prefix) + colorXml(`${prefix}color`, bar.color || { rgb: 'FF638EC6' });
+    inner += threshold(0, conditionalValueXml(bar.min, false, prefix)) + threshold(1, conditionalValueXml(bar.max, false, prefix)) + colorXml(`${prefix}color`, bar.color || { rgb: 'FF638EC6' });
     inner += `</${prefix}dataBar>`;
   }
   if (rule.iconSet) {
     const icons = rule.iconSet;
     if (icons.custom && notes) notes.add('Conditional format: icons chosen one by one (2010 extension) are written as their set');
-    inner += `<${prefix}iconSet iconSet="${escapeAttr(icons.set)}"${icons.showValue ? '' : ' showValue="0"'}${icons.reverse ? ' reverse="1"' : ''}>`;
-    for (const value of icons.values) inner += conditionalValueXml(value, true, prefix);
+    inner += `<${prefix}iconSet iconSet="${escapeAttr(icons.set)}"${icons.showValue ? '' : ' showValue="0"'}${icons.reverse ? ' reverse="1"' : ''}${extra && extra.icons ? extra.icons : ''}>`;
+    const between = (extra && extra.iconsBetween) || [];
+    // The last entry is what stands behind the last threshold, however many thresholds there are now.
+    const before = between.slice(0, -1);
+    icons.values.forEach((value, i) => {
+      inner += (before[i] || '') + threshold(i, conditionalValueXml(value, true, prefix));
+    });
+    // What stood before thresholds the set has no more.
+    for (let i = icons.values.length; i < before.length; i++) inner += before[i];
+    if (between.length > 0) inner += between[between.length - 1];
     inner += `</${prefix}iconSet>`;
   }
   if (extra) inner += extra.children;
