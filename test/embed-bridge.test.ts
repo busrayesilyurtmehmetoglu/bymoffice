@@ -1790,3 +1790,43 @@ test('bridge: the commands of the tracked changes without a file, with a workboo
   assert.deepEqual(h.sent[h.sent.length - 1], { type: 'done', id: 's', command: 'acceptAllRevisions', revisions: 0, trackChanges: false });
   assert.ok(opened.d.calls.indexOf('acceptAll') >= 0);
 });
+
+test('bridge: an application that answers ready from inside its postMessage is served: one ready, the file loaded, nothing thrown', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  const post = f.host.post;
+  const thrown: unknown[] = [];
+  let answered = false;
+  f.host.post = (json) => {
+    const delivered = post(json);
+    // As a page does that owns the frame of the editor: the answer to `ready` is given in the same call.
+    if (delivered && !answered && JSON.parse(json).type === 'ready') {
+      answered = true;
+      try {
+        void bridge.receive({ type: 'hello' });
+        void bridge.receive({ type: 'load', id: 'file', data: DATA, readOnly: true });
+      } catch (error) {
+        thrown.push(error);
+      }
+    }
+    return delivered;
+  };
+  let failed: unknown;
+  try {
+    bridge.start();
+  } catch (error) {
+    failed = error;
+  }
+  for (let i = 0; i < 5; i++) await settle();
+  f.runRetries();
+  for (let i = 0; i < 5; i++) await settle();
+  assert.equal(failed, undefined, 'start() does not throw');
+  assert.deepEqual(thrown, [], 'receive() inside postMessage does not throw');
+  // The hello asked for ready again; the load was carried out and answered once, and nothing is sent twice by the pass that was under way.
+  assert.deepEqual(types(f).filter((type) => type === 'loaded'), ['loaded']);
+  assert.deepEqual(types(f).slice(0, 1), ['ready']);
+  assert.ok(types(f).filter((type) => type === 'ready').length <= 2, types(f).join());
+  assert.equal(f.opened.length, 1);
+  const loaded = f.sent.find((message) => message.type === 'loaded');
+  assert.equal(loaded.id, 'file');
+});

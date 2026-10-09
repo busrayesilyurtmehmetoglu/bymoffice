@@ -522,14 +522,29 @@ export function createBridge(host: BridgeHost): Bridge {
     }
   };
 
+  let flushing = false;
   const flush = (): boolean => {
-    while (pending.length > 0) {
-      if (!deliver(pending[0].json)) return false;
-      pendingChars -= (pending.shift() as Outgoing).json.length;
-      // A channel that works earns the full time again when it goes away.
-      retries = 0;
+    // An application that answers from inside its postMessage comes back here through receive(), while the
+    // message it answers is still the first of the queue: the pass that is under way goes on with the rest.
+    if (flushing) return true;
+    flushing = true;
+    try {
+      while (pending.length > 0) {
+        const entry = pending[0];
+        if (!deliver(entry.json)) return false;
+        // What was sent goes by itself: the application may have changed the queue while it was called.
+        const at = pending.indexOf(entry);
+        if (at >= 0) {
+          pending.splice(at, 1);
+          pendingChars -= entry.json.length;
+        }
+        // A channel that works earns the full time again when it goes away.
+        retries = 0;
+      }
+      return true;
+    } finally {
+      flushing = false;
     }
-    return true;
   };
 
   const retry = () => {

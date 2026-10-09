@@ -53,6 +53,8 @@ Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen il
 - Durum bildiren iletilerden (`changed`, `selection`, `sheet`, `sheets`) her türden yalnız sonuncusu tutulur; birleştirilen `changed` iletisinin `sheets` alanı, yerine geçtiklerinin sayfalarını da içerir.
 - Saklanan iletilerin toplamı 64 milyon karakteri aşarsa en eski `saved` iletileri, aynı `id` ile `error` / `save-failed` iletisine çevrilir (dosya baytları bırakılır, isteğin yanıtı kaybolmaz).
 
+Uygulama, sayfanın gönderdiği iletiye **aynı çağrının içinden** `receive` ile yanıt verebilir (ör. `ready` gelir gelmez `load`); köprünün gönderim kuyruğu buna dayanıklıdır.
+
 `ready`'yi kaçırdığını düşünen uygulama (ör. dinleyicisini sayfa yüklendikten sonra kuran bir üst sayfa) `{ "type": "hello" }` gönderir; sayfa `ready`'yi yeniden gönderir.
 
 ## 3. Sözleşme
