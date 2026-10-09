@@ -17,7 +17,7 @@ import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model
 import { clearRange, copyRange, cutRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
 import { formulaReferences } from '../calc/refs';
 import { cycleAbsolute } from '../edit/absolute';
-import { canPointAt, isFormulaText, pointReference, pointSpanLive } from '../edit/point';
+import { canPointAt, fieldSpanLive, formulaFieldTarget, isFormulaText, pointReference, pointSpanLive, rangeFieldTarget } from '../edit/point';
 import {
   formatAt,
   formatRange,
@@ -74,11 +74,14 @@ import {
   conditionalFromFields,
   conditionalPatch,
   describeRule,
+  listSeparator,
   parseRangeList,
   rangeListText,
   validationFields,
   validationFromFields,
+  type DialogPointer,
   type ManagerRow,
+  type PointKind,
 } from './rules-dialog';
 import {
   canCopySheet,
@@ -241,11 +244,29 @@ interface Point {
   active: CellPos;
   focus: CellPos;
   range: CellRange;
-  /** The field the text is typed in: the editor of the grid, or the field of a formula bar. */
-  field: HTMLTextAreaElement;
+  /** The field the text is typed in: the editor of the grid, the field of a formula bar, or a field of a dialog of rules. */
+  field: PointField;
   start: number;
   end: number;
   text: string;
+}
+
+type PointField = HTMLTextAreaElement | HTMLInputElement;
+
+/** Whether the keyboard is one of Apple's: Cmd is the key that adds, and Ctrl with a click asks for the context menu. */
+const APPLE = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+
+/** Where a reference that is pointed at now is written (see pointTarget()). */
+interface PointTarget {
+  field: PointField;
+  start: number;
+  end: number;
+  /** The reference pointed at last, when this one takes its place. */
+  live: Point | undefined;
+  /** Written in front of the reference in a field of a dialog: the "=" of a formula, the separator of a list of ranges. */
+  lead?: string;
+  /** The reference is written with "$": the source of a list. */
+  absolute?: boolean;
 }
 
 /** Marks the field of a shell around the view (a formula bar) that edits the cell together with the grid's editor. */
@@ -302,6 +323,8 @@ interface Drag {
   moved: boolean;
   /** The drag points at cells for the formula that is being typed instead of selecting them. */
   point?: boolean;
+  /** The drag points at cells for a field of the dialog of rules; its pointer is held by the dialog, not by the canvas. */
+  dialog?: boolean;
 }
 
 interface Touch {
@@ -627,7 +650,7 @@ function expandByMerges(index: MergeIndex, range: CellRange): CellRange {
  * Puts text in the place of a part of a field, the caret behind it. As typing would where the
  * browser lets a script do that: the field's own undo (Ctrl+Z) then takes the text back in one step.
  */
-function replaceFieldText(field: HTMLTextAreaElement, start: number, end: number, text: string): void {
+function replaceFieldText(field: PointField, start: number, end: number, text: string): void {
   const before = field.value;
   const wanted = before.substring(0, start) + text + before.substring(end);
   const caret = start + text.length;
@@ -829,6 +852,16 @@ export class WorkbookView {
    * opened (for the list of rules: typed cells for a rule that are not applied yet), `say` shows a message in it.
    */
   private rulesDialog: { sheet: Sheet; submit(): void; close(): void; changed(): boolean; say(message: string): void } | undefined;
+  /** The field of the dialog of rules that cells are pointed at for, and what it takes; set by a press beside the dialog. */
+  private dialogField: { field: HTMLInputElement; kind: PointKind } | undefined;
+  /** A finger that came down beside the dialog of rules: lifted where it came down, it points at the cell under it. */
+  private dialogTouch: { pointerId: number; x: number; y: number; field: HTMLInputElement; kind: PointKind } | undefined;
+  /** Set while another sheet is shown for a dialog of rules to point at: the dialog stays open. */
+  private keepDialog = false;
+  /** Whether the dialog of rules was told that its cells are on its own sheet; the next reference takes that back. */
+  private dialogSaid = false;
+  /** Set while a dialog of rules is closed for a sheet that was asked for from outside: its own sheet is not shown again. */
+  private dialogStays = false;
   /** Set while a dialog of rules applies its own change: the one change that does not have to settle the dialog first. */
   private applyingRules = false;
   /** The names (folded) the sheets had when the selection was last copied: see copyOutdated(). */
@@ -1063,6 +1096,21 @@ export class WorkbookView {
     // What is being typed belongs to the sheet of its cell, and is written before another sheet is shown for
     // good - also when that is the sheet shown now, for a formula to point at.
     if (this.edit && (index !== this.sheetIndex || this.editAway())) this.commitEditing();
+    // A dialog of rules that shows another sheet for pointing is given up for the sheet asked for, as a dialog is
+    // for any other sheet shown from outside - also when that is the sheet it shows now, which then stays for good.
+    const open = this.rulesDialog;
+    if (open && this.dialogAway()) {
+      this.dialogStays = true;
+      try {
+        this.dismiss(() => open.close());
+      } finally {
+        this.dialogStays = false;
+      }
+      if (index === this.sheetIndex) {
+        this.noteActiveSheet();
+        return;
+      }
+    }
     if (index === this.sheetIndex) return;
     // So does a name that is being typed for it, and a note that is being typed on it.
     this.finishRename(true, true);
@@ -1074,6 +1122,8 @@ export class WorkbookView {
   private show(index: number): void {
     if (index === this.sheetIndex) return;
     this.closeMenu();
+    // A dialog of rules that was given up for this has shown its own sheet again: that may be this one.
+    if (index === this.sheetIndex) return;
     this.endDrag();
     this.endTouch();
     this.lastTap = undefined;
@@ -1094,7 +1144,7 @@ export class WorkbookView {
    * not a hidden sheet, which setActiveSheet() can show: a file does not open on one.
    */
   private noteActiveSheet(): void {
-    if (this.destroyed || this.editAway()) return;
+    if (this.destroyed || this.editAway() || this.dialogAway()) return;
     const sheet = this.workbook.sheets[this.sheetIndex];
     if (!sheet || sheet !== this.shown || sheet.state !== 'visible') return;
     if (this.workbook.activeSheet !== this.sheetIndex) this.workbook.activeSheet = this.sheetIndex;
@@ -2882,7 +2932,7 @@ export class WorkbookView {
       // Asked for every visible cell: only for a sheet that has comments.
       comments: floating && state.sheet.comments && state.sheet.comments.length > 0 ? floating : undefined,
       // What the formula being typed was pointed at, on the sheet it is on.
-      reference: this.edit && this.point && this.point.sheet === state.sheet ? this.point.range : undefined,
+      reference: (this.edit || this.rulesDialog) && this.point && this.point.sheet === state.sheet ? this.point.range : undefined,
     });
     // Rules whose formulas took too long are finished in the next frames.
     if (conditional && conditional.pending) this.schedule();
@@ -3434,6 +3484,7 @@ export class WorkbookView {
     const shown = this.validationAt(state.active.row, state.active.col) || found[0];
     const initial = validationFields(shown, this.locale, date1904);
     const apply = (rule: ValidationSettings | undefined) => {
+      this.dialogHome(sheet);
       // The dialog belongs to the sheet it was opened on.
       if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
       const had = validationsIn(this.workbook, this.sheetIndex, range).length > 0;
@@ -3449,6 +3500,7 @@ export class WorkbookView {
       fields: initial,
       mixed,
       coarse: coarsePointer(),
+      pointer: this.dialogPointer,
       onApply: (fields) => {
         const reading = { date1904, isName: (name: string) => hasDefinedName(this.workbook, name) };
         // What was only looked at is not changed: no step, and the rule stays the element of the file it is.
@@ -3460,7 +3512,7 @@ export class WorkbookView {
       onClear: () => apply(undefined),
       explain: (error) => this.localizeError(error),
       onClose: () => {
-        this.rulesDialog = undefined;
+        this.dialogClosed(sheet);
         // Back to the cells, unless the view is going away.
         if (!this.destroyed) this.focusInput(true);
       },
@@ -3574,6 +3626,7 @@ export class WorkbookView {
 
   /** Applies operations on rules for a dialog that stays open, and says what happened. */
   private applyRules(sheet: Sheet, ops: Op[], said: string): void {
+    this.dialogHome(sheet);
     // A dialog belongs to the sheet it was opened on.
     if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
     if (this.applyFromDialog(ops)) this.live.textContent = said;
@@ -3625,7 +3678,9 @@ export class WorkbookView {
       focus: editing ? 'type' : undefined,
       keepFormat: fields.preset === 'keep',
       coarse: coarsePointer(),
+      pointer: this.dialogPointer,
       onApply: (typed, where) => {
+        this.dialogHome(sheet);
         const reading = { date1904, isName: (name: string) => hasDefinedName(this.workbook, name) };
         if (editing) {
           // Only what was changed in the dialog is changed in the rule; nothing changed is no step.
@@ -3638,7 +3693,7 @@ export class WorkbookView {
       },
       explain: (error) => this.localizeError(error),
       onClose: () => {
-        this.rulesDialog = undefined;
+        this.dialogClosed(sheet);
         if (this.destroyed) return;
         // Back to the list it was opened from, or to the cells.
         if (back !== undefined && !this.locked && this.workbook.sheets[this.sheetIndex] === sheet && !this.leavingDialog) this.openRulesManager(back);
@@ -3648,6 +3703,208 @@ export class WorkbookView {
     this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => this.dismiss(() => dialog.dialog.close()), changed: () => dialog.dialog.changed, say: (message) => dialog.dialog.showError(message) };
     return true;
   }
+
+  /** Whether another sheet than the one a dialog of rules belongs to is shown, for the dialog to point at. */
+  private dialogAway(): boolean {
+    return this.rulesDialog !== undefined && this.state().sheet !== this.rulesDialog.sheet;
+  }
+
+  /** Shows a sheet for the dialog of rules that is open: the dialog stays, and the file does not learn of it. */
+  private showForDialog(index: number): void {
+    const nested = this.keepDialog;
+    // Neither the sheet that is looked at nor the way back is the user's choice of a sheet: the file opens where it did.
+    const noted = this.workbook.activeSheet;
+    this.keepDialog = true;
+    try {
+      this.show(index);
+    } finally {
+      this.keepDialog = nested;
+      this.workbook.activeSheet = noted;
+    }
+  }
+
+  /** Shows the sheet of a dialog of rules again when another one was shown for pointing: what the dialog does, it does there. */
+  private dialogHome(sheet: Sheet): void {
+    if (this.destroyed) return;
+    const home = this.workbook.sheets.indexOf(sheet);
+    if (home >= 0 && home !== this.sheetIndex) this.showForDialog(home);
+  }
+
+  /** A dialog of rules is gone: nothing is pointed at for it any more, and its sheet is shown, with the selection it had. */
+  private dialogClosed(sheet: Sheet): void {
+    this.rulesDialog = undefined;
+    this.dialogField = undefined;
+    this.dialogTouch = undefined;
+    this.dialogSaid = false;
+    if (this.drag && this.drag.dialog) this.endDrag();
+    if (!this.edit) this.clearPoint();
+    if (!this.dialogStays) this.dialogHome(sheet);
+  }
+
+  /**
+   * What a change from outside starts with while a dialog of rules shows another sheet for pointing: a dialog in
+   * which nothing was changed is closed first, so that the change is made on the sheet that stays shown (the one
+   * of the dialog) and undo comes back to it. One with changes is left; the change is then refused (see applyOps()).
+   */
+  private leaveAway(): void {
+    const open = this.rulesDialog;
+    if (!open || this.applyingRules || !this.dialogAway() || open.changed()) return;
+    this.dismiss(() => open.close());
+  }
+
+  /** Whether a point of the window is over an element. */
+  private over(element: HTMLElement, clientX: number, clientY: number): boolean {
+    const rect = element.getBoundingClientRect();
+    return clientX >= rect.left && clientX < rect.right && clientY >= rect.top && clientY < rect.bottom;
+  }
+
+  /**
+   * Where a reference pointed at for a field of the dialog of rules goes. A press starts anew: in
+   * a list of ranges the range takes the place of the whole list, or is added to it (`add`); in
+   * a formula it goes to the caret. `go` (a drag that goes on, a press with Shift) puts it in the
+   * place of the reference pointed at last, while that is still there with the caret behind it.
+   */
+  private dialogTarget(field: HTMLInputElement, kind: PointKind, add: boolean, go: boolean): PointTarget | undefined {
+    const text = field.value;
+    const start = field.selectionStart === null ? text.length : field.selectionStart;
+    const end = field.selectionEnd === null ? start : field.selectionEnd;
+    const point = this.point;
+    const live = point && point.field === field && fieldSpanLive(text, start, end, point) ? point : undefined;
+    const absolute = kind === 'source';
+    if (go && live) return { field, start: live.start, end: live.end, live, absolute };
+    if (kind === 'ranges') {
+      const place = rangeFieldTarget(text, add, listSeparator(this.locale));
+      return { field, start: place.start, end: place.end, live: undefined, lead: place.lead };
+    }
+    // A formula takes the next reference in the place of the last one while nothing was typed since, as a formula of a cell does.
+    if (live) return { field, start: live.start, end: live.end, live, absolute };
+    const place = formulaFieldTarget(text, start, end, { decimal: this.locale.decimal });
+    return place ? { field, start: place.start, end: place.end, live: undefined, lead: place.lead, absolute } : undefined;
+  }
+
+  /** The sheet whose tab is under a point of the window; -1 when none is. */
+  private tabUnder(clientX: number, clientY: number): number {
+    if (!this.over(this.tabs, clientX, clientY)) return -1;
+    const tabs = this.tabs.children;
+    for (let i = 0; i < tabs.length; i++) {
+      const tab = tabs[i] as HTMLElement;
+      if (tab.hasAttribute('data-sheet') && this.over(tab, clientX, clientY)) return this.tabSheetOf(tab);
+    }
+    return -1;
+  }
+
+  /** Says in the dialog of rules that the cells of a rule are on its own sheet. */
+  private sayOwnSheet(): void {
+    if (!this.rulesDialog) return;
+    this.rulesDialog.say(this.strings.rules.pointOwnSheet);
+    this.dialogSaid = true;
+  }
+
+  /**
+   * A press beside the dialog of rules while one of its fields takes references. On the cells it
+   * points at the cell, row or column under it for that field, and a drag at a range; on the tab
+   * of a sheet it shows that sheet for a formula to point at. Returns whether a drag began.
+   */
+  private dialogPress(event: MouseEvent, field: HTMLInputElement, kind: PointKind): boolean {
+    const dialog = this.rulesDialog;
+    if (this.destroyed || this.locked || !dialog || this.edit) return false;
+    const pointer = event as PointerEvent;
+    const pointerId = pointer.pointerId === undefined ? 0 : pointer.pointerId;
+    this.dialogTouch = undefined;
+    if (pointer.pointerType === 'touch') {
+      // A finger that moves points at nothing; only a tap does (see dialogLift()), as while a formula is typed.
+      this.dialogTouch = { pointerId, x: event.clientX, y: event.clientY, field, kind };
+      return false;
+    }
+    if (event.button !== 0) return false;
+    // On a Mac Ctrl and a click is the click for the context menu: it points at nothing. Cmd adds a range there.
+    if (event.ctrlKey && APPLE) return false;
+    return this.dialogPoint(event, field, kind, pointerId, true);
+  }
+
+  /** Points at what is under a pointer for a field of the dialog of rules; with `drag`, a drag goes on from there. */
+  private dialogPoint(event: MouseEvent, field: HTMLInputElement, kind: PointKind, pointerId: number, drag: boolean): boolean {
+    const dialog = this.rulesDialog;
+    if (!dialog) return false;
+    const tab = this.tabUnder(event.clientX, event.clientY);
+    if (tab >= 0) {
+      if (tab === this.sheetIndex) return false;
+      const sheet = this.workbook.sheets[tab];
+      // The cells a rule applies to are on its sheet, which its tab shows again for any field; a formula of the
+      // rule can read any sheet that has cells.
+      if (kind === 'ranges' && sheet !== dialog.sheet) {
+        this.sayOwnSheet();
+        return false;
+      }
+      this.endDrag();
+      this.showForDialog(tab);
+      return false;
+    }
+    if (!this.over(this.canvas, event.clientX, event.clientY) || this.state().sheet.kind !== 'worksheet') return false;
+    if (kind === 'ranges' && this.dialogAway()) {
+      this.sayOwnSheet();
+      return false;
+    }
+    this.readScroll();
+    this.endDrag();
+    const point = this.canvasPoint(event);
+    if (hitTest(this.layout(), point.x, point.y).area === 'corner') return false;
+    const target = this.dialogTarget(field, kind, APPLE ? event.metaKey : event.ctrlKey || event.metaKey, event.shiftKey);
+    if (!target) return false;
+    this.dialogField = { field, kind };
+    let mode: Drag['mode'] = 'cell';
+    const pointed = this.pointBy(
+      () => {
+        mode = this.press(point.x, point.y, event.shiftKey);
+      },
+      false,
+      target,
+    );
+    if (!pointed || !drag) return false;
+    this.drag = { pointerId, mode, x: point.x, y: point.y, originX: point.x, originY: point.y, moved: false, point: true, dialog: true };
+    return true;
+  }
+
+  /** What the dialogs of rules are given to let cells be pointed at for their fields. */
+  private readonly dialogPointer: DialogPointer = {
+    down: (event, field, kind) => this.dialogPress(event, field, kind),
+    move: (event) => {
+      const touch = this.dialogTouch;
+      const pointerId = (event as PointerEvent).pointerId === undefined ? 0 : (event as PointerEvent).pointerId;
+      if (touch && touch.pointerId === pointerId) {
+        if (Math.abs(event.clientX - touch.x) > TAP_SLOP || Math.abs(event.clientY - touch.y) > TAP_SLOP) this.dialogTouch = undefined;
+        return;
+      }
+      if (this.drag && this.drag.dialog) this.onPointerMove(event);
+    },
+    up: (event) => {
+      const touch = this.dialogTouch;
+      const pointerId = (event as PointerEvent).pointerId === undefined ? 0 : (event as PointerEvent).pointerId;
+      if (touch && touch.pointerId === pointerId) {
+        this.dialogTouch = undefined;
+        const still = Math.abs(event.clientX - touch.x) <= TAP_SLOP && Math.abs(event.clientY - touch.y) <= TAP_SLOP;
+        // The field the finger came down for still has to be there to be written into.
+        if (still && !this.destroyed && !this.locked && !this.edit && touch.field.isConnected) this.dialogPoint(event, touch.field, touch.kind, pointerId, false);
+        return;
+      }
+      if (this.drag && this.drag.dialog) this.onPointerUp(event);
+    },
+    cancel: () => {
+      this.dialogTouch = undefined;
+      if (this.drag && this.drag.dialog) this.endDrag();
+    },
+    settled: () => {
+      // Not the echo of a reference the view itself wrote.
+      if (this.pointWriting || this.edit || !this.rulesDialog) return;
+      const point = this.point;
+      if (!point) return;
+      const root = point.field.getRootNode() as Document | ShadowRoot;
+      // Typed into, or left for another control: the reference is part of the text now, and a drag at it is over.
+      if (root.activeElement === point.field && fieldSpanLive(point.field.value, point.field.selectionStart === null ? -1 : point.field.selectionStart, point.field.selectionEnd === null ? -1 : point.field.selectionEnd, point)) return;
+      this.clearPoint();
+      if (this.drag && this.drag.dialog) this.endDrag();
+    },
+  };
 
   /** Closes a dialog for good: it does not hand over to the list it was opened from. */
   private dismiss(close: () => void): void {
@@ -3706,6 +3963,7 @@ export class WorkbookView {
       strings: strings.rules,
       scope,
       coarse: coarsePointer(),
+      pointer: this.dialogPointer,
       rows,
       onMove: (index, to) => this.applyRules(sheet, moveConditionalRuleOps(this.workbook, this.sheetIndex, index, to), strings.rules.ruleChanged),
       onRanges: (index, text) => this.applyRules(sheet, updateConditionalRuleOps(this.workbook, this.sheetIndex, index, { ranges: this.rangesOf(text) }), strings.rules.ruleChanged),
@@ -3719,7 +3977,7 @@ export class WorkbookView {
       },
       explain: (error) => this.localizeError(error),
       onClose: () => {
-        this.rulesDialog = undefined;
+        this.dialogClosed(sheet);
         // Back to the cells, unless the view is going away; a dialog that takes the place of the list takes the focus next.
         if (!this.destroyed) this.focusInput(true);
       },
@@ -4697,7 +4955,10 @@ export class WorkbookView {
   /** Writes the editor's text to the cell and closes the editor. Returns whether a cell was being edited. */
   commitEditing(): boolean {
     const edit = this.edit;
-    if (!edit) return false;
+    if (!edit) {
+      this.leaveAway();
+      return false;
+    }
     if (this.committing) return false;
     const text = this.input.value;
     // Text that was only looked at, or the idle text an abandoned composition left behind, is not a change.
@@ -5539,7 +5800,12 @@ export class WorkbookView {
    * text) when the formula takes a reference there. Undefined when pointing does nothing: no
    * formula is being typed, an input method is composing, the place is not one for a reference.
    */
-  private pointTarget(): { field: HTMLTextAreaElement; start: number; end: number; live: Point | undefined } | undefined {
+  private pointTarget(): PointTarget | undefined {
+    if (!this.edit && this.rulesDialog && this.dialogField && !this.destroyed && !this.locked) {
+      // A drag for a field of the dialog of rules goes on while the reference it wrote is still there.
+      const target = this.dialogTarget(this.dialogField.field, this.dialogField.kind, false, true);
+      return target && target.live ? target : undefined;
+    }
     if (!this.edit || this.destroyed || this.locked || this.composing || this.committing) return undefined;
     if (this.state().sheet.kind !== 'worksheet') return undefined;
     const field = this.editField();
@@ -5638,10 +5904,9 @@ export class WorkbookView {
    * With `keys` (an arrow key) a command that moved nothing writes nothing while no reference
    * was pointed at yet: at the edge of the sheet the formula would refer to its own cell.
    */
-  private pointBy(run: () => void, keys = false): boolean {
-    const target = this.pointTarget();
+  private pointBy(run: () => void, keys = false, target: PointTarget | undefined = this.pointTarget()): boolean {
     const edit = this.edit;
-    if (!target || !edit) return false;
+    if (!target || (!edit && !this.rulesDialog)) return false;
     const state = this.state();
     const saved = { active: state.active, focus: state.focus, range: state.range };
     const live = target.live && target.live.sheet === state.sheet ? target.live : undefined;
@@ -5656,7 +5921,7 @@ export class WorkbookView {
       state.range = merge ? { ...merge } : { top: saved.active.row, left: saved.active.col, bottom: saved.active.row, right: saved.active.col };
     }
     const from = { active: state.active, range: state.range };
-    edit.pointed = true;
+    if (edit) edit.pointed = true;
     let next: { active: CellPos; focus: CellPos; range: CellRange };
     this.pointing = true;
     try {
@@ -5674,16 +5939,15 @@ export class WorkbookView {
   }
 
   /** Writes the reference to cells of the shown sheet into the formula and remembers it as the one pointed at. */
-  private writePoint(
-    target: { field: HTMLTextAreaElement; start: number; end: number; live?: Point },
-    sheet: Sheet,
-    at: { active: CellPos; focus: CellPos; range: CellRange },
-  ): void {
+  private writePoint(target: PointTarget, sheet: Sheet, at: { active: CellPos; focus: CellPos; range: CellRange }): void {
     const edit = this.edit;
-    if (!edit) return;
+    // Without a cell being edited the reference is one for a field of the dialog of rules, which belongs to a sheet as well.
+    const home = edit ? edit.home : this.rulesDialog ? this.rulesDialog.sheet : undefined;
+    if (!home) return;
     const merge = mergeIn(this.merges(), at.active.row, at.active.col);
     // The name of a sheet comes from the file: it only ever becomes text of the field.
-    const text = pointReference(at.range, { single: merge !== undefined && sameRange(merge, at.range), sheet: sheet === edit.home ? undefined : sheet.name });
+    const text = pointReference(at.range, { single: merge !== undefined && sameRange(merge, at.range), sheet: sheet === home ? undefined : sheet.name, absolute: target.absolute === true });
+    const lead = target.lead || '';
     const field = target.field;
     const live = target.live;
     if (live && live.sheet === sheet && live.text === text) {
@@ -5698,24 +5962,30 @@ export class WorkbookView {
     if (field === this.input && !this.hasFocus()) this.focusInput(true);
     this.pointWriting = true;
     try {
-      replaceFieldText(field, target.start, target.end, text);
+      replaceFieldText(field, target.start, target.end, lead + text);
     } finally {
       this.pointWriting = false;
     }
-    if (field !== this.input) this.input.value = field.value;
+    if (edit && field !== this.input) this.input.value = field.value;
     this.point = {
       sheet,
       active: { ...at.active },
       focus: { ...at.focus },
       range: { ...at.range },
       field,
-      start: target.start,
-      end: target.start + text.length,
+      start: target.start + lead.length,
+      end: target.start + lead.length + text.length,
       text,
     };
-    this.placeInput();
     this.schedule();
     this.live.textContent = this.strings.referenceAdded(text);
+    if (!edit) {
+      // What the dialog said about another sheet is answered by a reference that could be written.
+      if (this.dialogSaid && this.rulesDialog) this.rulesDialog.say('');
+      this.dialogSaid = false;
+      return;
+    }
+    this.placeInput();
     this.emitEditing();
   }
 
@@ -5771,7 +6041,7 @@ export class WorkbookView {
     if (this.panel) this.panel.close();
     if (this.tabPopover) this.tabPopover.close('owner');
     // A dialog that something else takes the place of is given up, as Escape gives it up.
-    if (this.rulesDialog) this.rulesDialog.close();
+    if (this.rulesDialog && !this.keepDialog) this.rulesDialog.close();
   }
 
   /**

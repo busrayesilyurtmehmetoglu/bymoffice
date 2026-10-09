@@ -98,6 +98,8 @@ export interface PointReferenceOptions {
   single?: boolean;
   /** Name of the sheet the range is on, when that is not the sheet of the formula. */
   sheet?: string;
+  /** Every column and row is written with "$" ("$B$5:$D$9", "$B:$D"): the source of a list is, as it does not move with the cell. */
+  absolute?: boolean;
 }
 
 function index(value: number, limit: number): number {
@@ -106,7 +108,7 @@ function index(value: number, limit: number): number {
 }
 
 /**
- * A range as a formula names it, always relative: "B5", "B5:D9", whole
+ * A range as a formula names it, relative unless asked for otherwise: "B5", "B5:D9", whole
  * columns "B:D", whole rows "3:7", on another sheet "Sheet2!B5" or
  * "'Sales 2026'!B5". The corners may come in any order. The text is the same
  * in every locale. Throws RangeError for a range outside the sheet.
@@ -118,11 +120,13 @@ export function pointReference(range: CellRange, options: PointReferenceOptions 
   const right = Math.max(range.left, range.right);
   const rows = left === 0 && right === MAX_COLS - 1;
   const cols = top === 0 && bottom === MAX_ROWS - 1;
+  const mark = options.absolute === true ? '$' : '';
+  const cell = (row: number, col: number) => (mark === '' ? cellName(row, col) : `$${columnName(col)}$${row + 1}`);
   let text: string;
-  if (rows) text = `${top + 1}:${bottom + 1}`;
-  else if (cols) text = `${columnName(left)}:${columnName(right)}`;
-  else if (options.single === true || (top === bottom && left === right)) text = cellName(top, left);
-  else text = `${cellName(top, left)}:${cellName(bottom, right)}`;
+  if (rows) text = `${mark}${top + 1}:${mark}${bottom + 1}`;
+  else if (cols) text = `${mark}${columnName(left)}:${mark}${columnName(right)}`;
+  else if (options.single === true || (top === bottom && left === right)) text = cell(top, left);
+  else text = `${cell(top, left)}:${cell(bottom, right)}`;
   return options.sheet !== undefined ? `${quoteSheetName(String(options.sheet))}!${text}` : text;
 }
 
@@ -156,4 +160,57 @@ export function putReference(text: string, start: number, end: number, reference
     text: text.substring(0, from) + reference + text.substring(to),
     span: { start: from, end: from + reference.length, text: reference },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Pointing for a field of a dialog (the cells a rule applies to, the formula or
+// the list a rule reads): the same references, written into a text that is not
+// the formula of a cell.
+
+/** Where a reference pointed at goes in a field, and what is written before it. */
+export interface FieldTarget {
+  start: number;
+  end: number;
+  /** Written in front of the reference and no part of it: the "=" of a formula, the separator of a list of ranges. */
+  lead: string;
+}
+
+/**
+ * Whether the reference a span stands for is still in a text of any kind and the caret right
+ * behind it: a drag that goes on then puts the next reference in its place.
+ */
+export function fieldSpanLive(text: string, caretStart: number, caretEnd: number, span: PointSpan): boolean {
+  if (typeof text !== 'string' || caretStart !== caretEnd || caretEnd !== span.end) return false;
+  if (!(span.start >= 0) || span.end !== span.start + span.text.length || span.end > text.length) return false;
+  return text.substring(span.start, span.end) === span.text;
+}
+
+/**
+ * Where a range that is pointed at goes in a field that lists ranges ("A1:B5; D1:D9"). The
+ * range takes the place of everything the field holds; with `add` (Ctrl or Cmd is held) it
+ * is put behind what is there, after the separator the locale lists with. A field that
+ * holds nothing takes the range alone either way.
+ */
+export function rangeFieldTarget(text: string, add: boolean, separator: string): FieldTarget {
+  const value = typeof text === 'string' ? text : '';
+  if (!add) return { start: 0, end: value.length, lead: '' };
+  // Separators and spaces the list ends in are written over: the new range brings its own.
+  let kept = value.length;
+  while (kept > 0 && ';, \t\n\r\u00a0'.indexOf(value.charAt(kept - 1)) >= 0) kept--;
+  return { start: kept, end: value.length, lead: kept > 0 ? `${separator} ` : '' };
+}
+
+/**
+ * Where a reference that is pointed at goes in a field that takes a value or a formula
+ * ("5", "=A1*2", the source of a list). A field that is empty, or whose whole text is
+ * selected, takes "=" and the reference in the place of what it holds. In a formula ("="
+ * first) the reference goes to the caret, in the place of the selected text, where a
+ * formula takes one (see canPointAt()). Undefined anywhere else: in a number or in the
+ * items of a list nothing is pointed at.
+ */
+export function formulaFieldTarget(text: string, start: number, end: number, context: PointContext = {}): FieldTarget | undefined {
+  if (typeof text !== 'string' || text.length > MAX_POINT_TEXT) return undefined;
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start || end > text.length) return undefined;
+  if (text.trim() === '' || (start === 0 && end === text.length)) return { start: 0, end: text.length, lead: '=' };
+  return canPointAt(text, start, end, context) ? { start, end, lead: '' } : undefined;
 }

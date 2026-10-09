@@ -703,9 +703,34 @@ export function rangeListText(ranges: readonly CellRange[], locale: FormatLocale
 
 let nextId = 1;
 
+/** What a field takes when cells are pointed at for it: a list of ranges, a formula, or the source of a list (a formula with absolute references). */
+export type PointKind = 'ranges' | 'formula' | 'source';
+
+/** Marks a field of a dialog that takes references to the cells pointed at behind the dialog, and says what kind it takes. */
+export const POINT_ATTRIBUTE = 'data-bym-point';
+
+/**
+ * Whoever shows the cells behind a dialog: it is told of every press beside the dialog while a
+ * field that takes references has the focus, and writes the reference into that field itself.
+ */
+export interface DialogPointer {
+  /** A pointer came down beside the dialog. Returns whether a drag began: the dialog then lets the cells be seen until the pointer is lifted. */
+  down(event: MouseEvent, field: HTMLInputElement, kind: PointKind): boolean;
+  /** A pointer moved over the place beside the dialog, or the pointer of the drag moved anywhere. */
+  move(event: MouseEvent): void;
+  /** A pointer was lifted beside the dialog, or the pointer of the drag anywhere. */
+  up(event: MouseEvent): void;
+  /** The drag was taken away (the browser needed the pointer). */
+  cancel(): void;
+  /** Something was typed into a field, or the focus went to another control: what was pointed at last is plain text from here on. */
+  settled(): void;
+}
+
 export interface DialogOptions {
   /** Positioned element the dialog covers. */
   parent: HTMLElement;
+  /** Lets the cells behind the dialog be pointed at for its fields (see POINT_ATTRIBUTE). */
+  pointer?: DialogPointer;
   title: string;
   /** Marks the dialog for the page and its tests: data-bym-dialog. */
   name: string;
@@ -737,9 +762,15 @@ export class Dialog {
   private invalid: HTMLElement | undefined;
   private closed = false;
   private pristine: string | undefined;
+  private readonly pointer: DialogPointer | undefined;
+  private readonly pointerEvents: boolean;
+  /** The pointer that drags over the cells behind the dialog; undefined when none does. */
+  private dragging: number | undefined;
 
   constructor(options: DialogOptions) {
     this.onClose = options.onClose;
+    this.pointer = options.pointer;
+    this.pointerEvents = typeof window !== 'undefined' && 'PointerEvent' in window;
     this.coarse = options.coarse === true;
     const element = document.createElement('div');
     element.className = 'bym-dialog-backdrop';
@@ -779,9 +810,145 @@ export class Dialog {
     this.actions = actions;
     element.addEventListener('keydown', this.onKeyDown);
     element.addEventListener('mousedown', this.onMouseDown);
+    if (this.pointer) {
+      if (this.pointerEvents) {
+        element.addEventListener('pointerdown', this.onPointerDown);
+        element.addEventListener('pointermove', this.onPointerMove);
+        element.addEventListener('pointerup', this.onPointerUp);
+        element.addEventListener('pointercancel', this.onPointerCancel);
+        element.addEventListener('lostpointercapture', this.onPointerCancel);
+      }
+      element.addEventListener('input', this.onSettled);
+      element.addEventListener('focusin', this.onSettled);
+      element.addEventListener('contextmenu', this.onContextMenu);
+    }
     for (const type of CONTAINED) element.addEventListener(type, stop);
     options.parent.appendChild(element);
   }
+
+  /** Marks a field as one that takes references to cells pointed at behind the dialog; without a kind, as one that takes none. */
+  pointable(field: HTMLInputElement, kind: PointKind | undefined): void {
+    if (kind === undefined) field.removeAttribute(POINT_ATTRIBUTE);
+    else field.setAttribute(POINT_ATTRIBUTE, kind);
+  }
+
+  /** The field cells are pointed at for now: the one that has the focus, when it takes references. */
+  private armed(): { field: HTMLInputElement; kind: PointKind } | undefined {
+    const root = this.panel.getRootNode() as Document | ShadowRoot;
+    const field = root.activeElement as HTMLInputElement | null;
+    if (!field || field.tagName !== 'INPUT' || !this.panel.contains(field) || field.readOnly || field.disabled) return undefined;
+    const kind = field.getAttribute(POINT_ATTRIBUTE);
+    return kind === 'ranges' || kind === 'formula' || kind === 'source' ? { field, kind } : undefined;
+  }
+
+  /** While a drag points at cells the dialog is seen through, and the cells are not dimmed. */
+  private seeThrough(on: boolean): void {
+    this.panel.style.opacity = on ? '0.25' : '';
+    this.panel.style.pointerEvents = on ? 'none' : '';
+    this.element.style.background = on ? 'transparent' : '';
+    if (on) this.panel.setAttribute('data-bym-pointing', '');
+    else this.panel.removeAttribute('data-bym-pointing');
+  }
+
+  private beginDrag(event: MouseEvent, pointerId: number): void {
+    const pointer = this.pointer;
+    const armed = this.armed();
+    if (!pointer || !armed || this.dragging !== undefined) return;
+    if (!pointer.down(event, armed.field, armed.kind) || this.closed) return;
+    this.dragging = pointerId;
+    this.seeThrough(true);
+    if (this.pointerEvents) {
+      try {
+        this.element.setPointerCapture(pointerId);
+      } catch {
+        // The pointer is already gone; the drag ends with the next event.
+      }
+    } else {
+      window.addEventListener('mousemove', this.onWindowMove);
+      window.addEventListener('mouseup', this.onWindowUp);
+    }
+    // A drag whose end the page never hears of (the window lost the focus, the page was hidden) is over.
+    window.addEventListener('blur', this.onDragLost);
+    document.addEventListener('visibilitychange', this.onDragLost);
+  }
+
+  /** Ends a drag that did not end with the pointer being lifted: nothing more is pointed at. */
+  private dropDrag(): void {
+    if (this.dragging === undefined) return;
+    this.endDrag();
+    if (this.pointer) this.pointer.cancel();
+  }
+
+  private onDragLost = (): void => {
+    this.dropDrag();
+  };
+
+  private onContextMenu = (event: Event): void => {
+    // No menu of the browser over the cells while they are pointed at.
+    if (this.dragging !== undefined) event.preventDefault();
+  };
+
+  private endDrag(): void {
+    const pointerId = this.dragging;
+    if (pointerId === undefined) return;
+    this.dragging = undefined;
+    this.seeThrough(false);
+    window.removeEventListener('mousemove', this.onWindowMove);
+    window.removeEventListener('mouseup', this.onWindowUp);
+    window.removeEventListener('blur', this.onDragLost);
+    document.removeEventListener('visibilitychange', this.onDragLost);
+    if (this.pointerEvents) {
+      try {
+        this.element.releasePointerCapture(pointerId);
+      } catch {
+        // Already released.
+      }
+    }
+  }
+
+  private onPointerDown = (event: PointerEvent): void => {
+    // Only a press on the place beside the dialog: the dialog's own controls work as they do.
+    if (this.closed || event.target !== this.element) return;
+    this.beginDrag(event, event.pointerId);
+  };
+
+  private onPointerMove = (event: PointerEvent): void => {
+    if (this.closed || !this.pointer || event.target !== this.element) return;
+    // The button was let go where no event told of it (over a menu of the browser, outside the window): the drag is over.
+    if (this.dragging === event.pointerId && (event.buttons & 1) === 0) {
+      this.dropDrag();
+      return;
+    }
+    this.pointer.move(event);
+  };
+
+  private onPointerUp = (event: PointerEvent): void => {
+    if (this.closed || !this.pointer || event.target !== this.element) return;
+    const dragged = this.dragging === event.pointerId;
+    this.pointer.up(event);
+    if (dragged) this.endDrag();
+  };
+
+  private onPointerCancel = (event: PointerEvent): void => {
+    if (this.closed || this.dragging !== event.pointerId) return;
+    this.dropDrag();
+  };
+
+  private onWindowMove = (event: MouseEvent): void => {
+    if (this.closed || !this.pointer || this.dragging === undefined) return;
+    if ((event.buttons & 1) === 0) this.dropDrag();
+    else this.pointer.move(event);
+  };
+
+  private onWindowUp = (event: MouseEvent): void => {
+    if (this.closed || !this.pointer || this.dragging === undefined) return;
+    this.pointer.up(event);
+    this.endDrag();
+  };
+
+  private onSettled = (): void => {
+    if (!this.closed && this.pointer) this.pointer.settled();
+  };
 
   get isOpen(): boolean {
     return !this.closed;
@@ -915,6 +1082,15 @@ export class Dialog {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.endDrag();
+    this.element.removeEventListener('pointerdown', this.onPointerDown);
+    this.element.removeEventListener('pointermove', this.onPointerMove);
+    this.element.removeEventListener('pointerup', this.onPointerUp);
+    this.element.removeEventListener('pointercancel', this.onPointerCancel);
+    this.element.removeEventListener('lostpointercapture', this.onPointerCancel);
+    this.element.removeEventListener('input', this.onSettled);
+    this.element.removeEventListener('focusin', this.onSettled);
+    this.element.removeEventListener('contextmenu', this.onContextMenu);
     this.element.removeEventListener('keydown', this.onKeyDown);
     this.element.removeEventListener('mousedown', this.onMouseDown);
     for (const type of CONTAINED) this.element.removeEventListener(type, stop);
@@ -968,7 +1144,10 @@ export class Dialog {
 
   private onMouseDown = (event: MouseEvent): void => {
     // A press beside the dialog leaves the focus where it is: the dialog is all there is to work with.
-    if (event.target === this.element) event.preventDefault();
+    if (event.target !== this.element) return;
+    event.preventDefault();
+    // Where there are no pointer events the mouse points at the cells all the same.
+    if (!this.closed && !this.pointerEvents && event.button === 0) this.beginDrag(event, 0);
   };
 
   private onKeyDown = (event: KeyboardEvent): void => {
@@ -1015,6 +1194,8 @@ export interface ValidationDialogOptions {
   /** The selection has cells of several rules, or cells with a rule beside cells without. */
   mixed: boolean;
   coarse?: boolean;
+  /** Lets cells be pointed at for the values of the rule (see DialogPointer). */
+  pointer?: DialogPointer;
   /** Applies the rule; a FieldError it throws is shown at its field, any other error as a message, and the dialog stays open. */
   onApply(fields: ValidationFields): void;
   /** Takes the rules off the selection. */
@@ -1050,7 +1231,7 @@ export class ValidationDialog {
     const strings = options.strings;
     this.strings = strings;
     this.separator = listSeparator(options.locale);
-    const dialog = new Dialog({ parent: options.parent, title: strings.validationTitle, name: 'validation', onClose: options.onClose, coarse: options.coarse });
+    const dialog = new Dialog({ parent: options.parent, title: strings.validationTitle, name: 'validation', onClose: options.onClose, coarse: options.coarse, pointer: options.pointer });
     this.dialog = dialog;
 
     if (options.mixed) {
@@ -1176,6 +1357,9 @@ export class ValidationDialog {
     label(this.rows.value2, valueLabel(type, operator, true, this.strings));
     if (type === 'list') this.controls.value1.setAttribute('aria-describedby', this.rows.hint.id);
     else this.controls.value1.removeAttribute('aria-describedby');
+    // The cells a list reads do not move with the cell that has the rule: they are pointed at as absolute references.
+    this.dialog.pointable(this.controls.value1, type === 'none' ? undefined : type === 'list' ? 'source' : 'formula');
+    this.dialog.pointable(this.controls.value2, 'formula');
   }
 }
 
@@ -1194,6 +1378,8 @@ export interface ConditionalDialogOptions {
   /** The rule has a format: "the format it has" is one of the formats to choose from. */
   keepFormat?: boolean;
   coarse?: boolean;
+  /** Lets cells be pointed at for the cells and the values of the rule (see DialogPointer). */
+  pointer?: DialogPointer;
   /** Applies the rule; a FieldError it throws is shown at its field, any other error as a message, and the dialog stays open. */
   onApply(fields: ConditionalFields, ranges: string): void;
   explain(error: unknown): string;
@@ -1232,7 +1418,7 @@ export class ConditionalDialog {
   constructor(options: ConditionalDialogOptions) {
     const strings = options.strings;
     this.strings = strings;
-    const dialog = new Dialog({ parent: options.parent, title: strings.conditionalTitle, name: 'conditional', onClose: options.onClose, coarse: options.coarse });
+    const dialog = new Dialog({ parent: options.parent, title: strings.conditionalTitle, name: 'conditional', onClose: options.onClose, coarse: options.coarse, pointer: options.pointer });
     this.dialog = dialog;
     const controls: Record<string, HTMLInputElement | HTMLSelectElement> = {};
     const rows: Record<string, HTMLElement> = {};
@@ -1259,10 +1445,13 @@ export class ConditionalDialog {
     };
 
     text('ranges', strings.appliesTo);
+    dialog.pointable(controls.ranges as HTMLInputElement, 'ranges');
     list('type', strings.ruleType, CONDITIONAL_TYPES.map((name) => [name, strings.conditionalTypes[name]] as [string, string]));
     list('operator', strings.data, VALIDATION_OPERATORS.map((name) => [name, strings.operators[name]] as [string, string]));
     text('value1', strings.value);
     text('value2', strings.maximum);
+    dialog.pointable(controls.value1 as HTMLInputElement, 'formula');
+    dialog.pointable(controls.value2 as HTMLInputElement, 'formula');
     text('text', strings.text);
     text('rank', strings.rank);
     check('percent', strings.percentOfRange);
@@ -1449,6 +1638,8 @@ export interface ConditionalManagerOptions {
   strings: RuleStrings;
   scope: 'selection' | 'sheet';
   coarse?: boolean;
+  /** Lets cells be pointed at for the cells of a rule (see DialogPointer); they are applied as typed cells are, when their field is left. */
+  pointer?: DialogPointer;
   /**
    * The rules to show, in the order they are applied in: those from place `from` on (no more
    * than MAX_MANAGER_ROWS of them), how many there are in all, and the rule right before and
@@ -1497,7 +1688,7 @@ export class ConditionalManager {
   constructor(options: ConditionalManagerOptions) {
     this.options = options;
     const strings = options.strings;
-    const dialog = new Dialog({ parent: options.parent, title: strings.managerTitle, name: 'conditional-rules', onClose: options.onClose, coarse: options.coarse });
+    const dialog = new Dialog({ parent: options.parent, title: strings.managerTitle, name: 'conditional-rules', onClose: options.onClose, coarse: options.coarse, pointer: options.pointer });
     this.dialog = dialog;
     dialog.panel.style.width = '460px';
     const scope = dialog.select([
@@ -1615,6 +1806,7 @@ export class ConditionalManager {
       ranges.setAttribute('aria-label', `${strings.appliesTo}: ${row.description}`);
       ranges.title = row.adjustable ? strings.appliesTo : row.reason || strings.appliesTo;
       ranges.readOnly = !row.adjustable;
+      if (row.adjustable) this.dialog.pointable(ranges, 'ranges');
       ranges.addEventListener('keydown', (event) => {
         if (event.key !== 'Enter' || event.isComposing) return;
         // Enter applies the cells of this rule and leaves the list open.

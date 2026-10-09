@@ -304,6 +304,8 @@ export interface RuleStrings {
   formulaBeingTyped: string;
   /** Said when something needs the workbook as it stands while a dialog of rules is open with changes in it. */
   dialogOpen: string;
+  /** Said in the dialog when cells of another sheet are pointed at for the cells a rule applies to. */
+  pointOwnSheet: string;
   /** Said once a rule was set or cleared. */
   validationSet: string;
   validationCleared: string;
@@ -661,6 +663,7 @@ export const STRINGS_EN: UiStrings = {
     tooManyRanges: 'The rule would be left with too many separate ranges',
     formulaBeingTyped: 'Finish the formula first',
     dialogOpen: 'Confirm or close the open rule dialog first',
+    pointOwnSheet: 'A rule applies to cells of its own sheet',
     validationSet: 'Data validation set',
     validationCleared: 'Data validation cleared',
     conditionalCommand: 'Conditional formatting',
@@ -1073,6 +1076,7 @@ export const STRINGS_TR: UiStrings = {
     tooManyRanges: 'Kural çok fazla ayrı aralığa bölünürdü',
     formulaBeingTyped: 'Önce formülü bitirin',
     dialogOpen: 'Önce açık kural kutusunu onaylayın ya da kapatın',
+    pointOwnSheet: 'Kural kendi sayfasının hücrelerine uygulanır',
     validationSet: 'Veri doğrulama uygulandı',
     validationCleared: 'Veri doğrulama temizlendi',
     conditionalCommand: 'Koşullu biçimlendirme',
