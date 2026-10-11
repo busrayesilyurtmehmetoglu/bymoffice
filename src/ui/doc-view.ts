@@ -13,7 +13,7 @@
 //
 // Nothing in this module touches the DOM at import time.
 
-import { focusOnceActive } from './focus-retry';
+import { FocusRetry, pressOf } from './focus-retry';
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
 import * as ops from '../ops/doc/index';
@@ -1121,6 +1121,7 @@ export class DocumentView {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.focusRetry) this.focusRetry.cancel();
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
@@ -2579,7 +2580,11 @@ export class DocumentView {
     this.update();
   };
 
-  private focusInput(quiet: boolean): void {
+  /** The focus a press asked for and did not get yet (see focus-retry.ts); made when the first press needs it. */
+  private focusRetry: FocusRetry | undefined;
+
+  /** `press`: the event of the press this is done for, when it is one; only then is the focus asked for again when the press ends. */
+  private focusInput(quiet: boolean, press?: Event): void {
     const focus = (): void => {
       this.quietFocus = quiet;
       try {
@@ -2590,8 +2595,10 @@ export class DocumentView {
       this.quietFocus = false;
     };
     focus();
-    // In a frame that is not the active one a press may not get the focus yet (see focus-retry.ts).
-    focusOnceActive(this.input, focus, () => !this.destroyed);
+    if (!press) return;
+    // In a frame that is not the active one a press may not get the focus yet.
+    if (!this.focusRetry) this.focusRetry = new FocusRetry(this.input, () => !this.destroyed);
+    this.focusRetry.after(pressOf(press), focus);
   }
 
   private onFocus = (): void => {
@@ -2637,13 +2644,13 @@ export class DocumentView {
     if (this.bar && this.bar.contains(target)) {
       if (typeof target.closest === 'function' && target.closest('button')) return;
       event.preventDefault();
-      this.focusInput(true);
+      this.focusInput(true, event);
       return;
     }
     // On the scrolling element itself the press is on a scroll bar: left to the browser, the focus is handed on from there.
     if (target === this.scroller) return;
     event.preventDefault();
-    this.focusInput(true);
+    this.focusInput(true, event);
   };
 
   private onBarClick = (event: MouseEvent): void => {

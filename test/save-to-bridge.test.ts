@@ -381,7 +381,7 @@ test('bridge: what is being typed and cannot be applied keeps the user\'s save f
   assert.equal(last(f).by, 'user');
 });
 
-test('bridge: closing the file, or loading another, ends the wait for a result; nothing is said about the old file', async () => {
+test('bridge: closing the file, or loading another, ends the wait for a result; no notice is shown for the old file', async () => {
   const f = fake();
   const bridge = createBridge(f.host);
   await bridge.receive({ type: 'load', data: DATA, save: true });
@@ -475,13 +475,14 @@ test('bridge: the page says whether the file is saved: saveState follows changes
   await bridge.receive({ type: 'load', data: DATA, save: true });
   const command = f.views[0].saveCommand as SaveCommand;
   const states = () => f.sent.filter((message) => message.type === 'saveState').map((message) => `${message.dirty} ${message.saving}`);
-  assert.deepEqual(states(), [], 'a file that was opened and not changed is said nothing about');
+  assert.deepEqual(states(), ['false false'], 'a file that was opened is said to be saved and not saving, right after loaded');
+  assert.deepEqual(f.sent.map((message) => message.type), ['ready', 'loaded', 'saveState']);
 
   f.views[0].onChange!({ sheets: [0] });
-  assert.deepEqual(states(), ['true false']);
+  assert.deepEqual(states(), ['false false', 'true false']);
   command.run();
   await settle();
-  assert.deepEqual(states(), ['true false', 'true true']);
+  assert.deepEqual(states(), ['false false', 'true false', 'true true']);
   // Changed while the application stores the file: the result makes it stored, the file as it is now is not.
   f.views[0].onChange!({ sheets: [0] });
   await bridge.receive({ type: 'saveResult', saveId: lastId(f), ok: true });
@@ -511,4 +512,142 @@ test('bridge: the page says whether the file is saved: saveState follows changes
   await other.receive({ type: 'load', data: DATA });
   g.views[0].onChange!({ sheets: [0] });
   assert.equal(g.sent.filter((message) => message.type === 'saveState').length, 0);
+});
+
+// ------------------------------------------------------------ second review
+
+const states = (f: Fake) => f.sent.filter((message) => message.type === 'saveState').map((message) => `${message.dirty} ${message.saving}`);
+
+test('bridge review2 3: another load with save starts from "saved, not saving": the state of the file before it is not left standing', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: '1', data: DATA, save: true });
+  f.views[0].onChange!({ sheets: [0] });
+  await settle();
+  assert.equal(states(f).pop(), 'true false');
+  await bridge.receive({ type: 'load', id: '2', data: DATA, save: true });
+  await settle();
+  assert.deepEqual([(f.views[1].saveCommand as SaveCommand).dirty, states(f).pop()], [false, 'false false'], 'what the application holds is what the new file is');
+  const order = f.sent.map((message) => (message.type === 'loaded' ? `loaded ${message.id}` : message.type === 'saveState' ? `saveState ${message.dirty} ${message.saving}` : message.type));
+  assert.deepEqual(order.slice(order.indexOf('loaded 2')), ['loaded 2', 'saveState false false'], 'right after loaded');
+});
+
+test('bridge review2 3: a save that waits when the file is closed or replaced does not leave the application "saving"', async () => {
+  for (const next of [{ type: 'close' }, { type: 'load', data: DATA }, { type: 'load', data: DATA, save: true }]) {
+    const f = fake();
+    const bridge = createBridge(f.host);
+    await bridge.receive({ type: 'load', data: DATA, save: true });
+    f.views[0].onChange!({ sheets: [0] });
+    (f.views[0].saveCommand as SaveCommand).run();
+    await settle();
+    assert.equal(states(f).pop(), 'true true', JSON.stringify(next));
+    await bridge.receive(next);
+    await settle();
+    assert.equal(states(f).pop(), 'false false', JSON.stringify(next));
+    const count = states(f).length;
+    // Nothing more is said for the file that is gone: its time limit, a result that comes late.
+    for (const entry of f.timers) if (entry.ms === 60000) entry.callback();
+    await bridge.receive({ type: 'saveResult', saveId: 'u1', ok: true });
+    await settle();
+    assert.equal(states(f).length, count, JSON.stringify(next));
+  }
+});
+
+test('bridge review2 3: close and a load without save say it once, and only after a file that had a state', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'close' });
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.deepEqual(states(f), [], 'no file with save was ever shown: nothing about saving is said');
+
+  await bridge.receive({ type: 'load', data: DATA, save: true });
+  assert.deepEqual(states(f), ['false false']);
+  await bridge.receive({ type: 'close', id: 'c' });
+  assert.deepEqual(states(f), ['false false', 'false false'], 'the close ends the state of the file');
+  assert.deepEqual(f.sent.slice(-2).map((message) => message.type), ['saveState', 'done'], 'before the close is confirmed');
+  await bridge.receive({ type: 'close' });
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.deepEqual(states(f), ['false false', 'false false'], 'and nothing is said again for what has no state');
+
+  // A file that cannot be written has no Save button: for the application it is a load without save.
+  const xls = xlsFile(workbookStream({ sheets: [{ name: 'A', records: cat(number(0, 0, 1)) }] }));
+  f.format = 'xlsx';
+  await bridge.receive({ type: 'load', data: DATA, save: true });
+  f.views[f.views.length - 1].onChange!({ sheets: [0] });
+  f.format = 'xls';
+  await bridge.receive({ type: 'load', data: base64Encode(xls), save: true });
+  assert.equal(last(f).save, undefined);
+  assert.equal(states(f).pop(), 'false false');
+});
+
+test('bridge review2 3: a file that replaces one with unsaved changes and cannot be shown: the old state is ended with the old file', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, save: true });
+  f.views[0].onChange!({ sheets: [0] });
+  assert.equal(states(f).pop(), 'true false');
+  const createView = f.host.createView;
+  f.host.createView = () => {
+    throw new Error('cannot be shown');
+  };
+  await bridge.receive({ type: 'load', id: 'bad', data: DATA, save: true });
+  f.host.createView = createView;
+  assert.deepEqual([last(f).type, last(f).code], ['error', 'corrupt']);
+  assert.equal(states(f).pop(), 'false false', 'no file is shown any more');
+});
+
+test('bridge review2 4: a save of the user that is given up while no channel is there fails at once, and its error names the save', async () => {
+  let up = true;
+  const f = fake();
+  f.host.maxPendingChars = 200;
+  const post = f.host.post;
+  f.host.post = (json) => (up ? post(json) : false);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, save: true });
+  const command = f.views[0].saveCommand as SaveCommand;
+  up = false;
+  f.content = new Array(400).fill(7);
+  f.views[0].onChange!({ sheets: [0] });
+  command.run();
+  await settle();
+  assert.deepEqual([command.saving, command.dirty], [false, true], 'not "saving" until the time limit: the file was given up');
+  assert.deepEqual(f.notices, [['error', STRINGS_EN.saveFailed('')]]);
+  up = true;
+  await bridge.receive({ type: 'hello' });
+  await settle();
+  const error = f.sent.find((message) => message.type === 'error');
+  assert.deepEqual([error.code, error.saveId, 'id' in error, 'data' in error], ['save-failed', 'u1', false, false]);
+  assert.equal(f.sent.some((message) => message.type === 'saved'), false, 'the bytes were let go of');
+  assert.equal(states(f).pop(), 'true false');
+  // The time limit of the save that is gone changes nothing, and neither does a result for it.
+  for (const entry of f.timers) if (entry.ms === 60000) entry.callback();
+  await bridge.receive({ type: 'saveResult', saveId: 'u1', ok: true });
+  await settle();
+  assert.deepEqual([command.dirty, last(f).code], [true, 'bad-message']);
+  assert.equal(f.notices.length, 1);
+  // The next save is one of its own.
+  command.run();
+  await settle();
+  assert.equal(lastId(f), 'u2');
+  await bridge.receive({ type: 'saveResult', saveId: 'u2', ok: true });
+  await settle();
+  assert.deepEqual([command.dirty, command.saving], [false, false]);
+});
+
+test('bridge review2 4: a save the application asked for and that is given up keeps its id, as before', async () => {
+  let up = true;
+  const f = fake();
+  f.host.maxPendingChars = 200;
+  const post = f.host.post;
+  f.host.post = (json) => (up ? post(json) : false);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  up = false;
+  f.content = new Array(400).fill(7);
+  await bridge.receive({ type: 'save', id: 's1' });
+  up = true;
+  await bridge.receive({ type: 'hello' });
+  const error = f.sent.find((message) => message.type === 'error');
+  assert.deepEqual([error.code, error.id, 'saveId' in error], ['save-failed', 's1', false]);
 });

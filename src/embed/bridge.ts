@@ -438,6 +438,8 @@ interface Outgoing {
   sheets?: number[];
   /** Which of the files that were shown the message speaks of (see fileSerial). */
   file: number;
+  /** A `saved` that comes from the user: the save it hands over, which waits for its `saveResult`. */
+  saveId?: string;
 }
 
 /** What a command on sheets is refused with when the view was asked and did nothing, for a reason it did not give. */
@@ -532,6 +534,8 @@ export function createBridge(host: BridgeHost): Bridge {
   let awaited: { saveId: string; resolve(): void; reject(error: unknown): void } | undefined;
   /** Counts the saves of the user: each `saved` that comes from one names itself, and its `saveResult` names it back. */
   let userSaves = 0;
+  /** The application was told the state of the save of a file (`saveState`) that has been closed since, and not that it is over. */
+  let saveStateLeft = false;
 
   const deliver = (json: string): boolean => {
     try {
@@ -614,16 +618,27 @@ export function createBridge(host: BridgeHost): Bridge {
     }
     const entry: Outgoing = { type, id: message.id as string | undefined, json: JSON.stringify(message), file: fileSerial };
     if (type === 'changed') entry.sheets = message.sheets as number[];
+    if (type === 'saved' && typeof message.saveId === 'string') entry.saveId = message.saveId;
     pending.push(entry);
     pendingChars += entry.json.length;
     if (flush()) return;
     // Nobody is listening. Answers are never dropped, but a saved file is big:
     // past the limit the oldest ones become errors the application can act on.
     for (let i = 0; i < pending.length && pendingChars > maxPendingChars; i++) {
-      if (pending[i].type !== 'saved') continue;
-      const json = JSON.stringify(errorMessage('save-failed', 'The saved file was given up: the application did not take it', pending[i].id));
-      pendingChars += json.length - pending[i].json.length;
-      pending[i] = { type: 'error', id: pending[i].id, json, file: pending[i].file };
+      const given = pending[i];
+      if (given.type !== 'saved') continue;
+      const error = errorMessage('save-failed', 'The saved file was given up: the application did not take it', given.id);
+      // A save of the user answers no request: the error names it as its `saved` would have.
+      if (given.saveId !== undefined) error.saveId = given.saveId;
+      const json = JSON.stringify(error);
+      pendingChars += json.length - given.json.length;
+      pending[i] = { type: 'error', id: given.id, json, file: given.file };
+      // No `saveResult` can come for a file the application never gets: the save has failed now, not when its time is up.
+      const waiting = awaited;
+      if (given.saveId !== undefined && waiting && waiting.saveId === given.saveId) {
+        awaited = undefined;
+        waiting.reject(new SaveError('refused', 'The saved file was given up: the application did not take it'));
+      }
     }
     if (!retrying && retries < MAX_RETRIES) {
       retrying = true;
@@ -662,11 +677,28 @@ export function createBridge(host: BridgeHost): Bridge {
     fileSerial++;
     const view = shown.view || shown.pages;
     // A save that waits for its result is of a file that is gone: nothing is said about it any more.
-    if (shown.saver) shown.saver.destroy();
+    // What the application was last told of it (unsaved, saving) is ended by whoever closed it: see settleSaveState().
+    if (shown.saver) {
+      shown.saver.destroy();
+      saveStateLeft = true;
+    }
     awaited = undefined;
     shown = undefined;
     sheetCount = undefined;
     if (view) view.destroy();
+  };
+
+  /**
+   * Tells the application where the save stands after the file that is shown was replaced or closed: a
+   * file with a Save button starts as saved and not saving, and the state of a file that is gone is ended
+   * with the same words. Without it the application would hold "unsaved" or "saving" of the file before
+   * for a file that is neither. Nothing is said when no file with a Save button is or was there.
+   */
+  const settleSaveState = () => {
+    const saver = shown && shown.saver;
+    if (!saver && !saveStateLeft) return;
+    saveStateLeft = false;
+    send({ type: 'saveState', dirty: saver ? saver.dirty : false, saving: saver ? saver.saving : false });
   };
 
   /** Gives up whatever load is under way or waiting. */
@@ -915,6 +947,8 @@ export function createBridge(host: BridgeHost): Bridge {
         if (shown && state) shown.revisionsSent = `${state.count} ${state.tracking}`;
       }
       send(out);
+      // Right after it: where the save of this file stands, in place of what was said of the file before.
+      settleSaveState();
     };
 
     if (doc) {
@@ -956,7 +990,9 @@ export function createBridge(host: BridgeHost): Bridge {
       } catch (error) {
         if (saver) saver.destroy();
         setState('error', 'corrupt');
-        return fail('corrupt', errorText(error), id);
+        fail('corrupt', errorText(error), id);
+        // The file before it was closed for this one, and nothing is shown now.
+        return settleSaveState();
       }
       shown = { file, view: undefined, pages, name, locked, convertedFrom, readOnly: locked || readOnly === true, saver, locale };
       setLocale(locale);
@@ -1031,7 +1067,9 @@ export function createBridge(host: BridgeHost): Bridge {
     } catch (error) {
       if (saver) saver.destroy();
       setState('error', 'corrupt');
-      return fail('corrupt', errorText(error), id);
+      fail('corrupt', errorText(error), id);
+      // The file before it was closed for this one, and nothing is shown now.
+      return settleSaveState();
     }
     shown = { file, view, pages: undefined, name, locked, convertedFrom, saver, locale };
     sheetCount = () => (Array.isArray(book.sheets) ? book.sheets.length : Infinity);
@@ -1420,6 +1458,7 @@ export function createBridge(host: BridgeHost): Bridge {
       supersede('the file was closed');
       closeShown();
       setState('empty');
+      settleSaveState();
       done('close', id);
     } catch (error) {
       fail('bad-message', errorText(error), id);

@@ -575,6 +575,123 @@ test.describe('saveTo: a file is saved to where it came from', () => {
     expect(await page.evaluate(() => (window as any).__errors)).toEqual(['SaveError refused undefined']);
   });
 
+  test('review 2: a page that saves from inside onSaveState whenever something is unsaved sends each change once, and is told of no conflict', async ({ page, request }) => {
+    const url = address('xlsx');
+    await seed(request, url, await createBlank('xlsx'));
+    const puts: string[] = [];
+    page.on('response', (answer) => {
+      if (answer.request().method() === 'PUT' && answer.url().endsWith(url)) puts.push(`${answer.status()} ${answer.request().headers()['if-match'] !== undefined}`);
+    });
+    await page.evaluate(async (file) => {
+      const w = window as any;
+      w.__states = [];
+      w.__notices = [];
+      w.__errors = [];
+      w.__mounted = await w.BymOffice.mount(document.getElementById('editor'), {
+        file,
+        saveTo: true,
+        locale: 'en',
+        // What "save by itself" looks like when it is written without a second thought.
+        onSaveState: (state: { dirty: boolean }) => {
+          w.__states.push(state);
+          if (state.dirty) w.__mounted.saveNow();
+        },
+        onNotice: (notice: { kind: string; message: string }) => w.__notices.push(`${notice.kind}: ${notice.message}`),
+        onError: (error: { code?: string }) => w.__errors.push(String(error.code)),
+      });
+    }, url);
+    await typeInGrid(page, '42');
+    await expect.poll(() => unsaved(page), { message: 'the change was saved by the page itself' }).toBe(false);
+    await expect.poll(() => lastState(page).then((state) => state.saving)).toBe(false);
+    expect((await onServer(request, url)).text).toBe('42|');
+    expect(puts, 'one PUT with If-Match, answered 204; no second request, no 412').toEqual(['204 true']);
+
+    await typeInGrid(page, '7');
+    await expect.poll(() => unsaved(page)).toBe(false);
+    await expect.poll(() => lastState(page).then((state) => state.saving)).toBe(false);
+    expect((await onServer(request, url)).text).toBe('42|7');
+    expect(puts).toEqual(['204 true', '204 true']);
+    expect(await page.evaluate(() => (window as any).__errors), 'onError was never called').toEqual([]);
+    expect((await notices(page)).filter((notice) => notice.startsWith('error')), 'no error was shown').toEqual([]);
+  });
+
+  test('review 2: two editors in one page: destroying one leaves the question before leaving and the save key of the other', async ({ page, request }) => {
+    const first = address('xlsx');
+    const second = first.replace(/\.xlsx$/, '-b.xlsx');
+    await seed(request, first, await createBlank('xlsx'));
+    await seed(request, second, await createBlank('xlsx'));
+    expect(await mount(page, { file: first, saveTo: true })).toBe('ok');
+    await page.evaluate(async (file) => {
+      const w = window as any;
+      const other = document.createElement('div');
+      other.id = 'other';
+      other.style.height = '300px';
+      document.body.appendChild(other);
+      w.__other = await w.BymOffice.mount(other, { file, saveTo: true, locale: 'en' });
+    }, second);
+    // Something unsaved in the second one, then the first one goes.
+    await page.evaluate(() => (window as any).__other.view.focus());
+    await expect(page.locator('#other .bym-input')).toBeFocused();
+    await page.keyboard.type('kept');
+    await page.keyboard.press('Enter');
+    expect(await page.evaluate(() => (window as any).__other.hasUnsavedChanges)).toBe(true);
+    await page.evaluate(() => (window as any).__mounted.destroy());
+    await expect(page.locator('#editor')).toBeEmpty();
+
+    expect(await asksBeforeLeaving(page), 'the other editor still asks').toBe(true);
+    await page.evaluate(() => {
+      (window as any).__keys = [];
+      (window as any).__other.view.focus();
+    });
+    await page.keyboard.press('ControlOrMeta+s');
+    await expect.poll(() => page.evaluate(() => (window as any).__other.hasUnsavedChanges), { message: 'the key saves the other editor' }).toBe(false);
+    expect((await onServer(request, second)).text).toBe('kept|');
+    await expect.poll(() => page.evaluate(() => (window as any).__keys)).toEqual([true]);
+    expect(await asksBeforeLeaving(page)).toBe(false);
+    // The other way round: the key in the place of the editor that is gone is the browser's again.
+    await page.evaluate(() => {
+      (window as any).__keys = [];
+      const field = document.createElement('input');
+      field.id = 'left';
+      document.getElementById('editor')!.appendChild(field);
+      field.focus();
+    });
+    await page.keyboard.press('ControlOrMeta+s');
+    await expect.poll(() => page.evaluate(() => (window as any).__keys)).toEqual([false]);
+  });
+
+  test('review 2: a field of the application inside the container: Ctrl/Cmd+S there is taken by the editor, which saves', async ({ page, request }) => {
+    // What happens today, written down so that a change of it is seen: the key is heard on the container, on its way
+    // down, so that no field inside the editor can keep it; a field the application put into the container is inside too.
+    const url = address('xlsx');
+    await seed(request, url, await createBlank('xlsx'));
+    expect(await mount(page, { file: url, saveTo: true })).toBe('ok');
+    await typeInGrid(page, 'typed');
+    expect(await unsaved(page)).toBe(true);
+    await page.evaluate(() => {
+      const field = document.createElement('input');
+      field.id = 'own';
+      document.getElementById('editor')!.appendChild(field);
+      field.focus();
+    });
+    await expect(page.locator('#own')).toBeFocused();
+    await page.keyboard.press('ControlOrMeta+s');
+    await expect.poll(() => page.evaluate(() => (window as any).__keys)).toEqual([true]);
+    await expect.poll(() => unsaved(page)).toBe(false);
+    expect((await onServer(request, url)).text).toBe('typed|');
+    await expect(page.locator('#own'), 'the focus stays in the field of the application').toBeFocused();
+
+    // A field outside the container keeps its key.
+    await page.evaluate(() => {
+      const field = document.createElement('input');
+      field.id = 'outside';
+      document.body.appendChild(field);
+      field.focus();
+    });
+    await page.keyboard.press('ControlOrMeta+s');
+    await expect.poll(() => page.evaluate(() => (window as any).__keys)).toEqual([true, false]);
+  });
+
   test('a saveTo that cannot be saved to makes mount() reject before anything is fetched or shown', async ({ page }) => {
     const bytes = Array.from(await createBlank('xlsx'));
     const fetched: string[] = [];
@@ -703,6 +820,36 @@ test.describe('saveTo on the bridge page: load with save', () => {
     await send(page, { type: 'save', id: 's' });
     const own = await waitFor(page, 'saved', 3);
     expect([own.id, 'by' in own]).toEqual(['s', false]);
+  });
+
+  test('review 2: every loaded file starts from "saved, not saving", and close ends the state of the file', async ({ page }) => {
+    const states = async () => (await messages(page)).filter((message) => message.type === 'saveState').map((message) => `${message.dirty} ${message.saving}`);
+    await send(page, { type: 'load', id: 'one', data: base64(await createBlank('xlsx')), save: true, toolbar: true });
+    await waitFor(page, 'loaded');
+    await expect.poll(states).toEqual(['false false']);
+    const input = page.locator('#editor .bym-input');
+    await input.focus();
+    await page.keyboard.type('1');
+    await page.keyboard.press('Enter');
+    await expect.poll(states).toEqual(['false false', 'true false']);
+    // The user saves, and the application loads another file before it has answered.
+    await page.keyboard.press('ControlOrMeta+s');
+    await waitFor(page, 'saved');
+    await expect.poll(async () => (await states()).pop()).toBe('true true');
+    await send(page, { type: 'load', id: 'two', data: base64(await createBlank('xlsx')), save: true, toolbar: true });
+    await waitFor(page, 'loaded', 2);
+    await expect.poll(async () => (await states()).pop(), { message: 'the new file is not unsaved and not saving' }).toBe('false false');
+    const order = (await messages(page)).map((message) => (message.type === 'loaded' ? `loaded ${message.id}` : message.type));
+    expect(order.slice(order.indexOf('loaded two'))).toEqual(['loaded two', 'saveState']);
+    await expect(page.locator('#editor .bym-toolbar [data-command="save"]')).toBeDisabled();
+
+    await page.locator('#editor .bym-input').focus();
+    await page.keyboard.type('2');
+    await page.keyboard.press('Enter');
+    await expect.poll(async () => (await states()).pop()).toBe('true false');
+    await send(page, { type: 'close', id: 'c' });
+    await waitFor(page, 'done');
+    expect((await states()).pop(), 'nothing is open: nothing is unsaved').toBe('false false');
   });
 
   test('without save in the load there is no button, and the key is not taken', async ({ page }) => {

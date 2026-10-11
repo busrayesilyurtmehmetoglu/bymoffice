@@ -137,6 +137,12 @@ export type SaveTarget =
       credentials: 'omit' | 'same-origin' | 'include';
       /** The address is the one the file was fetched from: its ETag is what `If-Match` is sent with. */
       sameAsFile: boolean;
+      /**
+       * The file was not fetched from an address, and the one it is saved to ends in the extension of a
+       * format that is not written (.doc, .rtf, .xls): a converted file sent there would take the place
+       * of an original, as at the address of the file itself. Only there when it holds.
+       */
+      replacesOriginal?: boolean;
       timeoutMs: number;
       /** A converted file may be saved to the address of its original. */
       allowConverted: boolean;
@@ -165,6 +171,29 @@ function httpAddress(text: string, base: string | undefined): string | undefined
   if (url.username !== '' || url.password !== '') return undefined;
   url.hash = '';
   return url.href;
+}
+
+/**
+ * What tells one http(s) address from another for a server: origin, path and query. The fragment is
+ * never sent, and an empty query ("?") is no query. The case of the path and how it is encoded are
+ * kept as they are: a server may tell them apart. Undefined for what is not an address.
+ */
+function addressKey(text: string): string | undefined {
+  try {
+    const url = new URL(text);
+    return url.origin + url.pathname + url.search;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether the path of an address ends as the name of a file of a format that is not written. */
+function endsInOldFormat(address: string): boolean {
+  try {
+    return /\.(doc|rtf|xls)$/i.test(new URL(address).pathname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -216,7 +245,12 @@ export function resolveSaveTarget(saveTo: unknown, fileUrl: string | undefined, 
   const timeoutMs = request.timeoutMs === undefined ? SAVE_TIMEOUT_MS : request.timeoutMs;
   if (typeof timeoutMs !== 'number' || !(timeoutMs > 0) || timeoutMs === Infinity) throw new TypeError('"saveTo.timeoutMs" must be a positive number of milliseconds');
   if (request.allowConverted !== undefined && typeof request.allowConverted !== 'boolean') throw new TypeError('"saveTo.allowConverted" must be true or false');
-  return { kind: 'request', url, method, headers, credentials, sameAsFile: url === fetched, timeoutMs, allowConverted: request.allowConverted === true };
+  // The same address written another way ("?" at its end, a fragment, the port spelled out) is the same file.
+  const sameAsFile = fetched !== undefined && addressKey(url) === addressKey(fetched);
+  const target: SaveTarget = { kind: 'request', url, method, headers, credentials, sameAsFile, timeoutMs, allowConverted: request.allowConverted === true };
+  // A file given as bytes has no address of its own to compare with: the name of the address is what is left to go by.
+  if (fetched === undefined && endsInOldFormat(url)) target.replacesOriginal = true;
+  return target;
 }
 
 /**
@@ -369,6 +403,10 @@ export class SaveController implements SaveCommand {
   /** The save that waits was asked to overwrite. */
   private nextOverwrites = false;
   private abort: (() => void) | undefined;
+  /** The host is being told of a change it is in the middle of making (see changed()). */
+  private changing = 0;
+  /** A call is being told that no save could start: one that comes from inside that telling is not told again. */
+  private refusing = false;
   private readonly listeners: (() => void)[] = [];
   private told = '';
   private destroyed = false;
@@ -399,7 +437,7 @@ export class SaveController implements SaveCommand {
    */
   get blockedConversion(): boolean {
     const target = this.host.target;
-    return target.kind === 'request' && target.sameAsFile && !target.allowConverted && this.host.info().convertedFrom !== undefined;
+    return target.kind === 'request' && (target.sameAsFile || target.replacesOriginal === true) && !target.allowConverted && this.host.info().convertedFrom !== undefined;
   }
 
   /** The ETag the next save is sent with, when there is one. */
@@ -411,7 +449,14 @@ export class SaveController implements SaveCommand {
   changed(): void {
     if (this.destroyed) return;
     this.count++;
-    this.emit();
+    // Whoever calls is still making the change (a cell that is being written has its editor open until
+    // this returns): a save asked for from inside onState waits until the change is over.
+    this.changing++;
+    try {
+      this.emit();
+    } finally {
+      this.changing--;
+    }
   }
 
   run(): void {
@@ -434,10 +479,19 @@ export class SaveController implements SaveCommand {
    * and otherwise waits for it and saves once more. With `overwrite` the
    * request carries no `If-Match`; such a call always waits for a save that
    * is under way, and then saves if there is still something to save.
+   *
+   * Safe to call from inside any callback of the host (onState, notice, onError, onSaved and the
+   * rest): the save under way is known before the first of them is called, so that such a call
+   * joins it or waits for it and never sends the file beside it. A call from inside the onState
+   * of a change that is being made saves as soon as that change is over.
    */
   saveNow(options?: SaveNowOptions): Promise<boolean> {
     const overwrite = options !== undefined && options !== null && options.overwrite === true;
+    // From inside the notification of a change: the file is taken once the change is made, not half way through it.
+    if (this.changing > 0 && !this.destroyed) return Promise.resolve().then(() => this.saveNow(options));
     if (this.destroyed || !this.host.writable()) return Promise.resolve(false);
+    // Asked from inside onState or onError while they hear that no save could start: they have heard.
+    if (this.refusing) return Promise.resolve(false);
     let settled = false;
     try {
       settled = this.host.commit();
@@ -446,11 +500,17 @@ export class SaveController implements SaveCommand {
     }
     if (!settled) {
       // Why it could not be applied was said where it happened; here only the state and onError learn of it.
-      this.error = this.host.strings().savePending;
-      this.emit();
-      this.report(new SaveError('pending', 'What is being typed could not be applied; the file was not saved'));
+      // A save that is under way goes on: when it succeeds, this is no longer what the state says.
+      this.refuse(() => {
+        this.error = this.host.strings().savePending;
+        this.emit();
+        this.report(new SaveError('pending', 'What is being typed could not be applied; the file was not saved'));
+      });
       return Promise.resolve(false);
     }
+    // The last question to the host. From here to the point where the save under way is known nothing
+    // of the host is called: a callback that asks for a save cannot find the controller half way.
+    const blocked = this.blockedConversion;
     if (this.running) {
       if (this.count === this.held && !overwrite) return this.running;
       if (overwrite) this.nextOverwrites = true;
@@ -465,16 +525,44 @@ export class SaveController implements SaveCommand {
       return this.next;
     }
     if (!this.dirty) return Promise.resolve(true);
-    if (this.blockedConversion) {
-      this.failed(new SaveError('converted', 'The file was converted; saving it over the original needs saveTo.allowConverted'));
+    if (blocked) {
+      this.refuse(() => void this.failed(new SaveError('converted', 'The file was converted; saving it over the original needs saveTo.allowConverted')));
       return Promise.resolve(false);
     }
-    const running: Promise<boolean> = this.start(overwrite).then((ok) => {
-      if (this.running === running) this.running = undefined;
-      return ok;
+    let settle: (ok: boolean) => void = () => undefined;
+    const running = new Promise<boolean>((resolve) => {
+      settle = resolve;
     });
+    // Before anything is said: onState hears "saving" next, and may ask for a save from there.
     this.running = running;
+    this.held = this.count;
+    this.busy = true;
+    this.error = undefined;
+    const end = (ok: boolean): void => {
+      if (this.running === running) this.running = undefined;
+      settle(ok);
+    };
+    this.start(overwrite).then(end, () => {
+      // A callback of the host threw where nothing catches it: the save has an end all the same.
+      this.busy = false;
+      try {
+        this.emit();
+      } catch {
+        // As above.
+      }
+      end(false);
+    });
     return running;
+  }
+
+  /** Tells of a save that could not start; a call of saveNow() from inside the telling answers false and tells nothing. */
+  private refuse(tell: () => void): void {
+    this.refusing = true;
+    try {
+      tell();
+    } finally {
+      this.refusing = false;
+    }
   }
 
   /** Gives up the request under way and stops speaking. Safe to call twice. */
@@ -489,13 +577,13 @@ export class SaveController implements SaveCommand {
 
   private async start(overwrite: boolean): Promise<boolean> {
     const host = this.host;
-    // Before the file is taken: what is changed from here on is not in these bytes.
-    this.held = this.count;
-    this.busy = true;
-    this.error = undefined;
+    // saveNow() has marked the save as under way; this is the first the host hears of it.
     this.emit();
     let bytes: Uint8Array;
     try {
+      // Before the file is taken: what is changed from here on is not in these bytes. (Taken again
+      // here, after onState was told: what a callback changed there is in them.)
+      this.held = this.count;
       bytes = await host.bytes();
     } catch (error) {
       if (this.destroyed) return false;
@@ -516,6 +604,9 @@ export class SaveController implements SaveCommand {
     if (this.destroyed) return false;
     this.savedCount = this.held;
     this.busy = false;
+    // Also what was said meanwhile of something typed that could not be applied: the state does not
+    // say "saved" and "could not be saved" at once.
+    this.error = undefined;
     this.lastSavedAt = host.now ? host.now() : Date.now();
     this.emit();
     // With changes made meanwhile there is still something to save: "saved" would say otherwise.
@@ -625,7 +716,11 @@ export class SaveController implements SaveCommand {
     // Only where the file came from: the ETag says nothing about what is at another address.
     // Not when the user chose to save over what the server holds.
     if (target.sameAsFile && this.etag !== undefined && !overwrite) set('If-Match', this.etag);
-    for (let i = 0; i < target.headers.length; i++) set(target.headers[i][0], target.headers[i][1]);
+    for (let i = 0; i < target.headers.length; i++) {
+      // An overwrite carries no If-Match at all, not the page's own either.
+      if (overwrite && target.headers[i][0].toLowerCase() === 'if-match') continue;
+      set(target.headers[i][0], target.headers[i][1]);
+    }
 
     const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
     // The view itself: only its part of the buffer is sent.
@@ -673,7 +768,11 @@ export class SaveController implements SaveCommand {
           drop(response);
           if (over) return;
           const status = response.status;
-          if (status === 0 || (status >= 300 && status < 400) || response.type === 'opaqueredirect' || response.redirected === true) {
+          // A fetch that does not know `redirect` (one made of XMLHttpRequest, in an old WebView) follows by itself and
+          // says nothing of it: the address its answer came from is then all that tells a login page from the file.
+          const from = typeof response.url === 'string' && response.url !== '' ? addressKey(response.url) : undefined;
+          const elsewhere = from !== undefined && from !== addressKey(target.url);
+          if (status === 0 || (status >= 300 && status < 400) || response.type === 'opaqueredirect' || response.redirected === true || elsewhere) {
             return end(new SaveError('redirected', 'The server redirected the save to another address; it was not followed', status === 0 ? undefined : status));
           }
           if (status >= 200 && status < 300) {

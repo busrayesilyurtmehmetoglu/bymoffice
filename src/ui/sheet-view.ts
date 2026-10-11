@@ -7,7 +7,7 @@
 // renderGrid(). Nothing in this module touches the DOM at import time, so it
 // can be imported where there is no document.
 
-import { focusOnceActive } from './focus-retry';
+import { FocusRetry, pressOf } from './focus-retry';
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
 import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
@@ -1237,6 +1237,7 @@ export class WorkbookView {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.focusRetry) this.focusRetry.cancel();
     if (this.unwatchFonts) this.unwatchFonts();
     this.unwatchFonts = undefined;
     if (this.unwatchEmbeddedFont) this.unwatchEmbeddedFont();
@@ -5517,8 +5518,14 @@ export class WorkbookView {
     return root.activeElement === this.input;
   }
 
-  /** Gives the input the focus without the focus ring that keyboard users get. */
-  private focusInput(quiet: boolean): void {
+  /** The focus a press asked for and did not get yet (see focus-retry.ts); made when the first press needs it. */
+  private focusRetry: FocusRetry | undefined;
+
+  /**
+   * Gives the input the focus without the focus ring that keyboard users get. `press`: the event of the
+   * press this is done for, when it is one; only then is the focus asked for again when the press ends.
+   */
+  private focusInput(quiet: boolean, press?: Event): void {
     if (quiet) this.root.classList.remove('bym-focus-ring');
     if (this.hasFocus()) return;
     const focus = (): void => {
@@ -5527,8 +5534,10 @@ export class WorkbookView {
       this.quietFocus = false;
     };
     focus();
-    // In a frame that is not the active one a press may not get the focus yet (see focus-retry.ts).
-    focusOnceActive(this.input, focus, () => !this.destroyed);
+    if (!press) return;
+    // In a frame that is not the active one a press may not get the focus yet.
+    if (!this.focusRetry) this.focusRetry = new FocusRetry(this.input, () => !this.destroyed);
+    this.focusRetry.after(pressOf(press), focus);
   }
 
   private selectIdleText(): void {
@@ -5701,7 +5710,7 @@ export class WorkbookView {
     }
     if (typeof target.closest === 'function' && target.closest('button, input, .bym-menu, .bym-note-edit')) return;
     event.preventDefault();
-    this.focusInput(true);
+    this.focusInput(true, event);
   };
 
   private onEditKey(event: KeyboardEvent): void {
@@ -6556,7 +6565,7 @@ export class WorkbookView {
       return;
     }
     if (!this.commitForPress()) return;
-    this.focusInput(true);
+    this.focusInput(true, event);
     this.endDrag();
     this.readScroll();
     // A press on the border between two headers resizes; it neither selects nor starts a selection drag.
@@ -6669,7 +6678,7 @@ export class WorkbookView {
         return;
       }
       if (!this.commitForPress()) return;
-      this.focusInput(true);
+      this.focusInput(true, event);
       if (this.pressCellButton(point.x, point.y, true)) {
         this.lastTap = undefined;
         return;
