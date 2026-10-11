@@ -1018,6 +1018,12 @@ export function createBridge(host: BridgeHost): Bridge {
 
     const saver = userSaves === true && !locked ? userSaver() : undefined;
     if (saver) options.saveCommand = saver;
+    // A load that says `toolbar: false` wants the workbook without the bars it is worked on with: the grid, its tabs
+    // and the status bar are what is left (a viewer). Without the field a workbook is shown as it always was.
+    if (toolbar === false) {
+      options.toolbar = false;
+      options.formulaBar = false;
+    }
     const createSheet = (toolbar === true && host.createEditor) || host.createView;
     closeShown();
     try {

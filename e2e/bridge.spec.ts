@@ -670,6 +670,14 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       await bridge.waitFor('loaded', 3);
       await expect(bridge.editor.locator('#editor .bym-editor .bym-toolbar')).toBeVisible();
 
+      // A workbook with `toolbar: false`: a viewer. The grid, its tabs and the status bar; no toolbar, no formula bar.
+      await bridge.send({ type: 'load', id: 't4', blank: 'xlsx', toolbar: false, readOnly: true });
+      await bridge.waitFor('loaded', 4);
+      await expect(bridge.editor.locator('#editor canvas').first()).toBeVisible();
+      await expect(bridge.editor.locator('#editor .bym-toolbar')).toHaveCount(0);
+      await expect(bridge.editor.locator('#editor .bym-formula')).toHaveCount(0);
+      await expect(bridge.editor.locator('#editor [role="tab"]').first()).toBeVisible();
+
       // Closing removes the shell with the view.
       await bridge.send({ type: 'close', id: 'c' });
       await bridge.waitFor('done', 6);

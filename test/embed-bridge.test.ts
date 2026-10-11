@@ -1830,3 +1830,19 @@ test('bridge: an application that answers ready from inside its postMessage is s
   const loaded = f.sent.find((message) => message.type === 'loaded');
   assert.equal(loaded.id, 'file');
 });
+
+test('bridge: a workbook loaded with toolbar: false is shown without the toolbar and the formula bar; without the field nothing is said about them', async () => {
+  const f = fake();
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, toolbar: false, readOnly: true });
+  const bare = f.views[0] as { toolbar?: boolean; formulaBar?: boolean; statusBar?: boolean; readOnly?: boolean };
+  assert.deepEqual([bare.toolbar, bare.formulaBar, bare.statusBar, bare.readOnly], [false, false, undefined, true]);
+
+  await bridge.receive({ type: 'load', data: DATA });
+  const usual = f.views[1] as { toolbar?: boolean; formulaBar?: boolean };
+  assert.deepEqual(['toolbar' in usual, 'formulaBar' in usual], [false, false], 'as before: the page decides');
+
+  await bridge.receive({ type: 'load', data: DATA, toolbar: true });
+  const full = f.views[f.views.length - 1] as { toolbar?: boolean; formulaBar?: boolean };
+  assert.deepEqual(['toolbar' in full, 'formulaBar' in full], [false, false]);
+});
