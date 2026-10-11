@@ -7,6 +7,7 @@
 // renderGrid(). Nothing in this module touches the DOM at import time, so it
 // can be imported where there is no document.
 
+import { focusOnceActive } from './focus-retry';
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
 import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
@@ -5520,9 +5521,14 @@ export class WorkbookView {
   private focusInput(quiet: boolean): void {
     if (quiet) this.root.classList.remove('bym-focus-ring');
     if (this.hasFocus()) return;
-    this.quietFocus = quiet;
-    this.input.focus({ preventScroll: true });
-    this.quietFocus = false;
+    const focus = (): void => {
+      this.quietFocus = quiet;
+      this.input.focus({ preventScroll: true });
+      this.quietFocus = false;
+    };
+    focus();
+    // In a frame that is not the active one a press may not get the focus yet (see focus-retry.ts).
+    focusOnceActive(this.input, focus, () => !this.destroyed);
   }
 
   private selectIdleText(): void {

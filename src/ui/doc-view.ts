@@ -13,6 +13,7 @@
 //
 // Nothing in this module touches the DOM at import time.
 
+import { focusOnceActive } from './focus-retry';
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
 import * as ops from '../ops/doc/index';
@@ -2579,13 +2580,18 @@ export class DocumentView {
   };
 
   private focusInput(quiet: boolean): void {
-    this.quietFocus = quiet;
-    try {
-      this.input.focus({ preventScroll: true });
-    } catch {
-      this.input.focus();
-    }
-    this.quietFocus = false;
+    const focus = (): void => {
+      this.quietFocus = quiet;
+      try {
+        this.input.focus({ preventScroll: true });
+      } catch {
+        this.input.focus();
+      }
+      this.quietFocus = false;
+    };
+    focus();
+    // In a frame that is not the active one a press may not get the focus yet (see focus-retry.ts).
+    focusOnceActive(this.input, focus, () => !this.destroyed);
   }
 
   private onFocus = (): void => {
