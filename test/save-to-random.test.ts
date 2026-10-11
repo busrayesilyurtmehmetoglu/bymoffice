@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SaveController, resolveSaveTarget, type SaveNowOptions, type SaveState } from '../src/embed/save-to';
+import { SaveController, resolveSaveTarget, type ConflictQuestion, type SaveNowOptions, type SaveState } from '../src/embed/save-to';
 import { STRINGS_EN } from '../src/ui/strings';
 
 // Random sequences of changes, saves, overwrites and answers of a server that
@@ -10,12 +10,16 @@ import { STRINGS_EN } from '../src/ui/strings';
 // - never two requests on their way at once;
 // - "nothing unsaved" only when the last 2xx answer was to the content as it is now;
 // - content that is older never goes over content that is newer;
-// - "saving" only while a request is on its way, and every saveNow() is answered.
+// - "saving" only while a request is on its way, and every saveNow() is answered;
+// - a conflict asks at most one question at a time, nothing is on its way while it is open, every
+//   question is taken away exactly once, and what the controller says of it is what the host was asked;
+// - while the ETag of the file is known, a request goes without If-Match only when saveNow({ overwrite: true })
+//   was called, or a question that was open was answered with "overwrite", since the server last took a save.
 //
 // The sequences come from a seed: one that fails is named in the message and runs again as it was.
 
-type Reenter = 'none' | 'onState' | 'onError' | 'onSaved' | 'notice' | 'strings' | 'commit' | 'bytes' | 'info';
-const MODES: Reenter[] = ['none', 'onState', 'onError', 'onSaved', 'notice', 'strings', 'commit', 'bytes', 'info'];
+type Reenter = 'none' | 'onState' | 'onError' | 'onSaved' | 'notice' | 'strings' | 'commit' | 'bytes' | 'info' | 'ask';
+const MODES: Reenter[] = ['none', 'onState', 'onError', 'onSaved', 'notice', 'strings', 'commit', 'bytes', 'info', 'ask'];
 const SEEDS = 120;
 const STEPS = 60;
 
@@ -26,6 +30,9 @@ function generator(seed: number): () => number {
     return state / 4294967296;
   };
 }
+
+/** How many questions the sequences of a test led to, and how many of them were answered with "overwrite": the test is one of them only if there were some. */
+const seen = { questions: 0, overwrites: 0 };
 
 const settle = async () => {
   for (let i = 0; i < 60; i++) await Promise.resolve();
@@ -54,10 +61,20 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
   let told: SaveState | undefined;
   let depth = 0;
   let controller: SaveController;
+  /** The questions about a conflict that were asked: how often each was taken away. */
+  const questions: { question: ConflictQuestion; closed: number }[] = [];
+  const asked = () => questions.filter((entry) => entry.closed === 0);
+  /**
+   * How often the file was allowed to go over whatever the server holds (saveNow({ overwrite: true }), or
+   * "overwrite" as the answer to a question that was open) since the server last took a save: what was
+   * allowed is the overwriting of the file the server held then, not of the one a later save put there.
+   */
+  let allowed = 0;
 
   const call = (options?: SaveNowOptions): void => {
     const entry = { settled: false };
     promises.push(entry);
+    if (options && options.overwrite === true) allowed++;
     controller.saveNow(options).then(
       () => void (entry.settled = true),
       () => {
@@ -112,6 +129,15 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     },
     onError: () => back('onError'),
     onSaved: () => back('onSaved'),
+    askOverwrite: (question) => {
+      const entry = { question, closed: 0 };
+      questions.push(entry);
+      seen.questions++;
+      if (asked().length > 1) problems.push('two questions about a conflict open at once');
+      if (open().length > 0) problems.push('a question was asked while a request was on its way');
+      back('ask');
+      return () => void entry.closed++;
+    },
     timer: (callback) => {
       const entry = { callback, off: false };
       timers.push(entry);
@@ -127,6 +153,9 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
           });
         }
         flights.push(flight);
+        if (flight.ifMatch === undefined && controller.currentETag !== undefined && allowed === 0) {
+          problems.push(`content ${flight.version} was sent without If-Match although the ETag ${controller.currentETag} is known and nobody allowed an overwrite since the server last took a save`);
+        }
         if (open().length > 1) problems.push(`two requests on their way at once (content ${open().map((other) => other.version).join(' and ')})`);
       })) as unknown as typeof fetch,
   });
@@ -143,6 +172,8 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
   };
   const respond = (flight: Flight, status: number, etag?: string | null, more: { [name: string]: unknown } = {}): void => {
     flight.done = true;
+    // A save the server took and said so: what was allowed before it is used up, whether it was this request or not.
+    if (status >= 200 && status < 300 && more.url === undefined) allowed = 0;
     flight.resolve({ status, headers: { get: (name: string) => (name.toLowerCase() === 'etag' && etag !== undefined ? etag : null) }, ...more });
   };
   const timeOut = (): void => {
@@ -159,6 +190,10 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     if (!controller.dirty && server.body !== version) problems.push(`${step}: nothing unsaved, but the server holds ${server.body} and the content is ${version}`);
     if (controller.saving && open().length === 0) problems.push(`${step}: saving with no request on its way`);
     if (!controller.saving && open().length > 0) problems.push(`${step}: a request on its way and not saving`);
+    if (controller.asking && open().length > 0) problems.push(`${step}: a request on its way while the user is asked about a conflict`);
+    if (controller.asking && !controller.dirty) problems.push(`${step}: the user is asked about a conflict of a file with nothing unsaved`);
+    if (controller.asking !== (asked().length === 1)) problems.push(`${step}: the controller says asking ${controller.asking}, and ${asked().length} question(s) were not taken away`);
+    if (questions.some((entry) => entry.closed > 1)) problems.push(`${step}: a question was taken away more than once`);
     if (told === undefined ? state.dirty || state.saving || state.error !== undefined : told.dirty !== state.dirty || told.saving !== state.saving || told.error !== state.error) {
       problems.push(`${step}: the page was last told ${JSON.stringify(told)} and the state is ${JSON.stringify(state)}`);
     }
@@ -169,7 +204,17 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     const flight = open()[0];
     let what = 'nothing';
     let saved = false;
-    if (pick < 0.25) {
+    if (asked().length > 0 && random() < 0.4) {
+      // The user answers the question, or an answer comes for one that is gone.
+      const target = random() < 0.9 ? asked()[0] : questions[0];
+      const overwrite = random() < 0.5;
+      what = `answer ${overwrite ? 'overwrite' : 'cancel'}${target.closed > 0 ? ' (late)' : ''}`;
+      if (overwrite && target.closed === 0) {
+        seen.overwrites++;
+        allowed++;
+      }
+      target.question.answer(overwrite);
+    } else if (pick < 0.25) {
       version++;
       controller.changed();
       what = 'change';
@@ -245,13 +290,17 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
   stuck = false;
   for (let i = 0; i < 50 && problems.length === 0; i++) {
     const flight = open()[0];
-    if (!flight) break;
-    const taken = take(flight);
-    respond(flight, taken.status, taken.etag);
-    if (taken.status === 200) last2xxBody = flight.version;
+    const waiting = asked()[0];
+    if (!flight && !waiting) break;
+    if (flight) {
+      const taken = take(flight);
+      respond(flight, taken.status, taken.etag);
+      if (taken.status === 200) last2xxBody = flight.version;
+    } else waiting.question.answer(false);
     await settle();
     check(`end ${i}`);
   }
+  if (problems.length === 0 && asked().length > 0) problems.push('a question about a conflict is open for ever at the end');
   if (open().length > 0) problems.push('requests go on without end');
   else {
     if (controller.saving) problems.push('saving for ever at the end');
@@ -264,11 +313,14 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
 for (const reenter of MODES) {
   test(`random saves, calling back into the controller from ${reenter}: one request at a time, and never "saved" for what the server does not hold`, async () => {
     let requests = 0;
+    seen.questions = 0;
+    seen.overwrites = 0;
     for (let seed = 1; seed <= SEEDS; seed++) {
       const problems = await run(seed, reenter);
       assert.deepEqual(problems, [], problems.join('\n'));
       requests++;
     }
     assert.equal(requests, SEEDS, 'every sequence ran');
+    assert.equal(seen.questions >= 8 && seen.overwrites >= 2, true, `the sequences ran into conflicts that were asked about and overwritten (${seen.questions} questions, ${seen.overwrites} overwrites)`);
   });
 }

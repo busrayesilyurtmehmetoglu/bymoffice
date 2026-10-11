@@ -105,6 +105,7 @@ test('saveTo: true saves to the address the file was fetched from, with PUT and 
     sameAsFile: true,
     timeoutMs: SAVE_TIMEOUT_MS,
     allowConverted: false,
+    onConflict: 'ask',
   });
   // A file that was given as bytes has no address to go back to.
   assert.throws(() => resolveSaveTarget(true, undefined, PAGE), TypeError);
@@ -140,6 +141,7 @@ test('saveTo: a request takes its url from the file when it has none, and its me
     sameAsFile: true,
     timeoutMs: SAVE_TIMEOUT_MS,
     allowConverted: false,
+    onConflict: 'ask',
   });
   const withUrl = resolveSaveTarget({ url: '/store', credentials: 'omit' }, undefined, PAGE);
   assert.deepEqual([withUrl.kind === 'request' && withUrl.url, withUrl.kind === 'request' && withUrl.method, withUrl.kind === 'request' && withUrl.credentials], ['https://app.example.com/store', 'PUT', 'omit']);

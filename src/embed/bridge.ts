@@ -17,7 +17,8 @@ import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { SheetPrintOptions } from '../ui/sheet-print';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
-import { SaveController, SaveError, type SaveInfo } from './save-to';
+import { askOverwrite, editorRootIn } from '../ui/save-confirm';
+import { SaveController, SaveError, type ConflictQuestion, type SaveInfo } from './save-to';
 
 export type BridgeErrorCode =
   | 'unsupported'
@@ -47,6 +48,8 @@ export interface BridgeDocumentView {
   setLocale?(locale: string): void;
   /** Turns editing off or on. */
   setReadOnly?(readOnly: boolean): void;
+  /** The root element of the view: what is asked of the user about the file is asked over the editor it belongs to. */
+  readonly element?: HTMLElement;
   undo?(): unknown;
   redo?(): unknown;
   readonly canUndo?: boolean;
@@ -123,6 +126,14 @@ export interface BridgeHost {
   maxPendingChars?: number;
   /** How long the page waits for the `saveResult` of a save the user started. Default 60 s. */
   saveResultTimeoutMs?: number;
+  /**
+   * Asks the user whether a save the application answered with `conflict` is to overwrite what
+   * the application holds, in the language of the file that is shown, and returns what takes the
+   * question away again. Without it nothing is asked: such a save has failed, and the view says so.
+   * `element` is the root element of the view that is shown, when the view names one. Nothing is
+   * asked about a file that is only read.
+   */
+  askOverwrite?(question: ConflictQuestion, locale: string | undefined, element: HTMLElement | undefined): (() => void) | void;
   /**
    * Registers a font of a `load` with `fonts`; resolves when the font can be
    * used. Default: the engine's registerFont().
@@ -1247,6 +1258,8 @@ export function createBridge(host: BridgeHost): Bridge {
             const saveId = `u${++userSaves}`;
             const waiting = { saveId, resolve, reject };
             const out: Message = { type: 'saved', by: 'user', saveId, data: base64Encode(bytes), format: info.format };
+            // The user was asked and chose to keep their own file: the application writes it whatever it holds.
+            if (info.overwrite === true) out.overwrite = true;
             if (info.name !== undefined) out.name = info.name;
             if (info.convertedFrom !== undefined) out.convertedFrom = info.convertedFrom;
             awaited = waiting;
@@ -1306,6 +1319,18 @@ export function createBridge(host: BridgeHost): Bridge {
         const view = current.view || current.pages;
         if (view && typeof view.showNotice === 'function') view.showNotice(text, kind);
       },
+      // A `saveResult` that said `conflict`: the user decides whether the file goes over what the application holds.
+      askOverwrite:
+        typeof host.askOverwrite === 'function'
+          ? (question) => {
+              const current = shown;
+              if (!current || current.saver !== mine) return question.answer(false);
+              // A file that is only read is not asked about: its conflict was told, and that is all.
+              if (current.view ? current.view.readOnly === true : current.readOnly === true) return question.answer(false);
+              const element = (current.view || current.pages || {}).element;
+              return (host.askOverwrite as NonNullable<BridgeHost['askOverwrite']>)(question, current.locale, element || undefined);
+            }
+          : undefined,
       // What the page knows and the application cannot count for itself: whether the file as it is now is the file
       // the application was last handed and said it stored. (A change made while the bytes were written is in no
       // `saved` message; a history that was cut can be undone to its end and still not be the file that was opened.)
@@ -1323,13 +1348,17 @@ export function createBridge(host: BridgeHost): Bridge {
     const saveId = field<string>(message, 'saveId', 'string', true);
     const ok = field<boolean>(message, 'ok', 'boolean', true);
     const text = field<string>(message, 'message', 'string', false);
+    const conflict = field<boolean>(message, 'conflict', 'boolean', false);
     const waiting = awaited;
     // Only the save that waits now is answered, and only by its own id: a result that comes after the page
     // stopped waiting, twice, or for a file that was closed must not be taken for the result of the next save.
     if (!waiting || waiting.saveId !== saveId) return fail('bad-message', 'No save with this "saveId" is waiting for a result', id);
     awaited = undefined;
+    const said = text === undefined ? '' : text.slice(0, MAX_RESULT_MESSAGE_CHARS);
     if (ok === true) waiting.resolve();
-    else waiting.reject(new Error(text === undefined ? '' : text.slice(0, MAX_RESULT_MESSAGE_CHARS)));
+    // The file the application holds is not the one it gave the page: the user is asked, and what the application said is shown with the question.
+    else if (conflict === true) waiting.reject(new SaveError('conflict', 'The application holds another file than the one that was opened', undefined, said));
+    else waiting.reject(new Error(said));
     done('saveResult', id);
   };
 
@@ -1427,6 +1456,8 @@ export function createBridge(host: BridgeHost): Bridge {
         if (view) view.setReadOnly(value);
         else if (pages && pages.setReadOnly) pages.setReadOnly(value);
         if (pages) shown.readOnly = value;
+        // A file that is only read now is not asked about: the question about a conflict is taken away, unanswered.
+        if (value && shown.saver) shown.saver.dismissConflict();
       } else if (type === 'setLocale') {
         try {
           if (view) view.setLocale(locale as string);
@@ -1684,6 +1715,9 @@ export function installBridge(options: InstallBridgeOptions): Bridge {
     fetchBytes,
     onState: options.onState,
     onLocale: options.onLocale,
+    // The question about a conflict is asked over the editor, in the language of the file.
+    askOverwrite: (question, locale, element) =>
+      askOverwrite({ root: editorRootIn(options.container, element), strings: resolveUiStrings(locale), detail: question.detail, answer: question.answer }),
     frame: typeof win.requestAnimationFrame === 'function' ? (callback) => void win.requestAnimationFrame(callback) : undefined,
     timer: (callback, ms) => void win.setTimeout(callback, ms),
   });

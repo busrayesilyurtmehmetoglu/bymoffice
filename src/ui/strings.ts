@@ -160,6 +160,11 @@ export interface UiStrings {
   saveFailed(detail: string): string;
   /** The server holds another file than the one that was opened (HTTP 412). */
   saveConflict: string;
+  /** The question a conflict leads to (see SaveToRequest.onConflict): its title, what it explains, and its two answers. */
+  saveConflictTitle: string;
+  saveConflictQuestion: string;
+  saveOverwrite: string;
+  saveCancel: string;
   /** The server answered the save with a redirect, which is not followed. */
   saveRedirected: string;
   /** A converted file is not saved over its original without the page's consent; `to` is "docx" or "xlsx". */
@@ -543,6 +548,11 @@ export const STRINGS_EN: UiStrings = {
   saved: 'Saved',
   saveFailed: (detail) => (detail ? `The file could not be saved (${detail})` : 'The file could not be saved'),
   saveConflict: 'The file was not saved: the file on the server is not the one you opened (someone else changed it, or an earlier save of yours was written although its answer did not arrive)',
+  saveConflictTitle: 'The file was changed on the server',
+  saveConflictQuestion:
+    'The file was changed on the server after you opened it (someone else changed it, or an earlier save of yours was written although its answer did not arrive). If you save, the changes there are overwritten.',
+  saveOverwrite: 'Overwrite',
+  saveCancel: 'Cancel',
   saveRedirected: 'The file was not saved: the server sent the request to another address; you may have been signed out',
   saveConvertedNotAllowed: (to) => `Changes to this file cannot be saved here: it was converted to ${to}, and this page has not allowed saving that in place of the original file`,
   saveDenied: 'The file was not saved: you are not allowed to save it',
@@ -970,6 +980,11 @@ export const STRINGS_TR: UiStrings = {
   saved: 'Kaydedildi',
   saveFailed: (detail) => (detail ? `Dosya kaydedilemedi (${detail})` : 'Dosya kaydedilemedi'),
   saveConflict: 'Dosya kaydedilmedi: sunucudaki dosya sizin açtığınızdan farklı (başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir)',
+  saveConflictTitle: 'Dosya sunucuda değişmiş',
+  saveConflictQuestion:
+    'Dosya, siz açtıktan sonra sunucuda değişmiş (başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir). Kaydederseniz oradaki değişikliklerin üzerine yazılır.',
+  saveOverwrite: 'Üzerine yaz',
+  saveCancel: 'Vazgeç',
   saveRedirected: 'Dosya kaydedilmedi: sunucu isteği başka bir adrese yönlendirdi; oturumunuzun süresi dolmuş olabilir',
   saveConvertedNotAllowed: (to) => `Bu dosyadaki değişiklikler buraya kaydedilemez: dosya ${to} biçimine çevrildi ve sayfa bunun özgün dosyanın yerine kaydedilmesine izin vermedi`,
   saveDenied: 'Dosya kaydedilmedi: kaydetme yetkiniz yok',

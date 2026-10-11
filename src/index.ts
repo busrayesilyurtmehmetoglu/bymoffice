@@ -21,6 +21,7 @@ import { DocumentEditor } from './ui/doc-editor';
 import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import type { SheetPrintOptions } from './ui/sheet-print';
 import { OpcPackage } from './opc';
+import { askOverwrite } from './ui/save-confirm';
 import { SaveController, fileETag, locksSaving, nameFromUrl, resolveSaveTarget, saveInfoOf, watchLeaving, type SaveNowOptions, type SaveState, type SaveTo } from './embed/save-to';
 
 export { CfbFile, type CfbEntry } from './cfb';
@@ -148,7 +149,7 @@ export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasur
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
 export type { SaveCommand } from './ui/save-command';
-export { SaveError, type SaveErrorCode, type SaveInfo, type SaveNowOptions, type SaveState, type SaveTo, type SaveToFunction, type SaveToRequest } from './embed/save-to';
+export { SaveError, type ConflictQuestion, type SaveErrorCode, type SaveInfo, type SaveNowOptions, type SaveState, type SaveTo, type SaveToFunction, type SaveToRequest } from './embed/save-to';
 export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
 export { defaultPaperFor, headerFooterFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPagePaint, type SheetPlanOptions, type SheetPrintOptions } from './ui/sheet-print';
 export {
@@ -377,6 +378,13 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * saved; its body is not read. What goes wrong is told to onNotice, to
    * onSaveState and, as a SaveError, to onError.
    *
+   * A save to an address that the server refuses with 412 (the file there was
+   * changed since it was opened) never overwrites by itself: after onError
+   * was told, the editor asks the user inside the container ("Overwrite" /
+   * "Cancel"), and "Overwrite" is saveNow({ overwrite: true }). A page that
+   * asks by itself turns the question off with `{ onConflict: 'fail' }`. A
+   * function is not asked about.
+   *
    * Nothing is saved, and there is no button, for a file that cannot be
    * written (doc, RTF and xls that were not converted, a document whose
    * protection allows no editing); the button is not shown while the view is
@@ -516,7 +524,8 @@ export interface MountedSpreadsheet {
    * when there was nothing to save; to false when it could not be (onNotice
    * and onSaveState say why), and always to false without `saveTo`. Never rejects.
    * `{ overwrite: true }` saves over whatever the server holds (no `If-Match`):
-   * the user's answer to a SaveError "conflict".
+   * the user's answer to a SaveError "conflict". While the editor asks the user
+   * about a conflict a call sends nothing, and resolves as the question ends.
    */
   saveNow(options?: SaveNowOptions): Promise<boolean>;
   /** Whether changes were made that saveNow() has not saved: with `saveTo`, what the Save button shows. */
@@ -553,7 +562,8 @@ export interface MountedDocument {
    * when there was nothing to save; to false when it could not be (onNotice
    * and onSaveState say why), and always to false without `saveTo`. Never rejects.
    * `{ overwrite: true }` saves over whatever the server holds (no `If-Match`):
-   * the user's answer to a SaveError "conflict".
+   * the user's answer to a SaveError "conflict". While the editor asks the user
+   * about a conflict a call sends nothing, and resolves as the question ends.
    */
   saveNow(options?: SaveNowOptions): Promise<boolean>;
   /** Whether changes were made that saveNow() has not saved: with `saveTo`, what the Save button shows. */
@@ -631,6 +641,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   let commit: () => boolean = () => true;
   let locked: () => boolean = () => false;
   let notice: (message: string, kind: 'error' | 'info') => void = () => undefined;
+  let focusView: () => void = () => undefined;
+  /** The root element of the editor, and whether its view is only read: what the question about a conflict needs. */
+  let editorRoot: (() => HTMLElement) | undefined;
+  let readOnlyNow: () => boolean = () => false;
   const info = () => saveInfoOf(file.format, conversion, fileName);
   const controller = saveTarget
     ? new SaveController({
@@ -644,9 +658,34 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
         onState: options.onSaveState,
         onSaved: options.onSave,
         onError: options.onError,
+        // A save the server refused with 412: the user is asked over the editor, unless the page said
+        // `onConflict: 'fail'` (the controller looks at that). A function of the application knows its own conflicts.
+        askOverwrite:
+          saveTarget.kind === 'request' && typeof document !== 'undefined'
+            ? (question) => {
+                // A view that is only read is not asked to overwrite anything: the conflict was told, and that is all.
+                if (readOnlyNow() || !editorRoot) return question.answer(false);
+                return askOverwrite({
+                  root: editorRoot(),
+                  strings: resolveUiStrings(options.locale),
+                  detail: question.detail,
+                  answer: question.answer,
+                  focusView: () => focusView(),
+                });
+              }
+            : undefined,
         etag,
       })
     : undefined;
+  /** A view that is turned read-only is not asked about a conflict any more: the question goes, unanswered. */
+  const watchReadOnly = (view: { setReadOnly(readOnly: boolean): void }): void => {
+    if (!controller) return;
+    const set = view.setReadOnly.bind(view);
+    view.setReadOnly = (readOnly: boolean) => {
+      set(readOnly);
+      if (readOnly) controller.dismissConflict();
+    };
+  };
   /** Without `saveTo`: whether anything was changed at all. */
   let touched = false;
   const changed = () => {
@@ -737,6 +776,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     // A protection that allows no editing: nothing is written back.
     locked = () => locksSaving(view.protection);
     notice = (message, kind) => view.showNotice(message, kind);
+    focusView = () => view.focus();
+    editorRoot = () => editor.element;
+    readOnlyNow = () => view.readOnly;
+    watchReadOnly(view);
     const destroy = tie(editor);
     converted();
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
@@ -796,6 +839,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     }
   };
   notice = (message, kind) => view.showNotice(message, kind);
+  focusView = () => view.focus();
+  editorRoot = () => editor.element;
+  readOnlyNow = () => view.readOnly;
+  watchReadOnly(view);
   const destroy = tie(editor);
   converted();
   const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);

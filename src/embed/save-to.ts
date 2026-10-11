@@ -14,6 +14,11 @@ export interface SaveInfo {
   convertedFrom?: 'doc' | 'rtf' | 'xls';
   /** The name of the file, when it is known: the last part of the path it was fetched from, or the name of a File. */
   name?: string;
+  /**
+   * The save was asked to go over whatever the target holds (saveNow({ overwrite: true }), or the
+   * user's answer to a conflict): a function that guards its target writes without that guard. Only there when it holds.
+   */
+  overwrite?: true;
 }
 
 /** An application's own way to save: resolves (or returns) when the bytes are safe, rejects or throws when they are not. */
@@ -43,6 +48,16 @@ export interface SaveToRequest {
    * unless the page says here that its server expects it. Default false.
    */
   allowConverted?: boolean;
+  /**
+   * What happens when the server refuses a save because the file it holds is
+   * not the one that was opened (HTTP 412). "ask" (the default): the editor
+   * asks the user, inside its container, whether to overwrite the file on the
+   * server, and does so only when the user says so. "fail": the editor only
+   * says that the file was not saved; the page asks by itself and calls
+   * saveNow({ overwrite: true }). onError is given the SaveError "conflict"
+   * either way, before anything is asked.
+   */
+  onConflict?: 'ask' | 'fail';
 }
 
 /** What saveNow() can be asked for. */
@@ -146,6 +161,8 @@ export type SaveTarget =
       timeoutMs: number;
       /** A converted file may be saved to the address of its original. */
       allowConverted: boolean;
+      /** A save the server refuses with 412 is asked about ("ask"), or only told ("fail"). Without it: "fail". */
+      onConflict?: 'ask' | 'fail';
     };
 
 /** RFC 9110 `token`: what the name of a header is made of. */
@@ -247,7 +264,10 @@ export function resolveSaveTarget(saveTo: unknown, fileUrl: string | undefined, 
   if (request.allowConverted !== undefined && typeof request.allowConverted !== 'boolean') throw new TypeError('"saveTo.allowConverted" must be true or false');
   // The same address written another way ("?" at its end, a fragment, the port spelled out) is the same file.
   const sameAsFile = fetched !== undefined && addressKey(url) === addressKey(fetched);
-  const target: SaveTarget = { kind: 'request', url, method, headers, credentials, sameAsFile, timeoutMs, allowConverted: request.allowConverted === true };
+  const onConflict = request.onConflict === undefined ? 'ask' : request.onConflict;
+  // No value overwrites without the user being asked: that is what saveNow({ overwrite: true }) is for.
+  if (onConflict !== 'ask' && onConflict !== 'fail') throw new TypeError('"saveTo.onConflict" must be "ask" or "fail"');
+  const target: SaveTarget = { kind: 'request', url, method, headers, credentials, sameAsFile, timeoutMs, allowConverted: request.allowConverted === true, onConflict };
   // A file given as bytes has no address of its own to compare with: the name of the address is what is left to go by.
   if (fetched === undefined && endsInOldFormat(url)) target.replacesOriginal = true;
   return target;
@@ -327,6 +347,17 @@ export interface SaveStrings {
   savePending: string;
 }
 
+/** What the user is asked when a save ran into a conflict: whether to save over what the target holds. */
+export interface ConflictQuestion {
+  /** What the application said of the conflict, as one short line of plain text; empty when it said nothing. */
+  detail: string;
+  /**
+   * The answer: true saves over what the target holds, false leaves the file unsaved. Only the first
+   * answer counts, and none does once the question was taken away.
+   */
+  answer(overwrite: boolean): void;
+}
+
 /** What a controller needs of whoever holds the file. */
 export interface SaveHost {
   target: SaveTarget;
@@ -349,6 +380,13 @@ export interface SaveHost {
   onSaved?(bytes: Uint8Array): void;
   /** Called with a SaveError for every save that failed. */
   onError?(error: unknown): void;
+  /**
+   * Asks the user whether a save that ran into a conflict is to overwrite what the target holds,
+   * and returns what takes the question away again (it is called once, whichever way the question
+   * ends). Without it nothing is asked: a conflict is a failure like any other. A request is only
+   * asked about when its target says "ask"; a function when it rejects with a SaveError "conflict".
+   */
+  askOverwrite?(question: ConflictQuestion): (() => void) | void;
   /** The ETag the file came with, when it was fetched. */
   etag?: string | null;
   /** Default: the global fetch. */
@@ -371,8 +409,15 @@ function detailOf(error: unknown): string {
   let text = '';
   if (error instanceof Error) text = error.message;
   else if (typeof error === 'string') text = error;
-    text = text.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim();
+  text = text.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim();
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+}
+
+/** A question that is open: what its answer settles, and what takes it away. */
+interface Asking {
+  promise: Promise<boolean>;
+  settle(ok: boolean): void;
+  close: (() => void) | undefined;
 }
 
 /** A body that is not read is let go of, so that the connection is free again. */
@@ -398,6 +443,12 @@ export class SaveController implements SaveCommand {
   private error: string | undefined;
   private etag: string | undefined;
   private running: Promise<boolean> | undefined;
+  /** What the call that started the save under way was answered with: the end of that save, or of the question it led to. */
+  private result: Promise<boolean> | undefined;
+  /** The question a conflict led to, while it is open: nothing is sent until it is answered. */
+  private question: Asking | undefined;
+  /** What the save that just ended in a conflict asked: the call that started it is answered with it. */
+  private asked: Promise<boolean> | undefined;
   /** The one save that waits for the one under way: it holds what was changed since that one took the file. */
   private next: Promise<boolean> | undefined;
   /** The save that waits was asked to overwrite. */
@@ -440,6 +491,11 @@ export class SaveController implements SaveCommand {
     return target.kind === 'request' && (target.sameAsFile || target.replacesOriginal === true) && !target.allowConverted && this.host.info().convertedFrom !== undefined;
   }
 
+  /** Whether the user is being asked what to do about a conflict: nothing is sent until the answer. */
+  get asking(): boolean {
+    return this.question !== undefined;
+  }
+
   /** The ETag the next save is sent with, when there is one. */
   get currentETag(): string | undefined {
     return this.etag;
@@ -478,7 +534,14 @@ export class SaveController implements SaveCommand {
    * while a save is under way sends nothing when that save holds everything,
    * and otherwise waits for it and saves once more. With `overwrite` the
    * request carries no `If-Match`; such a call always waits for a save that
-   * is under way, and then saves if there is still something to save.
+   * is under way, and then saves if there is still something to save. What
+   * `overwrite` allows is the overwriting of what the target holds when it is
+   * asked for: when the save that was under way is taken by the target, the
+   * one that waited is guarded again, by what the target holds from then on.
+   *
+   * While the user is asked about a conflict (SaveHost.askOverwrite) a call sends nothing and asks
+   * nothing more: it resolves as the question does, to what came of the overwrite or to false.
+   * A call with `overwrite` is that answer: the question is taken away and the file is sent.
    *
    * Safe to call from inside any callback of the host (onState, notice, onError, onSaved and the
    * rest): the save under way is known before the first of them is called, so that such a call
@@ -489,7 +552,14 @@ export class SaveController implements SaveCommand {
     const overwrite = options !== undefined && options !== null && options.overwrite === true;
     // From inside the notification of a change: the file is taken once the change is made, not half way through it.
     if (this.changing > 0 && !this.destroyed) return Promise.resolve().then(() => this.saveNow(options));
-    if (this.destroyed || !this.host.writable()) return Promise.resolve(false);
+    if (this.destroyed) return Promise.resolve(false);
+    if (!this.host.writable()) {
+      // A file that can no longer be written is not asked about either.
+      this.dismissConflict();
+      return Promise.resolve(false);
+    }
+    const open = this.question;
+    if (open) return overwrite ? this.answer(open, true) : open.promise;
     // Asked from inside onState or onError while they hear that no save could start: they have heard.
     if (this.refusing) return Promise.resolve(false);
     let settled = false;
@@ -512,7 +582,7 @@ export class SaveController implements SaveCommand {
     // of the host is called: a callback that asks for a save cannot find the controller half way.
     const blocked = this.blockedConversion;
     if (this.running) {
-      if (this.count === this.held && !overwrite) return this.running;
+      if (this.count === this.held && !overwrite) return this.result || this.running;
       if (overwrite) this.nextOverwrites = true;
       if (!this.next) {
         this.next = this.running.then(() => {
@@ -533,14 +603,28 @@ export class SaveController implements SaveCommand {
     const running = new Promise<boolean>((resolve) => {
       settle = resolve;
     });
+    let answer: (ok: boolean) => void = () => undefined;
+    const result = new Promise<boolean>((resolve) => {
+      answer = resolve;
+    });
     // Before anything is said: onState hears "saving" next, and may ask for a save from there.
     this.running = running;
+    this.result = result;
     this.held = this.count;
     this.busy = true;
     this.error = undefined;
     const end = (ok: boolean): void => {
-      if (this.running === running) this.running = undefined;
+      if (this.running === running) {
+        this.running = undefined;
+        this.result = undefined;
+      }
+      const asked = this.asked;
+      this.asked = undefined;
+      // The request is over: a save that waits for it goes on. The call itself is answered with what
+      // the user says, when the save ended in a question.
       settle(ok);
+      if (!ok && asked) void asked.then(answer);
+      else answer(ok);
     };
     this.start(overwrite).then(end, () => {
       // A callback of the host threw where nothing catches it: the save has an end all the same.
@@ -552,7 +636,84 @@ export class SaveController implements SaveCommand {
       }
       end(false);
     });
-    return running;
+    return result;
+  }
+
+  /**
+   * Takes the question about a conflict away without an answer, as "cancel" would: nothing is sent
+   * and the file stays unsaved. For a view that turned read-only. Does nothing when nothing is asked.
+   */
+  dismissConflict(): void {
+    const open = this.question;
+    if (open) void this.answer(open, false);
+  }
+
+  /** Ends the question: with `overwrite` the file is sent over what the target holds, and the question ends as that save does. */
+  private answer(open: Asking, overwrite: boolean): Promise<boolean> {
+    if (this.question !== open) return open.promise;
+    this.question = undefined;
+    const close = open.close;
+    open.close = undefined;
+    if (close) {
+      try {
+        close();
+      } catch {
+        // A host that fails at taking its question away does not undo the answer.
+      }
+    }
+    if (!overwrite || this.destroyed) {
+      open.settle(false);
+      return open.promise;
+    }
+    void this.saveNow({ overwrite: true }).then(open.settle);
+    return open.promise;
+  }
+
+  /** After a conflict was told: asks whether to overwrite, when the host can ask and nobody has answered already. */
+  private ask(error: SaveError): void {
+    const host = this.host;
+    const target = host.target;
+    if (this.destroyed || this.question || typeof host.askOverwrite !== 'function') return;
+    if (target.kind === 'request' && target.onConflict !== 'ask') return;
+    // An overwrite was asked for meanwhile (from inside onError, say): that is the answer.
+    if (this.nextOverwrites) return;
+    let settle: (ok: boolean) => void = () => undefined;
+    const open: Asking = {
+      promise: new Promise<boolean>((resolve) => {
+        settle = resolve;
+      }),
+      settle: (ok) => settle(ok),
+      close: undefined,
+    };
+    this.question = open;
+    this.asked = open.promise;
+    let close: (() => void) | void;
+    try {
+      close = host.askOverwrite({
+        // Only what an application said of its own conflict: a server's answer is never read.
+        detail: typeof error.cause === 'string' ? detailOf(error.cause) : '',
+        answer: (overwrite) => {
+          if (this.question === open) void this.answer(open, overwrite === true);
+        },
+      });
+    } catch {
+      // A host that cannot ask after all: the conflict stays the failure it was told as.
+      if (this.question === open) {
+        this.question = undefined;
+        open.settle(false);
+      }
+      return;
+    }
+    if (typeof close !== 'function') return;
+    if (this.question === open) open.close = close;
+    else {
+      // Answered while it was being asked: it is taken away at once.
+      try {
+        close();
+      } catch {
+        // As above.
+      }
+    }
   }
 
   /** Tells of a save that could not start; a call of saveNow() from inside the telling answers false and tells nothing. */
@@ -570,6 +731,8 @@ export class SaveController implements SaveCommand {
     if (this.destroyed) return;
     this.destroyed = true;
     this.listeners.length = 0;
+    // A question that is open is taken away; whoever waits for its answer is answered.
+    this.dismissConflict();
     const abort = this.abort;
     this.abort = undefined;
     if (abort) abort();
@@ -592,18 +755,30 @@ export class SaveController implements SaveCommand {
     if (this.destroyed) return false;
     try {
       const target = host.target;
-      const info = host.info();
+      let info = host.info();
+      // A copy: what the host hands out is not written to.
+      if (overwrite && target.kind === 'function') info = { ...info, overwrite: true };
       if (target.kind === 'function') await this.call(target.save, bytes, info);
       else await this.request(target, bytes, info, overwrite);
     } catch (error) {
       if (this.destroyed) return false;
-      if (error instanceof SaveError) return this.failed(error);
+      if (error instanceof SaveError) {
+        this.failed(error);
+        // After the notice and onError: a page that answers by itself there is not asked as well.
+        // A save that carried no condition and was refused all the same is not asked about again.
+        if (error.code === 'conflict' && !overwrite) this.ask(error);
+        return false;
+      }
       const detail = detailOf(error);
       return this.failed(new SaveError('refused', detail === '' ? 'The file was not taken' : detail, undefined, error), detail);
     }
     if (this.destroyed) return false;
     this.savedCount = this.held;
     this.busy = false;
+    // The target took a save: whoever asked meanwhile to overwrite meant the file it held before, not the
+    // one it holds now. The save that waits goes guarded again. (Before the host hears of the save: an
+    // overwrite it asks for from there is about the file as it is now.)
+    this.nextOverwrites = false;
     // Also what was said meanwhile of something typed that could not be applied: the state does not
     // say "saved" and "could not be saved" at once.
     this.error = undefined;

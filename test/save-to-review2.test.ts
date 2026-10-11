@@ -431,5 +431,5 @@ test('review2 9: a converted file that was given as bytes is not saved to an add
   const fetched = make(resolveSaveTarget('/copies/42.doc', '/files/42.doc', PAGE), {}, converted);
   assert.equal(fetched.controller.blockedConversion, false);
   // The target reads as before for an address that is not one of an old format.
-  assert.deepEqual(Object.keys(resolveSaveTarget('/files/42.docx', undefined, PAGE)).sort(), ['allowConverted', 'credentials', 'headers', 'kind', 'method', 'sameAsFile', 'timeoutMs', 'url']);
+  assert.deepEqual(Object.keys(resolveSaveTarget('/files/42.docx', undefined, PAGE)).sort(), ['allowConverted', 'credentials', 'headers', 'kind', 'method', 'onConflict', 'sameAsFile', 'timeoutMs', 'url']);
 });

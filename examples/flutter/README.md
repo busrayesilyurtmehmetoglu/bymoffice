@@ -70,6 +70,13 @@ editor.onUserSave.listen((file) async {
   }
 });
 
+// Çakışma: dosya, uygulamanın elinde (sunucuda) o arada değiştiyse üzerine yazmayın; sayfaya söyleyin.
+// Sayfa kullanıcıya sorar ("Üzerine yaz" / "Vazgeç"); "Üzerine yaz" denirse dosya `onUserSave` ile
+// yeniden gelir ve bu kez `file.overwrite == true`'dur: koşulsuz yazın. "Vazgeç"te hiçbir şey gelmez.
+//   if (!file.overwrite && await changedOnServer()) {
+//     await editor.saveResult(file, false, conflict: true, message: 'Başka biri az önce kaydetti');
+//   }
+
 await editor.undo();
 await editor.setReadOnly(true);
 

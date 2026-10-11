@@ -63,7 +63,7 @@ class BymOfficeDocument {
 /// The answer to a `save`, or the file the user saved in the page (see
 /// [BymOfficeController.onUserSave]).
 class BymOfficeSavedFile {
-  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom, this.name, this.byUser = false, this.saveId});
+  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom, this.name, this.byUser = false, this.saveId, this.overwrite = false});
 
   final Uint8List bytes;
 
@@ -85,6 +85,11 @@ class BymOfficeSavedFile {
   /// it back, so that a result that arrives late is never taken for the result
   /// of a later save.
   final String? saveId;
+
+  /// True when [byUser] and the user was asked about a conflict (see
+  /// [BymOfficeController.saveResult], `conflict`) and chose to overwrite: the
+  /// application stores the file whatever it holds, without its usual guard.
+  final bool overwrite;
 }
 
 /// A `changed` message: the workbook or the document was edited (or an edit
@@ -223,9 +228,21 @@ class BymOfficeController {
   /// it could not be saved, with [message] (one short line, shown as text)
   /// when one is given. A result for a save the page no longer waits for (it
   /// took more than a minute, or the file was closed) changes nothing.
-  Future<void> saveResult(BymOfficeSavedFile file, bool ok, {String? message}) {
+  ///
+  /// [conflict] (with [ok] false): the file could not be stored because what
+  /// the application holds was changed since it gave the file to the page. The
+  /// page then asks the user whether to overwrite; on "overwrite" it sends the
+  /// file again through [onUserSave] with [BymOfficeSavedFile.overwrite] set
+  /// (and a new `saveId`), on "cancel" it sends nothing.
+  Future<void> saveResult(BymOfficeSavedFile file, bool ok, {String? message, bool conflict = false}) {
     _checkAlive();
-    return _post(<String, dynamic>{'type': 'saveResult', 'saveId': file.saveId, 'ok': ok, if (message != null) 'message': message});
+    return _post(<String, dynamic>{
+      'type': 'saveResult',
+      'saveId': file.saveId,
+      'ok': ok,
+      if (message != null) 'message': message,
+      if (conflict && !ok) 'conflict': true,
+    });
   }
 
   /// Every `error` message, including those that also fail a request.
@@ -478,6 +495,7 @@ class BymOfficeController {
             name: message['name'] as String?,
             byUser: true,
             saveId: message['saveId'] as String?,
+            overwrite: message['overwrite'] == true,
           ));
         } else if (id is String) {
           _pending[id]?.complete(message);

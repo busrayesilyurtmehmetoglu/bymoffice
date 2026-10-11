@@ -1239,6 +1239,11 @@ export class WorkbookView {
   }
 
   /** Removes every listener, observer, pending frame and the view's DOM. Safe to call twice. */
+  /** The root element of the view, as it was put into the container. */
+  get element(): HTMLElement {
+    return this.root;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;

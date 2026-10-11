@@ -239,7 +239,8 @@ test.describe('saveTo: a file is saved to where it came from', () => {
   test('a file that was changed on the server since it was opened is not overwritten: 412 is told, and the file stays unsaved', async ({ page, request, hasTouch, pageProblems }) => {
     const url = address('xlsx');
     await seed(request, url, await createBlank('xlsx'));
-    expect(await mount(page, { file: url, saveTo: true })).toBe('ok');
+    // The page answers a conflict by itself: the editor asks nothing (what it asks otherwise: save-conflict.spec.ts).
+    expect(await mount(page, { file: url, saveTo: { onConflict: 'fail' } })).toBe('ok');
     // Someone else saves the file.
     await seed(request, url, await createBlank('xlsx', { sheetName: 'Theirs' }));
     await typeInGrid(page, 'mine');
@@ -737,10 +738,28 @@ test.describe('saveTo in the test page (demo)', () => {
     await type('ikinci');
     await press(save, hasTouch);
     await expect(state).toHaveText(/^Kaydedilemedi: Dosya kaydedilmedi: sunucudaki dosya sizin açtığınızdan farklı .+ — dirty: true, saving: false$/);
+    // The editor asks before it overwrites; the user is not sure yet.
+    const confirm = page.locator('#saveto-editor [data-bym-confirm="save-conflict"]');
+    await expect(confirm).toBeVisible();
+    await expect(confirm).toHaveAccessibleName('Dosya sunucuda değişmiş');
+    await expect(confirm.locator('[data-bym-action="cancel"]')).toBeFocused();
+    await press(confirm.locator('[data-bym-action="cancel"]'), hasTouch);
+    await expect(confirm).toHaveCount(0);
     await press(page.locator('#saveto-check'), hasTouch);
     await expect(notice).toHaveText(/^Sunucudaki kopya: .+ bayt, xlsx — Sheet1!A1 = \(boş\)$/);
-    // The user keeps their own: the copy on the server is overwritten, because they said so.
+    // The user keeps their own: the copy on the server is overwritten, because they said so (the page's own button).
     await press(page.locator('#saveto-overwrite'), hasTouch);
+    await expect(state).toHaveText(/^Kaydedildi \(.+\)\. — dirty: false, saving: false$/);
+    await press(page.locator('#saveto-check'), hasTouch);
+    await expect(notice).toHaveText(/^Sunucudaki kopya: .+ bayt, xlsx — Sayfa1!A1 = deneme$/);
+    // Once more, and this time the answer is given in the editor's own question.
+    await press(page.locator('#saveto-conflict'), hasTouch);
+    await expect(notice).toHaveText('Sunucudaki kopya değiştirildi: bir değişiklik yapıp kaydedin.');
+    await type('üçüncü');
+    await press(save, hasTouch);
+    await expect(confirm).toBeVisible();
+    await press(confirm.locator('[data-bym-action="overwrite"]'), hasTouch);
+    await expect(confirm).toHaveCount(0);
     await expect(state).toHaveText(/^Kaydedildi \(.+\)\. — dirty: false, saving: false$/);
     await press(page.locator('#saveto-check'), hasTouch);
     await expect(notice).toHaveText(/^Sunucudaki kopya: .+ bayt, xlsx — Sayfa1!A1 = deneme$/);

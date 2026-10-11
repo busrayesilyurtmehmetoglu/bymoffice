@@ -309,6 +309,11 @@ export class SpreadsheetEditor {
   }
 
   /** Removes the editor from its container with every listener and pending frame. Safe to call twice. */
+  /** The root element of the editor: the shell with the view in it, as it was put into the container. */
+  get element(): HTMLElement {
+    return this.root;
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;

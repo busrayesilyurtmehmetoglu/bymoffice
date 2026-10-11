@@ -166,13 +166,14 @@
           <label>Hedef
             <select id="saveto-target">
               <option value="same">saveTo: true (alındığı adres, PUT + If-Match)</option>
+              <option value="same-fail">saveTo: { onConflict: 'fail' } (çakışmada editör sormaz)</option>
               <option value="function">saveTo: işlev (bellekte tutar)</option>
               <option value="failing">saveTo: sunucu 503 yanıtlar</option>
             </select>
           </label>
           <button id="saveto-xlsx">Boş xlsx ile dene</button>
           <button id="saveto-docx">Boş docx ile dene</button>
-          <button id="saveto-conflict" disabled title="Sunucudaki kopyayı değiştirir: sonraki kayıt 412 alır, üzerine yazılmaz.">Sunucudaki kopyayı değiştir (412)</button>
+          <button id="saveto-conflict" disabled title="Sunucudaki kopyayı değiştirir: sonraki kayıt 412 alır; editör üzerine yazmadan önce sorar (onConflict: 'fail' ise yalnız bildirir).">Sunucudaki kopyayı değiştir (412)</button>
           <button id="saveto-overwrite" disabled title="mounted.saveNow({ overwrite: true }): If-Match göndermeden, sunucudaki kopyanın üzerine kaydeder.">Üzerine yaz</button>
           <button id="saveto-check" disabled>Sunucudaki kopyayı oku</button>
         </div>
@@ -691,11 +692,13 @@
               saveTo:
                 target === 'same'
                   ? true
-                  : target === 'failing'
-                    ? { url: `${saveToAddress}?status=503` }
-                    : (bytes, info) => {
-                        saveToKept = { bytes, info };
-                      },
+                  : target === 'same-fail'
+                    ? { onConflict: 'fail' }
+                    : target === 'failing'
+                      ? { url: `${saveToAddress}?status=503` }
+                      : (bytes, info) => {
+                          saveToKept = { bytes, info };
+                        },
               onSaveState: saveToState,
               onNotice: (notice) => {
                 $('saveto-notice').textContent = notice.message;
