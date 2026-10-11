@@ -183,7 +183,10 @@ async function expectCleanedUp(target: Target, pictures?: number): Promise<void>
   expect(left.present).toBe(false);
   expect(left.styles).toBe(0);
   const all = await urls(target);
-  if (pictures !== undefined) expect(all.made.length).toBe(pictures);
+  // At least the pictures of the pages that were printed. More when the pages were laid out anew while they were
+  // prepared (a font that arrived on a busy machine): the job then starts over, and what it had made is given back
+  // like the rest. That nothing is left is what is asserted; how often the job started is not what this is about.
+  if (pictures !== undefined) expect(all.made.length).toBeGreaterThanOrEqual(pictures);
   expect(all.made.filter((url) => all.revoked.indexOf(url) < 0)).toEqual([]);
 }
 
