@@ -340,10 +340,10 @@ test('a rule of a file: the formula of a period that was only looked at stays as
   apply(doc, updateConditionalRule(doc.wb, 0, 1, { stopIfTrue: true }));
   let xml = await partText(await save(doc), SHEET1);
   assert.ok(xml.includes(`<cfRule type="timePeriod" dxfId="2" priority="2" stopIfTrue="1" timePeriod="lastWeek"><formula>${WEEK}</formula></cfRule>`), xml);
-  // Other cells: the formula is written for the new first cell; the column it names with "$" stays.
+  // Other cells: the formula names the new first cell, spelled with the "$" the file had (the rule looks at its own cell).
   apply(doc, updateConditionalRule(doc.wb, 0, 1, { ranges: range('F3:G4') }));
   xml = await partText(await save(doc), SHEET1);
-  assert.ok(xml.includes(`<conditionalFormatting${XR} sqref="F3:G4"><cfRule type="timePeriod" dxfId="2" priority="2" stopIfTrue="1" timePeriod="lastWeek"><formula>${WEEK.replace(/\$D1/g, '$D3')}</formula></cfRule></conditionalFormatting>`), xml);
+  assert.ok(xml.includes(`<conditionalFormatting${XR} sqref="F3:G4"><cfRule type="timePeriod" dxfId="2" priority="2" stopIfTrue="1" timePeriod="lastWeek"><formula>${WEEK.replace(/\$D1/g, '$F3')}</formula></cfRule></conditionalFormatting>`), xml);
   await sameContent(await save(doc), doc, 'read back');
 });
 
@@ -414,7 +414,7 @@ test('copied and cut cells take both kinds of rule along: the formula of a perio
   const cut = copyRange(doc.wb, 0, range('D1:D5'));
   apply(doc, cutRange(doc.wb, 0, range('D1:D5')));
   apply(doc, pasteAt(doc.wb, 0, range('L3'), cut.text, cut).ops);
-  assert.deepEqual(listed().filter((line) => /^[DL]/.test(line)), ['L3:L7|iconSet|', `L3:L7|timePeriod|${FORMULAS.lastWeek('$D3')}`]);
+  assert.deepEqual(listed().filter((line) => /^[DL]/.test(line)), ['L3:L7|iconSet|', `L3:L7|timePeriod|${FORMULAS.lastWeek('$L3')}`]);
   assert.deepEqual(conditionalRules(doc.wb, 0).filter((info) => info.rule.type === 'iconSet' && info.ranges[0].left === 11)[0].rule.iconSet, { set: '3Flags', values: KEPT_VALUES, showValue: true, reverse: false }, 'the icon set that was moved');
   const saved = await save(doc);
   await checkPackage(saved);

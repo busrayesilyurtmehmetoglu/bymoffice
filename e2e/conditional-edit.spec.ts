@@ -566,20 +566,35 @@ test.describe('editing conditional formats', () => {
     expect(await view(page, 'JSON.stringify([view.conditionalRules()[1].rule.formulas, view.conditionalRules()[1].rule.dxfId, view.conditionalRules()[1].rule.dxf])')).toBe('[["3"],0,null]');
   });
 
-  test('another language while a dialog is open closes the dialog: what was typed is not read by other rules', async ({ page }) => {
+  test('another language while a dialog is open: one with something typed keeps the language as it is, one without is closed', async ({ page }) => {
     await mount(page, await plain());
     await select(page, 'A1:A4');
     expect(await view(page, 'view.openConditionalDialog("greaterThan")')).toBe(true);
     await fill(page, { value1: '1.5' });
-    await page.evaluate(() => (window as any).__editor.setLocale('tr'));
-    await expect(dialog(page)).toHaveCount(0);
-    expect(await rules(page)).toEqual([]);
+    // What was typed would be read by the rules of another language: the language is refused, shell and view alike.
+    const refused = await page.evaluate(() => {
+      try {
+        (window as any).__editor.setLocale('tr');
+        return 'changed';
+      } catch (error) {
+        return error instanceof RangeError ? error.message : String(error);
+      }
+    });
+    expect(refused).toBe('Confirm or close the open rule dialog first');
+    await expect(dialog(page)).toBeVisible();
+    await expect(field(page, 'value1')).toHaveValue('1.5');
+    await expect(page.locator('#host [aria-label="Spreadsheet"]')).toHaveCount(1);
+    await action(page, 'ok').click();
+    expect(await view(page, 'view.conditionalRules().map((info) => info.rule.formulas[0]).join()')).toBe('1.5');
+    // Nothing typed: the dialog is closed, as by Cancel, and the language is the one asked for.
     expect(await view(page, 'view.openConditionalDialog("manage")')).toBe(true);
-    await page.evaluate(() => (window as any).__editor.setLocale('en-US'));
-    await expect(manager(page)).toHaveCount(0);
-    expect(await page.evaluate(() => (window as any).__editor.view.openValidationDialog() as boolean)).toBe(true);
     await page.evaluate(() => (window as any).__editor.setLocale('tr'));
+    await expect(manager(page)).toHaveCount(0);
+    await expect(page.locator('#host [aria-label="Hesap tablosu"]')).toHaveCount(1);
+    expect(await page.evaluate(() => (window as any).__editor.view.openValidationDialog() as boolean)).toBe(true);
+    await page.evaluate(() => (window as any).__editor.setLocale('en-US'));
     await expect(dialog(page, 'validation')).toHaveCount(0);
+    await expect(page.locator('#host [aria-label="Spreadsheet"]')).toHaveCount(1);
   });
 
   // Fourth review: the rules after the first 200 are shown too, in runs of 200 (they could not be reached before).

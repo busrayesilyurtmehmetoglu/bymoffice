@@ -31,6 +31,7 @@ export type BridgeErrorCode =
   | 'read-only'
   | 'no-sheet'
   | 'sheet-refused'
+  | 'locale-refused'
   | 'no-document';
 
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
@@ -1427,8 +1428,15 @@ export function createBridge(host: BridgeHost): Bridge {
         else if (pages && pages.setReadOnly) pages.setReadOnly(value);
         if (pages) shown.readOnly = value;
       } else if (type === 'setLocale') {
-        if (view) view.setLocale(locale as string);
-        else if (pages && pages.setLocale) pages.setLocale(locale as string);
+        try {
+          if (view) view.setLocale(locale as string);
+          else if (pages && pages.setLocale) pages.setLocale(locale as string);
+        } catch (error) {
+          // The view keeps the language it has (a dialog of rules is open with changes, say), and says why in that
+          // language: the page around it keeps its own as well.
+          if (error instanceof RangeError) return fail('locale-refused', errorText(error), id);
+          throw error;
+        }
         shown.locale = locale;
         setLocale(locale);
       } else if (type === 'undo') {

@@ -46,6 +46,78 @@ export function seeded(seed: number): () => number {
 
 const dv = (attrs: string, inner = '') => `<dataValidation ${attrs}>${inner}</dataValidation>`;
 
+/**
+ * Rules of kinds that look at their own cell, their formulas spelled with "$" as other
+ * producers write them: the "$" anchors nothing there (see ownCellProblems()).
+ */
+const OWN_CELL_RULES =
+  cf('D3:D7 F1:F3', '<cfRule type="timePeriod" dxfId="2" priority="2" timePeriod="last7Days"><formula>AND(TODAY()-FLOOR($D3,1)&lt;=6,FLOOR($D3,1)&lt;=TODAY())</formula></cfRule>') +
+  cf('E1:E4', '<cfRule type="containsText" dxfId="0" priority="3" operator="containsText" text="x"><formula>NOT(ISERROR(SEARCH("x",$E$1)))</formula></cfRule>') +
+  cf('G2:G5 C8:C9', '<cfRule type="containsBlanks" dxfId="1" priority="4"><formula>LEN(TRIM(G$2))=0</formula></cfRule>');
+
+const CELL = '(\\$?[A-Z]{1,3}\\$?[0-9]{1,7})';
+const quotedText = (text: string) => `"${text.replace(/"/g, '""')}"`;
+/** The formula Excel writes for each kind of rule that looks at its own cell, with `c` where the cell stands. Written out here, apart from the engine. */
+const OWN_CELL_FORMULAS: Record<string, (c: string, text: string, period: string) => string | undefined> = {
+  containsText: (c, text) => `NOT(ISERROR(SEARCH(${quotedText(text)},${c})))`,
+  notContainsText: (c, text) => `ISERROR(SEARCH(${quotedText(text)},${c}))`,
+  beginsWith: (c, text) => `LEFT(${c},LEN(${quotedText(text)}))=${quotedText(text)}`,
+  endsWith: (c, text) => `RIGHT(${c},LEN(${quotedText(text)}))=${quotedText(text)}`,
+  containsBlanks: (c) => `LEN(TRIM(${c}))=0`,
+  notContainsBlanks: (c) => `LEN(TRIM(${c}))>0`,
+  containsErrors: (c) => `ISERROR(${c})`,
+  notContainsErrors: (c) => `NOT(ISERROR(${c}))`,
+  timePeriod: (c, _text, period) =>
+    ({
+      today: `FLOOR(${c},1)=TODAY()`,
+      yesterday: `FLOOR(${c},1)=TODAY()-1`,
+      tomorrow: `FLOOR(${c},1)=TODAY()+1`,
+      last7Days: `AND(TODAY()-FLOOR(${c},1)<=6,FLOOR(${c},1)<=TODAY())`,
+      lastWeek: `AND(TODAY()-ROUNDDOWN(${c},0)>=(WEEKDAY(TODAY())),TODAY()-ROUNDDOWN(${c},0)<(WEEKDAY(TODAY())+7))`,
+      thisWeek: `AND(TODAY()-ROUNDDOWN(${c},0)<=WEEKDAY(TODAY())-1,ROUNDDOWN(${c},0)-TODAY()<=7-WEEKDAY(TODAY()))`,
+      nextWeek: `AND(ROUNDDOWN(${c},0)-TODAY()>(7-WEEKDAY(TODAY())),ROUNDDOWN(${c},0)-TODAY()<(15-WEEKDAY(TODAY())))`,
+      lastMonth: `AND(MONTH(${c})=MONTH(EDATE(TODAY(),0-1)),YEAR(${c})=YEAR(EDATE(TODAY(),0-1)))`,
+      thisMonth: `AND(MONTH(${c})=MONTH(TODAY()),YEAR(${c})=YEAR(TODAY()))`,
+      nextMonth: `AND(MONTH(${c})=MONTH(EDATE(TODAY(),0+1)),YEAR(${c})=YEAR(EDATE(TODAY(),0+1)))`,
+    })[period],
+};
+
+const xmlText = (text: string) => text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+
+/**
+ * What a sheet part says wrong about the rules that look at their own cell: for each <cfRule>
+ * of such a kind, what its attributes say (the kind, the text, the period), the cell its
+ * formula names and the first cell of its `sqref` are one statement. A formula that is the one
+ * of the kind names that first cell, with whatever "$"; and none of them names a cell that is
+ * gone. A formula that is not the one of the kind (written by hand) is not looked at.
+ */
+export function ownCellProblems(xml: string): string[] {
+  const out: string[] = [];
+  const attr = (tag: string, name: string) => {
+    const found = new RegExp(`\\s${name}=(?:"([^"]*)"|'([^']*)')`).exec(tag);
+    return found ? xmlText(found[1] !== undefined ? found[1] : found[2]) : undefined;
+  };
+  for (const block of xml.match(/<conditionalFormatting\b[^>]*>[\s\S]*?<\/conditionalFormatting>/g) || []) {
+    const sqref = attr(block.slice(0, block.indexOf('>') + 1), 'sqref') || '';
+    const first = sqref.split(' ')[0].split(':')[0];
+    for (const rule of block.match(/<cfRule\b[^>]*>[\s\S]*?<\/cfRule>/g) || []) {
+      const tag = rule.slice(0, rule.indexOf('>') + 1);
+      const make = OWN_CELL_FORMULAS[attr(tag, 'type') || ''];
+      const formulas = (rule.match(/<formula>[\s\S]*?<\/formula>/g) || []).map((text) => xmlText(text.slice(9, -10)));
+      if (!make || formulas.length !== 1) continue;
+      if (formulas[0].indexOf('#REF!') >= 0) out.push(`${sqref}: ${formulas[0]} names a cell that is gone`);
+      // The formula of the kind with a place for the cell: every such place is to name one and the same cell.
+      const pattern = make('\u0000', attr(tag, 'text') || '', attr(tag, 'timePeriod') || '');
+      if (pattern === undefined) continue;
+      const found = new RegExp(`^${pattern.split('\u0000').map((piece) => piece.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join(CELL)}$`).exec(formulas[0]);
+      if (!found) continue;
+      const cells = found.slice(1);
+      if (cells.some((cell) => cell !== cells[0]) || cells[0].replace(/\$/g, '') !== first) out.push(`${sqref}: ${formulas[0]} does not name ${first}`);
+    }
+  }
+  return out;
+}
+
 /** Three sheets; the first has rules of every kind of place: several ranges, another sheet, the extension list. */
 export function randomBook(options: { conditional?: boolean; extensionOnly?: boolean } = {}): Promise<Uint8Array> {
   const data =
@@ -65,7 +137,7 @@ export function randomBook(options: { conditional?: boolean; extensionOnly?: boo
     '</x14:dataValidations></ext></extLst>';
   const lists =
     '<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>4</v></c></row></sheetData>' +
-    (options.conditional ? cf('A1:B3', '<cfRule type="cellIs" dxfId="1" priority="1" operator="equal"><formula>Data!$H$1</formula></cfRule>') : '') +
+    (options.conditional ? cf('A1:B3', '<cfRule type="cellIs" dxfId="1" priority="1" operator="equal"><formula>Data!$H$1</formula></cfRule>') + OWN_CELL_RULES : '') +
     '<dataValidations count="1">' +
     dv('type="decimal" operator="greaterThan" sqref="A1:B3"', '<formula1>Data!$H$1</formula1>') +
     '</dataValidations>';

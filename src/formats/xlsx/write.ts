@@ -58,6 +58,7 @@ import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { parseColor } from './styles';
 import { conditionalRuleXml, dataValidationXml, freshSheetParts, type RuleExtra } from './build';
+import { ownCellFormulaAt, ownCellSpelling, ruleOrigin, type CellSpelling, type RuleOrigin } from '../../ops/rules';
 
 const encoder = new TextEncoder();
 
@@ -726,6 +727,8 @@ function adjustBreaks(el: XmlElement, rows: boolean, adjuster: Adjuster): number
 interface FormulaSlot {
   get(): string;
   set(text: string): void;
+  /** The element whose text the formula is; missing for a formula in an attribute. */
+  node?: XmlElement;
 }
 
 /** The formulas of a conditional format or a validation: <formula>, <formula1>, <xm:f>, and thresholds given as formulas. */
@@ -739,6 +742,7 @@ function formulaSlots(el: XmlElement, out: FormulaSlot[]): void {
         set: (text) => {
           node.children = [{ type: 'text', value: text }];
         },
+        node,
       });
     } else if (local === 'cfvo' && node.attrs.get('type') === 'formula' && node.attrs.has('val')) {
       out.push({ get: () => node.attrs.get('val') as string, set: (text) => node.attrs.set('val', text) });
@@ -811,6 +815,20 @@ function adjustRule(el: XmlElement, adjuster: Adjuster): number | undefined {
   const before = slots.map((slot) => slot.get());
   const texts = before.slice();
   const name = adjuster.sheetName;
+  // Rules that look at their own cell, whatever "$" their formula spells it with (see ownCellSpelling()): the
+  // formula is written for the cell the range starts at once the edits are done, as where the rules are evaluated.
+  const itself: { at: number; rule: Pick<ConditionalRule, 'type' | 'text' | 'timePeriod'>; spelling: CellSpelling }[] = [];
+  const start = !child && localName(el.name) === 'conditionalFormatting' ? anchorOf(original) : undefined;
+  if (start) {
+    for (const rule of childrenOf(el, 'cfRule')) {
+      const formulas = childrenOf(rule, 'formula');
+      const at = formulas.length === 1 ? slots.findIndex((slot) => slot.node === formulas[0]) : -1;
+      if (at < 0) continue;
+      const stated = { type: rule.attrs.get('type') || '', text: rule.attrs.get('text'), timePeriod: rule.attrs.get('timePeriod'), formulas: [before[at]] };
+      const spelling = ownCellSpelling(stated, start);
+      if (spelling) itself.push({ at, rule: stated, spelling });
+    }
+  }
 
   let list = original;
   for (const edit of adjuster.own) {
@@ -835,6 +853,7 @@ function adjustRule(el: XmlElement, adjuster: Adjuster): number | undefined {
   }
   // Last, as where the rules are evaluated: the sheets get the names they have now.
   if (adjuster.rename) for (let i = 0; i < texts.length; i++) texts[i] = renameSheetsInFormula(texts[i], adjuster.rename);
+  for (const own of itself) texts[own.at] = anchor ? ownCellFormulaAt(own.rule, own.spelling, anchor) : before[own.at];
 
   if (list !== original) {
     list = collapseSingleCells(list);
@@ -1327,6 +1346,8 @@ interface SheetRewrite {
   legacyDrawing?: string | null;
   /** The record of the style sheet that holds the format of a conditional rule, as this save writes the style sheet (see planDxfs()). */
   dxfOf?: (rule: ConditionalRule) => number | undefined;
+  /** The text, as the file has it, of each sheet part that a rule of this sheet was copied from (see ruleOrigin()). */
+  ruleParts?: ReadonlyMap<string, string>;
 }
 
 interface SheetRenames {
@@ -1563,6 +1584,11 @@ interface ConditionalPlan {
   /** The attributes of the source elements of such rules other than their range (namespaces their rules may use, `pivot`). */
   blockAttrs: Map<number, string>;
   /**
+   * For rules that a paste made (see ruleOrigin()), by originKey(): the element each was copied from, as far as
+   * this sheet can state it (see copiedRuleSource()), and the namespaces it uses that its own element declared.
+   */
+  origins: Map<string, { text: string; attrs: string }>;
+  /**
    * The source elements the model held when the sheet was read. Only those are the model's to
    * change or to take out: an element the reader did not take in (it has no rule, its range is
    * none) is copied as it is.
@@ -1595,7 +1621,7 @@ interface ExtensionChange {
 }
 
 function conditionalPlanOf(sheet: Sheet, dxfOf: (rule: ConditionalRule) => number | undefined): ConditionalPlan {
-  const plan: ConditionalPlan = { kept: new Map(), live: [], sources: new Map(), blockAttrs: new Map(), known: new Set(), seen: 0, done: false, dxfOf, highest: 0, ext: new Map() };
+  const plan: ConditionalPlan = { kept: new Map(), live: [], sources: new Map(), blockAttrs: new Map(), origins: new Map(), known: new Set(), seen: 0, done: false, dxfOf, highest: 0, ext: new Map() };
   // What the sheet came with: the list before its first change, or the list it still has.
   const read = sheet.conditionalRead ? sheet.conditionalRead.list : sheet.conditionalFormats;
   for (const format of read || []) for (const rule of (format && format.rules) || []) if (rule && rule.src && !rule.extended) plan.known.add(rule.src[0]);
@@ -1662,6 +1688,148 @@ function collectConditionalSources(s: string, plan: ConditionalPlan): void {
   }
 }
 
+const NS_MARKUP = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+
+const originKey = (origin: RuleOrigin) => `${origin.part}\u0000${origin.rule[0]}:${origin.rule[1]}`;
+
+/** The rule a paste made, when it is written from the element it was copied from: one that has no element of its own in this part. */
+const copiedFrom = (rule: ConditionalRule): RuleOrigin | undefined => (rule.src ? undefined : ruleOrigin(rule));
+
+/** The parts that rules of a sheet were copied from (see ruleOrigin()): what the writer has to have at hand to write them. */
+function ruleOriginParts(sheet: Sheet, out: Set<string>): void {
+  for (const format of sheet.conditionalFormats || []) {
+    if (!format || !format.live || !Array.isArray(format.rules)) continue;
+    for (const rule of format.rules) {
+      const origin = rule ? copiedFrom(rule) : undefined;
+      if (origin) out.add(origin.part);
+    }
+  }
+}
+
+/** The namespaces a start tag declares by prefix, and the prefixes its mc:Ignorable names. */
+function declaredBy(attrs: readonly [string, string][]): { bound: Map<string, string>; ignorable: Set<string> } {
+  const bound = new Map<string, string>();
+  const ignorable = new Set<string>();
+  let markup: string | undefined;
+  for (const [name, value] of attrs) {
+    if (name.slice(0, 6) === 'xmlns:') {
+      bound.set(name.slice(6), value);
+      if (value === NS_MARKUP) markup = name.slice(6);
+    }
+  }
+  if (markup !== undefined) for (const [name, value] of attrs) if (name === `${markup}:Ignorable`) for (const prefix of value.split(/\s+/)) if (prefix !== '') ignorable.add(prefix);
+  return { bound, ignorable };
+}
+
+const namePrefix = (name: string) => (name.indexOf(':') > 0 ? name.slice(0, name.indexOf(':')) : '');
+
+/**
+ * An element a rule was copied from, as another element can state it: without what names the
+ * element itself (an attribute `uid` of a revision namespace, the <ext> that ties it to its
+ * counterpart in the extension list), and without what is in a namespace that is not at hand
+ * where it is written. `usable` answers for a prefix that the element does not declare itself.
+ */
+function portableRule(el: XmlElement, usable: (prefix: string) => boolean, local: readonly string[] = []): XmlElement {
+  const scope = local.slice();
+  for (const name of el.attrs.keys()) if (name.slice(0, 6) === 'xmlns:') scope.push(name.slice(6));
+  const known = (prefix: string) => prefix === '' || prefix === 'xml' || prefix === 'xmlns' || scope.indexOf(prefix) >= 0 || usable(prefix);
+  const attrs = new Map<string, string>();
+  for (const [name, value] of el.attrs) {
+    const prefix = namePrefix(name);
+    // The identity of the element: no other element may state it.
+    if (prefix !== '' && prefix !== 'xmlns' && localName(name) === 'uid') continue;
+    if (known(prefix)) attrs.set(name, value);
+  }
+  const children: XmlNode[] = [];
+  for (const node of el.children) {
+    if (node.type !== 'element') {
+      children.push(node);
+      continue;
+    }
+    if (!known(namePrefix(node.name)) && !node.attrs.has(`xmlns:${namePrefix(node.name)}`)) continue;
+    const name = localName(node.name);
+    // <ext><x14:id>: the rule this one was copied from has the counterpart, and keeps it.
+    if (name === 'ext' && node.children.some((child) => child.type === 'element' && localName(child.name) === 'id')) continue;
+    const kept = portableRule(node, usable, scope);
+    if (name === 'extLst' && !kept.children.some((child) => child.type === 'element')) continue;
+    children.push(kept);
+  }
+  return { type: 'element', name: el.name, attrs, children };
+}
+
+/**
+ * Finds the elements that rules of the plan were copied from, in the parts they were read from
+ * (`parts`: the text of each as the file has it), and keeps of each what the part that is
+ * written can state: `prefix` is how that part writes the names of the main namespace and
+ * `root` the attributes of its root. A namespace declared on the <conditionalFormatting> the
+ * rule stood in goes with the rule; one declared on the root of the other part is used only
+ * where this part declares it the same way (and lets a reader pass it over, if the other did).
+ * A rule whose part writes the main namespace under another prefix is written from the model alone.
+ */
+function collectRuleOrigins(plan: ConditionalPlan, parts: ReadonlyMap<string, string> | undefined, own: string, prefix: string, root: readonly [string, string][]): void {
+  const wanted = new Map<string, Set<string>>();
+  for (const format of plan.live) {
+    for (const rule of format.rules) {
+      const origin = copiedFrom(rule);
+      if (!origin) continue;
+      const places = wanted.get(origin.part);
+      if (places) places.add(`${origin.rule[0]}:${origin.rule[1]}`);
+      else wanted.set(origin.part, new Set([`${origin.rule[0]}:${origin.rule[1]}`]));
+    }
+  }
+  if (wanted.size === 0 || !parts) return;
+  const here = declaredBy(root);
+  for (const [part, places] of wanted) {
+    const text = parts.get(part);
+    if (text === undefined) continue;
+    const sc = new XmlScanner(text);
+    const rootLocal = openRoot(sc);
+    if (rootLocal === '' || sc.selfClosing || sc.name.slice(0, sc.name.length - rootLocal.length) !== prefix) continue;
+    const there = declaredBy(sc.attrs());
+    const same = part === own;
+    let seen = 0;
+    while (sc.next()) {
+      if (sc.kind === 'close') break;
+      if (sc.kind !== 'open') continue;
+      if (sc.local !== 'conditionalFormatting') {
+        sc.skip();
+        continue;
+      }
+      const index = seen++;
+      const block = declaredBy(sc.attrs());
+      const raw = sc.readRaw();
+      let at = 0;
+      for (const child of rawElement(raw).children) {
+        if (child.local !== 'cfRule') continue;
+        const place = `${index}:${at++}`;
+        if (!places.has(place)) continue;
+        const carried = new Set<string>();
+        const usable = (name: string) => {
+          const stated = block.bound.get(name);
+          if (stated !== undefined) {
+            carried.add(name);
+            return true;
+          }
+          const uri = there.bound.get(name);
+          if (uri === undefined) return false;
+          return same || (here.bound.get(name) === uri && (!there.ignorable.has(name) || here.ignorable.has(name)));
+        };
+        let kept: XmlElement;
+        try {
+          kept = portableRule(parseXml(raw.slice(child.start, child.end)).root, usable);
+        } catch (error) {
+          // Nested without end: the rule is written from the model alone.
+          if (error instanceof RangeError) continue;
+          throw error;
+        }
+        let attrs = '';
+        for (const name of carried) attrs += ` xmlns:${name}="${escapeAttr(block.bound.get(name) as string)}"`;
+        plan.origins.set(originKey({ part, rule: [index, at - 1] }), { text: elementText(kept), attrs });
+      }
+    }
+  }
+}
+
 /**
  * What the source element of a colour scale, a data bar or an icon set holds beside the fields
  * of the model, into `extra`: of each threshold its other attributes and its children (while
@@ -1716,7 +1884,9 @@ function keptThresholds(source: XmlElement, values: ConditionalValue[], icons: b
 /** A rule written from the model; one that came from the file keeps what its source holds beside the fields of the model. */
 function liveRuleXml(rule: ConditionalRule, prefix: string, plan: ConditionalPlan): string {
   const priority = rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++plan.highest;
-  const source = rule.src ? plan.sources.get(`${rule.src[0]}:${rule.src[1]}`) : undefined;
+  const origin = copiedFrom(rule);
+  const copied = origin ? plan.origins.get(originKey(origin)) : undefined;
+  const source = rule.src ? plan.sources.get(`${rule.src[0]}:${rule.src[1]}`) : copied ? copied.text : undefined;
   if (source === undefined) return conditionalRuleXml(rule, priority, plan.dxfOf(rule), undefined, prefix);
   if (rule.extId !== undefined) {
     // A rule the extension list says more about is never changed in what it says (the model holds it with what
@@ -1766,7 +1936,9 @@ function liveConditionalXml(prefix: string, plan: ConditionalPlan): string {
     let attrs = '';
     for (const rule of format.rules) {
       rules += liveRuleXml(rule, prefix, plan);
-      const from = rule.src ? plan.blockAttrs.get(rule.src[0]) : undefined;
+      const origin = copiedFrom(rule);
+      const copied = origin ? plan.origins.get(originKey(origin)) : undefined;
+      const from = rule.src ? plan.blockAttrs.get(rule.src[0]) : copied ? copied.attrs : undefined;
       if (from !== undefined && attrs === '') attrs = from;
     }
     if (sqref !== '' && rules !== '') out += `<${prefix}conditionalFormatting${attrs} sqref="${sqref}">${rules}</${prefix}conditionalFormatting>`;
@@ -2130,7 +2302,8 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
   const rootName = sc.name;
   const prefix = rootName.slice(0, rootName.length - rootLocal.length);
   let relPrefix: string | undefined;
-  for (const [name, value] of sc.attrs()) {
+  const rootAttrs = sc.attrs();
+  for (const [name, value] of rootAttrs) {
     if (name.slice(0, 6) === 'xmlns:' && (value === NS_REL || value === NS_REL_STRICT)) relPrefix = name.slice(6);
   }
   if (sc.selfClosing) throw new Error(`Cannot write sheet "${sheet.name}": its part has no <sheetData>`);
@@ -2199,6 +2372,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
     const stated = (rule: ConditionalRule) => (rule.dxfId !== undefined && rule.dxfId >= 0 && rule.dxfId < workbook.styles.dxfs.length ? rule.dxfId : undefined);
     state.conditional = conditionalPlanOf(sheet, options.dxfOf ? options.dxfOf : stated);
     collectConditionalSources(s, state.conditional);
+    collectRuleOrigins(state.conditional, options.ruleParts, sheet.part, prefix, rootAttrs);
   }
   /** Writes the regenerated elements that belong before the element of rank `rank` and were not in the source. */
   const flush = (rank: number) => {
@@ -4632,6 +4806,15 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     });
   }
 
+  // The sheet parts that pasted rules were copied from, as the file has them: such a rule is written with what its element holds there.
+  const ruleParts = new Map<string, string>();
+  const originParts = new Set<string>();
+  for (const sheet of workbook.sheets) if (sheet.kind === 'worksheet' && (sheet.conditionalModified || sheet.part === '')) ruleOriginParts(sheet, originParts);
+  for (const part of originParts) {
+    const bytes = await peek(part);
+    if (bytes) ruleParts.set(part, decodeSource(bytes));
+  }
+
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
   /** Sheets marked as modified whose part came out as the bytes of the file. */
@@ -4751,7 +4934,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       // Only the notes of the sheet changed: every byte of the part stays but the element that names their boxes.
       if (bytes && legacyDrawing !== undefined && foreign.length === 0 && !rename && tabSelected === undefined && !rules) next = setLegacyDrawing(bytes, legacyDrawing, sheet.name);
       else if (bytes && (foreign.length > 0 || rename || tabSelected !== undefined || legacyDrawing !== undefined || rules)) {
-        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf });
+        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf, ruleParts });
       }
       // The colour of the tab, in the part as it is by now.
       if (bytes && tab) next = next ? setTabColorIn(next, sheet.tabColor, sheet.name) || next : tabbed.get(sheet);
@@ -4764,7 +4947,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     } else {
       const bytes = await originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
-      const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
+      const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf, ruleParts }) as Uint8Array;
       const next = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
       // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation.
       if (sameBytes(next, bytes)) asInFile.add(sheet);
@@ -4892,7 +5075,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       `${around.properties}<dimension ref="A1"/><sheetViews>${around.view}</sheetViews>${around.format}<sheetData/>${around.protection}${around.page}</worksheet>`;
     // A link to another file belongs to the relationships of the sheet it was made in; only places in the workbook are written.
     const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
-    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf }) as Uint8Array;
+    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf, ruleParts }) as Uint8Array;
     if (!originals.has(part)) originals.set(part, null);
     writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
     if (notes) {

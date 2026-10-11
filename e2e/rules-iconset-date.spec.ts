@@ -467,7 +467,10 @@ test.describe('icon sets and dates in the dialog of a rule', () => {
     await expect(dialog(page).locator('label', { hasText: 'Simge sırasını ters çevir' })).toBeVisible();
     await expect(dialog(page).locator('label', { hasText: 'Yalnız simgeyi göster' })).toBeVisible();
     await expect(field(page, 'iconPreview')).toHaveAttribute('aria-label', 'Kümenin simgeleri, en düşük değerlerden en yükseğe');
+    // Given up from inside the dialog: with its kind changed it is not put away for another dialog.
+    await field(page, 'type').focus();
     await page.keyboard.press('Escape');
+    await expect(dialog(page)).toHaveCount(0);
     expect(await view(page, 'view.openConditionalDialog("manage")')).toBe(true);
     await field(page, 'scope', 'conditional-rules').selectOption('sheet');
     expect(await rowTexts(page)).toEqual(['Simge kümesi: 3 işaret']);

@@ -16,7 +16,7 @@ import type { CellRange, Workbook } from '../src/index';
 import { copyRange, cutRange, pasteAt, type CopiedRange } from '../src/ops/commands';
 import { conditionalRules, copiedRulesExtent, mainPartRule } from '../src/ops/rules';
 import { checkPackage, checkSheetOrder, load, partNames, partText, reopen, save } from './rules-fixtures';
-import { randomBook, randomStep, rulesNow, rulesSeen, seeded } from './rules-random-fixtures';
+import { ownCellProblems, randomBook, randomStep, rulesNow, rulesSeen, seeded } from './rules-random-fixtures';
 import { canonical } from './workbook-content';
 
 /** The block of cells of every sheet that the runs work in, and a little beyond it. */
@@ -60,13 +60,34 @@ function cellRules(wb: Workbook, sheetIndex: number): Map<string, CellRules> {
         const plain = mainPartRule(info.rule)!;
         entry.order += 'c';
         // The format by what it says: a file that is read back numbers its records anew.
-        entry.carried.push(canonical({ ...plain, priority: 0, dxfId: undefined, dxf: undefined, formulas: plain.formulas.map((text) => shiftFormula(text, -info.ranges[0].top, -info.ranges[0].left, true)), format: info.format }));
+        // A rule that looks at its own cell says so by its kind: its formula names the first cell of the rule with whatever
+        // "$" (held against that cell where the file is saved, see ownCellProblems()). Where the rule was copied from is
+        // a place in a file, as `src` is.
+        const formulas = OWN_CELL_KINDS.indexOf(plain.type) >= 0 ? [] : plain.formulas.map((text) => shiftFormula(text, -info.ranges[0].top, -info.ranges[0].left, true));
+        // A format that says nothing about the font is read back with an empty record for it: the same format.
+        const format = info.format && info.format.font && Object.keys(info.format.font).length === 0 ? { ...info.format, font: undefined } : info.format;
+        entry.carried.push(canonical({ ...plain, origin: undefined, priority: 0, dxfId: undefined, dxf: undefined, formulas, format }));
       }
       if (entry.validation !== undefined || entry.carried.length > 0 || entry.kept.length > 0) out.set(`${row},${col}`, entry);
     }
   }
   return out;
 }
+
+/** Two long texts are the same; the message of a failure shows where they part. */
+function sameText(actual: string, expected: string, label: string): void {
+  // A format whose record has a <font> that says nothing the model holds (a size alone) is read back with an empty
+  // record for the font; the model, once the format was changed, has none. The same format.
+  const plain = (text: string) => text.split(',"font":{}').join('').split('"font":{},').join('');
+  actual = plain(actual);
+  expected = plain(expected);
+  if (actual === expected) return;
+  let at = 0;
+  while (at < actual.length && actual[at] === expected[at]) at++;
+  assert.fail(`${label}\n  actual:   ...${actual.slice(Math.max(0, at - 160), at + 160)}\n  expected: ...${expected.slice(Math.max(0, at - 160), at + 160)}`);
+}
+
+const OWN_CELL_KINDS = ['timePeriod', 'containsText', 'notContainsText', 'beginsWith', 'endsWith', 'containsBlanks', 'notContainsBlanks', 'containsErrors', 'notContainsErrors'];
 
 const NONE: CellRules = { validation: undefined, fixed: false, carried: [], kept: [], order: '' };
 /** What a cell says; for a cell that was pasted over, how its own rules and those that stayed stand to each other is not part of it. */
@@ -99,7 +120,13 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
   };
   /** The file that is saved now says for every cell what the model says, in the same order. */
   const checkSaved = async (model: Map<string, CellRules>[], where: string) => {
-    const back = await reopen(await save(doc));
+    const saved = await save(doc);
+    for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) assert.deepEqual(ownCellProblems(await partText(saved, name)), [], `${where}: ${name}: rules that look at their own cell`);
+    // What names an element of the file (the `uid` of a rule) is stated by one element: a copy of the rule states none.
+    const ids: string[] = [];
+    for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) for (const found of (await partText(saved, name)).match(/<cfRule\b[^>]*\buid="[^"]*"/g) || []) ids.push(found.slice(found.lastIndexOf('uid=')));
+    assert.deepEqual(ids.filter((id, at) => ids.indexOf(id) !== at), [], `${where}: an identity of a rule is stated twice`);
+    const back = await reopen(saved);
     for (let s = 0; s < sheets; s++) {
       const read = cellRules(back, s);
       for (const key of new Set([...read.keys(), ...model[s].keys()])) assert.equal(said(read.get(key)), said(model[s].get(key)), `${where}: sheet ${s}, cell ${key} of the saved file`);
@@ -183,7 +210,7 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
       await checkPackage(saved);
       for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) checkSheetOrder(await partText(saved, name), `${where}: ${name}`);
       const back = await reopen(saved);
-      assert.equal(canonical(rulesNow(back)), canonical(rulesNow(doc.wb)), `${where}: the saved file has other rules`);
+      sameText(canonical(rulesNow(back)), canonical(rulesNow(doc.wb)), `${where}: the saved file has other rules`);
       assert.equal(canonical(rulesSeen(back)), canonical(rulesSeen(doc.wb)), `${where}: the saved file is looked up differently`);
     }
   }

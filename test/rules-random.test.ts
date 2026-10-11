@@ -11,7 +11,7 @@ import { open } from '../src/index';
 import { History } from '../src/ops/ops';
 import { canonical } from './workbook-content';
 import { checkPackage, checkSheetOrder, load, partNames, partText, reopen, save, sameBytes } from './rules-fixtures';
-import { conditionalCover, randomBook, randomStep, restatedProblem, rulesBuilt, rulesNow as validationsNow, rulesSeen as validationsSeen, seeded, validationBehaviour } from './rules-random-fixtures';
+import { conditionalCover, ownCellProblems, randomBook, randomStep, restatedProblem, rulesBuilt, rulesNow as validationsNow, rulesSeen as validationsSeen, seeded, validationBehaviour } from './rules-random-fixtures';
 
 
 async function run(seed: number, steps: number, rulesOnly: boolean, conditional = false, extensionOnly = false): Promise<void> {
@@ -73,7 +73,13 @@ async function run(seed: number, steps: number, rulesOnly: boolean, conditional 
     if (random() < 0.2 || i === steps - 1) {
       const saved = await save(doc);
       await checkPackage(saved);
-      for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) checkSheetOrder(await partText(saved, name), `${where}: ${name}`);
+      for (const name of partNames(saved)) {
+        if (!/^xl\/worksheets\/[^/]*\.xml$/.test(name)) continue;
+        const xml = await partText(saved, name);
+        checkSheetOrder(xml, `${where}: ${name}`);
+        // What a rule that looks at its own cell says by its kind, by its formula and by its first cell is one statement.
+        assert.deepEqual(ownCellProblems(xml), [], `${where}: ${name}: rules that look at their own cell`);
+      }
       const back = await reopen(saved);
       assert.equal(canonical(validationsNow(back)), canonical(validationsNow(doc.wb)), `${where}: the saved file has other rules`);
       assert.equal(canonical(validationsSeen(back)), canonical(validationsSeen(doc.wb)), `${where}: the saved file is looked up differently`);

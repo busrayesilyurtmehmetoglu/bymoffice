@@ -706,6 +706,19 @@ let nextId = 1;
 /** What a field takes when cells are pointed at for it: a list of ranges, a formula, or the source of a list (a formula with absolute references). */
 export type PointKind = 'ranges' | 'formula' | 'source';
 
+/** Whether the device is one of Apple's: there Cmd is the key that adds, and Ctrl with a click asks for the context menu. */
+export const APPLE_PLATFORM = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+
+/**
+ * Whether a press of the main button is the one that asks for the context menu: Ctrl and a click
+ * on a device of Apple's. Such a press is no click - it selects nothing, drags nothing and points
+ * at no cell - and the `contextmenu` event that comes with it opens the menu. Anywhere else Ctrl
+ * and a click is a click.
+ */
+export function isContextPress(event: Pick<MouseEvent, 'button' | 'ctrlKey'>, apple: boolean = APPLE_PLATFORM): boolean {
+  return apple && event.button === 0 && event.ctrlKey === true;
+}
+
 /** Marks a field of a dialog that takes references to the cells pointed at behind the dialog, and says what kind it takes. */
 export const POINT_ATTRIBUTE = 'data-bym-point';
 
@@ -1147,7 +1160,7 @@ export class Dialog {
     if (event.target !== this.element) return;
     event.preventDefault();
     // Where there are no pointer events the mouse points at the cells all the same.
-    if (!this.closed && !this.pointerEvents && event.button === 0) this.beginDrag(event, 0);
+    if (!this.closed && !this.pointerEvents && event.button === 0 && !isContextPress(event)) this.beginDrag(event, 0);
   };
 
   private onKeyDown = (event: KeyboardEvent): void => {

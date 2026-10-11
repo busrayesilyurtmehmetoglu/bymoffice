@@ -259,6 +259,141 @@ test.describe('undo, redo and changes from outside under a dialog of rules', () 
   });
 });
 
+test.describe('calls from outside that would put something else in the place of a dialog of rules', () => {
+  /** A list in A1 and a filter over A1:B3, so that every call has something to open. */
+  const prepared = async (page: Page) => {
+    await mountPage(page, await workbook());
+    await mounted(page, '(view.setValidation(api.parseRange("A1"), { type: "list", formula1: \'"1,2,3"\' }), view.select(api.parseRange("A1:B3")), view.toggleFilter(), true)');
+    await select(page, 'A1');
+  };
+  /** What the view shows beside the dialog: nothing of it may appear under a dialog with changes. */
+  const beside = (page: Page) =>
+    page.evaluate(() => {
+      const view = (window as any).__mounted.view;
+      const count = (selector: string) => document.querySelectorAll(selector).length;
+      return { editing: view.isEditing, note: count('.bym-note-input'), name: count('.bym-tab-input'), list: count('.bym-dropdown'), filter: count('.bym-filter'), validation: count('[data-bym-dialog="validation"]'), rules: count('[data-bym-dialog="conditional-rules"]'), label: count('[aria-label="Spreadsheet"]') > 0, sheet: view.activeSheet };
+    });
+  const NOTHING = { editing: false, note: 0, name: 0, list: 0, filter: 0, validation: 0, rules: 0, label: true, sheet: 0 };
+  const CALLS: [run: string, answer: unknown][] = [
+    ['view.startEditing("typed")', undefined],
+    ['view.setEditText("typed")', undefined],
+    ['view.editComment(0, 0)', false],
+    ['view.editComment()', false],
+    ['view.startRename(1)', false],
+    ['view.openValidationList()', false],
+    ['view.openFilterMenu(0)', false],
+    ['view.openValidationDialog()', false],
+    ['view.openConditionalDialog("manage")', false],
+    ['view.openConditionalDialog("lessThan")', false],
+  ];
+
+  test('under a dialog with changes each of them is refused: the dialog stays as it is, and that is said', async ({ page }) => {
+    await prepared(page);
+    expect(await mounted(page, 'view.openConditionalDialog("greaterThan")')).toBe(true);
+    await field(page, 'value1').fill('4');
+    const steps = await mounted<boolean>(page, 'view.history.canUndo');
+    for (const [run, answer] of CALLS) {
+      await page.evaluate(() => ((window as any).__notices.length = 0));
+      expect(await mounted(page, `(() => { const answer = ${run}; return answer === undefined ? null : answer; })()`), run).toBe(answer === undefined ? null : answer);
+      await expect(dialog(page), run).toBeVisible();
+      await expect(field(page, 'value1'), run).toHaveValue('4');
+      await expect(alert(page), run).toHaveText(OPEN);
+      expect(await notices(page), run).toEqual([OPEN]);
+      expect(await beside(page), run).toEqual(NOTHING);
+    }
+    // Another language is refused the same way, and the caller hears of it: the view keeps the one it has.
+    await page.evaluate(() => ((window as any).__notices.length = 0));
+    expect(await mounted(page, '(() => { try { view.setLocale("tr"); return "changed"; } catch (error) { return error instanceof RangeError ? error.message : String(error); } })()')).toBe(OPEN);
+    expect(await notices(page)).toEqual([OPEN]);
+    expect(await beside(page)).toEqual(NOTHING);
+    await expect(dialog(page)).toBeVisible();
+    await expect(field(page, 'value1')).toHaveValue('4');
+    expect(await mounted(page, 'view.history.canUndo')).toBe(steps);
+    // OK makes the rule the dialog was opened for.
+    await action(page, 'ok').click();
+    expect(await mounted(page, 'view.conditionalRules().map((info) => api.rangeName(info.ranges[0]) + " " + info.rule.formulas[0]).join()')).toBe('A1 4');
+  });
+
+  test('under a dialog nothing was changed in, each of them closes the dialog and is done', async ({ page }) => {
+    await prepared(page);
+    const done: [run: string, shown: Partial<typeof NOTHING>, undo: string][] = [
+      ['view.startEditing("typed")', { editing: true }, 'view.cancelEditing()'],
+      ['view.setEditText("typed")', { editing: true }, 'view.cancelEditing()'],
+      ['view.editComment(0, 0)', { note: 1 }, 'view.commitPending()'],
+      ['view.startRename(1)', { name: 1, sheet: 1 }, '(view.commitPending(), view.setActiveSheet(0))'],
+      ['view.openValidationList()', { list: 1 }, '(view.setActiveSheet(1), view.setActiveSheet(0))'],
+      ['view.openFilterMenu(0)', { filter: 1 }, '(view.setActiveSheet(1), view.setActiveSheet(0))'],
+      ['view.openValidationDialog()', { validation: 1 }, 'view.commitPending()'],
+      ['view.openConditionalDialog("manage")', { rules: 1 }, 'view.commitPending()'],
+      ['view.setLocale("tr")', { label: false }, 'view.setLocale("en-US")'],
+    ];
+    for (const [run, shown, undo] of done) {
+      await select(page, 'A1');
+      expect(await mounted(page, 'view.openConditionalDialog("greaterThan")'), run).toBe(true);
+      await expect(dialog(page), run).toBeVisible();
+      await mounted(page, `(${run}, true)`);
+      await expect(dialog(page), run).toHaveCount(0);
+      expect(await beside(page), run).toEqual({ ...NOTHING, ...shown });
+      await mounted(page, `(${undo}, true)`);
+      await page.keyboard.press('Escape');
+      await expect.poll(() => beside(page), { message: `${run}: put away again` }).toEqual(NOTHING);
+    }
+    expect(await notices(page)).toEqual([]);
+    expect(await ruleCount(page)).toBe(0);
+  });
+
+  test('a sheet shown from outside and a view made read-only close a dialog with changes, and what was changed in it is given up', async ({ page }) => {
+    await prepared(page);
+    expect(await mounted(page, 'view.openConditionalDialog("greaterThan")')).toBe(true);
+    await field(page, 'value1').fill('4');
+    await mounted(page, '(view.setActiveSheet(2), true)');
+    await expect(dialog(page)).toHaveCount(0);
+    expect(await mounted(page, 'view.activeSheet')).toBe(2);
+    await mounted(page, '(view.setActiveSheet(0), true)');
+    expect(await ruleCount(page)).toBe(0);
+    await select(page, 'A1');
+    expect(await mounted(page, 'view.openValidationDialog()')).toBe(true);
+    await field(page, 'type', 'validation').selectOption('whole');
+    await mounted(page, '(view.setReadOnly(true), true)');
+    await expect(dialog(page, 'validation')).toHaveCount(0);
+    expect(await mounted(page, 'view.workbook.sheets[0].dataValidations.length')).toBe(1);
+    expect(await mounted(page, 'view.history.canUndo')).toBe(true);
+  });
+
+  test('a dialog that shows another sheet for a formula to point at: a note is not opened under one with changes, and is opened on its own sheet otherwise', async ({ page, hasTouch }) => {
+    test.skip(!!hasTouch, 'the tab is pressed with the mouse');
+    await mountPage(page, await workbook());
+    const away = async () => {
+      await select(page, 'A1:A3');
+      expect(await mounted(page, 'view.openConditionalDialog("expression")')).toBe(true);
+      await field(page, 'value1').click();
+      const tab = (await page.locator('.bym-tabs button.bym-tab', { hasText: 'Calc' }).boundingBox())!;
+      await page.mouse.click(tab.x + tab.width / 2, tab.y + tab.height / 2);
+      await expect.poll(() => mounted(page, 'view.activeSheet')).toBe(1);
+      await expect(dialog(page)).toBeVisible();
+    };
+    // Nothing changed in it: the dialog is closed, its own sheet is shown again, and the note is one of that sheet.
+    await away();
+    expect(await mounted(page, 'view.editComment(1, 0)')).toBe(true);
+    await expect(dialog(page)).toHaveCount(0);
+    expect(await mounted(page, 'view.activeSheet')).toBe(0);
+    await expect(page.locator('.bym-note-input')).toHaveCount(1);
+    await page.locator('.bym-note-input').fill('on Data');
+    expect(await mounted(page, 'view.commitPending()')).toBe(true);
+    expect(await mounted(page, 'view.workbook.sheets.map((sheet) => (sheet.comments || []).length).join()')).toBe('1,0,0');
+    // With something typed into it: the dialog stays, with the sheet it shows, and no note is opened anywhere.
+    await away();
+    await field(page, 'value1').fill('=A1>2');
+    expect(await mounted(page, 'view.editComment(1, 0)')).toBe(false);
+    await expect(dialog(page)).toBeVisible();
+    await expect(field(page, 'value1')).toHaveValue('=A1>2');
+    await expect(alert(page)).toHaveText(OPEN);
+    expect(await mounted(page, 'view.activeSheet')).toBe(1);
+    await expect(page.locator('.bym-note-input')).toHaveCount(0);
+    expect((await notices(page)).slice(-1)).toEqual([OPEN]);
+  });
+});
+
 test.describe('the list of rules of a sheet with more than it shows at once', () => {
   test('the rules after the first 200 are reached, changed and deleted from the list', async ({ page }) => {
     let rulesXml = '';
@@ -414,5 +549,51 @@ test.describe('the bridge and what the view did not do', () => {
     await send({ type: 'setTabColor', id: 'tc', index: 0, color: '#00FF00' });
     await expect.poll(async () => (await messages('done')).length).toBe(2);
     await expect(dialog(page, 'validation')).toHaveCount(0);
+  });
+});
+
+test.describe('the bridge and a language asked for under a dialog of rules', () => {
+  test('setLocale under a dialog with changes is answered with locale-refused and nothing changes its language; under one without, it is done', async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as any).__messages = [];
+      (window as any).BymOfficeHost = { postMessage: (json: unknown) => (window as any).__messages.push(json) };
+    });
+    await page.goto('/dist/bymoffice.webview.html');
+    const send = (message: unknown) => page.evaluate((json) => (window as any).BymOfficeBridge.receive(json), JSON.stringify(message));
+    const messages = (type: string) => page.evaluate((type) => ((window as any).__messages as string[]).map((entry) => JSON.parse(entry)).filter((message) => message.type === type), type);
+    await send({ type: 'load', id: 'l', data: Buffer.from(await workbook()).toString('base64'), locale: 'en-US' });
+    await expect.poll(async () => (await messages('loaded')).length).toBe(1);
+    const button = page.locator('[data-command="validation"]');
+    const label = await button.getAttribute('aria-label');
+    await page.locator('.bym-input').focus();
+    await button.click();
+    await expect(dialog(page, 'validation')).toBeVisible();
+    await field(page, 'type', 'validation').selectOption('whole');
+    await send({ type: 'setLocale', id: 'tr', locale: 'tr' });
+    await expect.poll(async () => (await messages('error')).length).toBe(1);
+    expect((await messages('error'))[0]).toEqual({ type: 'error', id: 'tr', code: 'locale-refused', message: OPEN });
+    expect(await messages('done')).toEqual([]);
+    await expect(dialog(page, 'validation')).toBeVisible();
+    await expect(alert(page, 'validation')).toHaveText(OPEN);
+    // Neither the view nor the bars around it speak another language.
+    await expect(page.locator('[aria-label="Spreadsheet"]')).toHaveCount(1);
+    expect(await button.getAttribute('aria-label')).toBe(label);
+    // Given up by the user, the same command is done.
+    await action(page, 'cancel', 'validation').click();
+    await expect(dialog(page, 'validation')).toHaveCount(0);
+    await send({ type: 'setLocale', id: 'again', locale: 'tr' });
+    await expect.poll(async () => (await messages('done')).length).toBe(1);
+    expect((await messages('done'))[0]).toEqual({ type: 'done', id: 'again', command: 'setLocale' });
+    await expect(page.locator('[aria-label="Hesap tablosu"]')).toHaveCount(1);
+    expect(await button.getAttribute('aria-label')).not.toBe(label);
+    // Under a dialog nothing was changed in, the command closes the dialog and is done.
+    await page.locator('.bym-input').focus();
+    await button.click();
+    await expect(dialog(page, 'validation')).toBeVisible();
+    await send({ type: 'setLocale', id: 'en', locale: 'en-US' });
+    await expect.poll(async () => (await messages('done')).length).toBe(2);
+    await expect(dialog(page, 'validation')).toHaveCount(0);
+    await expect(page.locator('[aria-label="Spreadsheet"]')).toHaveCount(1);
+    expect(await button.getAttribute('aria-label')).toBe(label);
   });
 });

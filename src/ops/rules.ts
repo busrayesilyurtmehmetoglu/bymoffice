@@ -270,6 +270,9 @@ export function conditionalFormatNow(format: ConditionalFormat, space: RuleSpace
     counts.push(formulas.length);
     for (const text of formulas) texts.push(text);
   }
+  // The cell the formulas are written for in the file: the first of the ranges that movedThroughSpace() goes by.
+  const first = format.ranges.filter((range) => !!range && range.top <= range.bottom && range.left <= range.right)[0];
+  const start = first ? { row: first.top, col: first.left } : undefined;
   const ranges = movedThroughSpace(format.ranges, texts, space);
   if (!ranges) return undefined;
   const untouched = space.own.length === 0 && space.foreign.length === 0 && !space.nameMap;
@@ -279,7 +282,9 @@ export function conditionalFormatNow(format: ConditionalFormat, space: RuleSpace
     at += counts[i];
     if (!rule) return rule;
     const moved = untouched ? rule : withThresholds(rule, (values) => thresholdsNow(values, space));
-    return { ...moved, formulas };
+    // A rule that looks at its own cell names the cell the format starts at now, however it spells it.
+    const own = untouched ? undefined : ownCellSpelling(rule, start);
+    return { ...moved, formulas: own ? [ownCellFormulaAt(rule, own, { row: ranges[0].top, col: ranges[0].left })] : formulas };
   });
   return { ...format, ranges, rules };
 }
@@ -626,7 +631,8 @@ export function liveRulesMoved(workbook: Workbook, edited: Sheet, edit: Structur
       const rules = mapList(format.rules, (rule) => {
         if (!rule) return rule;
         let next = rule;
-        const formulas = rule.formulas.map((text) => adjustAnchoredFormula(text, sheet.name, edit, before, after, true));
+        const itself = ownCellSpelling(rule, before);
+        const formulas = itself ? [ownCellFormulaAt(rule, itself, after)] : rule.formulas.map((text) => adjustAnchoredFormula(text, sheet.name, edit, before, after, true));
         if (formulas.some((text, i) => text !== rule.formulas[i])) next = { ...next, formulas };
         // A threshold stands on its own: it is no cell's neighbour.
         return withThresholds(next, (values) =>
@@ -1140,6 +1146,58 @@ function periodRuleCell(rule: Pick<ConditionalRule, 'formulas'>, anchor: { row: 
   return first.write(first.absCol, first.absRow);
 }
 
+/** How a formula spells the one cell it names: with or without "$" before its column and its row. */
+export interface CellSpelling {
+  absCol: boolean;
+  absRow: boolean;
+}
+
+const SPELLINGS: readonly CellSpelling[] = [
+  { absCol: false, absRow: false },
+  { absCol: true, absRow: false },
+  { absCol: false, absRow: true },
+  { absCol: true, absRow: true },
+];
+
+const spelledCell = (cell: { row: number; col: number }, spelling: CellSpelling) => {
+  const plain = cellText(cell.row, cell.col);
+  const letters = plain.replace(/\d+$/, '');
+  return `${spelling.absCol ? '$' : ''}${letters}${spelling.absRow ? '$' : ''}${plain.slice(letters.length)}`;
+};
+
+/**
+ * The formula Excel writes for a rule whose kind says by itself which cell it looks at - the
+ * cell the rule is applied to: the text rules, the rules for blanks and errors, and a period of
+ * dates. Undefined for every other kind, and for such a rule without its text or period.
+ */
+function ownCellFormula(rule: Pick<ConditionalRule, 'type' | 'text' | 'timePeriod'>, cell: string): string | undefined {
+  if (rule.type === 'timePeriod') return typeof rule.timePeriod === 'string' ? periodFormula(rule.timePeriod, cell) : undefined;
+  if (!isMade(rule.type)) return undefined;
+  if (TEXT_OPERATORS[rule.type] !== undefined) return typeof rule.text === 'string' ? standardFormula(rule.type, rule.text, cell) : undefined;
+  return standardFormula(rule.type, '', cell);
+}
+
+/**
+ * For a rule of a kind that looks at its own cell (see ownCellFormula()): how its formula
+ * spells that cell, when the formula is, letter for letter, the one Excel writes for the kind
+ * and names the first cell of the rule (`anchor`). The "$" of such a formula anchors nothing:
+ * the rule means "this cell" whatever cells it has, and its formula is written anew for the
+ * first of them (see ownCellFormulaAt()). Undefined for any other rule and any other formula
+ * - one written by hand, or one that names another cell: those are formulas like any other.
+ */
+export function ownCellSpelling(rule: Pick<ConditionalRule, 'type' | 'text' | 'timePeriod' | 'formulas'> | undefined, anchor: { row: number; col: number } | undefined): CellSpelling | undefined {
+  if (!rule || !anchor || !Array.isArray(rule.formulas) || rule.formulas.length !== 1) return undefined;
+  const written = rule.formulas[0];
+  if (typeof written !== 'string' || ownCellFormula(rule, 'A1') === undefined) return undefined;
+  for (const spelling of SPELLINGS) if (ownCellFormula(rule, spelledCell(anchor, spelling)) === written) return spelling;
+  return undefined;
+}
+
+/** The formula of such a rule for another first cell, spelled the way it was. */
+export function ownCellFormulaAt(rule: Pick<ConditionalRule, 'type' | 'text' | 'timePeriod'>, spelling: CellSpelling, anchor: { row: number; col: number }): string {
+  return ownCellFormula(rule, spelledCell(anchor, spelling)) as string;
+}
+
 /** The thresholds a new icon set starts with, as Excel's do: the range shared out evenly, in percent. */
 function iconThresholds(count: number): ConditionalValue[] {
   const out: ConditionalValue[] = [];
@@ -1167,6 +1225,7 @@ function ruleFromSettings(settings: ConditionalSettings, anchor: { row: number; 
   else {
     rule = { type, priority: base ? base.priority : Infinity, stopIfTrue: base ? base.stopIfTrue : false, formulas: [], percent: false, bottom: false, aboveAverage: true, equalAverage: false };
     if (base && base.src) rule.src = base.src;
+    if (base && (base as PastedRule).origin) (rule as PastedRule).origin = (base as PastedRule).origin;
     if (base && base.dxfId !== undefined) rule.dxfId = base.dxfId;
     if (base && base.dxf) rule.dxf = base.dxf;
   }
@@ -1310,11 +1369,17 @@ function ruleFormulaTexts(rule: ConditionalRule): string[] {
   return out;
 }
 
-/** A rule with its formulas written for another first cell: relative references keep meaning the cells they meant. */
+/**
+ * A rule with its formulas written for another first cell: relative references keep meaning the
+ * cells they meant, and the formula of a rule that looks at its own cell names the new one
+ * (see ownCellSpelling()).
+ */
 function reanchored(rule: ConditionalRule, from: CellRange, to: CellRange): ConditionalRule {
   const dRow = to.top - from.top;
   const dCol = to.left - from.left;
   if ((dRow === 0 && dCol === 0) || rule.formulas.length === 0) return rule;
+  const own = ownCellSpelling(rule, { row: from.top, col: from.left });
+  if (own) return { ...rule, formulas: [ownCellFormulaAt(rule, own, { row: to.top, col: to.left })] };
   return { ...rule, formulas: rule.formulas.map((text) => shiftFormula(text, dRow, dCol, true)) };
 }
 
@@ -1548,6 +1613,33 @@ export function clearConditionalRules(workbook: Workbook, sheetIndex: number, ra
 }
 
 /**
+ * The element of the file a rule that a paste made was copied from: the part of the sheet it
+ * was read from and its place there (as ConditionalRule.src). The model holds a rule by its
+ * fields; what its element holds beside them (an attribute of a threshold, a child nobody
+ * knows) is in the file, and the writer takes it from there for the new rule as well - without
+ * what is the identity of the element itself, which no second element may state.
+ */
+export interface RuleOrigin {
+  part: string;
+  rule: [format: number, rule: number];
+}
+
+/** A conditional rule as the commands of this module hold it: one made by a paste says where it was copied from. */
+export type PastedRule = ConditionalRule & { origin?: RuleOrigin };
+
+/**
+ * Where what a rule of `sheet` holds beside the fields of the model is to be found: the element
+ * it was read from, or the one it was copied from. Undefined for a rule that was made here, and
+ * for a rule only the extension list has.
+ */
+export function ruleOrigin(rule: ConditionalRule, sheet?: Pick<Sheet, 'part'>): RuleOrigin | undefined {
+  if (!rule || rule.extended) return undefined;
+  if (rule.src && sheet && sheet.part !== '') return { part: sheet.part, rule: [rule.src[0], rule.src[1]] };
+  const origin = (rule as PastedRule).origin;
+  return origin && typeof origin.part === 'string' && Array.isArray(origin.rule) ? origin : undefined;
+}
+
+/**
  * A rule as the main part of a sheet states it, without what only the extension list says
  * about it (the border, axis and negative colours of a data bar, icons chosen one by one):
  * what a sheet that is in no file can be written with. Undefined for a rule only the
@@ -1661,9 +1753,17 @@ function validationKey(rule: Omit<DataValidation, 'ranges'>, anchor: { row: numb
   return stable(SETTING_KEYS.map((key) => (key === 'formula1' || key === 'formula2' ? (typeof rule[key] === 'string' ? shiftFormula(rule[key] as string, -anchor.row, -anchor.col, true) : null) : rule[key] === undefined ? null : rule[key])).concat([rule.extended === true]));
 }
 
-/** The same for a conditional rule: all of it but its place in the file and in the order. */
-function conditionalKey(rule: ConditionalRule, anchor: { row: number; col: number }): string {
-  return stable({ ...rule, src: undefined, priority: 0, formulas: rule.formulas.map((text) => shiftFormula(text, -anchor.row, -anchor.col, true)) });
+/**
+ * The same for a conditional rule: all of it but its place in the order - with the element of
+ * the file that holds what it says beside the fields of the model (see ruleOrigin()). Two rules
+ * the model holds alike are the same rule only when that element is the same: what another
+ * element holds beside those fields is not known here, and may differ.
+ */
+function conditionalKey(rule: ConditionalRule, anchor: { row: number; col: number }, sheet: Sheet): string {
+  const own = ownCellSpelling(rule, anchor);
+  const formulas = own ? [ownCellFormulaAt(rule, own, { row: 0, col: 0 })] : rule.formulas.map((text) => shiftFormula(text, -anchor.row, -anchor.col, true));
+  const origin = ruleOrigin(rule, sheet);
+  return stable({ ...rule, src: undefined, origin: origin ? `${origin.part}:${origin.rule[0]}:${origin.rule[1]}` : undefined, priority: 0, formulas });
 }
 
 const firstCell = (ranges: readonly CellRange[]) => ({ row: ranges[0].top, col: ranges[0].left });
@@ -1779,13 +1879,19 @@ export function copyRules(workbook: Workbook, sheetIndex: number, range: CellRan
     const part = clippedToCopy(now.ranges, left, right, runs);
     if (!part) continue;
     const rules = now.rules.filter((rule) => !!rule);
-    const keys = rules.map((rule) => conditionalKey(rule, firstCell(now.ranges)));
+    const keys = rules.map((rule) => conditionalKey(rule, firstCell(now.ranges), sheet));
     if (fixedFormat(now)) {
       for (const key of keys) copied.left.push({ kind: 'conditional', ranges: part.ranges, key });
       continue;
     }
     const to = { top: part.anchor.row, left: part.anchor.col, bottom: part.anchor.row, right: part.anchor.col };
-    if (rules.length > 0) copied.conditional.push({ ranges: part.ranges, anchor: part.anchor, rules: rules.map((rule) => reanchored(rule, now.ranges[0], to)), keys });
+    // Each says where its element is: a paste into another sheet finds there what the model has no field for.
+    const taken = rules.map((rule): ConditionalRule => {
+      const moved = reanchored(rule, now.ranges[0], to);
+      const origin = ruleOrigin(rule, sheet);
+      return origin ? ({ ...moved, origin } as PastedRule) : moved;
+    });
+    if (rules.length > 0) copied.conditional.push({ ranges: part.ranges, anchor: part.anchor, rules: taken, keys });
   }
   return copied.validations.length > 0 || copied.conditional.length > 0 || copied.left.length > 0 ? copied : undefined;
 }
@@ -2073,7 +2179,7 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
     if (!now) return undefined;
     const touched = rangesIntersect(now.ranges, areas);
     if (fixedFormat(now)) {
-      if (touched) for (const rule of now.rules) if (rule) staying.push({ key: conditionalKey(rule, firstCell(now.ranges)), ranges: now.ranges, inside: rangesInside(now.ranges, areas) });
+      if (touched) for (const rule of now.rules) if (rule) staying.push({ key: conditionalKey(rule, firstCell(now.ranges), sheet), ranges: now.ranges, inside: rangesInside(now.ranges, areas) });
       return undefined;
     }
     return { now, touched, kept: undefined as CellRange[] | undefined, inside: touched ? rangesInside(now.ranges, areas) : [] };
@@ -2090,7 +2196,7 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
       const place = `${slot.f}:${slot.r}`;
       order.set(place, at);
       if (!parts[slot.f]) return;
-      const key = conditionalKey(slot.rule, firstCell(slot.ranges));
+      const key = conditionalKey(slot.rule, firstCell(slot.ranges), sheet);
       const list = byKey.get(key);
       if (list) list.push({ place, f: slot.f });
       else byKey.set(key, [{ place, f: slot.f }]);
@@ -2185,6 +2291,7 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
   const added: Placed[] = [];
   for (const item of pasted) {
     if (item.same !== undefined) continue;
+    // The rule keeps the word of where it was copied from (see ruleOrigin()); its place in a file is one it gets.
     const plain = mainPartRule(item.rule);
     if (!plain) continue;
     // What the extension list says about the rule it was copied from stays with that one.

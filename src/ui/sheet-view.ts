@@ -64,10 +64,12 @@ import {
   type ValidationSettings,
 } from '../ops/rules';
 import {
+  APPLE_PLATFORM,
   ConditionalDialog,
   ConditionalManager,
   DIALOG_STYLE,
   FieldError,
+  isContextPress,
   managerPage,
   ValidationDialog,
   validationChange,
@@ -254,8 +256,8 @@ interface Point {
 
 type PointField = HTMLTextAreaElement | HTMLInputElement;
 
-/** Whether the keyboard is one of Apple's: Cmd is the key that adds, and Ctrl with a click asks for the context menu. */
-const APPLE = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+/** Whether the keyboard is one of Apple's: Cmd is the key that adds, and Ctrl with a click asks for the context menu (see isContextPress()). */
+const APPLE = APPLE_PLATFORM;
 
 /** Where a reference that is pointed at now is written (see pointTarget()). */
 interface PointTarget {
@@ -1203,9 +1205,12 @@ export class WorkbookView {
 
   /** Changes the language of number and date formats, and of the view's own labels, and redraws. */
   setLocale(locale: string | FormatLocale): void {
+    // What is typed into a dialog of rules is typed the way the locale writes it, and is not read by another one:
+    // a dialog in which nothing was changed is closed, one with changes keeps the language as it is. That is said
+    // (in the dialog, in the live region and to onNotice) and thrown, so that whatever stands around the view - an
+    // editor with labels of its own - does not go on to another language either.
+    if (!this.destroyed && !this.settleDialog()) throw new RangeError(this.strings.rules.dialogOpen);
     this.locale = resolveLocale(locale);
-    // What is typed into a dialog is typed the way the locale writes it: it is not read by another one.
-    if (this.rulesDialog) this.rulesDialog.close();
     this.validation.forEach((rules) => rules.setLocale(this.locale));
     // The view's own words follow a language tag; a locale object only changes formats.
     if (typeof locale === 'string') {
@@ -2114,6 +2119,8 @@ export class WorkbookView {
    */
   startRename(index: number): boolean {
     if (this.destroyed || this.locked) return false;
+    // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()).
+    if (!this.settleDialog()) return false;
     const sheet = this.workbook.sheets[index];
     if (!sheet) throw new RangeError(`No sheet with index ${index}`);
     if (this.renaming && this.renaming.sheet === sheet) return true;
@@ -2481,7 +2488,8 @@ export class WorkbookView {
     if (this.formulaEdit()) return;
     if (event.pointerType !== 'touch') {
       // The main button on a tab: the tab is dragged once the pointer goes far enough.
-      if (event.button === 0 && !this.renaming && (event.target as HTMLElement).classList.contains('bym-tab')) {
+      // (Not the press that asks for the menu of the tab: that one drags nothing.)
+      if (event.button === 0 && !isContextPress(event) && !this.renaming && (event.target as HTMLElement).classList.contains('bym-tab')) {
         this.tabDrag = { pointerId: event.pointerId, sheet: this.workbook.sheets[index], x: event.clientX, touch: false, started: false, gap: -1, lastX: event.clientX };
         this.watchTabDrag();
       }
@@ -3110,6 +3118,10 @@ export class WorkbookView {
    */
   editComment(row?: number, col?: number): boolean {
     if (this.destroyed || this.locked) return false;
+    // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()). One without
+    // is closed first of all, which shows its own sheet again: the note is one of that sheet, not of a sheet that was
+    // only shown for the dialog to point at.
+    if (!this.settleDialog()) return false;
     if (this.state().sheet.kind !== 'worksheet') return false;
     this.commitEditing();
     this.finishRename(true, true);
@@ -3382,6 +3394,8 @@ export class WorkbookView {
    */
   openValidationList(touch = false): boolean {
     if (this.destroyed || this.locked) return false;
+    // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()).
+    if (!this.settleDialog()) return false;
     // First of all: what is being typed is written, which shows the sheet of its cell again.
     if (!this.tryCommit()) return false;
     const state = this.state();
@@ -3456,6 +3470,8 @@ export class WorkbookView {
    */
   openValidationDialog(): boolean {
     if (this.destroyed || this.locked) return false;
+    // Another dialog of rules that is open: one with changes is not given up for this one (see settleDialog()).
+    if (!this.settleDialog()) return false;
     if (this.state().sheet.kind !== 'worksheet') return false;
     if (this.formulaEdit()) {
       this.notify(this.strings.rules.formulaBeingTyped, 'error');
@@ -3612,6 +3628,8 @@ export class WorkbookView {
   /** What every dialog of rules starts with; false when none can be opened. */
   private beginDialog(): boolean {
     if (this.destroyed || this.locked) return false;
+    // Another dialog of rules that is open: one with changes is not given up for this one (see settleDialog()).
+    if (!this.settleDialog()) return false;
     if (this.state().sheet.kind !== 'worksheet') return false;
     if (this.formulaEdit()) {
       this.notify(this.strings.rules.formulaBeingTyped, 'error');
@@ -3818,9 +3836,8 @@ export class WorkbookView {
       this.dialogTouch = { pointerId, x: event.clientX, y: event.clientY, field, kind };
       return false;
     }
-    if (event.button !== 0) return false;
-    // On a Mac Ctrl and a click is the click for the context menu: it points at nothing. Cmd adds a range there.
-    if (event.ctrlKey && APPLE) return false;
+    // The press that asks for the context menu (Ctrl and a click on a Mac) points at nothing. Cmd adds a range there.
+    if (event.button !== 0 || isContextPress(event)) return false;
     return this.dialogPoint(event, field, kind, pointerId, true);
   }
 
@@ -4340,6 +4357,8 @@ export class WorkbookView {
    */
   openFilterMenu(col: number, touch = false): boolean {
     if (this.destroyed || this.locked) return false;
+    // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()).
+    if (!this.settleDialog()) return false;
     // First of all: what is being typed is written, which shows the sheet of its cell again.
     if (!this.tryCommit()) return false;
     const state = this.state();
@@ -4751,6 +4770,8 @@ export class WorkbookView {
    */
   startEditing(initialText?: string): void {
     if (this.destroyed || this.locked || this.edit) return;
+    // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()).
+    if (!this.settleDialog()) return;
     const state = this.state();
     if (state.sheet.kind !== 'worksheet') return;
     this.closeMenu();
@@ -4782,6 +4803,8 @@ export class WorkbookView {
   setEditText(text: string): void {
     if (this.destroyed || this.locked) return;
     if (!this.edit) {
+      // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()).
+      if (!this.settleDialog()) return;
       if (this.state().sheet.kind !== 'worksheet') return;
       this.closeMenu();
       this.beginEdit();
@@ -6538,7 +6561,9 @@ export class WorkbookView {
       this.longPressTimer = window.setTimeout(this.onLongPress, LONG_PRESS_MS);
       return;
     }
-    if (event.button !== 0) return;
+    // The press that asks for the context menu - another button, or Ctrl and the main one on a Mac - selects nothing,
+    // drags nothing and points at nothing for a formula: the menu that follows does what it does after any such press.
+    if (event.button !== 0 || isContextPress(event)) return;
     // Keeps the browser from starting a text selection or an image drag.
     event.preventDefault();
     this.touchInput = false;
