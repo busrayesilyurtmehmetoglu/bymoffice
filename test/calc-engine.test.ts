@@ -581,7 +581,9 @@ test('a chain of 200,000 cells does not overflow the stack', () => {
   // The last cell first: the worst order to calculate in.
   const rows = Array.from(sheet.rows.entries()).reverse();
   sheet.rows = new Map(rows);
-  const engine = engineFor(workbook);
+  // No limit on the clock: what is asked is whether the stack holds, not how fast a machine that
+  // is busy with something else gets through the chain. The budget has its own tests.
+  const engine = engineFor(workbook, { budget: { milliseconds: 0 } });
   let start = performance.now();
   // The cells hold 0 as the value of the file.
   const result = engine.recalculate(undefined, { overwrite: true });
@@ -602,7 +604,7 @@ test('a chain of 200,000 cells does not overflow the stack', () => {
 test('a loop of 100,000 cells is found', () => {
   const length = 100000;
   const workbook = chainBook(length, true);
-  const engine = engineFor(workbook);
+  const engine = engineFor(workbook, { budget: { milliseconds: 0 } });
   engine.recalculate();
   assert.equal(engine.circular.length, length);
   const sheet = workbook.sheets[0];
