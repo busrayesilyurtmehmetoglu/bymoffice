@@ -502,6 +502,31 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       expectNoOutsideRequests(bridge.requests);
     });
 
+    test('formatting while changes are tracked is a tracked change the application hears of, and the saved file holds it', async ({ page, isMobile }) => {
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 'd1', data: base64(await docx(p('One two.'))), author: 'Me', trackChanges: true });
+      expect(await bridge.waitFor('loaded')).toMatchObject({ type: 'loaded', id: 'd1', kind: 'document', trackChanges: true });
+      await typeIntoDocument(page, bridge.editor, '', isMobile);
+      const key = (await page.evaluate(() => /Mac|iPhone|iPad|iPod/.test(navigator.platform))) ? 'Meta' : 'Control';
+      await page.keyboard.press(`${key}+a`);
+      await page.keyboard.press(`${key}+b`);
+      expect(await bridge.waitFor('revisions')).toEqual({ type: 'revisions', count: 1, trackChanges: true });
+      await bridge.send({ type: 'save', id: 's1' });
+      await bridge.waitFor('saved');
+      const saved = Buffer.from(await bridge.savedData(0), 'base64');
+      const xml = new TextDecoder().decode(await ZipArchive.read(new Uint8Array(saved)).read('word/document.xml'));
+      expect(xml).toMatch(/<w:rPr><w:b\/><w:bCs\/><w:rPrChange w:id="\d+" w:author="Me" w:date="[^"]+"><w:rPr\/><\/w:rPrChange><\/w:rPr><w:t>One two\.<\/w:t>/);
+      // Rejected, the count is told again and nothing of the change is left.
+      await bridge.send({ type: 'rejectAllRevisions', id: 'r' });
+      expect(await bridge.waitFor('done')).toEqual({ type: 'done', id: 'r', command: 'rejectAllRevisions', revisions: 0, trackChanges: true });
+      await bridge.send({ type: 'save', id: 's2' });
+      await bridge.waitFor('saved', 2);
+      const again = new TextDecoder().decode(await ZipArchive.read(new Uint8Array(Buffer.from(await bridge.savedData(1), 'base64'))).read('word/document.xml'));
+      expect(again).not.toContain('rPrChange');
+      expect(again).not.toContain('<w:b/>');
+    });
+
     test('a docx is edited: typing sends changed, undo and redo work, the saved file holds the text', async ({ page, isMobile }) => {
       const bridge = await start(page, mode);
       await bridge.waitFor('ready');

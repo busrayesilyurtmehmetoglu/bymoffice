@@ -80,7 +80,7 @@ import { flatten, harvestRow, paragraphWith, rebuild, withoutWrapper, type Harve
 import { collapsed, itemsLength, paragraphIn, paragraphLength, resolvePosition, storyOf, type DocPosition, type DocRange, type StoryHandle } from './position';
 import { rowSpans, rowWith, type Leftover } from './structure';
 import { neighbour } from './text';
-import { forcesTracking, plainProps } from './track';
+import { forcesTracking, plainProps, revisionExtras } from './track';
 
 /** What accepting or rejecting throws in a document whose protection is enforced: Word allows neither there. */
 export const REVISIONS_PROTECTED = 'The protection of the document does not allow changes to be accepted or rejected';
@@ -760,6 +760,20 @@ export function revisionsOf(doc: DocModel): DocRevision[] {
 
 // ------------------------------------------------------------------- resolver
 
+/**
+ * Properties a rejected record brings back, with the tracked changes the present properties keep as XML: rejecting one
+ * change of formatting never takes another change out of the document. A kept child of the same name that came with
+ * the record gives way to the one that carries the change.
+ */
+function withRevisionExtras<T extends { extras?: ExtraXml[] }>(old: T, present: ExtraXml[] | undefined, empty: T): T {
+  const kept = revisionExtras(present);
+  if (!kept.length) return Object.keys(old).length ? old : empty;
+  const names = new Set<string>();
+  for (const extra of kept) names.add(localName(extra.el.name) + (extra.index < 0 ? ' (self)' : ''));
+  const extras = (old.extras || []).filter((extra) => !names.has(localName(extra.el.name) + (extra.index < 0 ? ' (self)' : '')));
+  return { ...old, extras: extras.concat(kept) };
+}
+
 const without = <T extends object>(props: T, key: keyof T, empty: T): T => {
   const out = { ...props };
   delete out[key];
@@ -974,7 +988,7 @@ class Resolver {
       if (!out) out = { ...old };
       out[flag] = props[flag];
     }
-    return out || old;
+    return withRevisionExtras(out || old, props.extras, EMPTY_RUN_PROPS);
   }
 
   private paraProps(props: ParaProps, verdict: Verdict): ParaProps {
@@ -991,7 +1005,13 @@ class Resolver {
       delete old.markProps;
       delete old.section;
     }
-    old = plainProps(old);
+    // The tracked changes the properties keep as XML (a list number somebody inserted) are not this one: they stay.
+    old = withRevisionExtras(plainProps(old), props.extras, EMPTY_PARA_PROPS);
+    // A list number that carries such a change stays with it, also where the record says the paragraph was in no list:
+    // the number is somebody's change, to be resolved as one (and the kept <w:numPr> would be written whole anyway).
+    if (old.numbering === undefined && props.numbering !== undefined && old.extras && old.extras.some((extra) => extra.partial === true && localName(extra.el.name) === 'numPr')) {
+      old = { ...old, numbering: props.numbering };
+    }
     if (props.markProps === undefined && props.section === undefined) return Object.keys(old).length ? old : EMPTY_PARA_PROPS;
     const out: ParaProps = { ...old };
     if (props.markProps !== undefined) out.markProps = props.markProps;

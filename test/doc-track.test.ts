@@ -15,7 +15,6 @@ import {
   deleteForward,
   deleteRange,
   deleteRow,
-  indentList,
   insertBlock,
   insertColumn,
   insertHyperlink,
@@ -26,13 +25,9 @@ import {
   insertText,
   nextRevisionId,
   revisionDate,
-  setParaFormat,
-  setRunFormat,
   setTracking,
   splitParagraph,
   storyIds,
-  toggleList,
-  toggleRunFormat,
   type DocEdit,
   type DocEditOptions,
   type DocPosition,
@@ -482,11 +477,7 @@ test('what cannot be tracked is refused and changes nothing', async () => {
   const before = docPicture(o.doc);
   const span = range(pos(0, 1), pos(0, 3));
   const cell: DocPosition = { story: 'body', path: [1, 0, 0, 0], offset: 0 };
-  refused(() => setRunFormat(o.doc, span, { bold: true }));
-  refused(() => toggleRunFormat(o.doc, span, 'italic'));
-  refused(() => setParaFormat(o.doc, span, { align: 'center' }));
-  refused(() => toggleList(o.doc, span, 'bullet'));
-  refused(() => indentList(o.doc, span, 1));
+  // (Formatting of text, of paragraphs and lists is tracked: test/doc-track-format.test.ts.)
   refused(() => insertTable(o.doc, pos(0, 1), 2, 2));
   refused(() => insertRow(o.doc, cell, 'below'));
   refused(() => deleteRow(o.doc, cell));

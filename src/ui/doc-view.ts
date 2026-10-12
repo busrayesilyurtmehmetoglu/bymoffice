@@ -3286,8 +3286,8 @@ export class DocumentView {
       } catch {
         empty = false;
       }
-      // Where changes are tracked the mark is left alone (its formatting cannot be tracked yet): the text typed next takes the formatting.
-      if (empty && !this.trackingChanges && this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true)) return true;
+      // Where changes are tracked this is a tracked change of the formatting of the mark, like any other.
+      if (empty && this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true)) return true;
       // Checked now, so that a patch that is not valid is refused here and not at the next key.
       try {
         ops.patchRunProps({}, patch);
@@ -3308,7 +3308,30 @@ export class DocumentView {
     if (!this.editable || !range) return false;
     if (ops.isCollapsed(range)) {
       const now = this.selectionFormat;
-      return this.format({ [key]: !(now && now[key] === true) });
+      if (!(now && now[key] === true)) return this.format({ [key]: true });
+      // Off again. What was turned on for the text typed next and not typed yet is simply forgotten: the caret is
+      // where it was before, and nothing says "off" where nothing said "on".
+      const pending = this.pendingFormat;
+      if (pending && pending[key] === true) {
+        const rest: RunFormatPatch = { ...pending };
+        delete rest[key];
+        this.pendingFormat = Object.keys(rest).length ? rest : undefined;
+        const still = this.selectionFormat;
+        if (!(still && still[key] === true)) {
+          this.announceSelection();
+          return true;
+        }
+      }
+      // The mark of an empty paragraph: the property is taken off it again (switched off only where a style turns
+      // it on), which leaves the mark as it was, and takes back the tracked change that turning it on made.
+      let empty = false;
+      try {
+        empty = ops.resolvePosition(this.document, range.focus).length === 0;
+      } catch {
+        empty = false;
+      }
+      if (empty && this.perform((selection) => ops.toggleRunFormat(this.document, selection, key), true)) return true;
+      return this.format({ [key]: false });
     }
     return this.perform((selection) => ops.toggleRunFormat(this.document, selection, key), true);
   }

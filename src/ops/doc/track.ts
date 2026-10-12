@@ -21,10 +21,31 @@
 //     author made goes for good only between two paragraphs formatted alike. An editor without a name owns no
 //     insertion: the stand-in name is also what Word writes for anybody whose
 //     name was removed from a file.
+//   - formatting that is changed stays changed, and what it was is recorded:
+//     a run says so in its properties (`change`, a <w:rPrChange> that holds
+//     the run properties as they were), a paragraph in its own (a
+//     <w:pPrChange> with the paragraph properties as they were: alignment,
+//     indents, spacing, style, list - not the mark, not the section). The
+//     records are elements, spelled as the part of their story spells its
+//     elements, because that is what the model keeps of the ones a file
+//     brings: listing, accepting and rejecting know one kind only. Rules, as
+//     Word has them (see trackedRunProps):
+//       - formatting that carries a record already, whoever made it, gets no
+//         second one: what it was first is what a rejection brings back;
+//       - the author who, in the same session, brings formatting back to
+//         exactly what their own record says takes the record away;
+//       - text in a tracked insertion the same author made in this session
+//         is formatted without a record: what is new has no formatting it
+//         used to have. A paragraph (and its mark) is new in that sense only
+//         when all of it is: the mark and everything before it. A paragraph
+//         the author split still holds text that was there;
+//       - deleted text is not formatted at all.
 // Content in a `del` wrapper is not content any more: it takes no offsets
 // (see position.ts) and no command touches it again.
 
-import { EMPTY_PARA_PROPS, tracksChanges, type Block, type DocModel, type ExtraXml, type Inline, type ParaProps, type RevisionInfo, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
+import { createContext, createReaderState } from '../../formats/docx/common';
+import { paraPropsElement, runPropsElement, wEl, type PropsContext } from '../../formats/docx/write-props';
+import { EMPTY_PARA_PROPS, EMPTY_RUN_PROPS, tracksChanges, type AttrList, type Block, type DocModel, type DocRelationship, type ExtraXml, type Inline, type ParaProps, type RevisionInfo, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
 import type { XmlElement } from '../../xml';
 import { fieldPairs, makeRun, removedPieces, sameProps, type Piece } from './pieces';
 
@@ -87,7 +108,18 @@ export interface Tracking {
   date: string;
   /** A revision of this command with an id no other has. */
   revision(): RevisionInfo;
+  /**
+   * Is a revision one this author made since the document was opened: it carries the name, and its id is one that
+   * was given for that name in this session. A revision that came with the file is nobody's, whatever name it
+   * carries (somebody may be waiting to reject it), and neither is any revision for an editor without a name.
+   */
+  made(info: RevisionInfo | undefined): boolean;
+  /** An id for the second of two elements a revision with the id `from` was cut into: see renewedId(). */
+  renew(from: number | undefined): number;
 }
+
+/** The ids given to the revisions of each author since a document was opened. */
+const SESSION_IDS = new WeakMap<DocModel, Map<number, string>>();
 
 const systemClock = (): Date => new Date();
 
@@ -129,7 +161,33 @@ export function trackingFor(doc: DocModel, options?: TrackOptions): Tracking | u
     if (typeof options.date !== 'string' || !isIsoDate(options.date)) throw new RangeError('The date of a tracked change must be ISO 8601 text');
     date = options.date;
   } else date = revisionDate((setup.now || systemClock)());
-  return { author, named: known, date, revision: () => ({ id: nextRevisionId(doc), author, date }) };
+  let given = SESSION_IDS.get(doc);
+  if (!given) SESSION_IDS.set(doc, (given = new Map<number, string>()));
+  const ids = given;
+  return {
+    author,
+    named: known,
+    date,
+    revision: () => {
+      const id = nextRevisionId(doc);
+      ids.set(id, author);
+      return { id, author, date };
+    },
+    made: (info) => known && info !== undefined && info.id !== undefined && info.author === author && ids.get(info.id) === author,
+    renew: (from) => renewedId(doc, from),
+  };
+}
+
+/**
+ * A new id for an element that is a part of the revision with the id `from` (an edit cut that in two). The part is
+ * as much of this session as the revision was: whoever made the one made the other.
+ */
+function renewedId(doc: DocModel, from: number | undefined): number {
+  const id = nextRevisionId(doc);
+  const given = SESSION_IDS.get(doc);
+  const author = given && from !== undefined ? given.get(from) : undefined;
+  if (given && author !== undefined) given.set(id, author);
+  return id;
 }
 
 // ------------------------------------------------------------------------ ids
@@ -313,7 +371,7 @@ export function renumbered(pieces: Piece[], shared: Set<Wrapper>, tracking: Trac
     if (memo.has(wrap)) return memo.get(wrap);
     const parent = copy(wrap.parent);
     let out = wrap;
-    if (shared.has(wrap)) out = { ...wrap, id: tracking.revision().id } as Wrapper;
+    if (shared.has(wrap)) out = { ...wrap, id: tracking.renew((wrap as RevisionWrapper).id) } as Wrapper;
     else if (parent !== wrap.parent) out = { ...wrap } as Wrapper;
     if (out !== wrap) {
       if (parent) out.parent = parent;
@@ -398,7 +456,7 @@ export function insertionWrap(tracking: Tracking, pieces: Piece[], index: number
     let any = false;
     for (let i = index; i < pieces.length && !any; i++) any = chainHas(pieces[i].wrap, around);
     if (any) {
-      const second = { ...around, id: tracking.revision().id } as Wrapper;
+      const second = { ...around, id: tracking.renew(around.id) } as Wrapper;
       const memo = new Map<Wrapper, Wrapper>();
       out = pieces.slice();
       for (let i = index; i < out.length; i++) {
@@ -663,9 +721,9 @@ export function isOwnMark(props: ParaProps, tracking: Tracking): boolean {
 function freshChange(change: XmlElement, tracking: Tracking): XmlElement {
   const attrs = new Map(change.attrs);
   attrs.forEach((_value, name) => {
-    if (name.slice(name.indexOf(':') + 1) === 'id') attrs.set(name, String(tracking.revision().id));
+    if (name.slice(name.indexOf(':') + 1) === 'id') attrs.set(name, String(tracking.renew(undefined)));
   });
-  return { ...change, attrs };
+  return sameRecord(change, { ...change, attrs });
 }
 
 /**
@@ -718,7 +776,7 @@ function renumberedExtras(extras: ExtraXml[] | undefined, renew: (id: number) =>
  */
 export function withFreshChanges(props: ParaProps, tracking: Tracking): ParaProps {
   const mark = props.markProps;
-  const renew = (): number => tracking.revision().id as number;
+  const renew = (): number => tracking.renew(undefined);
   const extras = renumberedExtras(props.extras, renew);
   const markExtras = mark ? renumberedExtras(mark.extras, renew) : undefined;
   if (!props.change && !(mark && mark.change) && extras === props.extras && !(mark && markExtras !== mark.extras)) return props;
@@ -755,6 +813,168 @@ export function withMarkRevisionsOf(props: ParaProps, from: ParaProps): ParaProp
 
 export const isDeletedMark = (props: ParaProps): boolean => props.markProps !== undefined && props.markProps.deleted !== undefined;
 
+// ---------------------------------------------------------- formatting changes
+
+/** What is known of a record of changed formatting this session made: who made it, and the properties it holds, as the model has them. */
+interface OwnRecord {
+  author: string;
+  old: object;
+}
+
+/**
+ * The records of changed formatting made since the document was opened. A record a file brought is not among them:
+ * whoever it names, it is not taken away by formatting.
+ */
+const OWN_RECORDS = new WeakMap<XmlElement, OwnRecord>();
+
+/** A copy of a record (the same change, another id: its run or paragraph was split) is as much the author's as the record. */
+function sameRecord(from: XmlElement, copy: XmlElement): XmlElement {
+  const own = OWN_RECORDS.get(from);
+  if (own) OWN_RECORDS.set(copy, own);
+  return copy;
+}
+
+/** What a part needs to be written into: how it spells its elements. */
+interface PartLike {
+  part: string;
+  rootAttrs: AttrList;
+  relationships: Map<string, DocRelationship>;
+}
+
+const WRITERS = new WeakMap<object, PropsContext>();
+
+/** A writer of properties for the part of a story: records are spelled with the prefixes that part declares. */
+function writerFor(host: PartLike): PropsContext {
+  let ctx = WRITERS.get(host);
+  if (!ctx) {
+    const state = createReaderState();
+    const reader = createContext(state, host.part, host.rootAttrs, host.relationships);
+    // As the writer of the package finds it: the prefix bound to WordprocessingML, none when it is the default namespace.
+    const w = reader.wPrefixes.length ? reader.wPrefixes[0] : reader.prefixes.get('') === 'w' ? '' : 'w:';
+    ctx = { w, a: w, r: reader.rPrefixes[0], strict: state.strict, reader };
+    WRITERS.set(host, ctx);
+  }
+  return ctx;
+}
+
+function recordElement(tracking: Tracking, ctx: PropsContext, local: 'rPrChange' | 'pPrChange', inner: XmlElement, old: object): XmlElement {
+  const revision = tracking.revision();
+  const el = wEl(
+    ctx,
+    local,
+    [
+      ['id', revision.id],
+      ['author', revision.author],
+      ['date', revision.date],
+    ],
+    [inner],
+  );
+  OWN_RECORDS.set(el, { author: tracking.author, old });
+  return el;
+}
+
+/** Is the record one this author made in this session, and are the properties back at what it holds. */
+function undoes(tracking: Tracking, record: XmlElement, now: object): boolean {
+  const own = OWN_RECORDS.get(record);
+  return own !== undefined && tracking.named && own.author === tracking.author && sameProps(now, own.old);
+}
+
+function withoutChange<T extends { change?: XmlElement }>(props: T, empty: T): T {
+  const out = { ...props };
+  delete out.change;
+  return Object.keys(out).length ? out : empty;
+}
+
+/**
+ * The run properties a tracked change of formatting leaves: `after` is what the command made of `before` (the same
+ * object when it changed nothing), `host` the part the run is in. `own` says that the text is in a tracked insertion
+ * the author made in this session (or the properties are those of the mark of a paragraph that is all the author's,
+ * see isOwnParagraph): no record then. Properties that
+ * carry a record keep it and get no other (Word keeps one record: the first "as it was"); the author's own record of
+ * this session goes when the properties are back at what it holds. UNSURE: Word's rule for taking its own record
+ * away was not checked against Word; this one never loses a record somebody else may want to reject.
+ */
+export function trackedRunProps(tracking: Tracking, host: PartLike, before: RunProps, after: RunProps, own: boolean): RunProps {
+  if (after === before || own) return after;
+  const record = before.change;
+  if (record) {
+    if (after.change !== record) return after;
+    const bare = withoutChange(after, EMPTY_RUN_PROPS);
+    return undoes(tracking, record, plainProps(bare)) ? bare : after;
+  }
+  // What it was, as formatting and nothing else: a mark that is a revision itself says so outside the record.
+  const old = plainProps(before);
+  const ctx = writerFor(host);
+  return { ...after, change: recordElement(tracking, ctx, 'rPrChange', runPropsElement(ctx, old) || wEl(ctx, 'rPr'), old) };
+}
+
+/** Paragraph properties as a record of their change holds them: without the mark, the section the paragraph ends and any tracked change. */
+function recordedParaProps(props: ParaProps): ParaProps {
+  let bare = props;
+  if (props.markProps !== undefined || props.section !== undefined || props.change !== undefined) {
+    bare = { ...props };
+    delete bare.markProps;
+    delete bare.section;
+    delete bare.change;
+  }
+  return plainProps(bare);
+}
+
+/** Was the content put in by this author, as a tracked change, since the document was opened. */
+export function inSessionInsertion(wrap: Wrapper | undefined, tracking: Tracking): boolean {
+  let steps = 0;
+  for (let w = wrap; w && steps < MAX_WRAPPER_CHAIN; w = w.parent, steps++) if (w.kind === 'ins' && tracking.made(w)) return true;
+  return false;
+}
+
+/**
+ * Is a paragraph all the author's, made in this session: its mark is a tracked insertion of theirs and so is
+ * everything in it. Such a paragraph has no formatting it used to have. One the author only split is not: the half
+ * that got the new mark holds text that was there, and a change of its formatting has to be one that can be rejected.
+ */
+export function isOwnParagraph(paragraph: { props: ParaProps; children: Inline[] }, tracking: Tracking): boolean {
+  const mark = paragraph.props.markProps;
+  if (!mark || !tracking.made(mark.inserted)) return false;
+  for (const inline of paragraph.children) if (!inSessionInsertion(inline.wrap, tracking)) return false;
+  return true;
+}
+
+/** The kept children that hold a tracked change (a list number somebody inserted or changed, say). */
+export function revisionExtras(extras: ExtraXml[] | undefined): ExtraXml[] {
+  const out: ExtraXml[] = [];
+  if (!extras) return out;
+  for (const extra of extras) {
+    const one = [extra];
+    // Without its tracked changes it would be another element, or none.
+    if (plainExtras(one, true) !== one) out.push(extra);
+  }
+  return out;
+}
+
+/**
+ * The paragraph properties a tracked change of formatting leaves (alignment, indents, spacing, style, list); see
+ * trackedRunProps. `own`: the paragraph is all the author's (isOwnParagraph), and gets no record. A change that would
+ * take a tracked change of somebody else out of the properties (a paragraph leaves a list whose number carries one)
+ * is refused with TRACK_UNSUPPORTED: no record could bring that back.
+ */
+export function trackedParaProps(tracking: Tracking, host: PartLike, before: ParaProps, after: ParaProps, own: boolean): ParaProps {
+  if (after === before) return after;
+  const kept = revisionExtras(before.extras);
+  if (kept.length) {
+    const still = after.extras || [];
+    for (const extra of kept) if (still.indexOf(extra) < 0) throw new RangeError(TRACK_UNSUPPORTED);
+  }
+  if (own) return after;
+  const record = before.change;
+  if (record) {
+    if (after.change !== record || !undoes(tracking, record, recordedParaProps(after))) return after;
+    return withoutChange(after, EMPTY_PARA_PROPS);
+  }
+  const old = recordedParaProps(before);
+  const ctx = writerFor(host);
+  return { ...after, change: recordElement(tracking, ctx, 'pPrChange', paraPropsElement(ctx, old) || wEl(ctx, 'pPr'), old) };
+}
+
 // ------------------------------------------------------- one id, one element
 
 const changeId = (change: XmlElement): number | undefined => {
@@ -774,7 +994,7 @@ function renumberedChange(doc: DocModel, change: XmlElement): XmlElement {
       done = true;
     }
   });
-  return { ...change, attrs };
+  return sameRecord(change, { ...change, attrs });
 }
 
 /**
@@ -857,7 +1077,7 @@ export function distinctRevisions(doc: DocModel, blocks: Block[], untouched?: Se
           const copy = { ...w } as Wrapper;
           if (use) copy.parent = use;
           else delete copy.parent;
-          if (fresh) (copy as RevisionWrapper).id = nextRevisionId(doc);
+          if (fresh) (copy as RevisionWrapper).id = renewedId(doc, (w as RevisionWrapper).id);
           alias.set(w, copy);
           use = copy;
         } else {
@@ -885,7 +1105,7 @@ export function distinctRevisions(doc: DocModel, blocks: Block[], untouched?: Se
       if (mark.change && taken(changeId(mark.change))) mark = { ...mark, change: renumberedChange(doc, mark.change) };
       for (const key of MARK_FLAGS) {
         const info: RevisionInfo | undefined = mark[key];
-        if (info && taken(info.id)) mark = { ...mark, [key]: { ...info, id: nextRevisionId(doc) } };
+        if (info && taken(info.id)) mark = { ...mark, [key]: { ...info, id: renewedId(doc, info.id) } };
       }
       const markExtras = renumberedExtras(mark.extras, renew);
       if (markExtras !== mark.extras) mark = { ...mark, extras: markExtras };

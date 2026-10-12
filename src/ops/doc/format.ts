@@ -17,9 +17,10 @@ import {
   type Paragraph,
   type RunProps,
 } from '../../model/doc/types';
-import { buildEdit, tableContextOf, type Draft, type DocEdit } from './draft';
+import { buildEdit, tableContextOf, type Draft, type DocEdit, type DocEditOptions } from './draft';
 import { boundary, flatten, inheritedProps, markRunProps, paragraphWith, rebuild, sameInlines, sameProps, type Piece } from './pieces';
-import { asRange, containerBlocks, inTextBox, isCollapsed, orderRange, paragraphLength, paragraphsBetween, resolvePosition, type DocPosition, type DocRange } from './position';
+import { asRange, containerBlocks, inTextBox, isCollapsed, orderRange, paragraphLength, paragraphsBetween, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
+import { inSessionInsertion, isOwnParagraph, trackedParaProps, trackedRunProps } from './track';
 
 // Patches come from the caller of the editor, who may hand over anything: every field is checked before it reaches
 // the model, where the writer would put it into the file.
@@ -274,8 +275,16 @@ function withMark(props: ParaProps, next: RunProps): ParaProps {
   return Object.keys(out).length ? out : EMPTY_PARA_PROPS;
 }
 
+/**
+ * Changes the character formatting of a range. Where the draft tracks, the change is a tracked one: see
+ * trackedRunProps for what gets a record of the formatting it had.
+ */
 function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, paragraph: Paragraph, where: TableContext | undefined) => RunProps): void {
   editable(range);
+  const track = draft.track;
+  const host = track ? storyOf(draft.doc, range.anchor.story).host : undefined;
+  /** The properties of a paragraph mark after the change. */
+  const markChanged = (paragraph: Paragraph, mark: RunProps, next: RunProps): RunProps => (track && host ? trackedRunProps(track, host, mark, next, isOwnParagraph(paragraph, track)) : next);
   if (isCollapsed(range)) {
     // A caret. In an empty paragraph the formatting goes onto the paragraph mark, which text typed there takes
     // over (what Word does); in a paragraph with text there is nothing to format: the caller keeps the format
@@ -284,7 +293,7 @@ function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, pa
     if (at.length !== 0) return;
     const paragraph = at.paragraph;
     const mark = paragraph.props.markProps || EMPTY_RUN_PROPS;
-    const next = change(mark, paragraph, tableContextOf(draft.doc, range.anchor.story, range.anchor.path));
+    const next = markChanged(paragraph, mark, change(mark, paragraph, tableContextOf(draft.doc, range.anchor.story, range.anchor.path)));
     if (next !== mark) draft.setParagraph(range.anchor.story, range.anchor.path, paragraphWith(paragraph, paragraph.children, withMark(paragraph.props, next)));
     return;
   }
@@ -303,17 +312,29 @@ function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, pa
       if (!next) memo.set(props, (next = change(props, paragraph, where)));
       return next;
     };
+    // Tracked, the runs of one paragraph that share their properties share the record too, and the draft gives every
+    // run an id of its own (see distinctRevisions). It does so within one paragraph only, so a record is never shared
+    // between paragraphs: each makes its own. Text in an insertion of the author gets none (see trackedRunProps).
+    const recorded = new Map<RunProps, RunProps>();
+    const mine = new Map<RunProps, RunProps>();
     for (let q = from; q < to; q++) {
       const piece = pieces[q];
       if (!formattable(piece)) continue;
-      const next = changed(piece.props);
+      let next = changed(piece.props);
+      if (track && host && next !== piece.props) {
+        const own = inSessionInsertion(piece.wrap, track);
+        const made = own ? mine : recorded;
+        const known = made.get(piece.props);
+        if (known) next = known;
+        else made.set(piece.props, (next = trackedRunProps(track, host, piece.props, next, own)));
+      }
       if (next !== piece.props) pieces[q] = { ...piece, props: next };
     }
     let props = paragraph.props;
     if (part.mark) {
       // The paragraph mark is in the range: what is typed at the end of the paragraph is formatted alike.
       const mark = props.markProps || EMPTY_RUN_PROPS;
-      const next = change(mark, paragraph, where);
+      const next = markChanged(paragraph, mark, change(mark, paragraph, where));
       if (next !== mark) props = withMark(props, next);
     }
     const children = rebuild(pieces);
@@ -330,19 +351,24 @@ function mapRunProps(draft: Draft, range: DocRange, change: (props: RunProps, pa
  * insertText). An end of the range with `before` set leaves out the picture
  * at its offset, a start with it takes that picture in.
  */
-export function setRunFormat(doc: DocModel, range: DocRange, patch: RunFormatPatch): DocEdit {
+export function setRunFormat(doc: DocModel, range: DocRange, patch: RunFormatPatch, options?: DocEditOptions): DocEdit {
   const at = asRange(range);
-  return buildEdit(doc, (draft) => {
-    patchRunProps(EMPTY_RUN_PROPS, patch, doc);
-    // The change does not depend on the paragraph: each bag of properties is patched once for the whole range.
-    const memo = new Map<RunProps, RunProps>();
-    mapRunProps(draft, at, (props) => {
-      let next = memo.get(props);
-      if (!next) memo.set(props, (next = patchRunProps(props, patch, doc)));
-      return next;
-    });
-    return at;
-  });
+  return buildEdit(
+    doc,
+    (draft) => {
+      patchRunProps(EMPTY_RUN_PROPS, patch, doc);
+      // The change does not depend on the paragraph: each bag of properties is patched once for the whole range.
+      const memo = new Map<RunProps, RunProps>();
+      mapRunProps(draft, at, (props) => {
+        let next = memo.get(props);
+        if (!next) memo.set(props, (next = patchRunProps(props, patch, doc)));
+        return next;
+      });
+      return at;
+    },
+    options,
+    true,
+  );
 }
 
 /** Formatting in effect for the text of a range. A property is missing when the range mixes values; `mixed` names those. */
@@ -475,19 +501,24 @@ export type ToggleKey = 'bold' | 'italic' | 'underline' | 'strike';
  * still turns it on, it is switched off on the text itself. At a caret see
  * setRunFormat.
  */
-export function toggleRunFormat(doc: DocModel, range: DocRange, key: ToggleKey): DocEdit {
+export function toggleRunFormat(doc: DocModel, range: DocRange, key: ToggleKey, options?: DocEditOptions): DocEdit {
   if (key !== 'bold' && key !== 'italic' && key !== 'underline' && key !== 'strike') bad('The property cannot be toggled');
   const at = asRange(range);
   const on = rangeFormat(doc, at)[key] === true;
-  if (!on) return setRunFormat(doc, at, { [key]: true });
-  return buildEdit(doc, (draft) => {
-    mapRunProps(draft, at, (props, paragraph, where) => {
-      const removed = patchRunProps(props, { [key]: null });
-      const still = runValues(doc, resolveRunProps(doc, paragraph.props, removed, where), removed)[key] === true;
-      return still ? patchRunProps(props, { [key]: false }) : removed;
-    });
-    return at;
-  });
+  if (!on) return setRunFormat(doc, at, { [key]: true }, options);
+  return buildEdit(
+    doc,
+    (draft) => {
+      mapRunProps(draft, at, (props, paragraph, where) => {
+        const removed = patchRunProps(props, { [key]: null });
+        const still = runValues(doc, resolveRunProps(doc, paragraph.props, removed, where), removed)[key] === true;
+        return still ? patchRunProps(props, { [key]: false }) : removed;
+      });
+      return at;
+    },
+    options,
+    true,
+  );
 }
 
 // ------------------------------------------------------------------ paragraphs
@@ -626,25 +657,34 @@ export function patchParaProps(props: ParaProps, patch: ParaFormatPatch, doc?: D
   return Object.keys(out).length ? out : EMPTY_PARA_PROPS;
 }
 
+/** Changes the formatting of the paragraphs of a range. Where the draft tracks, each change is a tracked one: see trackedParaProps. */
 function mapParaProps(draft: Draft, range: DocRange, change: (props: ParaProps, paragraph: Paragraph, where: TableContext | undefined, path: number[]) => ParaProps): void {
   editable(range);
   const { story, list } = coveredParagraphs(draft.doc, range);
+  const track = draft.track;
+  const host = track ? storyOf(draft.doc, story).host : undefined;
   for (const part of list) {
     // As the draft has it now: an earlier step of this command may have put another object there (see Draft.replace).
     const paragraph = paragraphAt(draft.doc, story, part.path);
-    const next = change(paragraph.props, paragraph, tableContextOf(draft.doc, story, part.path), part.path);
+    let next = change(paragraph.props, paragraph, tableContextOf(draft.doc, story, part.path), part.path);
+    if (track && host) next = trackedParaProps(track, host, paragraph.props, next, isOwnParagraph(paragraph, track));
     if (next !== paragraph.props) draft.setParagraph(story, part.path, paragraphWith(paragraph, paragraph.children, next));
   }
 }
 
 /** Sets paragraph formatting on every paragraph a range touches. */
-export function setParaFormat(doc: DocModel, at: DocRange | DocPosition, patch: ParaFormatPatch): DocEdit {
+export function setParaFormat(doc: DocModel, at: DocRange | DocPosition, patch: ParaFormatPatch, options?: DocEditOptions): DocEdit {
   const range = asRange(at);
-  return buildEdit(doc, (draft) => {
-    patchParaProps(EMPTY_PARA_PROPS, patch, doc);
-    mapParaProps(draft, range, (props) => patchParaProps(props, patch, doc));
-    return range;
-  });
+  return buildEdit(
+    doc,
+    (draft) => {
+      patchParaProps(EMPTY_PARA_PROPS, patch, doc);
+      mapParaProps(draft, range, (props) => patchParaProps(props, patch, doc));
+      return range;
+    },
+    options,
+    true,
+  );
 }
 
 /** Paragraph properties that take a paragraph out of its list: the numbering removed, or switched off when a style brings it. */
@@ -729,38 +769,43 @@ function siblingParagraph(doc: DocModel, story: string, path: number[], step: 1 
  * The list of a neighbouring paragraph of the same kind is continued;
  * otherwise the document gets a new list definition.
  */
-export function toggleList(doc: DocModel, at: DocRange | DocPosition, kind: 'bullet' | 'number'): DocEdit {
+export function toggleList(doc: DocModel, at: DocRange | DocPosition, kind: 'bullet' | 'number', options?: DocEditOptions): DocEdit {
   const range = asRange(at);
   if (kind !== 'bullet' && kind !== 'number') bad('The kind of list is not valid');
-  return buildEdit(doc, (draft) => {
-    editable(range);
-    const { story, list } = coveredParagraphs(doc, range);
-    const kinds = list.map((part) => listKind(doc, resolveParaProps(doc, part.paragraph.props, tableContextOf(doc, story, part.path))));
-    if (kinds.every((value) => value === kind)) {
-      mapParaProps(draft, range, (props, _paragraph, where) => withoutNumbering(doc, props, where));
+  return buildEdit(
+    doc,
+    (draft) => {
+      editable(range);
+      const { story, list } = coveredParagraphs(doc, range);
+      const kinds = list.map((part) => listKind(doc, resolveParaProps(doc, part.paragraph.props, tableContextOf(doc, story, part.path))));
+      if (kinds.every((value) => value === kind)) {
+        mapParaProps(draft, range, (props, _paragraph, where) => withoutNumbering(doc, props, where));
+        return range;
+      }
+      let numId: number | undefined;
+      for (const step of [-1, 1] as const) {
+        const beside = numId === undefined ? siblingParagraph(doc, story, step === -1 ? list[0].path : list[list.length - 1].path, step) : undefined;
+        if (!beside) continue;
+        const effective = resolveParaProps(doc, beside.paragraph.props, tableContextOf(doc, story, beside.path));
+        if (listKind(doc, effective) === kind) numId = (effective.numbering as { numId: number }).numId;
+      }
+      if (numId === undefined) {
+        const abstract: AbstractNum = { id: nextId(doc.numbering.abstracts, 0), levels: listLevels(kind), multiLevelType: 'hybridMultilevel' };
+        numId = nextId(doc.numbering.nums, 1);
+        draft.apply({ type: 'setNumbering', abstracts: [[abstract.id, abstract]], nums: [[numId, { id: numId, abstractId: abstract.id, overrides: new Map() }]] });
+      }
+      const id = numId;
+      mapParaProps(draft, range, (props, _paragraph, where) => {
+        const effective = resolveParaProps(doc, props, where);
+        // An item of another list keeps its depth.
+        const level = listKind(doc, effective) !== 'none' && effective.numbering && effective.numbering.level !== undefined ? effective.numbering.level : 0;
+        return patchParaProps(props, { numbering: { numId: id, level } });
+      });
       return range;
-    }
-    let numId: number | undefined;
-    for (const step of [-1, 1] as const) {
-      const beside = numId === undefined ? siblingParagraph(doc, story, step === -1 ? list[0].path : list[list.length - 1].path, step) : undefined;
-      if (!beside) continue;
-      const effective = resolveParaProps(doc, beside.paragraph.props, tableContextOf(doc, story, beside.path));
-      if (listKind(doc, effective) === kind) numId = (effective.numbering as { numId: number }).numId;
-    }
-    if (numId === undefined) {
-      const abstract: AbstractNum = { id: nextId(doc.numbering.abstracts, 0), levels: listLevels(kind), multiLevelType: 'hybridMultilevel' };
-      numId = nextId(doc.numbering.nums, 1);
-      draft.apply({ type: 'setNumbering', abstracts: [[abstract.id, abstract]], nums: [[numId, { id: numId, abstractId: abstract.id, overrides: new Map() }]] });
-    }
-    const id = numId;
-    mapParaProps(draft, range, (props, _paragraph, where) => {
-      const effective = resolveParaProps(doc, props, where);
-      // An item of another list keeps its depth.
-      const level = listKind(doc, effective) !== 'none' && effective.numbering && effective.numbering.level !== undefined ? effective.numbering.level : 0;
-      return patchParaProps(props, { numbering: { numId: id, level } });
-    });
-    return range;
-  });
+    },
+    options,
+    true,
+  );
 }
 
 /** One step of indent outside lists, twips: half an inch. */
@@ -770,23 +815,28 @@ const INDENT_STEP = 720;
  * Moves the list items of a range `delta` levels deeper (levels 0 to 8);
  * paragraphs outside lists are indented by half an inch per step instead.
  */
-export function indentList(doc: DocModel, at: DocRange | DocPosition, delta: number): DocEdit {
+export function indentList(doc: DocModel, at: DocRange | DocPosition, delta: number, options?: DocEditOptions): DocEdit {
   const range = asRange(at);
   if (typeof delta !== 'number' || Math.floor(delta) !== delta || Math.abs(delta) > 8) bad('The change of level is not valid');
-  return buildEdit(doc, (draft) => {
-    mapParaProps(draft, range, (props, _paragraph, where) => {
-      const effective = resolveParaProps(doc, props, where);
-      if (listKind(doc, effective) !== 'none') {
-        const numbering = effective.numbering as { numId: number; level?: number };
-        const level = Math.max(0, Math.min(8, (numbering.level === undefined ? 0 : numbering.level) + delta));
-        return patchParaProps(props, { numbering: { numId: numbering.numId, level } });
-      }
-      const left = Math.max(0, ((effective.indent && effective.indent.left) || 0) + delta * INDENT_STEP);
-      // Back at the indent the style gives, the paragraph states none of its own.
-      const bare = patchParaProps(props, { indent: { left: null } });
-      const inherited = resolveParaProps(doc, bare, where).indent;
-      return left === ((inherited && inherited.left) || 0) ? bare : patchParaProps(props, { indent: { left } });
-    });
-    return range;
-  });
+  return buildEdit(
+    doc,
+    (draft) => {
+      mapParaProps(draft, range, (props, _paragraph, where) => {
+        const effective = resolveParaProps(doc, props, where);
+        if (listKind(doc, effective) !== 'none') {
+          const numbering = effective.numbering as { numId: number; level?: number };
+          const level = Math.max(0, Math.min(8, (numbering.level === undefined ? 0 : numbering.level) + delta));
+          return patchParaProps(props, { numbering: { numId: numbering.numId, level } });
+        }
+        const left = Math.max(0, ((effective.indent && effective.indent.left) || 0) + delta * INDENT_STEP);
+        // Back at the indent the style gives, the paragraph states none of its own.
+        const bare = patchParaProps(props, { indent: { left: null } });
+        const inherited = resolveParaProps(doc, bare, where).indent;
+        return left === ((inherited && inherited.left) || 0) ? bare : patchParaProps(props, { indent: { left } });
+      });
+      return range;
+    },
+    options,
+    true,
+  );
 }

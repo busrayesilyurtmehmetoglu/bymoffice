@@ -465,14 +465,15 @@ test.describe('tracked changes: turning tracking on and off', () => {
     await settled(page);
     expect(await revisions(page)).toEqual([['insert', 'Me', ' new']]);
     // What cannot be tracked is not offered while tracking is on.
-    await expect(button(page, 'alignCenter')).toBeDisabled();
+    await expect(button(page, 'insertTable')).toBeDisabled();
+    await expect(button(page, 'alignCenter')).toBeEnabled();
     expect(await savedPart(page, 'word/settings.xml')).toContain('<w:zoom w:percent="100"/><w:trackRevisions/><w:defaultTabStop w:val="708"/>');
 
     await track.click();
     await settled(page);
     await expect(track).toHaveAttribute('aria-pressed', 'false');
     expect(await lastNotice(page)).toBe('Changes are no longer tracked');
-    await expect(button(page, 'alignCenter')).toBeEnabled();
+    await expect(button(page, 'insertTable')).toBeEnabled();
     await page.keyboard.type(' plain');
     await settled(page);
     expect(await paragraphs(page)).toEqual(['First new plain paragraph.', 'Second one.']);

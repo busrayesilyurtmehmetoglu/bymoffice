@@ -466,7 +466,7 @@ function runGens(ctx: PropsContext, p: RunProps): Gen[] {
       ]),
     );
   }
-  if (p.change) add(localOf(p.change.name), p.change);
+  if (p.change) add(localOf(p.change.name), restatedRecord(ctx, p.change, RUN_KIND));
   return out;
 }
 
@@ -582,7 +582,7 @@ function paraGens(ctx: PropsContext, p: ParaProps): Gen[] {
   if (p.cnfStyle !== undefined) add('cnfStyle', cnfStyleEl(ctx, p.cnfStyle));
   if (p.markProps) add('rPr', runPropsElement(ctx, p.markProps) || wEl(ctx, 'rPr'));
   if (p.section) add('sectPr', sectionPropsElement(ctx, p.section));
-  if (p.change) add(localOf(p.change.name), p.change);
+  if (p.change) add(localOf(p.change.name), restatedRecord(ctx, p.change, PARA_KIND));
   return out;
 }
 
@@ -1063,6 +1063,28 @@ function assemble<P extends Bag>(ctx: PropsContext, kind: Kind<P>, props: P, att
     if (again && serializeElement(again) === serializeElement(el)) return self;
   }
   return el;
+}
+
+/**
+ * A record of changed formatting (<w:rPrChange>, <w:pPrChange>) as it is written. Where colours or fonts are
+ * rewritten for the package (one made without a theme), the properties the record holds are rewritten like the
+ * present ones: rejected, the change gives the colour and the font the text had. Everywhere else the record is
+ * written as it is kept, byte for byte.
+ */
+function restatedRecord<P extends Bag>(ctx: PropsContext, change: XmlElement, kind: Kind<P>): XmlElement {
+  if (!ctx.color && !ctx.fonts) return change;
+  let children: XmlNode[] | undefined;
+  for (let i = 0; i < change.children.length; i++) {
+    const node = change.children[i];
+    if (node.type !== 'element' || kindOf(ctx.reader, node.name) !== kind.local) continue;
+    const stated = assemble(ctx, kind, kind.read(ctx.reader, node), undefined, kind.local, true) || wEl(ctx, kind.local);
+    if (serializeElement(stated) !== serializeElement(node)) {
+      children = change.children.slice();
+      children[i] = stated;
+    }
+    break;
+  }
+  return children ? { ...change, children } : change;
 }
 
 const RUN_KIND: Kind<RunProps> = { local: 'rPr', order: RPR_ORDER, gens: runGens, read: readRunProps };

@@ -224,15 +224,15 @@ test.describe('tracked changes', () => {
     await mountEdit(page, await sample(p('First paragraph.') + p('Second one.')));
     const before = await savedXml(page);
     await select(page, [0], 0, 5);
-    await page.keyboard.press(`${await commandKey(page)}+b`);
+    // A table cannot be tracked yet. (Formatting can: e2e/doc-track-format.spec.ts.)
+    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(false);
     await settled(page);
     expect(await notices(page)).toEqual([{ message: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed', kind: 'info' }]);
     expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
     expect(await savedXml(page)).toBe(before);
-    for (const command of ['alignCenter', 'bulletList', 'insertTable', 'insertPicture', 'insertLink']) await expect(toolbarButton(page, command)).toBeDisabled();
-    await expect(toolbarButton(page, 'bold')).toBeEnabled();
-    // From the program too.
-    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(false);
+    for (const command of ['insertTable', 'insertPicture', 'insertLink']) await expect(toolbarButton(page, command)).toBeDisabled();
+    for (const command of ['bold', 'alignCenter', 'bulletList']) await expect(toolbarButton(page, command)).toBeEnabled();
+    expect(await page.evaluate(() => (window as any).__view.insertTable(1, 1))).toBe(false);
     expect((await notices(page)).length).toBe(2);
     expect(await paragraphs(page)).toEqual(['First paragraph.', 'Second one.']);
   });
@@ -240,7 +240,7 @@ test.describe('tracked changes', () => {
   test('in Turkish the refusal is said in Turkish', async ({ page }) => {
     await mountEdit(page, await sample(p('Birinci paragraf.')), { locale: 'tr' });
     await select(page, [0], 0, 7);
-    await page.keyboard.press(`${await commandKey(page)}+b`);
+    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(false);
     await settled(page);
     expect((await notices(page))[0].message).toBe('Bu belgede değişiklikler izleniyor ve bu tür değişiklik henüz izlenemiyor; hiçbir şey değiştirilmedi');
   });
