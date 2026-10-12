@@ -192,7 +192,7 @@ test('the cached values of a workbook are a budget its charts share: a chart tha
   const none = { points: 0 };
   assert.throws(() => parseChart(root, OFFICE_THEME, none), ChartBudgetError);
   // A chart that is none takes nothing either, and without a budget nothing is counted.
-  const radar = parseXml(chartXml({ plot: group('radarChart', '', three(0)) + catAx() + valAx() })).root;
+  const radar = parseXml(chartXml({ plot: group('surfaceChart', '', three(0)) + catAx() + valAx() })).root;
   const kept = { points: 50 };
   assert.equal(parseChart(radar, OFFICE_THEME, kept), undefined);
   assert.equal(kept.points, 50);
@@ -252,7 +252,7 @@ test('a chart that cannot be read is said in the warnings of its sheet; a chart 
   const dtd = `<?xml version="1.0"?><!DOCTYPE c:chartSpace [<!ENTITY a "aaaa">]>${plain.slice(plain.indexOf('<c:chartSpace'))}`;
   const cut = plain.slice(0, plain.length - 40);
   const junk = new Uint8Array([0xff, 0xfe, 0x00, 0x01, 0x02]);
-  const radar = chartXml({ plot: group('radarChart', '', three(0)) + catAx() + valAx() });
+  const radar = chartXml({ plot: group('surfaceChart', '', three(0)) + catAx() + valAx() });
   const charts = [plain, dtd, cut, junk, radar];
   const frames = charts.map((_chart, i) => twoCell([3, i * 5], [6, i * 5 + 4], chartFrameOf(`rIdC${i + 1}`))).join('');
   const workbook = await (await open(await chartWorkbook({ sheet: '<sheetData/>', drawing: frames, charts, chartSheet: junk }))).workbook();

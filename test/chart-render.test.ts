@@ -281,6 +281,61 @@ test('the title of the value axis is turned, around its own place, and the state
   assert.equal(ctx.saves, ctx.restores);
 });
 
+test('lines of their own (error bars, drop lines) are painted piece by piece, not joined', () => {
+  const bars = '<c:errBars><c:errBarType val="both"/><c:errValType val="fixedVal"/><c:noEndCap val="1"/><c:val val="5"/></c:errBars>';
+  const layout = layoutOf(chartXml({ plot: group('lineChart', '<c:grouping val="standard"/>', ser(0, { cat: CATS, val: numLit([10, 20, 30]), props: bars }), '<c:dropLines/>') + catAx() + valAx() }));
+  const error = layout.items.filter((item) => item.kind === 'path' && item.role === 'error')[0] as Extract<ChartLayout['items'][number], { kind: 'path' }>;
+  assert.equal(error.points.length, 12);
+  const ctx = context();
+  paintChartLayout(asCanvas(ctx), layout, 100, 50);
+  const stroke = ctx.strokes.filter((item) => item.style === '#595959' && item.path.length === 6);
+  assert.equal(stroke.length, 2, 'the error bars and the drop lines, three pieces each');
+  for (const one of stroke) assert.deepEqual(one.path.map((step) => step.charAt(0)), ['M', 'L', 'M', 'L', 'M', 'L'], 'every piece starts anew');
+  const painted = ctx.strokes.filter((item) => item.path.join() === [0, 4, 8].map((i) => `M${error.points[i] + 100},${error.points[i + 1] + 50},L${error.points[i + 2] + 100},${error.points[i + 3] + 50}`).join());
+  assert.equal(painted.length, 1, 'from each first point to each second, at the place of the chart');
+});
+
+test('bubbles are filled circles of their radii; a smoothed line is painted as curves through its points', () => {
+  const bubbles = layoutOf(
+    chartXml({
+      plot:
+        group('bubbleChart', '<c:varyColors val="0"/>', `<c:ser><c:idx val="0"/><c:order val="0"/>${spPr(solid('00B050'))}<c:xVal>${numLit([1, 2, 3])}</c:xVal><c:yVal>${numLit([1, 2, 3])}</c:yVal><c:bubbleSize>${numLit([1, 4, 9])}</c:bubbleSize></c:ser>`) +
+        xyAxes(),
+    }),
+  );
+  const circles = bubbles.items.filter((item) => item.kind === 'circles')[0] as Extract<ChartLayout['items'][number], { kind: 'circles' }>;
+  const ctx = context();
+  paintChartLayout(asCanvas(ctx), bubbles, 100, 50);
+  const fill = ctx.fills.filter((item) => item.fill === '#00B050')[0];
+  assert.ok(fill, 'filled in the colour of the series');
+  assert.deepEqual(
+    fill.arcs.map((arc) => [arc.x, arc.y, arc.radius, arc.start, arc.end]),
+    [0, 3, 6].map((i) => [circles.points[i] + 100, circles.points[i + 1] + 50, circles.points[i + 2], 0, Math.PI * 2]),
+    'a full circle for each bubble, at its place, of its radius',
+  );
+
+  const smooth = layoutOf(chartXml({ plot: group('lineChart', '<c:grouping val="standard"/>', ser(0, { cat: strLit(['a', 'b', 'c', 'd']), val: numLit([10, 30, 20, 40]), props: spPr(`<a:ln w="28575">${solid('C00000')}</a:ln>`), tail: '<c:smooth val="1"/>' })) + catAx() + valAx() }));
+  const curve = smooth.items.filter((item) => item.kind === 'path' && item.role === 'line')[0] as Extract<ChartLayout['items'][number], { kind: 'path' }>;
+  assert.equal(curve.points.length, 2 + 3 * 6);
+  const paper = context();
+  paintChartLayout(asCanvas(paper), smooth, 0, 0);
+  const line = paper.strokes.filter((item) => item.style === '#C00000')[0];
+  assert.deepEqual(line.path, [`M${curve.points[0]},${curve.points[1]}`, 'C', 'C', 'C'], 'the first point, then a curve to each further one: three curves for four points');
+});
+
+test('turned category labels are painted turned, and what follows them upright again', () => {
+  const labels = ['Uzun kategori adı 1', 'Uzun kategori adı 2', 'Uzun kategori adı 3', 'Uzun kategori adı 4', 'Uzun kategori adı 5'];
+  const layout = layoutOf(chartXml({ plot: group('barChart', '<c:barDir val="col"/><c:grouping val="clustered"/>', ser(0, { tx: '<c:v>Seri</c:v>', cat: strLit(labels), val: numLit([1, 2, 3, 4, 5]), props: '<c:dLbls><c:numFmt formatCode="0.0" sourceLinked="0"/><c:showVal val="1"/></c:dLbls>' })) + catAx() + valAx(), tail: legend('b') }), 480, 320);
+  assert.ok(layout.items.some((item) => item.kind === 'text' && item.angle === -45), 'the labels are laid out turned');
+  const ctx = context();
+  paintChartLayout(asCanvas(ctx), layout, 10, 20);
+  assert.deepEqual(ctx.texts.filter((item) => item.rotated).map((item) => item.text), labels, 'the five labels are painted turned');
+  assert.ok(ctx.texts.filter((item) => !item.rotated).length >= 4, 'the labels of the values and the legend are upright');
+  assert.deepEqual([ctx.texts[ctx.texts.length - 1].text, ctx.texts[ctx.texts.length - 1].rotated], ['5.0', false], 'what is painted after them (the data labels) is upright again');
+  assert.equal(ctx.saves, ctx.restores, 'every state that is saved is given back');
+  assert.equal(ctx.saves, 1 + labels.length, 'one for the chart and one for each turned label');
+});
+
 test('a canvas that fails: the error is passed on and the state of the context is as it was', () => {
   const layout = layoutOf(columns([1, 2, 3]));
   const ctx = context();

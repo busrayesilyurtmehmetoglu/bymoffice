@@ -172,7 +172,7 @@ export function paperSize(page: PageSettings | undefined, defaultPaper: number =
 }
 
 /** The margins in paper px; margins that leave no room for cells are replaced by the defaults. */
-function marginsOf(stated: PageMargins | undefined, paper: { width: number; height: number }): PageMargins {
+export function marginsOf(stated: PageMargins | undefined, paper: { width: number; height: number }): PageMargins {
   const px = (source: PageMargins): PageMargins => ({
     left: source.left * PX_PER_INCH,
     right: source.right * PX_PER_INCH,

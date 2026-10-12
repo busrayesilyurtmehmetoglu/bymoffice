@@ -1670,6 +1670,32 @@ function openRoot(sc: XmlScanner): void {
   }
 }
 
+/**
+ * How a chart sheet is printed: the margins, the paper and the header and footer its part states.
+ * Nothing else of the part is read: a chart sheet holds no cells, and stays in the package as it is.
+ * Undefined for a part that states none of them.
+ */
+export function parseChartSheetSetup(bytes: Uint8Array): SheetPageSetup | undefined {
+  const sc = new XmlScanner(bytes);
+  openRoot(sc);
+  const setup: SheetPageSetup = {};
+  if (!sc.selfClosing) {
+    while (sc.next()) {
+      if (sc.kind === 'close') break;
+      if (sc.kind !== 'open') continue;
+      if (sc.local === 'pageMargins' && !setup.margins) {
+        setup.margins = parsePageMargins(sc);
+        sc.skip();
+      } else if (sc.local === 'pageSetup' && !setup.page) {
+        setup.page = parsePageSettings(sc);
+        sc.skip();
+      } else if (sc.local === 'headerFooter' && !setup.headerFooter) setup.headerFooter = parseHeaderFooter(sc);
+      else sc.skip();
+    }
+  }
+  return Object.keys(setup).length > 0 ? setup : undefined;
+}
+
 /** Fills `sheet` (created with createSheet) from a worksheet part. */
 export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[], sheet: Sheet): void {
   const sc = new XmlScanner(bytes);

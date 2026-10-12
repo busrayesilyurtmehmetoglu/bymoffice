@@ -12,7 +12,7 @@ import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
 import { readSheetDrawings, type ChartReading } from './drawings';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
-import { parseWorksheet } from './worksheet';
+import { parseChartSheetSetup, parseWorksheet } from './worksheet';
 
 // Relationship types end the same way in the transitional and the strict namespace.
 const SHEET_KINDS: [suffix: string, kind: SheetKind][] = [
@@ -163,6 +163,13 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
         if (warnings.length > 0) sheet.warnings = warnings;
       } catch (error) {
         // The sheet stays as it was before charts were read: kept, not shown.
+      }
+      // How the sheet is printed. A part that cannot be read prints the way a new chart sheet does.
+      try {
+        const setup = parseChartSheetSetup(await pkg.readPart(rel.part));
+        if (setup) sheet.pageSetup = setup;
+      } catch (error) {
+        // Nothing of the part is needed to show the sheet.
       }
     }
     sheets.push(sheet);

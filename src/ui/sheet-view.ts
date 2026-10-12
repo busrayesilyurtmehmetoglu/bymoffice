@@ -1362,9 +1362,10 @@ export class WorkbookView {
 
   /**
    * Prints the sheet that is shown, or with `sheets: 'all'` every visible
-   * worksheet: lays the cells out on pages by the page setup of each sheet
-   * (paper, margins, scale or fit to pages, print area and titles, page
-   * breaks, header and footer), paints every page at the resolution of a
+   * worksheet and chart sheet: lays the cells out on pages by the page setup
+   * of each sheet (paper, margins, scale or fit to pages, print area and
+   * titles, page breaks, header and footer), gives a chart sheet one page
+   * that its chart fills, paints every page at the resolution of a
    * printer, and opens the print dialog of the window the view is in. The
    * pages are prepared one per turn, so the page stays responsive; when the
    * workbook is changed meanwhile, they are prepared anew. What belongs to
@@ -1546,7 +1547,9 @@ export class WorkbookView {
             pixelWidth: planned.pixelWidth,
             locale: this.locale,
             conditional,
-            drawings: layerOf(sheet),
+            // A chart sheet is its chart: it has no cells and no layer of drawings over them.
+            drawings: entry.chart ? undefined : layerOf(sheet),
+            charts: entry.chart ? this.chartRenderer() : undefined,
             fileName: options.fileName,
             now,
           });

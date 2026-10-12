@@ -43,7 +43,29 @@ export { ZipArchive, type ZipEntry } from './zip';
 export * from './xml';
 export * from './model/sheet/types';
 export * from './model/sheet/color';
-export type { Chart, ChartAxis, ChartCache, ChartData, ChartGroup, ChartKind, ChartLegend, ChartLine, ChartMarker, ChartPoint, ChartSeries, ChartShape, ChartTextStyle, ChartTitle } from './model/sheet/chart';
+export type {
+  Chart,
+  ChartAxis,
+  ChartCache,
+  ChartData,
+  ChartDataLabels,
+  ChartErrorBars,
+  ChartGroup,
+  ChartKind,
+  ChartLabelPosition,
+  ChartLegend,
+  ChartLine,
+  ChartManualLayout,
+  ChartMarker,
+  ChartPoint,
+  ChartPointLabel,
+  ChartSeries,
+  ChartShape,
+  ChartTextStyle,
+  ChartTitle,
+  ChartTrendline,
+  ChartUpDownBars,
+} from './model/sheet/chart';
 export { readXlsx } from './formats/xlsx/workbook';
 export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
 export { readDocx } from './formats/docx/document';

@@ -22,8 +22,11 @@ export const MAX_WORKBOOK_CHART_POINTS = 4000000;
 export const MAX_CHART_AREAS = 64;
 /** Axes read from one chart. */
 export const MAX_CHART_AXES = 16;
+/** Trend lines read from one series. */
+export const MAX_CHART_TRENDLINES = 8;
 
-export type ChartKind = 'bar' | 'line' | 'pie' | 'doughnut' | 'area' | 'scatter';
+/** "stock" is a line chart whose series are the open, high, low and close of each category, in that order. */
+export type ChartKind = 'bar' | 'line' | 'pie' | 'doughnut' | 'area' | 'scatter' | 'radar' | 'bubble' | 'stock';
 
 /** How the text of a part of a chart is set; what is missing is the default of the place it stands in. */
 export interface ChartTextStyle {
@@ -70,8 +73,10 @@ export interface ChartData {
   kind: 'num' | 'str';
   /** The reference as the file has it (c:f), without a leading "="; undefined for literal data. */
   ref?: string;
-  /** The reference names several levels of categories (c:multiLvlStrRef); the level next to the axis is the one shown. */
+  /** The reference names several levels of categories (c:multiLvlStrRef); `cache` is the level next to the axis. */
   multiLevel?: boolean;
+  /** The further levels of the cache of such a reference, from the axis outwards; the first of them is shown as a second row. */
+  levels?: ChartCache[];
   /** The values of the file, only for the points the file has any for. See chartCached(). */
   cache: ChartCache;
   /** How many points the file says there are (c:ptCount); at least one more than the last index of `cache`. */
@@ -124,6 +129,85 @@ export function chartCacheList(data: ChartData | undefined, limit = 10000): (num
   return out;
 }
 
+/** Where a data label stands beside its point (c:dLblPos). */
+export type ChartLabelPosition = 'outEnd' | 'inEnd' | 'ctr' | 'inBase' | 'bestFit' | 't' | 'b' | 'l' | 'r';
+
+/**
+ * What data labels show and how (c:dLbls of a chart type or of a series, c:dLbl of a point).
+ * What a level leaves open is what the level above it says: point, series, chart type.
+ */
+export interface ChartDataLabels {
+  /** The labels are taken away (c:delete). */
+  deleted?: boolean;
+  showValue?: boolean;
+  showCategory?: boolean;
+  showSeries?: boolean;
+  /** The share of the point in its series, pies and doughnuts only. */
+  showPercent?: boolean;
+  showBubbleSize?: boolean;
+  /** Stated, never drawn. */
+  showLegendKey?: boolean;
+  /** What stands between the parts of a label. */
+  separator?: string;
+  formatCode?: string;
+  /** The numbers are formatted as the cells of the series are. */
+  sourceLinked?: boolean;
+  position?: ChartLabelPosition;
+  style?: ChartTextStyle;
+  /** A label of a point with a text of its own (c:tx): the plain text of it. */
+  text?: string;
+}
+
+/** The label of one point (c:dLbl). */
+export interface ChartPointLabel extends ChartDataLabels {
+  index: number;
+}
+
+/** A trend line of a series (c:trendline). */
+export interface ChartTrendline {
+  type: 'linear' | 'exp' | 'log' | 'poly' | 'power' | 'movingAvg';
+  /** Polynomial: the degree, 2..6. */
+  order?: number;
+  /** Moving average: how many points are averaged, 2 and up. */
+  period?: number;
+  /** How far the line goes on beyond the last point and before the first, in units of the horizontal axis. */
+  forward?: number;
+  backward?: number;
+  name?: string;
+  line?: ChartLine;
+}
+
+/** Error bars of a series (c:errBars). */
+export interface ChartErrorBars {
+  /** "y": along the values; "x": along the horizontal values of a scatter or bubble series. */
+  direction: 'x' | 'y';
+  type: 'both' | 'plus' | 'minus';
+  valueType: 'fixedVal' | 'percentage' | 'stdDev' | 'stdErr' | 'cust';
+  /** The amount (fixedVal), the per cent (percentage), or the number of deviations (stdDev). */
+  value?: number;
+  /** Amounts of each point for "cust". */
+  plus?: ChartData;
+  minus?: ChartData;
+  noEndCap?: boolean;
+  line?: ChartLine;
+}
+
+/** A place set by hand (c:manualLayout): shares of the frame of the chart. Taken as stated; what is no place is not applied. */
+export interface ChartManualLayout {
+  /** Plot area only: "inner" is the area of the series, "outer" includes the labels of the axes. */
+  target?: 'inner' | 'outer';
+  /** "edge": from the corner of the frame; "factor": moved from where the part would stand by itself. */
+  xMode?: 'edge' | 'factor';
+  yMode?: 'edge' | 'factor';
+  /** "edge": `w` (`h`) is where the right (bottom) edge stands, not a width (height). Missing: a size. */
+  wMode?: 'edge';
+  hMode?: 'edge';
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+}
+
 export interface ChartMarker {
   /** "none", "auto", "circle", "square", "diamond", "triangle", "x", "plus", "star", "dash", "dot" ("picture" reads as "square"). */
   symbol: string;
@@ -138,6 +222,8 @@ export interface ChartPoint {
   index: number;
   shape?: ChartShape;
   marker?: ChartMarker;
+  /** A slice of a pie: how far it is pulled out, as a percentage of the radius. */
+  explosion?: number;
 }
 
 export interface ChartSeries {
@@ -156,10 +242,27 @@ export interface ChartSeries {
   marker?: ChartMarker;
   points?: ChartPoint[];
   invertIfNegative?: boolean;
-  /** The file asks for a curve through the points; a straight line is drawn. */
+  /** The file asks for a curve through the points. */
   smooth?: boolean;
-  /** The series has data labels (c:dLbls); they are not drawn. */
-  dataLabels?: boolean;
+  /** The data labels of the series (c:dLbls) and of single points of it (c:dLbl). */
+  dataLabels?: ChartDataLabels;
+  pointLabels?: ChartPointLabel[];
+  trendlines?: ChartTrendline[];
+  /** At most one along the values and one along the horizontal values. */
+  errorBars?: ChartErrorBars[];
+  /** Pie: how far every slice is pulled out, as a percentage of the radius. */
+  explosion?: number;
+  /** Bubble chart: the sizes of the bubbles (c:bubbleSize). */
+  bubbleSizes?: ChartData;
+}
+
+/** The boxes between the first and the last series of a line or stock chart (c:upDownBars). */
+export interface ChartUpDownBars {
+  /** Space between the boxes as a percentage of their width (0..500). */
+  gapWidth?: number;
+  /** The look of a box whose last series lies above its first, and of one where it lies below. */
+  up?: ChartShape;
+  down?: ChartShape;
 }
 
 /** One chart type of a plot area with its series. A combination chart has several. */
@@ -185,8 +288,28 @@ export interface ChartGroup {
   markers?: boolean;
   /** Scatter chart: "lineMarker", "line", "marker", "smooth", "smoothMarker", "none". */
   scatterStyle?: string;
-  /** The group has data labels (c:dLbls); they are not drawn. */
-  dataLabels?: boolean;
+  /** The data labels of every series of the type that states none of its own (c:dLbls). */
+  dataLabels?: ChartDataLabels;
+  /** Radar chart: "standard" (lines), "marker" (lines with markers), "filled". */
+  radarStyle?: 'standard' | 'marker' | 'filled';
+  /** Bubble chart: the size of the largest bubble as a percentage of the default (0..300). */
+  bubbleScale?: number;
+  /** Bubble chart: the size of a bubble is its area ("area", the default) or its width ("w"). */
+  sizeRepresents?: 'area' | 'w';
+  /** Bubble chart: bubbles of a negative size are drawn (by the size without its sign). */
+  showNegBubbles?: boolean;
+  /** Lines from each point down to the category axis (line and area charts). */
+  dropLines?: ChartLine;
+  /** Lines from the highest to the lowest series at each category (line and stock charts). */
+  hiLowLines?: ChartLine;
+  upDownBars?: ChartUpDownBars;
+  /**
+   * The file has a pie with a second plot (c:ofPieChart): only the pie is drawn, the points of the
+   * second plot as one slice of it. `split` says which points those are: the last `position` ones
+   * ("pos", and "auto" without a position: the last third), those below a value ("val") or a per
+   * cent ("percent"), or the ones listed ("cust").
+   */
+  ofPie?: { split: 'auto' | 'pos' | 'val' | 'percent' | 'cust'; position?: number; points?: number[] };
   /** Ids of the axes the group is drawn against. */
   axisIds: number[];
   series: ChartSeries[];
@@ -198,14 +321,18 @@ export interface ChartTitle {
   /** The cell the title is read from (c:strRef), as the file has it; `text` is then what the file cached. */
   ref?: string;
   style?: ChartTextStyle;
+  layout?: ChartManualLayout;
 }
 
 export interface ChartAxis {
   id: number;
-  /** "cat" also stands for a date axis and a series axis: they are drawn as categories. */
+  /** "cat" also stands for a date axis and a series axis. */
   kind: 'cat' | 'val';
-  /** The file has a date axis (c:dateAx). */
+  /** The file has a date axis (c:dateAx): categories that are dates stand where their dates lie, not side by side. */
   date?: boolean;
+  /** Date axis: the unit a category is as wide as, and the unit `majorUnit` counts in. */
+  baseTimeUnit?: 'days' | 'months' | 'years';
+  majorTimeUnit?: 'days' | 'months' | 'years';
   deleted?: boolean;
   /** Side of the plot area the axis stands on. */
   position: 'b' | 'l' | 't' | 'r';
@@ -214,7 +341,7 @@ export interface ChartAxis {
   /** c:orientation maxMin: the axis runs the other way. */
   reversed?: boolean;
   majorUnit?: number;
-  /** c:logBase: stated but not drawn (the axis is linear). */
+  /** c:logBase (2..1000): the axis counts in powers of it. */
   logBase?: number;
   formatCode?: string;
   /** The numbers are formatted as the cells of the first series are. */
@@ -224,8 +351,17 @@ export interface ChartAxis {
   /** "nextTo", "low", "high", "none". */
   tickLabels: 'nextTo' | 'low' | 'high' | 'none';
   title?: ChartTitle;
-  /** Where the other axis crosses this one. */
+  /**
+   * Where this axis crosses the one it names (`crossAxis`): at its zero or first category, at its minimum, or at
+   * its maximum. A value axis that crosses at the maximum stands at the last category (the far side of the plot
+   * area); a category axis that crosses at the maximum stands at the largest value.
+   */
   crosses?: 'autoZero' | 'min' | 'max';
+  /**
+   * The place on the other axis this one crosses at, in place of `crosses`. Of a category axis: the value the
+   * series stand on. Of a value axis: a category number, which only moves the axis when it lies beyond the last
+   * category (to the far side); between the categories the axis is drawn at the start.
+   */
   crossesAt?: number;
   /** Id of the axis this one crosses. */
   crossAxis?: number;
@@ -233,6 +369,8 @@ export interface ChartAxis {
   crossBetween?: 'between' | 'midCat';
   line?: ChartLine;
   labelStyle?: ChartTextStyle;
+  /** How the labels are turned, in degrees clockwise (-90..90), when the file says so (a:bodyPr rot of c:txPr). */
+  labelRotation?: number;
 }
 
 export interface ChartLegend {
@@ -240,6 +378,7 @@ export interface ChartLegend {
   /** Indexes of entries that are left out (c:legendEntry with c:delete). */
   deleted?: number[];
   style?: ChartTextStyle;
+  layout?: ChartManualLayout;
 }
 
 export interface Chart {
@@ -260,6 +399,8 @@ export interface Chart {
   /** Fill and outline of the whole chart and of the area the series are drawn in. */
   area?: ChartShape;
   plotArea?: ChartShape;
+  /** Where the plot area stands when the file sets it by hand. */
+  plotLayout?: ChartManualLayout;
   /** Text of the chart where a part states none of its own. */
   textStyle?: ChartTextStyle;
   /** The six accent colours of the theme ("#RRGGBB"): the colours series get that state none. */

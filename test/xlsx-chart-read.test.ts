@@ -96,7 +96,7 @@ test('every chart type that is drawn is read as its kind; the 3-D forms as their
 });
 
 test('a chart with a type that is not drawn is no chart of the model, whatever else it holds', () => {
-  for (const name of ['radarChart', 'bubbleChart', 'stockChart', 'surfaceChart', 'surface3DChart', 'ofPieChart']) {
+  for (const name of ['surfaceChart', 'surface3DChart', 'contourChart']) {
     assert.equal(readChart(chartXml({ plot: group(name, '', simple()) + catAx() + valAx() })), undefined, name);
     assert.equal(readChart(chartXml({ plot: group('barChart', '<c:barDir val="col"/>', simple()) + group(name, '', simple(1)) + catAx() + valAx() })), undefined, `${name} beside a bar chart`);
   }
@@ -208,19 +208,18 @@ test('markers, points with a look of their own, invert if negative, smooth, data
   );
   const line = chart.groups[0];
   assert.equal(line.markers, true);
-  assert.equal(line.dataLabels, true);
+  assert.deepEqual(line.dataLabels, { showPercent: true });
   const [a, b, c] = line.series;
   assert.deepEqual(a.marker, { symbol: 'diamond', size: 9, fill: '#010203' });
   assert.deepEqual(a.points, [{ index: 1, shape: { fill: '#AABBCC' } }]);
-  assert.equal(a.dataLabels, true);
+  assert.deepEqual(a.dataLabels, { showValue: true });
   assert.deepEqual(b.marker, { symbol: 'none' });
   assert.equal(b.invertIfNegative, true);
   assert.equal(b.smooth, true);
-  assert.equal(b.dataLabels, undefined, 'deleted labels are none');
+  assert.deepEqual(b.dataLabels, { deleted: true }, 'deleted labels say so');
   assert.deepEqual(c.marker, { symbol: 'auto', size: 72 }, 'an unknown symbol is the chart\'s own; a size is kept within bounds');
   assert.equal(c.smooth, undefined);
-  assert.ok(chart.notes.some((note) => /Data labels are not drawn \(2 /.test(note)), 'the labels are counted in a note');
-  assert.ok(chart.notes.some((note) => /Smoothed lines are drawn straight/.test(note)), 'smoothing is noted');
+  assert.ok(!chart.notes.some((note) => /Data labels|Smoothed/.test(note)), 'labels and smoothed lines are drawn: nothing to note');
 });
 
 test('pie and doughnut: first slice angle, hole size, colours that vary by default', () => {
@@ -323,7 +322,7 @@ test('the legend: position, entries left out; plotVisOnly and what stands for em
   assert.equal(must(chartXml({ plot: group('pieChart', '', simple()), tail: '<c:dispBlanksAs/>' })).blanks, 'zero', 'the element without a value: the default of the schema');
 });
 
-test('several chart types in one plot area are all read; a secondary axis and a manual layout are noted', () => {
+test('several chart types in one plot area are all read, with the axes of a second scale and a place set by hand', () => {
   const second = '<c:lineChart><c:grouping val="standard"/>' + simple(1) + '<c:axId val="333"/><c:axId val="444"/></c:lineChart>';
   const chart = must(
     chartXml({
@@ -338,8 +337,9 @@ test('several chart types in one plot area are all read; a secondary axis and a 
   );
   assert.deepEqual(chart.groups.map((item) => item.kind), ['bar', 'line']);
   assert.equal(chart.axes.length, 4);
-  assert.ok(chart.notes.some((note) => /secondary axis/.test(note)), 'the secondary axis is noted');
-  assert.ok(chart.notes.some((note) => /set by hand/.test(note)), 'the manual layout is noted');
+  assert.deepEqual(chart.groups[1].axisIds, [333, 444], 'the second chart type names its own axes');
+  assert.deepEqual(chart.legend?.layout, { x: 0.1 }, 'the place of the legend as the file states it');
+  assert.ok(!chart.notes.some((note) => /secondary axis|set by hand/.test(note)), 'neither is noted as not applied');
 });
 
 test('series are put in their order; an index that is missing is the place in the file', () => {
@@ -406,7 +406,7 @@ test('the frame of a chart in a drawing is a chart of the model, with the anchor
 });
 
 test('a chart that cannot be read is a placeholder; the other objects and the sheet are still there', async () => {
-  const radar = chartXml({ plot: group('radarChart', '', simple()) + catAx() + valAx() });
+  const radar = chartXml({ plot: group('surfaceChart', '', simple()) + catAx() + valAx() });
   const dtd = `<?xml version="1.0"?><!DOCTYPE c:chartSpace [<!ENTITY a "aaaa">]>${plain.slice(plain.indexOf('<c:chartSpace'))}`;
   const cut = plain.slice(0, plain.length - 40);
   const junk = new Uint8Array([0xff, 0xfe, 0x00, 0x01, 0x02]);
@@ -432,7 +432,7 @@ test('a chart sheet has the drawing that holds its chart; one whose chart is not
   assert.equal(sheets[1][0].object.type, 'chart');
   assert.equal(sheets[1][0].anchor.kind, 'absolute');
 
-  const radar = chartXml({ plot: group('radarChart', '', simple()) + catAx() + valAx() });
+  const radar = chartXml({ plot: group('surfaceChart', '', simple()) + catAx() + valAx() });
   const other = await drawingsOf(await chartWorkbook({ sheet: cells, chartSheet: radar }));
   assert.equal(other[1][0].object.type, 'placeholder');
 

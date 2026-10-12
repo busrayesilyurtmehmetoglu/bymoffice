@@ -65,7 +65,7 @@
         </div>
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
-          <button id="sample-chart" title="Verisi, üç grafiği (sütun, çizgi, pasta) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir.">Grafikli örnek xlsx üret ve aç</button>
+          <button id="sample-chart" title="Verisi, altı grafiği (sütun, çizgi, pasta; radar, ikincil eksenli ve veri etiketli birleşik, balon) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir.">Grafikli örnek xlsx üret ve aç</button>
           <button id="blank-docx">Boş docx oluştur ve aç</button>
           <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
           <button id="clear">Listeyi temizle</button>
@@ -603,8 +603,9 @@
         await handle([{ name: 'ornek.xlsx', data: await zip.write() }]);
       });
 
-      // A synthetic workbook with charts: data in A1:C6, a column chart, a line chart and a pie below it, and a chart
-      // sheet. The series refer to the cells, so that editing a cell changes the charts.
+      // A synthetic workbook with charts: data in A1:C6, a column chart, a line chart and a pie below it, under those a
+      // radar chart, columns with data labels and a trend line beside a line on a second scale, and a bubble chart;
+      // and a chart sheet. The series refer to the cells, so that editing a cell changes the charts.
       $('sample-chart').addEventListener('click', async () => {
         const utf8 = (text) => new TextEncoder().encode(text);
         const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
@@ -640,6 +641,24 @@
           chart('Aylara göre', `<c:lineChart><c:grouping val="standard"/>${series(0, 'B')}${series(1, 'C')}<c:marker val="1"/>${ids}</c:lineChart>${axes}`, 'b'),
           chart('Çay', `<c:pieChart><c:varyColors val="1"/>${series(0, 'B')}<c:firstSliceAng val="0"/></c:pieChart>`, 'r'),
           chart('Yığılmış', `<c:barChart><c:barDir val="bar"/><c:grouping val="stacked"/>${series(0, 'B')}${series(1, 'C')}<c:overlap val="100"/>${ids}</c:barChart>${axes}`, 'r'),
+          chart('Radar', `<c:radarChart><c:radarStyle val="marker"/>${series(0, 'B')}${series(1, 'C')}${ids}</c:radarChart>${axes}`, 'b'),
+          chart(
+            'İki ölçek',
+            `<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/>${series(0, 'B').replace('<c:cat>', '<c:dLbls><c:showLegendKey val="0"/><c:showVal val="1"/><c:showCatName val="0"/><c:showSerName val="0"/></c:dLbls><c:trendline><c:trendlineType val="linear"/></c:trendline><c:cat>')}<c:gapWidth val="150"/>${ids}</c:barChart>` +
+              `<c:lineChart><c:grouping val="standard"/>${series(1, 'C')}<c:marker val="1"/><c:axId val="3"/><c:axId val="4"/></c:lineChart>${axes}` +
+              '<c:catAx><c:axId val="3"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="1"/><c:axPos val="b"/><c:crossAx val="4"/></c:catAx>' +
+              '<c:valAx><c:axId val="4"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="r"/><c:crossAx val="3"/><c:crosses val="max"/></c:valAx>',
+            'b',
+          ),
+          chart(
+            'Balon',
+            '<c:bubbleChart><c:varyColors val="0"/><c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:strRef><c:f>Veri!$B$1</c:f></c:strRef></c:tx>' +
+              '<c:xVal><c:numRef><c:f>Veri!$B$2:$B$6</c:f></c:numRef></c:xVal><c:yVal><c:numRef><c:f>Veri!$C$2:$C$6</c:f></c:numRef></c:yVal><c:bubbleSize><c:numRef><c:f>Veri!$C$2:$C$6</c:f></c:numRef></c:bubbleSize></c:ser>' +
+              `<c:bubbleScale val="100"/>${ids}</c:bubbleChart>` +
+              '<c:valAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="2"/></c:valAx>' +
+              '<c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:crossAx val="1"/></c:valAx>',
+            'b',
+          ),
         ];
         const frame = (rel) =>
           `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Grafik"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>` +
@@ -670,8 +689,9 @@
         zip.set('xl/_rels/workbook.xml.rels', utf8(rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'chartsheet', 'chartsheets/sheet2.xml']])));
         zip.set('xl/worksheets/sheet1.xml', utf8(`${head}<worksheet xmlns="${MAIN}" xmlns:r="${REL}"><sheetData>${rows}</sheetData><drawing r:id="rId1"/></worksheet>`));
         zip.set('xl/worksheets/_rels/sheet1.xml.rels', utf8(rels([['rId1', 'drawing', '../drawings/drawing1.xml']])));
-        zip.set('xl/drawings/drawing1.xml', utf8(drawing(anchor(0, 7, 'rId1') + anchor(5, 7, 'rId2') + anchor(10, 7, 'rId3'))));
-        zip.set('xl/drawings/_rels/drawing1.xml.rels', utf8(rels([1, 2, 3].map((n) => [`rId${n}`, 'chart', `../charts/chart${n}.xml`]))));
+        // The fourth chart is that of the chart sheet.
+        zip.set('xl/drawings/drawing1.xml', utf8(drawing(anchor(0, 7, 'rId1') + anchor(5, 7, 'rId2') + anchor(10, 7, 'rId3') + anchor(0, 21, 'rId5') + anchor(5, 21, 'rId6') + anchor(10, 21, 'rId7'))));
+        zip.set('xl/drawings/_rels/drawing1.xml.rels', utf8(rels([1, 2, 3, 5, 6, 7].map((n) => [`rId${n}`, 'chart', `../charts/chart${n}.xml`]))));
         zip.set('xl/chartsheets/sheet2.xml', utf8(`${head}<chartsheet xmlns="${MAIN}" xmlns:r="${REL}"><sheetPr/><sheetViews><sheetView workbookViewId="0"/></sheetViews><drawing r:id="rId1"/></chartsheet>`));
         zip.set('xl/chartsheets/_rels/sheet2.xml.rels', utf8(rels([['rId1', 'drawing', '../drawings/drawing2.xml']])));
         zip.set('xl/drawings/drawing2.xml', utf8(drawing(`<xdr:absoluteAnchor><xdr:pos x="0" y="0"/><xdr:ext cx="9300000" cy="6070000"/>${frame('rId1')}<xdr:clientData/></xdr:absoluteAnchor>`)));

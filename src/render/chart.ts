@@ -9,7 +9,7 @@
 // fillText().
 
 import type { FormatLocale } from '../format/locale';
-import { chartValues, layoutChart, type ChartFont, type ChartItem, type ChartLayout, type ChartValues } from '../layout/chart';
+import { chartLayoutWeight as layoutWeight, chartValues, layoutChart, type ChartFont, type ChartItem, type ChartLayout, type ChartValues } from '../layout/chart';
 import type { Chart } from '../model/sheet/chart';
 import type { Font, Workbook } from '../model/sheet/types';
 import { fontsVersion } from './fonts';
@@ -135,8 +135,17 @@ function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: Ch
     const stroke = safeColor(item.stroke);
     if (!fill && !stroke) return;
     ctx.beginPath();
-    ctx.moveTo(points[0], points[1]);
-    for (let i = 2; i + 1 < points.length; i += 2) ctx.lineTo(points[i], points[i + 1]);
+    if (!item.segments) ctx.moveTo(points[0], points[1]);
+    if (item.curve) {
+      // Pieces of a curve: two control points and an end point each.
+      for (let i = 2; i + 5 < points.length; i += 6) ctx.bezierCurveTo(points[i], points[i + 1], points[i + 2], points[i + 3], points[i + 4], points[i + 5]);
+    } else if (item.segments) {
+      // Lines of their own: from every first point to every second.
+      for (let i = 0; i + 3 < points.length; i += 4) {
+        ctx.moveTo(points[i], points[i + 1]);
+        ctx.lineTo(points[i + 2], points[i + 3]);
+      }
+    } else for (let i = 2; i + 1 < points.length; i += 2) ctx.lineTo(points[i], points[i + 1]);
     if (item.closed) ctx.closePath();
     if (fill) {
       painter.setFill(fill);
@@ -176,6 +185,28 @@ function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: Ch
     }
     return;
   }
+  if (item.kind === 'circles') {
+    const fill = safeColor(item.fill);
+    const stroke = safeColor(item.stroke);
+    const points = item.points;
+    if (!fill && !stroke) return;
+    ctx.beginPath();
+    for (let i = 0; i + 2 < points.length; i += 3) {
+      const radius = points[i + 2];
+      if (!(radius > 0)) continue;
+      ctx.moveTo(points[i] + radius, points[i + 1]);
+      ctx.arc(points[i], points[i + 1], radius, 0, Math.PI * 2);
+    }
+    if (fill) {
+      painter.setFill(fill);
+      ctx.fill();
+    }
+    if (stroke) {
+      setStroke(ctx, stroke, item.lineWidth, false);
+      ctx.stroke();
+    }
+    return;
+  }
   if (item.kind === 'slice') {
     const fill = safeColor(item.fill);
     if (!fill || !(item.radius > 0) || !(item.end > item.start)) return;
@@ -204,11 +235,12 @@ function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: Ch
   painter.setFill(safeColor(item.color) || '#000000');
   ctx.textAlign = item.align;
   ctx.textBaseline = 'alphabetic';
-  if (item.rotated) {
-    // Read from the bottom up, around the point the text is centred on.
+  const angle = item.rotated ? -90 : typeof item.angle === 'number' && Number.isFinite(item.angle) ? item.angle : 0;
+  if (angle !== 0) {
+    // Turned around its own place: read from the bottom up for a turn against the clock.
     ctx.save();
     ctx.translate(item.x, item.y);
-    ctx.rotate(-Math.PI / 2);
+    ctx.rotate((angle * Math.PI) / 180);
     ctx.fillText(item.text, 0, 0);
     ctx.restore();
     painter.invalidate();
@@ -267,13 +299,6 @@ interface Kept {
   layouts: Map<string, ChartLayout>;
   /** What the entry weighs: see CHART_KEEP_BUDGET. */
   weight: number;
-}
-
-/** What a layout holds, counted in numbers. */
-function layoutWeight(layout: ChartLayout): number {
-  let weight = 0;
-  for (const item of layout.items) weight += 8 + (item.kind === 'path' || item.kind === 'markers' ? item.points.length : 0);
-  return weight;
 }
 
 /** What a renderer did and holds: for tests, and for whoever wants to see what charts cost. */

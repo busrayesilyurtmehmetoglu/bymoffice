@@ -249,7 +249,9 @@ test('several levels of categories: the level next to the axis is shown, from th
   // UNSURE: of the block A2:B5 the last column is taken for the level next to the axis.
   const live = chartValues(chart, { workbook });
   assert.deepEqual([live.label(0), live.label(3)], ['10', '40']);
-  assert.ok(chart.notes.some((note) => /levels of categories/.test(note)), 'the levels are noted');
+  assert.deepEqual(categories?.levels, [{ index: [0, 2], values: ['dış0', 'dış2'] }], 'the level beyond it is kept too');
+  assert.deepEqual([0, 1, 2, 3].map((i) => cached.outerLabel?.(i)), ['dış0', '', 'dış2', ''], 'and is what a second row of labels shows');
+  assert.ok(!chart.notes.some((note) => /levels of categories/.test(note)), 'two levels are both shown: nothing to note');
 });
 
 test('a scatter series has a place for every point: its x values, or 1, 2, 3 when they are no numbers', async () => {

@@ -11,15 +11,17 @@ import type { ConditionalSource } from '../format/conditional';
 import type { FormatLocale } from '../format/locale';
 import { headerFooterLines, parseHeaderFooter, type HeaderFooterFormat, type HeaderFooterPiece, type HeaderFooterRun, type HeaderFooterValues } from '../layout/header-footer';
 import { createSheetMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { MAX_SHEET_PAGES, PAPER_A4, PAPER_LETTER, SheetPagesError, paginateSheet, printRanges, type SheetPrintLayout, type SheetPrintPage } from '../layout/sheet-pages';
+import { MAX_SHEET_PAGES, PAPER_A4, PAPER_LETTER, SheetPagesError, marginsOf, paginateSheet, paperSize, printRanges, type SheetPrintLayout, type SheetPrintPage } from '../layout/sheet-pages';
+import type { Chart } from '../model/sheet/chart';
 import { resolveCellStyle } from '../model/sheet/color';
 import type { Font, HeaderFooter, Sheet, Workbook } from '../model/sheet/types';
+import { ChartRenderer } from '../render/chart';
 import { renderGridPrint, type GridBand, type GridDrawingSource } from '../render/grid';
 import { cssFont, fontPixels } from '../render/text';
 import { DocumentPrintError, type DocumentPrintOptions } from './doc-print';
 
 export interface SheetPrintOptions extends DocumentPrintOptions {
-  /** 'active' (the default) prints the sheet that is shown; 'all' every visible worksheet, in the order of the tabs. */
+  /** 'active' (the default) prints the sheet that is shown; 'all' every visible worksheet and chart sheet, in the order of the tabs. */
   sheets?: 'active' | 'all';
   /** What "&F" in a header or footer stands for; empty when it is not given. */
   fileName?: string;
@@ -35,6 +37,8 @@ export interface SheetJobPage {
   index: number;
   /** The number "&P" shows. */
   number: number;
+  /** The page of a chart sheet: the chart that fills what the margins leave of the paper. */
+  chart?: Chart;
 }
 
 export interface SheetJobPlan {
@@ -64,11 +68,44 @@ export function defaultPaperFor(tag: string | undefined): number {
   return typeof tag === 'string' && (/^en$/i.test(tag) || /[-_](US|CA)$/i.test(tag)) ? PAPER_LETTER : PAPER_A4;
 }
 
+/** The chart a chart sheet shows: the first one of its drawing that is drawn. */
+function chartOfSheet(sheet: Sheet): Chart | undefined {
+  if (sheet.kind !== 'chartsheet' || !Array.isArray(sheet.drawings)) return undefined;
+  for (const drawing of sheet.drawings) if (drawing && drawing.object && drawing.object.type === 'chart' && drawing.object.chart) return drawing.object.chart;
+  return undefined;
+}
+
 /**
- * The pages of a print job over the given sheets. Sheets that are no
- * worksheets and sheets with nothing to print are left out; a job without
- * any page throws a DocumentPrintError 'empty', one beyond the limit
- * 'too-long'.
+ * The one page of a chart sheet: the chart as large as the margins leave the paper.
+ * UNSURE: a chart sheet lies on its side unless its page setup says "portrait" - Excel makes
+ * a new chart sheet that way, and "default" leaves the choice to the application.
+ */
+function chartSheetLayout(sheet: Sheet, defaultPaper: number | undefined): SheetPrintLayout {
+  const setup = sheet.pageSetup;
+  const stated = setup ? setup.page : undefined;
+  const paper = paperSize({ ...(stated || {}), orientation: stated && stated.orientation === 'portrait' ? 'portrait' : 'landscape' }, defaultPaper);
+  const margins = marginsOf(setup ? setup.margins : undefined, paper);
+  const page: SheetPrintPage = {
+    area: 0,
+    // No cells: bands that hold nothing.
+    rows: { first: 0, last: -1 },
+    cols: { first: 0, last: -1 },
+    x: margins.left,
+    y: margins.top,
+    width: paper.width - margins.left - margins.right,
+    height: paper.height - margins.top - margins.bottom,
+  };
+  const layout: SheetPrintLayout = { paper: { width: paper.width, height: paper.height }, landscape: paper.landscape, margins, scale: 1, headings: false, headingWidth: 0, headingHeight: 0, gridLines: false, pages: [page] };
+  if (stated && stated.useFirstPageNumber === true && typeof stated.firstPageNumber === 'number' && Number.isFinite(stated.firstPageNumber) && Math.abs(stated.firstPageNumber) <= 32767) layout.firstPageNumber = Math.floor(stated.firstPageNumber);
+  return layout;
+}
+
+/**
+ * The pages of a print job over the given sheets. A chart sheet is one page
+ * (see chartSheetLayout). Sheets that are neither worksheets nor chart
+ * sheets, chart sheets whose chart is not drawn, and sheets with nothing to
+ * print are left out; a job without any page throws a DocumentPrintError
+ * 'empty', one beyond the limit 'too-long'.
  *
  * Pages are numbered through the whole job; a sheet that states the number
  * of its first page starts there. UNSURE: Excel numbers the same way when a
@@ -82,6 +119,15 @@ export function planSheetPages(workbook: Workbook, sheets: readonly number[], op
   for (let i = 0; i < sheets.length; i++) {
     const index = sheets[i];
     const sheet = workbook.sheets[index];
+    const chart = sheet ? chartOfSheet(sheet) : undefined;
+    if (sheet && chart) {
+      const layout = chartSheetLayout(sheet, options.defaultPaper);
+      if (layout.firstPageNumber !== undefined) next = layout.firstPageNumber;
+      pages.push({ sheet: index, layout, page: layout.pages[0], index: 0, number: next++, chart });
+      printed.push(index);
+      if (pages.length > limit) break;
+      continue;
+    }
     if (!sheet || sheet.kind !== 'worksheet') continue;
     const metrics = options.metrics ? options.metrics(sheet, index) : createSheetMetrics(sheet);
     const ranges = printRanges(workbook, index);
@@ -123,8 +169,10 @@ export interface SheetPagePaint {
   job: SheetJobPage;
   /** Pages of the whole job: what "&N" shows. */
   total: number;
-  /** Row and column sizes of the sheet. */
+  /** Row and column sizes of the sheet; not needed for the page of a chart sheet. */
   metrics: SheetMetrics;
+  /** What draws the chart of a chart sheet; one is made for the page when missing. */
+  charts?: Pick<ChartRenderer, 'paint'>;
   /** Width of the canvas in pixels; the height follows from the paper. */
   pixelWidth: number;
   locale?: FormatLocale;
@@ -301,6 +349,29 @@ export function paintSheetPage(ctx: CanvasRenderingContext2D, paint: SheetPagePa
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, Math.ceil(layout.paper.width * k) + 1, Math.ceil(layout.paper.height * k) + 1);
   if (!sheet) return;
+
+  if (job.chart) {
+    // A chart sheet: the chart in what the margins leave of the paper, laid out in px of the paper.
+    const charts = paint.charts || new ChartRenderer({ workbook, locale: () => paint.locale });
+    ctx.save();
+    try {
+      ctx.setTransform(k, 0, 0, k, 0, 0);
+      ctx.beginPath();
+      ctx.rect(page.x, page.y, page.width, page.height);
+      ctx.clip();
+      charts.paint(ctx, job.chart, page.x, page.y, Math.floor(page.width), Math.floor(page.height));
+    } finally {
+      ctx.restore();
+    }
+    ctx.save();
+    try {
+      ctx.setTransform(k, 0, 0, k, 0, 0);
+      paintHeaderFooter(ctx, paint);
+    } finally {
+      ctx.restore();
+    }
+    return;
+  }
 
   const s = layout.scale;
   const bands = (title: GridBand | undefined, own: GridBand): GridBand[] => (title ? [title, own] : [own]);

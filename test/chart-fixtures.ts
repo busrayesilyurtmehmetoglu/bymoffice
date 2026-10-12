@@ -124,6 +124,8 @@ export interface ChartBookSpec {
   charts?: (string | Uint8Array)[];
   /** A chart sheet ("Grafik1") placed after the worksheets, with this chart part. */
   chartSheet?: string | Uint8Array;
+  /** Elements of the chart sheet that stand before its drawing: pageMargins, pageSetup, headerFooter. */
+  chartSheetSetup?: string;
   styles?: string;
   workbookHead?: string;
   /** Relationship type of the chart parts; that of a chart by default. */
@@ -143,7 +145,7 @@ export async function chartWorkbook(spec: ChartBookSpec): Promise<Uint8Array> {
     sheets.push({
       name: 'Grafik1',
       kind: 'chartsheet',
-      xml: `${XML}<chartsheet xmlns="${NS_MAIN}" xmlns:r="${NS_REL}"><sheetPr/><sheetViews><sheetView zoomScale="90" workbookViewId="0"/></sheetViews><drawing r:id="rId1"/></chartsheet>`,
+      xml: `${XML}<chartsheet xmlns="${NS_MAIN}" xmlns:r="${NS_REL}"><sheetPr/><sheetViews><sheetView zoomScale="90" workbookViewId="0"/></sheetViews>${spec.chartSheetSetup ?? ''}<drawing r:id="rId1"/></chartsheet>`,
     });
   }
   const zip = ZipArchive.read(await buildXlsx({ theme: THEME, sheets, styles: spec.styles, workbookHead: spec.workbookHead }));
