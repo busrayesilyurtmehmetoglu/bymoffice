@@ -65,6 +65,7 @@
         </div>
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
+          <button id="sample-chart" title="Verisi, üç grafiği (sütun, çizgi, pasta) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir.">Grafikli örnek xlsx üret ve aç</button>
           <button id="blank-docx">Boş docx oluştur ve aç</button>
           <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
           <button id="clear">Listeyi temizle</button>
@@ -596,6 +597,83 @@
           utf8(`${head}<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows}</sheetData></worksheet>`),
         );
         await handle([{ name: 'ornek.xlsx', data: await zip.write() }]);
+      });
+
+      // A synthetic workbook with charts: data in A1:C6, a column chart, a line chart and a pie below it, and a chart
+      // sheet. The series refer to the cells, so that editing a cell changes the charts.
+      $('sample-chart').addEventListener('click', async () => {
+        const utf8 = (text) => new TextEncoder().encode(text);
+        const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const PKG = 'http://schemas.openxmlformats.org/package/2006/relationships';
+        const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const C = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+        const A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+        const XDR = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
+        const data = [['Ay', 'Çay', 'Kahve'], ['Ocak', 120, 80], ['Şubat', 150, 95], ['Mart', 90, 130], ['Nisan', 200, 110], ['Mayıs', 170, 60]];
+        const rows = data
+          .map(
+            (row, r) =>
+              `<row r="${r + 1}">` +
+              row.map((value, c) => (typeof value === 'number' ? `<c r="${'ABC'[c]}${r + 1}"><v>${value}</v></c>` : `<c r="${'ABC'[c]}${r + 1}" t="inlineStr"><is><t>${value}</t></is></c>`)).join('') +
+              '</row>',
+          )
+          .join('');
+        const cats = '<c:cat><c:strRef><c:f>Veri!$A$2:$A$6</c:f></c:strRef></c:cat>';
+        const series = (index, column) =>
+          `<c:ser><c:idx val="${index}"/><c:order val="${index}"/><c:tx><c:strRef><c:f>Veri!$${column}$1</c:f></c:strRef></c:tx>${cats}` +
+          `<c:val><c:numRef><c:f>Veri!$${column}$2:$${column}$6</c:f></c:numRef></c:val></c:ser>`;
+        const axes =
+          '<c:catAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>' +
+          '<c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:crossAx val="1"/></c:valAx>';
+        const chart = (title, plot, legend) =>
+          `${head}<c:chartSpace xmlns:c="${C}" xmlns:a="${A}" xmlns:r="${REL}"><c:chart>` +
+          `<c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>${title}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title><c:autoTitleDeleted val="0"/>` +
+          `<c:plotArea><c:layout/>${plot}</c:plotArea><c:legend><c:legendPos val="${legend}"/><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>`;
+        const ids = '<c:axId val="1"/><c:axId val="2"/>';
+        const charts = [
+          chart('Satışlar', `<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/>${series(0, 'B')}${series(1, 'C')}<c:gapWidth val="150"/>${ids}</c:barChart>${axes}`, 'b'),
+          chart('Aylara göre', `<c:lineChart><c:grouping val="standard"/>${series(0, 'B')}${series(1, 'C')}<c:marker val="1"/>${ids}</c:lineChart>${axes}`, 'b'),
+          chart('Çay', `<c:pieChart><c:varyColors val="1"/>${series(0, 'B')}<c:firstSliceAng val="0"/></c:pieChart>`, 'r'),
+          chart('Yığılmış', `<c:barChart><c:barDir val="bar"/><c:grouping val="stacked"/>${series(0, 'B')}${series(1, 'C')}<c:overlap val="100"/>${ids}</c:barChart>${axes}`, 'r'),
+        ];
+        const frame = (rel) =>
+          `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Grafik"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>` +
+          `<a:graphic><a:graphicData uri="${C}"><c:chart xmlns:c="${C}" xmlns:r="${REL}" r:id="${rel}"/></a:graphicData></a:graphic></xdr:graphicFrame>`;
+        const anchor = (col, row, rel) =>
+          `<xdr:twoCellAnchor><xdr:from><xdr:col>${col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>` +
+          `<xdr:to><xdr:col>${col + 5}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${row + 13}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>${frame(rel)}<xdr:clientData/></xdr:twoCellAnchor>`;
+        const drawing = (inner) => `${head}<xdr:wsDr xmlns:xdr="${XDR}" xmlns:a="${A}">${inner}</xdr:wsDr>`;
+        const rels = (items) => `${head}<Relationships xmlns="${PKG}">${items.map(([id, type, target]) => `<Relationship Id="${id}" Type="${REL}/${type}" Target="${target}"/>`).join('')}</Relationships>`;
+        const zip = new BymOffice.ZipArchive();
+        const type = (part, kind) => `<Override PartName="/xl/${part}" ContentType="application/vnd.openxmlformats-officedocument.${kind}+xml"/>`;
+        zip.set(
+          '[Content_Types].xml',
+          utf8(
+            `${head}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>' +
+              type('workbook.xml', 'spreadsheetml.sheet.main') +
+              type('worksheets/sheet1.xml', 'spreadsheetml.worksheet') +
+              type('chartsheets/sheet2.xml', 'spreadsheetml.chartsheet') +
+              type('drawings/drawing1.xml', 'drawing') +
+              type('drawings/drawing2.xml', 'drawing') +
+              charts.map((_chart, i) => type(`charts/chart${i + 1}.xml`, 'drawingml.chart')).join('') +
+              '</Types>',
+          ),
+        );
+        zip.set('_rels/.rels', utf8(rels([['rId1', 'officeDocument', 'xl/workbook.xml']])));
+        zip.set('xl/workbook.xml', utf8(`${head}<workbook xmlns="${MAIN}" xmlns:r="${REL}"><sheets><sheet name="Veri" sheetId="1" r:id="rId1"/><sheet name="Grafik" sheetId="2" r:id="rId2"/></sheets></workbook>`));
+        zip.set('xl/_rels/workbook.xml.rels', utf8(rels([['rId1', 'worksheet', 'worksheets/sheet1.xml'], ['rId2', 'chartsheet', 'chartsheets/sheet2.xml']])));
+        zip.set('xl/worksheets/sheet1.xml', utf8(`${head}<worksheet xmlns="${MAIN}" xmlns:r="${REL}"><sheetData>${rows}</sheetData><drawing r:id="rId1"/></worksheet>`));
+        zip.set('xl/worksheets/_rels/sheet1.xml.rels', utf8(rels([['rId1', 'drawing', '../drawings/drawing1.xml']])));
+        zip.set('xl/drawings/drawing1.xml', utf8(drawing(anchor(0, 7, 'rId1') + anchor(5, 7, 'rId2') + anchor(10, 7, 'rId3'))));
+        zip.set('xl/drawings/_rels/drawing1.xml.rels', utf8(rels([1, 2, 3].map((n) => [`rId${n}`, 'chart', `../charts/chart${n}.xml`]))));
+        zip.set('xl/chartsheets/sheet2.xml', utf8(`${head}<chartsheet xmlns="${MAIN}" xmlns:r="${REL}"><sheetPr/><sheetViews><sheetView workbookViewId="0"/></sheetViews><drawing r:id="rId1"/></chartsheet>`));
+        zip.set('xl/chartsheets/_rels/sheet2.xml.rels', utf8(rels([['rId1', 'drawing', '../drawings/drawing2.xml']])));
+        zip.set('xl/drawings/drawing2.xml', utf8(drawing(`<xdr:absoluteAnchor><xdr:pos x="0" y="0"/><xdr:ext cx="9300000" cy="6070000"/>${frame('rId1')}<xdr:clientData/></xdr:absoluteAnchor>`)));
+        zip.set('xl/drawings/_rels/drawing2.xml.rels', utf8(rels([['rId1', 'chart', '../charts/chart4.xml']])));
+        charts.forEach((xml, i) => zip.set(`xl/charts/chart${i + 1}.xml`, utf8(xml)));
+        await handle([{ name: 'grafikli-ornek.xlsx', data: await zip.write() }]);
       });
 
       // A font file of the user's, registered under its file name for the family typed next to it.

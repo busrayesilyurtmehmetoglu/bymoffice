@@ -5,6 +5,7 @@
 // source package and is written back from there (see the lossless principle).
 
 import type { XmlElement } from '../../xml';
+import type { Chart } from './chart';
 
 export const MAX_ROWS = 1048576;
 export const MAX_COLS = 16384;
@@ -635,13 +636,24 @@ export interface DrawingGroup extends DrawingObjectBase {
   children: DrawingObject[];
 }
 
-/** Something that is not drawn as it is: a chart, a diagram, an embedded object. */
+/** Something that is not drawn as it is: a chart of a kind that is not read (or that cannot be read), a diagram, an embedded object. */
 export interface DrawingPlaceholder extends DrawingObjectBase {
   type: 'placeholder';
   what: 'chart' | 'diagram' | 'object';
 }
 
-export type DrawingObject = DrawingPicture | DrawingShape | DrawingGroup | DrawingPlaceholder;
+/**
+ * A chart whose part could be read. The frame is the anchor, as for any other object; what
+ * the chart shows is worked out from the cells its series refer to whenever it is drawn.
+ */
+export interface DrawingChart extends DrawingObjectBase {
+  type: 'chart';
+  chart: Chart;
+  /** The chart part, e.g. "/xl/charts/chart1.xml". It is never written from the model. */
+  part?: string;
+}
+
+export type DrawingObject = DrawingPicture | DrawingShape | DrawingGroup | DrawingPlaceholder | DrawingChart;
 
 /**
  * One anchor of a sheet's drawing with what it holds. A view for reading: the drawing
@@ -950,7 +962,8 @@ export interface Sheet {
    */
   structuralEdits?: SheetStructuralEdit[];
   /**
-   * Pictures, shapes and placeholders of charts as the file has them, bottom one first. Like
+   * Pictures, shapes and charts as the file has them, bottom one first. A chart sheet has the
+   * one drawing that holds its chart. Like
    * conditional formats they are not changed by edits: structuralEdits are applied where they
    * are shown (see SheetDrawings), by the rules the writer moves the anchors in the file with.
    */

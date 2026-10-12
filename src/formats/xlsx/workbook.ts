@@ -4,10 +4,12 @@
 // parser; shared strings and sheet data are scanned as a stream.
 
 import type { OpcPackage, Relationship } from '../../opc';
+import { MAX_WORKBOOK_CHARTS, MAX_WORKBOOK_CHART_POINTS } from '../../model/sheet/chart';
 import { createSheet, type DefinedName, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
 import { childElements, localName, type XmlDocument, type XmlElement } from '../../xml';
+import { parseChart } from './chart';
 import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
-import { readSheetDrawings } from './drawings';
+import { readSheetDrawings, type ChartReading } from './drawings';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
 import { parseWorksheet } from './worksheet';
@@ -74,6 +76,8 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   }
   /** Parts of the pictures the drawings show: the only ones the view may ask for. */
   const mediaParts = new Set<string>();
+  /** What the charts of the whole workbook may cost: the limits hold for all sheets together. */
+  const chartReading: ChartReading = { read: parseChart, charts: MAX_WORKBOOK_CHARTS, points: MAX_WORKBOOK_CHART_POINTS };
 
   const sheets: Sheet[] = [];
   const seenParts = new Set<string>();
@@ -143,11 +147,23 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
       if (anchored.size > 0) sheet.anchored = [...anchored].sort();
       // What is shown of them; the parts themselves are written back as they are.
       const warnings: string[] = [];
-      const drawings = await readSheetDrawings(pkg, sheetRels, styles.themeColors, mediaParts, warnings);
+      const drawings = await readSheetDrawings(pkg, sheetRels, styles.themeColors, mediaParts, warnings, chartReading);
       if (drawings) sheet.drawings = drawings;
       const comments = await readSheetComments(pkg, sheetRels, persons, warnings);
       if (comments) sheet.comments = comments;
       if (warnings.length > 0) sheet.warnings = warnings;
+    } else {
+      // The chart of a chart sheet is found through the drawing its relationships name. Whatever
+      // those parts hold, the sheet is still listed: without a chart that can be read it shows a note.
+      try {
+        const warnings: string[] = [];
+        const drawings = await readSheetDrawings(pkg, await pkg.relationships(rel.part), styles.themeColors, mediaParts, warnings, chartReading);
+        if (drawings) sheet.drawings = drawings;
+        // A chart that could not be read is said, as on a worksheet: the sheet then shows its note.
+        if (warnings.length > 0) sheet.warnings = warnings;
+      } catch (error) {
+        // The sheet stays as it was before charts were read: kept, not shown.
+      }
     }
     sheets.push(sheet);
   }

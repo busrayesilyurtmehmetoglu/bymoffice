@@ -1191,6 +1191,11 @@ function objectXml(context: DrawingContext, object: DrawingObject, box: Box, dep
     context.notes.add(`Drawing: a ${object.what} is not in the model and is left out`);
     return '';
   }
+  if (object.type === 'chart') {
+    // A chart is drawn from its part and never written from the model (no reader of a format without parts makes one).
+    context.notes.add('Drawing: a chart is not written from the model and is left out');
+    return '';
+  }
   const id = ++context.nextId;
   if (object.type === 'picture') {
     let blip = '<a:blip/>';

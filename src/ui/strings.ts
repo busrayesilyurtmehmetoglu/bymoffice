@@ -8,6 +8,8 @@ export interface UiStrings {
   /** Label of the grid: "Sheet <name>". */
   sheet(name: string): string;
   chartSheetNote: string;
+  /** The name of a series of a chart that has none: `n` counts from 1. */
+  chartSeries(n: number): string;
   otherSheetNote: string;
   /** Said after the active cell when more than one cell is selected. */
   selected(range: string): string;
@@ -428,7 +430,8 @@ export const STRINGS_EN: UiStrings = {
   cellEditor: 'Cell editor',
   actionFailed: 'The action could not be completed',
   sheet: (name) => `Sheet ${name}`,
-  chartSheetNote: 'This sheet is a chart sheet. Charts are not shown yet.',
+  chartSheetNote: 'This sheet is a chart sheet. Its chart is of a kind that is not shown yet.',
+  chartSeries: (n) => `Series${n}`,
   otherSheetNote: 'This kind of sheet is not shown yet.',
   selected: (range) => `${range} selected`,
   insertRowsAbove: (count) => `Insert ${rows(count)} above`,
@@ -853,7 +856,8 @@ export const STRINGS_TR: UiStrings = {
   cellEditor: 'Hücre düzenleyici',
   actionFailed: 'İşlem tamamlanamadı',
   sheet: (name) => `Sayfa ${name}`,
-  chartSheetNote: 'Bu sayfa bir grafik sayfası. Grafikler henüz gösterilmiyor.',
+  chartSheetNote: 'Bu sayfa bir grafik sayfası. Grafiği henüz gösterilmeyen bir türde.',
+  chartSeries: (n) => `Seri${n}`,
   otherSheetNote: 'Bu tür sayfalar henüz gösterilmiyor.',
   selected: (range) => `${range} seçili`,
   insertRowsAbove: (count) => `Üste ${satir(count)} ekle`,

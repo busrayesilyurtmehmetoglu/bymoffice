@@ -1,6 +1,7 @@
 // What floats above the cells of a sheet: pictures, simple shapes with their
-// text, placeholders for charts, and the boxes of comments that are always
-// shown. Also says which cells carry a comment.
+// text, charts (drawn by render/chart.ts), placeholders for what is not
+// drawn, and the boxes of comments that are always shown. Also says which
+// cells carry a comment.
 //
 // The model holds drawings and comments as the file has them. Rows and columns
 // inserted or deleted since (Sheet.structuralEdits) are applied here, by the
@@ -30,6 +31,7 @@ import {
   type SheetDrawing,
   type SheetStructuralEdit,
 } from '../model/sheet/types';
+import { ChartRenderer, type ChartRendererOptions } from './chart';
 import type { DecodedImage } from './images';
 import { fontsVersion } from './fonts';
 import { cssFont, FONT_FALLBACK, TextPainter, wrapLines } from './text';
@@ -296,6 +298,13 @@ export interface SheetDrawingsOptions {
   labels?: Partial<SheetDrawingLabels>;
   /** False leaves the boxes of comments that are always shown out of the layer: on paper comments are not printed. Default true. */
   notes?: boolean;
+  /**
+   * Where charts get their numbers from: the workbook whose cells the series read, the locale
+   * and a counter of changes. Without it charts are drawn from the values their files cached.
+   * A renderer may be handed in instead: the layers of several sheets then share what it keeps,
+   * and the limit of what it keeps.
+   */
+  charts?: ChartRendererOptions | ChartRenderer;
 }
 
 /** Where the layer is drawn: a clip rectangle on the canvas and the canvas position of the top-left corner of cell A1. */
@@ -342,6 +351,7 @@ export class SheetDrawings {
   private readonly images: SheetDrawingsOptions['images'];
   private labels: SheetDrawingLabels;
   private readonly notes: boolean;
+  private readonly charts: ChartRenderer;
 
   private drawingsSeen: SheetDrawing[] | undefined;
   private commentsSeen: SheetComment[] | undefined;
@@ -366,6 +376,7 @@ export class SheetDrawings {
     this.images = options.images && typeof options.images.get === 'function' ? options.images : undefined;
     this.labels = { ...DEFAULT_LABELS, ...(options.labels || {}) };
     this.notes = options.notes !== false;
+    this.charts = options.charts instanceof ChartRenderer ? options.charts : new ChartRenderer(options.charts || {});
   }
 
   /** True when the sheet has nothing for this layer; a view then leaves it out of its frames. */
@@ -530,7 +541,7 @@ export class SheetDrawings {
       this.layoutFonts = fonts;
       this.layouts = new WeakMap();
     }
-    const frame: PaintFrame = { ctx, painter: new TextPainter(ctx), dpr, images: this.images, labels: this.labels, layouts: this.layouts, painted: 0, depth: 0 };
+    const frame: PaintFrame = { ctx, painter: new TextPainter(ctx), dpr, images: this.images, labels: this.labels, layouts: this.layouts, charts: this.charts, painted: 0, depth: 0 };
     ctx.save();
     ctx.beginPath();
     ctx.rect(clip.x, clip.y, clip.width, clip.height);
@@ -558,6 +569,7 @@ interface PaintFrame {
   images: SheetDrawingsOptions['images'];
   labels: SheetDrawingLabels;
   layouts: WeakMap<DrawingText, TextLayout>;
+  charts: ChartRenderer;
   painted: number;
   /** save() calls of the frame not yet matched by a restore(). */
   depth: number;
@@ -612,7 +624,7 @@ function paintObject(frame: PaintFrame, object: DrawingObject, x: number, y: num
       }
     }
   } else {
-    const mirror = (flipH || flipV) && object.type !== 'placeholder';
+    const mirror = (flipH || flipV) && object.type !== 'placeholder' && object.type !== 'chart';
     if (mirror) {
       pushState(frame);
       ctx.translate(x + width / 2, y + height / 2);
@@ -627,7 +639,8 @@ function paintObject(frame: PaintFrame, object: DrawingObject, x: number, y: num
       frame.painter.invalidate();
     }
     // What stands for something that is not drawn is never mirrored: its words are to be read.
-    if (object.type === 'placeholder') paintPlaceholder(frame, x, y, width, height, object.what === 'chart' ? frame.labels.chart : object.what === 'diagram' ? frame.labels.diagram : frame.labels.object);
+    if (object.type === 'chart') paintChart(frame, object, x, y, width, height);
+    else if (object.type === 'placeholder') paintPlaceholder(frame, x, y, width, height, object.what === 'chart' ? frame.labels.chart : object.what === 'diagram' ? frame.labels.diagram : frame.labels.object);
     else if (!drawn && object.type === 'picture') paintPlaceholder(frame, x, y, width, height, object.description || object.name || frame.labels.picture);
     // Text is turned with its shape but never mirrored.
     if (object.type === 'shape' && object.text) paintText(frame, object.text, x, y, width, height);
@@ -668,6 +681,27 @@ function paintPicture(frame: PaintFrame, picture: Extract<DrawingObject, { type:
     return true;
   }
   return false;
+}
+
+/** Draws a chart in its frame; one that cannot be laid out or painted is shown as the placeholder of a chart. */
+function paintChart(frame: PaintFrame, object: Extract<DrawingObject, { type: 'chart' }>, x: number, y: number, width: number, height: number): void {
+  // Whole pixels: the lines of a chart are thin and many. The size is rounded by itself and not as the distance
+  // between two rounded edges: that one changes by a pixel as the sheet is scrolled by parts of a pixel, and
+  // every such change is a chart laid out again.
+  const px = Math.round(x);
+  const py = Math.round(y);
+  const pw = Math.round(width);
+  const ph = Math.round(height);
+  let drawn = false;
+  try {
+    if (pw > 0 && ph > 0) frame.charts.paint(frame.ctx, object.chart, px, py, pw, ph);
+    drawn = true;
+  } catch (error) {
+    // Whatever a chart states, it costs no more than its own picture.
+  }
+  // Measuring and painting set fonts and fills of their own.
+  frame.painter.invalidate();
+  if (!drawn) paintPlaceholder(frame, x, y, width, height, frame.labels.chart);
 }
 
 function paintPlaceholder(frame: PaintFrame, x: number, y: number, width: number, height: number, label: string): void {

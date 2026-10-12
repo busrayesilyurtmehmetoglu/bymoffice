@@ -10,6 +10,7 @@
 import { FocusRetry, pressOf } from './focus-retry';
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
+import type { Chart } from '../model/sheet/chart';
 import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
@@ -107,6 +108,7 @@ import { PALETTE, PALETTE_COLUMNS } from './toolbar';
 import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
+import { ChartRenderer, type ChartRendererOptions } from '../render/chart';
 import { SheetDrawings } from '../render/sheet-drawings';
 import { onFontsChanged } from '../render/fonts';
 import { onEmbeddedFontNotice } from '../render/embedded-fonts';
@@ -839,6 +841,15 @@ export class WorkbookView {
   private tip: HTMLDivElement | undefined;
   /** Pictures, shapes and comments of the sheets that have any, made when a sheet is first drawn. */
   private drawings = new Map<Sheet, SheetDrawings>();
+  /**
+   * Works out and draws the charts of the sheet that is shown, on a worksheet and on a chart sheet alike; made when
+   * a chart is first drawn. What it keeps is given up when another sheet is shown, and is limited at any time.
+   */
+  private charts: ChartRenderer | undefined;
+  /** Counts the redraws that were asked for from outside: charts read their cells anew then (see render()). */
+  private chartEpoch = 0;
+  /** The name the canvas has for assistive technology while it shows the chart of a chart sheet; '' while it has none. */
+  private canvasLabel = '';
   /** Decoded pictures of the workbook; made when a sheet with a picture is first drawn. */
   private images: ImageStore | undefined;
   /** The comment of a cell, shown beside it while the cell is pointed at or active. */
@@ -1134,6 +1145,8 @@ export class WorkbookView {
     this.finishNote(true, true);
     this.sheetIndex = index;
     this.shown = this.workbook.sheets[index];
+    // What was worked out for the charts of the sheet that is left is not kept while they are out of sight.
+    if (this.charts) this.charts.clear();
     this.showSheet();
     this.schedule();
     this.noteActiveSheet();
@@ -1228,9 +1241,13 @@ export class WorkbookView {
     this.announce();
   }
 
-  /** Forces a synchronous redraw. */
+  /**
+   * Forces a synchronous redraw. Charts work their numbers out anew for it: a workbook that was changed
+   * directly, not through the view, is shown as it is now.
+   */
   render(): void {
     if (this.destroyed) return;
+    this.chartEpoch++;
     this.measure();
     this.readScroll();
     this.growExtent(this.state().scrollX, this.state().scrollY);
@@ -1324,6 +1341,8 @@ export class WorkbookView {
     if (this.images) this.images.destroy();
     this.images = undefined;
     this.drawings.clear();
+    if (this.charts) this.charts.clear();
+    this.charts = undefined;
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);
     // Give the backing store back right away; some browsers keep it until collection otherwise.
@@ -1430,7 +1449,7 @@ export class WorkbookView {
       const layerOf = (sheet: Sheet): SheetDrawings | undefined => {
         if (!layers.has(sheet)) {
           // Comments are not printed, so their boxes are left out of the layer.
-          layers.set(sheet, sheet.drawings && sheet.drawings.length > 0 ? new SheetDrawings(sheet, { images: store, labels: this.drawingLabels(), notes: false }) : undefined);
+          layers.set(sheet, sheet.drawings && sheet.drawings.length > 0 ? new SheetDrawings(sheet, { images: store, labels: this.drawingLabels(), notes: false, charts: this.chartSource() }) : undefined);
         }
         return layers.get(sheet);
       };
@@ -1675,7 +1694,8 @@ export class WorkbookView {
     this.scroller.setAttribute('aria-label', this.strings.sheet(state.sheet.name));
     const kind = state.sheet.kind;
     this.note.textContent = kind === 'worksheet' ? '' : kind === 'chartsheet' ? this.strings.chartSheetNote : this.strings.otherSheetNote;
-    this.note.style.display = kind === 'worksheet' ? 'none' : 'block';
+    // A chart sheet whose chart is drawn needs no note; draw() shows it again should the chart fail.
+    this.note.style.display = kind === 'worksheet' || this.sheetChart(state.sheet) ? 'none' : 'block';
 
     this.growExtent(state.scrollX, state.scrollY);
     this.commitScroll();
@@ -1802,6 +1822,7 @@ export class WorkbookView {
     }
     this.sheetIndex = index;
     this.shown = sheets[index];
+    if (this.charts) this.charts.clear();
     if (kind === 'rename') {
       // The same tabs under other names: a press that is under way on one of them still finds it.
       const tabs = this.tabs.children;
@@ -2928,6 +2949,20 @@ export class WorkbookView {
     const context = this.canvas.getContext('2d');
     if (!context) return;
     const state = this.state();
+    // A chart sheet has no cells: its chart takes the place of the grid.
+    const sheetChart = this.sheetChart(state.sheet);
+    const shown = sheetChart !== undefined && this.drawSheetChart(context, sheetChart);
+    this.labelCanvas(shown);
+    if (sheetChart) {
+      this.note.style.display = shown ? 'none' : 'block';
+      if (shown) {
+        this.placeInput();
+        this.placeTip();
+        this.placeComment();
+        this.placeNote();
+        return;
+      }
+    }
     const conditional = this.conditionalOf(state.sheet);
     const floating = this.drawingsOf(state.sheet);
     // A picture asked for in this frame is never dropped to make room for another.
@@ -2970,10 +3005,75 @@ export class WorkbookView {
         // Pictures are read from the file and decoded when they first come into view.
         this.images = new ImageStore(media, coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => this.schedule());
       }
-      found = new SheetDrawings(sheet, { images: this.images, labels: this.drawingLabels() });
+      found = new SheetDrawings(sheet, { images: this.images, labels: this.drawingLabels(), charts: this.chartRenderer() });
       this.drawings.set(sheet, found);
     }
     return found;
+  }
+
+  /** Where charts get their numbers from: the cells as they are now, read anew after every change and for every redraw asked for from outside. */
+  private chartSource(): ChartRendererOptions {
+    return { workbook: this.workbook, locale: () => this.locale, version: () => this.printEpoch + this.chartEpoch, seriesName: (n) => this.strings.chartSeries(n) };
+  }
+
+  /** The one renderer of the charts this view shows: the layers of all sheets and the chart sheets share what it keeps. */
+  private chartRenderer(): ChartRenderer {
+    if (!this.charts) this.charts = new ChartRenderer(this.chartSource());
+    return this.charts;
+  }
+
+  /**
+   * What the charts of the shown sheet cost and show (for tests and embedding): how many charts something is
+   * kept for and what it weighs (see CHART_KEEP_BUDGET), how often numbers were worked out and charts were laid
+   * out since the view was made, and the texts of the charts as they were last laid out (at most 500).
+   */
+  getChartState(): { charts: number; weight: number; values: number; layouts: number; texts: string[] } {
+    const texts: string[] = [];
+    if (this.destroyed || !this.charts) return { charts: 0, weight: 0, values: 0, layouts: 0, texts };
+    for (const layout of this.charts.layouts()) {
+      for (const item of layout.items) if (item.kind === 'text' && texts.length < 500) texts.push(item.text);
+    }
+    return { ...this.charts.state(), texts };
+  }
+
+  /** The chart a chart sheet shows: the first one of its drawing. Undefined for any other sheet, and for a chart that is not drawn. */
+  private sheetChart(sheet: Sheet): Chart | undefined {
+    if (sheet.kind !== 'chartsheet' || !sheet.drawings) return undefined;
+    for (const drawing of sheet.drawings) if (drawing && drawing.object && drawing.object.type === 'chart') return drawing.object.chart;
+    return undefined;
+  }
+
+  /** Fills the view with the chart of a chart sheet. False when it could not be drawn: the sheet then shows its note. */
+  private drawSheetChart(context: CanvasRenderingContext2D, chart: Chart): boolean {
+    const charts = this.chartRenderer();
+    context.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    context.globalAlpha = 1;
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, this.width, this.height);
+    try {
+      charts.paint(context, chart, 0, 0, Math.floor(this.width), Math.floor(this.height));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Gives the canvas a name while it shows the chart of a chart sheet, and takes it away again. With the chart
+   * drawn the note of the sheet is hidden, and nothing else would say what is there. The name is the view's own
+   * word for a chart: nothing of the file is in it.
+   */
+  private labelCanvas(chart: boolean): void {
+    const label = chart ? this.strings.placeholder('chart') : '';
+    if (label === this.canvasLabel) return;
+    this.canvasLabel = label;
+    if (label === '') {
+      this.canvas.removeAttribute('role');
+      this.canvas.removeAttribute('aria-label');
+    } else {
+      this.canvas.setAttribute('role', 'img');
+      this.canvas.setAttribute('aria-label', label);
+    }
   }
 
   private drawingLabels(): { chart: string; diagram: string; object: string; picture: string } {

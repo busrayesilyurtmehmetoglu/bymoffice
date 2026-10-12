@@ -1,12 +1,14 @@
 // Reads a drawing part (xl/drawings/drawingN.xml) into the read-only view the
-// grid draws from: pictures, simple shapes with their text, groups, and
-// placeholders for what is not drawn (charts, diagrams, embedded objects).
+// grid draws from: pictures, simple shapes with their text, groups, charts
+// (their parts are read by chart.ts), and placeholders for what is not drawn
+// (charts of other kinds, diagrams, embedded objects).
 //
 // The part itself stays in the package and is written back from there; nothing
 // here is ever serialized. One anchor that cannot be read is left out and
 // noted, the rest of the drawing is still shown.
 
 import type { OpcPackage, Relationship } from '../../opc';
+import type { Chart } from '../../model/sheet/chart';
 import {
   MAX_COLS,
   MAX_ROWS,
@@ -32,6 +34,8 @@ export const MAX_GROUP_DEPTH = 16;
 const MAX_WRAPPER_DEPTH = 8;
 const MAX_SHAPE_PARAGRAPHS = 2000;
 const MAX_SHAPE_TEXT = 32767;
+/** Chart parts read for one drawing; further charts are shown as placeholders. */
+export const MAX_DRAWING_CHARTS = 1000;
 /** EMU per pixel at 96 dpi. */
 export const EMU_PER_PIXEL = 9525;
 /** A sheet is at most this wide or tall, in EMU (16,384 columns of 255 characters and then some). */
@@ -44,7 +48,27 @@ export interface DrawingReadContext {
   themeColors: string[];
   /** Says whether a part exists; a picture whose part is missing is shown as a placeholder. */
   hasPart?(part: string): boolean;
+  /** The charts of the drawing that could be read, by the name of their part; a chart that is not among them is a placeholder. */
+  charts?: Map<string, Chart>;
   warnings: string[];
+}
+
+/** Reads the root element of a chart part; undefined for a chart that is not drawn. See parseChart(). */
+export type ChartPartReader = (root: XmlElement, themeColors: string[], budget?: { points: number }) => Chart | undefined;
+
+/**
+ * How the chart parts of a workbook are read, and what reading them may still cost. One
+ * object is handed to readSheetDrawings() for every sheet of a workbook, so that the limits
+ * hold for the workbook and not for each sheet again.
+ */
+export interface ChartReading {
+  read: ChartPartReader;
+  /** Chart parts that may still be read; counted down. */
+  charts: number;
+  /** Cached values (<c:pt>) that may still be read; counted down by `read`. */
+  points: number;
+  /** Chart parts larger than this are not read. Default 32 MB. */
+  maxPartBytes?: number;
 }
 
 interface ReadState {
@@ -496,6 +520,14 @@ function readObject(state: ReadState, el: XmlElement, depth: number, transformOu
   const data = child(child(el, 'graphic'), 'graphicData');
   const uri = (data && data.attrs.get('uri')) || '';
   const what = /\/chart(ex)?$|\/chart\b/.test(uri) ? 'chart' : /diagram/.test(uri) ? 'diagram' : 'object';
+  if (what === 'chart' && state.context.charts) {
+    // <c:chart r:id>: the part that holds the chart. One that was not read (another kind, damaged, missing) stays a placeholder.
+    const reference = child(data, 'chart');
+    const id = reference ? prefixedAttr(reference, 'id') : undefined;
+    const rel = id !== undefined ? state.relById.get(id) : undefined;
+    const chart = rel && !rel.external && rel.part ? state.context.charts.get(rel.part) : undefined;
+    if (chart && rel && rel.part) return { ...base, type: 'chart', chart, part: rel.part };
+  }
   return { ...base, type: 'placeholder', what };
 }
 
@@ -598,10 +630,49 @@ export function parseDrawing(root: XmlElement, context: DrawingReadContext): She
 /** Parts larger than this are not read; the sheet is shown without its drawing. */
 const MAX_PART_BYTES = 64 * 1024 * 1024;
 
+/** Chart parts larger than this are not read; the chart is shown as a placeholder. */
+export const MAX_CHART_PART_BYTES = 32 * 1024 * 1024;
+
+/**
+ * The charts a drawing part refers to, as far as `reading` reads them. A chart that could
+ * have been drawn but was not read (a part that is no XML or holds a DTD, one that is too
+ * large, one beyond the limits of the sheet or the workbook) is said in `warnings`: its
+ * frame shows a placeholder. Never throws.
+ */
+async function readCharts(pkg: OpcPackage, rels: Relationship[], themeColors: string[], reading: ChartReading, sheetBudget: { left: number }, warnings: string[]): Promise<Map<string, Chart>> {
+  const charts = new Map<string, Chart>();
+  const limit = reading.maxPartBytes !== undefined && reading.maxPartBytes >= 0 ? reading.maxPartBytes : MAX_CHART_PART_BYTES;
+  let beyond = 0;
+  for (const rel of rels) {
+    if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chart' || rel.external || !rel.part || charts.has(rel.part) || !pkg.hasPart(rel.part)) continue;
+    if (sheetBudget.left <= 0 || reading.charts <= 0) {
+      beyond++;
+      continue;
+    }
+    sheetBudget.left--;
+    reading.charts--;
+    try {
+      const bytes = await pkg.readPart(rel.part);
+      if (bytes.length > limit) throw new Error('the part is too large');
+      const chart = reading.read(parseXml(bytes).root, themeColors, reading);
+      if (chart) charts.set(rel.part, chart);
+    } catch (error) {
+      // A chart part that cannot be read (not XML, a DTD, too much of it) leaves its frame a placeholder.
+      if (warnings.length < MAX_CHART_WARNINGS) warnings.push(`Chart could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (beyond > 0) warnings.push(`Charts beyond the limit of a sheet (${MAX_DRAWING_CHARTS}) or a workbook are not shown: ${beyond}`);
+  return charts;
+}
+
+/** Warnings about charts of one drawing that are listed one by one. */
+const MAX_CHART_WARNINGS = 20;
+
 /**
  * The drawings of a sheet from the parts its relationships name; undefined
  * for a sheet without any. Parts of pictures that are shown are added to
- * `media`. Never throws for what the parts hold.
+ * `media`. With `charts` the chart parts of the drawings are read too;
+ * without it every chart is a placeholder. Never throws for what the parts hold.
  */
 export async function readSheetDrawings(
   pkg: OpcPackage,
@@ -609,15 +680,18 @@ export async function readSheetDrawings(
   themeColors: string[],
   media: Set<string>,
   warnings: string[],
+  charts?: ChartReading,
 ): Promise<SheetDrawing[] | undefined> {
   let drawings: SheetDrawing[] = [];
+  const chartBudget = { left: MAX_DRAWING_CHARTS };
   for (const rel of sheetRels) {
     if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'drawing' || rel.external || !rel.part || !pkg.hasPart(rel.part)) continue;
     try {
       const bytes = await pkg.readPart(rel.part);
       if (bytes.length > MAX_PART_BYTES) throw new Error('the part is too large');
       const rels = await pkg.relationships(rel.part);
-      const read = parseDrawing(parseXml(bytes).root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), warnings });
+      const found = charts ? await readCharts(pkg, rels, themeColors, charts, chartBudget, warnings) : undefined;
+      const read = parseDrawing(parseXml(bytes).root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), charts: found, warnings });
       drawings = drawings.concat(read.slice(0, MAX_SHEET_DRAWINGS - drawings.length));
     } catch (error) {
       warnings.push(`Drawing could not be read: ${error instanceof Error ? error.message : String(error)}`);
