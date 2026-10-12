@@ -80,6 +80,11 @@ export function parseTheme(theme: XmlDocument | undefined): DocTheme {
   return result;
 }
 
+/** The colour scheme as the readers of DrawingML parts take it ("RRGGBB": lt1, dk1, lt2, dk2, accent1..6, hlink, folHlink); "" for a slot the theme does not state. */
+export function themeColorList(theme: DocTheme): string[] {
+  return SCHEME_SLOTS.map((slot) => theme.colors.get(slot) || '');
+}
+
 /**
  * The colour scheme slot ("dk1", "accent3", ...) a theme colour name of a
  * document refers to; undefined for names that are not theme colours.

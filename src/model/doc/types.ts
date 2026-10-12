@@ -31,6 +31,7 @@
 // must never be changed in place; an edit replaces the reference.
 
 import type { XmlComment, XmlElement, XmlPI } from '../../xml';
+import type { Chart } from '../sheet/chart';
 
 /** Attributes in document order, names as written (with prefix). */
 export type AttrList = [name: string, value: string][];
@@ -787,6 +788,13 @@ export interface DrawingItem {
   transform?: DrawingTransform;
   /** Every picture in the drawing, in document order; pictures in text boxes belong to the drawings there. */
   images?: DrawingPicture[];
+  /**
+   * For a drawing of kind "chart" read from a docx: the chart part its frame
+   * names ("/word/charts/chart1.xml"), as the package spells it, when the
+   * relationship leads to a part of the package. The chart itself is DocModel.charts.get() of it; a part
+   * that could not be read has none there.
+   */
+  chartPart?: string;
   /** The first of `images`, with its cropping. */
   image?: ImageRef;
   crop?: ImageCrop;
@@ -1231,6 +1239,14 @@ export interface DocModel {
    * a docx file keeps its pictures in the package.
    */
   media?: Map<string, DocMedia>;
+  /**
+   * The charts of the document by the name of their part
+   * (DrawingItem.chartPart): what the parts state, with the values they
+   * cached, as far as they could be read. A view for showing them; the parts
+   * stay in the package and are written back from there. Only set by the
+   * docx reader, and only when a chart was read.
+   */
+  charts?: Map<string, Chart>;
   /** The document uses the strict (ISO/IEC 29500) namespaces. */
   strict: boolean;
   /** Things the reader got past: missing parts, relationships without a target, ... */

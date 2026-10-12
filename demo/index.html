@@ -66,6 +66,7 @@
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
           <button id="sample-chart" title="Verisi, altı grafiği (sütun, çizgi, pasta; radar, ikincil eksenli ve veri etiketli birleşik, balon) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir.">Grafikli örnek xlsx üret ve aç</button>
+          <button id="sample-doc-chart" title="İçinde üç grafik olan sentetik bir Word belgesi: satır içinde sütun grafiği, metnin sardığı pasta ve tablo hücresinde çizgi grafiği. Grafikler dosyadaki önbellek değerlerinden çizilir.">Grafikli örnek docx üret ve aç</button>
           <button id="blank-docx">Boş docx oluştur ve aç</button>
           <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
           <button id="clear">Listeyi temizle</button>
@@ -698,6 +699,83 @@
         zip.set('xl/drawings/_rels/drawing2.xml.rels', utf8(rels([['rId1', 'chart', '../charts/chart4.xml']])));
         charts.forEach((xml, i) => zip.set(`xl/charts/chart${i + 1}.xml`, utf8(xml)));
         await handle([{ name: 'grafikli-ornek.xlsx', data: await zip.write() }]);
+      });
+
+      // A synthetic document with charts: columns in a line of their own, a pie the text flows around and a line chart in
+      // a table cell. A chart of a document is drawn from the values its part cached; no workbook is embedded here.
+      $('sample-doc-chart').addEventListener('click', async () => {
+        const utf8 = (text) => new TextEncoder().encode(text);
+        const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const PKG = 'http://schemas.openxmlformats.org/package/2006/relationships';
+        const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+        const C = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+        const A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+        const months = ['Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs'];
+        const points = (values) => `<c:ptCount val="${values.length}"/>` + values.map((value, i) => `<c:pt idx="${i}"><c:v>${value}</c:v></c:pt>`).join('');
+        const cats = `<c:cat><c:strRef><c:f>Sayfa1!$A$2:$A$6</c:f><c:strCache>${points(months)}</c:strCache></c:strRef></c:cat>`;
+        const series = (index, name, values) =>
+          `<c:ser><c:idx val="${index}"/><c:order val="${index}"/><c:tx><c:strRef><c:f>Sayfa1!$${'BC'[index]}$1</c:f><c:strCache>${points([name])}</c:strCache></c:strRef></c:tx>${cats}` +
+          `<c:val><c:numRef><c:f>Sayfa1!$${'BC'[index]}$2:$${'BC'[index]}$6</c:f><c:numCache><c:formatCode>General</c:formatCode>${points(values)}</c:numCache></c:numRef></c:val></c:ser>`;
+        const tea = series(0, 'Çay', [120, 150, 90, 200, 170]);
+        const coffee = series(1, 'Kahve', [80, 95, 130, 110, 60]);
+        const ids = '<c:axId val="1"/><c:axId val="2"/>';
+        const axes =
+          '<c:catAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>' +
+          '<c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines/><c:crossAx val="1"/></c:valAx>';
+        const chart = (title, plot, legend) =>
+          `${head}<c:chartSpace xmlns:c="${C}" xmlns:a="${A}" xmlns:r="${REL}"><c:chart>` +
+          `<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="tr-TR"/><a:t>${title}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val="0"/></c:title>` +
+          `<c:plotArea><c:layout/>${plot}</c:plotArea><c:legend><c:legendPos val="${legend}"/><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>`;
+        const charts = [
+          chart('Satışlar', `<c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/>${tea}${coffee}<c:gapWidth val="150"/>${ids}</c:barChart>${axes}`, 'r'),
+          chart('Çay', `<c:pieChart><c:varyColors val="1"/>${tea}<c:firstSliceAng val="0"/></c:pieChart>`, 'b'),
+          chart('Aylara göre', `<c:lineChart><c:grouping val="standard"/>${tea}${coffee}<c:marker val="1"/>${ids}</c:lineChart>${axes}`, 'b'),
+        ];
+        const EMU = 9525;
+        const graphic = (rel) => `<a:graphic xmlns:a="${A}"><a:graphicData uri="${C}"><c:chart xmlns:c="${C}" r:id="${rel}"/></a:graphicData></a:graphic>`;
+        const inline = (rel, id, width, height, text) =>
+          `<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${width * EMU}" cy="${height * EMU}"/><wp:docPr id="${id}" name="Grafik ${id}" descr="${text}"/>` +
+          `<wp:cNvGraphicFramePr/>${graphic(rel)}</wp:inline></w:drawing></w:r>`;
+        const floating = (rel, id, width, height, text) =>
+          '<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="2" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">' +
+          '<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>right</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+          `<wp:extent cx="${width * EMU}" cy="${height * EMU}"/><wp:wrapSquare wrapText="bothSides"/><wp:docPr id="${id}" name="Grafik ${id}" descr="${text}"/><wp:cNvGraphicFramePr/>${graphic(rel)}</wp:anchor></w:drawing></w:r>`;
+        const run = (text, bold) => `<w:r>${bold ? '<w:rPr><w:b/></w:rPr>' : ''}<w:t xml:space="preserve">${text}</w:t></w:r>`;
+        const para = (inner) => `<w:p>${inner}</w:p>`;
+        const filler = 'Bu paragraf pasta grafiğinin çevresinden akar: grafik sağda durur, metin solunda satır satır ilerler ve grafiğin altına inince sayfanın bütün genişliğini kullanır. ';
+        const body =
+          para(run('Grafikli örnek belge', true)) +
+          para(run('Aşağıdaki sütun grafiği kendi satırında durur.')) +
+          para(inline('rIdC1', 1, 440, 260, 'Aylara göre çay ve kahve satışları (sütun)')) +
+          para(floating('rIdC2', 2, 220, 200, 'Çay satışlarının aylara dağılımı (pasta)') + run(filler + filler + filler)) +
+          para(run('Tablo hücresindeki grafik:')) +
+          '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>' +
+          ['top', 'left', 'bottom', 'right', 'insideH', 'insideV'].map((side) => `<w:${side} w:val="single" w:sz="4" w:space="0" w:color="999999"/>`).join('') +
+          '</w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w="3000"/><w:gridCol w:w="6000"/></w:tblGrid><w:tr>' +
+          `<w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr>${para(run('Çizgi grafiği önbellekteki değerlerden çizilir; gömülü çalışma kitabı açılmaz.'))}</w:tc>` +
+          `<w:tc><w:tcPr><w:tcW w:w="6000" w:type="dxa"/></w:tcPr>${para(inline('rIdC3', 3, 380, 220, 'Aylara göre çay ve kahve satışları (çizgi)'))}</w:tc>` +
+          '</w:tr></w:tbl>' +
+          para('') +
+          '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>';
+        const rels = (items) => `${head}<Relationships xmlns="${PKG}">${items.map(([id, type, target]) => `<Relationship Id="${id}" Type="${REL}/${type}" Target="${target}"/>`).join('')}</Relationships>`;
+        const zip = new BymOffice.ZipArchive();
+        zip.set(
+          '[Content_Types].xml',
+          utf8(
+            `${head}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>' +
+              '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>' +
+              charts.map((_chart, i) => `<Override PartName="/word/charts/chart${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>`).join('') +
+              '</Types>',
+          ),
+        );
+        zip.set('_rels/.rels', utf8(rels([['rId1', 'officeDocument', 'word/document.xml']])));
+        zip.set('word/document.xml', utf8(`${head}<w:document xmlns:w="${W}" xmlns:r="${REL}" xmlns:wp="${WP}"><w:body>${body}</w:body></w:document>`));
+        zip.set('word/_rels/document.xml.rels', utf8(rels(charts.map((_chart, i) => [`rIdC${i + 1}`, 'chart', `charts/chart${i + 1}.xml`]))));
+        charts.forEach((xml, i) => zip.set(`word/charts/chart${i + 1}.xml`, utf8(xml)));
+        await handle([{ name: 'grafikli-ornek.docx', data: await zip.write() }]);
       });
 
       // A font file of the user's, registered under its file name for the family typed next to it.

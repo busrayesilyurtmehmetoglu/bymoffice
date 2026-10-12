@@ -106,7 +106,7 @@ function markerPath(ctx: CanvasRenderingContext2D, symbol: string, x: number, y:
   }
 }
 
-function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: ChartItem): void {
+function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: ChartItem, css: (font: ChartFont) => string): void {
   if (item.kind === 'rect') {
     const fill = safeColor(item.fill);
     const stroke = safeColor(item.stroke);
@@ -231,7 +231,7 @@ function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: Ch
   }
   // Text: only ever through fillText().
   if (typeof item.text !== 'string' || item.text === '') return;
-  painter.setFont(chartCssFont(item.font));
+  painter.setFont(css(item.font));
   painter.setFill(safeColor(item.color) || '#000000');
   ctx.textAlign = item.align;
   ctx.textBaseline = 'alphabetic';
@@ -250,9 +250,11 @@ function paintItem(ctx: CanvasRenderingContext2D, painter: TextPainter, item: Ch
 /**
  * Paints a layout with its top-left corner at (x, y), clipped to the frame of
  * the chart. The state of the context is as it was afterwards, also when
- * painting fails (the error is passed on).
+ * painting fails (the error is passed on). `css` names the value for
+ * `ctx.font` of a font of the chart, for a host that measured the layout with
+ * fonts of its own; default chartCssFont().
  */
-export function paintChartLayout(ctx: CanvasRenderingContext2D, layout: ChartLayout, x: number, y: number): void {
+export function paintChartLayout(ctx: CanvasRenderingContext2D, layout: ChartLayout, x: number, y: number, css: (font: ChartFont) => string = chartCssFont): void {
   if (!(layout.width > 0 && layout.height > 0)) return;
   const painter = new TextPainter(ctx);
   ctx.save();
@@ -265,7 +267,7 @@ export function paintChartLayout(ctx: CanvasRenderingContext2D, layout: ChartLay
     ctx.lineJoin = 'miter';
     ctx.setLineDash([]);
     const items = layout.items;
-    for (let i = 0; i < items.length; i++) paintItem(ctx, painter, items[i]);
+    for (let i = 0; i < items.length; i++) paintItem(ctx, painter, items[i], css);
   } finally {
     ctx.restore();
   }
@@ -284,6 +286,13 @@ export interface ChartRendererOptions {
   version?(): number;
   /** The name of a series that has none. */
   seriesName?(n: number): string;
+  /**
+   * The value for `ctx.font` of a font of a chart, for measuring and for painting alike:
+   * for a host that names its fonts another way than the grid does (a document, with the
+   * font list of its own measurer). It must be safe for a font name that comes from a
+   * file. Default chartCssFont().
+   */
+  cssFont?(font: ChartFont): string;
 }
 
 /** Numbers kept for the charts of one renderer, all charts together: values of points, cells of labels and the coordinates of what is drawn. */
@@ -361,7 +370,7 @@ export class ChartRenderer {
       const measure = (text: string, font: ChartFont): number => {
         let value = css.get(font);
         if (value === undefined) {
-          value = chartCssFont(font);
+          value = options.cssFont ? options.cssFont(font) : chartCssFont(font);
           css.set(font, value);
         }
         return painter.measure(value, text);
@@ -415,6 +424,6 @@ export class ChartRenderer {
 
   /** Paints a chart into the box (x, y, width, height). Throws when the chart cannot be laid out or painted; the context is then as it was. */
   paint(ctx: CanvasRenderingContext2D, chart: Chart, x: number, y: number, width: number, height: number): void {
-    paintChartLayout(ctx, this.layout(ctx, chart, width, height), x, y);
+    paintChartLayout(ctx, this.layout(ctx, chart, width, height), x, y, this.options.cssFont);
   }
 }

@@ -530,6 +530,9 @@ export function drawingContent(
     else {
       const placeholder: ImageItem = { type: 'image', x: 0, y: 0, width, height, placeholder: item.kind };
       if (item.description !== undefined) placeholder.alt = item.description;
+      // A chart the reader could read: drawn in the frame by a painter that draws charts.
+      const chart = item.kind === 'chart' && item.chartPart !== undefined && ctx.doc.charts ? ctx.doc.charts.get(item.chartPart) : undefined;
+      if (chart) placeholder.chart = chart;
       items.push(placeholder);
     }
   }

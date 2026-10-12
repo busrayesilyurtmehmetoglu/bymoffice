@@ -6,6 +6,7 @@
 // are used where they exist and replaced by plain drawing where they do not.
 
 import type { ImageItem, LayoutFont, LayoutPage, LineItem, RectItem, ShapeItem, TextItem } from '../layout/doc/types';
+import type { Chart } from '../model/sheet/chart';
 import { docCssFont } from './doc-measure';
 
 /** A decoded picture and its size in its own pixels (which may be fewer than the file has). */
@@ -33,6 +34,12 @@ export interface RenderPageOptions {
   background?: string | null;
   /** Words shown inside a placeholder (what stands there, or its alternative text). */
   placeholderLabel?(item: ImageItem): string | undefined;
+  /**
+   * Draws the charts of the page (ImageItem.chart) into their boxes, in px of
+   * the page: the context is already scaled. Without it, and for a chart it
+   * throws for, the placeholder is drawn. See DocChartPainter.
+   */
+  charts?: { paint(ctx: CanvasRenderingContext2D, chart: Chart, x: number, y: number, width: number, height: number): void };
 }
 
 const COLOR = /^#[0-9a-fA-F]{6}$/;
@@ -564,6 +571,19 @@ function drawImage(p: Painter, item: ImageItem): void {
     ctx.translate(-(item.x + item.width / 2), -(item.y + item.height / 2));
   }
   let drawn = false;
+  const charts = p.options.charts;
+  if (item.chart && charts) {
+    // The styles the painter of charts leaves behind are undone; the placeholder stands for a chart it fails for.
+    ctx.save();
+    try {
+      charts.paint(ctx, item.chart, item.x, item.y, item.width, item.height);
+      drawn = true;
+    } catch {
+      // Drawn below.
+    }
+    ctx.restore();
+    forget(p);
+  }
   if (loaded && loaded.width > 0 && loaded.height > 0) {
     const sx = cropLeft * loaded.width;
     const sy = cropTop * loaded.height;

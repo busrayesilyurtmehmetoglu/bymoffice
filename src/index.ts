@@ -68,7 +68,8 @@ export type {
 } from './model/sheet/chart';
 export { readXlsx } from './formats/xlsx/workbook';
 export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
-export { readDocx } from './formats/docx/document';
+export { readDocx, type DocxReadOptions } from './formats/docx/document';
+export { MAX_DOC_CHARTS, MAX_DOC_CHART_BYTES, MAX_DOC_CHART_POINTS, type DocChartLimits } from './formats/docx/charts';
 export { buildDocx, writeDocx, type DocxWriteReport } from './formats/docx/write';
 export { createBlank, type BlankOptions } from './formats/blank';
 export { convertForEditing, openConverted, type ConvertibleFile, type EditableConversion, type OpenedForEditing } from './formats/convert';
@@ -183,6 +184,7 @@ export { DocLayout } from './layout/doc/layout';
 export { revisionColor } from './layout/doc/prep';
 export type { DocLayoutOptions, FontMetrics, ImageItem, LayoutBudget, LayoutFont, LayoutPage, LayoutProgress, LineItem, PageItem, RectItem, ShapeItem, TextItem, TextMeasurer } from './layout/doc/types';
 export { renderPage, type PageImage, type RenderPageOptions } from './render/doc';
+export { DocChartPainter, type DocChartPainterOptions } from './render/doc-chart';
 export { baseFontFamily, registerFont, registeredFonts, unregisterFont, type FontRegistration, type FontSource, type RegisteredFont } from './render/fonts';
 export { EMBEDDED_FONT_FACES, EMBEDDED_FONT_FAMILY, configureEmbeddedFonts, embeddedFontsState, type EmbeddedFontsOptions, type EmbeddedFontsState } from './render/embedded-fonts';
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';

@@ -24,10 +24,12 @@ import type { OpcPackage, Relationship } from '../../opc';
 import { parseXml, type XmlComment, type XmlDocument, type XmlPI } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { linkFields, scanBlocks } from './body';
+import { readDocCharts, type DocChartLimits } from './charts';
 import { linkComments, parseSidePart } from './comments';
 import { bounded, createContext, createReaderState, kindOf, pushExtra, pushMisc, quote, type PartContext, type ReaderState } from './common';
+import { partNames } from '../xlsx/drawings';
 import { parseNumbering } from './numbering';
-import { parseFontTable, parseSettings, parseTheme } from './parts';
+import { parseFontTable, parseSettings, parseTheme, themeColorList } from './parts';
 import { SourceCursor, decodePart } from './source';
 import { parseDocStyles } from './styles';
 
@@ -235,10 +237,15 @@ function fillComment(comment: Comment, ctx: PartContext, attrs: AttrList): void 
   if (rest.length) comment.attrs = rest;
 }
 
-export async function readDocx(pkg: OpcPackage): Promise<DocModel> {
+/** Limits of reading a document, for hosts that want tighter ones than the defaults. */
+export interface DocxReadOptions extends DocChartLimits {}
+
+export async function readDocx(pkg: OpcPackage, options: DocxReadOptions = {}): Promise<DocModel> {
   const main = await pkg.mainPart();
   if (!main || !pkg.hasPart(main)) throw new Error('Invalid docx: the package has no main document part');
   const state = createReaderState();
+  const partName = partNames(pkg);
+  state.partName = partName;
   const rels = await pkg.relationships(main);
 
   const settingsTree = await readTree(pkg, supportingPart(pkg, rels, '/settings', state), state);
@@ -264,12 +271,14 @@ export async function readDocx(pkg: OpcPackage): Promise<DocModel> {
   for (const rel of rels) {
     const target = rel.type.endsWith('/header') ? headers : rel.type.endsWith('/footer') ? footers : undefined;
     if (!target || rel.external || !rel.part) continue;
-    if (!pkg.hasPart(rel.part)) {
+    // The part as the package spells it: ids that spell one part differently share its story, read once.
+    const part = partName(rel.part);
+    if (part === undefined) {
       state.warnings.push(`The ${target === headers ? 'header' : 'footer'} part ${quote(rel.part)} is missing`);
       continue;
     }
-    let story = byPart.get(rel.part);
-    if (!story) byPart.set(rel.part, (story = await readHeaderFooter(pkg, rel.part, state)));
+    let story = byPart.get(part);
+    if (!story) byPart.set(part, (story = await readHeaderFooter(pkg, rel.part, state)));
     target.set(rel.id, story);
   }
 
@@ -302,6 +311,11 @@ export async function readDocx(pkg: OpcPackage): Promise<DocModel> {
       else bounded(extended.root);
     }
     linkComments(model.comments, extended ? extended.root : undefined);
+  }
+  // The charts the frames of every story name, from the values their parts cached.
+  if (state.chartParts.size > 0) {
+    const charts = await readDocCharts(pkg, state.chartParts, themeColorList(theme), state.warnings, options);
+    if (charts) model.charts = charts;
   }
   model.strict = state.strict;
   return model;

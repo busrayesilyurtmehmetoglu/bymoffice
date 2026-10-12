@@ -21,7 +21,10 @@ import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, 
 import * as ops from '../ops/doc/index';
 import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
 import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
+import { getLocale, type FormatLocale } from '../format/locale';
 import { renderPage } from '../render/doc';
+import type { ChartRendererState } from '../render/chart';
+import { DocChartPainter } from '../render/doc-chart';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
 import { CanvasTextMeasurer } from '../render/doc-measure';
 import { onFontsChanged } from '../render/fonts';
@@ -182,6 +185,11 @@ const MAX_MARKED_COMMENTS = 2000;
 const COMMENT_MARK = 22;
 /** Marks that would lie over each other stand beside each other, in at most so many columns. */
 const MAX_MARK_COLUMNS = 6;
+/** The locale the numbers of charts are written in: that of the language of the view (Turkish or English), by default that of the browser. */
+function chartLocaleOf(locale: string | object | undefined): FormatLocale {
+  return getLocale(typeof locale === 'string' ? locale : typeof locale === 'undefined' && typeof navigator !== 'undefined' ? navigator.language : undefined);
+}
+
 /** How long one page waits for its pictures before it is printed with placeholders. */
 const PRINT_PICTURES_MS = 30000;
 
@@ -644,6 +652,10 @@ export class DocumentView {
   private readonly styleHost: Node;
   private readonly painter: CanvasTextMeasurer;
   private readonly measurer: TextMeasurer;
+  /** Draws the charts of the document on its pages, on screen and on paper; keeps what it worked out for them. */
+  private readonly charts: DocChartPainter;
+  /** Number formats of the charts follow it. */
+  private chartLocale: FormatLocale;
   private readonly images: ImageStore;
   private readonly pictures: { readPart(part: string): Promise<Uint8Array> };
   private printJob: PrintJob | undefined;
@@ -791,6 +803,13 @@ export class DocumentView {
     this.history = new ops.DocHistory<DocRange | undefined>(doc);
     this.painter = new CanvasTextMeasurer({ fonts: doc.fonts });
     this.measurer = options.measurer || this.painter;
+    this.chartLocale = chartLocaleOf(options.locale);
+    this.charts = new DocChartPainter({
+      cssFont: this.painter.cssFont,
+      family: doc.theme.minorFont.latin,
+      locale: () => this.chartLocale,
+      seriesName: (n) => this.strings.chartSeries(n),
+    });
     // Pictures put in while editing are in the model (a view may be made editable later); the others where the document was read from.
     const source = options.package;
     const pictures = {
@@ -1083,6 +1102,9 @@ export class DocumentView {
   setLocale(locale: string | object): void {
     if (this.destroyed) return;
     this.strings = resolveStrings(locale);
+    // Numbers and the made-up names of series of the charts are in the language of the view.
+    this.chartLocale = chartLocaleOf(locale);
+    this.charts.clear();
     this.root.setAttribute('aria-label', this.strings.document);
     this.applyInputMode();
     this.syncBalloon();
@@ -1112,6 +1134,8 @@ export class DocumentView {
     if (this.layoutTimer !== undefined) clearTimeout(this.layoutTimer);
     this.layoutTimer = undefined;
     this.painter.clear();
+    // The words of the charts are measured with the same fonts: they are laid out anew as well.
+    this.charts.clear();
     this.layoutEpoch++;
     // Places in the text are places of the model: an editor keeps its caret.
     if (!this.editable) this.selection = undefined;
@@ -1128,6 +1152,15 @@ export class DocumentView {
     this.runLayout(FIRST_SLICE_MS);
     // At once, so that the pages are not gone for a frame.
     this.update();
+  }
+
+  /**
+   * What is kept for the charts of the document and how often something was worked out for
+   * them (charts kept, their weight in numbers, how often cached values were read and charts
+   * laid out): for tests, and for whoever wants to see what charts cost.
+   */
+  getChartState(): ChartRendererState {
+    return this.charts.state();
   }
 
   /** What the view shows right now; for tests and for host pages that mirror it. */
@@ -1170,6 +1203,7 @@ export class DocumentView {
     this.endDrag();
     this.endPress();
     this.typing.destroy();
+    this.charts.clear();
     if (this.balloon) this.balloon.destroy();
     this.balloon = undefined;
     this.unlisten();
@@ -1324,6 +1358,7 @@ export class DocumentView {
             cssFont: this.painter.cssFont,
             metrics: this.metricsOf,
             placeholderLabel: this.placeholderLabel,
+            charts: this.charts,
           });
         };
         // Pictures of the pages before this one may make room for those of this one.
@@ -1614,6 +1649,8 @@ export class DocumentView {
       const entries = this.document.fonts.size;
       const fontsMoved = this.fontEntries >= 0 && entries !== this.fontEntries;
       this.fontEntries = entries;
+      // The charts too: their words are set in the fonts the table stands in for.
+      if (fontsMoved) this.charts.clear();
       progress = this.failed || fontsMoved ? undefined : this.engine.edited({ milliseconds: EDIT_LAYOUT_MS });
     } catch {
       progress = undefined;
@@ -2111,6 +2148,7 @@ export class DocumentView {
         cssFont: this.painter.cssFont,
         metrics: this.metricsOf,
         placeholderLabel: this.placeholderLabel,
+        charts: this.charts,
       });
       this.paintSelection(context, slot.index, scale);
       this.paintComments(context, slot, scale);

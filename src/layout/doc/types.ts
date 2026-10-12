@@ -6,6 +6,8 @@
 // 1 EMU = 1/9525 px). The model keeps the units of the file; the engine
 // converts once.
 
+import type { Chart } from '../../model/sheet/chart';
+
 /** A font as text is measured and painted with it. */
 export interface LayoutFont {
   /** Family name from the document, already resolved through styles and theme. */
@@ -158,6 +160,13 @@ export interface ImageItem {
    * of the size of the item.
    */
   placeholder?: string;
+  /**
+   * The chart that stands here, for an item whose `placeholder` is "chart"
+   * and whose chart could be read. A painter that draws charts draws it in
+   * the box of the item; any other draws the placeholder. The words of a
+   * chart are no text of the page: they are in no TextItem.
+   */
+  chart?: Chart;
   /** Room the effects of the picture (shadow, glow) take beyond its box, px. */
   effect?: { left: number; top: number; right: number; bottom: number };
   flipH?: boolean;

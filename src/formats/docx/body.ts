@@ -57,6 +57,7 @@ import {
   MAX_EMU,
   MAX_NESTING,
   MAX_TWIPS,
+  MAX_CHART_FRAME_WARNINGS,
   MAX_XML_DEPTH,
   anyAttr,
   attr,
@@ -74,6 +75,7 @@ import {
   parseOnOff,
   pushExtra,
   pushMisc,
+  quote,
   relAttr,
   textOf,
   type PartContext,
@@ -422,6 +424,35 @@ function textBoxes(ctx: PartContext, el: XmlElement, depth: number): Block[][] |
 
 const DISTANCES = ['distT', 'distB', 'distL', 'distR'] as const;
 
+/**
+ * The chart part the <c:chart> of a frame names, under the name the package
+ * has it: a part of this package its relationship says is a chart. A frame that leads out of the file, to a part
+ * that is not there, or to something that is no chart has none (it shows a
+ * placeholder); the first two are said in the warnings.
+ */
+function chartPart(ctx: PartContext, el: XmlElement | undefined): string | undefined {
+  if (!el || localOf(el.name) !== 'chart') return undefined;
+  const rId = anyAttr(el, 'id');
+  const rel = rId === undefined ? undefined : ctx.relationships.get(rId);
+  if (!rel || rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chart') return undefined;
+  const state = ctx.state;
+  const warn = (text: string) => {
+    if (state.chartWarnings++ < MAX_CHART_FRAME_WARNINGS) state.warnings.push(text);
+  };
+  if (rel.external || rel.part === null) {
+    warn(`${ctx.part}: a chart with an external target is not shown`);
+    return undefined;
+  }
+  // The part as the package spells it: frames that spell one part differently show one chart, read once.
+  const part = state.partName ? state.partName(rel.part) : rel.part;
+  if (part === undefined) {
+    warn(`The chart part ${quote(rel.part)} is missing`);
+    return undefined;
+  }
+  state.chartParts.add(part);
+  return part;
+}
+
 function readDrawing(ctx: PartContext, el: XmlElement, depth: number): RunItem {
   const frame = child(el, 'inline') || child(el, 'anchor');
   if (!frame) return { type: 'unknown', xml: keep(ctx, el, 'r') };
@@ -522,6 +553,10 @@ function readDrawing(ctx: PartContext, el: XmlElement, depth: number): RunItem {
   if (data) {
     // The outermost object: a picture or shape (properties in spPr) or a group (grpSpPr).
     const top = firstElement(ctx, data);
+    if (item.kind === 'chart') {
+      const part = chartPart(ctx, top);
+      if (part !== undefined) item.chartPart = part;
+    }
     const transform = readTransform(child(child(top, 'spPr'), 'xfrm') || child(child(top, 'grpSpPr'), 'xfrm'));
     if (transform) item.transform = transform;
 

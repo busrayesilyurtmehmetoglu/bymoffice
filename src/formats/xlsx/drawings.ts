@@ -69,6 +69,60 @@ export interface ChartReading {
   points: number;
   /** Chart parts larger than this are not read. Default 32 MB. */
   maxPartBytes?: number;
+  /** Bytes of chart parts that may still be read; counted down. MAX_WORKBOOK_CHART_BYTES when missing. */
+  bytes?: number;
+  /** Bytes of drawing parts that may still be read; counted down. MAX_WORKBOOK_DRAWING_BYTES when missing. */
+  drawingBytes?: number;
+  /**
+   * What was made of each chart part so far, by the name the package has it under (null: not
+   * shown). Filled by the reader: a part that several drawings name, or one drawing in several
+   * spellings, is read and counted once.
+   */
+  known?: Map<string, Chart | null>;
+  /** Why a chart part of `known` could not be read: said again for every drawing that names it. */
+  failed?: Map<string, string>;
+  /** The names of the parts of the package; made by the reader on first use. */
+  names?: PartNames;
+  /** The package `known`, `failed` and `names` belong to: they are made anew for another one. */
+  of?: OpcPackage;
+}
+
+/** What `reading` knows of the parts of `pkg`; what it knew of another package is let go of. */
+function partsKnown(pkg: OpcPackage, reading: ChartReading): { names: PartNames; known: Map<string, Chart | null>; failed: Map<string, string> } {
+  if (reading.of !== pkg || !reading.names || !reading.known || !reading.failed) {
+    reading.of = pkg;
+    reading.names = partNames(pkg);
+    reading.known = new Map();
+    reading.failed = new Map();
+  }
+  return { names: reading.names, known: reading.known, failed: reading.failed };
+}
+
+/** Gives the name the package has a part under; undefined for a part it does not have. */
+export type PartNames = (part: string) => string | undefined;
+
+/**
+ * The names of the parts of a package as it spells them. Part names are compared without
+ * regard to case (OPC), so one part can be named in many spellings; whoever keeps what it
+ * read by part name has to keep it under one of them. A name that is spelt as an entry of
+ * the package is that entry; otherwise it is the first entry that differs in case only, as
+ * OpcPackage.readPart() reads it.
+ */
+export function partNames(pkg: Pick<OpcPackage, 'partNames'>): PartNames {
+  let exact: Set<string> | undefined;
+  let folded: Map<string, string> | undefined;
+  return (part) => {
+    if (!exact || !folded) {
+      exact = new Set();
+      folded = new Map();
+      for (const name of pkg.partNames()) {
+        exact.add(name);
+        const lower = name.toLowerCase();
+        if (!folded.has(lower)) folded.set(lower, name);
+      }
+    }
+    return exact.has(part) ? part : folded.get(part.toLowerCase());
+  };
 }
 
 interface ReadState {
@@ -632,6 +686,10 @@ const MAX_PART_BYTES = 64 * 1024 * 1024;
 
 /** Chart parts larger than this are not read; the chart is shown as a placeholder. */
 export const MAX_CHART_PART_BYTES = 32 * 1024 * 1024;
+/** Bytes of drawing parts read for one workbook, all sheets together; a drawing beyond them is not shown. */
+export const MAX_WORKBOOK_DRAWING_BYTES = 256 * 1024 * 1024;
+/** Bytes of chart parts read for one workbook, all charts together; a chart beyond them is shown as a placeholder. */
+export const MAX_WORKBOOK_CHART_BYTES = 64 * 1024 * 1024;
 
 /**
  * The charts a drawing part refers to, as far as `reading` reads them. A chart that could
@@ -642,24 +700,44 @@ export const MAX_CHART_PART_BYTES = 32 * 1024 * 1024;
 async function readCharts(pkg: OpcPackage, rels: Relationship[], themeColors: string[], reading: ChartReading, sheetBudget: { left: number }, warnings: string[]): Promise<Map<string, Chart>> {
   const charts = new Map<string, Chart>();
   const limit = reading.maxPartBytes !== undefined && reading.maxPartBytes >= 0 ? reading.maxPartBytes : MAX_CHART_PART_BYTES;
+  const { names, known, failed } = partsKnown(pkg, reading);
+  if (!(typeof reading.bytes === 'number' && reading.bytes >= 0)) reading.bytes = MAX_WORKBOOK_CHART_BYTES;
+  const warn = (text: string) => {
+    if (warnings.length < MAX_CHART_WARNINGS) warnings.push(text);
+  };
   let beyond = 0;
   for (const rel of rels) {
-    if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chart' || rel.external || !rel.part || charts.has(rel.part) || !pkg.hasPart(rel.part)) continue;
+    if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chart' || rel.external || !rel.part || charts.has(rel.part)) continue;
+    // The part as the package spells it: however a relationship spells it, it is read and counted once for the workbook.
+    const part = names(rel.part);
+    if (part === undefined) continue;
+    const made = known.get(part);
+    if (made !== undefined) {
+      if (made) charts.set(rel.part, made);
+      else if (failed.has(part)) warn(failed.get(part) as string);
+      continue;
+    }
     if (sheetBudget.left <= 0 || reading.charts <= 0) {
       beyond++;
       continue;
     }
     sheetBudget.left--;
     reading.charts--;
+    let chart: Chart | undefined;
     try {
-      const bytes = await pkg.readPart(rel.part);
+      const bytes = await pkg.readPart(part);
       if (bytes.length > limit) throw new Error('the part is too large');
-      const chart = reading.read(parseXml(bytes).root, themeColors, reading);
-      if (chart) charts.set(rel.part, chart);
+      if (bytes.length > reading.bytes) throw new Error('the charts of the workbook hold too many bytes');
+      reading.bytes -= bytes.length;
+      chart = reading.read(parseXml(bytes).root, themeColors, reading);
     } catch (error) {
       // A chart part that cannot be read (not XML, a DTD, too much of it) leaves its frame a placeholder.
-      if (warnings.length < MAX_CHART_WARNINGS) warnings.push(`Chart could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      const text = `Chart could not be read: ${error instanceof Error ? error.message : String(error)}`;
+      failed.set(part, text);
+      warn(text);
     }
+    known.set(part, chart || null);
+    if (chart) charts.set(rel.part, chart);
   }
   if (beyond > 0) warnings.push(`Charts beyond the limit of a sheet (${MAX_DRAWING_CHARTS}) or a workbook are not shown: ${beyond}`);
   return charts;
@@ -684,11 +762,23 @@ export async function readSheetDrawings(
 ): Promise<SheetDrawing[] | undefined> {
   let drawings: SheetDrawing[] = [];
   const chartBudget = { left: MAX_DRAWING_CHARTS };
+  const names = charts ? partsKnown(pkg, charts).names : partNames(pkg);
+  if (charts && !(typeof charts.drawingBytes === 'number' && charts.drawingBytes >= 0)) charts.drawingBytes = MAX_WORKBOOK_DRAWING_BYTES;
+  /** The drawing parts of this sheet that were read, as the package spells them: one that is named again, in whatever spelling, is not read again. */
+  const seen = new Set<string>();
   for (const rel of sheetRels) {
-    if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'drawing' || rel.external || !rel.part || !pkg.hasPart(rel.part)) continue;
+    if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'drawing' || rel.external || !rel.part) continue;
+    const part = names(rel.part);
+    if (part === undefined || seen.has(part)) continue;
+    seen.add(part);
     try {
-      const bytes = await pkg.readPart(rel.part);
+      const bytes = await pkg.readPart(part);
       if (bytes.length > MAX_PART_BYTES) throw new Error('the part is too large');
+      // A drawing several sheets name is read for each of them: what that costs is bounded for the workbook.
+      if (charts && charts.drawingBytes !== undefined) {
+        if (bytes.length > charts.drawingBytes) throw new Error('the drawings of the workbook hold too many bytes');
+        charts.drawingBytes -= bytes.length;
+      }
       const rels = await pkg.relationships(rel.part);
       const found = charts ? await readCharts(pkg, rels, themeColors, charts, chartBudget, warnings) : undefined;
       const read = parseDrawing(parseXml(bytes).root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), charts: found, warnings });

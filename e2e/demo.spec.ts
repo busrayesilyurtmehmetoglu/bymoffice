@@ -203,6 +203,31 @@ test.describe('demo page', () => {
     await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
     await expect(page.locator('#preview-section')).toBeHidden();
   });
+  test('the sample document with charts opens with its charts drawn', async ({ page }) => {
+    await page.locator('#sample-doc-chart').click();
+    await expect(page.locator('#status')).toHaveText('Biçim: docx (ooxml)');
+    await expect(page.locator('#doc-section')).toBeVisible();
+    await expect(page.locator('#doc canvas').first()).toBeVisible();
+    await page.waitForFunction(() => (window as any).__docView.layoutDone === true);
+    // The first two accent colours of Office: the series of the charts state no colour and the document has no theme.
+    const count = () =>
+      page.locator('#doc canvas').first().evaluate((element) => {
+        const canvas = element as HTMLCanvasElement;
+        const data = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height).data;
+        const out = { blue: 0, orange: 0, placeholder: 0 };
+        for (let i = 0; i < data.length; i += 4) {
+          if (Math.abs(data[i] - 0x44) < 6 && Math.abs(data[i + 1] - 0x72) < 6 && Math.abs(data[i + 2] - 0xc4) < 6) out.blue++;
+          else if (Math.abs(data[i] - 0xed) < 6 && Math.abs(data[i + 1] - 0x7d) < 6 && Math.abs(data[i + 2] - 0x31) < 6) out.orange++;
+          else if (data[i] === 241 && data[i + 1] === 243 && data[i + 2] === 244) out.placeholder++;
+        }
+        return out;
+      });
+    await expect.poll(async () => (await count()).blue, { message: 'the series of tea' }).toBeGreaterThan(500);
+    const found = await count();
+    expect(found.orange, 'the series of coffee').toBeGreaterThan(500);
+    expect(found.placeholder, 'no placeholder').toBe(0);
+    await expect(page.locator('#parts tr td:first-child', { hasText: '/word/charts/chart1.xml' })).toHaveCount(1);
+  });
   test('a docx opens in the document view; another file takes its place', async ({ page }) => {
     const input = await sampleDocx();
     await page.locator('#file').setInputFiles(upload('belge.docx', input));

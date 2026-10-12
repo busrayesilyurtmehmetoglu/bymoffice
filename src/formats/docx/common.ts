@@ -42,10 +42,23 @@ export interface ReaderState {
   warnings: string[];
   unknown: Map<string, number>;
   strict: boolean;
+  /** Chart parts the frames of the document name, as the package spells them, each once, in the order the frames were met. */
+  chartParts: Set<string>;
+  /**
+   * The name the package has a part under (part names are compared without regard to case, so a relationship may spell
+   * one otherwise); undefined for a part it does not have. Set by whoever reads a package. Without it every part a
+   * relationship names is taken to be there, under the name the relationship gives it.
+   */
+  partName?(part: string): string | undefined;
+  /** Warnings about frames of charts said so far: see MAX_CHART_FRAME_WARNINGS. */
+  chartWarnings: number;
 }
 
+/** Warnings about frames of charts that lead nowhere, for one document; further ones are not said. */
+export const MAX_CHART_FRAME_WARNINGS = 20;
+
 export function createReaderState(): ReaderState {
-  return { runProps: new Map(), paraProps: new Map(), warnings: [], unknown: new Map(), strict: false };
+  return { runProps: new Map(), paraProps: new Map(), warnings: [], unknown: new Map(), strict: false, chartParts: new Set(), chartWarnings: 0 };
 }
 
 /**
