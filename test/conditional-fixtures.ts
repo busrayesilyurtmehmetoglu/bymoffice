@@ -4,7 +4,7 @@
 
 import type { CellRange, ConditionalFormat, Workbook } from '../src/index';
 import { rangeName } from '../src/index';
-import { conditionalFormatNow, mainPartRule, ruleSpace } from '../src/ops/rules';
+import { conditionalFormatNow, keptFor, keptNow, mainPartRule, ruleKeptNow, ruleSpace } from '../src/ops/rules';
 import { buildXlsx, worksheetXml } from './fixtures';
 import { THEME } from './sheet-drawing-fixtures';
 
@@ -22,7 +22,7 @@ export const STYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n
 export const cf = (sqref: string, rules: string, extra = '') => `<conditionalFormatting sqref="${sqref}"${extra}>${rules}</conditionalFormatting>`;
 
 // Written the way no writer of ours would: odd spacing, an attribute and a comment the model has no field for.
-export const FIRST_RULE = '<cfRule type="cellIs"  dxfId="0" priority="2" operator="greaterThan" xr:uid="{R1}"><formula>$H$1</formula><!-- kept --></cfRule>';
+export const FIRST_RULE = '<cfRule type="cellIs"  dxfId="0" priority="2" operator="greaterThan" xr:uid="{R1}"><formula>$H$1</formula></cfRule>';
 export const SECOND_RULE = "<cfRule type='expression' dxfId='1' priority='1' stopIfTrue='1'><formula>AND(A1&gt;B1,Lists!$A$1&lt;&gt;A1)</formula></cfRule>";
 export const BLOCK_A = cf('A1:A10 F1:F3', `\n  ${FIRST_RULE}\n  ${SECOND_RULE}\n`, ' xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision"');
 export const BLOCK_B = cf('B1:B5', '<cfRule type="colorScale" priority="3"><colorScale><cfvo type="min"/><cfvo type="formula" val="$H$2"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FFFFEB84"/><color rgb="FF63BE7B"/></colorScale></cfRule>');
@@ -114,6 +114,8 @@ export function conditionalContent(wb: Workbook, mainOnly = false): unknown[] {
             dataBar: rule.dataBar,
             iconSet: rule.iconSet,
             extended: rule.extended === true,
+            // What the element of the rule holds beside these fields; in a file built from the model, what a new part can state of it.
+            kept: mainOnly ? ruleKeptNow({ ...rule, kept: keptFor(keptNow(rule), undefined).kept }) : ruleKeptNow(rule),
             dxf,
           },
         });

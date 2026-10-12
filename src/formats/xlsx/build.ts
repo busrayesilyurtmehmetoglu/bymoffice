@@ -59,6 +59,8 @@ import {
   type StyleSheet,
   type Workbook,
 } from '../../model/sheet/types';
+import { KEPT_MAIN, MAX_KEPT_DEPTH, unpackKept, type KeptAttr, type KeptNode, type RuleKept } from '../../model/sheet/types';
+import { keptFor, keptNow, ruleHolder } from '../../ops/rules';
 import { adjustCommentCell, adjustDrawingAnchor, commentEdits } from '../../render/sheet-drawings';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
 import { ZipArchive } from '../../zip';
@@ -735,19 +737,196 @@ export interface RuleExtra {
   attrs: string;
   /** Children of the <cfRule>, as text. */
   children: string;
-  /** Attributes of its <iconSet>, as they go into the start tag. */
-  icons?: string;
+  /** Attributes of its <colorScale>, <dataBar> or <iconSet>, as they go into the start tag. */
+  holder?: string;
   /**
-   * Children of its <iconSet> that are no thresholds, as text: those before the first <cfvo>,
-   * before the second, ..., and behind the last.
+   * Children of that element that are neither thresholds nor colours, as text: those before the
+   * first <cfvo>, before the second, ..., and the last entry what stands at the end of the element.
    */
-  iconsBetween?: string[];
+  between?: string[];
   /**
    * The threshold at `index` of its colour scale, data bar or icon set, given the element the
    * model alone would write: the source element where it says the same, or that element with
    * what changed.
    */
   cfvo?(index: number, written: string): string;
+  /** The same for the colour at `index` of a scale or a bar. */
+  color?(index: number, written: string): string;
+}
+
+const NS_XML = 'http://www.w3.org/XML/1998/namespace';
+const NS_XMLNS = 'http://www.w3.org/2000/xmlns/';
+
+/** The attributes conditionalRuleXml() and dataValidationXml() write themselves, per element. */
+const WRITTEN_ATTRS = {
+  cfRule: ['type', 'dxfId', 'priority', 'stopIfTrue', 'aboveAverage', 'percent', 'bottom', 'operator', 'text', 'timePeriod', 'rank', 'stdDev', 'equalAverage'],
+  colorScale: [] as string[],
+  dataBar: ['minLength', 'maxLength', 'showValue'],
+  iconSet: ['iconSet', 'showValue', 'reverse'],
+  cfvo: ['type', 'val'],
+  iconCfvo: ['type', 'val', 'gte'],
+  color: ['rgb', 'theme', 'indexed', 'tint', 'auto'],
+  dataValidation: ['type', 'errorStyle', 'operator', 'allowBlank', 'showDropDown', 'showInputMessage', 'showErrorMessage', 'errorTitle', 'error', 'promptTitle', 'prompt', 'sqref'],
+};
+
+/** The part kept content is written into: how it writes its own names, and the namespaces its root declares. */
+export interface KeptTarget {
+  /** What the part writes before a name of its own namespace: '' or "x:". */
+  prefix: string;
+  /** The namespace of the part itself. */
+  main: string;
+  /** The namespace of names without a prefix at the root: '' when the root declares none. */
+  plain: string;
+  /** The prefix the root declares for a namespace, by namespace. */
+  bound: Map<string, string>;
+  /** Every prefix the root declares. */
+  taken: Set<string>;
+}
+
+/** The target for a part with the root attributes `root` whose root element is written with `prefix`. */
+export function keptTarget(prefix: string, root: readonly [string, string][]): KeptTarget {
+  const target: KeptTarget = { prefix, main: '', plain: '', bound: new Map(), taken: new Set() };
+  for (const [name, value] of root) {
+    if (name === 'xmlns') target.plain = value;
+    else if (name.slice(0, 6) === 'xmlns:') {
+      target.taken.add(name.slice(6));
+      if (!target.bound.has(value)) target.bound.set(value, name.slice(6));
+    }
+  }
+  if (prefix === '') target.main = target.plain;
+  else for (const [uri, bound] of target.bound) if (`${bound}:` === prefix) target.main = uri;
+  if (target.main === '') target.main = NS_MAIN;
+  return target;
+}
+
+/** The target a part made by this module is: its root declares its own namespace and that of relationships. */
+const FRESH_TARGET = keptTarget('', [['xmlns', NS_MAIN], ['xmlns:r', NS_REL]]);
+
+/** A name XML can state as a local name: what the reader took from a file is one, what a caller put into the model may not be. */
+const isLocalName = (name: unknown): name is string => typeof name === 'string' && name !== '' && !/[\s<>&"'=/:!?;,()[\]{}#%$@^*+|\\~`]/.test(name) && !/^[\d.-]/.test(name);
+
+/**
+ * Writes what rules hold beside the fields of the model (RuleKept) as text for one part: names
+ * under the prefixes the root of the part declares, and a namespace it does not declare under
+ * a prefix that is declared on the element of the rule itself (see declarations()). Values go
+ * through the escapes of attributes and text; nothing of it is ever taken as markup.
+ */
+class KeptWriter {
+  private readonly local = new Map<string, string>();
+  private made = 0;
+
+  constructor(private readonly target: KeptTarget) {}
+
+  private prefixOf(ns: string): string {
+    const bound = this.target.bound.get(ns) || this.local.get(ns);
+    if (bound !== undefined) return bound;
+    let name: string;
+    do name = `ns${++this.made}`;
+    while (this.target.taken.has(name));
+    this.local.set(ns, name);
+    return name;
+  }
+
+  /** The namespaces used so far that the root does not declare, as attributes of the element of the rule. */
+  declarations(): string {
+    let out = '';
+    for (const [ns, name] of this.local) out += ` xmlns:${name}="${attrEscape(ns)}"`;
+    return out;
+  }
+
+  /**
+   * Attributes as they go into a start tag. `known` are the attributes the model writes into that
+   * tag itself: an element states an attribute once, so one of those is not written a second time
+   * (the reader never keeps one; a model put together by hand might), and neither is one that is
+   * listed twice or that would declare a namespace.
+   */
+  attrs(attrs: readonly KeptAttr[] | undefined, known: readonly string[] = []): string {
+    let out = '';
+    if (!Array.isArray(attrs)) return out;
+    const seen = new Set<string>();
+    for (const attr of attrs) {
+      if (!Array.isArray(attr) || typeof attr[0] !== 'string' || !isLocalName(attr[1]) || typeof attr[2] !== 'string') continue;
+      const [ns, name, value] = attr;
+      if (ns === NS_XMLNS || (ns === '' && (name === 'xmlns' || known.indexOf(name) >= 0)) || seen.has(`${ns} ${name}`)) continue;
+      seen.add(`${ns} ${name}`);
+      let stated: string;
+      if (ns === '') stated = name;
+      else if (ns === NS_XML) stated = `xml:${name}`;
+      else if (ns === KEPT_MAIN && this.target.prefix !== '') stated = this.target.prefix + name;
+      else stated = `${this.prefixOf(ns === KEPT_MAIN ? this.target.main : ns)}:${name}`;
+      out += ` ${stated}="${attrEscape(value)}"`;
+    }
+    return out;
+  }
+
+  /** One element; `plain` is the namespace names without a prefix are in where it stands. */
+  node(node: KeptNode, plain: string, depth = 1): string {
+    if (!node || typeof node !== 'object' || typeof node.ns !== 'string' || !isLocalName(node.name) || depth > MAX_KEPT_DEPTH) return '';
+    const ns = node.ns === KEPT_MAIN ? this.target.main : node.ns;
+    let name = node.name;
+    let declared = '';
+    if (node.ns === KEPT_MAIN && this.target.prefix !== '') name = this.target.prefix + name;
+    else if (ns === NS_XML) name = `xml:${name}`;
+    else if (node.ns === KEPT_MAIN || ns === '') {
+      // A name without a prefix: the namespace such names are in is stated where it is another one.
+      if (plain !== ns) {
+        declared = ` xmlns="${attrEscape(ns)}"`;
+        plain = ns;
+      }
+    } else name = `${this.prefixOf(ns)}:${name}`;
+    let inner = '';
+    if (Array.isArray(node.children)) for (const child of node.children) inner += typeof child === 'string' ? textEscape(child) : this.node(child, plain, depth + 1);
+    const start = `<${name}${declared}${this.attrs(node.attrs)}`;
+    return inner === '' ? `${start}/>` : `${start}>${inner}</${name}>`;
+  }
+
+  nodes(nodes: readonly KeptNode[] | undefined): string {
+    let out = '';
+    if (Array.isArray(nodes)) for (const node of nodes) out += this.node(node, this.target.plain);
+    return out;
+  }
+}
+
+/**
+ * What a conditional rule carries beside its fields (`kept`, cut down to what the part can
+ * state: see keptFor()) as conditionalRuleXml() takes it. What it holds of a scale, a bar or
+ * an icon set goes with the rule while the rule states that element; what it holds of the
+ * thresholds and the colours, while the rule has as many of them. Undefined for nothing.
+ */
+export function keptRuleExtra(rule: ConditionalRule, kept: RuleKept | undefined, target: KeptTarget): RuleExtra | undefined {
+  const content = kept && typeof kept === 'object' && !kept.over ? unpackKept(kept.packed) : undefined;
+  if (!content) return undefined;
+  const writer = new KeptWriter(target);
+  const extra: RuleExtra = { attrs: writer.attrs(content.attrs, WRITTEN_ATTRS.cfRule), children: writer.nodes(content.children) };
+  const holder = content.holder;
+  const now = ruleHolder(rule);
+  if (holder && now && holder.kind === now.kind) {
+    extra.holder = writer.attrs(holder.attrs, WRITTEN_ATTRS[now.kind]);
+    if (Array.isArray(holder.between)) extra.between = holder.between.map((nodes) => writer.nodes(nodes));
+    const thresholds = Array.isArray(holder.cfvo) && holder.cfvo.length === now.values ? holder.cfvo.map((item) => (item ? { attrs: writer.attrs(item.attrs, now.kind === 'iconSet' ? WRITTEN_ATTRS.iconCfvo : WRITTEN_ATTRS.cfvo), children: writer.nodes(item.children) } : undefined)) : undefined;
+    const colors = Array.isArray(holder.colors) && holder.colors.length === now.colors ? holder.colors.map((item) => (item ? { attrs: writer.attrs(item.attrs, WRITTEN_ATTRS.color), children: writer.nodes(item.children) } : undefined)) : undefined;
+    const added = (item: { attrs: string; children: string } | undefined, written: string) => {
+      if (!item || written.slice(-2) !== '/>') return written;
+      if (item.children === '') return `${written.slice(0, -2)}${item.attrs}/>`;
+      const name = /^<([^\s/>]+)/.exec(written);
+      return name ? `${written.slice(0, -2)}${item.attrs}>${item.children}</${name[1]}>` : written;
+    };
+    if (thresholds) extra.cfvo = (index, written) => added(thresholds[index], written);
+    if (colors) extra.color = (index, written) => added(colors[index], written);
+  }
+  // Every piece is written by now: the namespaces they needed are known.
+  extra.attrs = writer.declarations() + extra.attrs;
+  return extra;
+}
+
+/** The same for a data validation, as dataValidationXml() takes it. */
+export function keptValidationExtra(kept: RuleKept | undefined, target: KeptTarget): { attrs: string; children: string } | undefined {
+  const content = kept && typeof kept === 'object' && !kept.over ? unpackKept(kept.packed) : undefined;
+  if (!content) return undefined;
+  const writer = new KeptWriter(target);
+  const attrs = writer.attrs(content.attrs, WRITTEN_ATTRS.dataValidation);
+  const children = writer.nodes(content.children);
+  return { attrs: writer.declarations() + attrs, children };
 }
 
 /**
@@ -780,37 +959,56 @@ export function conditionalRuleXml(rule: ConditionalRule, priority: number, dxfI
   if (rule.rank !== undefined) out += ` rank="${rule.rank}"`;
   if (extra) out += extra.attrs;
 
-  const threshold = (index: number, written: string) => (extra && extra.cfvo ? extra.cfvo(index, written) : written);
+  // What the rule holds of a scale, a bar or an icon set is that of the one element it states (the first of these, where a model has more).
+  const holder = rule.iconSet ? 'iconSet' : rule.colorScale ? 'colorScale' : rule.dataBar ? 'dataBar' : '';
+  const more = (kind: string) => (extra && kind === holder ? extra : undefined);
+  const thresholds = (kind: string, values: ConditionalValue[]) => {
+    const from = more(kind);
+    // The last entry is what stands at the end of the element, however many thresholds there are now.
+    const before = from && from.between ? from.between.slice(0, -1) : [];
+    let text = '';
+    values.forEach((value, i) => {
+      const written = conditionalValueXml(value, kind === 'iconSet', prefix);
+      text += (before[i] || '') + (from && from.cfvo ? from.cfvo(i, written) : written);
+    });
+    // What stood before thresholds the element has no more.
+    for (let i = values.length; i < before.length; i++) text += before[i];
+    return text;
+  };
+  const colors = (kind: string, list: Color[]) => {
+    const from = more(kind);
+    let text = '';
+    list.forEach((color, i) => {
+      const written = colorXml(`${prefix}color`, color);
+      text += from && from.color ? from.color(i, written) : written;
+    });
+    return text;
+  };
+  const start = (kind: string) => {
+    const from = more(kind);
+    return from && from.holder ? from.holder : '';
+  };
+  const end = (kind: string) => {
+    const from = more(kind);
+    return from && from.between && from.between.length > 0 ? from.between[from.between.length - 1] : '';
+  };
   let inner = '';
   for (const formula of rule.formulas.slice(0, 3)) inner += `<${prefix}formula>${escapeText(formula)}</${prefix}formula>`;
   if (rule.colorScale) {
-    inner += `<${prefix}colorScale>`;
-    rule.colorScale.values.forEach((value, i) => {
-      inner += threshold(i, conditionalValueXml(value, false, prefix));
-    });
-    for (const color of rule.colorScale.colors) inner += colorXml(`${prefix}color`, color);
-    inner += `</${prefix}colorScale>`;
+    inner += `<${prefix}colorScale${start('colorScale')}>${thresholds('colorScale', rule.colorScale.values)}${colors('colorScale', rule.colorScale.colors)}${end('colorScale')}</${prefix}colorScale>`;
   }
   if (rule.dataBar) {
     const bar = rule.dataBar;
     if (bar.extended && notes) notes.add('Conditional format: what the 2010 extension says about a data bar (border, axis, negative colours) is left out');
-    inner += `<${prefix}dataBar${bar.minLength !== 10 ? ` minLength="${bar.minLength}"` : ''}${bar.maxLength !== 90 ? ` maxLength="${bar.maxLength}"` : ''}${bar.showValue ? '' : ' showValue="0"'}>`;
-    inner += threshold(0, conditionalValueXml(bar.min, false, prefix)) + threshold(1, conditionalValueXml(bar.max, false, prefix)) + colorXml(`${prefix}color`, bar.color || { rgb: 'FF638EC6' });
+    inner += `<${prefix}dataBar${bar.minLength !== 10 ? ` minLength="${bar.minLength}"` : ''}${bar.maxLength !== 90 ? ` maxLength="${bar.maxLength}"` : ''}${bar.showValue ? '' : ' showValue="0"'}${start('dataBar')}>`;
+    inner += thresholds('dataBar', [bar.min, bar.max]) + colors('dataBar', [bar.color || { rgb: 'FF638EC6' }]) + end('dataBar');
     inner += `</${prefix}dataBar>`;
   }
   if (rule.iconSet) {
     const icons = rule.iconSet;
     if (icons.custom && notes) notes.add('Conditional format: icons chosen one by one (2010 extension) are written as their set');
-    inner += `<${prefix}iconSet iconSet="${escapeAttr(icons.set)}"${icons.showValue ? '' : ' showValue="0"'}${icons.reverse ? ' reverse="1"' : ''}${extra && extra.icons ? extra.icons : ''}>`;
-    const between = (extra && extra.iconsBetween) || [];
-    // The last entry is what stands behind the last threshold, however many thresholds there are now.
-    const before = between.slice(0, -1);
-    icons.values.forEach((value, i) => {
-      inner += (before[i] || '') + threshold(i, conditionalValueXml(value, true, prefix));
-    });
-    // What stood before thresholds the set has no more.
-    for (let i = icons.values.length; i < before.length; i++) inner += before[i];
-    if (between.length > 0) inner += between[between.length - 1];
+    inner += `<${prefix}iconSet iconSet="${escapeAttr(icons.set)}"${icons.showValue ? '' : ' showValue="0"'}${icons.reverse ? ' reverse="1"' : ''}${start('iconSet')}>`;
+    inner += thresholds('iconSet', icons.values) + end('iconSet');
     inner += `</${prefix}iconSet>`;
   }
   if (extra) inner += extra.children;
@@ -833,7 +1031,12 @@ function conditionalFormatsXml(sheet: Sheet, dxfOf: (rule: ConditionalRule) => n
   for (const format of formats) {
     const sqref = sqrefOf(format.ranges);
     let rules = '';
-    for (const rule of format.rules) rules += conditionalRuleXml(rule, rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++highest, dxfOf(rule), notes);
+    for (const rule of format.rules) {
+      // What the element of the rule held beside the fields of the model, as far as a new part can state it.
+      const fitted = keptFor(rule.extended ? undefined : keptNow(rule), undefined);
+      if (fitted.lost) notes.add('Conditional format: what a rule holds beside its settings in a namespace of an extension is left out');
+      rules += conditionalRuleXml(rule, rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++highest, dxfOf(rule), notes, '', keptRuleExtra(rule, fitted.kept, FRESH_TARGET));
+    }
     if (sqref === '' || rules === '') continue;
     const element = `<conditionalFormatting sqref="${sqref}">${rules}</conditionalFormatting>`;
     const text = format.live ? element : moved(element);
@@ -878,12 +1081,16 @@ export function dataValidationXml(validation: DataValidation, prefix = '', extra
  * Rules of the extension list are among those of the file: written here, their source is
  * read where it is.
  */
-function dataValidationsXml(sheet: Sheet, moved: (element: string) => string): string {
+function dataValidationsXml(sheet: Sheet, moved: (element: string) => string, notes: Notes): string {
   let rules = '';
   let count = 0;
   for (const validation of sheet.dataValidations || []) {
     if (!validation || !Array.isArray(validation.ranges) || sqrefOf(validation.ranges) === '') continue;
-    const element = validation.live ? dataValidationXml(validation) : moved(dataValidationXml(validation));
+    // As for a conditional rule: what its element held beside the fields of the model.
+    const fitted = keptFor(validation.kept, undefined);
+    if (fitted.lost) notes.add('Data validation: what a rule holds beside its settings in a namespace of an extension is left out');
+    const written = dataValidationXml(validation, '', keptValidationExtra(fitted.kept, FRESH_TARGET));
+    const element = validation.live ? written : moved(written);
     if (element === '') continue;
     rules += element;
     count++;
@@ -1597,7 +1804,7 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   if (merges.length !== sheet.merges.length) notes.add('Sheet: a merged range outside the sheet is left out', sheet.merges.length - merges.length);
   parts.push(mergeCellsXml({ ...sheet, merges }, ''));
   for (const format of conditionalFormatsXml(sheet, dxfOf, notes, (element) => adjustSheetElement(element, ownName, own, foreign, rename))) parts.push(format);
-  parts.push(dataValidationsXml(sheet, (element) => adjustSheetElement(element, ownName, own, foreign, rename)));
+  parts.push(dataValidationsXml(sheet, (element) => adjustSheetElement(element, ownName, own, foreign, rename), notes));
 
   let links = '';
   /** Cells that have a link; the cells of a very large range are noted as far as LINK_CELLS goes. */

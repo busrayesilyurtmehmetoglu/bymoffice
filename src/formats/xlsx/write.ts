@@ -43,6 +43,7 @@ import {
   type Row,
   type SharedString,
   type Sheet,
+  type SheetSpaces,
   type SheetNameMap,
   type SheetStructuralEdit,
   type SortState,
@@ -57,8 +58,8 @@ import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../../render/
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { parseColor } from './styles';
-import { conditionalRuleXml, dataValidationXml, freshSheetParts, type RuleExtra } from './build';
-import { ownCellFormulaAt, ownCellSpelling, ruleOrigin, type CellSpelling, type RuleOrigin } from '../../ops/rules';
+import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
+import { keptFor, keptNow, ownCellFormulaAt, ownCellSpelling, type CellSpelling } from '../../ops/rules';
 
 const encoder = new TextEncoder();
 
@@ -1346,8 +1347,6 @@ interface SheetRewrite {
   legacyDrawing?: string | null;
   /** The record of the style sheet that holds the format of a conditional rule, as this save writes the style sheet (see planDxfs()). */
   dxfOf?: (rule: ConditionalRule) => number | undefined;
-  /** The text, as the file has it, of each sheet part that a rule of this sheet was copied from (see ruleOrigin()). */
-  ruleParts?: ReadonlyMap<string, string>;
 }
 
 interface SheetRenames {
@@ -1583,11 +1582,10 @@ interface ConditionalPlan {
   sources: Map<string, string>;
   /** The attributes of the source elements of such rules other than their range (namespaces their rules may use, `pivot`). */
   blockAttrs: Map<number, string>;
-  /**
-   * For rules that a paste made (see ruleOrigin()), by originKey(): the element each was copied from, as far as
-   * this sheet can state it (see copiedRuleSource()), and the namespaces it uses that its own element declared.
-   */
-  origins: Map<string, { text: string; attrs: string }>;
+  /** The part that is written, for what rules without a source element hold beside the fields of the model (ConditionalRule.kept). */
+  target: KeptTarget;
+  /** The namespaces the root of that part lets readers pass over (as Sheet.spaces). */
+  spaces: SheetSpaces;
   /**
    * The source elements the model held when the sheet was read. Only those are the model's to
    * change or to take out: an element the reader did not take in (it has no rule, its range is
@@ -1620,8 +1618,8 @@ interface ExtensionChange {
   sqref?: string;
 }
 
-function conditionalPlanOf(sheet: Sheet, dxfOf: (rule: ConditionalRule) => number | undefined): ConditionalPlan {
-  const plan: ConditionalPlan = { kept: new Map(), live: [], sources: new Map(), blockAttrs: new Map(), origins: new Map(), known: new Set(), seen: 0, done: false, dxfOf, highest: 0, ext: new Map() };
+function conditionalPlanOf(sheet: Sheet, dxfOf: (rule: ConditionalRule) => number | undefined, target: KeptTarget, spaces: SheetSpaces): ConditionalPlan {
+  const plan: ConditionalPlan = { kept: new Map(), live: [], sources: new Map(), blockAttrs: new Map(), target, spaces, known: new Set(), seen: 0, done: false, dxfOf, highest: 0, ext: new Map() };
   // What the sheet came with: the list before its first change, or the list it still has.
   const read = sheet.conditionalRead ? sheet.conditionalRead.list : sheet.conditionalFormats;
   for (const format of read || []) for (const rule of (format && format.rules) || []) if (rule && rule.src && !rule.extended) plan.known.add(rule.src[0]);
@@ -1690,168 +1688,70 @@ function collectConditionalSources(s: string, plan: ConditionalPlan): void {
 
 const NS_MARKUP = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
 
-const originKey = (origin: RuleOrigin) => `${origin.part}\u0000${origin.rule[0]}:${origin.rule[1]}`;
-
-/** The rule a paste made, when it is written from the element it was copied from: one that has no element of its own in this part. */
-const copiedFrom = (rule: ConditionalRule): RuleOrigin | undefined => (rule.src ? undefined : ruleOrigin(rule));
-
-/** The parts that rules of a sheet were copied from (see ruleOrigin()): what the writer has to have at hand to write them. */
-function ruleOriginParts(sheet: Sheet, out: Set<string>): void {
-  for (const format of sheet.conditionalFormats || []) {
-    if (!format || !format.live || !Array.isArray(format.rules)) continue;
-    for (const rule of format.rules) {
-      const origin = rule ? copiedFrom(rule) : undefined;
-      if (origin) out.add(origin.part);
-    }
-  }
-}
-
-/** The namespaces a start tag declares by prefix, and the prefixes its mc:Ignorable names. */
-function declaredBy(attrs: readonly [string, string][]): { bound: Map<string, string>; ignorable: Set<string> } {
+/** The namespaces the mc:Ignorable of a root lets readers pass over: what the reader notes of it (Sheet.spaces). */
+function spacesOf(attrs: readonly [string, string][]): SheetSpaces {
   const bound = new Map<string, string>();
+  for (const [name, value] of attrs) if (name.slice(0, 6) === 'xmlns:') bound.set(name.slice(6), value);
   const ignorable = new Set<string>();
-  let markup: string | undefined;
   for (const [name, value] of attrs) {
-    if (name.slice(0, 6) === 'xmlns:') {
-      bound.set(name.slice(6), value);
-      if (value === NS_MARKUP) markup = name.slice(6);
+    const colon = name.indexOf(':');
+    if (colon <= 0 || name.slice(colon + 1) !== 'Ignorable' || bound.get(name.slice(0, colon)) !== NS_MARKUP) continue;
+    for (const prefix of value.split(/\s+/)) {
+      const uri = prefix === '' ? undefined : bound.get(prefix);
+      if (uri !== undefined) ignorable.add(uri);
     }
   }
-  if (markup !== undefined) for (const [name, value] of attrs) if (name === `${markup}:Ignorable`) for (const prefix of value.split(/\s+/)) if (prefix !== '') ignorable.add(prefix);
-  return { bound, ignorable };
+  return { ignorable: Array.from(ignorable).sort() };
 }
 
-const namePrefix = (name: string) => (name.indexOf(':') > 0 ? name.slice(0, name.indexOf(':')) : '');
+/** A comment or a processing instruction as it is written: content the model has no field for, kept where the element it is in is written anew. */
+const noteText = (node: XmlNode): string => (node.type === 'comment' ? `<!--${node.value}-->` : node.type === 'pi' ? `<?${node.target}${node.value ? ` ${node.value}` : ''}?>` : '');
 
-/**
- * An element a rule was copied from, as another element can state it: without what names the
- * element itself (an attribute `uid` of a revision namespace, the <ext> that ties it to its
- * counterpart in the extension list), and without what is in a namespace that is not at hand
- * where it is written. `usable` answers for a prefix that the element does not declare itself.
- */
-function portableRule(el: XmlElement, usable: (prefix: string) => boolean, local: readonly string[] = []): XmlElement {
-  const scope = local.slice();
-  for (const name of el.attrs.keys()) if (name.slice(0, 6) === 'xmlns:') scope.push(name.slice(6));
-  const known = (prefix: string) => prefix === '' || prefix === 'xml' || prefix === 'xmlns' || scope.indexOf(prefix) >= 0 || usable(prefix);
-  const attrs = new Map<string, string>();
-  for (const [name, value] of el.attrs) {
-    const prefix = namePrefix(name);
-    // The identity of the element: no other element may state it.
-    if (prefix !== '' && prefix !== 'xmlns' && localName(name) === 'uid') continue;
-    if (known(prefix)) attrs.set(name, value);
-  }
-  const children: XmlNode[] = [];
-  for (const node of el.children) {
-    if (node.type !== 'element') {
-      children.push(node);
-      continue;
-    }
-    if (!known(namePrefix(node.name)) && !node.attrs.has(`xmlns:${namePrefix(node.name)}`)) continue;
-    const name = localName(node.name);
-    // <ext><x14:id>: the rule this one was copied from has the counterpart, and keeps it.
-    if (name === 'ext' && node.children.some((child) => child.type === 'element' && localName(child.name) === 'id')) continue;
-    const kept = portableRule(node, usable, scope);
-    if (name === 'extLst' && !kept.children.some((child) => child.type === 'element')) continue;
-    children.push(kept);
-  }
-  return { type: 'element', name: el.name, attrs, children };
-}
-
-/**
- * Finds the elements that rules of the plan were copied from, in the parts they were read from
- * (`parts`: the text of each as the file has it), and keeps of each what the part that is
- * written can state: `prefix` is how that part writes the names of the main namespace and
- * `root` the attributes of its root. A namespace declared on the <conditionalFormatting> the
- * rule stood in goes with the rule; one declared on the root of the other part is used only
- * where this part declares it the same way (and lets a reader pass it over, if the other did).
- * A rule whose part writes the main namespace under another prefix is written from the model alone.
- */
-function collectRuleOrigins(plan: ConditionalPlan, parts: ReadonlyMap<string, string> | undefined, own: string, prefix: string, root: readonly [string, string][]): void {
-  const wanted = new Map<string, Set<string>>();
-  for (const format of plan.live) {
-    for (const rule of format.rules) {
-      const origin = copiedFrom(rule);
-      if (!origin) continue;
-      const places = wanted.get(origin.part);
-      if (places) places.add(`${origin.rule[0]}:${origin.rule[1]}`);
-      else wanted.set(origin.part, new Set([`${origin.rule[0]}:${origin.rule[1]}`]));
-    }
-  }
-  if (wanted.size === 0 || !parts) return;
-  const here = declaredBy(root);
-  for (const [part, places] of wanted) {
-    const text = parts.get(part);
-    if (text === undefined) continue;
-    const sc = new XmlScanner(text);
-    const rootLocal = openRoot(sc);
-    if (rootLocal === '' || sc.selfClosing || sc.name.slice(0, sc.name.length - rootLocal.length) !== prefix) continue;
-    const there = declaredBy(sc.attrs());
-    const same = part === own;
-    let seen = 0;
-    while (sc.next()) {
-      if (sc.kind === 'close') break;
-      if (sc.kind !== 'open') continue;
-      if (sc.local !== 'conditionalFormatting') {
-        sc.skip();
-        continue;
-      }
-      const index = seen++;
-      const block = declaredBy(sc.attrs());
-      const raw = sc.readRaw();
-      let at = 0;
-      for (const child of rawElement(raw).children) {
-        if (child.local !== 'cfRule') continue;
-        const place = `${index}:${at++}`;
-        if (!places.has(place)) continue;
-        const carried = new Set<string>();
-        const usable = (name: string) => {
-          const stated = block.bound.get(name);
-          if (stated !== undefined) {
-            carried.add(name);
-            return true;
-          }
-          const uri = there.bound.get(name);
-          if (uri === undefined) return false;
-          return same || (here.bound.get(name) === uri && (!there.ignorable.has(name) || here.ignorable.has(name)));
-        };
-        let kept: XmlElement;
-        try {
-          kept = portableRule(parseXml(raw.slice(child.start, child.end)).root, usable);
-        } catch (error) {
-          // Nested without end: the rule is written from the model alone.
-          if (error instanceof RangeError) continue;
-          throw error;
-        }
-        let attrs = '';
-        for (const name of carried) attrs += ` xmlns:${name}="${escapeAttr(block.bound.get(name) as string)}"`;
-        plan.origins.set(originKey({ part, rule: [index, at - 1] }), { text: elementText(kept), attrs });
-      }
-    }
-  }
-}
+/** Attributes the model has a field for, of the element that states the thresholds of a rule and of a colour; every other one of a source element is kept. */
+const HOLDER_ATTRS: Record<string, string[]> = { iconSet: ICON_SET_ATTRS, dataBar: ['minLength', 'maxLength', 'showValue'], colorScale: [] };
+const COLOR_ATTRS = ['rgb', 'theme', 'indexed', 'tint', 'auto'];
 
 /**
  * What the source element of a colour scale, a data bar or an icon set holds beside the fields
- * of the model, into `extra`: of each threshold its other attributes and its children (while
- * the element has as many thresholds as the model: thresholds that were given anew are
- * written as they are), and of an icon set its other attributes and the elements among its
- * thresholds.
+ * of the model, into `extra`: its other attributes and the elements among its thresholds, of
+ * each threshold its other attributes and its children (while the element has as many
+ * thresholds as the model: thresholds that were given anew are written as they are), and the
+ * same of each colour of a scale or a bar.
  */
-function keptThresholds(source: XmlElement, values: ConditionalValue[], icons: boolean, extra: RuleExtra): void {
+function keptThresholds(source: XmlElement, values: ConditionalValue[], kind: string, colors: number, extra: RuleExtra): void {
+  const icons = kind === 'iconSet';
   const nodes: XmlElement[] = [];
+  const tints: XmlElement[] = [];
   const between: string[] = [''];
   for (const node of source.children) {
-    if (node.type !== 'element') continue;
-    if (localName(node.name) === 'cfvo') {
+    if (node.type !== 'element') {
+      between[between.length - 1] += noteText(node);
+      continue;
+    }
+    const local = localName(node.name);
+    if (local === 'cfvo') {
       nodes.push(node);
       between.push('');
-    } else if (icons) between[between.length - 1] += elementText(node);
+    } else if (local === 'color' && !icons) tints.push(node);
+    else between[between.length - 1] += elementText(node);
   }
-  if (icons) {
-    let attrs = '';
-    for (const [name, value] of source.attrs) if (ICON_SET_ATTRS.indexOf(name) < 0) attrs += ` ${name}="${escapeAttr(value)}"`;
-    extra.icons = attrs;
-    extra.iconsBetween = between;
+  let attrs = '';
+  const known = HOLDER_ATTRS[kind] || [];
+  for (const [name, value] of source.attrs) if (known.indexOf(name) < 0) attrs += ` ${name}="${escapeAttr(value)}"`;
+  extra.holder = attrs;
+  extra.between = between;
+  if (tints.length === colors && colors > 0) {
+    extra.color = (index, written) => {
+      const node = tints[index];
+      if (!node || written.slice(-2) !== '/>') return written;
+      let more = '';
+      for (const [name, value] of node.attrs) if (COLOR_ATTRS.indexOf(name) < 0) more += ` ${name}="${escapeAttr(value)}"`;
+      let inner = '';
+      for (const child of node.children) if (child.type === 'element') inner += elementText(child);
+      if (inner === '') return more === '' ? written : `${written.slice(0, -2)}${more}/>`;
+      const name = /^<([^\s/>]+)/.exec(written);
+      return name ? `${written.slice(0, -2)}${more}>${inner}</${name[1]}>` : written;
+    };
   }
   if (nodes.length !== values.length) return;
   extra.cfvo = (index, written) => {
@@ -1884,10 +1784,11 @@ function keptThresholds(source: XmlElement, values: ConditionalValue[], icons: b
 /** A rule written from the model; one that came from the file keeps what its source holds beside the fields of the model. */
 function liveRuleXml(rule: ConditionalRule, prefix: string, plan: ConditionalPlan): string {
   const priority = rule.priority < Infinity && rule.priority >= 1 ? Math.floor(rule.priority) : ++plan.highest;
-  const origin = copiedFrom(rule);
-  const copied = origin ? plan.origins.get(originKey(origin)) : undefined;
-  const source = rule.src ? plan.sources.get(`${rule.src[0]}:${rule.src[1]}`) : copied ? copied.text : undefined;
-  if (source === undefined) return conditionalRuleXml(rule, priority, plan.dxfOf(rule), undefined, prefix);
+  const source = rule.src ? plan.sources.get(`${rule.src[0]}:${rule.src[1]}`) : undefined;
+  // Without an element of its own in this part (a rule that was pasted, the rule of a copied sheet): what the model
+  // holds of the element it came from, as far as this part can state it. Whoever put the rule here saw to that
+  // already (see keptFor()); a model that was put together by hand is cut down here.
+  if (source === undefined) return conditionalRuleXml(rule, priority, plan.dxfOf(rule), undefined, prefix, keptRuleExtra(rule, keptFor(keptNow(rule), plan.spaces).kept, plan.target));
   if (rule.extId !== undefined) {
     // A rule the extension list says more about is never changed in what it says (the model holds it with what
     // that list adds): its element is the source, with its place in the order and whether it stops the others.
@@ -1911,14 +1812,18 @@ function liveRuleXml(rule: ConditionalRule, prefix: string, plan: ConditionalPla
   // The element that states what the rule still states: its thresholds are those of the model, one for one.
   const holder = rule.iconSet ? 'iconSet' : rule.colorScale ? 'colorScale' : rule.dataBar ? 'dataBar' : '';
   const values = rule.iconSet ? rule.iconSet.values : rule.colorScale ? rule.colorScale.values : rule.dataBar ? [rule.dataBar.min, rule.dataBar.max] : [];
+  const colors = rule.iconSet ? 0 : rule.colorScale ? rule.colorScale.colors.length : rule.dataBar ? 1 : 0;
   let held = false;
   for (const node of root.children) {
-    if (node.type !== 'element') continue;
+    if (node.type !== 'element') {
+      extra.children += noteText(node);
+      continue;
+    }
     const local = localName(node.name);
     if (RULE_CHILDREN.indexOf(local) < 0) extra.children += elementText(node);
     else if (local === holder && !held) {
       held = true;
-      keptThresholds(node, values, holder === 'iconSet', extra);
+      keptThresholds(node, values, holder, colors, extra);
     }
   }
   return conditionalRuleXml(rule, priority, plan.dxfOf(rule), undefined, prefix, extra);
@@ -1936,9 +1841,7 @@ function liveConditionalXml(prefix: string, plan: ConditionalPlan): string {
     let attrs = '';
     for (const rule of format.rules) {
       rules += liveRuleXml(rule, prefix, plan);
-      const origin = copiedFrom(rule);
-      const copied = origin ? plan.origins.get(originKey(origin)) : undefined;
-      const from = rule.src ? plan.blockAttrs.get(rule.src[0]) : copied ? copied.attrs : undefined;
+      const from = rule.src ? plan.blockAttrs.get(rule.src[0]) : undefined;
       if (from !== undefined && attrs === '') attrs = from;
     }
     if (sqref !== '' && rules !== '') out += `<${prefix}conditionalFormatting${attrs} sqref="${sqref}">${rules}</${prefix}conditionalFormatting>`;
@@ -2132,10 +2035,13 @@ interface ValidationPlan {
   done: boolean;
   /** Live rules written so far. */
   written: Set<DataValidation>;
+  /** As ConditionalPlan.target and ConditionalPlan.spaces. */
+  target: KeptTarget;
+  spaces: SheetSpaces;
 }
 
-function validationPlanOf(sheet: Sheet): ValidationPlan {
-  const plan: ValidationPlan = { kept: new Set(), live: [], sources: new Map(), known: new Set(), seen: 0, done: false, written: new Set() };
+function validationPlanOf(sheet: Sheet, target: KeptTarget, spaces: SheetSpaces): ValidationPlan {
+  const plan: ValidationPlan = { kept: new Set(), live: [], sources: new Map(), known: new Set(), seen: 0, done: false, written: new Set(), target, spaces };
   const read = sheet.validationsRead ? sheet.validationsRead.list : sheet.dataValidations;
   for (const rule of read || []) if (rule && !rule.extended && rule.src !== undefined) plan.known.add(rule.src);
   for (const rule of sheet.dataValidations || []) {
@@ -2179,13 +2085,17 @@ function collectValidationSources(s: string, plan: ValidationPlan): void {
 /** A live rule as an element; one that came from the file keeps what its source holds beside the fields of the model. */
 function liveValidationXml(rule: DataValidation, prefix: string, plan: ValidationPlan): string {
   const source = rule.src === undefined ? undefined : plan.sources.get(rule.src);
-  if (source === undefined) return dataValidationXml(rule, prefix);
+  // Without an element of its own in this part: what the model holds of the element the rule came from (see liveRuleXml()).
+  if (source === undefined) return dataValidationXml(rule, prefix, keptValidationExtra(keptFor(rule.kept, plan.spaces).kept, plan.target));
   const root = parseXml(source).root;
   let attrs = '';
   for (const [name, value] of root.attrs) if (VALIDATION_ATTRS.indexOf(name) < 0) attrs += ` ${name}="${escapeAttr(value)}"`;
   let children = '';
   for (const node of root.children) {
-    if (node.type !== 'element') continue;
+    if (node.type !== 'element') {
+      children += noteText(node);
+      continue;
+    }
     const local = localName(node.name);
     if (local !== 'formula1' && local !== 'formula2') children += elementText(node);
   }
@@ -2365,14 +2275,13 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
   const state: ChildState = { sheetData: 0, linkPrefix: relPrefix, colsRaw: undefined, linksRaw: undefined, changed: false, filterMode, tabSelected: options.tabSelected, tabWindows: options.tabWindows, full: fresh, prefix };
   // Rules that were added, changed or deleted: the elements of the part follow the model, whatever else is written.
   if (fresh || sheet.validationsModified) {
-    state.validations = validationPlanOf(sheet);
+    state.validations = validationPlanOf(sheet, keptTarget(prefix, rootAttrs), spacesOf(rootAttrs));
     collectValidationSources(s, state.validations);
   }
   if (fresh || sheet.conditionalModified) {
     const stated = (rule: ConditionalRule) => (rule.dxfId !== undefined && rule.dxfId >= 0 && rule.dxfId < workbook.styles.dxfs.length ? rule.dxfId : undefined);
-    state.conditional = conditionalPlanOf(sheet, options.dxfOf ? options.dxfOf : stated);
+    state.conditional = conditionalPlanOf(sheet, options.dxfOf ? options.dxfOf : stated, keptTarget(prefix, rootAttrs), spacesOf(rootAttrs));
     collectConditionalSources(s, state.conditional);
-    collectRuleOrigins(state.conditional, options.ruleParts, sheet.part, prefix, rootAttrs);
   }
   /** Writes the regenerated elements that belong before the element of rank `rank` and were not in the source. */
   const flush = (rank: number) => {
@@ -2755,7 +2664,8 @@ function dxfElement(format: DifferentialFormat, base: XmlElement | undefined): X
   if (font && font.color) fontChildren.push(colorElement(`${prefix}color`, font.color));
   for (const node of rest) if (DXF_FONT_BEFORE_UNDERLINE.indexOf(localName(node.name)) < 0 && DXF_FONT_BEFORE_COLOR.indexOf(localName(node.name)) < 0) fontChildren.push(node);
   dxf.children = dxf.children.filter((node) => !(node.type === 'element' && (localName(node.name) === 'font' || localName(node.name) === 'fill')));
-  if (fontChildren.length > 0) insertInOrder(dxf, element(`${prefix}font`, oldFont ? Array.from(oldFont.attrs) : [], fontChildren), DXF_ORDER);
+  // A font that states something only in its attributes stays as well: the model holds a font for it (one that says nothing).
+  if (fontChildren.length > 0 || (oldFont && oldFont.attrs.size > 0)) insertInOrder(dxf, element(`${prefix}font`, oldFont ? Array.from(oldFont.attrs) : [], fontChildren), DXF_ORDER);
   const fill = format.fill;
   if (fill && fill.type === 'pattern') {
     // In a differential format a pattern that names no type is solid, and the colour of a solid fill is the background.
@@ -4806,15 +4716,6 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     });
   }
 
-  // The sheet parts that pasted rules were copied from, as the file has them: such a rule is written with what its element holds there.
-  const ruleParts = new Map<string, string>();
-  const originParts = new Set<string>();
-  for (const sheet of workbook.sheets) if (sheet.kind === 'worksheet' && (sheet.conditionalModified || sheet.part === '')) ruleOriginParts(sheet, originParts);
-  for (const part of originParts) {
-    const bytes = await peek(part);
-    if (bytes) ruleParts.set(part, decodeSource(bytes));
-  }
-
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
   /** Sheets marked as modified whose part came out as the bytes of the file. */
@@ -4934,7 +4835,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       // Only the notes of the sheet changed: every byte of the part stays but the element that names their boxes.
       if (bytes && legacyDrawing !== undefined && foreign.length === 0 && !rename && tabSelected === undefined && !rules) next = setLegacyDrawing(bytes, legacyDrawing, sheet.name);
       else if (bytes && (foreign.length > 0 || rename || tabSelected !== undefined || legacyDrawing !== undefined || rules)) {
-        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf, ruleParts });
+        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf });
       }
       // The colour of the tab, in the part as it is by now.
       if (bytes && tab) next = next ? setTabColorIn(next, sheet.tabColor, sheet.name) || next : tabbed.get(sheet);
@@ -4947,7 +4848,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     } else {
       const bytes = await originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
-      const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf, ruleParts }) as Uint8Array;
+      const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
       const next = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
       // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation.
       if (sameBytes(next, bytes)) asInFile.add(sheet);
@@ -5075,7 +4976,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       `${around.properties}<dimension ref="A1"/><sheetViews>${around.view}</sheetViews>${around.format}<sheetData/>${around.protection}${around.page}</worksheet>`;
     // A link to another file belongs to the relationships of the sheet it was made in; only places in the workbook are written.
     const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
-    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf, ruleParts }) as Uint8Array;
+    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf }) as Uint8Array;
     if (!originals.has(part)) originals.set(part, null);
     writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
     if (notes) {

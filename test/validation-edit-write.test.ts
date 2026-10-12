@@ -80,10 +80,10 @@ test('rules that were not touched keep their source text; the count follows; a r
   assert.equal(xml, original.replace(RULES, expected));
   assert.deepEqual(now(await reopen(saved)), now(doc.wb));
 
-  // The first rule cut as well: its unknown attributes and its comment-free children are written with it.
+  // The first rule cut as well: its unknown attributes, its children and its comment are written with it.
   apply(doc, setValidation(doc.wb, 0, range('A1'), undefined));
   const again = await partText(await save(doc), SHEET1);
-  assert.ok(again.includes('<dataValidation type="whole" showErrorMessage="1" xr:uid="{AAAA}" imeMode="off" sqref="A2:A10 C1:C3"><formula1>1</formula1><formula2>9</formula2></dataValidation>'), again);
+  assert.ok(again.includes('<dataValidation type="whole" showErrorMessage="1" xr:uid="{AAAA}" imeMode="off" sqref="A2:A10 C1:C3"><formula1>1</formula1><formula2>9</formula2><!-- kept --></dataValidation>'), again);
   assert.ok(!again.includes(FIRST));
 });
 
@@ -154,7 +154,8 @@ test('rules of the file and rules changed since are both where the view has them
 });
 
 test('a sheet that is not in the file is written with its rules, and so is a copy of a sheet', async () => {
-  const doc = await load(BODY + RULES + TAIL, [{ name: 'Lists', xml: '<sheetData/>' }]);
+  // (A rule with a comment in it is kept as the file has it, and is not copied: see rules-kept-review.test.ts.)
+  const doc = await load(BODY + RULES.replace('<!-- kept -->', '') + TAIL, [{ name: 'Lists', xml: '<sheetData/>' }]);
   apply(doc, [{ type: 'insertSheet', sheet: 2, name: 'New' }]);
   apply(doc, setValidation(doc.wb, 2, range('A1:A3'), { type: 'list', formula1: 'Data!$H$1:$H$2' }));
   apply(doc, [{ type: 'insert', sheet: 0, axis: 'row', at: 0, count: 1 }]);

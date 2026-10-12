@@ -8,7 +8,7 @@
 import { renameSheetsInFormula } from '../calc/refs';
 import { protectionNow } from '../formats/xlsx/build';
 import { commentCellNow } from '../render/sheet-drawings';
-import { conditionalFormatNow, dataValidationNow, extensionRuleCount, mainPartRule, ruleSpace, ruleWithFormulas } from './rules';
+import { conditionalFormatNow, dataValidationNow, extensionRuleCount, fittedConditional, fittedRule, keptOver, mainPartRule, ruleContentLosses, ruleSpace, ruleWithFormulas } from './rules';
 import { MAX_COLS, MAX_ROWS, checkSheetName, createSheet, foldSheetName, type Cell, type Color, type ConditionalFormat, type ConditionalRule, type DataValidation, type DefinedName, type Hyperlink, type Row, type Sheet, type SheetComment, type SheetNameMap, type SheetState, type Workbook } from '../model/sheet/types';
 import { copySheetProblem, deleteSheetProblem, insertSheetProblem, moveSheetProblem, renameSheetProblem, sheetStateProblem, tabColorProblem, type Op } from './ops';
 
@@ -187,7 +187,9 @@ export function canCopySheet(workbook: Workbook, index: number, options: CopyShe
 export interface CopySheetLoss {
   /**
    * "conditionalFormatExtensions" (conditional rules the extension list has, or says more
-   * about than the main part: those parts are not copied), "drawings" (pictures, shapes, charts),
+   * about than the main part: those parts are not copied), "ruleContent" (conditional rules and
+   * data validations whose element holds, beside the fields of the model, content that a sheet in
+   * no file cannot state: see keptFor()), "drawings" (pictures, shapes, charts),
    * "threadedComments", "externalLinks" (links to places outside the workbook), "pageBreaks",
    * "rowAttributes" (rows with attributes of another namespace than the sheet's own, the hint
    * x14ac:dyDescent aside; attributes without a namespace are copied), the kind of a part
@@ -218,6 +220,8 @@ export function copySheetLosses(workbook: Workbook, index: number): CopySheetLos
   };
   // The rules are copied; what the extension list says about them (a rule of its own, the border of a data bar) is not.
   add('conditionalFormatExtensions', extensionRuleCount(workbook, sheet));
+  // What a rule holds beside the fields of the model goes with it, but for what a part that is in no file cannot state (see keptFor()).
+  add('ruleContent', ruleContentLosses(workbook, sheet));
   add('drawings', sheet.drawings ? sheet.drawings.length : 0);
   let threaded = 0;
   for (const comment of sheet.comments || []) if (comment && comment.threaded && commentCellNow(comment, sheet.structuralEdits)) threaded++;
@@ -375,8 +379,10 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
   const validations: DataValidation[] = [];
   for (const rule of source.dataValidations || []) {
     const now = dataValidationNow(rule, space);
-    if (!now) continue;
-    const copied: DataValidation = { ...now, ranges: now.ranges.map((range) => ({ ...range })), live: true };
+    // A rule whose element holds what is not carried is not copied: it would say less than the rule it is a copy of (counted, see copySheetLosses()).
+    if (!now || keptOver(now)) continue;
+    // What its element holds beside the fields of the model goes along, as far as a sheet that is in no file can state it.
+    const copied: DataValidation = { ...fittedRule(now, undefined).rule, ranges: now.ranges.map((range) => ({ ...range })), live: true };
     delete copied.src;
     delete copied.extended;
     for (const key of ['formula1', 'formula2'] as const) if (typeof copied[key] === 'string') copied[key] = renamed(copied[key] as string);
@@ -390,10 +396,10 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
     if (!now) continue;
     const rules: ConditionalRule[] = [];
     for (const rule of now.rules) {
-      const kept = rule ? mainPartRule(rule) : undefined;
+      const kept = rule && !keptOver(rule) ? mainPartRule(rule) : undefined;
       if (!kept) continue;
       // Every formula of the rule, those of its thresholds included, names the copy where it named the sheet.
-      rules.push(ruleWithFormulas(kept, renamed));
+      rules.push(ruleWithFormulas(fittedConditional(kept, undefined).rule, renamed));
     }
     if (rules.length > 0) formats.push({ ranges: now.ranges.map((range) => ({ ...range })), rules, live: true });
   }

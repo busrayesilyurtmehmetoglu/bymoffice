@@ -600,6 +600,7 @@ export const STRINGS_EN: UiStrings = {
   copyLoss: (what, count) => {
     const names: Record<string, [string, string]> = {
       conditionalFormatExtensions: ['conditional format setting of a newer Excel', 'conditional format settings of a newer Excel'],
+      ruleContent: ['rule with content that only its own sheet can hold', 'rules with content that only their own sheet can hold'],
       drawings: ['picture or shape', 'pictures and shapes'],
       threadedComments: ['threaded comment', 'threaded comments'],
       externalLinks: ['link to another place', 'links to other places'],
@@ -625,8 +626,8 @@ export const STRINGS_EN: UiStrings = {
   notesNotPasted: (count) => (count === 1 ? 'One note was not pasted: its cell cannot take a note' : `${count} notes were not pasted: their cells cannot take notes`),
   rulesNotPasted: (count) =>
     count === 1
-      ? 'One data validation or conditional format could not be pasted as it is where the cells come from: it is of a kind that is kept as the file has it'
-      : `${count} data validations or conditional formats could not be pasted as they are where the cells come from: they are of a kind that is kept as the file has it`,
+      ? 'One data validation or conditional format did not come with the cells as it is: a rule that is kept as the file has it stays where it is and is not copied, and extension content this sheet cannot hold is left out'
+      : `${count} data validations or conditional formats did not come with the cells as they are: rules that are kept as the file has them stay where they are and are not copied, and extension content this sheet cannot hold is left out`,
   cannotHideLastSheet: 'The last visible sheet cannot be hidden',
   cannotSortThreaded: 'A range with a threaded comment cannot be sorted yet',
   sheetName: 'Sheet name',
@@ -1033,6 +1034,7 @@ export const STRINGS_TR: UiStrings = {
   copyLoss: (what, count) => {
     const names: Record<string, string> = {
       conditionalFormatExtensions: 'yeni Excel sürümüne özgü koşullu biçim ayarı',
+      ruleContent: 'içeriği yalnız kendi sayfasında durabilen kural',
       drawings: 'görsel ya da şekil',
       threadedComments: 'yorum zinciri',
       externalLinks: 'dış bağlantı',
@@ -1055,7 +1057,7 @@ export const STRINGS_TR: UiStrings = {
     return Object.prototype.hasOwnProperty.call(names, what) ? `${count} ${names[what]}` : what;
   },
   notesNotPasted: (count) => `${count} not yapıştırılmadı: hücresi not alamıyor`,
-  rulesNotPasted: (count) => `${count} veri doğrulama ya da koşullu biçim kuralı kaynaktaki gibi yapıştırılamadı: bu tür kurallar dosyadaki haliyle korunur`,
+  rulesNotPasted: (count) => `${count} veri doğrulama ya da koşullu biçim kuralı hücrelerle birlikte olduğu gibi gelmedi: dosyadaki haliyle korunan kural yerinde bırakılır ve kopyalanmaz, bu sayfanın tutamadığı uzantı içeriği ise kuraldan çıkarılır`,
   cannotHideLastSheet: 'Görünen son sayfa gizlenemez',
   cannotSortThreaded: 'Yorum zinciri içeren aralık henüz sıralanamıyor',
   sheetName: 'Sayfa adı',

@@ -11,7 +11,7 @@ import { open } from '../src/index';
 import { History } from '../src/ops/ops';
 import { canonical } from './workbook-content';
 import { checkPackage, checkSheetOrder, load, partNames, partText, reopen, save, sameBytes } from './rules-fixtures';
-import { conditionalCover, ownCellProblems, randomBook, randomStep, restatedProblem, rulesBuilt, rulesNow as validationsNow, rulesSeen as validationsSeen, seeded, validationBehaviour } from './rules-random-fixtures';
+import { conditionalCover, mceProblems, ownCellProblems, randomBook, randomStep, restatedProblem, rulesBuilt, rulesNow as validationsNow, rulesSeen as validationsSeen, seeded, validationBehaviour } from './rules-random-fixtures';
 
 
 async function run(seed: number, steps: number, rulesOnly: boolean, conditional = false, extensionOnly = false): Promise<void> {
@@ -79,6 +79,8 @@ async function run(seed: number, steps: number, rulesOnly: boolean, conditional 
         checkSheetOrder(xml, `${where}: ${name}`);
         // What a rule that looks at its own cell says by its kind, by its formula and by its first cell is one statement.
         assert.deepEqual(ownCellProblems(xml), [], `${where}: ${name}: rules that look at their own cell`);
+        // No rule took an attribute that names prefixes to a part where those prefixes name nothing.
+        assert.deepEqual(mceProblems(xml), [], `${where}: ${name}: prefixes named by markup-compatibility attributes`);
       }
       const back = await reopen(saved);
       assert.equal(canonical(validationsNow(back)), canonical(validationsNow(doc.wb)), `${where}: the saved file has other rules`);

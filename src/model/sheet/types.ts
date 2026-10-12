@@ -4,7 +4,7 @@
 // The model holds what the engine understands. Everything else stays in the
 // source package and is written back from there (see the lossless principle).
 
-import type { XmlElement } from '../../xml';
+import { parseXml, type XmlElement } from '../../xml';
 import type { Chart } from './chart';
 
 export const MAX_ROWS = 1048576;
@@ -201,6 +201,258 @@ export interface ConditionalIconSet {
   custom?: { set: string; id: number }[];
 }
 
+/**
+ * An attribute the model has no field for: the namespace it is in ('' for none, which is what
+ * an attribute without a prefix is in), its local name and its value. The namespace is the
+ * one the prefix of the file stood for, never the prefix: another part may bind it otherwise.
+ */
+export type KeptAttr = [ns: string, name: string, value: string];
+
+/**
+ * An element the model has no field for, as a small tree: its namespace (the one a name
+ * without a prefix is in included), its local name, its attributes and what it holds - elements
+ * and text, in the order of the file. Comments and processing instructions are not in it.
+ */
+export interface KeptNode {
+  ns: string;
+  name: string;
+  attrs?: KeptAttr[];
+  children?: (KeptNode | string)[];
+}
+
+/** What one element the model does have fields for (a threshold, a colour) holds beside them. */
+export interface KeptItem {
+  attrs?: KeptAttr[];
+  children?: KeptNode[];
+}
+
+/**
+ * What the <colorScale>, <dataBar> or <iconSet> of a rule holds beside the fields of the model.
+ * It goes with the rule while the rule states an element of that kind.
+ */
+export interface KeptHolder {
+  kind: 'colorScale' | 'dataBar' | 'iconSet';
+  attrs?: KeptAttr[];
+  /**
+   * Elements among its thresholds that the model does not know: those before the first <cfvo>,
+   * before the second, ..., and the last entry those behind the last one (written at the end of
+   * the element).
+   */
+  between?: KeptNode[][];
+  /** Per threshold, what its <cfvo> holds beside type, value (and, in an icon set, `gte`); null for one that holds nothing else. Used while the rule has as many thresholds. */
+  cfvo?: (KeptItem | null)[];
+  /** The same per <color> of a scale or a bar. */
+  colors?: (KeptItem | null)[];
+}
+
+/**
+ * What the element of a rule (<cfRule>, <dataValidation>) holds beside the fields of the model,
+ * with every name resolved to its namespace, as a tree: what the reader collects, what a writer
+ * states, and what the model holds packed into one text (see RuleKept, packKept()).
+ * What names the element itself is never in it (an attribute `uid` of a revision namespace, the
+ * <ext> that ties a rule to its counterpart in the extension list): no second element may state that.
+ */
+export interface KeptContent {
+  /** Attributes of the element, in the order of the file. */
+  attrs?: KeptAttr[];
+  /** Children of the element, in the order of the file. */
+  children?: KeptNode[];
+  /** Of a conditional rule: what its scale, bar or icon set holds. */
+  holder?: KeptHolder;
+}
+
+/**
+ * What the element of a rule holds beside the fields of the model, as the model holds it: the
+ * reader fills it, a rule that is copied takes it along, and the writer states it wherever the
+ * rule is written without its own element at hand. A rule without any such content has no `kept`.
+ */
+export interface RuleKept {
+  /**
+   * The content (KeptContent) as one text: see packKept() and unpackKept(). A text takes the
+   * memory of its characters, where a tree of objects takes many times that; two rules that
+   * hold the same have the same text.
+   */
+  packed?: string;
+  /**
+   * The namespaces among those used in the content that the part of the sheet the rule is in
+   * lets readers pass over (mc:Ignorable of its root), sorted. Content in one of them is written
+   * only into a part whose root says the same of that namespace; elsewhere it is left out, and
+   * whoever puts the rule there counts it (see keptFor() of the rule commands).
+   */
+  ignorable?: string[];
+  /**
+   * The element holds what a rule does not carry: more than MAX_KEPT_SIZE or deeper than
+   * MAX_KEPT_DEPTH, more than the budget of its sheet or workbook has left (MAX_KEPT_SHEET,
+   * MAX_KEPT_BOOK), content that names prefixes in its values (the markup-compatibility
+   * namespace, xsi:type), a comment or a processing instruction, a prefix nothing declares, or
+   * more of an element than the model has room for. Nothing of it is in the model. In the file
+   * it stays byte for byte, and a rule that is changed where it is still has all of it; the rule
+   * is not copied (it is kept as the file has it), which is counted where a copy is asked for.
+   */
+  over?: true;
+}
+
+/** The namespace kept content is said to be in when it is in the one of the part itself (transitional or strict): every part writes it as its own. */
+export const KEPT_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+
+/** Most of what a rule carries beside its fields: the characters of all names, namespaces and values together, and how deep its elements nest. */
+export const MAX_KEPT_SIZE = 8192;
+export const MAX_KEPT_DEPTH = 8;
+/** Most of it the rules of one sheet, and those of one workbook, hold together (in characters); the content of a rule beyond that stays in the file alone, as one over MAX_KEPT_SIZE does. */
+export const MAX_KEPT_SHEET = 4 * 1024 * 1024;
+export const MAX_KEPT_BOOK = 16 * 1024 * 1024;
+
+const NS_XML_SPACE = 'http://www.w3.org/XML/1998/namespace';
+const packText = (text: string) => text.replace(/[&<>\r]/g, (ch) => (ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : '&#13;'));
+const packValue = (text: string) => text.replace(/[&<"\t\n\r]/g, (ch) => (ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '"' ? '&quot;' : `&#${ch.charCodeAt(0)};`));
+
+/**
+ * Kept content as one text: a small XML document of its own, in which every namespace of the
+ * content has a prefix the document declares itself ("n0", "n1", ... in the order they are first
+ * used), so that the text says all there is to say. Equal content gives equal text. Undefined
+ * for content that holds nothing.
+ *
+ *   <k xmlns:n0="..."> <a .../> <c>...</c> <h k="iconSet"> <a .../> <b>...</b>... <vs><v><a .../><c>...</c></v>...</vs> <ts>...</ts> </h> </k>
+ *
+ * <a> carries attributes, <c> children, <b> one list of what stands among the thresholds, <vs>
+ * the thresholds and <ts> the colours (one <v> each). The elements of the document itself are in
+ * no namespace and stand at fixed places; the content is what is inside <a>, <c> and <b>.
+ */
+export function packKept(content: KeptContent | undefined): string | undefined {
+  if (!content || (!content.attrs && !content.children && !content.holder)) return undefined;
+  const prefixes = new Map<string, string>();
+  const named = (ns: string, name: string) => {
+    if (ns === '') return name;
+    if (ns === NS_XML_SPACE) return `xml:${name}`;
+    let prefix = prefixes.get(ns);
+    if (prefix === undefined) prefixes.set(ns, (prefix = `n${prefixes.size}`));
+    return `${prefix}:${name}`;
+  };
+  const attrs = (list: KeptAttr[] | undefined) => {
+    if (!list || list.length === 0) return '';
+    let out = '<a';
+    for (const attr of list) out += ` ${named(attr[0], attr[1])}="${packValue(attr[2])}"`;
+    return `${out}/>`;
+  };
+  const node = (item: KeptNode): string => {
+    let out = `<${named(item.ns, item.name)}`;
+    for (const attr of item.attrs || []) out += ` ${named(attr[0], attr[1])}="${packValue(attr[2])}"`;
+    if (!item.children || item.children.length === 0) return `${out}/>`;
+    out += '>';
+    for (const child of item.children) out += typeof child === 'string' ? packText(child) : node(child);
+    return `${out}</${named(item.ns, item.name)}>`;
+  };
+  const nodes = (tag: string, list: (KeptNode | string)[] | undefined, always = false) => {
+    if (!list || list.length === 0) return always ? `<${tag}/>` : '';
+    let out = `<${tag}>`;
+    for (const item of list) if (typeof item !== 'string') out += node(item);
+    return `${out}</${tag}>`;
+  };
+  const items = (tag: string, list: (KeptItem | null)[] | undefined) => {
+    if (!list) return '';
+    let out = `<${tag}>`;
+    for (const item of list) out += item ? `<v>${attrs(item.attrs)}${nodes('c', item.children)}</v>` : '<v/>';
+    return `${out}</${tag}>`;
+  };
+  let body = attrs(content.attrs) + nodes('c', content.children);
+  const holder = content.holder;
+  if (holder) {
+    body += `<h k="${holder.kind}">${attrs(holder.attrs)}`;
+    for (const list of holder.between || []) body += nodes('b', list, true);
+    body += `${items('vs', holder.cfvo)}${items('ts', holder.colors)}</h>`;
+  }
+  let root = '<k';
+  for (const [ns, prefix] of prefixes) root += ` xmlns:${prefix}="${packValue(ns)}"`;
+  // One text of its own: put together piece by piece, it would be held as the tree of its pieces, which takes many times its size.
+  return [root, '>', body, '</k>'].join('');
+}
+
+/** The content a text made by packKept() holds; undefined for none, and for a text that is no such text. */
+export function unpackKept(packed: string | undefined): KeptContent | undefined {
+  if (typeof packed !== 'string' || packed === '') return undefined;
+  let root: XmlElement;
+  try {
+    root = parseXml(packed).root;
+  } catch (error) {
+    return undefined;
+  }
+  if (root.name !== 'k') return undefined;
+  const spaces = new Map<string, string>();
+  for (const [name, value] of root.attrs) if (name.slice(0, 6) === 'xmlns:') spaces.set(name.slice(6), value);
+  const split = (name: string): [string, string] => {
+    const colon = name.indexOf(':');
+    if (colon < 0) return ['', name];
+    const prefix = name.slice(0, colon);
+    return [prefix === 'xml' ? NS_XML_SPACE : spaces.get(prefix) || '', name.slice(colon + 1)];
+  };
+  const attrs = (el: XmlElement): KeptAttr[] | undefined => {
+    let out: KeptAttr[] | undefined;
+    for (const [name, value] of el.attrs) {
+      const [ns, local] = split(name);
+      (out || (out = [])).push([ns, local, value]);
+    }
+    return out;
+  };
+  const node = (el: XmlElement): KeptNode => {
+    const [ns, name] = split(el.name);
+    const out: KeptNode = { ns, name };
+    const own = attrs(el);
+    if (own) out.attrs = own;
+    let children: (KeptNode | string)[] | undefined;
+    for (const child of el.children) {
+      if (child.type === 'element') (children || (children = [])).push(node(child));
+      else if (child.type === 'text' && child.value !== '') {
+        const last = children ? children[children.length - 1] : undefined;
+        if (children && typeof last === 'string') children[children.length - 1] = last + child.value;
+        else (children || (children = [])).push(child.value);
+      }
+    }
+    if (children) out.children = children;
+    return out;
+  };
+  const elements = (el: XmlElement) => el.children.filter((child): child is XmlElement => child.type === 'element');
+  const nodes = (el: XmlElement) => elements(el).map(node);
+  const items = (el: XmlElement) =>
+    elements(el).map((item): KeptItem | null => {
+      const out: KeptItem = {};
+      for (const part of elements(item)) {
+        if (part.name === 'a') {
+          const own = attrs(part);
+          if (own) out.attrs = own;
+        } else if (part.name === 'c') out.children = nodes(part);
+      }
+      return out.attrs || out.children ? out : null;
+    });
+  const content: KeptContent = {};
+  for (const part of elements(root)) {
+    if (part.name === 'a') {
+      const own = attrs(part);
+      if (own) content.attrs = own;
+    } else if (part.name === 'c') content.children = nodes(part);
+    else if (part.name === 'h') {
+      const kind = part.attrs.get('k');
+      if (kind !== 'colorScale' && kind !== 'dataBar' && kind !== 'iconSet') continue;
+      const holder: KeptHolder = { kind };
+      for (const inner of elements(part)) {
+        if (inner.name === 'a') {
+          const own = attrs(inner);
+          if (own) holder.attrs = own;
+        } else if (inner.name === 'b') (holder.between || (holder.between = [])).push(nodes(inner));
+        else if (inner.name === 'vs') holder.cfvo = items(inner);
+        else if (inner.name === 'ts') holder.colors = items(inner);
+      }
+      content.holder = holder;
+    }
+  }
+  return content.attrs || content.children || content.holder ? content : undefined;
+}
+
+/** What a rule that is put into a sheet has to know of the part of that sheet. */
+export interface SheetSpaces {
+  /** The namespaces the root of the part lets readers pass over (the prefixes of its mc:Ignorable, resolved), sorted. */
+  ignorable: string[];
+}
+
 /** One <cfRule>. Attributes that only some rule types use are present when the file states them. */
 export interface ConditionalRule {
   /** "cellIs", "expression", "colorScale", "dataBar", "iconSet", "top10", ... as in ST_CfType; unknown types are kept and never match. */
@@ -241,6 +493,8 @@ export interface ConditionalRule {
    * source element holds beside the fields of the model. A rule added since has none.
    */
   src?: [format: number, rule: number];
+  /** What the element of the rule holds beside these fields (see RuleKept); not read for a rule of the extension list, which is never written from the model. */
+  kept?: RuleKept;
 }
 
 /**
@@ -403,6 +657,8 @@ export interface DataValidation {
    * either applies.
    */
   live?: boolean;
+  /** What the element of the rule holds beside these fields (see RuleKept). */
+  kept?: RuleKept;
 }
 
 export interface RichRun {
@@ -900,6 +1156,13 @@ export interface Sheet {
    * which is what the list is for (see copySheetLosses()).
    */
   unmodelled?: string[];
+  /**
+   * Set by the reader for a part whose root lets readers pass over namespaces (mc:Ignorable):
+   * content of such a namespace that a rule holds beside the fields of the model can be put into
+   * this sheet only if its part says the same of that namespace (see RuleKept.ignorable and
+   * keptFor()). A sheet that is in no file has none.
+   */
+  spaces?: SheetSpaces;
   /**
    * Conditional formats. Those of the file are as the file has them and are not changed by
    * edits: rows and columns inserted or deleted since (structuralEdits) are applied where they

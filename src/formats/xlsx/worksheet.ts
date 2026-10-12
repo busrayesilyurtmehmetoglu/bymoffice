@@ -5,8 +5,14 @@
 // source package and are written back from there.
 
 import {
+  KEPT_MAIN,
   MAX_COLS,
+  MAX_KEPT_BOOK,
+  MAX_KEPT_DEPTH,
+  MAX_KEPT_SHEET,
+  MAX_KEPT_SIZE,
   MAX_ROWS,
+  packKept,
   cellName,
   parseCellRef,
   parseRange,
@@ -27,10 +33,16 @@ import {
   type FilterDateGroup,
   type HeaderFooter,
   type Hyperlink,
+  type KeptAttr,
+  type KeptContent,
+  type KeptHolder,
+  type KeptItem,
+  type KeptNode,
   type PageBreak,
   type PageSettings,
   type PrintOptions,
   type Row,
+  type RuleKept,
   type SharedString,
   type Sheet,
   type SheetPageSetup,
@@ -653,6 +665,364 @@ function parseSqref(text: string | undefined): CellRange[] {
 
 const flagAttr = (el: XmlElement, name: string, fallback: boolean) => parseBool(el.attrs.get(name), fallback);
 
+// ---------------------------------------------------------------------------
+// What a rule holds beside the fields of the model
+//
+// Read into the model with every name resolved to its namespace (see RuleKept), so that a
+// rule that is copied can be written wherever it goes without the part it was read from.
+
+const NS_MARKUP = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+const NS_XML = 'http://www.w3.org/XML/1998/namespace';
+
+/** The namespaces in scope at the root of a part: by prefix ('' for the one of names without a prefix), with its own and those readers may pass over. */
+interface PartSpaces {
+  bound: Map<string, string>;
+  main: string;
+  ignorable: Set<string>;
+  /** How many characters the rules of the sheet, and those of the workbook, may still hold (MAX_KEPT_SHEET, MAX_KEPT_BOOK). */
+  budget: { sheet: number; book: { left: number } };
+}
+
+/**
+ * What the rules of a workbook may still hold, by the list of shared strings its sheets are
+ * read with (one list for all the sheets of a workbook, and nothing else is common to them here).
+ */
+const BOOK_BUDGETS = new WeakMap<object, { left: number }>();
+
+/** Namespaces in which an attribute `uid` names the element it is on: the revision namespaces of Excel ("…/2014/revision", "…/2015/revision2", "…/2016/revision3", ...). */
+const REVISION_SPACE = /^http:\/\/schemas\.microsoft\.com\/office\/spreadsheetml\/20\d\d\/revision\d*$/;
+/** The namespace of the 2010 extension: its <id> in an <ext> of a rule ties the rule to its counterpart in the extension list. */
+const NS_X14 = 'http://schemas.microsoft.com/office/spreadsheetml/2009/9/main';
+/** xsi:type names a type by a prefix, as the attributes of the markup-compatibility namespace name namespaces by theirs. */
+const NS_XSI = 'http://www.w3.org/2001/XMLSchema-instance';
+
+/**
+ * A text of its own: what is cut out of the text of a part may be held as a piece of that text
+ * by the engine, and would keep all of it in memory for as long as the model lives.
+ */
+const ownText = (text: string): string => (text.length < 12 ? text : text.split('').join(''));
+
+/** With the root open tag current. */
+function partSpaces(sc: XmlScanner, sheet: Sheet, book: object): PartSpaces {
+  const bound = new Map<string, string>();
+  const attrs = sc.attrs();
+  for (const [name, value] of attrs) {
+    if (name === 'xmlns') bound.set('', ownText(value));
+    else if (name.slice(0, 6) === 'xmlns:') bound.set(ownText(name.slice(6)), ownText(value));
+  }
+  const ignorable = new Set<string>();
+  for (const [name, value] of attrs) {
+    const colon = name.indexOf(':');
+    if (colon <= 0 || name.slice(colon + 1) !== 'Ignorable' || bound.get(name.slice(0, colon)) !== NS_MARKUP) continue;
+    for (const prefix of value.split(/\s+/)) {
+      const uri = prefix === '' ? undefined : bound.get(prefix);
+      if (uri !== undefined) ignorable.add(uri);
+    }
+  }
+  const colon = sc.name.indexOf(':');
+  const main = bound.get(colon > 0 ? sc.name.slice(0, colon) : '') || '';
+  if (ignorable.size > 0) sheet.spaces = { ignorable: Array.from(ignorable).sort() };
+  let left = BOOK_BUDGETS.get(book);
+  if (!left) BOOK_BUDGETS.set(book, (left = { left: MAX_KEPT_BOOK }));
+  return { bound, main, ignorable, budget: { sheet: MAX_KEPT_SHEET, book: left } };
+}
+
+/** Attributes the model has a field for, per element; every other one is kept. */
+const KNOWN_RULE_ATTRS = new Set(['type', 'dxfId', 'priority', 'stopIfTrue', 'aboveAverage', 'percent', 'bottom', 'operator', 'text', 'timePeriod', 'rank', 'stdDev', 'equalAverage']);
+const KNOWN_RULE_CHILDREN = new Set(['formula', 'colorScale', 'dataBar', 'iconSet']);
+const KNOWN_HOLDER_ATTRS: Record<KeptHolder['kind'], Set<string>> = {
+  colorScale: new Set(),
+  dataBar: new Set(['minLength', 'maxLength', 'showValue']),
+  iconSet: new Set(['iconSet', 'showValue', 'reverse']),
+};
+const KNOWN_CFVO_ATTRS = new Set(['type', 'val']);
+const KNOWN_ICON_CFVO_ATTRS = new Set(['type', 'val', 'gte']);
+const KNOWN_COLOR_ATTRS = new Set(['rgb', 'theme', 'indexed', 'tint', 'auto']);
+const KNOWN_VALIDATION_ATTRS = new Set(['type', 'errorStyle', 'operator', 'allowBlank', 'showDropDown', 'showInputMessage', 'showErrorMessage', 'errorTitle', 'error', 'promptTitle', 'prompt', 'sqref']);
+const KNOWN_VALIDATION_CHILDREN = new Set(['formula1', 'formula2', 'sqref']);
+const NO_NAMES = new Set<string>();
+
+/** Does the element state anything but the attributes and children named: the test every rule passes through, which has to be cheap. */
+function holdsMore(el: XmlElement, attrs: Set<string>, children: Set<string>): boolean {
+  for (const name of el.attrs.keys()) if (!attrs.has(name)) return true;
+  for (const child of el.children) if (child.type === 'element' && !children.has(localName(child.name))) return true;
+  return false;
+}
+
+/** Does the element hold a comment or a processing instruction, at any depth: content no model field and no kept content stands for. */
+function holdsNotes(el: XmlElement): boolean {
+  for (const child of el.children) {
+    if (child.type === 'comment' || child.type === 'pi') return true;
+    if (child.type === 'element' && child.children.length > 0 && holdsNotes(child)) return true;
+  }
+  return false;
+}
+
+/** Thrown inside KeptReader for an element that holds more than a rule carries, or what cannot be resolved. */
+const TOO_MUCH = {};
+
+/** Collects what one rule element holds beside the fields of the model. */
+class KeptReader {
+  private size = 0;
+  private readonly used = new Set<string>();
+
+  constructor(private readonly spaces: PartSpaces) {}
+
+  /** The scope inside `el`: `outer` itself when the element declares no namespace. */
+  scope(el: XmlElement, outer: Map<string, string>): Map<string, string> {
+    let scope = outer;
+    for (const [name, value] of el.attrs) {
+      if (name !== 'xmlns' && name.slice(0, 6) !== 'xmlns:') continue;
+      if (scope === outer) scope = new Map(outer);
+      scope.set(name === 'xmlns' ? '' : name.slice(6), ownText(value));
+    }
+    return scope;
+  }
+
+  private count(text: string): void {
+    this.size += text.length + 4;
+    if (this.size > MAX_KEPT_SIZE) throw TOO_MUCH;
+  }
+
+  /** The namespace of a name with the prefix `prefix`; an attribute without one is in none. */
+  private space(prefix: string, scope: Map<string, string>, attr: boolean): string {
+    if (prefix === '') {
+      if (attr) return '';
+      const uri = scope.get('') || '';
+      if (uri === NS_MARKUP) throw TOO_MUCH;
+      return uri !== '' && uri === this.spaces.main ? KEPT_MAIN : uri;
+    }
+    if (prefix === 'xml') return NS_XML;
+    const uri = scope.get(prefix);
+    // A prefix nothing declares: the element stays in the file, and is not carried.
+    if (uri === undefined || uri === '') throw TOO_MUCH;
+    // What is in these namespaces names other namespaces by the prefixes of this part (mc:Ignorable="x14ac",
+    // Requires="x14", xsi:type="x:t"): stated in another part, the prefixes would name nothing, or something else.
+    if (uri === NS_MARKUP || (attr && uri === NS_XSI)) throw TOO_MUCH;
+    if (uri === this.spaces.main) return KEPT_MAIN;
+    if (this.spaces.ignorable.has(uri)) this.used.add(uri);
+    return uri;
+  }
+
+  /** The attributes of `el` but those named in `known`, declarations of namespaces and what names the element itself. */
+  attrs(el: XmlElement, scope: Map<string, string>, known: Set<string>): KeptAttr[] | undefined {
+    let out: KeptAttr[] | undefined;
+    for (const [name, value] of el.attrs) {
+      if (known.has(name) || name === 'xmlns' || name.slice(0, 6) === 'xmlns:') continue;
+      const colon = name.indexOf(':');
+      const local = colon > 0 ? name.slice(colon + 1) : name;
+      // The identity of the element, which no other element may state: `uid` of a revision namespace. Any other `uid` is content.
+      if (colon > 0 && local === 'uid' && REVISION_SPACE.test(scope.get(name.slice(0, colon)) || '')) continue;
+      const ns = this.space(colon > 0 ? name.slice(0, colon) : '', scope, true);
+      this.count(ns);
+      this.count(local);
+      this.count(value);
+      (out || (out = [])).push([ns, ownText(local), ownText(value)]);
+    }
+    return out;
+  }
+
+  /** An element as a tree; undefined for one that only ties its parent to another element of the file. */
+  node(el: XmlElement, outer: Map<string, string>, depth: number): KeptNode | undefined {
+    if (depth > MAX_KEPT_DEPTH) throw TOO_MUCH;
+    const scope = this.scope(el, outer);
+    const colon = el.name.indexOf(':');
+    const name = colon > 0 ? el.name.slice(colon + 1) : el.name;
+    // <ext><x14:id>: the counterpart in the extension list belongs to the rule of the file. An <id> of another namespace is content.
+    if (name === 'ext' && el.children.some((child) => child.type === 'element' && localName(child.name) === 'id' && this.scope(child, scope).get(child.name.indexOf(':') > 0 ? child.name.slice(0, child.name.indexOf(':')) : '') === NS_X14)) return undefined;
+    const node: KeptNode = { ns: this.space(colon > 0 ? el.name.slice(0, colon) : '', scope, false), name: ownText(name) };
+    this.count(node.ns);
+    this.count(name);
+    const attrs = this.attrs(el, scope, NO_NAMES);
+    if (attrs) node.attrs = attrs;
+    let children: (KeptNode | string)[] | undefined;
+    let elements = 0;
+    for (const child of el.children) {
+      if (child.type === 'text') {
+        this.count(child.value);
+        // Text in pieces (a CDATA section beside plain text) is one text: a file says no more of it.
+        const last = children ? children[children.length - 1] : undefined;
+        if (children && typeof last === 'string') children[children.length - 1] = ownText(last + child.value);
+        else if (child.value !== '') (children || (children = [])).push(ownText(child.value));
+      } else if (child.type === 'element') {
+        const kept = this.node(child, scope, depth + 1);
+        if (!kept) continue;
+        elements++;
+        (children || (children = [])).push(kept);
+      } else throw TOO_MUCH;
+    }
+    // A list of extensions that held nothing but such a tie.
+    if (name === 'extLst' && elements === 0) return undefined;
+    if (children) node.children = children;
+    return node;
+  }
+
+  /** The children of `el` but those named in `known`. */
+  children(el: XmlElement, scope: Map<string, string>, known: Set<string>): KeptNode[] | undefined {
+    let out: KeptNode[] | undefined;
+    for (const child of el.children) {
+      if (child.type !== 'element' || known.has(localName(child.name))) continue;
+      const kept = this.node(child, scope, 1);
+      if (kept) (out || (out = [])).push(kept);
+    }
+    return out;
+  }
+
+  /** What an element of the model with attributes `known` and no children of its own holds beside them; null for nothing. */
+  item(el: XmlElement, outer: Map<string, string>, known: Set<string>): KeptItem | null {
+    const scope = this.scope(el, outer);
+    const attrs = this.attrs(el, scope, known);
+    const children = this.children(el, scope, NO_NAMES);
+    if (!attrs && !children) return null;
+    const item: KeptItem = {};
+    if (attrs) item.attrs = attrs;
+    if (children) item.children = children;
+    return item;
+  }
+
+  /**
+   * The content as the model holds it (packed into one text), with the namespaces it uses that
+   * readers of the part may pass over; undefined when it holds nothing. Content the sheet or the
+   * workbook has no room left for is not held.
+   */
+  done(content: KeptContent): RuleKept | undefined {
+    const packed = packKept(content);
+    if (packed === undefined) return undefined;
+    const budget = this.spaces.budget;
+    if (packed.length > budget.sheet || packed.length > budget.book.left) throw TOO_MUCH;
+    budget.sheet -= packed.length;
+    budget.book.left -= packed.length;
+    const kept: RuleKept = { packed };
+    if (this.used.size > 0) kept.ignorable = Array.from(this.used).sort();
+    return kept;
+  }
+}
+
+/** What a <colorScale>, <dataBar> or <iconSet> holds beside the fields of the model; undefined for nothing. */
+function keptHolder(reader: KeptReader, el: XmlElement, kind: KeptHolder['kind'], outer: Map<string, string>): KeptHolder | undefined {
+  const scope = reader.scope(el, outer);
+  const holder: KeptHolder = { kind };
+  const attrs = reader.attrs(el, scope, KNOWN_HOLDER_ATTRS[kind]);
+  if (attrs) holder.attrs = attrs;
+  const between: KeptNode[][] = [[]];
+  const cfvo: (KeptItem | null)[] = [];
+  const colors: (KeptItem | null)[] = [];
+  let any = !!attrs;
+  let stray = false;
+  for (const child of el.children) {
+    if (child.type !== 'element') continue;
+    const local = localName(child.name);
+    if (local === 'cfvo') {
+      // A value stated in an element of its own is how the extension list writes it: not what the main part states.
+      if (child.children.some((inner) => inner.type === 'element' && localName(inner.name) === 'f')) throw TOO_MUCH;
+      const item = reader.item(child, scope, kind === 'iconSet' ? KNOWN_ICON_CFVO_ATTRS : KNOWN_CFVO_ATTRS);
+      if (item) any = true;
+      cfvo.push(item);
+      between.push([]);
+    } else if (local === 'color' && kind !== 'iconSet') {
+      const item = reader.item(child, scope, KNOWN_COLOR_ATTRS);
+      if (item) any = true;
+      colors.push(item);
+    } else {
+      const node = reader.node(child, scope, 1);
+      if (!node) continue;
+      between[between.length - 1].push(node);
+      stray = true;
+      any = true;
+    }
+  }
+  // A bar has two thresholds and one colour: more than the model holds of it is more than is carried.
+  if (kind === 'dataBar' && (cfvo.length > 2 || colors.length > 1)) throw TOO_MUCH;
+  if (!any) return undefined;
+  if (stray) holder.between = between;
+  if (cfvo.some((item) => item !== null)) holder.cfvo = cfvo;
+  if (colors.some((item) => item !== null)) holder.colors = colors;
+  return holder;
+}
+
+/** What a <cfRule> of the main part holds beside the fields of the model (see RuleKept); undefined for nothing. */
+function keptOfRule(el: XmlElement, spaces: PartSpaces, block: Map<string, string>): RuleKept | undefined {
+  const reader = new KeptReader(spaces);
+  try {
+    const scope = reader.scope(el, block);
+    if (holdsNotes(el)) throw TOO_MUCH;
+    const kept: KeptContent = {};
+    const attrs = reader.attrs(el, scope, KNOWN_RULE_ATTRS);
+    if (attrs) kept.attrs = attrs;
+    const children = reader.children(el, scope, KNOWN_RULE_CHILDREN);
+    if (children) kept.children = children;
+    let held = false;
+    for (const child of el.children) {
+      if (child.type !== 'element') continue;
+      const local = localName(child.name);
+      if (local !== 'colorScale' && local !== 'dataBar' && local !== 'iconSet') continue;
+      // The model holds one of each; a rule that states one twice is not carried.
+      if (held) throw TOO_MUCH;
+      held = true;
+      const holder = keptHolder(reader, child, local, scope);
+      if (holder) kept.holder = holder;
+    }
+    return reader.done(kept);
+  } catch (error) {
+    if (error !== TOO_MUCH) throw error;
+    return { over: true };
+  }
+}
+
+/**
+ * The same for a <dataValidation>, of the main part or of the extension list. What a rule of
+ * the extension list holds is in the words of that list (x14:...), which the main part - where
+ * a copy of the rule is written - has no place for: it is not carried.
+ */
+function keptOfValidation(el: XmlElement, spaces: PartSpaces, extension: boolean): RuleKept | undefined {
+  const reader = new KeptReader(spaces);
+  try {
+    const scope = reader.scope(el, spaces.bound);
+    if (holdsNotes(el)) throw TOO_MUCH;
+    const kept: KeptContent = {};
+    const attrs = reader.attrs(el, scope, KNOWN_VALIDATION_ATTRS);
+    if (attrs) kept.attrs = attrs;
+    const children = reader.children(el, scope, KNOWN_VALIDATION_CHILDREN);
+    if (children) kept.children = children;
+    if (extension && (attrs || children)) throw TOO_MUCH;
+    return reader.done(kept);
+  } catch (error) {
+    if (error !== TOO_MUCH) throw error;
+    return { over: true };
+  }
+}
+
+const HOLDER_CHILDREN = new Set(['cfvo', 'color']);
+const ICON_CHILDREN = new Set(['cfvo']);
+
+/** Does a <cfRule> of the main part hold anything the model has no field for. */
+function ruleHoldsMore(el: XmlElement): boolean {
+  if (holdsMore(el, KNOWN_RULE_ATTRS, KNOWN_RULE_CHILDREN)) return true;
+  let holders = 0;
+  for (const child of el.children) {
+    if (child.type !== 'element') continue;
+    const local = localName(child.name);
+    if (local !== 'colorScale' && local !== 'dataBar' && local !== 'iconSet') continue;
+    if (++holders > 1) return true;
+    const icons = local === 'iconSet';
+    if (holdsMore(child, KNOWN_HOLDER_ATTRS[local], icons ? ICON_CHILDREN : HOLDER_CHILDREN)) return true;
+    let thresholds = 0;
+    let colors = 0;
+    for (const inner of child.children) {
+      if (inner.type !== 'element') continue;
+      if (localName(inner.name) === 'cfvo') {
+        thresholds++;
+        if (holdsMore(inner, icons ? KNOWN_ICON_CFVO_ATTRS : KNOWN_CFVO_ATTRS, NO_NAMES)) return true;
+      } else {
+        colors++;
+        if (holdsMore(inner, KNOWN_COLOR_ATTRS, NO_NAMES)) return true;
+      }
+    }
+    if (local === 'dataBar' && (thresholds > 2 || colors > 1)) return true;
+  }
+  return false;
+}
+
 /** A <cfvo>: its value is the "val" attribute, or an <xm:f> child in the extension list. */
 function parseConditionalValue(el: XmlElement): ConditionalValue {
   const value: ConditionalValue = { type: el.attrs.get('type') || 'num', gte: flagAttr(el, 'gte', true) };
@@ -742,7 +1112,7 @@ function parseIconSet(el: XmlElement): ConditionalIconSet {
 }
 
 /** Reads a <cfRule>; `extension` is set for an <x14:cfRule>. The element of a data bar is handed back for linking. */
-function parseConditionalRule(el: XmlElement, extension: boolean): ConditionalRule {
+function parseConditionalRule(el: XmlElement, extension: boolean, spaces?: PartSpaces, block?: Map<string, string>): ConditionalRule {
   const priority = parseUint(el.attrs.get('priority'));
   const rule: ConditionalRule = {
     type: el.attrs.get('type') || '',
@@ -801,19 +1171,34 @@ function parseConditionalRule(el: XmlElement, extension: boolean): ConditionalRu
         break;
     }
   }
+  // A rule of the extension list is never written from the model: what it holds stays where it is.
+  if (!extension && spaces && (ruleHoldsMore(el) || holdsNotes(el))) {
+    const kept = keptOfRule(el, spaces, block || spaces.bound);
+    if (kept) rule.kept = kept;
+  }
   return rule;
 }
 
 /** With a <conditionalFormatting> open tag current (either namespace): reads it and consumes the element. */
-function parseConditionalFormatting(sc: XmlScanner, extension: boolean, index = -1): ConditionalFormat {
+function parseConditionalFormatting(sc: XmlScanner, extension: boolean, index = -1, spaces?: PartSpaces): ConditionalFormat {
   const el = parseXml(sc.readRaw()).root;
+  // The namespaces the element declares for its rules.
+  let block: Map<string, string> | undefined;
+  if (spaces) {
+    block = spaces.bound;
+    for (const [name, value] of el.attrs) {
+      if (name !== 'xmlns' && name.slice(0, 6) !== 'xmlns:') continue;
+      if (block === spaces.bound) block = new Map(block);
+      block.set(name === 'xmlns' ? '' : name.slice(6), ownText(value));
+    }
+  }
   // The range is an attribute in the main namespace and an <xm:sqref> child in the extension list.
   const sqref = firstElement(el, 'sqref');
   const format: ConditionalFormat = { ranges: parseSqref(sqref ? elementText(sqref) : el.attrs.get('sqref')), rules: [] };
   // Where the element and its rules are in the part: how the writer finds them again.
   if (index >= 0) format.src = index;
   childElements(el, 'cfRule').forEach((child, at) => {
-    const rule = parseConditionalRule(child, extension);
+    const rule = parseConditionalRule(child, extension, spaces, block);
     if (index >= 0) rule.src = [index, at];
     format.rules.push(rule);
   });
@@ -988,7 +1373,7 @@ function parseAutoFilter(sc: XmlScanner): AutoFilter | undefined {
 /** Most validations read from one sheet; the format allows 65,534. */
 const MAX_VALIDATIONS = 65534;
 
-function parseDataValidation(el: XmlElement, extension: boolean): DataValidation | undefined {
+function parseDataValidation(el: XmlElement, extension: boolean, spaces?: PartSpaces): DataValidation | undefined {
   // The range is an attribute in the main namespace and an <xm:sqref> child in the extension list.
   const sqref = firstElement(el, 'sqref');
   const ranges = parseSqref(sqref ? elementText(sqref) : el.attrs.get('sqref'));
@@ -1017,17 +1402,31 @@ function parseDataValidation(el: XmlElement, extension: boolean): DataValidation
     rule[name] = elementText(inner || child);
   }
   if (extension) rule.extended = true;
+  if (spaces && (holdsMore(el, KNOWN_VALIDATION_ATTRS, KNOWN_VALIDATION_CHILDREN) || holdsNotes(el))) {
+    const kept = keptOfValidation(el, spaces, extension);
+    if (kept) rule.kept = kept;
+  }
   return rule;
 }
 
 /** With a <dataValidations> open tag current (either namespace): reads its rules and consumes the element. */
-function parseDataValidations(sc: XmlScanner, out: DataValidation[], extension: boolean, seen?: { count: number }): void {
+function parseDataValidations(sc: XmlScanner, out: DataValidation[], extension: boolean, seen?: { count: number }, spaces?: PartSpaces): void {
+  // The namespaces the list declares for its rules.
+  if (spaces) {
+    let bound = spaces.bound;
+    for (const [name, value] of sc.attrs()) {
+      if (name !== 'xmlns' && name.slice(0, 6) !== 'xmlns:') continue;
+      if (bound === spaces.bound) bound = new Map(bound);
+      bound.set(name === 'xmlns' ? '' : name.slice(6), ownText(value));
+    }
+    if (bound !== spaces.bound) spaces = { bound, main: spaces.main, ignorable: spaces.ignorable, budget: spaces.budget };
+  }
   eachChild(sc, () => {
     if (sc.local !== 'dataValidation') return sc.skip();
     // Every element counts, read or not: the number is how the writer finds the element again.
     const index = seen ? seen.count++ : -1;
     if (out.length >= MAX_VALIDATIONS) return sc.skip();
-    const rule = parseDataValidation(parseXml(sc.readRaw()).root, extension);
+    const rule = parseDataValidation(parseXml(sc.readRaw()).root, extension, spaces);
     if (!rule) return;
     if (index >= 0) rule.src = index;
     out.push(rule);
@@ -1196,11 +1595,23 @@ function eachChild(sc: XmlScanner, visit: () => void): void {
 }
 
 /** With the worksheet's <extLst> open tag current: reads the conditional formats and the validations of the 2010 extension. */
-function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[], validations: DataValidation[], sheet: Sheet): void {
+function parseSheetExtensions(sc: XmlScanner, extended: ConditionalFormat[], validations: DataValidation[], sheet: Sheet, spaces: PartSpaces): void {
+  /** The scope with what the open tag that is current declares. */
+  const within = (outer: Map<string, string>) => {
+    let scope = outer;
+    for (const [name, value] of sc.attrs()) {
+      if (name !== 'xmlns' && name.slice(0, 6) !== 'xmlns:') continue;
+      if (scope === outer) scope = new Map(outer);
+      scope.set(name === 'xmlns' ? '' : name.slice(6), ownText(value));
+    }
+    return scope;
+  };
+  const list = within(spaces.bound);
   eachChild(sc, () => {
     if (sc.local !== 'ext') return sc.skip();
+    const ext = within(list);
     eachChild(sc, () => {
-      if (sc.local === 'dataValidations') return parseDataValidations(sc, validations, true);
+      if (sc.local === 'dataValidations') return parseDataValidations(sc, validations, true, undefined, { bound: within(ext), main: spaces.main, ignorable: spaces.ignorable, budget: spaces.budget });
       if (sc.local !== 'conditionalFormattings') {
         // Sparklines, slicers, ...: kept in the source part.
         unmodelled(sheet, sc.local);
@@ -1263,6 +1674,7 @@ function openRoot(sc: XmlScanner): void {
 export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[], sheet: Sheet): void {
   const sc = new XmlScanner(bytes);
   openRoot(sc);
+  const spaces = partSpaces(sc, sheet, sharedStrings);
 
   const rowState = { prevRow: -1 };
   const colState = { count: 0 };
@@ -1314,7 +1726,7 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           parseHyperlinks(sc, sheet);
           break;
         case 'conditionalFormatting':
-          conditional.push(parseConditionalFormatting(sc, false, formatsSeen++));
+          conditional.push(parseConditionalFormatting(sc, false, formatsSeen++, spaces));
           break;
         case 'autoFilter': {
           const filter = parseAutoFilter(sc);
@@ -1322,10 +1734,10 @@ export function parseWorksheet(bytes: Uint8Array, sharedStrings: SharedString[],
           break;
         }
         case 'dataValidations':
-          parseDataValidations(sc, validations, false, validationsSeen);
+          parseDataValidations(sc, validations, false, validationsSeen, spaces);
           break;
         case 'extLst':
-          parseSheetExtensions(sc, extended, validations, sheet);
+          parseSheetExtensions(sc, extended, validations, sheet, spaces);
           break;
         case 'pageMargins':
           if (!pageSetupOf(sheet).margins) pageSetupOf(sheet).margins = parsePageMargins(sc);

@@ -4,7 +4,8 @@
 // by the script that hands the files it makes to another reader.
 
 import type { CellRange, DataValidation, Workbook } from '../src/index';
-import { rangeName } from '../src/index';
+import { parseXml, rangeName } from '../src/index';
+import type { XmlElement } from '../src/xml';
 import { DataValidations } from '../src/format/validation';
 import type { History, Op } from '../src/ops/ops';
 import { CalcEngine } from '../src/calc/engine';
@@ -14,6 +15,7 @@ import {
   clearConditionalRules,
   conditionalRules,
   dataValidationNow,
+  validationKeptNow,
   moveConditionalRule,
   removeConditionalRule,
   ruleSpace,
@@ -118,13 +120,39 @@ export function ownCellProblems(xml: string): string[] {
   return out;
 }
 
+// What the rules of the three sheets hold beside the fields of the model, each sheet in its own way: the first in a
+// namespace its root lets readers pass over, the second in the same namespace under another prefix (passed over as
+// well), the third in a namespace that only the element of the rule declares. Each with an identity of its element.
+const NS_MC = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+const NS_XR = 'http://schemas.microsoft.com/office/spreadsheetml/2014/revision';
+export const NS_MINE = 'urn:example:mine';
+const ROOT_DATA = `xmlns:mc="${NS_MC}" mc:Ignorable="my xr" xmlns:my="${NS_MINE}" xmlns:xr="${NS_XR}"`;
+// The second sheet also lets readers pass over the namespace the third states on its rules without saying so.
+const ROOT_LISTS = `xmlns:mc="${NS_MC}" mc:Ignorable="q zz" xmlns:q="${NS_MINE}" xmlns:zz="urn:example:z"`;
+// Content that names prefixes (markup compatibility) and a comment: rules that are kept as the file has them.
+const ROOT_OTHER = `xmlns:mc="${NS_MC}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"`;
+const FIXED_OTHER =
+  cf('P1:P6', '<cfRule type="cellIs" dxfId="0" priority="31" operator="equal"><formula>7</formula><extLst><ext uri="{MCE}"><mc:AlternateContent><mc:Choice Requires="x14"><x14:thing/></mc:Choice><mc:Fallback><plain/></mc:Fallback></mc:AlternateContent></ext></extLst></cfRule>') +
+  cf('R1:R6', '<cfRule type="cellIs" dxfId="1" priority="32" operator="equal" mc:Ignorable="foo" xmlns:foo="urn:example:foo" foo:a="1"><formula>8</formula><!-- noted --></cfRule>');
+const KEPT_DATA = cf(
+  'N1:N6',
+  '<cfRule type="iconSet" priority="40" xr:uid="{KEPT-DATA}" my:mark="data" kept="data"><iconSet iconSet="3Arrows" percent="0"><cfvo type="percent" val="0" foo="bar"/><cfvo type="percent" val="33"><my:more/></cfvo><cfvo type="percent" val="67"/></iconSet></cfRule>',
+);
+const KEPT_LISTS = cf('N1:N6', '<cfRule type="colorScale" priority="20" q:mark="lists"><colorScale q:scale="s" plain="p"><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B" tone="t"/><color rgb="FF63BE7B"/></colorScale></cfRule>');
+const KEPT_OTHER = cf(
+  'N1:N6',
+  '<cfRule type="dataBar" priority="30" xr:uid="{KEPT-OTHER}" z:mark="other"><dataBar z:bar="b"><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="{OWN}"><z:own>text &amp; more</z:own></ext></extLst></cfRule>',
+  ` xmlns:z="urn:example:z" xmlns:xr="${NS_XR}"`,
+);
+const rooted = (root: string, inner: string) => worksheetXml(inner).replace('<worksheet ', `<worksheet ${root} `);
+
 /** Three sheets; the first has rules of every kind of place: several ranges, another sheet, the extension list. */
 export function randomBook(options: { conditional?: boolean; extensionOnly?: boolean } = {}): Promise<Uint8Array> {
   const data =
     '<sheetData><row r="1"><c r="A1"><v>5</v></c><c r="B1"><v>1</v></c><c r="H1"><v>1</v></c></row><row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>7</v></c><c r="H2"><v>2</v></c></row><row r="3"><c r="A3"><v>5</v></c><c r="C3"><v>4</v></c></row></sheetData>' +
-    (options.conditional ? BLOCK_A + BLOCK_B + BLOCK_C + BLOCK_D : '') +
+    (options.conditional ? BLOCK_A + BLOCK_B + BLOCK_C + BLOCK_D + KEPT_DATA : '') +
     '<dataValidations count="4">' +
-    dv('type="whole" showErrorMessage="1" errorTitle="Range" error="1 to 9" sqref="A1:A10 C1:C3"', '<formula1>1</formula1><formula2>9</formula2>') +
+    dv('type="whole" showErrorMessage="1" errorTitle="Range" error="1 to 9" imeMode="hiragana" my:note="data" xr:uid="{V-DATA}" sqref="A1:A10 C1:C3"', '<formula1>1</formula1><formula2>9</formula2>') +
     dv('type="list" allowBlank="1" showInputMessage="1" promptTitle="Pick" prompt="One of them" sqref="B1:B5"', '<formula1>$H$1:$H$2</formula1>') +
     dv('type="custom" showErrorMessage="1" errorStyle="warning" sqref="D2:E6"', '<formula1>AND(D2&gt;$H$1,Lists!$A$1&lt;&gt;D1)</formula1>') +
     dv('type="list" sqref="F1:F4"', '<formula1>Lists!$A$1:$A$3</formula1>') +
@@ -137,20 +165,21 @@ export function randomBook(options: { conditional?: boolean; extensionOnly?: boo
     '</x14:dataValidations></ext></extLst>';
   const lists =
     '<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>4</v></c></row></sheetData>' +
-    (options.conditional ? cf('A1:B3', '<cfRule type="cellIs" dxfId="1" priority="1" operator="equal"><formula>Data!$H$1</formula></cfRule>') + OWN_CELL_RULES : '') +
+    (options.conditional ? cf('A1:B3', '<cfRule type="cellIs" dxfId="1" priority="1" operator="equal"><formula>Data!$H$1</formula></cfRule>') + OWN_CELL_RULES + KEPT_LISTS : '') +
     '<dataValidations count="1">' +
-    dv('type="decimal" operator="greaterThan" sqref="A1:B3"', '<formula1>Data!$H$1</formula1>') +
+    dv('type="decimal" operator="greaterThan" q:note="lists" sqref="A1:B3"', '<formula1>Data!$H$1</formula1>') +
     '</dataValidations>';
   return buildXlsx({
     sheets: [
-      { name: 'Data', xml: worksheetXml(data) },
-      { name: 'Lists', xml: worksheetXml(lists) },
+      { name: 'Data', xml: rooted(ROOT_DATA, data) },
+      { name: 'Lists', xml: rooted(ROOT_LISTS, lists) },
       // Rules that say more than a dialog shows, elements the reader leaves out of the model, a validation with attributes of its own.
       {
         name: 'Other',
-        xml: worksheetXml(
+        xml: rooted(
+          ROOT_OTHER,
           '<sheetData/>' +
-            (options.conditional ? UNMODELLED_FORMATS + reviewRules(3) : '') +
+            (options.conditional ? UNMODELLED_FORMATS + reviewRules(3) + KEPT_OTHER + FIXED_OTHER : '') +
             `<dataValidations count="3" xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision">${UNMODELLED_VALIDATION}` +
             dv('type="list" imeMode="off" xr:uid="{CCCC}" allowBlank="1" sqref="K1:K5"', '<formula1>"a, b,c"</formula1>') +
             dv('type="whole" sqref="K7:K8"', '<formula1>SUM( $A$1:$A$3 )</formula1><formula2>99</formula2>') +
@@ -317,7 +346,7 @@ export function validationsNow(wb: Workbook): unknown[] {
       (sheet.dataValidations || [])
         .map((rule) => dataValidationNow(rule, space))
         .filter((rule): rule is DataValidation => !!rule)
-        .map((rule) => [rule.ranges.map(rangeName).join(' '), rule.type, rule.operator, rule.formula1, rule.formula2, rule.extended === true, ...message(rule)]),
+        .map((rule) => [rule.ranges.map(rangeName).join(' '), rule.type, rule.operator, rule.formula1, rule.formula2, rule.extended === true, ...message(rule), validationKeptNow(rule) || null]),
     ];
   });
 }
@@ -422,5 +451,41 @@ export function conditionalCover(wb: Workbook, sheetIndex: number): Map<string, 
       for (let row = range.top; row <= Math.min(range.bottom, 23); row++) for (let col = range.left; col <= Math.min(range.right, 17); col++) out.set(`${row},${col}`, (out.get(`${row},${col}`) || 0) + 1);
     }
   }
+  return out;
+}
+
+const NS_MCE = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+const MCE_PREFIX_LISTS = ['Ignorable', 'Requires', 'MustUnderstand', 'ProcessContent', 'PreserveElements', 'PreserveAttributes'];
+
+/**
+ * What is wrong with the markup-compatibility attributes of a part: each names prefixes
+ * (mc:Ignorable="x14ac xr", <mc:Choice Requires="x14">), and a prefix that is declared nowhere
+ * around it names nothing. Empty for a part that is in order.
+ */
+export function mceProblems(xml: string): string[] {
+  const out: string[] = [];
+  const visit = (el: XmlElement, outer: Map<string, string>) => {
+    let scope = outer;
+    for (const [name, value] of el.attrs) {
+      if (name.slice(0, 6) !== 'xmlns:') continue;
+      if (scope === outer) scope = new Map(outer);
+      scope.set(name.slice(6), value);
+    }
+    const colon = el.name.indexOf(':');
+    const mce = colon > 0 && scope.get(el.name.slice(0, colon)) === NS_MCE;
+    for (const [name, value] of el.attrs) {
+      const at = name.indexOf(':');
+      const local = at > 0 ? name.slice(at + 1) : name;
+      // Requires and the like are attributes without a prefix on the elements of the namespace; Ignorable and the like carry its prefix anywhere.
+      const listed = MCE_PREFIX_LISTS.indexOf(local) >= 0 && (at > 0 ? scope.get(name.slice(0, at)) === NS_MCE : mce);
+      if (!listed) continue;
+      for (const token of value.split(/\s+/)) {
+        const prefix = token.split(':')[0];
+        if (prefix !== '' && !scope.has(prefix)) out.push(`<${el.name}> ${name}="${value}": the prefix ${prefix} is declared nowhere`);
+      }
+    }
+    for (const child of el.children) if (child.type === 'element') visit(child, scope);
+  };
+  visit(parseXml(xml).root, new Map());
   return out;
 }

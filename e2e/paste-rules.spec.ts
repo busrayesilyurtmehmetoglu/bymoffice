@@ -280,7 +280,7 @@ test.describe('rules go with copied cells', () => {
     await copyTo(page, 'B2', 'D5');
     expect(await cellValue(page, 'D5')).toBe('Red');
     expect(await ruleAt(page, 'D5')).toBeNull();
-    await expect.poll(() => notices(page)).toEqual(['One data validation or conditional format could not be pasted as it is where the cells come from: it is of a kind that is kept as the file has it']);
+    await expect.poll(() => notices(page)).toEqual(['One data validation or conditional format did not come with the cells as it is: a rule that is kept as the file has it stays where it is and is not copied, and extension content this sheet cannot hold is left out']);
     // Pasted over: its cells keep it.
     await copyTo(page, 'A2', 'B3');
     expect(await cellValue(page, 'B3')).toBe(3);
@@ -388,7 +388,7 @@ test.describe('rules go with copied cells', () => {
     expect(await cellValue(page, 'C4')).toBe('Red');
     await expect
       .poll(() => notices(page))
-      .toEqual(['One note was not pasted: its cell cannot take a note; One data validation or conditional format could not be pasted as it is where the cells come from: it is of a kind that is kept as the file has it']);
+      .toEqual(['One note was not pasted: its cell cannot take a note; One data validation or conditional format did not come with the cells as it is: a rule that is kept as the file has it stays where it is and is not copied, and extension content this sheet cannot hold is left out']);
   });
 
   test('a read-only view copies and changes nothing: no cut, no paste, no rule moved', async ({ page }) => {

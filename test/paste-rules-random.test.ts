@@ -7,6 +7,11 @@
 // what decides how the cell looks. After every paste and cut, and every save, the
 // file is read back and says what the model says; everything undone gives the
 // rules of the file back as they were written.
+//
+// What a rule says includes what its element holds beside the fields of the model
+// (RuleKept): the copy holds what the rule it is a copy of holds, but for what the
+// sheet it is pasted into cannot state - and then the paste says that rules did
+// not come as they are.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -14,9 +19,10 @@ import { shiftFormula } from '../src/calc/refs';
 import { DataValidations } from '../src/format/validation';
 import type { CellRange, Workbook } from '../src/index';
 import { copyRange, cutRange, pasteAt, type CopiedRange } from '../src/ops/commands';
-import { conditionalRules, copiedRulesExtent, mainPartRule } from '../src/ops/rules';
+import { conditionalRules, copiedRulesExtent, keptFor, mainPartRule, ruleKeptNow, validationKeptNow } from '../src/ops/rules';
 import { checkPackage, checkSheetOrder, load, partNames, partText, reopen, save } from './rules-fixtures';
-import { ownCellProblems, randomBook, randomStep, rulesNow, rulesSeen, seeded } from './rules-random-fixtures';
+import { packKept } from '../src/model/sheet/types';
+import { mceProblems, ownCellProblems, randomBook, randomStep, rulesNow, rulesSeen, seeded } from './rules-random-fixtures';
 import { canonical } from './workbook-content';
 
 /** The block of cells of every sheet that the runs work in, and a little beyond it. */
@@ -47,12 +53,13 @@ function cellRules(wb: Workbook, sheetIndex: number): Map<string, CellRules> {
       const rule = validations.ruleAt(row, col);
       if (rule) {
         const home = (text: string | undefined) => (text === undefined ? undefined : shiftFormula(text, -rule.ranges[0].top, -rule.ranges[0].left, true));
-        entry.fixed = rule.extended === true;
-        entry.validation = canonical({ ...rule, ranges: undefined, src: undefined, live: undefined, extended: undefined, formula1: home(rule.formula1), formula2: home(rule.formula2) });
+        // A rule whose element holds what is not carried is kept as the file has it, as one of the extension list is.
+        entry.fixed = rule.extended === true || (!!rule.kept && rule.kept.over === true);
+        entry.validation = canonical({ ...rule, ranges: undefined, src: undefined, live: undefined, extended: undefined, formula1: home(rule.formula1), formula2: home(rule.formula2), kept: validationKeptNow(rule) });
       }
       for (const info of infos) {
         if (!info.ranges.some((range) => row >= range.top && row <= range.bottom && col >= range.left && col <= range.right)) continue;
-        if (info.rule.extended) {
+        if (info.rule.extended || (info.rule.kept && info.rule.kept.over)) {
           entry.order += 'k';
           entry.kept.push(canonical({ ...info.rule, src: undefined, priority: 0 }));
           continue;
@@ -64,9 +71,7 @@ function cellRules(wb: Workbook, sheetIndex: number): Map<string, CellRules> {
         // "$" (held against that cell where the file is saved, see ownCellProblems()). Where the rule was copied from is
         // a place in a file, as `src` is.
         const formulas = OWN_CELL_KINDS.indexOf(plain.type) >= 0 ? [] : plain.formulas.map((text) => shiftFormula(text, -info.ranges[0].top, -info.ranges[0].left, true));
-        // A format that says nothing about the font is read back with an empty record for it: the same format.
-        const format = info.format && info.format.font && Object.keys(info.format.font).length === 0 ? { ...info.format, font: undefined } : info.format;
-        entry.carried.push(canonical({ ...plain, origin: undefined, priority: 0, dxfId: undefined, dxf: undefined, formulas, format }));
+        entry.carried.push(canonical({ ...plain, priority: 0, dxfId: undefined, dxf: undefined, formulas, format: info.format, kept: ruleKeptNow(info.rule) }));
       }
       if (entry.validation !== undefined || entry.carried.length > 0 || entry.kept.length > 0) out.set(`${row},${col}`, entry);
     }
@@ -76,11 +81,6 @@ function cellRules(wb: Workbook, sheetIndex: number): Map<string, CellRules> {
 
 /** Two long texts are the same; the message of a failure shows where they part. */
 function sameText(actual: string, expected: string, label: string): void {
-  // A format whose record has a <font> that says nothing the model holds (a size alone) is read back with an empty
-  // record for the font; the model, once the format was changed, has none. The same format.
-  const plain = (text: string) => text.split(',"font":{}').join('').split('"font":{},').join('');
-  actual = plain(actual);
-  expected = plain(expected);
   if (actual === expected) return;
   let at = 0;
   while (at < actual.length && actual[at] === expected[at]) at++;
@@ -104,7 +104,19 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
   const trail: string[] = [];
   const all = () => doc.wb.sheets.map((_, s) => cellRules(doc.wb, s));
   /** Every cell of every sheet says what it said, but the cells of `range` of `sheet`, which say what `expected` gives. */
-  const check = (before: Map<string, CellRules>[], sheet: number, range: CellRange | undefined, expected: (row: number, col: number, was: CellRules) => CellRules, where: string) => {
+  /**
+   * With `cutDown`: a rule of a cell that was written may also say what that gives for it (what the sheet can state of
+   * what the rule it is a copy of holds beside the fields of the model); `lost` is called where one does.
+   */
+  const check = (
+    before: Map<string, CellRules>[],
+    sheet: number,
+    range: CellRange | undefined,
+    expected: (row: number, col: number, was: CellRules) => CellRules,
+    where: string,
+    cutDown?: (text: string) => string,
+    lost?: () => void,
+  ) => {
     const after = all();
     for (let s = 0; s < sheets; s++) {
       for (let row = 0; row < ROWS; row++) {
@@ -112,7 +124,22 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
           const key = `${row},${col}`;
           const was = before[s].get(key) || NONE;
           const inside = s === sheet && range !== undefined && row >= range.top && row <= range.bottom && col >= range.left && col <= range.right;
-          assert.equal(said(after[s].get(key), inside), said(inside ? expected(row, col, was) : was, inside), `${where}: sheet ${s}, cell ${key}${inside ? '' : ', which was not touched'}`);
+          const wanted = inside ? expected(row, col, was) : was;
+          const found = after[s].get(key) || NONE;
+          if (inside && cutDown && said(found, true) !== said(wanted, true) && found.carried.length === wanted.carried.length) {
+            // Rule by rule: as the rule it is a copy of, or as much of that as this sheet can state.
+            let cut = false;
+            const either = (text: string | undefined, whole: string | undefined) => {
+              if (text === whole || text === undefined || whole === undefined || text !== cutDown(whole)) return whole;
+              cut = true;
+              return text;
+            };
+            const allowed: CellRules = { ...wanted, validation: either(found.validation, wanted.validation), carried: wanted.carried.map((whole, at) => either(found.carried[at], whole) as string) };
+            assert.equal(said(found, true), said(allowed, true), `${where}: sheet ${s}, cell ${key}`);
+            if (cut && lost) lost();
+            continue;
+          }
+          assert.equal(said(after[s].get(key), inside), said(wanted, inside), `${where}: sheet ${s}, cell ${key}${inside ? '' : ', which was not touched'}`);
         }
       }
     }
@@ -122,6 +149,8 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
   const checkSaved = async (model: Map<string, CellRules>[], where: string) => {
     const saved = await save(doc);
     for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) assert.deepEqual(ownCellProblems(await partText(saved, name)), [], `${where}: ${name}: rules that look at their own cell`);
+    // Every prefix an attribute of the markup-compatibility namespace names is declared where it stands: no rule took such an attribute to a part that does not know its prefixes.
+    for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) assert.deepEqual(mceProblems(await partText(saved, name)), [], `${where}: ${name}: prefixes named by markup-compatibility attributes`);
     // What names an element of the file (the `uid` of a rule) is stated by one element: a copy of the rule states none.
     const ids: string[] = [];
     for (const name of partNames(saved)) if (/^xl\/worksheets\/[^/]*\.xml$/.test(name)) for (const found of (await partText(saved, name)).match(/<cfRule\b[^>]*\buid="[^"]*"/g) || []) ids.push(found.slice(found.lastIndexOf('uid=')));
@@ -170,6 +199,23 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
       const result = pasteAt(doc.wb, sheet, selection, copied.text, copied);
       assert.deepEqual(result.range, selection, `${where}: what was pasted over`);
       if (result.ops.length > 0) doc.history.apply(result.ops, undefined, undefined);
+      // What a rule holds beside the fields of the model: all of it, with what readers of this sheet may pass over said for
+      // this sheet (`whole`), or what this sheet can state of it (`fitted`) - and then the paste says that not all came.
+      const spaces = doc.wb.sheets[sheet].spaces;
+      const placed = (text: string, all: boolean): string => {
+        const rule = JSON.parse(text);
+        if (!rule.kept) return text;
+        const kept = keptFor({ packed: packKept(rule.kept), ignorable: all ? undefined : rule.kept.ignorable }, spaces).kept;
+        rule.kept = validationKeptNow({ kept });
+        return canonical(rule);
+      };
+      const cutDown = new Map<string, string>();
+      const whole = (text: string) => {
+        const all = placed(text, true);
+        cutDown.set(all, placed(text, false));
+        return all;
+      };
+      let cut = false;
       const model = check(
         before,
         sheet,
@@ -177,11 +223,17 @@ async function run(seed: number, steps: number, extensionOnly: boolean): Promise
         (row, col, was) => {
           const from = cells.get(`${(row - top) % height},${(col - left) % width}`) || NONE;
           // A cell under a validation of the extension list keeps it; that list's conditional rules stay beside what comes.
-          const validation = was.fixed ? was.validation : from.fixed ? undefined : from.validation;
-          return { validation, fixed: was.fixed, carried: from.carried, kept: was.kept, order: '' };
+          const validation = was.fixed ? was.validation : from.fixed || from.validation === undefined ? undefined : whole(from.validation);
+          return { validation, fixed: was.fixed, carried: from.carried.map(whole), kept: was.kept, order: '' };
         },
         `${where}, paste`,
+        (text) => cutDown.get(text) || text,
+        () => {
+          cut = true;
+        },
       );
+      // The copy holds what the rule it is a copy of holds, or it is said that it does not.
+      if (cut) assert.ok((result.skippedRules || 0) >= 1, `${where}: a rule came without part of what its element holds, and the paste does not say so`);
       await checkSaved(model, `${where}, paste`);
     } else if (roll < 0.58) {
       const sheet = int(sheets);

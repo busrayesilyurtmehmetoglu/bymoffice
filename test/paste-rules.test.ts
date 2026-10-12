@@ -36,7 +36,7 @@ const formats = (wb: Workbook, sheet = 0) =>
   });
 
 const dv = (attrs: string, inner = '') => `<dataValidation ${attrs}>${inner}</dataValidation>`;
-const WHOLE = dv('type="whole"   showErrorMessage="1" imeMode="off" sqref="A1:A3"', '<formula1>1</formula1><!-- kept --><formula2>B1*2</formula2>');
+const WHOLE = dv('type="whole"   showErrorMessage="1" imeMode="off" sqref="A1:A3"', '<formula1>1</formula1><formula2>B1*2</formula2>');
 const LIST = dv('type="list" allowBlank="1" sqref="C1:C2"', '<formula1>$H$1:$H$2</formula1>');
 const CUSTOM = dv('type="custom" sqref="E5"', "<formula1>AND(E5&gt;$H$1,Lists!$A1&lt;&gt;D5)</formula1>");
 const X14_LIST =

@@ -295,7 +295,7 @@ test('a rule of a file: one thing changed is that thing changed; thresholds, the
   await checkPackage(saved);
   let xml = await partText(saved, SHEET1);
   const icons = (attrs: string, values = '<cfvo type="percent" val="0"/><cfvo type="num" val="2" gte="0"/><cfvo type="formula" val="$H$1"/>') =>
-    `<conditionalFormatting${XR} sqref="D1:D5"><cfRule type="iconSet" priority="1" xr:uid="{I1}"><iconSet ${attrs}>${values}</iconSet></cfRule></conditionalFormatting>`;
+    `<conditionalFormatting${XR} sqref="D1:D5"><cfRule type="iconSet" priority="1" xr:uid="{I1}"><iconSet ${attrs}>${values}</iconSet><!-- kept --></cfRule></conditionalFormatting>`;
   // The rule leaves its element (the other rule stays in it, as the file wrote it) and keeps its unknown attributes.
   assert.equal(xml, original.replace(FILE_ICONS, '').replace(OTHER_BLOCK, OTHER_BLOCK + icons('iconSet="3Flags" reverse="1" percent="0"')), 'the direction alone');
   assert.ok(xml.includes(FILE_PERIOD) && xml.includes(OTHER_BLOCK), 'the rules that were not touched keep their source text');
@@ -359,7 +359,7 @@ test('one kind becomes the other: an icon set that becomes a period gets a formu
   const xml = await partText(saved, SHEET1);
   checkSheetOrder(xml);
   // The place of each in the file and its unknown attributes stay; what belonged to the kind it was does not.
-  assert.ok(xml.includes(`<cfRule type="timePeriod" dxfId="3" priority="1" timePeriod="nextMonth" xr:uid="{I1}"><formula>${escaped(FORMULAS.nextMonth('D1'))}</formula></cfRule>`), xml);
+  assert.ok(xml.includes(`<cfRule type="timePeriod" dxfId="3" priority="1" timePeriod="nextMonth" xr:uid="{I1}"><formula>${escaped(FORMULAS.nextMonth('D1'))}</formula><!-- kept --></cfRule>`), xml);
   assert.ok(xml.includes(`<cfRule type="iconSet" priority="2"><iconSet iconSet="4Arrows">${cfvos(4)}</iconSet></cfRule>`), xml);
   await sameContent(saved, doc, 'read back');
   doc.history.undo();
@@ -371,7 +371,7 @@ test('one kind becomes the other: an icon set that becomes a period gets a formu
 // Rows, columns and the clipboard
 
 test('rows and columns that move take the formula of a period and the thresholds of an icon set with them, for a new rule and for a rule of the file', async () => {
-  const doc = await loadBytes(await numbers(5, FILE_BLOCK));
+  const doc = await loadBytes(await numbers(5, FILE_BLOCK.replace('<!-- kept -->', '')));
   apply(doc, addConditionalRule(doc.wb, 0, range('G4:G6'), { type: 'timePeriod', timePeriod: 'thisMonth', format: RED }));
   assert.deepEqual(now(doc.wb), [`G4:G6|timePeriod|1|${FORMULAS.thisMonth('G4')}`, 'D1:D5|iconSet|2|', `D1:D5|timePeriod|3|${FORMULAS.lastWeek('$D1')}`]);
   apply(doc, [{ type: 'insert', sheet: 0, axis: 'row', at: 0, count: 2 }]);
@@ -399,7 +399,7 @@ test('rows and columns that move take the formula of a period and the thresholds
 });
 
 test('copied and cut cells take both kinds of rule along: the formula of a period is written for the cells it is pasted on, an icon set keeps its thresholds', async () => {
-  const doc = await loadBytes(await numbers(5, FILE_BLOCK));
+  const doc = await loadBytes(await numbers(5, FILE_BLOCK.replace('<!-- kept -->', '')));
   apply(doc, addConditionalRule(doc.wb, 0, range('A1:A5'), { type: 'timePeriod', timePeriod: 'last7Days', format: RED }));
   apply(doc, addConditionalRule(doc.wb, 0, range('A1:A5'), { type: 'iconSet', iconSet: '5Arrows', reverse: true }));
   // A copy: the cells it is pasted on get the rules of the cells they are copies of.

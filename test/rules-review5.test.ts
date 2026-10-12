@@ -5,7 +5,8 @@
 //   column it stood in;
 // - a rule that is pasted into another sheet takes along what its element holds beside the
 //   fields of the model, but no identity of the element it was copied from;
-// - of two rules the model holds alike, the one the cells were copied from gets the cells.
+// - of two rules the model holds alike that differ in what their elements hold beside it, the
+//   one the cells were copied from gets the cells.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -253,19 +254,22 @@ test('a rule pasted into a sheet that was added keeps the same, and a second pas
   assert.ok(/sqref="A1 C4"/.test(there[0]) && there[0].indexOf(KEPT_ICON) >= 0 && there[0].indexOf('uid') < 0, `the rule as the file states it, in:\n${there[0]}`);
 });
 
-test('what a copied rule holds in a namespace of its own goes along when its element declared it, and when the other sheet declares it the same way', async () => {
+test('what a copied rule holds in a namespace of its own goes along: declared on the rule where the other sheet does not declare it, left out and counted where readers were let to pass it over and are not there', async () => {
   const MC = 'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"';
   const sheet = (rootAttrs: string, inner: string) => worksheetXml(inner).replace('<worksheet ', `<worksheet ${rootAttrs} `);
   const RULE = '<cfRule type="iconSet" priority="5" my:mark="1" plain="1"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0" my:x="1"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"><my:more/></cfvo></iconSet></cfRule>';
   const PLAIN = '<conditionalFormatting sqref="A1"><cfRule type="iconSet" priority="1" plain="1"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"/></iconSet></cfRule></conditionalFormatting>';
   const FULL = '<conditionalFormatting sqref="A1"><cfRule type="iconSet" priority="1" my:mark="1" plain="1"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0" my:x="1"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"><my:more/></cfvo></iconSet></cfRule></conditionalFormatting>';
-  const cases: [what: string, source: string, target: string, expected: string][] = [
-    ['declared on the root of the sheet it came from only', `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="my"`, '', PLAIN],
-    ['declared for another namespace in the sheet it goes to', 'xmlns:my="urn:example:mine"', 'xmlns:my="urn:example:other"', PLAIN],
-    ['passed over by readers of the one sheet, not of the other', `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="my"`, 'xmlns:my="urn:example:mine"', PLAIN],
-    ['declared the same way in both', `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="my"`, `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="x my"`, FULL],
+  // The namespace under a prefix of the rule's own, where the root of the part has none for it.
+  const OWN = FULL.replace('<cfRule type="iconSet" priority="1"', '<cfRule type="iconSet" priority="1" xmlns:ns1="urn:example:mine"').replace(/my:/g, 'ns1:');
+  const cases: [what: string, source: string, target: string, expected: string, skipped: number | undefined][] = [
+    ['passed over by readers of the sheet it came from, not declared in the other', `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="my"`, '', PLAIN, 1],
+    ['declared for another namespace in the sheet it goes to', 'xmlns:my="urn:example:mine"', 'xmlns:my="urn:example:other"', OWN, undefined],
+    ['declared in the sheet it came from only', 'xmlns:my="urn:example:mine"', '', OWN, undefined],
+    ['passed over by readers of the one sheet, not of the other', `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="my"`, 'xmlns:my="urn:example:mine"', PLAIN, 1],
+    ['declared the same way in both', `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="my"`, `xmlns:my="urn:example:mine" ${MC} mc:Ignorable="x my"`, FULL, undefined],
   ];
-  for (const [what, source, target, expected] of cases) {
+  for (const [what, source, target, expected, skipped] of cases) {
     const doc = await load(
       await buildXlsx({
         sheets: [
@@ -276,7 +280,10 @@ test('what a copied rule holds in a namespace of its own goes along when its ele
       }),
     );
     const copied = copyRange(doc.wb, 0, R('D1'));
-    apply(doc, pasteAt(doc.wb, 1, R('A1'), copied.text, copied).ops);
+    const result = pasteAt(doc.wb, 1, R('A1'), copied.text, copied);
+    apply(doc, result.ops);
+    // What is left out is known when the rule is pasted, and said.
+    assert.equal(result.skippedRules, skipped, `${what}: the rules that did not come as they are`);
     const saved = await save(doc);
     await checkPackage(saved);
     assert.deepEqual(formats(await partText(saved, 'xl/worksheets/sheet2.xml')), [expected], what);
@@ -289,7 +296,7 @@ test('what a copied rule holds in a namespace of its own goes along when its ele
   }
 });
 
-test('a namespace declared on the element a copied rule stood in goes with the rule', async () => {
+test('a namespace declared on the element a copied rule stood in is declared on the rule where the rule goes', async () => {
   const bytes = await buildXlsx({
     sheets: [
       { name: 'Data', xml: worksheetXml('<sheetData/>' + cf('D1:D5', '<cfRule type="iconSet" priority="5" my:mark="1" plain="1"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0" my:x="1"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"><my:more/></cfvo></iconSet></cfRule>', ' xmlns:my="urn:example:mine"')) },
@@ -303,8 +310,8 @@ test('a namespace declared on the element a copied rule stood in goes with the r
   const saved = await save(doc);
   await checkPackage(saved);
   const there = formats(await partText(saved, 'xl/worksheets/sheet2.xml')).join('\n');
-  // The declaration stands on the element the rule was in: it goes with the rule, and so does what uses it.
-  assert.ok(/<conditionalFormatting xmlns:my="urn:example:mine" sqref="A1">/.test(there) && there.indexOf('my:mark="1"') >= 0 && there.indexOf('<my:more/>') >= 0 && there.indexOf('plain="1"') >= 0, `declared where the rule stood, in:\n${there}`);
+  // The model holds the namespace, not the prefix of the file: the rule declares it for itself, and what uses it goes with it.
+  assert.ok(/<conditionalFormatting sqref="A1"><cfRule [^>]*xmlns:ns1="urn:example:mine"/.test(there) && there.indexOf('ns1:mark="1"') >= 0 && there.indexOf('<ns1:more/>') >= 0 && there.indexOf('plain="1"') >= 0, `declared on the rule, in:\n${there}`);
   assert.equal((await reopen(saved)).sheets[1].conditionalFormats!.length, 1, 'the file reads back');
 });
 
@@ -331,7 +338,7 @@ test('a data bar the extension list says more about is pasted into another sheet
   assert.equal(conditionalRules(await reopen(saved), 1).length, 1, 'the file reads back');
 });
 
-test('of two rules the model holds alike, the one the cells were copied from gets the cells', async () => {
+test('of two rules the model holds alike but for what their elements hold beside its fields, the one the cells were copied from gets the cells', async () => {
   const A = '<cfRule type="iconSet" priority="2"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0" foo="FROM-A"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"/></iconSet></cfRule>';
   const C = '<cfRule type="iconSet" priority="1" xr:uid="{FROM-C}" xmlns:xr="urn:x"><iconSet iconSet="3Arrows"><cfvo type="percent" val="0"/><cfvo type="percent" val="33"/><cfvo type="percent" val="67"/></iconSet></cfRule>';
   const bytes = await buildXlsx({ sheets: [{ name: 'S', xml: worksheetXml('<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>' + cf('A1:A5', A) + cf('C1:C5', C)) }], styles: STYLES });

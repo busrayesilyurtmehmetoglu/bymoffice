@@ -32,8 +32,17 @@ import {
   type ConditionalValue,
   type DataValidation,
   type DifferentialFormat,
+  packKept,
+  unpackKept,
+  type KeptAttr,
+  type KeptContent,
+  type KeptHolder,
+  type KeptItem,
+  type KeptNode,
+  type RuleKept,
   type Sheet,
   type SheetNameMap,
+  type SheetSpaces,
   type StyleSheet,
   type Workbook,
 } from '../model/sheet/types';
@@ -984,8 +993,12 @@ function stable(value: unknown): string {
  * differently from it. A property that is stated as the rule shows it stays what it is in the
  * file (a colour of the theme, a "bold" that is stated as off); what the words of RuleFormat
  * cannot say (border, number format, gradient) is never touched. Undefined for nothing at all.
+ * `fontStays` says that the record the format started from has a font that holds more than
+ * the model has a word for (a size, a name): that element stays in the file whatever is taken
+ * from it, and so the format keeps a font, be it one that says nothing here - as the file
+ * reads back.
  */
-function formatOf(format: RuleFormat, base: DifferentialFormat | undefined, read: ColorReader): DifferentialFormat | undefined {
+function formatOf(format: RuleFormat, base: DifferentialFormat | undefined, read: ColorReader, fontStays = false): DifferentialFormat | undefined {
   if (typeof format !== 'object') throw new RangeError('The format of a rule is a set of properties');
   const shown = ruleFormatOf(base, read);
   const out: DifferentialFormat = base ? { ...base } : {};
@@ -1006,13 +1019,31 @@ function formatOf(format: RuleFormat, base: DifferentialFormat | undefined, read
     if (format.color === undefined) delete font.color;
     else font.color = colorOf(format.color, 'colour of the text');
   }
-  if (Object.keys(font).length > 0) out.font = font;
+  if (Object.keys(font).length > 0 || (fontStays && !!base && !!base.font)) out.font = font;
   else delete out.font;
   if (!same(format.fill, shown.fill)) {
     if (format.fill === undefined) delete out.fill;
     else out.fill = { type: 'pattern', pattern: 'solid', bg: colorOf(format.fill, 'fill colour') };
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** What the model reads of the font of a differential format; every other child of the element, and every attribute, is kept as it is. */
+const DXF_FONT_FIELDS = ['b', 'i', 'strike', 'u', 'color'];
+
+/** Does the font of a record of the style sheet hold anything the model has no field for. */
+function fontHoldsMore(dxf: { children: { type: string; name?: string; attrs?: Map<string, string>; children?: unknown[] }[] } | undefined): boolean {
+  if (!dxf || !Array.isArray(dxf.children)) return false;
+  for (const node of dxf.children) {
+    if (node.type !== 'element' || typeof node.name !== 'string' || node.name.slice(node.name.indexOf(':') + 1) !== 'font') continue;
+    if (node.attrs && node.attrs.size > 0) return true;
+    for (const child of (node.children || []) as { type: string; name?: string }[]) {
+      if (child.type === 'element' && typeof child.name === 'string' && DXF_FONT_FIELDS.indexOf(child.name.slice(child.name.indexOf(':') + 1)) < 0) return true;
+    }
+    // The first font is the one the reader takes.
+    return false;
+  }
+  return false;
 }
 
 /** A rule with the format `format` asks for (see ConditionalSettings.format); the rule itself when that is the format it has. */
@@ -1026,7 +1057,7 @@ function withFormat(rule: ConditionalRule, format: RuleFormat | null, styles: St
     delete bare.dxfId;
     return bare;
   }
-  const wanted = formatOf(format, base, read);
+  const wanted = formatOf(format, base, read, fontHoldsMore(rule.dxfId !== undefined ? styles.dxfs[rule.dxfId] : undefined));
   if (stable(wanted) === stable(base)) return rule;
   if (!wanted) return withFormat(rule, null, styles, read);
   // The record the format started from is still named: what it holds beside font and fill is taken from it when the file is written.
@@ -1225,7 +1256,8 @@ function ruleFromSettings(settings: ConditionalSettings, anchor: { row: number; 
   else {
     rule = { type, priority: base ? base.priority : Infinity, stopIfTrue: base ? base.stopIfTrue : false, formulas: [], percent: false, bottom: false, aboveAverage: true, equalAverage: false };
     if (base && base.src) rule.src = base.src;
-    if (base && (base as PastedRule).origin) (rule as PastedRule).origin = (base as PastedRule).origin;
+    // What its element holds beside the fields of the model stays with the rule, whatever kind it is now.
+    if (base && base.kept) rule.kept = base.kept;
     if (base && base.dxfId !== undefined) rule.dxfId = base.dxfId;
     if (base && base.dxf) rule.dxf = base.dxf;
   }
@@ -1612,31 +1644,284 @@ export function clearConditionalRules(workbook: Workbook, sheetIndex: number, ra
   return conditionalOp(sheetIndex, workbook, sheet, placed, canRenumber(slots), removed, replaced);
 }
 
-/**
- * The element of the file a rule that a paste made was copied from: the part of the sheet it
- * was read from and its place there (as ConditionalRule.src). The model holds a rule by its
- * fields; what its element holds beside them (an attribute of a threshold, a child nobody
- * knows) is in the file, and the writer takes it from there for the new rule as well - without
- * what is the identity of the element itself, which no second element may state.
- */
-export interface RuleOrigin {
-  part: string;
-  rule: [format: number, rule: number];
+/** The element of a rule that states its thresholds, and how many thresholds and colours the rule has there. */
+export function ruleHolder(rule: ConditionalRule): { kind: KeptHolder['kind']; values: number; colors: number } | undefined {
+  if (rule.iconSet) return { kind: 'iconSet', values: rule.iconSet.values.length, colors: 0 };
+  if (rule.colorScale) return { kind: 'colorScale', values: rule.colorScale.values.length, colors: rule.colorScale.colors.length };
+  if (rule.dataBar) return { kind: 'dataBar', values: 2, colors: 1 };
+  return undefined;
 }
 
-/** A conditional rule as the commands of this module hold it: one made by a paste says where it was copied from. */
-export type PastedRule = ConditionalRule & { origin?: RuleOrigin };
+const hasNodes = (list: unknown): list is unknown[] => Array.isArray(list) && list.length > 0;
+
+/** Kept content as a tree, with what the model says about it beside the content (see RuleKept): what ruleKeptNow() answers with. */
+export type KeptView = KeptContent & { ignorable?: string[]; over?: true };
+
+/** The namespaces the names of kept content are in. */
+function usedSpaces(content: KeptContent): Set<string> {
+  const used = new Set<string>();
+  const attrs = (list: KeptAttr[] | undefined) => {
+    for (const attr of list || []) used.add(attr[0]);
+  };
+  const nodes = (list: (KeptNode | string)[] | undefined) => {
+    for (const node of list || []) {
+      if (typeof node === 'string') continue;
+      used.add(node.ns);
+      attrs(node.attrs);
+      nodes(node.children);
+    }
+  };
+  const items = (list: (KeptItem | null)[] | undefined) => {
+    for (const item of list || []) {
+      if (!item) continue;
+      attrs(item.attrs);
+      nodes(item.children);
+    }
+  };
+  attrs(content.attrs);
+  nodes(content.children);
+  if (content.holder) {
+    attrs(content.holder.attrs);
+    for (const list of content.holder.between || []) nodes(list);
+    items(content.holder.cfvo);
+    items(content.holder.colors);
+  }
+  return used;
+}
+
+/** Kept content as the model holds it: packed, with those of the namespaces `passed` that it uses. Undefined for none. */
+function keptOf(content: KeptContent, passed: readonly string[] | undefined): RuleKept | undefined {
+  const packed = packKept(content);
+  if (packed === undefined) return undefined;
+  const kept: RuleKept = { packed };
+  if (passed && passed.length > 0) {
+    const used = usedSpaces(content);
+    const ignorable = passed.filter((uri) => used.has(uri)).sort();
+    if (ignorable.length > 0) kept.ignorable = ignorable;
+  }
+  return kept;
+}
 
 /**
- * Where what a rule of `sheet` holds beside the fields of the model is to be found: the element
- * it was read from, or the one it was copied from. Undefined for a rule that was made here, and
- * for a rule only the extension list has.
+ * What a conditional rule holds beside the fields of the model as it stands now: what its
+ * element stated of a scale, a bar or an icon set only while the rule states that element, and
+ * what it stated of thresholds and colours only while the rule has as many - which is what a
+ * writer writes of it, and what a copy of the rule takes along. The record of the rule itself
+ * where all of it stands; undefined for nothing.
  */
-export function ruleOrigin(rule: ConditionalRule, sheet?: Pick<Sheet, 'part'>): RuleOrigin | undefined {
-  if (!rule || rule.extended) return undefined;
-  if (rule.src && sheet && sheet.part !== '') return { part: sheet.part, rule: [rule.src[0], rule.src[1]] };
-  const origin = (rule as PastedRule).origin;
-  return origin && typeof origin.part === 'string' && Array.isArray(origin.rule) ? origin : undefined;
+export function keptNow(rule: Pick<ConditionalRule, 'kept' | 'iconSet' | 'colorScale' | 'dataBar'>): RuleKept | undefined {
+  const kept = rule.kept;
+  if (!kept || typeof kept !== 'object') return undefined;
+  if (kept.over) return kept;
+  // Only what is said of the element with the thresholds depends on the rule as it is now.
+  if (typeof kept.packed !== 'string' || kept.packed.indexOf('<h ') < 0) return typeof kept.packed === 'string' && kept.packed !== '' ? kept : undefined;
+  const content = unpackKept(kept.packed);
+  if (!content) return undefined;
+  const holder = content.holder;
+  if (!holder) return kept;
+  const now = ruleHolder(rule as ConditionalRule);
+  let changed = false;
+  if (!now || holder.kind !== now.kind) {
+    delete content.holder;
+    changed = true;
+  } else {
+    if (Array.isArray(holder.between) && holder.between.length !== now.values + 1) {
+      // One list before each threshold and one for the end of the element: with another number of thresholds, what stood
+      // before thresholds the element has no more stands at its end, before what stood there (as it is written).
+      const before = holder.between.slice(0, -1);
+      let end: KeptNode[] = [];
+      for (let i = now.values; i < before.length; i++) end = end.concat(before[i] || []);
+      const between = before.slice(0, now.values);
+      while (between.length < now.values) between.push([]);
+      between.push(end.concat(holder.between[holder.between.length - 1] || []));
+      holder.between = between;
+      changed = true;
+    }
+    if (holder.between && !holder.between.some(hasNodes)) {
+      delete holder.between;
+      changed = true;
+    }
+    if (holder.cfvo && holder.cfvo.length !== now.values) {
+      delete holder.cfvo;
+      changed = true;
+    }
+    if (holder.colors && holder.colors.length !== now.colors) {
+      delete holder.colors;
+      changed = true;
+    }
+    if (!holder.attrs && !holder.between && !holder.cfvo && !holder.colors) {
+      delete content.holder;
+      changed = true;
+    }
+  }
+  return changed ? keptOf(content, kept.ignorable) : kept;
+}
+
+const viewOf = (kept: RuleKept | undefined): KeptView | undefined => {
+  if (!kept || typeof kept !== 'object') return undefined;
+  if (kept.over) return { over: true };
+  const content = unpackKept(kept.packed);
+  if (!content) return undefined;
+  const view: KeptView = content;
+  if (Array.isArray(kept.ignorable) && kept.ignorable.length > 0) view.ignorable = kept.ignorable;
+  return view;
+};
+
+/** keptNow() as a tree (see KeptView): undefined for nothing, `over` alone for a rule whose element holds what is not carried. */
+export function ruleKeptNow(rule: Pick<ConditionalRule, 'kept' | 'iconSet' | 'colorScale' | 'dataBar'>): KeptView | undefined {
+  return viewOf(keptNow(rule));
+}
+
+/** The same for a data validation, all of whose kept content it states at any time. */
+export function validationKeptNow(rule: Pick<DataValidation, 'kept'>): KeptView | undefined {
+  return viewOf(rule.kept);
+}
+
+/**
+ * What a rule holds beside the fields of the model (`kept`) as a sheet whose part lets readers
+ * pass over the namespaces `spaces` can state it (undefined: a sheet that is in no file, which
+ * lets them pass over none), and whether anything of it had to be left out. A namespace the
+ * part does not declare is no loss: the writer declares it on the element of the rule. What is
+ * left out is
+ * - content in a namespace that readers of the part it came from were let to pass over
+ *   (RuleKept.ignorable), where the root of this part does not say the same of that namespace:
+ *   stated there, a reader that does not know the namespace would have to refuse the file;
+ * - all of it, for an element that holds what a rule does not carry (RuleKept.over) - the
+ *   commands do not copy such a rule at all (it is kept as the file has it).
+ * What is said of the namespaces readers may pass over is said anew for this sheet: content
+ * that came from a part that did not let readers pass it over is content they may pass over here.
+ * Whoever puts the rule into the sheet calls this, and counts what is lost: the writer writes
+ * what the model holds, and leaves nothing out on its own.
+ */
+export function keptFor(kept: RuleKept | undefined, spaces: SheetSpaces | undefined): { kept: RuleKept | undefined; lost: boolean } {
+  if (!kept || typeof kept !== 'object') return { kept: undefined, lost: false };
+  if (kept.over) return { kept: undefined, lost: true };
+  const passed = spaces && Array.isArray(spaces.ignorable) ? spaces.ignorable : [];
+  const own = Array.isArray(kept.ignorable) ? kept.ignorable : [];
+  if (own.length === 0 && passed.length === 0) return { kept, lost: false };
+  const drop = own.filter((uri) => passed.indexOf(uri) < 0);
+  // All this sheet lets readers pass over is what the rule says it uses of such: nothing to leave out, nothing to say anew.
+  if (drop.length === 0 && passed.every((uri) => own.indexOf(uri) >= 0)) return { kept, lost: false };
+  const content = unpackKept(kept.packed);
+  if (!content) return { kept: undefined, lost: false };
+  let lost = false;
+  const attrs = (list: KeptAttr[] | undefined): KeptAttr[] | undefined => {
+    if (!Array.isArray(list)) return undefined;
+    const out = list.filter((attr) => drop.indexOf(attr[0]) < 0);
+    if (out.length !== list.length) lost = true;
+    return out.length > 0 ? out : undefined;
+  };
+  const node = (item: KeptNode): KeptNode | undefined => {
+    if (drop.indexOf(item.ns) >= 0) {
+      lost = true;
+      return undefined;
+    }
+    const out: KeptNode = { ns: item.ns, name: item.name };
+    const stated = attrs(item.attrs);
+    if (stated) out.attrs = stated;
+    if (Array.isArray(item.children)) {
+      const children: (KeptNode | string)[] = [];
+      for (const child of item.children) {
+        const left = typeof child === 'string' ? child : node(child);
+        if (left !== undefined) children.push(left);
+      }
+      if (children.length > 0) out.children = children;
+    }
+    return out;
+  };
+  const nodes = (list: KeptNode[] | undefined): KeptNode[] | undefined => {
+    if (!Array.isArray(list)) return undefined;
+    const out: KeptNode[] = [];
+    for (const item of list) {
+      const left = node(item);
+      if (left) out.push(left);
+    }
+    return out.length > 0 ? out : undefined;
+  };
+  const items = (list: (KeptItem | null)[] | undefined): (KeptItem | null)[] | undefined => {
+    if (!Array.isArray(list)) return undefined;
+    const out = list.map((item): KeptItem | null => {
+      if (!item) return null;
+      const next: KeptItem = {};
+      const stated = attrs(item.attrs);
+      if (stated) next.attrs = stated;
+      const children = nodes(item.children);
+      if (children) next.children = children;
+      return next.attrs || next.children ? next : null;
+    });
+    return out.some((item) => item !== null) ? out : undefined;
+  };
+  const out: KeptContent = {};
+  if (drop.length === 0) Object.assign(out, content);
+  else {
+    const stated = attrs(content.attrs);
+    if (stated) out.attrs = stated;
+    const children = nodes(content.children);
+    if (children) out.children = children;
+    if (content.holder) {
+      const held: KeptHolder = { kind: content.holder.kind };
+      const heldAttrs = attrs(content.holder.attrs);
+      if (heldAttrs) held.attrs = heldAttrs;
+      if (Array.isArray(content.holder.between)) {
+        const between = content.holder.between.map((list) => nodes(list) || []);
+        if (between.some((list) => list.length > 0)) held.between = between;
+      }
+      const cfvo = items(content.holder.cfvo);
+      if (cfvo) held.cfvo = cfvo;
+      const colors = items(content.holder.colors);
+      if (colors) held.colors = colors;
+      if (held.attrs || held.between || held.cfvo || held.colors) out.holder = held;
+    }
+  }
+  const next = keptOf(out, passed);
+  // The same content under the same word on its namespaces is the record it was.
+  if (next && !lost && next.packed === kept.packed && stable(next.ignorable || []) === stable(own)) return { kept, lost };
+  return { kept: next, lost };
+}
+
+/** A rule with what it holds beside the fields of the model cut down to what `sheet` can state (see keptFor()), and whether that left anything out. */
+export function fittedRule<T extends { kept?: RuleKept }>(rule: T, sheet: Pick<Sheet, 'spaces'> | undefined): { rule: T; lost: boolean } {
+  return fitted(rule, sheet, rule.kept);
+}
+
+/** fittedRule() for a rule that states `now` of what it holds. */
+function fitted<T extends { kept?: RuleKept }>(rule: T, sheet: Pick<Sheet, 'spaces'> | undefined, now: RuleKept | undefined): { rule: T; lost: boolean } {
+  if (!rule.kept) return { rule, lost: false };
+  const fitted = keptFor(now, sheet ? sheet.spaces : undefined);
+  if (fitted.kept === rule.kept) return { rule, lost: fitted.lost };
+  const next = { ...rule };
+  if (fitted.kept) next.kept = fitted.kept;
+  else delete next.kept;
+  return { rule: next, lost: fitted.lost };
+}
+
+/** The same for a conditional rule, which takes along what it states now (see keptNow()). */
+export function fittedConditional(rule: ConditionalRule, sheet: Pick<Sheet, 'spaces'> | undefined): { rule: ConditionalRule; lost: boolean } {
+  return fitted(rule, sheet, keptNow(rule));
+}
+
+/** Is what the element of a rule holds beside the fields of the model not carried at all (RuleKept.over): the rule is kept as the file has it. */
+export const keptOver = (rule: { kept?: RuleKept } | undefined): boolean => !!rule && !!rule.kept && rule.kept.over === true;
+
+/**
+ * How many rules of a sheet - conditional rules of the main part and data validations - a
+ * copy of the sheet does not get as they are: those whose element holds what is not carried
+ * (they are not copied), and those that state, beside the fields of the model, something a
+ * sheet that is in no file cannot (they are copied without it; see keptFor()).
+ */
+export function ruleContentLosses(workbook: Workbook, sheet: Sheet): number {
+  const space = ruleSpace(workbook, sheet);
+  let count = 0;
+  for (const format of sheet.conditionalFormats || []) {
+    const now = conditionalFormatNow(format, space);
+    if (!now) continue;
+    for (const rule of now.rules) if (rule && !rule.extended && rule.kept && keptFor(keptNow(rule), undefined).lost) count++;
+  }
+  for (const rule of sheet.dataValidations || []) {
+    const now = dataValidationNow(rule, space);
+    if (now && now.kept && keptFor(now.kept, undefined).lost) count++;
+  }
+  return count;
 }
 
 /**
@@ -1739,9 +2024,9 @@ export interface CopiedRules {
 const followsSheets = (text: string | undefined) => typeof text !== 'string' || text.indexOf('!') < 0 || !formulaNamesSheetsUnread(text);
 
 /** A data validation that is kept as it is: one of the extension list, or one that could not follow the sheets it names. */
-const fixedValidation = (now: DataValidation) => now.extended === true || !followsSheets(now.formula1) || !followsSheets(now.formula2);
+const fixedValidation = (now: DataValidation) => now.extended === true || keptOver(now) || !followsSheets(now.formula1) || !followsSheets(now.formula2);
 /** The same for a conditional format: one rule of that kind keeps the whole format as it is. */
-const fixedFormat = (now: ConditionalFormat) => now.rules.some((rule) => !!rule && (rule.extended === true || !ruleFormulaTexts(rule).every(followsSheets)));
+const fixedFormat = (now: ConditionalFormat) => now.rules.some((rule) => !!rule && (rule.extended === true || keptOver(rule) || !ruleFormulaTexts(rule).every(followsSheets)));
 
 const VALIDATION_FORMULAS = ['formula1', 'formula2'] as const;
 
@@ -1749,21 +2034,38 @@ const VALIDATION_FORMULAS = ['formula1', 'formula2'] as const;
  * What a rule says, apart from the cells it has: its formulas as they would be written for
  * A1. Two rules of a sheet with the same key say the same for every cell.
  */
-function validationKey(rule: Omit<DataValidation, 'ranges'>, anchor: { row: number; col: number }): string {
-  return stable(SETTING_KEYS.map((key) => (key === 'formula1' || key === 'formula2' ? (typeof rule[key] === 'string' ? shiftFormula(rule[key] as string, -anchor.row, -anchor.col, true) : null) : rule[key] === undefined ? null : rule[key])).concat([rule.extended === true]));
+function validationKey(rule: Omit<DataValidation, 'ranges'>, anchor: { row: number; col: number }, sheet?: Pick<Sheet, 'part'>): string {
+  return stable(
+    (SETTING_KEYS.map((key) => (key === 'formula1' || key === 'formula2' ? (typeof rule[key] === 'string' ? shiftFormula(rule[key] as string, -anchor.row, -anchor.col, true) : null) : rule[key] === undefined ? null : rule[key])) as unknown[]).concat([
+      rule.extended === true,
+      keptIdentity(rule.kept, rule.src === undefined ? undefined : String(rule.src), sheet),
+    ]),
+  );
 }
 
 /**
- * The same for a conditional rule: all of it but its place in the order - with the element of
- * the file that holds what it says beside the fields of the model (see ruleOrigin()). Two rules
- * the model holds alike are the same rule only when that element is the same: what another
- * element holds beside those fields is not known here, and may differ.
+ * What a rule holds beside the fields of the model, as part of what the rule says: the content
+ * itself, without the word on which namespaces readers may pass over (that is about the part
+ * it is in). For an element that holds more than the model carries (RuleKept.over) the content
+ * is not known here: such a rule is the same rule as itself only, by the element it was read from.
  */
-function conditionalKey(rule: ConditionalRule, anchor: { row: number; col: number }, sheet: Sheet): string {
+function keptIdentity(kept: RuleKept | undefined, src: string | undefined, sheet: Pick<Sheet, 'part'> | undefined): unknown {
+  if (!kept) return null;
+  if (kept.over) return `over:${sheet ? sheet.part : ''}:${src === undefined ? '' : src}`;
+  // Equal content is equal text (see packKept()).
+  return typeof kept.packed === 'string' && kept.packed !== '' ? kept.packed : null;
+}
+
+/**
+ * The same for a conditional rule: all of it but its place in the order, with what its element
+ * holds beside the fields of the model (see ruleKeptNow()). Two rules that say the same in the
+ * model and in that content are the same rule, whichever elements of whichever file they came
+ * from; two that differ in either are not.
+ */
+function conditionalKey(rule: ConditionalRule, anchor: { row: number; col: number }, sheet: Pick<Sheet, 'part'> | undefined): string {
   const own = ownCellSpelling(rule, anchor);
   const formulas = own ? [ownCellFormulaAt(rule, own, { row: 0, col: 0 })] : rule.formulas.map((text) => shiftFormula(text, -anchor.row, -anchor.col, true));
-  const origin = ruleOrigin(rule, sheet);
-  return stable({ ...rule, src: undefined, origin: origin ? `${origin.part}:${origin.rule[0]}:${origin.rule[1]}` : undefined, priority: 0, formulas });
+  return stable({ ...rule, src: undefined, kept: keptIdentity(keptNow(rule), rule.src ? `${rule.src[0]}:${rule.src[1]}` : undefined, sheet), priority: 0, formulas });
 }
 
 const firstCell = (ranges: readonly CellRange[]) => ({ row: ranges[0].top, col: ranges[0].left });
@@ -1862,7 +2164,7 @@ export function copyRules(workbook: Workbook, sheetIndex: number, range: CellRan
     if (!now || !rangesIntersect(now.ranges, selection)) continue;
     const part = clippedToCopy(now.ranges, left, right, runs);
     if (!part) continue;
-    const key = validationKey(now, firstCell(now.ranges));
+    const key = validationKey(now, firstCell(now.ranges), sheet);
     if (fixedValidation(now)) {
       copied.left.push({ kind: 'validation', ranges: part.ranges, key });
       continue;
@@ -1871,6 +2173,8 @@ export function copyRules(workbook: Workbook, sheetIndex: number, range: CellRan
     const dCol = part.anchor.col - now.ranges[0].left;
     const taken = {} as Record<string, unknown>;
     for (const name of SETTING_KEYS) if (now[name] !== undefined) taken[name] = name === 'formula1' || name === 'formula2' ? shiftFormula(now[name] as string, dRow, dCol, true) : now[name];
+    // What its element holds beside these goes with the rule (see RuleKept).
+    if (now.kept) taken.kept = now.kept;
     copied.validations.push({ ranges: part.ranges, anchor: part.anchor, rule: taken as unknown as Omit<DataValidation, 'ranges'>, key });
   }
   for (const format of sheet.conditionalFormats || []) {
@@ -1885,12 +2189,8 @@ export function copyRules(workbook: Workbook, sheetIndex: number, range: CellRan
       continue;
     }
     const to = { top: part.anchor.row, left: part.anchor.col, bottom: part.anchor.row, right: part.anchor.col };
-    // Each says where its element is: a paste into another sheet finds there what the model has no field for.
-    const taken = rules.map((rule): ConditionalRule => {
-      const moved = reanchored(rule, now.ranges[0], to);
-      const origin = ruleOrigin(rule, sheet);
-      return origin ? ({ ...moved, origin } as PastedRule) : moved;
-    });
+    // Each takes along what its element holds beside the fields of the model (ConditionalRule.kept).
+    const taken = rules.map((rule) => reanchored(rule, now.ranges[0], to));
     if (rules.length > 0) copied.conditional.push({ ranges: part.ranges, anchor: part.anchor, rules: taken, keys });
   }
   return copied.validations.length > 0 || copied.conditional.length > 0 || copied.left.length > 0 ? copied : undefined;
@@ -2048,14 +2348,14 @@ function validationsPasted(workbook: Workbook, sheet: Sheet, copied: CopiedRules
   let fixed: CellRange[] = [];
   for (const now of nows) {
     if (!now || !fixedValidation(now) || !rangesIntersect(now.ranges, areas)) continue;
-    staying.push({ key: validationKey(now, firstCell(now.ranges)), ranges: now.ranges, inside: rangesInside(now.ranges, areas) });
+    staying.push({ key: validationKey(now, firstCell(now.ranges), sheet), ranges: now.ranges, inside: rangesInside(now.ranges, areas) });
     fixed = fixed.concat(now.ranges);
   }
   let skipped = countUndone(staying, left);
   const free = fixed.length > 0 ? subtractRanges(areas, fixed) : areas.slice();
   // A cell has one rule: the first of the copy that names it.
   let claimed: CellRange[] = [];
-  const pasted: { ranges: CellRange[]; rule: Omit<DataValidation, 'ranges'>; key: string; taken: boolean }[] = [];
+  const pasted: { ranges: CellRange[]; rule: Omit<DataValidation, 'ranges'>; key: string; alt: string | undefined; lost: boolean; taken: boolean }[] = [];
   for (const item of wanted) {
     const all = tiledRanges(item.ranges, areas[0], height, width);
     if (!all) {
@@ -2065,9 +2365,13 @@ function validationsPasted(workbook: Workbook, sheet: Sheet, copied: CopiedRules
     const ranges = fixed.length > 0 || claimed.length > 0 ? subtractRanges(all, fixed.concat(claimed)) : all;
     if (ranges.length === 0) continue;
     claimed = claimed.concat(ranges);
-    const rule = { ...item.rule };
+    // What the rule holds beside the fields of the model, as far as this sheet can state it (see keptFor()).
+    const fitted = fittedRule(item.rule, sheet);
+    const rule = { ...fitted.rule };
     for (const name of VALIDATION_FORMULAS) if (typeof rule[name] === 'string') rule[name] = shiftFormula(rule[name] as string, ranges[0].top - item.anchor.row, ranges[0].left - item.anchor.col, true);
-    pasted.push({ ranges, rule, key: item.key, taken: false });
+    // Cut down, it may be a rule the sheet has: one that was pasted here before.
+    const alt = fitted.rule !== item.rule ? validationKey(rule, firstCell(ranges), sheet) : undefined;
+    pasted.push({ ranges, rule, key: item.key, alt, lost: fitted.lost, taken: false });
   }
   if (free.length === 0) return { list: sheet.dataValidations, skipped };
 
@@ -2075,17 +2379,20 @@ function validationsPasted(workbook: Workbook, sheet: Sheet, copied: CopiedRules
   // cells as well, as in Excel, and no second rule says the same. A rule that has exactly these cells comes first.
   const byKey = new Map<string, (typeof pasted)[number][]>();
   for (const item of pasted) {
-    const list = byKey.get(item.key);
-    if (list) list.push(item);
-    else byKey.set(item.key, [item]);
+    for (const key of item.alt === undefined || item.alt === item.key ? [item.key] : [item.key, item.alt]) {
+      const list = byKey.get(key);
+      if (list) list.push(item);
+      else byKey.set(key, [item]);
+    }
   }
   const parts = nows.map((now) => {
     if (!now || fixedValidation(now)) return undefined;
     const touched = rangesIntersect(now.ranges, free);
-    const candidates = byKey.size > 0 ? byKey.get(validationKey(now, firstCell(now.ranges))) : undefined;
+    const key = byKey.size > 0 ? validationKey(now, firstCell(now.ranges), sheet) : '';
+    const candidates = byKey.size > 0 ? byKey.get(key) : undefined;
     if (!touched && !candidates) return undefined;
     const kept = touched ? subtractRanges(now.ranges, free) : now.ranges;
-    return { now, touched, kept, inside: touched ? rangesInside(now.ranges, free) : [], candidates, same: undefined as (typeof pasted)[number] | undefined, exact: false };
+    return { now, key, touched, kept, inside: touched ? rangesInside(now.ranges, free) : [], candidates, same: undefined as (typeof pasted)[number] | undefined, exact: false };
   });
   for (const exact of [true, false]) {
     for (const part of parts) {
@@ -2119,6 +2426,10 @@ function validationsPasted(workbook: Workbook, sheet: Sheet, copied: CopiedRules
     changed.set(at, validationAsRead(sheet, next, space) || next);
   });
   const added = pasted.filter((item) => !item.taken);
+  // What a rule could not take along is counted: the rule is there, not all of what it held - be it a rule that is new
+  // to the sheet or one the sheet had that says what is left of it.
+  for (const item of added) if (item.lost) skipped++;
+  for (const part of parts) if (part && part.same && part.same.lost && part.key !== part.same.key) skipped++;
   if (changed.size === 0 && added.length === 0) return { list: sheet.dataValidations, skipped };
   const next: DataValidation[] = [];
   current.forEach((rule, at) => {
@@ -2150,7 +2461,7 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
   if (current.length === 0 && wanted.length === 0) return { ops: [], skipped: left.length };
   let skipped = 0;
   // The rules of the copy one by one, in the order they are applied in where they come from; those of one format share their ranges.
-  let pasted: { ranges: CellRange[]; rule: ConditionalRule; key: string; same: string | undefined }[] = [];
+  let pasted: { ranges: CellRange[]; rule: ConditionalRule; key: string; alt: string | undefined; lost: boolean; same: string | undefined }[] = [];
   for (const item of wanted) {
     const ranges = tiledRanges(item.ranges, areas[0], height, width);
     if (!ranges) {
@@ -2159,7 +2470,14 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
     }
     if (ranges.length === 0) continue;
     const from = { top: item.anchor.row, left: item.anchor.col, bottom: item.anchor.row, right: item.anchor.col };
-    item.rules.forEach((rule, i) => pasted.push({ ranges, rule: reanchored(rule, from, ranges[0]), key: item.keys[i], same: undefined }));
+    item.rules.forEach((rule, i) => {
+      // What the rule holds beside the fields of the model, as far as this sheet can state it (see keptFor()).
+      const fitted = fittedConditional(rule, sheet);
+      const placed = reanchored(fitted.rule, from, ranges[0]);
+      // Cut down, it may be a rule the sheet has: one that was pasted here before.
+      const alt = fitted.rule !== rule ? conditionalKey(mainPartRule(placed) || placed, firstCell(ranges), sheet) : undefined;
+      pasted.push({ ranges, rule: placed, key: item.keys[i], alt, lost: fitted.lost, same: undefined });
+    });
   }
   pasted = pasted
     .map((item, order) => ({ item, order }))
@@ -2189,6 +2507,8 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
   // The rule the copy brings may be one the sheet has (for the cells that were copied, say): that one then has the
   // cells as well, as in Excel, and no second rule says the same. A rule that has exactly these cells comes first.
   const order = new Map<string, number>();
+  /** What each rule of the sheet says, by its place (see conditionalKey()). */
+  const said = new Map<string, string>();
   const taken = new Map<string, (typeof pasted)[number]>();
   if (pasted.length > 0) {
     const byKey = new Map<string, { place: string; f: number }[]>();
@@ -2197,6 +2517,7 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
       order.set(place, at);
       if (!parts[slot.f]) return;
       const key = conditionalKey(slot.rule, firstCell(slot.ranges), sheet);
+      said.set(place, key);
       const list = byKey.get(key);
       if (list) list.push({ place, f: slot.f });
       else byKey.set(key, [{ place, f: slot.f }]);
@@ -2204,7 +2525,7 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
     for (const exact of [true, false]) {
       for (const item of pasted) {
         if (item.same !== undefined) continue;
-        for (const found of byKey.get(item.key) || []) {
+        for (const found of (byKey.get(item.key) || []).concat(item.alt !== undefined && item.alt !== item.key ? byKey.get(item.alt) || [] : [])) {
           if (taken.has(found.place)) continue;
           if (exact) {
             const part = parts[found.f] as { touched: boolean; inside: CellRange[] };
@@ -2290,12 +2611,16 @@ function conditionalPasted(workbook: Workbook, sheetIndex: number, sheet: Sheet,
   // The rules that are new to the sheet, in the order of the copy.
   const added: Placed[] = [];
   for (const item of pasted) {
-    if (item.same !== undefined) continue;
-    // The rule keeps the word of where it was copied from (see ruleOrigin()); its place in a file is one it gets.
+    if (item.same !== undefined) {
+      // A rule of the sheet that says what is left of this one has the cells: what could not come is counted all the same.
+      if (item.lost && said.get(item.same) !== item.key) skipped++;
+      continue;
+    }
+    // The rule keeps what its element held beside the fields of the model (ConditionalRule.kept); its place in a file is one it gets.
     const plain = mainPartRule(item.rule);
     if (!plain) continue;
-    // What the extension list says about the rule it was copied from stays with that one.
-    if (item.rule.extId !== undefined || (item.rule.iconSet && item.rule.iconSet.custom)) skipped++;
+    // What the extension list says about the rule it was copied from stays with that one, and so does what this sheet cannot state.
+    if (item.rule.extId !== undefined || (item.rule.iconSet && item.rule.iconSet.custom) || item.lost) skipped++;
     added.push({ f: -1, r: -1, rule: plain, detach: item.ranges });
   }
   if (replaced.size === 0 && gone.size === 0 && moved.size === 0 && added.length === 0) return { ops: [], skipped };
