@@ -70,6 +70,14 @@ editor.onUserSave.listen((file) async {
   }
 });
 
+// Kendiliğinden kaydetme: `autoSave: true` (ya da `{'delayMs': 5000, 'maxWaitMs': 60000}`) ile sayfa, son
+// değişiklikten 2 sn sonra dosyayı kendisi verir; aynı `onUserSave` akışına `file.byAuto == true` ile gelir ve
+// aynı biçimde `saveResult` ile yanıtlanır. Yazılmakta olan hücreyi bölmez; `conflict: true` yanıtında onay
+// açılmaz, kendiliğinden kayıt durur ve onay kullanıcının Kaydet'ine kalır (derlenmedi).
+// Çakışma denetimi uygulamadadır: `byAuto` dosyayı saklamadan önce elinizdeki sürümle karşılaştırın; değiştiyse
+// yazmadan `saveResult(file, false, conflict: true)` deyin. Sayfa köprüde sürüm (ETag) bilgisi tutmaz.
+await editor.load(bytes, name: 'rapor.xlsx', toolbar: true, autoSave: true);
+
 // Çakışma: dosya, uygulamanın elinde (sunucuda) o arada değiştiyse üzerine yazmayın; sayfaya söyleyin.
 // Sayfa kullanıcıya sorar ("Üzerine yaz" / "Vazgeç"); "Üzerine yaz" denirse dosya `onUserSave` ile
 // yeniden gelir ve bu kez `file.overwrite == true`'dur: koşulsuz yazın. "Vazgeç"te hiçbir şey gelmez.

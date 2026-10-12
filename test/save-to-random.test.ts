@@ -16,6 +16,19 @@ import { STRINGS_EN } from '../src/ui/strings';
 // - while the ETag of the file is known, a request goes without If-Match only when saveNow({ overwrite: true })
 //   was called, or a question that was open was answered with "overwrite", since the server last took a save.
 //
+// The same sequences run once more with auto-save on, with time that passes, something that is being
+// typed, a view that turns read-only and a page that is hidden among the steps. Everything above holds
+// there as well, and with it:
+//
+// - auto-save never writes the file while something is being typed, while the user is asked about a
+//   conflict, from a view that is only read, for a file that cannot be written or while it is off;
+// - after a conflict, a refusal or a redirect nothing is sent until the user has acted (a save, an
+//   overwrite, an answer): auto-save does not try again by itself;
+// - a request auto-save sends always carries If-Match: where the server named no version of the file
+//   (its answers come without an ETag, or with a weak one, in these sequences) auto-save sends nothing;
+// - auto-save never falls asleep: with changes that no save holds and nothing in its way (no save under
+//   way, no question, not paused, a view that can be edited) a timer of its own is waiting, and never two.
+//
 // The sequences come from a seed: one that fails is named in the message and runs again as it was.
 
 type Reenter = 'none' | 'onState' | 'onError' | 'onSaved' | 'notice' | 'strings' | 'commit' | 'bytes' | 'info' | 'ask';
@@ -32,7 +45,9 @@ function generator(seed: number): () => number {
 }
 
 /** How many questions the sequences of a test led to, and how many of them were answered with "overwrite": the test is one of them only if there were some. */
-const seen = { questions: 0, overwrites: 0 };
+const seen = { questions: 0, overwrites: 0, autoWrites: 0, deferred: 0, unguarded: 0, paused: 0 };
+/** The time limit of a request in these runs: no wait of auto-save is ever this long, which tells the two kinds of timer apart. */
+const REQUEST_TIMEOUT = 123457;
 
 const settle = async () => {
   for (let i = 0; i < 60; i++) await Promise.resolve();
@@ -46,13 +61,24 @@ interface Flight {
   done: boolean;
 }
 
-async function run(seed: number, reenter: Reenter): Promise<string[]> {
-  const random = generator(seed * 7919 + MODES.indexOf(reenter));
+async function run(seed: number, reenter: Reenter, auto = false): Promise<string[]> {
+  const random = generator(seed * 7919 + MODES.indexOf(reenter) + (auto ? 104729 : 0));
+  let clock = 5000;
+  /** Something is being typed; the view is only read; auto-save is on. */
+  let typing = false;
+  let readOnly = false;
+  let autoOn = auto;
+  /** A save ended in a way auto-save must not try again by itself, and the user has not acted since. */
+  let halted = false;
+  /** The file was last written for a save nobody asked for: the request that follows is auto-save's. */
+  let writtenByAuto = false;
+  /** The file became writable again and nothing told the controller (nothing does: a change is what looks again). */
+  let unwoken = false;
   /** The content of the file now. */
   let version = 0;
   const server = { body: 0, etag: '"e0"', serial: 0, writes: [] as number[] };
   const flights: Flight[] = [];
-  const timers: { callback: () => void; off: boolean }[] = [];
+  const timers: { callback: () => void; off: boolean; at: number; request: boolean }[] = [];
   const problems: string[] = [];
   const promises: { settled: boolean }[] = [];
   let last2xxBody = 0;
@@ -111,9 +137,35 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     },
     bytes: async () => {
       const taken = version;
+      // A save of the user: whatever kept auto-save still is over, and what comes of this save decides anew.
+      halted = false;
+      writtenByAuto = false;
       back('bytes');
       return new Uint8Array([taken & 255, taken >> 8]);
     },
+    // What auto-save writes the file with: every call is a save nobody asked for.
+    bytesAsIs: async () => {
+      const taken = version;
+      seen.autoWrites++;
+      writtenByAuto = true;
+      if (controller.currentETag === undefined) seen.unguarded++;
+      if (!autoOn) problems.push('auto-save wrote the file while it was off');
+      if (typing) problems.push('auto-save wrote the file while something was being typed');
+      if (readOnly) problems.push('auto-save wrote the file from a view that is only read');
+      if (!writable) problems.push('auto-save wrote a file that cannot be written');
+      if (asked().length > 0) problems.push('auto-save wrote the file while the user was asked about a conflict');
+      if (halted) problems.push('auto-save wrote the file after a conflict or a refusal, and the user had not acted since');
+      back('bytes');
+      return new Uint8Array([taken & 255, taken >> 8]);
+    },
+    pending: () => {
+      if (typing) seen.deferred++;
+      return typing;
+    },
+    readOnly: () => readOnly,
+    autoSave: auto ? { delayMs: 1000, maxWaitMs: 4000 } : undefined,
+    now: () => clock,
+    timeoutMs: REQUEST_TIMEOUT,
     info: () => {
       back('info');
       return { format: 'xlsx' };
@@ -138,8 +190,8 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
       back('ask');
       return () => void entry.closed++;
     },
-    timer: (callback) => {
-      const entry = { callback, off: false };
+    timer: (callback, ms) => {
+      const entry = { callback, off: false, at: clock + ms, request: ms === REQUEST_TIMEOUT };
       timers.push(entry);
       return () => void (entry.off = true);
     },
@@ -153,6 +205,7 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
           });
         }
         flights.push(flight);
+        if (writtenByAuto && flight.ifMatch === undefined) problems.push(`auto-save sent content ${flight.version} without If-Match: it could overwrite what someone else saved, unasked`);
         if (flight.ifMatch === undefined && controller.currentETag !== undefined && allowed === 0) {
           problems.push(`content ${flight.version} was sent without If-Match although the ETag ${controller.currentETag} is known and nobody allowed an overwrite since the server last took a save`);
         }
@@ -172,15 +225,31 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
   };
   const respond = (flight: Flight, status: number, etag?: string | null, more: { [name: string]: unknown } = {}): void => {
     flight.done = true;
+    // What trying again does not mend: auto-save holds still until the user acts.
+    if (status === 412 || status === 401 || status === 423 || status === 302 || status === 0 || more.url !== undefined) halted = true;
     // A save the server took and said so: what was allowed before it is used up, whether it was this request or not.
     if (status >= 200 && status < 300 && more.url === undefined) allowed = 0;
     flight.resolve({ status, headers: { get: (name: string) => (name.toLowerCase() === 'etag' && etag !== undefined ? etag : null) }, ...more });
   };
   const timeOut = (): void => {
-    const timer = timers.filter((entry) => !entry.off).pop();
+    const timer = timers.filter((entry) => !entry.off && entry.request).pop();
     if (!timer) return;
     timer.off = true;
     timer.callback();
+  };
+  /** Time passes: the timers of auto-save that come due run, the earliest first. */
+  const pass = async (ms: number): Promise<void> => {
+    const end = clock + ms;
+    for (let guard = 0; guard < 200; guard++) {
+      let next: (typeof timers)[number] | undefined;
+      for (const entry of timers) if (!entry.off && !entry.request && entry.at <= end && (!next || entry.at < next.at)) next = entry;
+      if (!next) break;
+      clock = Math.max(clock, next.at);
+      next.off = true;
+      next.callback();
+      await settle();
+    }
+    clock = end;
   };
 
   const trace: string[] = [];
@@ -191,6 +260,16 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     if (controller.saving && open().length === 0) problems.push(`${step}: saving with no request on its way`);
     if (!controller.saving && open().length > 0) problems.push(`${step}: a request on its way and not saving`);
     if (controller.asking && open().length > 0) problems.push(`${step}: a request on its way while the user is asked about a conflict`);
+    // The state says that auto-save waits exactly when it is on and has nothing to guard a save with, or was stopped.
+    const waits = state.auto === true && (controller.currentETag === undefined || controller.autoSaveStopped);
+    if ((state.autoPaused === true) !== waits) problems.push(`${step}: the state says autoPaused ${state.autoPaused}; auto-save is ${state.auto ? 'on' : 'off'}, the ETag is ${controller.currentETag}, stopped ${controller.autoSaveStopped}`);
+    if (state.autoPaused === true && controller.currentETag === undefined) seen.paused++;
+    const waiting = timers.filter((entry) => !entry.off && !entry.request).length;
+    if (waiting > 1) problems.push(`${step}: ${waiting} timers of auto-save wait at once`);
+    if (!autoOn && waiting > 0) problems.push(`${step}: a timer of auto-save waits while it is off`);
+    if (autoOn && state.dirty && !state.saving && !controller.asking && state.autoPaused !== true && writable && !readOnly && !unwoken && waiting === 0) {
+      problems.push(`${step}: auto-save is on, there are changes and nothing is in its way, and no timer of its waits`);
+    }
     if (controller.asking && !controller.dirty) problems.push(`${step}: the user is asked about a conflict of a file with nothing unsaved`);
     if (controller.asking !== (asked().length === 1)) problems.push(`${step}: the controller says asking ${controller.asking}, and ${asked().length} question(s) were not taken away`);
     if (questions.some((entry) => entry.closed > 1)) problems.push(`${step}: a question was taken away more than once`);
@@ -204,7 +283,30 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     const flight = open()[0];
     let what = 'nothing';
     let saved = false;
-    if (asked().length > 0 && random() < 0.4) {
+    const extra = auto ? random() : 1;
+    if (extra < 0.3) {
+      // What only happens with auto-save: time, typing, a view that is only read, a hidden page, the switch.
+      const which = random();
+      if (which < 0.6) {
+        const ms = 700 * (1 + Math.floor(random() * 10));
+        await pass(ms);
+        what = `${ms} ms pass`;
+      } else if (which < 0.75) {
+        typing = !typing;
+        what = `typing ${typing}`;
+      } else if (which < 0.83) {
+        readOnly = !readOnly;
+        if (!readOnly) controller.wake();
+        what = `read-only ${readOnly}`;
+      } else if (which < 0.93) {
+        controller.pageHidden();
+        what = 'page hidden';
+      } else {
+        autoOn = !autoOn;
+        controller.setAutoSave(autoOn ? { delayMs: 1000, maxWaitMs: 4000 } : false);
+        what = `auto-save ${autoOn}`;
+      }
+    } else if (asked().length > 0 && random() < 0.4) {
       // The user answers the question, or an answer comes for one that is gone.
       const target = random() < 0.9 ? asked()[0] : questions[0];
       const overwrite = random() < 0.5;
@@ -217,6 +319,7 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     } else if (pick < 0.25) {
       version++;
       controller.changed();
+      unwoken = false;
       what = 'change';
     } else if (pick < 0.4) {
       call();
@@ -272,6 +375,7 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
       }
     } else if (pick < 0.88) {
       writable = !writable;
+      if (writable) unwoken = true;
       what = `writable ${writable}`;
     } else if (pick < 0.93) {
       stuck = !stuck;
@@ -285,7 +389,12 @@ async function run(seed: number, reenter: Reenter): Promise<string[]> {
     if (problems.length > 0) break;
   }
 
-  // Everything that is still on its way is answered.
+  // Everything that is still on its way is answered, and nothing new starts by itself.
+  if (auto && problems.length === 0) {
+    autoOn = false;
+    controller.setAutoSave(false);
+    await settle();
+  }
   writable = true;
   stuck = false;
   for (let i = 0; i < 50 && problems.length === 0; i++) {
@@ -322,5 +431,23 @@ for (const reenter of MODES) {
     }
     assert.equal(requests, SEEDS, 'every sequence ran');
     assert.equal(seen.questions >= 8 && seen.overwrites >= 2, true, `the sequences ran into conflicts that were asked about and overwritten (${seen.questions} questions, ${seen.overwrites} overwrites)`);
+  });
+
+  test(`random saves with auto-save, calling back into the controller from ${reenter}: nothing is sent over what is being typed, nor by itself after a conflict`, async () => {
+    seen.questions = 0;
+    seen.overwrites = 0;
+    seen.autoWrites = 0;
+    seen.deferred = 0;
+    seen.unguarded = 0;
+    seen.paused = 0;
+    for (let seed = 1; seed <= SEEDS; seed++) {
+      const problems = await run(seed, reenter, true);
+      assert.deepEqual(problems, [], problems.join('\n'));
+    }
+    assert.equal(seen.autoWrites >= 25, true, `auto-save wrote the file often enough to be tested (${seen.autoWrites} times)`);
+    assert.equal(seen.deferred >= 20, true, `auto-save met something that was being typed often enough (${seen.deferred} times)`);
+    assert.equal(seen.questions >= 4, true, `the sequences ran into conflicts that were asked about (${seen.questions} questions)`);
+    assert.equal(seen.unguarded, 0, `auto-save never wrote the file with no ETag to guard it (${seen.unguarded} times)`);
+    assert.equal(seen.paused >= 50, true, `the server left auto-save without an ETag often enough (${seen.paused} steps)`);
   });
 }

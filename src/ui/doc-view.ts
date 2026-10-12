@@ -13,7 +13,9 @@
 //
 // Nothing in this module touches the DOM at import time.
 
+import { watchDragEnd } from './drag-end';
 import { FocusRetry, pressOf } from './focus-retry';
+import { isContextPress } from './rules-dialog';
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
 import * as ops from '../ops/doc/index';
@@ -679,6 +681,8 @@ export class DocumentView {
 
   private selection: { anchor: TextPosition; focus: TextPosition } | 'all' | undefined;
   private dragging = false;
+  /** Ends the watch on the ways the drag under way can end. */
+  private unwatchDrag: (() => void) | undefined;
   private dragMoved = false;
   private pinch: { distance: number; zoom: number } | undefined;
   private gestureZoom = 0;
@@ -2250,7 +2254,8 @@ export class DocumentView {
   }
 
   private onPointerDown = (event: PointerEvent | MouseEvent): void => {
-    if (this.destroyed || event.button !== 0) return;
+    // Ctrl and a click on a device of Apple's asks for the context menu: it selects nothing and drags nothing.
+    if (this.destroyed || event.button !== 0 || isContextPress(event)) return;
     this.dragMoved = false;
     // A finger scrolls; only a mouse or a pen selects.
     if ('pointerType' in event && event.pointerType === 'touch') return;
@@ -2275,13 +2280,21 @@ export class DocumentView {
       this.selection = { anchor: position, focus: position };
       if (had) this.repaintAll();
     }
-    // A second press without the end of the first one (a pointer that was lost) must not leave a timer behind.
-    if (this.dragTimer !== undefined) clearInterval(this.dragTimer);
+    this.beginDrag();
+  };
+
+  /**
+   * A press that may become a drag: the pointer is followed until the drag ends, in whichever way a
+   * drag can end (see watchDragEnd()). "Dragging" that outlived its drag would hold back everything
+   * that waits for it: the layout for new fonts, auto-save.
+   */
+  private beginDrag(): void {
+    // A second press without the end of the first one (a pointer that was lost) must not leave anything behind.
+    this.endDrag();
     this.dragging = true;
     window.addEventListener(this.pointerEvents ? 'pointermove' : 'mousemove', this.onPointerMove as EventListener);
-    window.addEventListener(this.pointerEvents ? 'pointerup' : 'mouseup', this.onPointerUp);
-    if (this.pointerEvents) window.addEventListener('pointercancel', this.onPointerUp);
-  };
+    this.unwatchDrag = watchDragEnd({ window, document, element: this.root, pointerEvents: this.pointerEvents }, this.onPointerUp);
+  }
 
   private onPointerMove = (event: PointerEvent | MouseEvent): void => {
     if (!this.dragging || this.destroyed) return;
@@ -2306,14 +2319,15 @@ export class DocumentView {
     if (this.dragTimer !== undefined) clearInterval(this.dragTimer);
     this.dragTimer = undefined;
     this.dragPoint = undefined;
+    const unwatch = this.unwatchDrag;
+    this.unwatchDrag = undefined;
+    if (unwatch) unwatch();
     if (!this.dragging) return;
     this.dragging = false;
-    this.fontsSettled();
     window.removeEventListener('pointermove', this.onPointerMove as EventListener);
     window.removeEventListener('mousemove', this.onPointerMove as EventListener);
-    window.removeEventListener('pointerup', this.onPointerUp);
-    window.removeEventListener('mouseup', this.onPointerUp);
-    window.removeEventListener('pointercancel', this.onPointerUp);
+    // Not for a view that is gone: its drag only has to end.
+    if (!this.destroyed) this.fontsSettled();
   }
 
   private onDoubleClick = (event: MouseEvent): void => {
@@ -3169,6 +3183,8 @@ export class DocumentView {
       return;
     }
     if (this.editable === !readOnly) return;
+    // A drag does not go on from one kind of view into the other.
+    this.endDrag();
     this.typing.commit();
     this.history.seal();
     this.hideTouchTools();
@@ -3416,6 +3432,16 @@ export class DocumentView {
     if (this.destroyed) return;
     this.typing.commit();
     this.history.seal();
+  }
+
+  /**
+   * Whether the user is in the middle of something a save must not fall into: an input method
+   * that composes (what it has typed so far is not text yet), a selection or a picture that is
+   * dragged. Only asks: nothing is ended. Auto-save waits while it holds.
+   */
+  hasPendingInput(): boolean {
+    if (this.destroyed) return false;
+    return this.typing.composing || this.dragging;
   }
 
   /** The selection as a range of the model; undefined for "everything" in a read-only view and without a selection. */
@@ -3932,12 +3958,7 @@ export class DocumentView {
     }
     this.selectionMoved(false);
     if (count !== 1) return;
-    // A second press without the end of the first one (a pointer that was lost) must not leave a timer behind.
-    if (this.dragTimer !== undefined) clearInterval(this.dragTimer);
-    this.dragging = true;
-    window.addEventListener(this.pointerEvents ? 'pointermove' : 'mousemove', this.onPointerMove as EventListener);
-    window.addEventListener(this.pointerEvents ? 'pointerup' : 'mouseup', this.onPointerUp);
-    if (this.pointerEvents) window.addEventListener('pointercancel', this.onPointerUp);
+    this.beginDrag();
     // While the pointer is held near the top or the bottom, the pages scroll and the selection follows.
     this.dragTimer = setInterval(this.onDragTick, 50);
   }

@@ -14,6 +14,7 @@ Tek bir `.js` dosyası olarak dağıtılır, çalışma zamanı bağımlılığ�
 
   // Editör: dosyayı adresinden açar, düzenletir ve Kaydet düğmesi / Ctrl+S ile aynı adrese geri kaydeder.
   await BymOffice.mount(document.getElementById('editor'), { file: '/files/42', saveTo: true });
+  // `autoSave: true` eklenirse düğmeye basmadan, son değişiklikten 2 saniye sonra kendiliğinden kaydeder.
 </script>
 ```
 

@@ -177,6 +177,8 @@ export interface UiStrings {
   saveNoConnection: string;
   /** What is being typed could not be applied, so nothing was saved. */
   savePending: string;
+  /** Auto-save sends nothing because the server named no version of the file to guard the save with. */
+  autoSaveNoVersion: string;
   /** A font of MountOptions.fonts that could not be loaded; `late` when it was still loading when the file was shown. */
   fontNotLoaded(family: string, late: boolean): string;
   /** The font of the package that stands in for `family` was needed and could not be loaded. */
@@ -563,6 +565,7 @@ export const STRINGS_EN: UiStrings = {
   saveTimedOut: 'The file could not be saved: no answer came in time',
   saveNoConnection: 'The file could not be saved: the server could not be reached',
   savePending: 'The file was not saved: what is being typed could not be applied',
+  autoSaveNoVersion: 'Auto-save is not working: the server did not say which version of the file it holds. Save with the Save button.',
   embeddedFontNotLoaded: (family) => `This device does not have the font "${family}", and the font that stands in for it could not be loaded; the text is shown in another font. Give the address of the font folder with "fontsUrl", or turn the font off with "fonts: false"`,
   fontNotLoaded: (family, late) => (late ? `The font "${family}" is still loading; the file is shown without it until it arrives` : `The font "${family}" could not be loaded; the file is shown without it`),
   pictureNotSupported: 'This picture cannot be inserted',
@@ -997,6 +1000,7 @@ export const STRINGS_TR: UiStrings = {
   saveTimedOut: 'Dosya kaydedilemedi: zamanında yanıt gelmedi',
   saveNoConnection: 'Dosya kaydedilemedi: sunucuya ulaşılamadı',
   savePending: 'Dosya kaydedilmedi: yazılmakta olan uygulanamadı',
+  autoSaveNoVersion: 'Kendiliğinden kaydetme çalışmıyor: sunucu dosyanın sürümünü bildirmedi. Kaydet düğmesiyle kaydedin.',
   embeddedFontNotLoaded: (family) => `Bu cihazda "${family}" fontu yok, yerine geçen font da yüklenemedi; metin başka bir fontla gösteriliyor. Font klasörünün adresini "fontsUrl" ile verin ya da fontu "fonts: false" ile kapatın`,
   fontNotLoaded: (family, late) => (late ? `"${family}" fontu hâlâ yükleniyor; gelene dek dosya onsuz gösteriliyor` : `"${family}" fontu yüklenemedi; dosya onsuz gösteriliyor`),
   pictureNotSupported: 'Bu görsel eklenemiyor',

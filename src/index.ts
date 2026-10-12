@@ -22,7 +22,20 @@ import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import type { SheetPrintOptions } from './ui/sheet-print';
 import { OpcPackage } from './opc';
 import { askOverwrite } from './ui/save-confirm';
-import { SaveController, fileETag, locksSaving, nameFromUrl, resolveSaveTarget, saveInfoOf, watchLeaving, type SaveNowOptions, type SaveState, type SaveTo } from './embed/save-to';
+import {
+  SaveController,
+  bindSaveToPage,
+  fileETag,
+  locksSaving,
+  nameFromUrl,
+  resolveAutoSave,
+  resolveSaveTarget,
+  saveInfoOf,
+  type AutoSave,
+  type SaveNowOptions,
+  type SaveState,
+  type SaveTo,
+} from './embed/save-to';
 
 export { CfbFile, type CfbEntry } from './cfb';
 export { OpcPackage, type Relationship } from './opc';
@@ -154,7 +167,18 @@ export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasur
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
 export type { SaveCommand } from './ui/save-command';
-export { SaveError, type ConflictQuestion, type SaveErrorCode, type SaveInfo, type SaveNowOptions, type SaveState, type SaveTo, type SaveToFunction, type SaveToRequest } from './embed/save-to';
+export {
+  SaveError,
+  type AutoSave,
+  type ConflictQuestion,
+  type SaveErrorCode,
+  type SaveInfo,
+  type SaveNowOptions,
+  type SaveState,
+  type SaveTo,
+  type SaveToFunction,
+  type SaveToRequest,
+} from './embed/save-to';
 export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
 export { defaultPaperFor, headerFooterFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPagePaint, type SheetPlanOptions, type SheetPrintOptions } from './ui/sheet-print';
 export {
@@ -398,6 +422,42 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * given as bytes, an address of another scheme, another method.
    */
   saveTo?: SaveTo | false;
+  /**
+   * With `saveTo`: saves by itself, without the button. Off unless given. `true` saves two
+   * seconds after the last change (every change starts the two seconds again) and, for someone
+   * who never stops, thirty seconds after the first change at the latest; `{ delayMs, maxWaitMs }`
+   * sets the two times (`delayMs` 250 to 600 000, `maxWaitMs` not below it). mount() rejects with
+   * TypeError for other values, and for auto-save without `saveTo`.
+   *
+   * Such a save goes the way the save of the button goes (one request at a time, `If-Match`,
+   * the same state and the same errors), with these differences:
+   *
+   * - What is being typed is neither applied nor cut short: while a cell, a note or the name of
+   *   a sheet is being typed, a dialog of rules or the question about a conflict is open, an
+   *   input method composes or something is dragged, nothing is sent; it is looked at again one
+   *   delay later.
+   * - It only goes with a condition: a save to an address is sent by itself only with `If-Match`
+   *   (the ETag the server last named for the address the file came from, or a header of the
+   *   page's own). Where there is none - the file was given as bytes or is saved to another
+   *   address, the server sends no strong ETag - nothing is sent by itself: onNotice says so once
+   *   and onSaveState says `autoPaused`; the Save button works as ever, and a save whose answer
+   *   brings an ETag sets auto-save going again. `{ unconditional: true }` lifts this: auto-save
+   *   then saves without a condition and can silently overwrite what someone else saved. A
+   *   function given as `saveTo` guards its own target.
+   * - A conflict (412) is told (onNotice, onSaveState, onError) and not asked about, and
+   *   auto-save stops: the question opens when the user saves next.
+   * - A request that did not get through, one without an answer in time and a 5xx answer are
+   *   tried again after 5, 10, 20… seconds (five minutes at most), and told once. Any other
+   *   failure stops auto-save until the user saves. A save that succeeds starts it over.
+   * - A converted file that may not replace its original (`allowConverted`) and a view that is
+   *   read-only are never sent by it.
+   * - When the page is hidden (the tab is left or closed) what waits is sent at once.
+   * - A save that succeeds is not told to onNotice ("Saved" every few seconds), only to
+   *   onSaveState; the first one after something went wrong is.
+   *
+   * A function given as `saveTo` is told `info.auto: true` for these saves.
+   */
+  autoSave?: AutoSave;
   /** With `saveTo`: called whenever there is something else to say about saving. */
   onSaveState?(state: SaveState): void;
   /**
@@ -533,8 +593,21 @@ export interface MountedSpreadsheet {
    * about a conflict a call sends nothing, and resolves as the question ends.
    */
   saveNow(options?: SaveNowOptions): Promise<boolean>;
-  /** Whether changes were made that saveNow() has not saved: with `saveTo`, what the Save button shows. */
+  /**
+   * Whether there is work that saveNow() has not saved. With `saveTo`: changes that no save holds,
+   * or text that is typed and not applied yet (a cell, a note or the name of a sheet that is being
+   * typed, a dialog of rules with changes) - what leaving the page now would lose, and what the
+   * question before leaving goes by. The second is no change of the file yet: onSaveState's `dirty`
+   * does not count it, and a save (not auto-save) applies it first.
+   */
   readonly hasUnsavedChanges: boolean;
+  /**
+   * Turns auto-save on, off or to other times while the view is shown (see MountOptions.autoSave).
+   * Turned on over unsaved changes, it saves them one delay later; it does not start again what a
+   * conflict or a refusal stopped (the user's next save does). Throws TypeError for a value that
+   * cannot be, and for turning it on without `saveTo`.
+   */
+  setAutoSave(value: AutoSave): void;
   /** Removes the view from the container; the same as `editor.destroy()`. */
   destroy(): void;
 }
@@ -573,6 +646,13 @@ export interface MountedDocument {
   saveNow(options?: SaveNowOptions): Promise<boolean>;
   /** Whether changes were made that saveNow() has not saved: with `saveTo`, what the Save button shows. */
   readonly hasUnsavedChanges: boolean;
+  /**
+   * Turns auto-save on, off or to other times while the view is shown (see MountOptions.autoSave).
+   * Turned on over unsaved changes, it saves them one delay later; it does not start again what a
+   * conflict or a refusal stopped (the user's next save does). Throws TypeError for a value that
+   * cannot be, and for turning it on without `saveTo`.
+   */
+  setAutoSave(value: AutoSave): void;
   /** Removes the view from the container; the same as `editor.destroy()`. */
   destroy(): void;
 }
@@ -601,6 +681,9 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   const base = typeof document !== 'undefined' && typeof document.baseURI === 'string' ? document.baseURI : undefined;
   // Before anything is fetched: a `saveTo` that cannot be saved to is a mistake of the page, and is told at once.
   const saveTarget = options.saveTo === undefined || options.saveTo === false || options.saveTo === null ? undefined : resolveSaveTarget(options.saveTo, typeof input === 'string' ? input : undefined, base);
+  // The same for auto-save: its times are read, and it has nowhere to save to without `saveTo`.
+  const autoSave = resolveAutoSave(options.autoSave);
+  if (autoSave && !saveTarget) throw new TypeError('"autoSave" needs "saveTo": there is nowhere to save to');
   /** The ETag the file came with: what a save to the same address is sent with. */
   let etag: string | null = null;
   let fileName: string | undefined;
@@ -644,6 +727,9 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   let save: () => Promise<Uint8Array>;
   // What the two kinds of view answer differently; set once the view is there.
   let commit: () => boolean = () => true;
+  /** Whether the user is in the middle of something, and the file as the model is: what auto-save asks and takes. */
+  let pendingInput: () => boolean = () => false;
+  let saveAsIs: () => Promise<Uint8Array> = () => save();
   let locked: () => boolean = () => false;
   let notice: (message: string, kind: 'error' | 'info') => void = () => undefined;
   let focusView: () => void = () => undefined;
@@ -657,6 +743,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
         writable: () => (file.format === 'docx' || file.format === 'xlsx') && !locked(),
         commit: () => commit(),
         bytes: () => save(),
+        bytesAsIs: () => saveAsIs(),
+        pending: () => pendingInput(),
+        readOnly: () => readOnlyNow(),
+        autoSave,
         info,
         strings: () => resolveUiStrings(options.locale),
         notice: (message, kind) => notice(message, kind),
@@ -682,14 +772,18 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
         etag,
       })
     : undefined;
-  /** A view that is turned read-only is not asked about a conflict any more: the question goes, unanswered. */
-  const watchReadOnly = (view: { setReadOnly(readOnly: boolean): void }): void => {
+  /** What ties the controller to the page: the question before leaving, the hidden page, the view that turns read-only. */
+  let bound: { unsaved(): boolean; release(): void } | undefined;
+  /** `unapplied`: whether text is typed in the view that is in no change yet (see SavePage). */
+  const watchReadOnly = (view: { setReadOnly(readOnly: boolean): void }, unapplied: () => boolean): void => {
     if (!controller) return;
-    const set = view.setReadOnly.bind(view);
-    view.setReadOnly = (readOnly: boolean) => {
-      set(readOnly);
-      if (readOnly) controller.dismissConflict();
-    };
+    bound = bindSaveToPage(controller, {
+      view,
+      unapplied,
+      window: typeof window !== 'undefined' ? window : undefined,
+      document: typeof document !== 'undefined' ? document : undefined,
+      warnOnLeave: options.warnOnLeave !== false,
+    });
   };
   /** Without `saveTo`: whether anything was changed at all. */
   let touched = false;
@@ -698,9 +792,12 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     if (controller) controller.changed();
   };
   const saveNow = (saveOptions?: SaveNowOptions): Promise<boolean> => (controller ? controller.saveNow(saveOptions) : Promise.resolve(false));
-  const unsaved = (): boolean => (controller ? controller.dirty : touched);
-  /** Ends the watch on the page being left. */
-  let unwatchLeave: (() => void) | undefined;
+  // With `saveTo`: also text that is typed and in no change yet, which a user who leaves would lose.
+  const unsaved = (): boolean => (bound ? bound.unsaved() : controller ? controller.dirty : touched);
+  const setAutoSave = (value: AutoSave): void => {
+    if (controller) return controller.setAutoSave(value);
+    if (resolveAutoSave(value)) throw new TypeError('"autoSave" needs "saveTo": there is nowhere to save to');
+  };
   /**
    * Ties what mount() holds to the life of the editor: its destroy() (which is also the result's) takes the key
    * listener and the question before leaving away and gives up a save that is under way, whoever calls it.
@@ -709,15 +806,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     // While the event goes down, before any field inside the editor can keep it to itself (a dialog of
     // rules, the field of a note or of a link do): otherwise the browser would open its "save page" there.
     container.addEventListener('keydown', onKeyDown, true);
-    // Leaving the page with changes nobody holds asks first.
-    if (controller && options.warnOnLeave !== false && typeof window !== 'undefined') unwatchLeave = watchLeaving(window, () => controller.dirty);
     const destroyEditor = editor.destroy.bind(editor);
     let over = false;
     editor.destroy = () => {
       if (!over) {
         over = true;
         container.removeEventListener('keydown', onKeyDown, true);
-        if (unwatchLeave) unwatchLeave();
+        if (bound) bound.release();
         if (controller) controller.destroy();
       }
       destroyEditor();
@@ -778,13 +873,22 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       view.commitEditing();
       return true;
     };
+    pendingInput = () => view.hasPendingInput();
+    saveAsIs = async () => {
+      // As save(), without ending anything: auto-save only runs while nothing is being composed.
+      const changes = view.changeCount;
+      const bytes = await file.save();
+      if (view.changeCount === changes) view.markSaved();
+      return bytes;
+    };
     // A protection that allows no editing: nothing is written back.
     locked = () => locksSaving(view.protection);
     notice = (message, kind) => view.showNotice(message, kind);
     focusView = () => view.focus();
     editorRoot = () => editor.element;
     readOnlyNow = () => view.readOnly;
-    watchReadOnly(view);
+    // What is typed in a document is in the document: nothing waits in a field to be applied.
+    watchReadOnly(view, () => false);
     const destroy = tie(editor);
     converted();
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
@@ -800,6 +904,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       get hasUnsavedChanges() {
         return unsaved();
       },
+      setAutoSave,
       destroy,
     };
     if (conversion) mounted.conversion = conversion;
@@ -843,11 +948,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       return false;
     }
   };
+  pendingInput = () => view.hasPendingInput();
+  saveAsIs = () => file.save();
   notice = (message, kind) => view.showNotice(message, kind);
   focusView = () => view.focus();
   editorRoot = () => editor.element;
   readOnlyNow = () => view.readOnly;
-  watchReadOnly(view);
+  watchReadOnly(view, () => view.hasUnappliedText());
   const destroy = tie(editor);
   converted();
   const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);
@@ -863,6 +970,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     get hasUnsavedChanges() {
       return unsaved();
     },
+    setAutoSave,
     destroy,
   };
   if (conversion) mounted.conversion = conversion;

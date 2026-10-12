@@ -63,7 +63,7 @@ class BymOfficeDocument {
 /// The answer to a `save`, or the file the user saved in the page (see
 /// [BymOfficeController.onUserSave]).
 class BymOfficeSavedFile {
-  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom, this.name, this.byUser = false, this.saveId, this.overwrite = false});
+  const BymOfficeSavedFile({required this.bytes, this.format, this.convertedFrom, this.name, this.byUser = false, this.byAuto = false, this.saveId, this.overwrite = false});
 
   final Uint8List bytes;
 
@@ -81,7 +81,13 @@ class BymOfficeSavedFile {
   /// [BymOfficeController.saveResult].
   final bool byUser;
 
-  /// Set when [byUser]: names this save. [BymOfficeController.saveResult] sends
+  /// True for a file the page saved by itself (a file loaded with `autoSave`):
+  /// nobody pressed Save. It arrives on [BymOfficeController.onUserSave] like
+  /// the saves of the user and is answered the same way. An application that
+  /// asks the user where to store a file does so only when this is false.
+  final bool byAuto;
+
+  /// Set when [byUser] or [byAuto]: names this save. [BymOfficeController.saveResult] sends
   /// it back, so that a result that arrives late is never taken for the result
   /// of a later save.
   final String? saveId;
@@ -220,6 +226,8 @@ class BymOfficeController {
   /// only for a file loaded with `userSaves: true`. The listener stores the
   /// bytes and then calls [saveResult]; until it does, the page shows the save
   /// as under way, and after a minute without an answer as failed.
+  /// The files the page saves by itself (`autoSave`) arrive here as well, with
+  /// [BymOfficeSavedFile.byAuto] set.
   /// (NOT COMPILED: written against the contract, never built.)
   Stream<BymOfficeSavedFile> get onUserSave => _userSaves.stream;
 
@@ -233,7 +241,10 @@ class BymOfficeController {
   /// the application holds was changed since it gave the file to the page. The
   /// page then asks the user whether to overwrite; on "overwrite" it sends the
   /// file again through [onUserSave] with [BymOfficeSavedFile.overwrite] set
-  /// (and a new `saveId`), on "cancel" it sends nothing.
+  /// (and a new `saveId`), on "cancel" it sends nothing. For a file the page
+  /// saved by itself ([BymOfficeSavedFile.byAuto]) nothing is asked: the page
+  /// says that the file was not saved and stops saving by itself, and asks
+  /// when the user presses Save and that save is answered with [conflict] too.
   Future<void> saveResult(BymOfficeSavedFile file, bool ok, {String? message, bool conflict = false}) {
     _checkAlive();
     return _post(<String, dynamic>{
@@ -255,7 +266,10 @@ class BymOfficeController {
   /// what [save] returns is a file of the new format. [toolbar] shows a
   /// document with the formatting toolbar above its pages. [userSaves] gives
   /// the page a Save button (in the toolbar) and makes Ctrl/Cmd+S save: the
-  /// file then arrives on [onUserSave].
+  /// file then arrives on [onUserSave]. [autoSave] (`true`, or a map with
+  /// `delayMs` and `maxWaitMs`) does the same and also makes the page save by
+  /// itself, two seconds after the last change unless the map says otherwise:
+  /// those files arrive on [onUserSave] with [BymOfficeSavedFile.byAuto].
   Future<BymOfficeDocument> load(
     Uint8List bytes, {
     String? name,
@@ -265,18 +279,19 @@ class BymOfficeController {
     bool? convert,
     bool? toolbar,
     bool? userSaves,
+    Object? autoSave,
   }) async {
     _checkAlive();
     // Base64 of a large file takes a while; keep it off the UI thread.
     final String data = await compute(base64Encode, bytes);
-    return _load(<String, dynamic>{'data': data}, name: name, locale: locale, readOnly: readOnly, sheet: sheet, convert: convert, toolbar: toolbar, userSaves: userSaves);
+    return _load(<String, dynamic>{'data': data}, name: name, locale: locale, readOnly: readOnly, sheet: sheet, convert: convert, toolbar: toolbar, userSaves: userSaves, autoSave: autoSave);
   }
 
   /// Starts with a new, empty file instead of opening one. [kind] is "docx"
   /// or "xlsx"; [locale] also chooses the paper size and the name of the sheet.
-  Future<BymOfficeDocument> loadBlank(String kind, {String? name, String? locale, bool? readOnly, bool? toolbar, bool? userSaves}) {
+  Future<BymOfficeDocument> loadBlank(String kind, {String? name, String? locale, bool? readOnly, bool? toolbar, bool? userSaves, Object? autoSave}) {
     _checkAlive();
-    return _load(<String, dynamic>{'blank': kind}, name: name, locale: locale, readOnly: readOnly, toolbar: toolbar, userSaves: userSaves);
+    return _load(<String, dynamic>{'blank': kind}, name: name, locale: locale, readOnly: readOnly, toolbar: toolbar, userSaves: userSaves, autoSave: autoSave);
   }
 
   Future<BymOfficeDocument> _load(
@@ -288,6 +303,7 @@ class BymOfficeController {
     bool? convert,
     bool? toolbar,
     bool? userSaves,
+    Object? autoSave,
   }) async {
     final Map<String, dynamic> answer = await _request(<String, dynamic>{
       'type': 'load',
@@ -298,7 +314,8 @@ class BymOfficeController {
       if (sheet != null) 'sheet': sheet,
       if (convert != null) 'convert': convert,
       if (toolbar != null) 'toolbar': toolbar,
-      if (userSaves != null) 'save': userSaves,
+      // `save` as an object also turns the Save button on; `auto` is true or { delayMs, maxWaitMs }.
+      if (autoSave != null && autoSave != false) 'save': <String, dynamic>{'auto': autoSave} else if (userSaves != null) 'save': userSaves,
     });
     return BymOfficeDocument(
       format: answer['format'] as String,
@@ -486,14 +503,15 @@ class BymOfficeController {
         // Sent again after every `hello`; only the first one counts.
         if (!_ready.isCompleted) _ready.complete(message['version'] as String? ?? '');
       case 'saved':
-        // A file the user saved in the page has no id: it answers no request.
-        if (message['by'] == 'user') {
+        // A file the user saved in the page, or the page saved by itself, has no id: it answers no request.
+        if (message['by'] == 'user' || message['by'] == 'auto') {
           _userSaves.add(BymOfficeSavedFile(
             bytes: base64Decode(message['data'] as String),
             format: message['format'] as String?,
             convertedFrom: message['convertedFrom'] as String?,
             name: message['name'] as String?,
-            byUser: true,
+            byUser: message['by'] == 'user',
+            byAuto: message['by'] == 'auto',
             saveId: message['saveId'] as String?,
             overwrite: message['overwrite'] == true,
           ));

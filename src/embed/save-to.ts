@@ -19,6 +19,11 @@ export interface SaveInfo {
    * user's answer to a conflict): a function that guards its target writes without that guard. Only there when it holds.
    */
   overwrite?: true;
+  /**
+   * The save was started by auto-save (MountOptions.autoSave) and not by the user: what is being
+   * typed was not applied for it. Only there when it holds.
+   */
+  auto?: true;
 }
 
 /** An application's own way to save: resolves (or returns) when the bytes are safe, rejects or throws when they are not. */
@@ -70,6 +75,61 @@ export interface SaveNowOptions {
   overwrite?: boolean;
 }
 
+/**
+ * MountOptions.autoSave: `true` for the times below, or the times themselves. `delayMs` (250 to
+ * 600 000, default 2000) is how long after the last change the file is saved; `maxWaitMs` (at
+ * least `delayMs`; default 30 000, or `delayMs` when that is longer) is how long after the first
+ * change that no save holds it is saved at the latest, for someone who never stops typing.
+ *
+ * A save to an address goes by itself only when it can carry a condition (`If-Match` with the
+ * ETag the server last named): otherwise it could overwrite, without anyone being asked, what
+ * someone else saved meanwhile. `unconditional: true` says that this is acceptable: auto-save
+ * then also saves where no ETag is known, and can silently overwrite the changes of others.
+ */
+export type AutoSave = boolean | { delayMs?: number; maxWaitMs?: number; unconditional?: boolean };
+
+/** The times of auto-save, with everything that was left out filled in. */
+export interface AutoSaveSettings {
+  delayMs: number;
+  maxWaitMs: number;
+  /** Auto-save also goes where the request carries no condition. Only there when it holds. */
+  unconditional?: true;
+}
+
+/** How long after the last change auto-save saves, unless the page says otherwise. */
+export const AUTO_SAVE_DELAY_MS = 2000;
+/** How long after the first unsaved change auto-save saves at the latest, unless the page says otherwise. */
+export const AUTO_SAVE_MAX_WAIT_MS = 30000;
+/** The shortest and the longest delay that can be asked for. */
+export const AUTO_SAVE_MIN_DELAY_MS = 250;
+export const AUTO_SAVE_MAX_DELAY_MS = 600000;
+/** How long auto-save waits before it tries again after a save that did not get through; twice as long after every further one. */
+export const AUTO_SAVE_RETRY_MS = 5000;
+/** The longest it waits between two tries. */
+export const AUTO_SAVE_MAX_RETRY_MS = 300000;
+
+/**
+ * Reads MountOptions.autoSave: undefined for "off" (undefined, null, false). Throws TypeError
+ * for a value that is neither a boolean nor an object, a delay outside 250 to 600 000 ms and a
+ * longest wait that is shorter than the delay or not finite.
+ */
+export function resolveAutoSave(value: unknown, name = 'autoSave'): AutoSaveSettings | undefined {
+  if (value === undefined || value === null || value === false) return undefined;
+  if (value === true) return { delayMs: AUTO_SAVE_DELAY_MS, maxWaitMs: AUTO_SAVE_MAX_WAIT_MS };
+  if (typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`"${name}" must be true, false or { delayMs, maxWaitMs }`);
+  const given = value as { delayMs?: unknown; maxWaitMs?: unknown; unconditional?: unknown };
+  const delayMs = given.delayMs === undefined || given.delayMs === null ? AUTO_SAVE_DELAY_MS : given.delayMs;
+  if (typeof delayMs !== 'number' || !(delayMs >= AUTO_SAVE_MIN_DELAY_MS && delayMs <= AUTO_SAVE_MAX_DELAY_MS)) {
+    throw new TypeError(`"${name}.delayMs" must be a number of milliseconds from ${AUTO_SAVE_MIN_DELAY_MS} to ${AUTO_SAVE_MAX_DELAY_MS}`);
+  }
+  const maxWaitMs = given.maxWaitMs === undefined || given.maxWaitMs === null ? Math.max(AUTO_SAVE_MAX_WAIT_MS, delayMs) : given.maxWaitMs;
+  if (typeof maxWaitMs !== 'number' || !(maxWaitMs >= delayMs) || maxWaitMs === Infinity) {
+    throw new TypeError(`"${name}.maxWaitMs" must be a finite number of milliseconds that is not below "delayMs"`);
+  }
+  if (given.unconditional !== undefined && given.unconditional !== null && typeof given.unconditional !== 'boolean') throw new TypeError(`"${name}.unconditional" must be true or false`);
+  return given.unconditional === true ? { delayMs, maxWaitMs, unconditional: true } : { delayMs, maxWaitMs };
+}
+
 /** MountOptions.saveTo: `true` for the address the file was fetched from, an address, a request, or a function. */
 export type SaveTo = true | string | SaveToRequest | SaveToFunction;
 
@@ -83,6 +143,14 @@ export interface SaveState {
   lastSavedAt?: number;
   /** Why the last save failed, in the language of the view; gone when a save starts or succeeds. */
   error?: string;
+  /** Auto-save is on (MountOptions.autoSave, setAutoSave()). Only there, as true, when it is. */
+  auto?: boolean;
+  /**
+   * Auto-save is on and sends nothing by itself until the user has saved: a save ended in a
+   * conflict or a refusal, or the server named no version of the file (no strong ETag) that a
+   * save could be guarded with. Only there, as true, when it holds.
+   */
+  autoPaused?: boolean;
 }
 
 export type SaveErrorCode =
@@ -333,6 +401,80 @@ export function watchLeaving(
   return () => win.removeEventListener('beforeunload', onLeave);
 }
 
+/**
+ * Calls `hidden` whenever the page is hidden (its tab was left, its window is being closed): the
+ * last moment at which something can still be sent. The result takes the listener away again;
+ * safe to call twice.
+ */
+export function watchHiding(
+  doc: { visibilityState?: string; addEventListener(type: 'visibilitychange', listener: () => void): void; removeEventListener(type: 'visibilitychange', listener: () => void): void },
+  hidden: () => void,
+): () => void {
+  const onChange = () => {
+    if (doc.visibilityState === 'hidden') hidden();
+  };
+  doc.addEventListener('visibilitychange', onChange);
+  return () => doc.removeEventListener('visibilitychange', onChange);
+}
+
+/** What bindSaveToPage() needs of the page a view is mounted in. */
+export interface SavePage {
+  /** The view: its setReadOnly() is wrapped, so that the controller hears of it whoever calls it. */
+  view: { setReadOnly(readOnly: boolean): void };
+  /**
+   * Whether text is typed in the view that is in no change yet: a cell, a note or the name of a
+   * sheet that is being typed, a dialog with changes. Not a drag, and not a composition by itself.
+   */
+  unapplied(): boolean;
+  window?: { addEventListener(type: 'beforeunload', listener: (event: BeforeUnloadEvent) => void): void; removeEventListener(type: 'beforeunload', listener: (event: BeforeUnloadEvent) => void): void };
+  document?: { visibilityState?: string; addEventListener(type: 'visibilitychange', listener: () => void): void; removeEventListener(type: 'visibilitychange', listener: () => void): void };
+  /** Ask before the page is left with unsaved work. Default false here; mount() passes its option. */
+  warnOnLeave?: boolean;
+}
+
+/**
+ * Ties a controller to the page its view is shown in: what mount() does around a view, apart from
+ * the view itself. Leaving the page with unsaved work asks first, a page that is hidden lets
+ * auto-save send what waits, a view that turns read-only takes the question about a conflict away
+ * and one that can be edited again starts the delay of auto-save anew.
+ *
+ * `unsaved()` is what MountedView.hasUnsavedChanges answers: changes that no save holds, or text
+ * that is typed and not applied yet. The second is no change of the file, so the state of the
+ * controller (`dirty`, what onSaveState is told) does not count it; a user who leaves loses it all the same.
+ * `release()` takes the listeners away (the view keeps its wrapped setReadOnly); safe to call twice.
+ */
+export function bindSaveToPage(controller: SaveController, page: SavePage): { unsaved(): boolean; release(): void } {
+  const unsaved = (): boolean => {
+    if (controller.dirty) return true;
+    try {
+      return page.unapplied() === true;
+    } catch {
+      // A view that cannot say (it is gone) holds nothing that could be lost.
+      return false;
+    }
+  };
+  const view = page.view;
+  const set = view.setReadOnly.bind(view);
+  view.setReadOnly = (readOnly: boolean) => {
+    set(readOnly);
+    // A view that is only read is not asked about a conflict any more: the question goes, unanswered.
+    if (readOnly) controller.dismissConflict();
+    // Editing is on again: what auto-save held back while the view was only read is its to send.
+    else controller.wake();
+  };
+  let unwatchLeave: (() => void) | undefined = page.window && page.warnOnLeave === true ? watchLeaving(page.window, unsaved) : undefined;
+  // A page that is hidden may never be seen again: auto-save sends what waits (it does nothing when it is off).
+  let unwatchHiding: (() => void) | undefined = page.document ? watchHiding(page.document, () => controller.pageHidden()) : undefined;
+  return {
+    unsaved,
+    release() {
+      if (unwatchLeave) unwatchLeave();
+      if (unwatchHiding) unwatchHiding();
+      unwatchLeave = unwatchHiding = undefined;
+    },
+  };
+}
+
 /** The words a save is spoken of with: part of the view's strings. */
 export interface SaveStrings {
   saved: string;
@@ -345,6 +487,7 @@ export interface SaveStrings {
   saveTimedOut: string;
   saveNoConnection: string;
   savePending: string;
+  autoSaveNoVersion: string;
 }
 
 /** What the user is asked when a save ran into a conflict: whether to save over what the target holds. */
@@ -371,6 +514,21 @@ export interface SaveHost {
   commit(): boolean;
   /** The file as it is now. The model is taken before the first await. */
   bytes(): Promise<Uint8Array>;
+  /**
+   * The file as the model is now, with nothing of what is being typed applied and nothing closed:
+   * what auto-save sends. Without it auto-save writes the file with bytes().
+   */
+  bytesAsIs?(): Promise<Uint8Array>;
+  /**
+   * Whether the user is in the middle of something that a save must not cut short or apply by
+   * itself: a cell, a note or the name of a sheet that is being typed, a dialog that is open, an
+   * input method that composes, a drag. Auto-save waits while it holds; it never calls commit().
+   */
+  pending?(): boolean;
+  /** Whether the view is only read now: auto-save sends nothing from such a view. */
+  readOnly?(): boolean;
+  /** Auto-save as it starts out; SaveController.setAutoSave() changes it. */
+  autoSave?: AutoSaveSettings;
   info(): SaveInfo;
   strings(): SaveStrings;
   /** Says something to the user. */
@@ -461,10 +619,42 @@ export class SaveController implements SaveCommand {
   private readonly listeners: (() => void)[] = [];
   private told = '';
   private destroyed = false;
+  /** Auto-save, when it is on. */
+  private auto: AutoSaveSettings | undefined;
+  /** Calls off the timer auto-save waits with. */
+  private autoTimer: (() => void) | undefined;
+  /** The save under way was started by auto-save, and the user has not asked for it since. */
+  private autoRun = false;
+  /**
+   * A save ended in a way that trying again by itself cannot mend (a conflict, a refusal): auto-save
+   * sends nothing until a save of the user has started.
+   */
+  private stopped = false;
+  /** How many saves in a row did not get through: what the wait before the next try grows with. */
+  private retries = 0;
+  /** Auto-save sends nothing before this time: the wait after a failure, after something that was being typed, after it was turned on. */
+  private notBefore: number | undefined;
+  /** How long that wait was when it was set: it is never longer than this, whatever the clock does. */
+  private holdMs = 0;
+  /** It was said that auto-save cannot guard its saves (no ETag): not said again until it could. */
+  private unguardedTold = false;
+  /** Something that went wrong was told, and nothing that went right since: the next save that succeeds says so, also one nobody asked for. */
+  private troubleTold = false;
+  /** When the last change was made. */
+  private changedAt = 0;
+  /** When the first change was made that no save holds. */
+  private dirtySince: number | undefined;
+  /** When the save under way took the file. */
+  private startedAt = 0;
+  /** The failure auto-save told last: the same one is not told again by the tries that follow. */
+  private autoTold: SaveErrorCode | undefined;
+  /** The page was hidden while a save was under way: what was changed since is saved as soon as it ends. */
+  private flushDue = false;
 
   constructor(host: SaveHost) {
     this.host = host;
     this.etag = strongETag(host.etag);
+    this.auto = host.autoSave ? { ...host.autoSave } : undefined;
   }
 
   get dirty(): boolean {
@@ -479,7 +669,38 @@ export class SaveController implements SaveCommand {
     const state: SaveState = { dirty: this.dirty, saving: this.busy };
     if (this.lastSavedAt !== undefined) state.lastSavedAt = this.lastSavedAt;
     if (this.error !== undefined) state.error = this.error;
+    if (this.auto) {
+      state.auto = true;
+      if (this.stopped || !this.guarded()) state.autoPaused = true;
+    }
     return state;
+  }
+
+  /** The times auto-save works with; undefined when it is off. */
+  get autoSave(): AutoSaveSettings | undefined {
+    return this.auto ? { ...this.auto } : undefined;
+  }
+
+  /**
+   * Whether a save that auto-save sends now is guarded against overwriting what someone else saved:
+   * the request carries `If-Match` (the ETag the server last named for the address the file came
+   * from, or a header of the page's own), or the page said that it need not be (`unconditional`).
+   * A function of the application guards its target itself.
+   */
+  private guarded(): boolean {
+    const target = this.host.target;
+    if (target.kind === 'function' || (this.auto !== undefined && this.auto.unconditional === true)) return true;
+    if (target.sameAsFile && this.etag !== undefined) return true;
+    for (let i = 0; i < target.headers.length; i++) if (target.headers[i][0].toLowerCase() === 'if-match') return true;
+    return false;
+  }
+
+  /**
+   * Whether auto-save holds still because of how a save ended (a conflict, a refusal of the
+   * server or of the application): it sends nothing until the user saves.
+   */
+  get autoSaveStopped(): boolean {
+    return this.stopped;
   }
 
   /**
@@ -505,6 +726,8 @@ export class SaveController implements SaveCommand {
   changed(): void {
     if (this.destroyed) return;
     this.count++;
+    this.changedAt = this.now();
+    if (this.dirtySince === undefined) this.dirtySince = this.changedAt;
     // Whoever calls is still making the change (a cell that is being written has its editor open until
     // this returns): a save asked for from inside onState waits until the change is over.
     this.changing++;
@@ -513,6 +736,8 @@ export class SaveController implements SaveCommand {
     } finally {
       this.changing--;
     }
+    // Every change starts the delay of auto-save again.
+    this.arm();
   }
 
   run(): void {
@@ -582,6 +807,8 @@ export class SaveController implements SaveCommand {
     // of the host is called: a callback that asks for a save cannot find the controller half way.
     const blocked = this.blockedConversion;
     if (this.running) {
+      // A save auto-save started is the user's from here on: its failure is told and its conflict asked about.
+      this.autoRun = false;
       if (this.count === this.held && !overwrite) return this.result || this.running;
       if (overwrite) this.nextOverwrites = true;
       if (!this.next) {
@@ -599,6 +826,11 @@ export class SaveController implements SaveCommand {
       this.refuse(() => void this.failed(new SaveError('converted', 'The file was converted; saving it over the original needs saveTo.allowConverted')));
       return Promise.resolve(false);
     }
+    return this.launch(overwrite, false);
+  }
+
+  /** Starts a save: the one of the user, or (`auto`) the one nobody asked for. Nothing is under way when it is called. */
+  private launch(overwrite: boolean, auto: boolean): Promise<boolean> {
     let settle: (ok: boolean) => void = () => undefined;
     const running = new Promise<boolean>((resolve) => {
       settle = resolve;
@@ -613,10 +845,20 @@ export class SaveController implements SaveCommand {
     this.held = this.count;
     this.busy = true;
     this.error = undefined;
+    this.autoRun = auto;
+    this.disarm();
+    if (!auto) {
+      // The user saves: whatever kept auto-save still is over, and what comes of this save decides anew.
+      this.stopped = false;
+      this.retries = 0;
+      this.notBefore = undefined;
+      this.autoTold = undefined;
+    }
     const end = (ok: boolean): void => {
       if (this.running === running) {
         this.running = undefined;
         this.result = undefined;
+        this.autoRun = false;
       }
       const asked = this.asked;
       this.asked = undefined;
@@ -625,8 +867,14 @@ export class SaveController implements SaveCommand {
       settle(ok);
       if (!ok && asked) void asked.then(answer);
       else answer(ok);
+      // What was changed meanwhile, or what did not get through, is auto-save's to send later; at once
+      // for a page that was hidden while this save was under way.
+      const flush = this.flushDue;
+      this.flushDue = false;
+      if (flush && ok) this.autoNow();
+      else this.arm();
     };
-    this.start(overwrite).then(end, () => {
+    this.start(overwrite, auto).then(end, () => {
       // A callback of the host threw where nothing catches it: the save has an end all the same.
       this.busy = false;
       try {
@@ -637,6 +885,146 @@ export class SaveController implements SaveCommand {
       end(false);
     });
     return result;
+  }
+
+  /**
+   * Turns auto-save on, off, or to other times (see AutoSave). Turned on over changes that no save
+   * holds, it saves them a delay later. It does not undo what stopped it: after a conflict or a
+   * refusal it stays still until the user saves. Throws TypeError for a value resolveAutoSave() refuses,
+   * and changes nothing then.
+   */
+  setAutoSave(value: AutoSave | undefined | null): void {
+    const settings = resolveAutoSave(value);
+    if (this.destroyed) return;
+    this.auto = settings;
+    this.disarm();
+    if (settings) {
+      this.hold(settings.delayMs);
+      this.arm();
+    } else this.flushDue = false;
+    this.emit();
+  }
+
+  /**
+   * Says that something that kept auto-save from sending may be over (the view can be edited
+   * again): the delay starts anew. Does nothing where nothing waits.
+   */
+  wake(): void {
+    if (!this.auto || this.destroyed) return;
+    this.hold(this.auto.delayMs);
+    this.arm();
+  }
+
+  /**
+   * The page was hidden (the tab was left, the window is being closed): auto-save sends what waits
+   * at once, as the last chance it may get. What is being typed is not applied here either, and a
+   * save that was stopped stays stopped. Does nothing without auto-save.
+   */
+  pageHidden(): void {
+    if (!this.auto || this.destroyed || this.stopped || !this.dirty) return;
+    if (this.busy) {
+      // One request at a time: what the save under way does not hold goes when it has ended.
+      if (this.count !== this.held) this.flushDue = true;
+      return;
+    }
+    this.autoNow();
+  }
+
+  private now(): number {
+    return this.host.now ? this.host.now() : Date.now();
+  }
+
+  /** Auto-save sends nothing for the next `ms` (and not before what already holds it back). */
+  private hold(ms: number): void {
+    const until = this.now() + ms;
+    if (this.notBefore === undefined || until > this.notBefore) {
+      this.notBefore = until;
+      this.holdMs = ms;
+    }
+  }
+
+  private disarm(): void {
+    const off = this.autoTimer;
+    this.autoTimer = undefined;
+    if (off) off();
+  }
+
+  /** Sets the timer of auto-save to when the file is next to be sent, when there is something to send and nothing in the way. */
+  private arm(): void {
+    this.disarm();
+    const auto = this.auto;
+    if (!auto || this.destroyed || this.stopped || this.busy || this.question || !this.dirty) return;
+    const now = this.now();
+    // A clock that was set back: no time that was noted lies in the future, and no wait is longer than
+    // it was meant to be. (Without this auto-save would be silent for as long as the clock went back.)
+    if (this.changedAt > now) this.changedAt = now;
+    if (this.dirtySince !== undefined && this.dirtySince > now) this.dirtySince = now;
+    if (this.notBefore !== undefined && this.notBefore - now > this.holdMs) this.notBefore = now + this.holdMs;
+    let due = this.changedAt + auto.delayMs;
+    // Who never stops typing is saved all the same.
+    if (this.dirtySince !== undefined) due = Math.min(due, this.dirtySince + auto.maxWaitMs);
+    if (this.notBefore !== undefined) due = Math.max(due, this.notBefore);
+    const stop = (this.host.timer || defaultTimer)(
+      () => {
+        if (this.autoTimer !== stop) return;
+        this.autoTimer = undefined;
+        this.autoNow();
+      },
+      Math.max(0, due - now),
+    );
+    this.autoTimer = stop;
+  }
+
+  /**
+   * The save nobody asked for, now: sent when nothing is under way, the file can be written and the
+   * user is not in the middle of something. It applies nothing that is being typed, asks nothing and
+   * never waits in line: whatever keeps it from starting, it is looked at again later or not at all.
+   */
+  private autoNow(): void {
+    this.disarm();
+    if (!this.autoFree()) return;
+    // Inside the telling of a change: the timer looks again when the change is over.
+    if (this.changing > 0) return this.arm();
+    const host = this.host;
+    let pending = false;
+    let able = false;
+    try {
+      // A file that cannot be written, a converted one that may not replace its original and a view that is
+      // only read are not tried: a change or wake() is what looks again.
+      able = host.writable() && !this.blockedConversion && !(host.readOnly !== undefined && host.readOnly());
+      pending = able && host.pending !== undefined && host.pending();
+    } catch {
+      // A host that cannot say is taken to be in the middle of something.
+      able = true;
+      pending = true;
+    }
+    // The host was asked, and may have saved, changed or destroyed from inside its answers: looked at again.
+    if (!able) return;
+    if (!this.autoFree()) return this.arm();
+    if (!this.guarded()) {
+      // Nothing to guard the save with: it could go over what someone else saved, and nobody would be
+      // asked. Nothing is sent; the user is told once, and the state says that auto-save waits. No save
+      // has failed, so onError hears nothing. A save of the user that brings an ETag sets it going again.
+      const tell = !this.unguardedTold;
+      this.unguardedTold = true;
+      this.emit();
+      if (tell) {
+        this.troubleTold = true;
+        this.say(host.strings().autoSaveNoVersion, 'error');
+      }
+      return;
+    }
+    if (pending) {
+      // Nothing is cut short: looked at again a delay from now.
+      this.hold((this.auto as AutoSaveSettings).delayMs);
+      return this.arm();
+    }
+    void this.launch(false, true);
+  }
+
+  /** Whether auto-save has something to send and nothing of the controller's own is in its way. */
+  private autoFree(): boolean {
+    return this.auto !== undefined && !this.destroyed && !this.stopped && !this.busy && !this.running && !this.question && this.dirty;
   }
 
   /**
@@ -731,6 +1119,8 @@ export class SaveController implements SaveCommand {
     if (this.destroyed) return;
     this.destroyed = true;
     this.listeners.length = 0;
+    this.disarm();
+    this.flushDue = false;
     // A question that is open is taken away; whoever waits for its answer is answered.
     this.dismissConflict();
     const abort = this.abort;
@@ -738,7 +1128,7 @@ export class SaveController implements SaveCommand {
     if (abort) abort();
   }
 
-  private async start(overwrite: boolean): Promise<boolean> {
+  private async start(overwrite: boolean, auto: boolean): Promise<boolean> {
     const host = this.host;
     // saveNow() has marked the save as under way; this is the first the host hears of it.
     this.emit();
@@ -747,7 +1137,9 @@ export class SaveController implements SaveCommand {
       // Before the file is taken: what is changed from here on is not in these bytes. (Taken again
       // here, after onState was told: what a callback changed there is in them.)
       this.held = this.count;
-      bytes = await host.bytes();
+      this.startedAt = this.now();
+      // The save nobody asked for takes the model as it is: nothing that is being typed is applied for it.
+      bytes = await (auto && host.bytesAsIs ? host.bytesAsIs() : host.bytes());
     } catch (error) {
       if (this.destroyed) return false;
       return this.failed(new SaveError('write', 'The file could not be written', undefined, error));
@@ -758,15 +1150,20 @@ export class SaveController implements SaveCommand {
       let info = host.info();
       // A copy: what the host hands out is not written to.
       if (overwrite && target.kind === 'function') info = { ...info, overwrite: true };
+      if (auto) info = { ...info, auto: true };
       if (target.kind === 'function') await this.call(target.save, bytes, info);
       else await this.request(target, bytes, info, overwrite);
     } catch (error) {
       if (this.destroyed) return false;
       if (error instanceof SaveError) {
+        // Before it is told: a save the user asks for from inside the telling is another save.
+        const wasAuto = this.autoRun;
         this.failed(error);
         // After the notice and onError: a page that answers by itself there is not asked as well.
         // A save that carried no condition and was refused all the same is not asked about again.
-        if (error.code === 'conflict' && !overwrite) this.ask(error);
+        // Nor is the conflict of a save nobody asked for: the question would open under the hands of whoever
+        // is typing. It was told, auto-save holds still, and the next save of the user is what asks.
+        if (error.code === 'conflict' && !overwrite && !wasAuto) this.ask(error);
         return false;
       }
       const detail = detailOf(error);
@@ -782,10 +1179,23 @@ export class SaveController implements SaveCommand {
     // Also what was said meanwhile of something typed that could not be applied: the state does not
     // say "saved" and "could not be saved" at once.
     this.error = undefined;
+    // A save that was taken: auto-save starts over, whatever held it back.
+    this.stopped = false;
+    this.retries = 0;
+    this.notBefore = undefined;
+    this.autoTold = undefined;
+    // What was changed since the file was taken has waited since then at the latest.
+    this.dirtySince = this.dirty ? this.startedAt : undefined;
+    if (this.guarded()) this.unguardedTold = false;
     this.lastSavedAt = host.now ? host.now() : Date.now();
     this.emit();
     // With changes made meanwhile there is still something to save: "saved" would say otherwise.
-    if (!this.dirty) this.say(host.strings().saved, 'info');
+    // A save nobody asked for is not told either, every few seconds: the state says it. Unless
+    // something that went wrong was told before: then the user learns that it is over.
+    if (!this.dirty && (!this.autoRun || this.troubleTold)) {
+      this.troubleTold = false;
+      this.say(host.strings().saved, 'info');
+    }
     if (host.onSaved) {
       try {
         host.onSaved(bytes);
@@ -798,19 +1208,31 @@ export class SaveController implements SaveCommand {
 
   /** Lets the application's function save, and gives up waiting for it when it takes too long. */
   private call(save: SaveToFunction, bytes: Uint8Array, info: SaveInfo): Promise<void> {
+    // The function is called here and waited for in waitFor(), which never sees the bytes: nothing
+    // that waits (a time limit of ten minutes, on a timer that may not let go of its callback) keeps a file alive.
+    let job: void | Promise<void>;
+    try {
+      job = save(bytes, info);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.waitFor(job);
+  }
+
+  /** Waits for what the application's function returned, and gives up when it takes too long. */
+  private waitFor(job: void | Promise<void>): Promise<void> {
     const host = this.host;
     const timeout = host.timeoutMs === undefined ? SAVE_FUNCTION_TIMEOUT_MS : host.timeoutMs;
+    // Destroyed from inside the function: nobody waits for it any more.
+    if (this.destroyed) return Promise.reject(new SaveError('network', 'The save was given up'));
     return new Promise<void>((resolve, reject) => {
       let over = false;
-      const stop = (host.timer || defaultTimer)(() => {
-        if (over) return;
-        over = true;
-        reject(new SaveError('timeout', `The application did not finish saving within ${Math.round(timeout / 1000)} s`));
-      }, timeout);
+      let stop: (() => void) | undefined;
       const end = (error?: { reason: unknown }) => {
         if (over) return;
         over = true;
-        stop();
+        if (stop) stop();
+        stop = undefined;
         if (this.abort === give) this.abort = undefined;
         if (error) reject(error.reason);
         else resolve();
@@ -818,12 +1240,7 @@ export class SaveController implements SaveCommand {
       // The view is destroyed: the function is no longer waited for, and its time limit is called off.
       const give = () => end({ reason: new SaveError('network', 'The save was given up') });
       this.abort = give;
-      let job: void | Promise<void>;
-      try {
-        job = save(bytes, info);
-      } catch (error) {
-        return end({ reason: error });
-      }
+      stop = (host.timer || defaultTimer)(() => end({ reason: new SaveError('timeout', `The application did not finish saving within ${Math.round(timeout / 1000)} s`) }), timeout);
       Promise.resolve(job).then(
         () => end(),
         (reason) => end({ reason }),
@@ -868,7 +1285,20 @@ export class SaveController implements SaveCommand {
     }
     this.busy = false;
     this.error = text;
+    // What auto-save does about it. A request that did not get through, one without an answer in time and
+    // a server that failed (5xx) are tried again, each time after twice the wait; anything else is not
+    // mended by trying, and holds auto-save still until the user saves.
+    const again = error.code === 'network' || error.code === 'timeout' || (error.code === 'http' && error.status !== undefined && error.status >= 500);
+    if (again) {
+      this.retries++;
+      this.hold(Math.min(AUTO_SAVE_MAX_RETRY_MS, AUTO_SAVE_RETRY_MS * Math.pow(2, Math.min(this.retries - 1, 30))));
+    } else this.stopped = true;
+    // The same failure of one try after the other is told once: the state says it every time.
+    const repeated = this.autoRun && this.autoTold === error.code;
+    this.autoTold = this.autoRun ? error.code : undefined;
     this.emit();
+    if (repeated) return false;
+    this.troubleTold = true;
     this.say(text, 'error');
     this.report(error);
     return false;
@@ -988,7 +1418,7 @@ export class SaveController implements SaveCommand {
   private emit(): void {
     if (this.destroyed) return;
     const state = this.state;
-    const key = `${state.dirty} ${state.saving} ${state.lastSavedAt} ${state.error}`;
+    const key = `${state.dirty} ${state.saving} ${state.lastSavedAt} ${state.error} ${state.auto} ${state.autoPaused}`;
     if (key === this.told) return;
     this.told = key;
     if (this.host.onState) {

@@ -18,7 +18,7 @@ import type { SheetPrintOptions } from '../ui/sheet-print';
 import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
-import { SaveController, SaveError, type ConflictQuestion, type SaveInfo } from './save-to';
+import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
 export type BridgeErrorCode =
   | 'unsupported'
@@ -76,6 +76,8 @@ export interface BridgeDocumentView {
   readonly trackingChanges?: boolean;
   /** Says something to the user: that the document was saved, or why it was not. */
   showNotice?(message: string, kind?: 'error' | 'info'): void;
+  /** Whether an input method composes or something is dragged: auto-save waits meanwhile. */
+  hasPendingInput?(): boolean;
 }
 
 export interface BridgeHost {
@@ -145,8 +147,14 @@ export interface BridgeHost {
   onLocale?(locale: string): void;
   /** Runs a callback on the next frame; selection messages are sent from it. Default: a 16 ms timer. */
   frame?(callback: () => void): void;
-  /** Runs a callback after a delay. Default: setTimeout. */
-  timer?(callback: () => void, ms: number): void;
+  /**
+   * Runs a callback after a delay. Default: setTimeout. It may return what calls the timer off
+   * (as clearTimeout does): the waits that end early are then really ended. Without one the page
+   * only lets go of what the callback held, and the timer runs out empty.
+   */
+  timer?(callback: () => void, ms: number): void | (() => void);
+  /** The clock auto-save counts with, in milliseconds. Default: Date.now. */
+  now?(): number;
 }
 
 export interface Bridge {
@@ -159,6 +167,11 @@ export interface Bridge {
   start(): void;
   /** Closes the file, gives up a load that is under way and stops answering. */
   destroy(): void;
+  /**
+   * Says that the page was hidden (the application went to the background, the WebView is being
+   * closed): a file loaded with `save: { auto }` hands what waits to the application at once.
+   */
+  pageHidden(): void;
 }
 
 const ENCODE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -508,8 +521,30 @@ interface Shown {
 
 /** The message handling of the bridge page, with everything it needs from the page handed in. */
 export function createBridge(host: BridgeHost): Bridge {
-  const timer = host.timer || ((callback: () => void, ms: number) => void setTimeout(callback, ms));
-  const frame = host.frame || ((callback: () => void) => timer(callback, 16));
+  const timer =
+    host.timer ||
+    ((callback: () => void, ms: number): (() => void) => {
+      const handle = setTimeout(callback, ms);
+      return () => clearTimeout(handle);
+    });
+  const frame = host.frame || ((callback: () => void) => void timer(callback, 16));
+  /**
+   * A timer that can be called off whatever the host's can do: called off, it lets go of its callback
+   * (and of everything that callback holds) at once, and ends the host's timer when the host said how.
+   */
+  const cancellable = (callback: () => void, ms: number): (() => void) => {
+    let waiting: (() => void) | undefined = callback;
+    const cancel = timer(() => {
+      const run = waiting;
+      waiting = undefined;
+      if (run) run();
+    }, ms);
+    return () => {
+      if (!waiting) return;
+      waiting = undefined;
+      if (typeof cancel === 'function') cancel();
+    };
+  };
   const fetchTimeout = host.fetchTimeoutMs === undefined ? DEFAULT_FETCH_TIMEOUT_MS : host.fetchTimeoutMs;
   const maxFetchBytes = host.maxFetchBytes === undefined ? DEFAULT_MAX_FETCH_BYTES : host.maxFetchBytes;
   const maxPendingChars = host.maxPendingChars === undefined ? DEFAULT_MAX_PENDING_CHARS : host.maxPendingChars;
@@ -543,7 +578,7 @@ export function createBridge(host: BridgeHost): Bridge {
   /** The list of sheets as the application was last told (in `loaded` or `sheets`), as JSON; '' while no workbook is shown. */
   let sheetsSent = '';
   /** The save of the user that the application has been handed and has not answered with `saveResult` yet. */
-  let awaited: { saveId: string; resolve(): void; reject(error: unknown): void } | undefined;
+  let awaited: { saveId: string; resolve(): void; reject(error: unknown): void; stop(): void } | undefined;
   /** Counts the saves of the user: each `saved` that comes from one names itself, and its `saveResult` names it back. */
   let userSaves = 0;
   /** The application was told the state of the save of a file (`saveState`) that has been closed since, and not that it is over. */
@@ -649,6 +684,7 @@ export function createBridge(host: BridgeHost): Bridge {
       const waiting = awaited;
       if (given.saveId !== undefined && waiting && waiting.saveId === given.saveId) {
         awaited = undefined;
+        waiting.stop();
         waiting.reject(new SaveError('refused', 'The saved file was given up: the application did not take it'));
       }
     }
@@ -694,6 +730,7 @@ export function createBridge(host: BridgeHost): Bridge {
       shown.saver.destroy();
       saveStateLeft = true;
     }
+    if (awaited) awaited.stop();
     awaited = undefined;
     shown = undefined;
     sheetCount = undefined;
@@ -826,7 +863,21 @@ export function createBridge(host: BridgeHost): Bridge {
     const toolbar = field<boolean>(message, 'toolbar', 'boolean', false);
     const author = field<string>(message, 'author', 'string', false);
     const trackChanges = field<boolean>(message, 'trackChanges', 'boolean', false);
-    const userSaves = field<boolean>(message, 'save', 'boolean', false);
+    // `save`: true, or an object that also says whether the page saves by itself ({ auto }).
+    const saveField = message.save;
+    let userSaves = false;
+    let autoSave: AutoSaveSettings | undefined;
+    if (typeof saveField === 'object' && saveField !== null && !Array.isArray(saveField)) {
+      userSaves = true;
+      try {
+        autoSave = resolveAutoSave((saveField as { auto?: unknown }).auto, 'save.auto');
+      } catch (error) {
+        throw new BadMessage(errorText(error));
+      }
+    } else if (saveField !== undefined && saveField !== null) {
+      if (typeof saveField !== 'boolean') throw new BadMessage('"save" must be a boolean or an object ({ auto })');
+      userSaves = saveField;
+    }
     if (author !== undefined && author.length > 255) throw new BadMessage('"author" is too long');
     if ((data === undefined ? 0 : 1) + (url === undefined ? 0 : 1) + (blank === undefined ? 0 : 1) !== 1) {
       throw new BadMessage('"load" needs exactly one of "data", "url" and "blank"');
@@ -946,6 +997,8 @@ export function createBridge(host: BridgeHost): Bridge {
       if (locked) out.readOnly = true;
       // The page has a Save button and takes Ctrl+S: the application will be handed what the user saves.
       if (shown && shown.saver) out.save = true;
+      // And saves by itself: such a file arrives in `saved` messages that say `by: "auto"`.
+      if (shown && shown.saver && shown.saver.autoSave) out.autoSave = true;
       if (convertedFrom !== undefined) out.convertedFrom = convertedFrom;
       if (warnings !== undefined) out.warnings = warnings;
       if (doc) {
@@ -993,7 +1046,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (locale !== undefined) documentOptions.locale = locale;
       if (author !== undefined) documentOptions.author = author;
       if (trackChanges === true) documentOptions.trackChanges = true;
-      const saver = userSaves === true && !locked ? userSaver() : undefined;
+      const saver = userSaves === true && !locked ? userSaver(autoSave) : undefined;
       if (saver) documentOptions.saveCommand = saver;
       const create = (toolbar === true && host.createDocumentEditor) || (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>);
       closeShown();
@@ -1064,7 +1117,7 @@ export function createBridge(host: BridgeHost): Bridge {
     // Who the notes added to cells are by.
     if (author !== undefined) options.author = author;
 
-    const saver = userSaves === true && !locked ? userSaver() : undefined;
+    const saver = userSaves === true && !locked ? userSaver(autoSave) : undefined;
     if (saver) options.saveCommand = saver;
     // A load that says `toolbar: false` wants the workbook without the bars it is worked on with: the grid, its tabs
     // and the status bar are what is left (a viewer). Without the field a workbook is shown as it always was.
@@ -1242,34 +1295,42 @@ export function createBridge(host: BridgeHost): Bridge {
     return bytes;
   };
 
+  /** The file that is shown as bytes, as its model is: nothing that is being typed is applied, nothing is closed. */
+  const writeShownAsIs = async (current: Shown): Promise<Uint8Array> => {
+    const pages = current.pages;
+    const changes = pages ? pages.changeCount : undefined;
+    const bytes = await current.file.save();
+    if (pages && pages.markSaved && pages.changeCount === changes) pages.markSaved();
+    return bytes;
+  };
+
   /**
    * What the Save button and Ctrl+S of the page run for a `load` with `save`: the application is
    * handed the file in a `saved` message that says it comes from the user, and answers with
    * `saveResult` when it has stored it. Until then the page shows the save as under way; without
-   * an answer in time it has failed.
+   * an answer in time it has failed. With `auto` the page also hands the file over by itself, in
+   * `saved` messages that say `by: "auto"` and are answered the same way.
    */
-  function userSaver(): SaveController {
+  function userSaver(auto?: AutoSaveSettings): SaveController {
     const mine: SaveController = new SaveController({
       target: {
         kind: 'function',
-        save: (bytes: Uint8Array, info: SaveInfo) =>
-          new Promise<void>((resolve, reject) => {
-            // Never the id of a save before it, of this file or of another: an answer that comes late names a save that is gone.
-            const saveId = `u${++userSaves}`;
-            const waiting = { saveId, resolve, reject };
-            const out: Message = { type: 'saved', by: 'user', saveId, data: base64Encode(bytes), format: info.format };
-            // The user was asked and chose to keep their own file: the application writes it whatever it holds.
-            if (info.overwrite === true) out.overwrite = true;
-            if (info.name !== undefined) out.name = info.name;
-            if (info.convertedFrom !== undefined) out.convertedFrom = info.convertedFrom;
-            awaited = waiting;
-            send(out);
-            timer(() => {
-              if (awaited !== waiting) return;
-              awaited = undefined;
-              reject(new SaveError('timeout', `The application did not answer the save within ${Math.round(saveResultTimeout / 1000)} s`));
-            }, saveResultTimeout);
-          }),
+        // No closure is made here: what waits for the result (awaitResult) knows the id of the save and
+        // never its bytes, so that a file is let go of as soon as its message is.
+        save: (bytes: Uint8Array, info: SaveInfo) => {
+          // Never the id of a save before it, of this file or of another: an answer that comes late names a save that is gone.
+          // One count for both kinds: the letter only says who started the save.
+          const saveId = `${info.auto === true ? 'a' : 'u'}${++userSaves}`;
+          const out: Message = { type: 'saved', by: info.auto === true ? 'auto' : 'user', saveId, data: base64Encode(bytes), format: info.format };
+          // The user was asked and chose to keep their own file: the application writes it whatever it holds.
+          if (info.overwrite === true) out.overwrite = true;
+          if (info.name !== undefined) out.name = info.name;
+          if (info.convertedFrom !== undefined) out.convertedFrom = info.convertedFrom;
+          // Before the message goes: an application that answers from inside the call finds the save waiting.
+          const result = awaitResult(saveId);
+          send(out);
+          return result;
+        },
       },
       writable: () => shown !== undefined && shown.saver === mine && !shown.locked,
       commit: () => {
@@ -1295,6 +1356,24 @@ export function createBridge(host: BridgeHost): Bridge {
         if (!current || current.saver !== mine) return Promise.reject(new Error('No file is open'));
         return writeShown(current);
       },
+      bytesAsIs: () => {
+        const current = shown;
+        if (!current || current.saver !== mine) return Promise.reject(new Error('No file is open'));
+        return writeShownAsIs(current);
+      },
+      // What auto-save must not fall into. A view that cannot say is one in which nothing is typed.
+      pending: () => {
+        const current = shown;
+        if (!current || current.saver !== mine) return true;
+        const view = current.view || current.pages;
+        return !!view && typeof view.hasPendingInput === 'function' && view.hasPendingInput();
+      },
+      readOnly: () => {
+        const current = shown;
+        return !current || (current.view ? current.view.readOnly === true : current.readOnly === true);
+      },
+      autoSave: auto,
+      now: host.now,
       info: () => {
         const current = shown;
         const out: SaveInfo = { format: (current ? current.file.format : 'docx') as SaveInfo['format'] };
@@ -1304,15 +1383,7 @@ export function createBridge(host: BridgeHost): Bridge {
       },
       strings: () => resolveUiStrings(shown ? shown.locale : undefined),
       // The clock of the page, as everything else here uses it.
-      timer: (callback, ms) => {
-        let off = false;
-        timer(() => {
-          if (!off) callback();
-        }, ms);
-        return () => {
-          off = true;
-        };
-      },
+      timer: cancellable,
       notice: (text, kind) => {
         const current = shown;
         if (!current || current.saver !== mine) return;
@@ -1343,6 +1414,22 @@ export function createBridge(host: BridgeHost): Bridge {
     return mine;
   }
 
+  /**
+   * Waits for the `saveResult` of the save that was just handed over: resolves and rejects as the
+   * result says, and rejects when none comes in time. Whoever ends the wait calls its timer off.
+   */
+  function awaitResult(saveId: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const waiting = { saveId, resolve, reject, stop: (): void => undefined };
+      awaited = waiting;
+      waiting.stop = cancellable(() => {
+        if (awaited !== waiting) return;
+        awaited = undefined;
+        reject(new SaveError('timeout', `The application did not answer the save within ${Math.round(saveResultTimeout / 1000)} s`));
+      }, saveResultTimeout);
+    });
+  }
+
   /** The application's answer to a `saved` message that came from the user. */
   const saveResult = (message: Message, id: string | undefined) => {
     const saveId = field<string>(message, 'saveId', 'string', true);
@@ -1354,6 +1441,7 @@ export function createBridge(host: BridgeHost): Bridge {
     // stopped waiting, twice, or for a file that was closed must not be taken for the result of the next save.
     if (!waiting || waiting.saveId !== saveId) return fail('bad-message', 'No save with this "saveId" is waiting for a result', id);
     awaited = undefined;
+    waiting.stop();
     const said = text === undefined ? '' : text.slice(0, MAX_RESULT_MESSAGE_CHARS);
     if (ok === true) waiting.resolve();
     // The file the application holds is not the one it gave the page: the user is asked, and what the application said is shown with the question.
@@ -1458,6 +1546,8 @@ export function createBridge(host: BridgeHost): Bridge {
         if (pages) shown.readOnly = value;
         // A file that is only read now is not asked about: the question about a conflict is taken away, unanswered.
         if (value && shown.saver) shown.saver.dismissConflict();
+        // Editing is on again: what auto-save held back while the file was only read is its to hand over.
+        else if (shown.saver) shown.saver.wake();
       } else if (type === 'setLocale') {
         try {
           if (view) view.setLocale(locale as string);
@@ -1524,6 +1614,9 @@ export function createBridge(host: BridgeHost): Bridge {
 
   return {
     start,
+    pageHidden() {
+      if (!destroyed && shown && shown.saver) shown.saver.pageHidden();
+    },
     receive(message: unknown): Promise<void> {
       if (destroyed) return Promise.resolve();
       // A call proves the application is there: `ready` and anything kept get another try.
@@ -1719,7 +1812,10 @@ export function installBridge(options: InstallBridgeOptions): Bridge {
     askOverwrite: (question, locale, element) =>
       askOverwrite({ root: editorRootIn(options.container, element), strings: resolveUiStrings(locale), detail: question.detail, answer: question.answer }),
     frame: typeof win.requestAnimationFrame === 'function' ? (callback) => void win.requestAnimationFrame(callback) : undefined,
-    timer: (callback, ms) => void win.setTimeout(callback, ms),
+    timer: (callback, ms) => {
+      const handle = win.setTimeout(callback, ms);
+      return () => win.clearTimeout(handle);
+    },
   });
 
   // Nothing is returned to the caller: some WebViews report an error when the
@@ -1747,12 +1843,21 @@ export function installBridge(options: InstallBridgeOptions): Bridge {
   const onWebViewMessage = (event: { data: unknown }) => void bridge.receive(event.data);
   if (webview && typeof webview.addEventListener === 'function') webview.addEventListener('message', onWebViewMessage);
 
+  // A page that is hidden may never be shown again: what auto-save holds is handed over at once.
+  const doc = win.document as Document | undefined;
+  const onVisibility = () => {
+    if (doc && doc.visibilityState === 'hidden') bridge.pageHidden();
+  };
+  if (doc && typeof doc.addEventListener === 'function') doc.addEventListener('visibilitychange', onVisibility);
+
   bridge.start();
   return {
     start: bridge.start,
     receive: bridge.receive,
+    pageHidden: bridge.pageHidden,
     destroy() {
       bridge.destroy();
+      if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility);
       win.removeEventListener('message', onWindowMessage);
       if (webview && typeof webview.removeEventListener === 'function') webview.removeEventListener('message', onWebViewMessage);
       if (channels.BymOfficeBridge === entry) delete channels.BymOfficeBridge;

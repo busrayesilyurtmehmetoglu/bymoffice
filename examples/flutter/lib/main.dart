@@ -51,6 +51,8 @@ class _EditorPageState extends State<EditorPage> {
     _errors = _editor.onError.listen((BymOfficeException error) => _show('${error.code}: ${error.message}'));
     // The Save button of the page's toolbar and Ctrl/Cmd+S: the page hands the file over, the application
     // stores it and says what became of it. (NOT COMPILED: written against the contract, never built.)
+    // (This example does not load with `autoSave`: storing here asks the user for a place, which a save
+    // nobody asked for must not do. An application that saves by itself stores [file.byAuto] files silently.)
     _userSaves = _editor.onUserSave.listen((BymOfficeSavedFile file) async {
       try {
         final bool stored = await _store(file.bytes);

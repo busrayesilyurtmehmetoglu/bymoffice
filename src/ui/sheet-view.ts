@@ -5173,6 +5173,28 @@ export class WorkbookView {
   }
 
   /**
+   * Whether the user is in the middle of something that commitPending() would apply or close, or
+   * that a save must not fall into: a cell, a note or the name of a sheet that is being typed, a
+   * dialog of rules that is open (changed or not), an input method that composes, a drag in the
+   * grid. Only asks: nothing is applied and nothing is closed. Auto-save waits while it holds.
+   */
+  hasPendingInput(): boolean {
+    if (this.destroyed) return false;
+    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || this.rulesDialog !== undefined || this.composing || this.drag !== undefined;
+  }
+
+  /**
+   * Whether text is typed in the view that is in no change of the workbook yet, and that leaving
+   * now would lose: a cell, a note or the name of a sheet that is being typed, a dialog of rules
+   * in which something was changed. Less than hasPendingInput(): a drag, a composition by itself
+   * and a dialog nothing was changed in hold no text. Only asks.
+   */
+  hasUnappliedText(): boolean {
+    if (this.destroyed) return false;
+    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || (this.rulesDialog !== undefined && this.rulesDialog.changed());
+  }
+
+  /**
    * What is done about a dialog of rules that is open when the workbook is about to be taken or changed from
    * outside the dialog: closed when nothing was changed in it, left open and said otherwise (see commitPending()).
    * Returns whether no dialog is open afterwards.

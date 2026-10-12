@@ -1161,7 +1161,7 @@ test.describe('BymOffice.mount with a document', () => {
     }, Array.from(input));
     expect(result.kind).toBe('document');
     expect(result.format).toBe('docx');
-    expect(result.keys).toEqual(['destroy', 'document', 'editor', 'file', 'hasUnsavedChanges', 'kind', 'print', 'save', 'saveNow', 'view']);
+    expect(result.keys).toEqual(['destroy', 'document', 'editor', 'file', 'hasUnsavedChanges', 'kind', 'print', 'save', 'saveNow', 'setAutoSave', 'view']);
     expect(result.blocks).toBe(true);
     expect(result.isView).toBe(true);
     expect(result.saved).toEqual(Array.from(input));

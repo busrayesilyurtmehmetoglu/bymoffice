@@ -162,6 +162,8 @@
           Burada üretilen boş bir dosya bu sayfayı sunan yerel sunucuya (<code>/e2e/saved/…</code>, yalnız bellekte tutulur) konur ve
           <code>BymOffice.mount(el, { file: adres, saveTo: … })</code> ile açılır. Araç çubuğunun başındaki Kaydet düğmesi ve Ctrl/Cmd+S dosyayı
           alındığı adrese geri yollar. Yukarıda bıraktığınız dosyalar bu denemeye girmez, hiçbir yere gönderilmez.
+          "Kendiliğinden kaydet" işaretliyse (<code>autoSave: true</code>) son değişiklikten 2 saniye sonra düğmeye basmadan kaydeder; yazılmakta olan hücreyi
+          bölmez, çakışmada (412) durur ve soruyu ancak Kaydet'e basınca sorar.
         </p>
         <div class="row" style="margin: 0 0 10px">
           <label>Hedef
@@ -172,6 +174,7 @@
               <option value="failing">saveTo: sunucu 503 yanıtlar</option>
             </select>
           </label>
+          <label title="mount({ autoSave: true }); açıkken işaret değişirse mounted.setAutoSave(…)"><input type="checkbox" id="saveto-auto" /> Kendiliğinden kaydet</label>
           <button id="saveto-xlsx">Boş xlsx ile dene</button>
           <button id="saveto-docx">Boş docx ile dene</button>
           <button id="saveto-conflict" disabled title="Sunucudaki kopyayı değiştirir: sonraki kayıt 412 alır; editör üzerine yazmadan önce sorar (onConflict: 'fail' ise yalnız bildirir).">Sunucudaki kopyayı değiştir (412)</button>
@@ -745,7 +748,8 @@
       const saveToState = (state) => {
         $('saveto-state').textContent =
           (state.saving ? 'Kaydediliyor…' : state.error ? `Kaydedilemedi: ${state.error}` : state.dirty ? 'Kaydedilmemiş değişiklik var.' : state.lastSavedAt ? `Kaydedildi (${new Date(state.lastSavedAt).toLocaleTimeString('tr-TR')}).` : 'Değişiklik yok.') +
-          ` — dirty: ${state.dirty}, saving: ${state.saving}`;
+          ` — dirty: ${state.dirty}, saving: ${state.saving}` +
+          (state.auto ? ', auto: true' : '');
       };
       const tryLocation = location.protocol === 'http:' || location.protocol === 'https:';
       // A name of its own for every page that is opened: two pages do not save over each other.
@@ -777,13 +781,14 @@
                       : (bytes, info) => {
                           saveToKept = { bytes, info };
                         },
+              autoSave: $('saveto-auto').checked,
               onSaveState: saveToState,
               onNotice: (notice) => {
                 $('saveto-notice').textContent = notice.message;
               },
             });
             window.__saveTo = saveToMounted;
-            saveToState({ dirty: false, saving: false });
+            saveToState($('saveto-auto').checked ? { dirty: false, saving: false, auto: true } : { dirty: false, saving: false });
             $('saveto-conflict').disabled = false;
             $('saveto-overwrite').disabled = false;
             $('saveto-check').disabled = false;
@@ -793,6 +798,10 @@
           }
         });
       }
+      // Auto-save is turned on and off while the file is open; the state that follows says which it is.
+      $('saveto-auto').addEventListener('change', () => {
+        if (saveToMounted) saveToMounted.setAutoSave($('saveto-auto').checked);
+      });
       $('saveto-conflict').addEventListener('click', async () => {
         // Someone else saves the file: the ETag the editor holds no longer names what the server has.
         const kind = saveToAddress.endsWith('docx') ? 'docx' : 'xlsx';
