@@ -91,7 +91,8 @@ export async function buildDocx(spec: DocxSpec): Promise<Uint8Array> {
   Object.keys(spec.headers || {}).forEach((id, i) => supporting('header', `header${i + 1}.xml`, wrapped('hdr', spec.headers![id]), id));
   Object.keys(spec.footers || {}).forEach((id, i) => supporting('footer', `footer${i + 1}.xml`, wrapped('ftr', spec.footers![id]), id));
   for (const [id, type, target, external] of spec.rels || []) {
-    rels.push(`<Relationship Id="${id}" Type="${ns.rel}/${type}" Target="${target}"${external ? ' TargetMode="External"' : ''}/>`);
+    // A type that is an address of its own (the parts Word added later are not under the base of the standard) is taken as it is.
+    rels.push(`<Relationship Id="${id}" Type="${type.indexOf('://') >= 0 ? type : `${ns.rel}/${type}`}" Target="${target}"${external ? ' TargetMode="External"' : ''}/>`);
   }
 
   put(

@@ -139,6 +139,42 @@ export interface UiStrings {
   revisionsProtected: string;
   trackingTurned(on: boolean): string;
   cannotStopTracking: string;
+  // Comments of a document.
+  /** The name of the box that shows a comment with its answers, and of its mark beside the page; `author` comes from the file. */
+  commentBy(author: string): string;
+  /** Said when a comment is stepped to: its number, how many threads there are, who wrote it and what it says. */
+  commentStep(number: number, count: number, author: string, text: string, wrapped?: 'first' | 'last'): string;
+  /** How many answers a comment has, beside its mark. */
+  commentReplies(count: number): string;
+  commentResolved: string;
+  commentEdit: string;
+  commentReply: string;
+  commentResolve: string;
+  commentReopen: string;
+  commentDelete: string;
+  commentSave: string;
+  commentCancel: string;
+  commentClose: string;
+  /** Label of the field a comment is written in, and of the one for an answer. */
+  commentText: string;
+  commentReplyText: string;
+  newComment: string;
+  noComments: string;
+  /** Said after a command of comments was done. */
+  commentAdded: string;
+  commentChanged: string;
+  commentReplied: string;
+  commentRemoved: string;
+  commentResolvedSaid(done: boolean): string;
+  /** A comment was asked for without a caret or a selection to put it at. */
+  commentNeedsPlace: string;
+  /** No comment can be put where the selection is (a header, a footer, a text box). */
+  cannotCommentHere: string;
+  /** The comment cannot be changed: its marks sit in content the editor keeps whole. */
+  commentFixed: string;
+  commentGone: string;
+  /** The text of a comment is too long or is not there. */
+  commentTextNeeded: string;
   /** Said after a copy was pasted as text alone because changes are tracked. */
   pastedAsText: string;
   cannotCutObjects: string;
@@ -511,7 +547,7 @@ export const STRINGS_EN: UiStrings = {
   cannotTrackChange: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed',
   protectedDocument: (kind) =>
     kind === 'comments'
-      ? 'This document is protected: only comments are allowed. It is shown read-only'
+      ? 'This document is protected: only comments can be added and changed; its text cannot be edited'
       : kind === 'forms'
         ? 'This document is protected: only its form fields may be filled in. It is shown read-only'
         : 'This document is protected against changes. It is shown read-only',
@@ -540,6 +576,33 @@ export const STRINGS_EN: UiStrings = {
   revisionsProtected: 'The protection of this document does not allow changes to be accepted or rejected',
   trackingTurned: (on) => (on ? 'Changes are tracked from now on' : 'Changes are no longer tracked'),
   cannotStopTracking: 'Tracking cannot be turned off in this document',
+  commentBy: (author) => (author !== '' ? `Comment by ${author}` : 'Comment'),
+  commentStep: (number, count, author, text, wrapped) =>
+    `${wrapped === 'first' ? 'Back at the first comment. ' : wrapped === 'last' ? 'At the last comment. ' : ''}Comment ${number} of ${count}${author !== '' ? `, by ${author}` : ''}${text !== '' ? `: ${text}` : ''}`,
+  commentReplies: (count) => (count === 1 ? '1 reply' : `${count} replies`),
+  commentResolved: 'Resolved',
+  commentEdit: 'Edit',
+  commentReply: 'Reply',
+  commentResolve: 'Resolve',
+  commentReopen: 'Reopen',
+  commentDelete: 'Delete',
+  commentSave: 'Save',
+  commentCancel: 'Cancel',
+  commentClose: 'Close',
+  commentText: 'Comment text',
+  commentReplyText: 'Reply text',
+  newComment: 'New comment',
+  noComments: 'The document has no comments',
+  commentAdded: 'Comment added',
+  commentChanged: 'Comment changed',
+  commentReplied: 'Reply added',
+  commentRemoved: 'Comment deleted',
+  commentResolvedSaid: (done) => (done ? 'Comment resolved' : 'Comment reopened'),
+  commentNeedsPlace: 'Put the caret in the text, or select the text, the comment is about',
+  cannotCommentHere: 'A comment cannot be added here',
+  commentFixed: 'This comment cannot be changed here: its marks sit in a part of the document that is kept as it is',
+  commentGone: 'The comment is no longer in the document',
+  commentTextNeeded: 'A comment needs text, of at most 32,767 characters',
   pastedAsText: 'Changes are tracked in this document: the copy was pasted as text, without its formatting and pictures',
   cannotCutObjects: 'The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place',
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
@@ -946,7 +1009,7 @@ export const STRINGS_TR: UiStrings = {
   cannotTrackChange: 'Bu belgede değişiklikler izleniyor ve bu tür değişiklik henüz izlenemiyor; hiçbir şey değiştirilmedi',
   protectedDocument: (kind) =>
     kind === 'comments'
-      ? 'Bu belge korumalı: yalnız yorum eklenebilir. Salt okunur gösteriliyor'
+      ? 'Bu belge korumalı: yalnız yorum eklenip değiştirilebilir; metni düzenlenemez'
       : kind === 'forms'
         ? 'Bu belge korumalı: yalnız form alanları doldurulabilir. Salt okunur gösteriliyor'
         : 'Bu belge değişikliğe karşı korumalı. Salt okunur gösteriliyor',
@@ -975,6 +1038,33 @@ export const STRINGS_TR: UiStrings = {
   revisionsProtected: 'Bu belgenin koruması değişikliklerin kabul ya da reddedilmesine izin vermiyor',
   trackingTurned: (on) => (on ? 'Değişiklikler artık izleniyor' : 'Değişiklikler artık izlenmiyor'),
   cannotStopTracking: 'Bu belgede izleme kapatılamaz',
+  commentBy: (author) => (author !== '' ? `Yorum: ${author}` : 'Yorum'),
+  commentStep: (number, count, author, text, wrapped) =>
+    `${wrapped === 'first' ? 'İlk yoruma dönüldü. ' : wrapped === 'last' ? 'Son yoruma gelindi. ' : ''}Yorum ${number} / ${count}${author !== '' ? `, ${author}` : ''}${text !== '' ? `: ${text}` : ''}`,
+  commentReplies: (count) => `${count} yanıt`,
+  commentResolved: 'Çözüldü',
+  commentEdit: 'Düzenle',
+  commentReply: 'Yanıtla',
+  commentResolve: 'Çöz',
+  commentReopen: 'Yeniden aç',
+  commentDelete: 'Sil',
+  commentSave: 'Kaydet',
+  commentCancel: 'Vazgeç',
+  commentClose: 'Kapat',
+  commentText: 'Yorum metni',
+  commentReplyText: 'Yanıt metni',
+  newComment: 'Yeni yorum',
+  noComments: 'Belgede yorum yok',
+  commentAdded: 'Yorum eklendi',
+  commentChanged: 'Yorum değiştirildi',
+  commentReplied: 'Yanıt eklendi',
+  commentRemoved: 'Yorum silindi',
+  commentResolvedSaid: (done) => (done ? 'Yorum çözüldü' : 'Yorum yeniden açıldı'),
+  commentNeedsPlace: 'İmleci yorumun ilgili olduğu metne koyun ya da o metni seçin',
+  cannotCommentHere: 'Buraya yorum eklenemez',
+  commentFixed: 'Bu yorum burada değiştirilemez: işaretleri belgenin olduğu gibi korunan bir bölümünde',
+  commentGone: 'Yorum artık belgede yok',
+  commentTextNeeded: 'Yorum için en çok 32.767 karakterlik bir metin gerekir',
   pastedAsText: 'Bu belgede değişiklikler izleniyor: kopya biçimi ve görselleri olmadan, metin olarak yapıştırıldı',
   cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (dipnot, denklem, metin kutusu, içerik denetimi, izlenen değişiklik); yerinde bırakıldı',
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',

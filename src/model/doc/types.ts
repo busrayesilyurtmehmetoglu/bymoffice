@@ -1023,6 +1023,18 @@ export interface Comment extends SourceSpan {
   date?: string;
   blocks: Block[];
   attrs?: AttrList;
+  /**
+   * What the comment is known by in the parts beside the comments (the
+   * replies and "resolved" of commentsExtended.xml, commentsIds.xml): the
+   * w14:paraId of its last paragraph, 8 hex digits, upper case. The paragraph
+   * of a comment read from a file carries the attribute too (in its `attrs`);
+   * one made here does not, and the writer adds it.
+   */
+  paraId?: string;
+  /** The comment answers another one: the id of that comment (w15:paraIdParent of commentsExtended.xml). */
+  parent?: number;
+  /** The comment is resolved (w15:done of commentsExtended.xml). */
+  done?: boolean;
 }
 
 /** Footnotes, endnotes or comments: a part that holds many small stories. */

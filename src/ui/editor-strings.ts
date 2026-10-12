@@ -108,6 +108,10 @@ export interface EditorStrings {
   changesProtected: string;
   /** The button that opens the menu with "accept all" and "reject all". */
   allChanges: string;
+  /** The comments of a document: a new one for the selection, the one before and the one after. */
+  newComment: string;
+  previousComment: string;
+  nextComment: string;
   acceptAllChanges: string;
   rejectAllChanges: string;
 }
@@ -224,6 +228,9 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   rejectChange: 'Reject change',
   changesProtected: 'the protection of this document does not allow it',
   allChanges: 'All changes',
+  newComment: 'Comment',
+  previousComment: 'Previous comment',
+  nextComment: 'Next comment',
   acceptAllChanges: 'Accept all changes',
   rejectAllChanges: 'Reject all changes',
 };
@@ -324,6 +331,9 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   rejectChange: 'Değişikliği reddet',
   changesProtected: 'bu belgenin koruması izin vermiyor',
   allChanges: 'Tüm değişiklikler',
+  newComment: 'Yorum',
+  previousComment: 'Önceki yorum',
+  nextComment: 'Sonraki yorum',
   acceptAllChanges: 'Tüm değişiklikleri kabul et',
   rejectAllChanges: 'Tüm değişiklikleri reddet',
 };

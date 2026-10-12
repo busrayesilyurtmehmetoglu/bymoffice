@@ -231,7 +231,8 @@ function bridged(): Shown {
 const loadedOf = (shown: Shown): Record<string, unknown> => shown.sent.filter((message) => message.type === 'loaded' || message.type === 'error').slice(-1)[0];
 
 test('bridge: a document protected against changes is loaded read-only, and loaded says why', async () => {
-  for (const edit of ['readOnly', 'comments', 'forms']) {
+  // A protection for comments is another matter: see the test after this one.
+  for (const edit of ['readOnly', 'forms']) {
     const shown = bridged();
     const data = base64Encode(await buildSpec({ body: BODY, settings: protect(edit, '1') }));
     await shown.bridge.receive(JSON.stringify({ type: 'load', id: 'a', data, readOnly: false }));
@@ -242,6 +243,24 @@ test('bridge: a document protected against changes is loaded read-only, and load
     assert.deepEqual(shown.readOnlyCalls, [true]);
     assert.deepEqual(shown.sent[shown.sent.length - 1], { type: 'done', id: 'b', command: 'setReadOnly', readOnly: true });
   }
+});
+
+test('bridge: a document protected for comments is not loaded read-only: its view is asked for editing and keeps the text locked itself', async () => {
+  const shown = bridged();
+  const data = base64Encode(await buildSpec({ body: BODY, settings: protect('comments', '1') }));
+  await shown.bridge.receive(JSON.stringify({ type: 'load', id: 'a', data, readOnly: false }));
+  assert.deepEqual(loadedOf(shown), { type: 'loaded', id: 'a', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, protection: 'comments', commentsOnly: true });
+  assert.equal(shown.options[0].readOnly, false);
+  // Turning the comments off and on again reaches the view, and nothing is forced.
+  await shown.bridge.receive(JSON.stringify({ type: 'setReadOnly', id: 'b', readOnly: true }));
+  await shown.bridge.receive(JSON.stringify({ type: 'setReadOnly', id: 'c', readOnly: false }));
+  assert.deepEqual(shown.readOnlyCalls, [true, false]);
+  assert.deepEqual(shown.sent[shown.sent.length - 1], { type: 'done', id: 'c', command: 'setReadOnly' });
+  // Loaded read-only by the application, it is read-only like any other document.
+  const asked = bridged();
+  await asked.bridge.receive(JSON.stringify({ type: 'load', id: 'a', data, readOnly: true }));
+  assert.equal(asked.options[0].readOnly, true);
+  assert.deepEqual(loadedOf(asked), { type: 'loaded', id: 'a', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, protection: 'comments', commentsOnly: true });
 });
 
 test('bridge: exempt ranges are reported and not honoured', async () => {

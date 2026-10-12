@@ -46,3 +46,22 @@ export {
   type RevisionKind,
   type RevisionsEdit,
 } from './revisions';
+export {
+  COMMENT_FIXED,
+  COMMENT_GONE,
+  COMMENT_NOT_HERE,
+  MAX_COMMENTS,
+  MAX_COMMENT_TEXT,
+  addComment,
+  commentAtPosition,
+  commentText,
+  editComment,
+  initialsOf,
+  listComments,
+  removeComment,
+  replyToComment,
+  resolveComment,
+  type CommentEdit,
+  type CommentOptions,
+  type DocComment,
+} from './comments';

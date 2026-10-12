@@ -1,7 +1,8 @@
 // The toolbar of the document editor: undo and redo, the paragraph style, the
 // font and its size, character and paragraph formatting, lists, tables, a
-// picture, a link, a page break, and the tracked changes: tracking on and off,
-// the change before and after, accept, reject, and a menu for all of them. It has the looks and the keys of the
+// picture, a link, a page break, the tracked changes (tracking on and off,
+// the change before and after, accept, reject, and a menu for all of them) and
+// the comments (a new one, the one before and after). It has the looks and the keys of the
 // spreadsheet editor's toolbar: its buttons are a single Tab stop with the
 // arrow keys moving between them, each list is a Tab stop of its own, and a
 // command ends with the focus back in the document.
@@ -57,7 +58,45 @@ type ButtonKey =
   | 'nextChange'
   | 'acceptChange'
   | 'rejectChange'
-  | 'changesMenu';
+  | 'changesMenu'
+  | 'newComment'
+  | 'previousComment'
+  | 'nextComment';
+
+type CommentKey = 'newComment' | 'previousComment' | 'nextComment';
+
+/** The icons of the comment buttons, drawn like the editor's other icons (24 x 24, the colour of the text): a speech balloon with a plus, an arrow up, an arrow down. */
+const COMMENT_ICONS: { [key in CommentKey]: string[] } = {
+  newComment: ['M5 5h14v11h-7l-4 3.5V16H5z', 'M12 8v5 M9.5 10.5h5'],
+  previousComment: ['M5 5h14v11h-7l-4 3.5V16H5z', 'M12 13.5v-6 M9.5 10l2.5-2.5 2.5 2.5'],
+  nextComment: ['M5 5h14v11h-7l-4 3.5V16H5z', 'M12 7.5v6 M9.5 11l2.5 2.5 2.5-2.5'],
+};
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function commentIcon(key: CommentKey): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, 'svg') as SVGSVGElement;
+  const attrs: { [name: string]: string } = {
+    viewBox: '0 0 24 24',
+    width: '20',
+    height: '20',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.75',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  };
+  for (const name of Object.keys(attrs)) svg.setAttribute(name, attrs[name]);
+  svg.setAttribute('class', 'bym-icon');
+  for (const d of COMMENT_ICONS[key]) {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    svg.appendChild(path);
+  }
+  return svg;
+}
 
 const SHARED_ICONS: { [key: string]: IconName } = {
   save: 'save',
@@ -114,6 +153,8 @@ const TABLE_GRID_COLUMNS = 8;
 /** Largest picture read from a file the user picks, bytes. */
 const MAX_PICTURE_FILE = 20000000;
 
+const apple = (): boolean => typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+
 function option(value: string, label: string): HTMLOptionElement {
   const element = document.createElement('option');
   element.value = value;
@@ -133,6 +174,8 @@ export class DocToolbar {
   private readonly actions = new Map<HTMLButtonElement, () => void>();
   /** Buttons whose press opens something: their action runs as it is, not as a command of the view. */
   private readonly openers = new Set<HTMLButtonElement>();
+  /** Buttons whose command puts the focus where it belongs itself. */
+  private readonly keepsFocus = new Set<HTMLButtonElement>();
   private readonly styleSelect: HTMLSelectElement;
   private readonly fontSelect: HTMLSelectElement;
   private readonly unwatchFonts: () => void;
@@ -198,6 +241,13 @@ export class DocToolbar {
     this.addMenuButton('insertLink', 'dialog', () => this.openLink());
     this.addButton('pageBreak', () => view().insertPageBreak());
     this.addSeparator();
+    // The comments, before the tracked changes as in Word. The field of a new one takes the focus: the command
+    // does not hand it back to the document.
+    this.addButton('newComment', () => view().startComment());
+    this.keepsFocus.add(this.buttons.newComment as HTMLButtonElement);
+    this.addButton('previousComment', () => view().goToComment('previous'));
+    this.addButton('nextComment', () => view().goToComment('next'));
+    this.addSeparator();
     // The tracked changes: Word's order. Accept and reject go on to the next change, as they do there.
     this.addButton('trackChanges', () => view().setTrackChanges(!view().trackingChanges), true);
     this.addButton('previousChange', () => view().goToRevision('previous'));
@@ -261,7 +311,7 @@ export class DocToolbar {
     if (save && saveButton) {
       // Dimmed while there is nothing to save, busy while a save is under way (a press then saves once more
       // when something was changed meanwhile). The whole toolbar is gone from a document that is read-only.
-      this.setDisabled('save', !editable || !(save.dirty || save.saving));
+      this.setDisabled('save', !(editable || view.canComment) || !(save.dirty || save.saving));
       const busy = save.saving ? 'true' : 'false';
       if (saveButton.getAttribute('aria-busy') !== busy) saveButton.setAttribute('aria-busy', busy);
     }
@@ -284,6 +334,11 @@ export class DocToolbar {
     this.sizeSelect.disabled = !editable;
     if (!editable) this.closePopover();
     this.updateChanges(editable);
+    // The comments: also where the protection of the document allows comments and nothing else.
+    const commented = view.commentCount > 0;
+    this.setDisabled('newComment', !view.canComment);
+    this.setDisabled('previousComment', !commented);
+    this.setDisabled('nextComment', !commented);
 
     const pressed = (key: ButtonKey, name: keyof RangeFormat, value: unknown) => this.setPressed(key, mixed.indexOf(name) >= 0 ? 'mixed' : format !== undefined && format[name] === value ? 'true' : 'false');
     pressed('bold', 'bold', true);
@@ -457,7 +512,7 @@ export class DocToolbar {
     button.setAttribute('data-command', key);
     button.tabIndex = -1;
     if (toggles) button.setAttribute('aria-pressed', 'false');
-    button.appendChild(SHARED_ICONS[key] ? createIcon(SHARED_ICONS[key]) : createDocIcon(key as DocIconName));
+    button.appendChild(SHARED_ICONS[key] ? createIcon(SHARED_ICONS[key]) : key in COMMENT_ICONS ? commentIcon(key as CommentKey) : createDocIcon(key as DocIconName));
     this.buttons[key] = button;
     this.actions.set(button, action);
     this.controls.push(button);
@@ -525,6 +580,9 @@ export class DocToolbar {
       acceptChange: s.acceptChange,
       rejectChange: s.rejectChange,
       changesMenu: s.allChanges,
+      newComment: `${s.newComment} (${apple() ? '\u2325\u2318M' : 'Ctrl+Alt+M'})`,
+      previousComment: s.previousComment,
+      nextComment: s.nextComment,
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {
       const button = this.buttons[key];
@@ -740,7 +798,7 @@ export class DocToolbar {
       return;
     }
     this.closePopover();
-    this.host.run(action);
+    this.host.run(action, this.keepsFocus.has(button));
   };
 
   /** A press on the toolbar leaves the focus where it is (in the document); only the lists need it to open. */

@@ -1846,3 +1846,363 @@ test('bridge: a workbook loaded with toolbar: false is shown without the toolbar
   const full = f.views[f.views.length - 1] as { toolbar?: boolean; formulaBar?: boolean };
   assert.deepEqual(['toolbar' in full, 'formulaBar' in full], [false, false]);
 });
+
+// ------------------------------------------------------ the comments of a document
+
+interface FakeComment {
+  id: number;
+  author: string;
+  date?: string;
+  text: string;
+  done: boolean;
+  parent?: number;
+  /** More than the contract passes on. */
+  plain?: boolean;
+}
+
+/** Makes the views of an editable document keep comments the way the view of the engine does. */
+function withComments(f: Fake, list: FakeComment[], format = 'docx'): { d: EditableDocument; state: { list: FakeComment[]; can: boolean; refuse: boolean; calls: unknown[][] } } {
+  const d = withEditableDocument(f, format);
+  const state = { list: list.slice(), can: true, refuse: false, calls: [] as unknown[][] };
+  for (const name of ['createDocumentView', 'createDocumentEditor'] as const) {
+    const inner = f.host[name] as NonNullable<BridgeHost['createDocumentView']>;
+    f.host[name] = ((container: HTMLElement, doc: never, options: never) => {
+      const view = inner(container, doc, options) as unknown as Record<string, unknown>;
+      const changed = () => d.views[d.views.length - 1].options.onChange!();
+      view.comments = () => state.list.map((comment) => ({ ...comment }));
+      Object.defineProperty(view, 'canComment', { get: () => state.can });
+      view.addComment = (text: string, at?: unknown) => {
+        state.calls.push(['add', text, at]);
+        if (state.refuse) return undefined;
+        const id = 100 + state.list.length;
+        state.list.push({ id, author: 'Me', text, done: false });
+        changed();
+        return id;
+      };
+      view.replyToComment = (id: number, text: string) => {
+        state.calls.push(['reply', id, text]);
+        if (state.refuse) return undefined;
+        const made = 100 + state.list.length;
+        state.list.push({ id: made, author: 'Me', text, done: false, parent: id });
+        changed();
+        return made;
+      };
+      const change = (call: string, apply: (comment: FakeComment, value: unknown) => void) => (id: number, value: unknown) => {
+        state.calls.push([call, id, value]);
+        const comment = state.list.filter((one) => one.id === id)[0];
+        if (state.refuse || !comment) return false;
+        apply(comment, value);
+        changed();
+        return true;
+      };
+      view.editComment = change('edit', (comment, text) => (comment.text = text as string));
+      view.resolveComment = change('resolve', (comment, done) => (comment.done = done as boolean));
+      view.removeComment = change('remove', (comment) => state.list.splice(state.list.indexOf(comment), 1));
+      return view as never;
+    }) as never;
+  }
+  return { d, state };
+}
+
+const last = (f: Fake) => f.sent[f.sent.length - 1];
+/** As much of a document model as the bridge looks at, with a protection that is enforced. */
+const protectedModel = (edit: string): object => ({ body: { blocks: [], source: '' }, headers: new Map(), footers: new Map(), settings: { protection: { edit, enforced: true } } });
+
+test('bridge: `loaded` lists the comments of a document, with the fields of the contract and no others', async () => {
+  const f = fake();
+  withComments(f, [
+    { id: 1, author: 'Ann', date: '2026-10-01T09:00:00Z', text: 'Why?', done: false, plain: true },
+    { id: 2, author: 'Bob', text: 'Because.', done: true, parent: 1 },
+  ]);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA });
+  assert.deepEqual(f.sent[1], {
+    type: 'loaded',
+    id: 'l',
+    format: 'docx',
+    kind: 'document',
+    sheets: [],
+    activeSheet: 0,
+    comments: [
+      { id: 1, author: 'Ann', text: 'Why?', done: false, date: '2026-10-01T09:00:00Z' },
+      { id: 2, author: 'Bob', text: 'Because.', done: true, parent: 1 },
+    ],
+  });
+  const g = fake();
+  withComments(g, []);
+  await createBridge(g.host).receive({ type: 'load', id: 'l', data: DATA });
+  assert.deepEqual(g.sent[1], { type: 'loaded', id: 'l', format: 'docx', kind: 'document', sheets: [], activeSheet: 0 });
+});
+
+test('bridge: addComment reaches the view; `comments` lists the result before `changed`, `done` names the new comment', async () => {
+  const f = fake();
+  const { state } = withComments(f, [{ id: 1, author: 'Ann', text: 'Why?', done: false }]);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  const before = f.sent.length;
+  await bridge.receive({ type: 'addComment', id: 'a', text: 'New one' });
+  assert.deepEqual(state.calls, [['add', 'New one', undefined]]);
+  assert.deepEqual(f.sent.slice(before), [
+    { type: 'comments', comments: [{ id: 1, author: 'Ann', text: 'Why?', done: false }, { id: 101, author: 'Me', text: 'New one', done: false }] },
+    { type: 'changed', sheets: [], canUndo: false, canRedo: false },
+    { type: 'done', id: 'a', command: 'addComment', commentId: 101 },
+  ]);
+  // With a place: a caret, or a range.
+  await bridge.receive({ type: 'addComment', text: 'At a place', anchor: { path: [2], offset: 4 } });
+  assert.deepEqual(state.calls[1], ['add', 'At a place', { anchor: { story: 'body', path: [2], offset: 4 }, focus: { story: 'body', path: [2], offset: 4 } }]);
+  await bridge.receive({ type: 'addComment', text: 'A range', anchor: { story: 'footnote:2', path: [0], offset: 1 }, focus: { story: 'footnote:2', path: [0, 1, 0, 0], offset: 9 } });
+  assert.deepEqual(state.calls[2], ['add', 'A range', { anchor: { story: 'footnote:2', path: [0], offset: 1 }, focus: { story: 'footnote:2', path: [0, 1, 0, 0], offset: 9 } }]);
+  // Without an id nothing is answered, and the list is told all the same.
+  assert.equal(last(f).type, 'changed');
+  assert.equal(f.sent[f.sent.length - 2].type, 'comments');
+});
+
+test('bridge: editComment, replyComment, resolveComment and removeComment reach the view and are answered', async () => {
+  const f = fake();
+  const { state } = withComments(f, [{ id: 1, author: 'Ann', text: 'Why?', done: false }]);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'editComment', id: 'e', commentId: 1, text: 'Why not?' });
+  assert.deepEqual(last(f), { type: 'done', id: 'e', command: 'editComment' });
+  await bridge.receive({ type: 'replyComment', id: 'r', commentId: 1, text: 'Because.' });
+  assert.deepEqual(last(f), { type: 'done', id: 'r', command: 'replyComment', commentId: 101 });
+  await bridge.receive({ type: 'resolveComment', id: 's', commentId: 1 });
+  assert.deepEqual(last(f), { type: 'done', id: 's', command: 'resolveComment' });
+  await bridge.receive({ type: 'resolveComment', id: 't', commentId: 1, done: false });
+  await bridge.receive({ type: 'removeComment', id: 'x', commentId: 101 });
+  assert.deepEqual(last(f), { type: 'done', id: 'x', command: 'removeComment' });
+  assert.deepEqual(state.calls, [
+    ['edit', 1, 'Why not?'],
+    ['reply', 1, 'Because.'],
+    ['resolve', 1, true],
+    ['resolve', 1, false],
+    ['remove', 101, undefined],
+  ]);
+  assert.deepEqual(state.list, [{ id: 1, author: 'Ann', text: 'Why not?', done: false }]);
+  // The list was told after every change, and not again when nothing changed.
+  const told = f.sent.filter((message) => message.type === 'comments');
+  assert.equal(told.length, 5);
+  assert.deepEqual(told[4].comments, [{ id: 1, author: 'Ann', text: 'Why not?', done: false }]);
+  // A comment the view does not have, or a view that refuses: an error, and nothing told.
+  const before = f.sent.length;
+  await bridge.receive({ type: 'removeComment', id: 'y', commentId: 77 });
+  assert.deepEqual([last(f).type, last(f).code, last(f).id], ['error', 'comment-refused', 'y']);
+  state.refuse = true;
+  await bridge.receive({ type: 'addComment', id: 'z', text: 'No' });
+  assert.deepEqual([last(f).code, last(f).id], ['comment-refused', 'z']);
+  assert.equal(f.sent.length, before + 2);
+});
+
+test('bridge: the commands of comments refuse what is not a text, an id or a place, before the view hears of it', async () => {
+  const f = fake();
+  const { state } = withComments(f, [{ id: 1, author: 'Ann', text: 'Why?', done: false }]);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  const bad: object[] = [
+    { type: 'addComment' },
+    { type: 'addComment', text: 5 },
+    { type: 'addComment', text: 'x'.repeat(32768) },
+    { type: 'addComment', text: 'x', anchor: 'body' },
+    { type: 'addComment', text: 'x', anchor: { path: [], offset: 0 } },
+    { type: 'addComment', text: 'x', anchor: { path: [0.5], offset: 0 } },
+    { type: 'addComment', text: 'x', anchor: { path: [0], offset: -1 } },
+    { type: 'addComment', text: 'x', anchor: { story: 7, path: [0], offset: 0 } },
+    { type: 'addComment', text: 'x', focus: { path: [0], offset: 0 } },
+    { type: 'editComment', text: 'x' },
+    { type: 'editComment', commentId: '1', text: 'x' },
+    { type: 'editComment', commentId: 1.5, text: 'x' },
+    { type: 'editComment', commentId: 1 },
+    { type: 'replyComment', commentId: 1, text: null },
+    { type: 'resolveComment', commentId: 1, done: 'yes' },
+    { type: 'removeComment' },
+    { type: 'removeComment', commentId: -1 },
+  ];
+  for (const message of bad) {
+    await bridge.receive({ ...message, id: 'b' });
+    assert.deepEqual([last(f).type, last(f).code, last(f).id], ['error', 'bad-message', 'b'], JSON.stringify(message).slice(0, 80));
+  }
+  assert.deepEqual(state.calls, []);
+});
+
+test('bridge: the commands of comments without a file, with a workbook, and with a document that takes none', async () => {
+  const commands = [
+    { type: 'addComment', text: 'x' },
+    { type: 'editComment', commentId: 1, text: 'x' },
+    { type: 'replyComment', commentId: 1, text: 'x' },
+    { type: 'resolveComment', commentId: 1 },
+    { type: 'removeComment', commentId: 1 },
+  ];
+  const f = fake();
+  const bridge = createBridge(f.host);
+  for (const command of commands) {
+    await bridge.receive({ ...command, id: 'n' });
+    assert.deepEqual([last(f).code, last(f).id], ['not-loaded', 'n'], command.type);
+  }
+  await bridge.receive({ type: 'load', data: DATA });
+  for (const command of commands) {
+    await bridge.receive({ ...command, id: 'w' });
+    assert.equal(last(f).code, 'no-document', command.type);
+  }
+  // An RTF file that was not converted is read-only; its comments are listed all the same.
+  const g = fake();
+  const rtf = withComments(g, [{ id: 0, author: 'Ann', text: 'Old', done: false }], 'rtf');
+  const second = createBridge(g.host);
+  await second.receive({ type: 'load', data: DATA });
+  assert.deepEqual(g.sent[1].comments, [{ id: 0, author: 'Ann', text: 'Old', done: false }]);
+  for (const command of commands) {
+    await second.receive({ ...command, id: 'r' });
+    assert.equal(last(g).code, 'read-only', command.type);
+  }
+  // A document that was opened read-only, and one whose view takes no comments.
+  const h = fake();
+  const opened = withComments(h, [{ id: 1, author: 'Ann', text: 'x', done: false }]);
+  const third = createBridge(h.host);
+  await third.receive({ type: 'load', data: DATA, readOnly: true });
+  await third.receive({ type: 'resolveComment', commentId: 1, id: 'r' });
+  assert.equal(last(h).code, 'read-only');
+  await third.receive({ type: 'setReadOnly', readOnly: false });
+  opened.state.can = false;
+  await third.receive({ type: 'resolveComment', commentId: 1, id: 'c' });
+  assert.equal(last(h).code, 'read-only');
+  opened.state.can = true;
+  await third.receive({ type: 'resolveComment', commentId: 1, id: 's' });
+  assert.deepEqual(last(h), { type: 'done', id: 's', command: 'resolveComment' });
+  assert.deepEqual(rtf.state.calls.concat(opened.state.calls), [['resolve', 1, true]]);
+});
+
+test('bridge: a document protected for comments is opened for comments: not read-only, saved, and said so', async () => {
+  const f = fake();
+  const { d, state } = withComments(f, [{ id: 1, author: 'Ann', text: 'x', done: false }]);
+  (d as { model: object }).model = protectedModel('comments');
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA, save: true });
+  const loaded = f.sent.filter((message) => message.type === 'loaded')[0];
+  assert.deepEqual(loaded, { type: 'loaded', id: 'l', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, save: true, protection: 'comments', commentsOnly: true, comments: [{ id: 1, author: 'Ann', text: 'x', done: false }] });
+  // The view was asked for editing (it keeps the text read-only itself) and got what saves the file.
+  assert.equal(d.views[0].options.readOnly, false);
+  assert.notEqual((d.views[0].options as { saveCommand?: unknown }).saveCommand, undefined);
+  await bridge.receive({ type: 'addComment', id: 'a', text: 'Allowed' });
+  assert.deepEqual(last(f), { type: 'done', id: 'a', command: 'addComment', commentId: 101 });
+  assert.deepEqual(state.calls, [['add', 'Allowed', undefined]]);
+  // The other protections keep the file read-only, comments and all.
+  for (const edit of ['readOnly', 'forms']) {
+    const g = fake();
+    const other = withComments(g, [{ id: 1, author: 'Ann', text: 'x', done: false }]);
+    (other.d as { model: object }).model = protectedModel(edit);
+    const second = createBridge(g.host);
+    await second.receive({ type: 'load', id: 'l', data: DATA });
+    const told = g.sent.filter((message) => message.type === 'loaded')[0];
+    assert.deepEqual([told.readOnly, told.protection, told.commentsOnly], [true, edit, undefined], edit);
+    await second.receive({ type: 'addComment', id: 'a', text: 'No' });
+    assert.equal(last(g).code, 'read-only', edit);
+    assert.deepEqual(other.state.calls, []);
+  }
+});
+
+// ------------------------------------------- review of the comments on the bridge
+
+test('bridge: a document protected for comments answers the commands of the tracked changes with read-only, and its view is not asked', async () => {
+  const f = fake();
+  const { d } = withRevisions(f, 2);
+  (d as { model: object }).model = protectedModel('comments');
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA });
+  assert.equal(f.sent.filter((message) => message.type === 'loaded')[0].commentsOnly, true);
+  for (const type of ['acceptAllRevisions', 'rejectAllRevisions', 'setTrackChanges']) {
+    await bridge.receive({ type, on: true, id: 'p' });
+    assert.deepEqual([last(f).type, last(f).code, last(f).id], ['error', 'read-only', 'p'], type);
+  }
+  assert.deepEqual(d.calls.filter((call) => /acceptAll|rejectAll|track/.test(call)), []);
+});
+
+test('bridge: the text of a comment is cut to 2,000 characters in the messages, and says so', async () => {
+  const f = fake();
+  const long = 'x'.repeat(1999) + '😀' + 'y'.repeat(5000);
+  const { state } = withComments(f, [{ id: 1, author: 'Ann', text: long, done: false }, { id: 2, author: 'Bob', text: 'z'.repeat(2000), done: false }]);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA });
+  const listed = f.sent.filter((message) => message.type === 'loaded')[0].comments;
+  // Not in the middle of a character: the pair that would be cut is left out whole.
+  assert.deepEqual(listed[0], { id: 1, author: 'Ann', text: 'x'.repeat(1999), done: false, truncated: true });
+  assert.deepEqual(listed[1], { id: 2, author: 'Bob', text: 'z'.repeat(2000), done: false });
+  // The same in the message that follows a change.
+  state.list.push({ id: 3, author: 'Cid', text: 'w'.repeat(2001), done: false });
+  await bridge.receive({ type: 'resolveComment', commentId: 2 });
+  const told = f.sent.filter((message) => message.type === 'comments')[0].comments;
+  assert.deepEqual([told[0].text.length, told[0].truncated, told[2].text.length, told[2].truncated], [1999, true, 2000, true]);
+  // A name is cut too: nothing a file brings is passed on without a limit.
+  assert.ok(JSON.stringify(told).length < 8000, 'the message is longer than its comments allow');
+});
+
+test('bridge: at most 2,000 comments and a bounded amount of text are listed; the rest is said to be there', async () => {
+  const many: FakeComment[] = [];
+  for (let i = 0; i < 2500; i++) many.push({ id: i, author: 'A', text: 't' + i, done: false });
+  const f = fake();
+  withComments(f, many);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA });
+  const loaded = f.sent.filter((message) => message.type === 'loaded')[0];
+  assert.equal(loaded.comments.length, 2000);
+  assert.equal(loaded.commentsMore, true);
+  assert.equal(loaded.comments[1999].id, 1999);
+  await bridge.receive({ type: 'resolveComment', commentId: 5 });
+  const told = f.sent.filter((message) => message.type === 'comments')[0];
+  assert.deepEqual([told.comments.length, told.more], [2000, true]);
+  // Long texts: the list ends where the message would grow beyond its size.
+  const g = fake();
+  const longs: FakeComment[] = [];
+  for (let i = 0; i < 1000; i++) longs.push({ id: i, author: 'A'.repeat(300), text: 'x'.repeat(5000), done: false });
+  withComments(g, longs);
+  await createBridge(g.host).receive({ type: 'load', id: 'l', data: DATA });
+  const big = g.sent.filter((message) => message.type === 'loaded')[0];
+  assert.ok(big.comments.length > 0 && big.comments.length < 1000, `${big.comments.length} long comments were listed`);
+  assert.equal(big.commentsMore, true);
+  assert.ok(JSON.stringify(big).length <= 600000, `the message has ${JSON.stringify(big).length} characters`);
+  assert.equal(big.comments[0].author.length, 255);
+});
+
+test('bridge: typing tells nothing of the comments; the list is not even asked for while the view says its comments are the same', async () => {
+  const f = fake();
+  const { d, state } = withComments(f, [{ id: 1, author: 'Ann', text: 'Why?', done: false }]);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA });
+  const options = d.views[0].options;
+  // A view that keeps no count of its comments: the list is compared, and told only when it differs.
+  for (let i = 0; i < 5; i++) options.onChange!();
+  assert.equal(f.sent.filter((message) => message.type === 'comments').length, 0, 'the comments were told although none changed');
+  assert.equal(f.sent.filter((message) => message.type === 'changed').length, 5);
+  state.list[0].text = 'Why not?';
+  options.onChange!();
+  options.onChange!();
+  assert.equal(f.sent.filter((message) => message.type === 'comments').length, 1);
+
+  // A view that counts: while the number stays, comments() is not called.
+  const g = fake();
+  const counted = withComments(g, [{ id: 1, author: 'Ann', text: 'Why?', done: false }]);
+  let revision = 7;
+  let asked = 0;
+  for (const name of ['createDocumentView', 'createDocumentEditor'] as const) {
+    const inner = g.host[name] as NonNullable<BridgeHost['createDocumentView']>;
+    g.host[name] = ((container: HTMLElement, doc: never, opts: never) => {
+      const view = inner(container, doc, opts) as unknown as Record<string, unknown>;
+      const comments = view.comments as () => unknown[];
+      view.comments = () => {
+        asked++;
+        return comments();
+      };
+      Object.defineProperty(view, 'commentsRevision', { get: () => revision });
+      return view as never;
+    }) as never;
+  }
+  const second = createBridge(g.host);
+  await second.receive({ type: 'load', data: DATA });
+  const before = asked;
+  for (let i = 0; i < 50; i++) counted.d.views[0].options.onChange!();
+  assert.equal(asked, before, 'the list of comments was asked for although the view said it was the same');
+  assert.equal(g.sent.filter((message) => message.type === 'comments').length, 0);
+  counted.state.list[0].done = true;
+  revision = 8;
+  counted.d.views[0].options.onChange!();
+  assert.equal(asked, before + 1);
+  assert.deepEqual(g.sent.filter((message) => message.type === 'comments').map((message) => message.comments), [[{ id: 1, author: 'Ann', text: 'Why?', done: true }]]);
+});

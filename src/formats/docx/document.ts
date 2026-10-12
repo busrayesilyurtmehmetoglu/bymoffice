@@ -24,6 +24,7 @@ import type { OpcPackage, Relationship } from '../../opc';
 import { parseXml, type XmlComment, type XmlDocument, type XmlPI } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { linkFields, scanBlocks } from './body';
+import { linkComments, parseSidePart } from './comments';
 import { bounded, createContext, createReaderState, kindOf, pushExtra, pushMisc, quote, type PartContext, type ReaderState } from './common';
 import { parseNumbering } from './numbering';
 import { parseFontTable, parseSettings, parseTheme } from './parts';
@@ -290,7 +291,18 @@ export async function readDocx(pkg: OpcPackage): Promise<DocModel> {
   const endnotes = supportingPart(pkg, rels, '/endnotes', state);
   if (endnotes !== undefined) model.endnotes = await readCollection<Note>(pkg, endnotes, state, 'endnote', fillNote);
   const comments = supportingPart(pkg, rels, '/comments', state);
-  if (comments !== undefined) model.comments = await readCollection<Comment>(pkg, comments, state, 'comment', fillComment);
+  if (comments !== undefined) {
+    model.comments = await readCollection<Comment>(pkg, comments, state, 'comment', fillComment);
+    // Which comment answers which, and which is resolved: the part beside the comments says it.
+    let extended: XmlDocument | undefined;
+    const part = supportingPart(pkg, rels, '/commentsExtended', state);
+    if (part !== undefined) {
+      extended = parseSidePart(await pkg.readPart(part));
+      if (!extended) state.warnings.push(`${quote(part)} is not well-formed: the replies and the resolved state of the comments were not read`);
+      else bounded(extended.root);
+    }
+    linkComments(model.comments, extended ? extended.root : undefined);
+  }
   model.strict = state.strict;
   return model;
 }

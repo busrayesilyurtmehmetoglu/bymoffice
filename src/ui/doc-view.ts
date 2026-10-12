@@ -19,7 +19,7 @@ import { isContextPress } from './rules-dialog';
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
 import * as ops from '../ops/doc/index';
-import type { DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
+import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
 import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
 import { renderPage } from '../render/doc';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore, declaredImageSize, sniffImageType } from '../render/images';
@@ -27,6 +27,7 @@ import { CanvasTextMeasurer } from '../render/doc-measure';
 import { onFontsChanged } from '../render/fonts';
 import { onEmbeddedFontNotice } from '../render/embedded-fonts';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
+import { COMMENT_STYLE_TEXT, CommentBalloon, DOCKED_BELOW, commentColor, commentFill, type BalloonPlace } from './doc-comments';
 import { cutLoses, fragmentOfRange, setCopyMedia, sliceHtml, sliceOf, storeCopy, storedCopy, type DocSlice, type StoredCopy } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
 import {
@@ -175,6 +176,12 @@ const EMU_PER_PX = 9525;
 const MAX_LOOKED_AT_BLOCKS = 400;
 /** How often the pages are prepared for printing anew because the document changed meanwhile. */
 const MAX_PRINT_RESTARTS = 3;
+/** Most threads of comments that are marked on one page; a page with more shows the first of them. */
+const MAX_MARKED_COMMENTS = 2000;
+/** Side of the mark of a comment in the margin, CSS px. */
+const COMMENT_MARK = 22;
+/** Marks that would lie over each other stand beside each other, in at most so many columns. */
+const MAX_MARK_COLUMNS = 6;
 /** How long one page waits for its pictures before it is printed with placeholders. */
 const PRINT_PICTURES_MS = 30000;
 
@@ -210,7 +217,8 @@ const STYLE_TEXT =
   '.bym-doc-compose{background:#1a73e8}' +
   '.bym-doc-handle{background:#1a73e8;border-radius:0 50% 50% 50%;touch-action:none}' +
   '.bym-doc-handle-start{border-radius:50% 0 50% 50%}' +
-  '.bym-doc-bubble{background:#fff;border:1px solid #dadce0;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#202124}';
+  '.bym-doc-bubble{background:#fff;border:1px solid #dadce0;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#202124}' +
+  COMMENT_STYLE_TEXT;
 
 /** One style element per document or shadow root, shared by the views in it. */
 const styleUsers = new WeakMap<Node, { element: HTMLStyleElement; count: number }>();
@@ -605,6 +613,10 @@ interface Slot {
   context: CanvasRenderingContext2D | null;
   text: HTMLDivElement;
   links: HTMLElement[];
+  /** The marks of the comments of the page in its margin, by the id of the first comment of each thread. */
+  marks: Map<number, HTMLButtonElement>;
+  /** Where each of those threads has its first line on the page, px of the page. */
+  places: Map<number, { top: number; bottom: number }>;
   dirty: boolean;
   left: number;
   top: number;
@@ -743,6 +755,23 @@ export class DocumentView {
   private readonly lock: 'readOnly' | 'comments' | 'forms' | undefined;
   /** The user was told why the document cannot be edited. */
   private lockTold = false;
+  /** The document allows comments and nothing else (its protection says so), and editing was asked for: comments can be added and changed. */
+  private commenting = false;
+  /** The comments of the document, for the number of changes of the document they were listed at. */
+  private commentCache: { at: number; list: DocComment[]; roots: DocComment[]; threads: Map<number, DocComment[]> } | undefined;
+  private commentsVersion = 0;
+  /** The box that shows a comment with its answers; made when the first comment is shown. */
+  private balloon: CommentBalloon | undefined;
+  /** The balloon came by itself (the caret went into the text of a comment) and goes by itself. */
+  private balloonPassive = false;
+  /** What a new comment is written for: the selection as it was when the field was opened. */
+  private composeRange: DocRange | undefined;
+  /** The mark the balloon was opened from: where the focus goes back to. */
+  private balloonOpener: HTMLElement | undefined;
+  /** The thread whose balloon the user sent away: it does not come back by itself while the caret stays in its text. */
+  private dismissedThread: number | undefined;
+  /** The comments (commentsRevision) the pages were last painted for. */
+  private paintedComments = -1;
 
   constructor(container: HTMLElement, doc: DocModel, options: DocumentViewOptions = {}) {
     this.container = container;
@@ -757,6 +786,7 @@ export class DocumentView {
     const protection = enforcedProtection(doc);
     this.lock = protection !== undefined && protection !== 'trackedChanges' ? protection : undefined;
     this.editable = options.readOnly === false && this.lock === undefined;
+    this.commenting = options.readOnly === false && this.lock === 'comments';
     ops.setTracking(doc, { force: options.trackChanges === true, author: typeof options.author === 'string' ? options.author : undefined, now: typeof options.now === 'function' ? options.now : undefined });
     this.history = new ops.DocHistory<DocRange | undefined>(doc);
     this.painter = new CanvasTextMeasurer({ fonts: doc.fonts });
@@ -1055,6 +1085,7 @@ export class DocumentView {
     this.strings = resolveStrings(locale);
     this.root.setAttribute('aria-label', this.strings.document);
     this.applyInputMode();
+    this.syncBalloon();
     this.slots.forEach((slot) => {
       slot.element.setAttribute('aria-label', this.strings.page(slot.index + 1));
       // Placeholders carry words.
@@ -1139,6 +1170,8 @@ export class DocumentView {
     this.endDrag();
     this.endPress();
     this.typing.destroy();
+    if (this.balloon) this.balloon.destroy();
+    this.balloon = undefined;
     this.unlisten();
     this.unmountAll();
     this.images.destroy();
@@ -1867,6 +1900,7 @@ export class DocumentView {
     });
 
     this.placeCaret();
+    if (this.balloon && this.balloon.isOpen) this.balloon.moveTo(this.balloonPlace());
     this.updateBar();
     const page = this.currentPage;
     if (page !== this.reportedPage || count !== this.reportedCount) {
@@ -1946,7 +1980,7 @@ export class DocumentView {
 
     element.appendChild(canvas);
     element.appendChild(text);
-    const slot: Slot = { index, element, canvas, context: null, text, links: [], dirty: true, left: NaN, top: NaN, width: NaN, height: NaN };
+    const slot: Slot = { index, element, canvas, context: null, text, links: [], marks: new Map(), places: new Map(), dirty: true, left: NaN, top: NaN, width: NaN, height: NaN };
     this.describe(slot);
     this.slots.set(index, slot);
     // In page order, whatever order the pages came into view in: the order of the Tab key and of a screen reader.
@@ -1969,6 +2003,8 @@ export class DocumentView {
     slot.canvas.height = 0;
     slot.context = null;
     slot.links.length = 0;
+    slot.marks.clear();
+    slot.places.clear();
   }
 
   private unmountAll(): void {
@@ -2077,6 +2113,7 @@ export class DocumentView {
         placeholderLabel: this.placeholderLabel,
       });
       this.paintSelection(context, slot.index, scale);
+      this.paintComments(context, slot, scale);
     } catch {
       // One page that cannot be painted must not take the view down; it stays blank.
       if (!this.paintFailed) this.notify(this.strings.actionFailed, 'error');
@@ -2257,10 +2294,14 @@ export class DocumentView {
     // Ctrl and a click on a device of Apple's asks for the context menu: it selects nothing and drags nothing.
     if (this.destroyed || event.button !== 0 || isContextPress(event)) return;
     this.dragMoved = false;
+    // The mark of a comment is a button: a press on it selects nothing.
+    if (this.markOf(event.target)) return;
     // A finger scrolls; only a mouse or a pen selects.
     if ('pointerType' in event && event.pointerType === 'touch') return;
     // The mouse events a browser makes up after a tap are not presses of a mouse.
     if (Date.now() - this.lastTouch < 800) return;
+    // A press beside it takes away the balloon of a comment, unless something is being written in it.
+    if (this.balloon && this.balloon.isOpen && !this.balloon.composing) this.closeBalloon(false);
     if (this.editable) {
       this.editPointerDown(event);
       return;
@@ -2331,7 +2372,7 @@ export class DocumentView {
   }
 
   private onDoubleClick = (event: MouseEvent): void => {
-    if (this.destroyed) return;
+    if (this.destroyed || this.markOf(event.target)) return;
     if (this.editable) {
       // A mouse was counted when it was pressed; this is the second tap of a finger.
       if (Date.now() - this.lastDown.time > CLICK_MS * 2) this.selectWordAt(event, false);
@@ -2501,7 +2542,21 @@ export class DocumentView {
   }
 
   private onStripClick = (event: MouseEvent): void => {
-    if (this.destroyed || this.dragMoved) return;
+    if (this.destroyed) return;
+    const mark = this.markOf(event.target);
+    if (mark) {
+      // The mark of a comment in the margin: its balloon, with the focus in it.
+      const id = Number(mark.getAttribute('data-comment'));
+      event.preventDefault();
+      if (this.balloon && this.balloon.isOpen && this.balloon.threadId === id && !this.balloon.composing) this.closeBalloon(true);
+      else {
+        this.showComment(id, true);
+        this.balloonOpener = mark;
+      }
+      return;
+    }
+    if (this.dragMoved) return;
+    this.clickComment(event);
     if (this.editable) {
       // A tap of a finger puts the caret there; a link is followed with Ctrl (Cmd) held, as in Word.
       if (Date.now() - this.lastTouch < 800) {
@@ -2532,6 +2587,24 @@ export class DocumentView {
     }
     // The other keys on the buttons of the bar are theirs.
     if (this.bar && target && this.bar.contains(target)) return;
+    // And those on the mark of a comment: Enter and the space bar press it.
+    if (this.markOf(target)) {
+      if (key === 'Escape') this.focusInput(true);
+      return;
+    }
+    // Ctrl+Alt+M (Cmd+Option+M): a new comment for the selection, as in Word.
+    if (command && event.altKey && !event.shiftKey && (event.code === 'KeyM' || key === 'm' || key === 'M')) {
+      event.preventDefault();
+      this.startComment();
+      return;
+    }
+    // Escape takes the balloon of a comment away first.
+    if (key === 'Escape' && !command && !event.altKey && this.balloon && this.balloon.isOpen && !this.balloon.composing) {
+      event.preventDefault();
+      this.dismissedThread = this.balloon.threadId;
+      this.closeBalloon(false);
+      return;
+    }
     if (!command && !event.altKey && (key === 'Enter' || key === ' ')) {
       const link = this.linkOf(target);
       if (link !== undefined) {
@@ -2541,6 +2614,13 @@ export class DocumentView {
       }
     }
     if (this.editable && this.editKey(event)) return;
+    // Where only comments can be changed, undo and redo are theirs: nothing else is in the history.
+    if (this.commenting && command && !event.altKey && (key === 'z' || key === 'Z' || key === 'y' || key === 'Y')) {
+      event.preventDefault();
+      if (key === 'y' || key === 'Y' || event.shiftKey) this.redo();
+      else this.undo();
+      return;
+    }
     if (event.altKey) return;
     if (command) {
       if (key === 'a' || key === 'A') this.selectAll();
@@ -3164,6 +3244,675 @@ export class DocumentView {
     if (this.strip.title !== title) this.strip.title = title;
   };
 
+
+  // ---------------------------------------------------------------- comments
+
+  /**
+   * Whether comments can be added, edited, answered, resolved and removed:
+   * in an editor, and in the view of a document whose protection allows
+   * comments and nothing else, once editing was asked for. Such a view stays
+   * read-only (`readOnly` is true): its text cannot be changed.
+   */
+  get canComment(): boolean {
+    return !this.destroyed && (this.editable || this.commenting);
+  }
+
+  private commentState(): { list: DocComment[]; roots: DocComment[]; threads: Map<number, DocComment[]> } {
+    const cached = this.commentCache;
+    if (cached && cached.at === this.changes) return cached;
+    let list: DocComment[] = [];
+    try {
+      list = ops.listComments(this.document);
+    } catch {
+      // A document whose comments cannot be followed is shown without them.
+      list = [];
+    }
+    const roots: DocComment[] = [];
+    const threads = new Map<number, DocComment[]>();
+    for (let i = 0; i < list.length; i++) {
+      const comment = list[i];
+      if (comment.parent === undefined) {
+        roots.push(comment);
+        threads.set(comment.id, [comment]);
+      } else {
+        const thread = threads.get(comment.parent);
+        if (thread) thread.push(comment);
+      }
+    }
+    // What a host is told of the comments (who, when, what, which thread, resolved) is the same list as before
+    // when nothing of it changed: typing moves the places of comments, and says nothing new about them.
+    const before = cached ? cached.list : undefined;
+    let same = before !== undefined && before.length === list.length;
+    for (let i = 0; same && before && i < list.length; i++) {
+      const a = before[i];
+      const b = list[i];
+      // Whether a comment has a place at all is part of it: one without is not marked on any page.
+      same = a.id === b.id && a.text === b.text && a.done === b.done && a.parent === b.parent && a.author === b.author && a.date === b.date && (a.start === undefined) === (b.start === undefined);
+    }
+    if (!same) this.commentsVersion++;
+    const state = { at: this.changes, list, roots, threads };
+    this.commentCache = state;
+    return state;
+  }
+
+  /**
+   * A number that changes whenever what comments() says of the comments
+   * themselves changes (one is added or removed, its text, its thread or
+   * whether it is resolved): the same number means the same comments, though
+   * the places of their text may have moved.
+   */
+  get commentsRevision(): number {
+    this.commentState();
+    return this.commentsVersion;
+  }
+
+  /**
+   * The comments of the document: those about text in the order of that
+   * text, each followed by its answers (`parent` names the first comment of
+   * their thread), then the ones nothing refers to. Each describes the
+   * document as it is now: after a change, ask again.
+   */
+  comments(): DocComment[] {
+    return this.commentState().list.map((comment) => ({ ...comment }));
+  }
+
+  /** How many comments the document has, answers included. */
+  get commentCount(): number {
+    return this.commentState().list.length;
+  }
+
+  /** The first comment of the thread the balloon shows; undefined when none is shown. */
+  get shownComment(): number | undefined {
+    return this.balloon ? this.balloon.threadId : undefined;
+  }
+
+  /** Applies an edit of comments as one step of the history. Undefined when nothing was changed; the reason was said. */
+  private runComment(make: () => ops.CommentEdit, said: string): ops.CommentEdit | undefined {
+    if (!this.canComment) return undefined;
+    this.typing.commit();
+    const before = this.getSelection();
+    let edit: ops.CommentEdit;
+    try {
+      edit = make();
+      if (edit.ops.length === 0) return undefined;
+      this.history.seal();
+      this.history.applyEdit(edit, before);
+      this.history.seal();
+    } catch (error) {
+      this.refuse(error);
+      return undefined;
+    }
+    this.pendingFormat = undefined;
+    this.commentsChanged(before ? edit.selection : undefined);
+    this.notify(said, 'info');
+    return edit;
+  }
+
+  /** The document was changed by a command of comments: the pages, the marks and the balloon follow. */
+  private commentsChanged(selection: DocRange | undefined): void {
+    if (this.editable) {
+      this.changed(selection);
+      return;
+    }
+    this.modified = true;
+    this.changes++;
+    this.follow();
+    this.commentsFollow();
+    if (this.options.onChange) this.options.onChange();
+  }
+
+  /** Paints the pages anew and brings the balloon up to date when the comments are not the ones that were painted. */
+  private commentsFollow(): void {
+    const version = this.commentsRevision;
+    if (version === this.paintedComments) return;
+    this.paintedComments = version;
+    this.repaintAll();
+    this.syncBalloon();
+  }
+
+  /**
+   * Adds a comment about the selection, or about `at`: about the word a
+   * caret is in (between words: about the place itself). The author and the
+   * date are those of the options of the view. One step of the history, and
+   * never a tracked change. Returns the id of the comment; undefined when
+   * none was added (no selection, a header or footer, a view that takes no
+   * comments), which is said.
+   */
+  addComment(text: string, at?: DocRange | DocPosition): number | undefined {
+    if (!this.canComment) return undefined;
+    let range: DocRange | undefined;
+    try {
+      range = at === undefined ? this.range() : ops.asRange(at);
+    } catch (error) {
+      this.refuse(error);
+      return undefined;
+    }
+    if (!range) {
+      this.notify(this.strings.commentNeedsPlace, 'info');
+      return undefined;
+    }
+    const where = range;
+    const edit = this.runComment(() => ops.addComment(this.document, where, text), this.strings.commentAdded);
+    return edit ? edit.id : undefined;
+  }
+
+  /** Replaces the text of a comment (plain paragraphs, "\n" between them). False when nothing was changed. */
+  editComment(id: number, text: string): boolean {
+    return this.runComment(() => ops.editComment(this.document, id, text, this.getSelection()), this.strings.commentChanged) !== undefined;
+  }
+
+  /** Answers a comment: the answer joins the thread of that comment. Returns the id of the answer. */
+  replyToComment(id: number, text: string): number | undefined {
+    const edit = this.runComment(() => ops.replyToComment(this.document, id, text, undefined, this.getSelection()), this.strings.commentReplied);
+    return edit ? edit.id : undefined;
+  }
+
+  /** Says that the thread of a comment is resolved (or, with false, open again). False when it was so already. */
+  resolveComment(id: number, done = true): boolean {
+    return this.runComment(() => ops.resolveComment(this.document, id, done === true, this.getSelection()), this.strings.commentResolvedSaid(done === true)) !== undefined;
+  }
+
+  /** Removes a comment with its marks in the text; the first comment of a thread takes its answers along. */
+  removeComment(id: number): boolean {
+    return this.runComment(() => ops.removeComment(this.document, id, this.getSelection()), this.strings.commentRemoved) !== undefined;
+  }
+
+  /**
+   * Opens the field for a new comment about the selection: what the Comment
+   * button and Ctrl+Alt+M do. The comment is added when the field is saved.
+   * False when no comment can be written (no selection, a place that takes
+   * none, a view that takes no comments), which is said.
+   */
+  startComment(): boolean {
+    if (!this.canComment) return false;
+    this.typing.commit();
+    const range = this.getSelection();
+    if (!range) {
+      this.notify(this.strings.commentNeedsPlace, 'info');
+      return false;
+    }
+    const story = range.focus.story;
+    if ((story !== 'body' && storyKind(story) !== 'footnote' && storyKind(story) !== 'endnote') || range.anchor.story !== story || range.focus.path.indexOf(-1) >= 0 || range.anchor.path.indexOf(-1) >= 0) {
+      this.notify(this.strings.cannotCommentHere, 'info');
+      return false;
+    }
+    this.composeRange = range;
+    this.balloonPassive = false;
+    this.balloonOpener = undefined;
+    this.ensureBalloon().show([], this.placeOfPosition(range.focus), { mode: 'new', focus: true });
+    this.repaintAll();
+    return true;
+  }
+
+  /**
+   * Shows a comment with its answers in the balloon (`focus`: with the focus
+   * in it), or with undefined takes the balloon away. False for a comment the
+   * document does not have.
+   */
+  showComment(id: number | undefined, focus = false): boolean {
+    if (this.destroyed) return false;
+    if (id === undefined) {
+      this.closeBalloon(false);
+      return true;
+    }
+    return this.openThread(id, focus, false);
+  }
+
+  /**
+   * Goes to a comment: the one with an id, or the next or the previous
+   * thread from the one that is shown (else from the selection), around the
+   * ends of the document. Its text is selected and brought into view, its
+   * balloon is shown, and what it says is said (live region and onNotice).
+   * False when there is no such comment.
+   */
+  goToComment(target: number | 'next' | 'previous'): boolean {
+    if (this.destroyed) return false;
+    this.typing.commit();
+    const state = this.commentState();
+    const roots = state.roots;
+    if (roots.length === 0) {
+      if (target === 'next' || target === 'previous') this.notify(this.strings.noComments, 'info');
+      return false;
+    }
+    let index = -1;
+    let wrapped: 'first' | 'last' | undefined;
+    if (target === 'next' || target === 'previous') {
+      const step = target === 'next' ? 1 : -1;
+      const shown = this.shownComment;
+      let current = -1;
+      for (let i = 0; i < roots.length; i++) if (roots[i].id === shown) current = i;
+      if (current < 0) {
+        // From where the selection is: the first thread after it, or the last one before it.
+        const range = this.range();
+        let at: DocPosition | undefined;
+        try {
+          at = range ? (step === 1 ? ops.orderRange(range).end : ops.orderRange(range).start) : undefined;
+        } catch {
+          at = undefined;
+        }
+        if (at) {
+          for (let i = step === 1 ? 0 : roots.length - 1; i >= 0 && i < roots.length; i += step) {
+            const comment = roots[i];
+            if (!comment.start || !comment.end || comment.story !== at.story) continue;
+            if (step === 1 ? placeOrder(comment.start, at) > 0 : placeOrder(comment.end, at) < 0) {
+              index = i;
+              break;
+            }
+          }
+        }
+        if (index < 0) {
+          index = step === 1 ? 0 : roots.length - 1;
+          if (at) wrapped = step === 1 ? 'first' : 'last';
+        }
+      } else {
+        index = current + step;
+        if (index >= roots.length) {
+          index = 0;
+          wrapped = 'first';
+        } else if (index < 0) {
+          index = roots.length - 1;
+          wrapped = 'last';
+        }
+      }
+    } else {
+      for (let i = 0; i < roots.length; i++) if (roots[i].id === target) index = i;
+      if (index < 0) {
+        // An answer: its thread.
+        for (let i = 0; i < state.list.length; i++) {
+          if (state.list[i].id !== target) continue;
+          for (let k = 0; k < roots.length; k++) if (roots[k].id === state.list[i].parent) index = k;
+        }
+      }
+      if (index < 0) return false;
+    }
+    const comment = roots[index];
+    if (comment.start && comment.end) {
+      const range = { anchor: copyPosition(comment.start), focus: copyPosition(comment.end) };
+      if (this.editable) {
+        try {
+          this.setSelection(range);
+        } catch {
+          // The text of the comment is in a place no caret goes to: only its balloon is shown.
+        }
+      } else {
+        this.selection = range;
+        const page = this.pageOfPosition(comment.start);
+        if (page >= 0 && !this.slots.has(page)) this.scrollToPage(page);
+      }
+    }
+    this.openThread(comment.id, false, false);
+    this.notify(this.strings.commentStep(index + 1, roots.length, comment.author, comment.text.length > 200 ? comment.text.slice(0, 200) + '…' : comment.text, wrapped), 'info');
+    return true;
+  }
+
+  private ensureBalloon(): CommentBalloon {
+    if (!this.balloon) {
+      this.balloon = new CommentBalloon({
+        root: this.root,
+        strings: () => this.strings,
+        canChange: () => this.canComment,
+        submit: (mode, id, text) => this.submitComment(mode, id, text),
+        resolve: (id, done) => {
+          this.resolveComment(id, done);
+        },
+        remove: (id) => {
+          this.removeComment(id);
+          // The thread went with its first comment, by a button of its balloon: the keys go back to the document
+          // (also where a browser gives the focus to no button that is pressed with the mouse).
+          if (!(this.balloon && this.balloon.isOpen)) this.focusInput(true);
+        },
+        closed: (refocus) => {
+          // Sent away by the user: it does not come back by itself while the caret stays where it is.
+          const range = this.range();
+          const under = range && this.editable ? ops.commentAtPosition(this.commentState().roots, range.focus) : undefined;
+          this.dismissedThread = under ? under.id : undefined;
+          this.balloonClosed(refocus);
+        },
+      });
+    }
+    return this.balloon;
+  }
+
+  /** What the field of the balloon was saved with. */
+  private submitComment(mode: 'new' | 'reply' | 'edit', id: number | undefined, text: string): boolean {
+    if (typeof text !== 'string' || text.trim() === '') {
+      this.notify(this.strings.commentTextNeeded, 'info');
+      return false;
+    }
+    let thread: number | undefined;
+    if (mode === 'new') {
+      const made = this.addComment(text, this.composeRange);
+      if (made === undefined) return false;
+      thread = made;
+    } else if (id === undefined) return false;
+    else if (mode === 'reply') {
+      if (this.replyToComment(id, text) === undefined) return false;
+      thread = this.balloon ? this.balloon.threadId : id;
+    } else {
+      thread = this.balloon ? this.balloon.threadId : id;
+      // Saved as it was: nothing to change, and the field goes all the same.
+      const now = this.commentState().list.filter((comment) => comment.id === id)[0];
+      if (!(now && now.plain && now.text === text) && !this.editComment(id, text)) return false;
+    }
+    this.composeRange = undefined;
+    // The thread as it is now, and the keys back to the document.
+    if (thread === undefined || !this.openThread(thread, false, false)) this.closeBalloon(false);
+    this.focusInput(true);
+    return true;
+  }
+
+  /** Shows the thread a comment belongs to. `passive`: it came by itself and goes by itself when the caret leaves its text. */
+  private openThread(id: number, focus: boolean, passive: boolean): boolean {
+    const state = this.commentState();
+    let thread = state.threads.get(id);
+    if (!thread) {
+      for (let i = 0; i < state.list.length && !thread; i++) if (state.list[i].id === id && state.list[i].parent !== undefined) thread = state.threads.get(state.list[i].parent as number);
+    }
+    if (!thread) return false;
+    this.balloonPassive = passive;
+    this.balloonOpener = undefined;
+    this.composeRange = undefined;
+    this.ensureBalloon().show(thread, this.threadPlace(thread[0].id), { focus });
+    // The text of the thread that is shown is marked more strongly, and its mark says that it is open.
+    this.repaintAll();
+    return true;
+  }
+
+  private closeBalloon(refocus: boolean): void {
+    const balloon = this.balloon;
+    if (!balloon || !balloon.isOpen) return;
+    const had = balloon.hasFocus;
+    balloon.hide();
+    this.balloonClosed(refocus || had);
+  }
+
+  private balloonClosed(refocus: boolean): void {
+    const opener = this.balloonOpener;
+    this.balloonOpener = undefined;
+    this.balloonPassive = false;
+    this.composeRange = undefined;
+    if (refocus && !this.destroyed) {
+      if (opener && opener.isConnected) opener.focus({ preventScroll: true });
+      else this.focusInput(true);
+    }
+    this.repaintAll();
+  }
+
+  /** The balloon shows the thread as it is now; it goes when its thread is gone. */
+  private syncBalloon(): void {
+    const balloon = this.balloon;
+    if (!balloon || !balloon.isOpen) return;
+    const id = balloon.threadId;
+    if (id === undefined) {
+      // A new comment is being written: only the words may have changed.
+      balloon.refresh([]);
+      return;
+    }
+    const thread = this.commentState().threads.get(id);
+    if (thread) balloon.refresh(thread);
+    else this.closeBalloon(false);
+  }
+
+  /** Whether the view is so narrow that the balloon lies along its bottom edge. */
+  private balloonDocked(): boolean {
+    return this.root.clientWidth < DOCKED_BELOW;
+  }
+
+  /** The caret went somewhere: the balloon of the comment it is in comes, and one that came that way goes when the caret leaves. */
+  private followComment(): void {
+    const balloon = this.balloon;
+    if (balloon && balloon.isOpen && (balloon.composing || balloon.hasFocus)) return;
+    const roots = this.commentState().roots;
+    let found: DocComment | undefined;
+    // Beside the text only: a balloon along the bottom edge would come and go under the hands of who types.
+    if (roots.length > 0 && this.editable && !this.balloonDocked()) {
+      const range = this.range();
+      if (range && ops.samePosition(range.anchor, range.focus)) found = ops.commentAtPosition(roots, range.focus);
+    }
+    if (!found) this.dismissedThread = undefined;
+    if (found) {
+      if (found.id !== this.dismissedThread && (!balloon || !balloon.isOpen || balloon.threadId !== found.id)) this.openThread(found.id, false, true);
+    } else if (balloon && balloon.isOpen && this.balloonPassive) this.closeBalloon(false);
+  }
+
+  private markOf(target: EventTarget | null): HTMLElement | undefined {
+    const element = target as Element | null;
+    const mark = element && typeof element.closest === 'function' ? element.closest('.bym-doc-comment-mark') : null;
+    return mark ? (mark as HTMLElement) : undefined;
+  }
+
+  /** The thread whose text is under a point of the window. */
+  private commentUnder(clientX: number, clientY: number): DocComment | undefined {
+    const point = this.pagePoint(clientX, clientY);
+    const hit = point ? this.hitAt(point.page, point.x, point.y) : undefined;
+    if (!point || !hit) return undefined;
+    const item = hit.item;
+    const box = this.measurer.metrics(item.font);
+    // On the text itself, not merely nearest to it.
+    if (point.x < item.x || point.x > item.x + item.width || point.y < item.y - box.ascent || point.y > item.y + box.descent) return undefined;
+    const at = DocumentView.positionOf(item, Math.min(hit.offset, Math.max(0, item.text.length - 1)));
+    let best: DocComment | undefined;
+    const roots = this.commentState().roots;
+    for (let i = 0; i < roots.length; i++) {
+      const comment = roots[i];
+      if (!comment.start || !comment.end || comment.story !== at.story) continue;
+      if (placeOrder(comment.start, at) <= 0 && placeOrder(comment.end, at) > 0) best = comment;
+    }
+    return best;
+  }
+
+  /** A click on the pages: on the text of a comment its balloon comes, beside it the balloon goes. Where a caret follows the click, the caret decides (see followComment). */
+  private clickComment(event: MouseEvent): void {
+    if (this.commentState().roots.length === 0) return;
+    const touch = Date.now() - this.lastTouch < 800;
+    if (this.editable && !touch && !this.balloonDocked()) return;
+    const balloon = this.balloon;
+    if (balloon && balloon.isOpen && balloon.composing) return;
+    const found = this.commentUnder(event.clientX, event.clientY);
+    if (found) this.openThread(found.id, false, false);
+    else if (balloon && balloon.isOpen) this.closeBalloon(false);
+  }
+
+  /** The page a position is laid out on; -1 when no page laid out so far holds it. */
+  private pageOfPosition(position: DocPosition): number {
+    const pages = this.pages;
+    for (let p = 0; p < pages.length; p++) {
+      const items = pages[p].items;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type !== 'text' || !item.source || item.repeat || item.source.story !== position.story) continue;
+        if (comparePaths(item.source.path, position.path) !== 0) continue;
+        if (position.offset >= item.source.offset && position.offset <= item.source.offset + item.text.length) return p;
+      }
+    }
+    return -1;
+  }
+
+  /** Where the balloon belongs for a line of a page: lined up with the right edge of the page, clear of the line. */
+  private lineBalloonPlace(slot: Slot, top: number, bottom: number): BalloonPlace {
+    const a = this.rootPoint(slot, this.pageWidth(slot.index), top);
+    const b = this.rootPoint(slot, this.pageWidth(slot.index), bottom);
+    return { right: a.x - 4, top: a.y, bottom: b.y };
+  }
+
+  /** Where the balloon of a thread belongs: at the first of its lines on the pages that are shown. */
+  private threadPlace(id: number): BalloonPlace | undefined {
+    let found: { slot: Slot; place: { top: number; bottom: number } } | undefined;
+    this.slots.forEach((slot) => {
+      const place = slot.places.get(id);
+      if (place && (!found || slot.index < found.slot.index)) found = { slot, place };
+    });
+    return found ? this.lineBalloonPlace(found.slot, found.place.top, found.place.bottom) : undefined;
+  }
+
+  /** Where the balloon belongs for a place in the text, when that is on a page that is shown. */
+  private placeOfPosition(position: DocPosition): BalloonPlace | undefined {
+    let out: BalloonPlace | undefined;
+    this.slots.forEach((slot) => {
+      if (out) return;
+      const page = this.pages[slot.index];
+      const items = page ? page.items : [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type !== 'text' || !item.source || item.repeat || item.rotation !== undefined || item.source.story !== position.story) continue;
+        if (comparePaths(item.source.path, position.path) !== 0) continue;
+        if (position.offset < item.source.offset || position.offset > item.source.offset + item.text.length) continue;
+        const box = this.measurer.metrics(item.font);
+        out = this.lineBalloonPlace(slot, item.y - box.ascent, item.y + box.descent);
+        return;
+      }
+    });
+    return out;
+  }
+
+  private balloonPlace(): BalloonPlace | undefined {
+    const balloon = this.balloon;
+    if (!balloon || !balloon.isOpen) return undefined;
+    const id = balloon.threadId;
+    if (id !== undefined) return this.threadPlace(id);
+    return this.composeRange ? this.placeOfPosition(this.composeRange.focus) : undefined;
+  }
+
+  /**
+   * Paints the comments of a page: the text each is about in the colour of
+   * its author (paler for a resolved thread, stronger for the one whose
+   * balloon is shown), a bar where a comment is about a point, and for each
+   * thread a mark in the margin beside its first line. Nothing of this is
+   * part of a printed page (see paintForPrint).
+   */
+  private paintComments(context: CanvasRenderingContext2D, slot: Slot, scale: number): void {
+    const state = this.commentState();
+    const roots = state.roots;
+    slot.places.clear();
+    if (roots.length === 0) {
+      if (slot.marks.size > 0) this.placeMarks(slot, state);
+      return;
+    }
+    const items = this.pages[slot.index].items;
+    const shown = this.shownComment;
+    // What the page holds of each story, from its first paragraph to its last: a comment that lies before or after
+    // that is passed without a look at the text of the page (a file may hold very many comments).
+    const spans = new Map<string, { first: number[]; last: number[] }>();
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type !== 'text' || !item.source || item.repeat) continue;
+      const source = item.source;
+      const span = spans.get(source.story);
+      if (!span) spans.set(source.story, { first: source.path, last: source.path });
+      else {
+        if (comparePaths(source.path, span.first) < 0) span.first = source.path;
+        if (comparePaths(source.path, span.last) > 0) span.last = source.path;
+      }
+    }
+    context.save();
+    context.scale(scale, scale);
+    let marked = 0;
+    for (let c = 0; c < roots.length && marked < MAX_MARKED_COMMENTS; c++) {
+      const comment = roots[c];
+      const start = comment.start;
+      const end = comment.end;
+      if (!start || !end) continue;
+      const span = spans.get(start.story);
+      if (!span || comparePaths(start.path, span.last) > 0 || comparePaths(end.path, span.first) < 0) continue;
+      const point = comparePositions(start, end) === 0;
+      const range: TextRange = { start, end, prefix: flowPrefix(start.path) };
+      let first: { top: number; bottom: number } | undefined;
+      context.fillStyle = commentFill(comment.author, comment.done, comment.id === shown);
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type !== 'text' || !(item.width > 0) || item.rotation !== undefined || !item.source || item.repeat || item.source.story !== comment.story) continue;
+        let a: number;
+        let b: number;
+        if (point) {
+          if (first || comparePaths(item.source.path, start.path) !== 0) continue;
+          const at = start.offset - item.source.offset;
+          if (at < 0 || at > item.text.length) continue;
+          a = b = this.advance(item, at);
+        } else {
+          const part = selectedPart(range, item);
+          if (!part) continue;
+          a = this.advance(item, part[0]);
+          b = this.advance(item, part[1]);
+        }
+        const box = this.measurer.metrics(item.font);
+        const top = item.y - box.ascent;
+        const height = box.ascent + box.descent;
+        if (point) {
+          // About a place, not about text: a bar where the place is.
+          const [r, g, bl] = commentColor(comment.author);
+          context.fillStyle = `rgba(${r}, ${g}, ${bl}, ${comment.done ? 0.35 : 0.9})`;
+          context.fillRect(item.x + a - 1, top, 2.5, height);
+        } else if (b > a) context.fillRect(item.x + a, top, b - a, height);
+        else continue;
+        if (!first) first = { top, bottom: top + height };
+      }
+      if (first) {
+        slot.places.set(comment.id, first);
+        marked++;
+      }
+    }
+    context.restore();
+    this.placeMarks(slot, state);
+  }
+
+  /** The marks in the margin of a page: a button for each thread that has a line on it, and none for the others. */
+  private placeMarks(slot: Slot, state: { roots: DocComment[]; threads: Map<number, DocComment[]> }): void {
+    const s = this.strings;
+    const height = this.pageHeight(slot.index);
+    const shown = this.shownComment;
+    // Where the marks of each column end, screen px from the top of the page: a mark that would lie over the one
+    // above it (two threads on one line, lines that are close at a small zoom) stands beside it instead.
+    const columns: number[] = [];
+    const marks = slot.marks;
+    const stale: number[] = [];
+    marks.forEach((_mark, id) => {
+      if (!slot.places.has(id)) stale.push(id);
+    });
+    for (let i = 0; i < stale.length; i++) {
+      const mark = marks.get(stale[i]) as HTMLButtonElement;
+      if (mark.parentNode) mark.parentNode.removeChild(mark);
+      marks.delete(stale[i]);
+    }
+    for (let i = 0; i < state.roots.length; i++) {
+      const comment = state.roots[i];
+      const place = slot.places.get(comment.id);
+      if (!place) continue;
+      let mark = marks.get(comment.id);
+      if (!mark) {
+        mark = document.createElement('button');
+        mark.type = 'button';
+        mark.className = 'bym-doc-comment-mark';
+        mark.setAttribute('data-comment', String(comment.id));
+        mark.setAttribute('aria-haspopup', 'dialog');
+        mark.style.cssText = `position:absolute;z-index:1;display:block;box-sizing:border-box;width:${COMMENT_MARK}px;height:${COMMENT_MARK}px;min-width:0;min-height:0;margin:0;padding:0;overflow:hidden;text-align:center`;
+        slot.element.appendChild(mark);
+        marks.set(comment.id, mark);
+      }
+      const thread = state.threads.get(comment.id);
+      const replies = thread ? thread.length - 1 : 0;
+      // The name of an author is set as text.
+      const label = s.commentBy(comment.author) + (comment.done ? `, ${s.commentResolved}` : '') + (replies > 0 ? `, ${s.commentReplies(replies)}` : '');
+      if (mark.getAttribute('aria-label') !== label) {
+        mark.setAttribute('aria-label', label);
+        mark.title = label;
+      }
+      const count = replies > 0 ? String(replies + 1) : '';
+      if (mark.textContent !== count) mark.textContent = count;
+      const done = comment.done ? 'true' : 'false';
+      if (mark.getAttribute('data-done') !== done) mark.setAttribute('data-done', done);
+      const expanded = comment.id === shown ? 'true' : 'false';
+      if (mark.getAttribute('aria-expanded') !== expanded) mark.setAttribute('aria-expanded', expanded);
+      const [r, g, b] = commentColor(comment.author);
+      mark.style.borderColor = `rgb(${r}, ${g}, ${b})`;
+      const top = place.top * this.scale;
+      let column = 0;
+      while (column < columns.length && column < MAX_MARK_COLUMNS - 1 && columns[column] > top) column++;
+      columns[column] = top + COMMENT_MARK + 1;
+      mark.style.right = `${2 + column * (COMMENT_MARK + 2)}px`;
+      mark.style.top = `${(place.top / height) * 100}%`;
+    }
+  }
+
   /** Says, once, why the document cannot be edited. */
   private tellLock(): void {
     if (this.lockTold || this.lock === undefined) return;
@@ -3178,6 +3927,15 @@ export class DocumentView {
    */
   setReadOnly(readOnly: boolean): void {
     if (this.destroyed) return;
+    if (this.lock === 'comments') {
+      // The text stays as it is; whether comments can be added and changed is what is turned on and off.
+      if (!readOnly) this.tellLock();
+      if (this.commenting === !readOnly) return;
+      this.commenting = !readOnly;
+      if (readOnly && this.balloon && this.balloon.composing) this.closeBalloon(false);
+      this.syncBalloon();
+      return;
+    }
     if (!readOnly && this.lock !== undefined) {
       this.tellLock();
       return;
@@ -3215,16 +3973,16 @@ export class DocumentView {
   }
 
   get canUndo(): boolean {
-    return this.editable && this.history.canUndo;
+    return (this.editable || this.commenting) && this.history.canUndo;
   }
 
   get canRedo(): boolean {
-    return this.editable && this.history.canRedo;
+    return (this.editable || this.commenting) && this.history.canRedo;
   }
 
   /** Undoes the last change; the caret goes back to where it was before it. */
   undo(): boolean {
-    if (!this.editable || this.destroyed) return false;
+    if ((!this.editable && !this.commenting) || this.destroyed) return false;
     this.typing.commit();
     const step = this.history.undo();
     if (!step) return false;
@@ -3233,7 +3991,7 @@ export class DocumentView {
   }
 
   redo(): boolean {
-    if (!this.editable || this.destroyed) return false;
+    if ((!this.editable && !this.commenting) || this.destroyed) return false;
     this.typing.commit();
     const step = this.history.redo();
     if (!step) return false;
@@ -3518,7 +4276,15 @@ export class DocumentView {
               ? s.revisionGone
               : message === ops.TRACK_ENFORCED
                 ? s.cannotStopTracking
-                : s.cannotEditHere,
+                : message === ops.COMMENT_NOT_HERE
+                  ? s.cannotCommentHere
+                  : message === ops.COMMENT_FIXED
+                    ? s.commentFixed
+                    : message === ops.COMMENT_GONE
+                      ? s.commentGone
+                      : /^The text of a comment/.test(message)
+                        ? s.commentTextNeeded
+                        : s.cannotEditHere,
       'info',
     );
   }
@@ -3577,11 +4343,20 @@ export class DocumentView {
     this.targetX = undefined;
     this.follow();
     this.selectionMoved(true);
+    // The marks and the balloon of the comments follow when the comments themselves changed (one was added or
+    // removed, resolved, answered, edited). Typing does not change them: the pages it changes are painted anew
+    // by the layout, with their comments, and every other page shows what it showed.
+    this.commentsFollow();
     if (this.options.onChange) this.options.onChange();
   }
 
   private afterHistory(meta: DocRange | undefined): void {
     this.pendingFormat = undefined;
+    if (!this.editable) {
+      // A view that only takes comments has no caret to put anywhere.
+      this.commentsChanged(undefined);
+      return;
+    }
     let selection: DocRange | undefined;
     if (meta) {
       try {
@@ -3611,6 +4386,7 @@ export class DocumentView {
     this.blink = !this.blink;
     this.typing.sync();
     if (reveal) this.reveal();
+    this.followComment();
     this.schedule();
     if (this.options.onSelectionChange) this.options.onSelectionChange(this.getSelection());
   }

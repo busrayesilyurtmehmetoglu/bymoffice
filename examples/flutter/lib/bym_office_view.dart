@@ -119,6 +119,31 @@ class BymOfficeRevisions {
   final bool trackChanges;
 }
 
+/// One comment of a document, as the `comments` message and `loaded.comments` list it.
+/// An answer names the first comment of its thread in [parent]; [done] says that the
+/// thread is resolved. NOT COMPILED: written against the contract, never built or run with Flutter.
+class BymOfficeComment {
+  const BymOfficeComment({required this.id, required this.author, required this.text, required this.done, this.date, this.parent});
+
+  factory BymOfficeComment.fromJson(Map<String, dynamic> json) => BymOfficeComment(
+        id: (json['id'] as num).toInt(),
+        author: json['author'] as String? ?? '',
+        text: json['text'] as String? ?? '',
+        done: json['done'] == true,
+        date: json['date'] as String?,
+        parent: (json['parent'] as num?)?.toInt(),
+      );
+
+  final int id;
+  final String author;
+  final String text;
+  final bool done;
+
+  /// ISO 8601 text as the file has it.
+  final String? date;
+  final int? parent;
+}
+
 /// A `selection` message. [range] and [active] are cell names such as "A1:B2" and "A1".
 class BymOfficeSelection {
   const BymOfficeSelection({required this.sheet, required this.range, required this.active});
@@ -199,6 +224,7 @@ class BymOfficeController {
   final StreamController<BymOfficeSheetChange> _sheets = StreamController<BymOfficeSheetChange>.broadcast();
   final StreamController<BymOfficeSheetList> _sheetLists = StreamController<BymOfficeSheetList>.broadcast();
   final StreamController<BymOfficeRevisions> _revisions = StreamController<BymOfficeRevisions>.broadcast();
+  final StreamController<List<BymOfficeComment>> _comments = StreamController<List<BymOfficeComment>>.broadcast();
   final StreamController<BymOfficeException> _errors = StreamController<BymOfficeException>.broadcast();
   final StreamController<String> _links = StreamController<String>.broadcast();
   final StreamController<BymOfficeSavedFile> _userSaves = StreamController<BymOfficeSavedFile>.broadcast();
@@ -218,6 +244,12 @@ class BymOfficeController {
   /// The number of tracked changes of the document, or whether its changes are
   /// tracked, changed; never sent for a workbook. (NOT COMPILED, see BymOfficeRevisions.)
   Stream<BymOfficeRevisions> get onRevisionsChanged => _revisions.stream;
+
+  /// The comments of the document, whenever the list is not the one told last (a command,
+  /// what the user did in the page, undo and redo); never sent for a workbook. The list a
+  /// file starts with is in `loaded.comments`, which this wrapper does not read.
+  /// (NOT COMPILED, see BymOfficeComment.)
+  Stream<List<BymOfficeComment>> get onCommentsChanged => _comments.stream;
 
   /// A link in a document was activated; the page never opens it itself.
   Stream<String> get onLink => _links.stream;
@@ -424,6 +456,40 @@ class BymOfficeController {
   /// Turns the tracking of changes on or off; completes with what holds afterwards.
   Future<BymOfficeRevisions> setTrackChanges(bool on) async => _revisionsOf(await _request(<String, dynamic>{'type': 'setTrackChanges', 'on': on}));
 
+  // NOT COMPILED: the five commands below (comments of a document) were written
+  // against the contract and have not been built or run with Flutter. They fail with
+  // the code "no-document" for a workbook, "read-only" for a document that takes no
+  // comments, and "comment-refused" when nothing was changed (no such comment, no place
+  // for it). A document protected for comments takes them although its text is locked.
+
+  /// Adds a comment about the selection of the page, or about the range from [anchor]
+  /// to [focus] (`{'story': 'body', 'path': [0], 'offset': 4}`; [anchor] alone: the word
+  /// there). Completes with the id of the new comment.
+  Future<int> addComment(String text, {Map<String, dynamic>? anchor, Map<String, dynamic>? focus}) async {
+    final Map<String, dynamic> answer = await _request(<String, dynamic>{
+      'type': 'addComment',
+      'text': text,
+      if (anchor != null) 'anchor': anchor,
+      if (focus != null) 'focus': focus,
+    });
+    return (answer['commentId'] as num).toInt();
+  }
+
+  /// Replaces the text of a comment (plain text; "\n" separates paragraphs).
+  Future<void> editComment(int commentId, String text) => _request(<String, dynamic>{'type': 'editComment', 'commentId': commentId, 'text': text});
+
+  /// Answers a comment; completes with the id of the answer.
+  Future<int> replyComment(int commentId, String text) async {
+    final Map<String, dynamic> answer = await _request(<String, dynamic>{'type': 'replyComment', 'commentId': commentId, 'text': text});
+    return (answer['commentId'] as num).toInt();
+  }
+
+  /// Marks the thread of a comment resolved, or open again.
+  Future<void> resolveComment(int commentId, {bool done = true}) => _request(<String, dynamic>{'type': 'resolveComment', 'commentId': commentId, 'done': done});
+
+  /// Removes a comment; the first comment of a thread takes its answers along.
+  Future<void> removeComment(int commentId) => _request(<String, dynamic>{'type': 'removeComment', 'commentId': commentId});
+
   /// Closes the file in the page, detaches from the WebView and fails whatever
   /// is still waiting. Requests made afterwards fail at once.
   void dispose() {
@@ -442,6 +508,7 @@ class BymOfficeController {
     _sheets.close();
     _sheetLists.close();
     _revisions.close();
+    _comments.close();
     _errors.close();
     _links.close();
     _userSaves.close();
@@ -535,6 +602,10 @@ class BymOfficeController {
         ));
       case 'revisions':
         _revisions.add(BymOfficeRevisions(count: (message['count'] as num).toInt(), trackChanges: message['trackChanges'] == true));
+      case 'comments':
+        _comments.add((message['comments'] as List<dynamic>)
+            .map((dynamic entry) => BymOfficeComment.fromJson(Map<String, dynamic>.from(entry as Map<dynamic, dynamic>)))
+            .toList());
       case 'sheet':
         _sheets.add(BymOfficeSheetChange(index: (message['index'] as num).toInt(), name: message['name'] as String? ?? ''));
       case 'sheets':

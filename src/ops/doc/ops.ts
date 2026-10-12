@@ -9,7 +9,7 @@
 // back by reference, source spans and all, and restores `modified`, so that
 // "edit, undo, save" writes the bytes that were read.
 
-import type { AbstractNum, Block, Body, DocMedia, DocModel, DocRelationship, DocStyles, FontInfo, Note, NumInstance, SectionProps, SourceSpan, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
+import type { AbstractNum, Block, Body, Comment, DocMedia, DocModel, DocRelationship, DocStyles, FontInfo, Note, NumInstance, SectionProps, SourceSpan, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
 import { storyOf, type StoryHandle } from './position';
 
 /** `modified` flag to set after an operation: true when missing, null to remove the flag. */
@@ -64,6 +64,16 @@ export type DocOp =
    * span the section had, so that undoing gives the text of the file back.
    */
   | { type: 'setBodySection'; section: SectionProps; span?: SourceSpan; modified?: Flag }
+  /**
+   * Puts another table of comments, in its order, in the place of the one
+   * the document has: how a comment is added, changed or removed (a comment
+   * is never changed in place; a changed one is a new object without a
+   * source span). A document without comments gets a collection for them,
+   * which has no part yet (the writer gives it one). Null takes the
+   * collection away again: what undoes its making, and refused for comments
+   * that were read from a file.
+   */
+  | { type: 'setComments'; items: Map<number, Comment> | null; modified?: Flag }
   /** Turns the "track changes" setting of the document (DocSettings.trackRevisions) on or off. */
   | { type: 'setTrackRevisions'; on: boolean }
   /**
@@ -256,6 +266,31 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
       else delete body.sectionSpan;
       inverse.modified = setFlag(body, op.modified);
       return inverse;
+    }
+    case 'setComments': {
+      const collection = doc.comments;
+      if (op.items === null) {
+        if (!collection) return { type: 'setComments', items: null };
+        if (collection.source !== '') return bad('The comments of the file cannot be taken away as a whole');
+        delete doc.comments;
+        const inverse: DocOp = { type: 'setComments', items: collection.items };
+        if (collection.modified !== undefined) inverse.modified = collection.modified;
+        else inverse.modified = null;
+        return inverse;
+      }
+      if (!(op.items instanceof Map)) return bad('A table of comments is needed');
+      for (const [id, comment] of op.items) {
+        if (typeof id !== 'number' || Math.floor(id) !== id || !comment || comment.id !== id || !Array.isArray(comment.blocks)) return bad('A comment is kept under its id');
+      }
+      if (!collection) {
+        const made: StoryCollection<Comment> = { part: '', rootName: '', rootAttrs: [], relationships: new Map(), source: '', items: op.items };
+        doc.comments = made;
+        setFlag(made, op.modified);
+        return { type: 'setComments', items: null };
+      }
+      const before = collection.items;
+      collection.items = op.items;
+      return { type: 'setComments', items: before, modified: setFlag(collection, op.modified) };
     }
     case 'setTrackRevisions': {
       if (typeof op.on !== 'boolean' || !doc.settings) return bad('Tracking is either on or off');

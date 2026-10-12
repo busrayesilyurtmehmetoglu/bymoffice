@@ -33,7 +33,8 @@ export type BridgeErrorCode =
   | 'no-sheet'
   | 'sheet-refused'
   | 'locale-refused'
-  | 'no-document';
+  | 'no-document'
+  | 'comment-refused';
 
 /** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
 export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
@@ -74,10 +75,33 @@ export interface BridgeDocumentView {
   setTrackChanges?(on: boolean): unknown;
   /** Whether the changes made in the view are tracked. */
   readonly trackingChanges?: boolean;
+  /** The comments of the document, answers after the comment they answer: what the application is told. */
+  comments?(): BridgeComment[];
+  /** Changes whenever what comments() says of the comments changes: while it stays the same the list is not asked for again. */
+  readonly commentsRevision?: number;
+  /** Whether comments can be added and changed (also true where a protection allows comments and nothing else). */
+  readonly canComment?: boolean;
+  /** Adds a comment about the selection, or about the range or place given; the id of the comment, or undefined when none was added. */
+  addComment?(text: string, at?: unknown): number | undefined;
+  editComment?(id: number, text: string): boolean;
+  /** Answers a comment; the id of the answer, or undefined. */
+  replyToComment?(id: number, text: string): number | undefined;
+  resolveComment?(id: number, done?: boolean): boolean;
+  removeComment?(id: number): boolean;
   /** Says something to the user: that the document was saved, or why it was not. */
   showNotice?(message: string, kind?: 'error' | 'info'): void;
   /** Whether an input method composes or something is dragged: auto-save waits meanwhile. */
   hasPendingInput?(): boolean;
+}
+
+/** A comment as a document view lists it; the bridge passes on the fields the contract names. */
+export interface BridgeComment {
+  id: number;
+  author: string;
+  date?: string;
+  text: string;
+  done: boolean;
+  parent?: number;
 }
 
 export interface BridgeHost {
@@ -500,6 +524,93 @@ function revisionState(pages: BridgeDocumentView): { count: number; tracking: bo
   return { count, tracking: pages.trackingChanges === true };
 }
 
+/** Most comments one message lists; a document with more says so (`more`). */
+const MAX_LISTED_COMMENTS = 2000;
+/** Most of the text of one comment a message carries, UTF-16 code units; a longer one is cut and says so (`truncated`). */
+const MAX_LISTED_TEXT = 2000;
+/** Most of the name of an author a message carries: what `load.author` may be. */
+const MAX_LISTED_AUTHOR = 255;
+/** Most text (names, dates and comments together) one list carries; it ends where more would not fit, and says so (`more`). */
+const MAX_LISTED_CHARS = 500000;
+
+/** The first `limit` code units of a text, without half of a surrogate pair at the end. */
+function cutText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const code = text.charCodeAt(limit - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit);
+}
+
+/** A number for a list of comments as it is told: lists that are told differently have, as good as always, different numbers. */
+function listDigest(list: Message[]): string {
+  let hash = 0x811c9dc5;
+  const mix = (text: string): void => {
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+    hash = Math.imul(hash ^ 0x1f, 0x01000193);
+  };
+  for (const entry of list) {
+    mix(String(entry.id));
+    mix(String(entry.author));
+    mix(String(entry.text));
+    mix(`${entry.done} ${entry.parent} ${entry.date} ${entry.truncated}`);
+  }
+  return `${list.length}:${hash >>> 0}`;
+}
+/** Longest text of a comment a command may bring, UTF-16 code units: what the engine takes. */
+const MAX_COMMENT_CHARS = 32767;
+
+/** What a document view says of its comments, as the contract has it; undefined for a view that knows nothing of them. */
+function commentState(pages: BridgeDocumentView): { list: Message[]; more: boolean } | undefined {
+  if (typeof pages.comments !== 'function') return undefined;
+  let all: BridgeComment[] = [];
+  try {
+    const listed = pages.comments();
+    all = Array.isArray(listed) ? listed : [];
+  } catch {
+    all = [];
+  }
+  const list: Message[] = [];
+  let room = MAX_LISTED_CHARS;
+  let more = false;
+  for (let i = 0; i < all.length; i++) {
+    const comment = all[i];
+    if (!comment || typeof comment.id !== 'number') continue;
+    if (list.length >= MAX_LISTED_COMMENTS) {
+      more = true;
+      break;
+    }
+    // What a file brings is passed on in pieces of a size the application can count on.
+    const whole = typeof comment.text === 'string' ? comment.text : '';
+    const text = cutText(whole, MAX_LISTED_TEXT);
+    const author = cutText(typeof comment.author === 'string' ? comment.author : '', MAX_LISTED_AUTHOR);
+    const date = typeof comment.date === 'string' ? cutText(comment.date, 64) : undefined;
+    room -= text.length + author.length + (date ? date.length : 0) + 64;
+    if (room < 0) {
+      more = true;
+      break;
+    }
+    const out: Message = { id: comment.id, author, text, done: comment.done === true };
+    if (date !== undefined) out.date = date;
+    if (typeof comment.parent === 'number') out.parent = comment.parent;
+    if (text.length < whole.length) out.truncated = true;
+    list.push(out);
+  }
+  return { list, more };
+}
+
+/** A place of a document in a message: `{ story?, path, offset }`. Throws BadMessage for anything else. */
+function positionField(message: Message, name: string): { story: string; path: number[]; offset: number } | undefined {
+  const value = message[name];
+  if (value === undefined || value === null) return undefined;
+  const place = value as { story?: unknown; path?: unknown; offset?: unknown };
+  if (typeof value !== 'object' || Array.isArray(value)) throw new BadMessage(`"${name}" must be a position`);
+  const story = place.story === undefined ? 'body' : place.story;
+  const path = place.path;
+  if (typeof story !== 'string' || story.length > 64) throw new BadMessage(`"${name}.story" must be the name of a story`);
+  if (!Array.isArray(path) || path.length === 0 || path.length > 256 || !path.every((step) => Number.isInteger(step) && step >= -1 && step <= 0x7fffffff)) throw new BadMessage(`"${name}.path" must be a path`);
+  if (!(Number.isInteger(place.offset) && (place.offset as number) >= 0 && (place.offset as number) <= 0x7fffffff)) throw new BadMessage(`"${name}.offset" must be an offset`);
+  return { story, path: path.slice() as number[], offset: place.offset as number };
+}
+
 interface Shown {
   file: OfficeFile;
   view: WorkbookView | undefined;
@@ -513,6 +624,12 @@ interface Shown {
   readOnly?: boolean;
   /** A document: what the application was last told about its tracked changes, as "count tracking". */
   revisionsSent?: string;
+  /** A document: a digest of the list of comments the application was last told (see listDigest), not the list. */
+  commentsSent?: string;
+  /** A document: what the view said its comments were at (BridgeDocumentView.commentsRevision) when they were last looked at. */
+  commentsRevision?: number;
+  /** A document whose protection allows comments and nothing else. */
+  commentsOnly?: boolean;
   /** A `load` with `save`: what the Save button and Ctrl+S of the page run. */
   saver?: SaveController;
   /** The language the file was loaded with or `setLocale` chose: what a save is spoken of in. */
@@ -981,10 +1098,12 @@ export function createBridge(host: BridgeHost): Bridge {
       const text = failure.pending ? `The font "${failure.family}" is still loading; the file is shown without it until it arrives` : `The font "${failure.family}" could not be loaded: ${failure.reason}`;
       (warnings || (warnings = [])).push(text);
     }
-    // What the document enforces: a protection for comments or forms allows no editing here, as the read-only one.
+    // What the document enforces: a protection for forms allows no editing here, as the read-only one. One for
+    // comments allows comments: the text stays as it is (the view sees to that), and the file is written back.
     const protection = doc ? enforcedProtection(doc) : undefined;
     // Only docx and xlsx are written back with their changes; the other formats stay read-only until they are converted.
-    const locked = needsConversion(file.format) || (protection !== undefined && protection !== 'trackedChanges');
+    const locked = needsConversion(file.format) || (protection !== undefined && protection !== 'trackedChanges' && protection !== 'comments');
+    const commentsOnly = !locked && protection === 'comments';
 
     const loaded = (activeSheet: number, sheets: unknown[], document: boolean) => {
       const out: Message = { type: 'loaded' };
@@ -1005,11 +1124,21 @@ export function createBridge(host: BridgeHost): Bridge {
         // Why the document is read-only, or that its changes are tracked.
         if (protection !== undefined) out.protection = protection;
         if (protection !== undefined && hasPermissionRanges(doc)) out.protectionExceptions = true;
+        // The text cannot be edited; comments can be added and changed, and the file is saved with them.
+        if (commentsOnly) out.commentsOnly = true;
         if (!locked && (trackChanges === true || tracksChanges(doc))) out.trackChanges = true;
         // How many tracked changes it has, when it has any.
         const state = shown && shown.pages ? revisionState(shown.pages) : undefined;
         if (state && state.count > 0) out.revisions = state.count;
         if (shown && state) shown.revisionsSent = `${state.count} ${state.tracking}`;
+        // Its comments, when it has any.
+        const comments = shown && shown.pages ? commentState(shown.pages) : undefined;
+        if (comments && comments.list.length > 0) {
+          out.comments = comments.list;
+          if (comments.more) out.commentsMore = true;
+        }
+        if (shown && comments) shown.commentsSent = listDigest(comments.list);
+        if (shown && shown.pages && typeof shown.pages.commentsRevision === 'number') shown.commentsRevision = shown.pages.commentsRevision;
       }
       send(out);
       // Right after it: where the save of this file stands, in place of what was said of the file before.
@@ -1035,6 +1164,8 @@ export function createBridge(host: BridgeHost): Bridge {
               send({ type: 'revisions', count: state.count, trackChanges: state.tracking });
             }
           }
+          // And the comments, when the list is not the one that was told last.
+          tellComments(shown);
           send({ type: 'changed', sheets: [], canUndo: pages.canUndo === true, canRedo: pages.canRedo === true });
         },
         // The page must not be replaced by what a link points to: the application decides what to do with it.
@@ -1059,7 +1190,7 @@ export function createBridge(host: BridgeHost): Bridge {
         // The file before it was closed for this one, and nothing is shown now.
         return settleSaveState();
       }
-      shown = { file, view: undefined, pages, name, locked, convertedFrom, readOnly: locked || readOnly === true, saver, locale };
+      shown = { file, view: undefined, pages, name, locked, convertedFrom, readOnly: locked || readOnly === true, saver, locale, commentsOnly };
       setLocale(locale);
       setState('open');
       loaded(0, [], true);
@@ -1145,6 +1276,69 @@ export function createBridge(host: BridgeHost): Bridge {
     loaded(view.activeSheet, list, false);
   };
 
+  /** Tells the application the comments of the document, when they are not what it was told last. */
+  const tellComments = (of: Shown): void => {
+    const pages = of.pages;
+    if (!pages) return;
+    // A view that says when its comments changed is not asked for the list after every key that is typed.
+    const revision = pages.commentsRevision;
+    if (typeof revision === 'number') {
+      if (revision === of.commentsRevision) return;
+      of.commentsRevision = revision;
+    }
+    const state = commentState(pages);
+    if (!state) return;
+    const key = listDigest(state.list);
+    if (key === of.commentsSent) return;
+    of.commentsSent = key;
+    const out: Message = { type: 'comments', comments: state.list };
+    if (state.more) out.more = true;
+    send(out);
+  };
+
+  /**
+   * Adds, edits, answers, resolves or removes a comment of the document that is shown, as one
+   * undo step. The list that results is told by `comments` (before the `changed` of the same
+   * change), whether or not the command has an id; the answer says that it was done (with the
+   * id of the comment that was made) or why it was not.
+   */
+  const commentDocument = (type: 'addComment' | 'editComment' | 'replyComment' | 'resolveComment' | 'removeComment', message: Message, id: string | undefined) => {
+    // Everything that comes from outside is looked at before anything is asked of the view.
+    const text = type === 'addComment' || type === 'editComment' || type === 'replyComment' ? field<string>(message, 'text', 'string', true) : undefined;
+    if (text !== undefined && text.length > MAX_COMMENT_CHARS) throw new BadMessage('"text" is too long');
+    const commentId = type === 'addComment' ? undefined : field<number>(message, 'commentId', 'number', true);
+    if (commentId !== undefined && !(Number.isInteger(commentId) && commentId >= 0 && commentId <= 0x7fffffff)) throw new BadMessage('"commentId" must be the id of a comment');
+    const resolved = type === 'resolveComment' ? field<boolean>(message, 'done', 'boolean', false) : undefined;
+    const anchor = type === 'addComment' ? positionField(message, 'anchor') : undefined;
+    const focus = type === 'addComment' ? positionField(message, 'focus') : undefined;
+    if (focus && !anchor) throw new BadMessage('"focus" needs "anchor"');
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const pages = shown.pages;
+    if (!pages) return fail('no-document', 'The open file is not a document', id);
+    if (shown.locked || shown.readOnly === true || pages.canComment !== true) return fail('read-only', 'The document takes no comments: it is read-only', id);
+    let made: number | undefined;
+    let did = false;
+    try {
+      if (type === 'addComment') {
+        made = pages.addComment ? pages.addComment(text as string, anchor ? { anchor, focus: focus || anchor } : undefined) : undefined;
+        did = made !== undefined;
+      } else if (type === 'replyComment') {
+        made = pages.replyToComment ? pages.replyToComment(commentId as number, text as string) : undefined;
+        did = made !== undefined;
+      } else if (type === 'editComment') did = pages.editComment ? pages.editComment(commentId as number, text as string) === true : false;
+      else if (type === 'resolveComment') did = pages.resolveComment ? pages.resolveComment(commentId as number, resolved !== false) === true : false;
+      else did = pages.removeComment ? pages.removeComment(commentId as number) === true : false;
+    } catch (error) {
+      return fail('comment-refused', errorText(error), id);
+    }
+    // The view said why (onNotice of the page); the application hears that nothing was changed.
+    if (!did) return fail('comment-refused', 'The comment was not changed: there is no such comment, no place for it, or nothing to change', id);
+    if (id === undefined) return;
+    const out: Message = { type: 'done', id, command: type };
+    if (made !== undefined) out.commentId = made;
+    send(out);
+  };
+
   /**
    * Accepts or rejects every tracked change of the document that is shown, or turns its
    * tracking on or off. What results is told by `revisions` and `changed` when anything
@@ -1157,6 +1351,8 @@ export function createBridge(host: BridgeHost): Bridge {
     const pages = shown.pages;
     if (!pages) return fail('no-document', 'The open file is not a document', id);
     if (shown.locked || shown.readOnly === true) return fail('read-only', 'The document is read-only', id);
+    // A protection that allows comments and nothing else: the text, and so its tracked changes, cannot be touched.
+    if (shown.commentsOnly) return fail('read-only', 'The protection of the document allows comments only', id);
     if (type === 'setTrackChanges') {
       if (pages.setTrackChanges) pages.setTrackChanges(on === true);
     } else if (type === 'acceptAllRevisions') {
@@ -1527,6 +1723,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
+      if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
       }

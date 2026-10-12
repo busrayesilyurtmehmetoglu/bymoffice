@@ -1,7 +1,8 @@
 // The document editor: the pages (DocumentView) with a formatting toolbar
 // above them. The view does all the work on the document; the shell only
 // calls its public methods and shows its state. A document that is shown
-// read-only has no toolbar: it looks as the view alone does.
+// read-only has no toolbar: it looks as the view alone does (one whose
+// protection allows comments has the toolbar, with the comments alone).
 //
 // Nothing in this module touches the DOM at import time.
 
@@ -256,7 +257,8 @@ export class DocumentEditor {
     const view = this.view;
     // A callback of the view can come before the constructor has the view.
     if (this.destroyed || !view || !this.toolbar) return;
-    const display = view.readOnly ? 'none' : '';
+    // Shown while the document can be edited, or at least commented (a protection that allows comments only).
+    const display = view.readOnly && !view.canComment ? 'none' : '';
     if (this.toolbar.element.style.display !== display) this.toolbar.element.style.display = display;
     this.toolbar.update();
   }

@@ -166,6 +166,7 @@ export { EMBEDDED_FONT_FACES, EMBEDDED_FONT_FAMILY, configureEmbeddedFonts, embe
 export { CanvasTextMeasurer, createCanvasMeasurer, docCssFont, type CanvasMeasurerOptions, type FontHint, type MeasureContext } from './render/doc-measure';
 export { DocumentView, documentText, type DocumentViewOptions, type DocumentViewState, type DocumentZoom } from './ui/doc-view';
 export { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
+export type { CommentEdit, CommentOptions, DocComment } from './ops/doc/index';
 export type { SaveCommand } from './ui/save-command';
 export {
   SaveError,
@@ -529,9 +530,11 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
 /** What the protection of a mounted document enforces. */
 export interface MountProtection {
   /**
-   * "readOnly", "comments" or "forms": the document is shown read-only and
-   * nothing turns editing on (comments and form fields cannot be edited
-   * here either). "trackedChanges": the document can be edited, and every
+   * "readOnly" or "forms": the document is shown read-only and nothing
+   * turns editing on (form fields cannot be filled in here either).
+   * "comments": the text is read-only, and comments can be added, edited,
+   * answered, resolved and removed (`view.canComment`); the file is saved
+   * with them. "trackedChanges": the document can be edited, and every
    * change is tracked.
    */
   edit: 'readOnly' | 'comments' | 'forms' | 'trackedChanges';
@@ -881,12 +884,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       if (view.changeCount === changes) view.markSaved();
       return bytes;
     };
-    // A protection that allows no editing: nothing is written back.
-    locked = () => locksSaving(view.protection);
+    // A protection that allows no editing: nothing is written back. One that allows comments is written back with them.
+    locked = () => view.protection !== 'comments' && locksSaving(view.protection);
     notice = (message, kind) => view.showNotice(message, kind);
     focusView = () => view.focus();
     editorRoot = () => editor.element;
-    readOnlyNow = () => view.readOnly;
+    // A view that takes comments (and nothing else) has changes to save, although its text is read-only.
+    readOnlyNow = () => view.readOnly && !view.canComment;
     // What is typed in a document is in the document: nothing waits in a field to be applied.
     watchReadOnly(view, () => false);
     const destroy = tie(editor);

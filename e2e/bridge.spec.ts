@@ -527,6 +527,122 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       expect(again).not.toContain('<w:b/>');
     });
 
+    test('the comments of a docx: listed in loaded, added, answered, resolved and removed by command, on the page and in the saved file', async ({ page }) => {
+      const run = (text: string) => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
+      const body = `<w:p>${run('One ')}<w:commentRangeStart w:id="1"/>${run('two')}<w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r>${run(' three.')}</w:p>${p('Second paragraph.')}`;
+      const comments = '<w:comment w:id="1" w:author="Ann" w:date="2026-10-01T09:00:00Z" w:initials="A"><w:p><w:r><w:annotationRef/></w:r><w:r><w:t>Why two?</w:t></w:r></w:p></w:comment>';
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 'd1', data: base64(await docx(body, { comments })), author: 'Me' });
+      const ann = { id: 1, author: 'Ann', text: 'Why two?', done: false, date: '2026-10-01T09:00:00Z' };
+      expect(await bridge.waitFor('loaded')).toEqual({ type: 'loaded', id: 'd1', format: 'docx', kind: 'document', sheets: [], activeSheet: 0, comments: [ann] });
+      await expect(bridge.editor.locator('#editor .bym-doc-comment-mark')).toHaveCount(1);
+
+      // A comment about a range of the second paragraph.
+      await bridge.send({ type: 'addComment', id: 'a', text: 'About the second', anchor: { path: [1], offset: 0 }, focus: { path: [1], offset: 6 } });
+      const added = await bridge.waitFor('done');
+      expect(added).toEqual({ type: 'done', id: 'a', command: 'addComment', commentId: added.commentId });
+      expect(typeof added.commentId).toBe('number');
+      const told = (await bridge.messages()).filter((message) => message.type === 'comments' || message.type === 'changed');
+      expect(told.map((message) => message.type)).toEqual(['comments', 'changed']);
+      expect(told[0].comments.map((comment: any) => [comment.id, comment.author, comment.text, comment.done, comment.parent])).toEqual([
+        [1, 'Ann', 'Why two?', false, undefined],
+        [added.commentId, 'Me', 'About the second', false, undefined],
+      ]);
+      expect(typeof told[0].comments[1].date).toBe('string');
+      await expect(bridge.editor.locator('#editor .bym-doc-comment-mark')).toHaveCount(2);
+
+      await bridge.send({ type: 'replyComment', id: 'r', commentId: 1, text: 'Because.' });
+      const replied = await bridge.waitFor('done', 2);
+      expect(replied.command).toBe('replyComment');
+      await bridge.send({ type: 'resolveComment', id: 's', commentId: 1 });
+      expect(await bridge.waitFor('done', 3)).toEqual({ type: 'done', id: 's', command: 'resolveComment' });
+      await bridge.send({ type: 'editComment', id: 'e', commentId: added.commentId, text: 'About the word "Second"' });
+      expect(await bridge.waitFor('done', 4)).toEqual({ type: 'done', id: 'e', command: 'editComment' });
+      const list = (await bridge.waitFor('comments', 4)).comments;
+      expect(list.map((comment: any) => [comment.author, comment.text, comment.done, comment.parent])).toEqual([
+        ['Ann', 'Why two?', true, undefined],
+        ['Me', 'Because.', true, 1],
+        ['Me', 'About the word "Second"', false, undefined],
+      ]);
+
+      await bridge.send({ type: 'save', id: 's1' });
+      await bridge.waitFor('saved');
+      const zip = ZipArchive.read(new Uint8Array(Buffer.from(await bridge.savedData(0), 'base64')));
+      const savedComments = new TextDecoder().decode(await zip.read('word/comments.xml'));
+      expect(savedComments).toContain('About the word "Second"');
+      expect(savedComments).toContain('Because.');
+      expect(zip.has('word/commentsExtended.xml')).toBe(true);
+      expect(new TextDecoder().decode(await zip.read('word/commentsExtended.xml'))).toMatch(/w15:paraIdParent="[0-9A-F]{8}" w15:done="1"/);
+
+      // Removing the first comment takes its answer along; a comment that is not there is an error.
+      await bridge.send({ type: 'removeComment', id: 'x', commentId: 1 });
+      expect(await bridge.waitFor('done', 5)).toEqual({ type: 'done', id: 'x', command: 'removeComment' });
+      expect((await bridge.waitFor('comments', 5)).comments.map((comment: any) => comment.text)).toEqual(['About the word "Second"']);
+      await bridge.send({ type: 'removeComment', id: 'y', commentId: 1 });
+      const refused = await bridge.waitFor('error');
+      expect([refused.code, refused.id]).toEqual(['comment-refused', 'y']);
+      await bridge.send({ type: 'undo', id: 'u' });
+      expect((await bridge.waitFor('comments', 6)).comments.length).toBe(3);
+      await expect(bridge.editor.locator('#editor .bym-doc-comment-mark')).toHaveCount(2);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
+    test('a docx protected for comments: typing and the commands of the tracked changes change nothing, a comment is taken, and typing in another docx tells nothing of its comments', async ({ page, isMobile }) => {
+      const run = (text: string) => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
+      const who = ' w:id="40" w:author="Bob" w:date="2026-10-01T09:00:00Z"';
+      const body = `<w:p>${run('One ')}<w:commentRangeStart w:id="1"/>${run('two')}<w:commentRangeEnd w:id="1"/><w:r><w:commentReference w:id="1"/></w:r>${run(' three ')}<w:ins${who}>${run('four')}</w:ins></w:p>${p('Second paragraph.')}`;
+      const comments = '<w:comment w:id="1" w:author="Ann" w:date="2026-10-01T09:00:00Z"><w:p><w:r><w:annotationRef/></w:r><w:r><w:t>Why two?</w:t></w:r></w:p></w:comment>';
+      const locked = await docx(body, { comments, settings: '<w:documentProtection w:edit="comments" w:enforcement="1"/>' });
+      const bridge = await start(page, mode);
+      await bridge.waitFor('ready');
+      await bridge.send({ type: 'load', id: 'd1', data: base64(locked), author: 'Me' });
+      const loaded = await bridge.waitFor('loaded');
+      expect([loaded.readOnly, loaded.protection, loaded.commentsOnly, loaded.revisions, loaded.comments.length]).toEqual([undefined, 'comments', true, 1, 1]);
+      // Keys go nowhere: nothing is said to have changed.
+      const sheet = bridge.editor.locator('#editor .bym-doc-page[data-page="1"]');
+      if (isMobile) await sheet.tap({ position: { x: 6, y: 6 } });
+      else await sheet.click({ position: { x: 6, y: 6 } });
+      await page.keyboard.type('typed');
+      await page.keyboard.press('Delete');
+      await page.keyboard.press('Backspace');
+      // The commands that would change the text are refused, each with the code of a file that cannot be edited.
+      let errors = 0;
+      for (const message of [{ type: 'acceptAllRevisions' }, { type: 'rejectAllRevisions' }, { type: 'setTrackChanges', on: true }]) {
+        await bridge.send({ ...message, id: `e${errors}` });
+        const refused = await bridge.waitFor('error', ++errors);
+        expect([refused.code, refused.id]).toEqual(['read-only', `e${errors - 1}`]);
+      }
+      await bridge.send({ type: 'setReadOnly', id: 'ro', readOnly: false });
+      await bridge.waitFor('done');
+      await bridge.send({ type: 'undo', id: 'u0' });
+      await bridge.waitFor('done', 2);
+      expect((await bridge.messages()).filter((message) => message.type === 'changed' || message.type === 'revisions' || message.type === 'comments')).toEqual([]);
+      await bridge.send({ type: 'save', id: 's1' });
+      await bridge.waitFor('saved');
+      expect(Buffer.from(await bridge.savedData(0), 'base64').equals(Buffer.from(locked))).toBe(true);
+      // A comment is taken, and is the only thing the saved file gains.
+      await bridge.send({ type: 'addComment', id: 'a', text: 'Allowed', anchor: { path: [1], offset: 0 }, focus: { path: [1], offset: 6 } });
+      expect((await bridge.waitFor('done', 3)).command).toBe('addComment');
+      await bridge.send({ type: 'save', id: 's2' });
+      await bridge.waitFor('saved', 2);
+      const zip = ZipArchive.read(new Uint8Array(Buffer.from(await bridge.savedData(1), 'base64')));
+      expect(new TextDecoder().decode(await zip.read('word/comments.xml'))).toContain('Allowed');
+      const saved = new TextDecoder().decode(await zip.read('word/document.xml'));
+      expect(saved).toContain('<w:ins w:id="40"');
+      expect(saved.replace(/<[^>]+>/g, '')).toBe('One two three fourSecond paragraph.');
+      expect(new TextDecoder().decode(await zip.read('word/settings.xml'))).toContain('w:edit="comments"');
+
+      // A docx that can be edited: what is typed is told as changed, and nothing is told of the comments, which are the same.
+      await bridge.send({ type: 'load', id: 'd2', data: base64(await docx(body, { comments })), author: 'Me' });
+      await bridge.waitFor('loaded', 2);
+      const before = (await bridge.messages()).filter((message) => message.type === 'comments').length;
+      await typeIntoDocument(page, bridge.editor, 'abc', isMobile);
+      await bridge.waitFor('changed', 4);
+      expect((await bridge.messages()).filter((message) => message.type === 'comments').length).toBe(before);
+      expectNoOutsideRequests(bridge.requests);
+    });
+
     test('a docx is edited: typing sends changed, undo and redo work, the saved file holds the text', async ({ page, isMobile }) => {
       const bridge = await start(page, mode);
       await bridge.waitFor('ready');

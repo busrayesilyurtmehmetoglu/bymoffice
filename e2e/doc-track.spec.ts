@@ -579,7 +579,8 @@ test.describe('the caret around deleted text', () => {
 });
 
 test.describe('protected documents', () => {
-  for (const edit of ['readOnly', 'comments', 'forms']) {
+  // A protection for comments keeps the text read-only too, and allows comments: see doc-comments.spec.ts.
+  for (const edit of ['readOnly', 'forms']) {
     test(`a document protected for "${edit}" is read-only and stays so; the reason is said once`, async ({ page }) => {
       await mountEdit(page, await sample(p('First paragraph.') + p('Second one.'), protect(edit)));
       expect(await page.evaluate(() => [(window as any).__mounted.protection, (window as any).__view.readOnly, (window as any).__view.protection])).toEqual([{ edit, exceptions: false }, true, edit]);

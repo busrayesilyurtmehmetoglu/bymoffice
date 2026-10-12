@@ -139,10 +139,10 @@
       <section id="doc-section" hidden>
         <h2>Belge görünümü</h2>
         <div class="row" style="margin: 0 0 10px">
-          <label title="İzlenen değişikliklerde (w:ins / w:del) yazar adı olarak yazılır. Belge izleme istiyorsa (ayarı açık ya da 'yalnız izlenen değişiklik' korumalı) düzenlemeler bu adla izlenir.">Yazar adı (izlenen değişiklikler için)
+          <label title="İzlenen değişikliklerde (w:ins / w:del) ve eklenen yorumlarda (w:comment) yazar adı olarak yazılır. Belge izleme istiyorsa (ayarı açık ya da 'yalnız izlenen değişiklik' korumalı) düzenlemeler bu adla izlenir.">Yazar adı (izlenen değişiklikler ve yorumlar için)
             <input type="text" id="doc-author" value="Deneme Kullanıcısı" maxlength="255" />
           </label>
-          <span class="muted">Ad, bir sonraki dosya açılışında geçerli olur. Araç çubuğunun sonundaki değişiklikler grubu izlemeyi açıp kapatır, izlenen değişiklikler arasında gezer, seçileni ya da tümünü kabul eder ya da reddeder.</span>
+          <span class="muted">Ad, bir sonraki dosya açılışında geçerli olur. Araç çubuğunun sonundaki değişiklikler grubu izlemeyi açıp kapatır, izlenen değişiklikler arasında gezer, seçileni ya da tümünü kabul eder ya da reddeder. Yorum düğmeleri (Yorum: Ctrl+Alt+M, Önceki/Sonraki yorum) seçime yorum ekler ve yorumlar arasında gezer; yorumlu metin vurguludur, kenar boşluğundaki işaret yorum balonunu açar (Düzenle, Yanıtla, Çöz, Sil).</span>
         </div>
         <p class="muted" id="doc-note"></p>
         <p class="muted" id="doc-state"></p>
@@ -362,7 +362,8 @@
           const protection = docView.protection;
           const kinds = { readOnly: 'değişikliğe karşı korumalı', comments: 'yalnız yoruma açık', forms: 'yalnız form doldurmaya açık', trackedChanges: 'yalnız izlenen değişikliğe açık' };
           $('doc-state').textContent =
-            (protection ? `Belge koruması: ${kinds[protection]}${docView.readOnly ? ' (salt okunur gösteriliyor)' : ''}. ` : '') +
+            (protection ? `Belge koruması: ${kinds[protection]}${docView.readOnly ? (docView.canComment ? ' (metin kilitli, yorumlar eklenip değiştirilebilir)' : ' (salt okunur gösteriliyor)') : ''}. ` : '') +
+            (docView.commentCount > 0 ? `${docView.commentCount} yorum. ` : '') +
             (!docView.readOnly && docView.trackingChanges
               ? 'Değişiklikler izleniyor: yazılan altı çizili, silinen üstü çizili görünür; biçim, liste, tablo, görsel ve bağlantı değişiklikleri reddedilir.'
               : '');

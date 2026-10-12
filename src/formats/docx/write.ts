@@ -53,6 +53,7 @@
 
 import {
   safeHyperlinkTarget,
+  type AttrList,
   type Block,
   type Body,
   type Comment,
@@ -79,6 +80,18 @@ import { ZipArchive } from '../../zip';
 import { DEFAULT_AUTHOR, largestAnnotationId } from '../../ops/doc/track';
 import { resolveColor, resolveFont } from './resolve';
 import { WORD_NAMESPACES, parseOnOff } from './common';
+import {
+  COMMENTS_EXTENDED_REL,
+  COMMENTS_EXTENDED_TYPE,
+  commentsForWriting,
+  extendedPartText,
+  extensiblePartText,
+  idsPartText,
+  modelLinks,
+  needsExtended,
+  paraIdsInSource,
+  parseSidePart,
+} from './comments';
 import { decodePart } from './source';
 import type { BodyContext } from './write-body';
 import {
@@ -410,19 +423,58 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   const counts = { copied: 0, written: 0 };
   let splitControls = 0;
 
+  const dir = main.slice(0, main.lastIndexOf('/') + 1);
+  /** The part the document relates to by a type that ends so, as the file had it; else a name in the folder of the document that no part of the file has. */
+  const partFor = async (suffix: string, fileName: string): Promise<{ part: string; related: boolean } | undefined> => {
+    const rels = await relsFor(main);
+    const existing = rels.partOf(main, suffix);
+    if (existing) return { part: existing, related: true };
+    let part = dir + fileName;
+    const dot = fileName.lastIndexOf('.');
+    for (let n = 2; n < 1000 && (await originalOf(part)); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
+    return (await originalOf(part)) ? undefined : { part, related: false };
+  };
+
   let stories = 0;
+  /** The comments were written, or are gone again after a write that made them: the parts beside them follow. */
+  let commentsWritten = false;
   for (const entry of storiesOf(doc)) {
-    const story = entry.story;
-    // A part that an earlier write put into the package is written again whatever the flag says: the
-    // model may have been taken back to what was read (undo past the save), and the package has to follow.
-    if (!regenerate && !story.modified && !saved.written.has(story.part)) continue;
-    if (story.rootName === '' || story.part.charAt(0) !== '/') throw new Error(`Cannot write the document: the ${entry.kind} has no part in the package`);
-    const original = await originalOf(story.part);
+    let story = entry.story;
+    let part = story.part;
+    let rootAttrs = story.rootAttrs;
+    /** Set for comments that were made here and have no part yet: the root their part is written with. */
+    let newRoot: { name: string; attrs: AttrList } | undefined;
+    if (entry.kind === 'comments' && story.rootName === '' && story.source === '') {
+      // Comments that were added to a document without any: their part is made, where the document relates to one
+      // that is missing or under a name that is free.
+      const place = await partFor('/comments', 'comments.xml');
+      if (!place) {
+        if (report) report.warnings.push('No free name was found for a new comments.xml; the comments were not written');
+        continue;
+      }
+      part = place.part;
+      rootAttrs = generatedRootAttrs(doc.strict);
+      const ctx = createBodyContext(part, rootAttrs, story.relationships, shared);
+      newRoot = { name: ctx.w + 'comments', attrs: rootAttrs };
+      if (!place.related) (await relsFor(main)).add((await relsFor(main)).freeId(), ns.rel + 'comments', relativeTarget(main, part), false);
+    } else {
+      // A part that an earlier write put into the package is written again whatever the flag says: the
+      // model may have been taken back to what was read (undo past the save), and the package has to follow.
+      if (!regenerate && !story.modified && !saved.written.has(story.part)) continue;
+      if (story.rootName === '' || story.part.charAt(0) !== '/') throw new Error(`Cannot write the document: the ${entry.kind} has no part in the package`);
+    }
+    if (entry.kind === 'comments') {
+      commentsWritten = true;
+      // A comment that is known by a paragraph id says so in its last paragraph.
+      story = commentsForWriting(story as StoryCollection<Comment>, rootAttrs);
+      rootAttrs = newRoot ? rootAttrs : story.rootAttrs;
+    }
+    const original = await originalOf(part);
     stories++;
     const relationships = story.relationships;
     // Relationships made for this write: the model is not changed by writing it.
     const made = new Map<string, DocRelationship>();
-    const ctx = createBodyContext(story.part, story.rootAttrs, relationships, shared);
+    const ctx = createBodyContext(part, rootAttrs, relationships, shared);
     // A picture of a drawing that is written from nothing: the relationship the part has for it, or a new one.
     ctx.image = (ref: ImageRef): string | undefined => {
       const known = relationships.get(ref.rId);
@@ -436,27 +488,76 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
       made.set(id, {
         id,
         type: ns.rel + 'image',
-        target: external ? ref.target : relativeTarget(story.part, ref.target),
+        target: external ? ref.target : relativeTarget(part, ref.target),
         external,
         part: external ? null : ref.target,
       });
       return id;
     };
-    const text = textOf(ctx, entry, { regenerate, counts });
+    const text = textOf(ctx, story === entry.story ? entry : { kind: entry.kind, story }, newRoot ? { regenerate, counts, root: newRoot } : { regenerate, counts });
     if (ctx.splitControls.count) splitControls += ctx.splitControls.count;
     // The bytes of the file when the text is what was read from them (they may differ in a byte order mark or line ends).
-    writes.set(story.part, { data: original && text === story.source ? original : encodePart(text) });
+    writes.set(part, { data: original && text === story.source ? original : encodePart(text), contentType: newRoot ? CONTENT_TYPES.comments : undefined });
     // Relationships the model has and the part lacks.
-    const rels = await relsFor(story.part);
+    const rels = await relsFor(part);
     for (const rel of relationships.values()) {
       if (!rels.has(rel.id)) rels.add(rel.id, rel.type, rel.target, rel.external);
     }
     for (const rel of made.values()) rels.add(rel.id, rel.type, rel.target, rel.external);
   }
 
+  // The parts beside the comments: which comment answers which and which is resolved, and the ids that last.
+  // Each is brought up to date with the comments that were just written, and left alone (so that it goes back
+  // to what the file had) when it says of them what the model says.
+  if (commentsWritten) {
+    const links = modelLinks(doc.comments);
+    const had = paraIdsInSource(doc.comments ? doc.comments.source : '');
+    const mainRels = await relsFor(main);
+    const unreadable = (part: string): void => {
+      if (report) report.warnings.push(`${part} could not be followed; what it says of the comments was not brought up to date`);
+    };
+    const extendedPlace = await partFor('/commentsExtended', 'commentsExtended.xml');
+    if (!extendedPlace) {
+      if (needsExtended(links) && report) report.warnings.push('No free name was found for a new commentsExtended.xml; the answers and the resolved state of the comments were not written');
+    } else {
+      const original = await originalOf(extendedPlace.part);
+      const tree = parseSidePart(original);
+      if (original && !tree) unreadable(extendedPlace.part);
+      else {
+        const text = extendedPartText(tree, links, had);
+        if (text !== undefined) {
+          writes.set(extendedPlace.part, { data: encodePart(text), contentType: COMMENTS_EXTENDED_TYPE });
+          if (!extendedPlace.related) mainRels.add(mainRels.freeId(), COMMENTS_EXTENDED_REL, relativeTarget(main, extendedPlace.part), false);
+        }
+      }
+    }
+    // These two are never made: a file without them is one of a Word that does not look for them.
+    const idsPart = mainRels.partOf(main, '/commentsIds');
+    const idsOriginal = idsPart ? await originalOf(idsPart) : undefined;
+    if (idsPart && idsOriginal) {
+      const tree = parseSidePart(idsOriginal);
+      if (!tree) unreadable(idsPart);
+      else {
+        const result = idsPartText(tree, links, had);
+        if (result) {
+          writes.set(idsPart, { data: encodePart(result.text) });
+          const extensiblePart = mainRels.partOf(main, '/commentsExtensible');
+          const extensibleOriginal = extensiblePart ? await originalOf(extensiblePart) : undefined;
+          if (extensiblePart && extensibleOriginal) {
+            const extensible = parseSidePart(extensibleOriginal);
+            if (!extensible) unreadable(extensiblePart);
+            else {
+              const text = extensiblePartText(extensible, result.removed);
+              if (text !== undefined) writes.set(extensiblePart, { data: encodePart(text) });
+            }
+          }
+        }
+      }
+    }
+  }
+
   // The one setting an edit changes: whether changes are tracked. The settings part is written when the model
   // says otherwise than the file does, and then nothing in it changes but <w:trackRevisions>.
-  const dir = main.slice(0, main.lastIndexOf('/') + 1);
   let tracking: { part: string; data: Uint8Array; contentType?: string; relate: boolean } | undefined;
   {
     const wanted = doc.settings.trackRevisions === true;
@@ -754,7 +855,7 @@ function attr(counts: { dropped: { count: number } }, value: string): string {
 }
 
 /** Relationship types of the parts a new package writes from the model; relationships to them are not carried over. */
-const REBUILT = ['/styles', '/numbering', '/settings', '/fontTable', '/theme', '/header', '/footer', '/footnotes', '/endnotes', '/comments', '/webSettings'];
+const REBUILT = ['/styles', '/numbering', '/settings', '/fontTable', '/theme', '/header', '/footer', '/footnotes', '/endnotes', '/comments', '/commentsExtended', '/webSettings'];
 
 const SEPARATOR_PROPS = Object.freeze({ spacing: Object.freeze({ after: 0, line: 240, lineRule: 'auto' as const }) });
 
@@ -973,7 +1074,9 @@ export async function buildDocx(model: DocModel, options: BuildDocxOptions = {})
 
   const footnotes = withSeparators(doc.footnotes);
   const endnotes = withSeparators(doc.endnotes);
-  const entries = storiesOf(footnotes === doc.footnotes && endnotes === doc.endnotes ? doc : { ...doc, footnotes, endnotes });
+  // A comment that is known by a paragraph id (it is answered, or resolved) says so in its last paragraph.
+  const comments = doc.comments ? commentsForWriting(doc.comments, doc.comments.rootName === '' ? rootAttrs : doc.comments.rootAttrs) : undefined;
+  const entries = storiesOf(footnotes === doc.footnotes && endnotes === doc.endnotes && comments === doc.comments ? doc : { ...doc, footnotes, endnotes, comments });
 
   // The pictures there are: those of the model, and those the source of a packaged model gives.
   const available = new Map<string, DocMedia>(doc.media || []);
@@ -1120,6 +1223,17 @@ export async function buildDocx(model: DocModel, options: BuildDocxOptions = {})
     const kind = entry.kind === 'body' ? 'document' : entry.kind;
     overrides.push([part, CONTENT_TYPES[kind]]);
     if (entry.kind !== 'body' && entry.kind !== 'header' && entry.kind !== 'footer') bodyRels.add(ns.rel + entry.kind, relativeTarget('/word/document.xml', part), false);
+  }
+
+  // Which comment answers which, and which is resolved: a part of its own, when any comment is either.
+  const links = modelLinks(comments);
+  if (needsExtended(links)) {
+    const text = extendedPartText(undefined, links, new Set());
+    if (text !== undefined) {
+      storyParts.push(['word/commentsExtended.xml', encodePart(text)]);
+      overrides.push(['/word/commentsExtended.xml', COMMENTS_EXTENDED_TYPE]);
+      bodyRels.add(COMMENTS_EXTENDED_REL, 'commentsExtended.xml', false);
+    }
   }
 
   // The supporting parts, all written from the model.
