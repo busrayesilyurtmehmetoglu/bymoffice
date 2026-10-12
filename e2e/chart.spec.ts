@@ -422,8 +422,10 @@ test.describe('charts of a workbook', () => {
     expect(up.runs.length, 'two days rose').toBe(2);
     expect(down.runs.length, 'one fell').toBe(1);
     // 10 to 50, 50 to 30 and 30 to 80 of a scale of 100: boxes of 40, 20 and 50 parts.
-    expectRatio(up.runs[0].height, down.runs[0].height, 2);
-    expectRatio(up.runs[1].height, down.runs[0].height, 2.5);
+    // The outline of a box takes the same few pixels of every box, however many a device has to a pixel: what is
+    // compared is how much one box is higher than another, 20 parts and 10 parts.
+    expect(up.runs[0].height, 'the box of 40 parts is higher than the one of 20').toBeGreaterThan(down.runs[0].height);
+    expectRatio(up.runs[0].height - down.runs[0].height, up.runs[1].height - up.runs[0].height, 2);
   });
 
   test('a logarithmic value axis: equal factors are equal steps', async ({ page }) => {
