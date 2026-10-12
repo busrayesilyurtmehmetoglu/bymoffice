@@ -87,6 +87,13 @@ export function parseErrorCode(text: string): ErrorCode | undefined {
 // percent sign), then what the cell editor would read as a number: thousands separators,
 // currency, dates and times (en-US conventions). Everything is scanned by hand and only
 // short text is ever looked at closely, so no text can make this slow.
+//
+// Text that is a number or a date the way files write them has that value in every locale:
+// the engine itself writes numbers with a point ("&", CONCAT, TEXT), and what it writes it
+// must read back. Only text that is neither is then read the way the locale of the context
+// writes numbers, where that is with another decimal sign ("7,5" and "1.234,5" in Turkish).
+// That second reading knows the decimal sign and the thousands separator, no dates or times.
+// UNSURE: a Turkish Excel reads "1.234" as 1234 and "7.5" as a date; here both stay what a file means.
 
 function isSpaceCode(c: number): boolean {
   if (c === 32 || (c >= 9 && c <= 13) || c === 160) return true;
@@ -155,17 +162,16 @@ function inputOptions(context: CalcContext | undefined): { date1904: boolean; to
   return { date1904: context.date1904 === true, today: new Date(Date.UTC(year, 6, 1, 12)) };
 }
 
+function isDateFormatId(id: number | undefined): boolean {
+  return id !== undefined && ((id >= DATE_FORMAT_MIN && id <= DATE_FORMAT_MAX) || id === FORMAT_ELAPSED || id === FORMAT_SUBSECONDS);
+}
+
 /** Text as a date or a time: its serial number; undefined when it is neither. */
 export function parseDateText(text: string, context?: CalcContext): number | undefined {
   if (text.length > MAX_NUMBER_TEXT) return undefined;
   const parsed = parseCellInput(text, inputOptions(context));
   if (parsed.kind !== 'number' || typeof parsed.value !== 'number') return undefined;
-  const id = parsed.numFmtId;
-  if (id === undefined) return undefined;
-  if ((id >= DATE_FORMAT_MIN && id <= DATE_FORMAT_MAX) || id === FORMAT_ELAPSED || id === FORMAT_SUBSECONDS) {
-    return parsed.value;
-  }
-  return undefined;
+  return isDateFormatId(parsed.numFmtId) ? parsed.value : undefined;
 }
 
 /**
@@ -203,12 +209,121 @@ function fractionText(text: string): number | undefined {
   return isFinite(value) ? (negative ? -value : value) : undefined;
 }
 
+/** The decimal sign and the thousands separator of a locale that writes numbers another way than files do. */
+export interface NumberSeparators {
+  readonly decimal: string;
+  /** Empty when the locale has none that can be told from the decimal sign. */
+  readonly group: string;
+}
+
+function isDigitCode(c: number): boolean {
+  return c >= 48 && c <= 57;
+}
+
+/** Whether a character can separate digits: one character that is no part of a number written the plain way. */
+function isSeparator(text: unknown): text is string {
+  if (typeof text !== 'string' || text.length !== 1) return false;
+  const c = text.charCodeAt(0);
+  // Digits, signs, the percent sign and the "E" of an exponent mean something else.
+  return !((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 37 || c === 69 || c === 101);
+}
+
+const separatorsOf = new WeakMap<FormatLocale, NumberSeparators | null>();
+
 /**
- * Text as a number the way Excel reads it wherever a number is needed: plain numbers,
- * percentages, thousands separators, currency, fractions, dates and times (en-US conventions).
- * The context gives the date system and the year of dates written without one.
+ * The separators of the locale of a context, when text that is no number the way files write
+ * one is to be read with them: the locale writes its decimal sign as something other than a point. Undefined
+ * without a locale and for a locale that writes numbers the way files do (English).
  */
-export function parseNumberText(text: string, context?: CalcContext): number | undefined {
+export function numberSeparators(context: CalcContext | undefined): NumberSeparators | undefined {
+  const locale = context === undefined ? undefined : context.locale;
+  if (locale === undefined || locale === null || typeof locale !== 'object') return undefined;
+  let found = separatorsOf.get(locale);
+  if (found === undefined) {
+    found = null;
+    if (isSeparator(locale.decimal) && locale.decimal !== '.') {
+      found = { decimal: locale.decimal, group: isSeparator(locale.group) && locale.group !== locale.decimal ? locale.group : '' };
+    }
+    separatorsOf.set(locale, found);
+  }
+  return found === null ? undefined : found;
+}
+
+/**
+ * Text holding a number written with the separators of a locale, rewritten the way files
+ * write it: "1.234,5" becomes "1234.5", "(12,5%)" becomes "(12.5%)". Everything around the
+ * digits stays. Undefined when the text holds neither separator, or when one stands where
+ * the locale would not put it: thousands separators need one to three digits before them
+ * and three after each, none follows the decimal sign, and digits follow a decimal sign.
+ */
+export function fromLocalNumber(text: string, separators: NumberSeparators): string | undefined {
+  const decimal = separators.decimal;
+  const group = separators.group;
+  const n = text.length;
+  let out = '';
+  let i = 0;
+  let copied = 0;
+  let found = false;
+  while (i < n) {
+    if (!isDigitCode(text.charCodeAt(i))) {
+      const ch = text.charAt(i);
+      // A thousands separator opens no number; a decimal sign may (",5").
+      if (group !== '' && ch === group) return undefined;
+      if (ch !== decimal) {
+        i++;
+        continue;
+      }
+    }
+    // A number starts here: groups of digits, then a decimal part.
+    let grouped = false;
+    for (;;) {
+      const start = i;
+      while (i < n && isDigitCode(text.charCodeAt(i))) i++;
+      const run = i - start;
+      // The first group has one to three digits, every later one exactly three.
+      if (grouped && run !== 3) return undefined;
+      if (i >= n || group === '' || text.charAt(i) !== group) break;
+      if (!grouped && (run < 1 || run > 3)) return undefined;
+      out += text.substring(copied, i);
+      copied = i + 1;
+      grouped = true;
+      found = true;
+      i++;
+    }
+    if (i < n && text.charAt(i) === decimal) {
+      out += text.substring(copied, i) + '.';
+      found = true;
+      i++;
+      copied = i;
+      const start = i;
+      while (i < n && isDigitCode(text.charCodeAt(i))) i++;
+      // A decimal sign with nothing after it ("5,") is not how a number is written.
+      if (i === start) return undefined;
+      // Neither separator follows a decimal part.
+      if (i < n && (text.charAt(i) === decimal || (group !== '' && text.charAt(i) === group))) return undefined;
+    }
+  }
+  return found ? out + text.substring(copied) : undefined;
+}
+
+/**
+ * A plain number as text, as textToNumber() reads one; text that is none, and that is no
+ * number or date of another kind the way files write them ("1,234", "3/4/2024"), is then
+ * read with the separators of a locale, when there are any ("7,5", "1.234,5").
+ */
+export function plainNumberText(text: string, separators: NumberSeparators | undefined): number | undefined {
+  const number = textToNumber(text);
+  if (number !== undefined || separators === undefined) return number;
+  if (text.length > MAX_NUMBER_TEXT) return undefined;
+  const local = fromLocalNumber(text, separators);
+  if (local === undefined) return undefined;
+  const read = textToNumber(local);
+  // What files write keeps its meaning: "1,234" is 1234 with a thousands separator, no plain number.
+  return read === undefined || parseFileNumberText(text, undefined) !== undefined ? undefined : read;
+}
+
+/** parseNumberText() for text written the way files write numbers. */
+function parseFileNumberText(text: string, context: CalcContext | undefined): number | undefined {
   const plain = textToNumber(text);
   if (plain !== undefined) return plain;
   if (text.length > MAX_NUMBER_TEXT || text.length === 0) return undefined;
@@ -219,6 +334,38 @@ export function parseNumberText(text: string, context?: CalcContext): number | u
   if (fraction !== undefined) return fraction;
   const parsed = parseCellInput(text, inputOptions(context));
   return parsed.kind === 'number' && typeof parsed.value === 'number' && isFinite(parsed.value) ? parsed.value : undefined;
+}
+
+/**
+ * Text that is no number and no date the way files write them, read the way a locale writes
+ * numbers: plain numbers, percentages, thousands separators, currency. Never a date or a time.
+ */
+function parseLocalNumberText(text: string, separators: NumberSeparators): number | undefined {
+  if (text.length > MAX_NUMBER_TEXT || text.length === 0) return undefined;
+  const c = text.charCodeAt(0);
+  if (c === 61 || c === 39) return undefined;
+  const local = fromLocalNumber(text, separators);
+  if (local === undefined) return undefined;
+  const plain = textToNumber(local);
+  if (plain !== undefined) return plain;
+  const parsed = parseCellInput(local, { date1904: false });
+  if (parsed.kind !== 'number' || typeof parsed.value !== 'number' || !isFinite(parsed.value)) return undefined;
+  return isDateFormatId(parsed.numFmtId) ? undefined : parsed.value;
+}
+
+/**
+ * Text as a number the way Excel reads it wherever a number is needed: plain numbers,
+ * percentages, thousands separators, currency, fractions, dates and times (en-US conventions).
+ * The context gives the date system, the year of dates written without one, and the locale:
+ * text that is no number the way files write one is read with the decimal sign and the
+ * thousands separator of the locale, where they differ ("7,5", "1.234,5"). What is a number
+ * or a date the way files write it has the same value in every locale.
+ */
+export function parseNumberText(text: string, context?: CalcContext): number | undefined {
+  const number = parseFileNumberText(text, context);
+  if (number !== undefined) return number;
+  const separators = numberSeparators(context);
+  return separators === undefined ? undefined : parseLocalNumberText(text, separators);
 }
 
 /**
@@ -405,8 +552,11 @@ export interface CalcContext {
   random(): number;
   /**
    * The locale of whoever looks at the workbook, when there is one: UPPER, LOWER and PROPER
-   * follow its letters (in Turkish "i" is the small "İ" and "ı" the small "I"). Without it
-   * letters change case the way they do in English.
+   * follow its letters (in Turkish "i" is the small "İ" and "ı" the small "I"), and text
+   * that is no number the way files write one is read with its decimal sign ("7,5" in
+   * criteria, VALUE, text met by an operator). Without it letters change case the way they
+   * do in English and only the point is a decimal sign. What functions write (TEXT, FIXED,
+   * "&") does not depend on it.
    */
   readonly locale?: FormatLocale;
   /** The formula text of a cell without the leading "=", or undefined when the cell holds no formula. */

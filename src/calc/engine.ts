@@ -63,9 +63,11 @@ export interface CalcEngineOptions {
   /** A random number in [0, 1). */
   random?: () => number;
   /**
-   * The locale functions that change the case of letters follow (UPPER, LOWER, PROPER); asked
-   * every time one is calculated, so a view can answer with the locale it shows at that
-   * moment. English when omitted. A formula is not calculated again because the answer changed.
+   * The locale functions follow: the case of letters (UPPER, LOWER, PROPER), and the decimal
+   * sign text is read with when it is no number the way files write one (criteria, VALUE,
+   * NUMBERVALUE, text met by an operator). Asked every time a
+   * formula is calculated, so a view can answer with the locale it shows at that moment.
+   * English when omitted. A formula is not calculated again because the answer changed.
    */
   locale?: () => FormatLocale | undefined;
   /** Reserved for iterative calculation, which is not supported: circular references always give 0. */

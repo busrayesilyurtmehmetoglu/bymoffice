@@ -12,6 +12,7 @@ import {
   ERROR_NA,
   ERROR_VALUE,
   isError,
+  numberSeparators,
   textToNumber,
   toBoolean,
   toText,
@@ -467,30 +468,14 @@ const unicode = textFunction((subject) => {
   return point === undefined ? ERROR_VALUE : point;
 });
 
-const numberValue = mapScalars((args) => {
-  const source = toText(args[0]);
-  if (typeof source !== 'string') return source;
-  let decimal = '.';
-  let group = ',';
-  if (args.length > 1 && args[1] !== null) {
-    const given = toText(args[1]);
-    if (typeof given !== 'string') return given;
-    if (given === '') return ERROR_VALUE;
-    decimal = given.charAt(0);
-  }
-  if (args.length > 2 && args[2] !== null) {
-    const given = toText(args[2]);
-    if (typeof given !== 'string') return given;
-    if (given === '') return ERROR_VALUE;
-    group = given.charAt(0);
-  }
-  if (decimal === group || source.length > 1024) return ERROR_VALUE;
+/** NUMBERVALUE with both separators known: every thousands separator before the decimal sign is dropped, wherever it stands. */
+function readNumberValue(source: string, decimal: string, group: string): number | CalcError {
   let body = '';
   let percents = 0;
   let seenDecimal = false;
   for (let i = 0; i < source.length; i++) {
     const c = source.charAt(i);
-    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === ' ') continue;
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\u00a0') continue;
     if (c === '%') {
       percents++;
       continue;
@@ -511,6 +496,36 @@ const numberValue = mapScalars((args) => {
   let result = Number(body);
   for (let i = 0; i < percents && result !== 0; i++) result /= 100;
   return isFinite(result) ? result : ERROR_VALUE;
+}
+
+const numberValue = mapScalars((args, context) => {
+  const source = toText(args[0]);
+  if (typeof source !== 'string') return source;
+  let decimal = '.';
+  let group = ',';
+  let given = false;
+  if (args.length > 1 && args[1] !== null) {
+    const text = toText(args[1]);
+    if (typeof text !== 'string') return text;
+    if (text === '') return ERROR_VALUE;
+    decimal = text.charAt(0);
+    given = true;
+  }
+  if (args.length > 2 && args[2] !== null) {
+    const text = toText(args[2]);
+    if (typeof text !== 'string') return text;
+    if (text === '') return ERROR_VALUE;
+    group = text.charAt(0);
+    given = true;
+  }
+  if (decimal === group || source.length > 1024) return ERROR_VALUE;
+  const number = readNumberValue(source, decimal, group);
+  if (given || !isError(number)) return number;
+  // No separator was given and the text is no number the way files write one: as everywhere
+  // text is read as a number, the separators of the locale are tried second ("1.234,5"),
+  // when its decimal sign is there. Points alone ("1.234.5") stay the error they were.
+  const local = numberSeparators(context);
+  return local === undefined || source.indexOf(local.decimal) < 0 ? number : readNumberValue(source, local.decimal, local.group);
 });
 
 /** Where the n-th delimiter is: its start and end, or undefined. Negative n counts from the end. */

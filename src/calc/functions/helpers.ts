@@ -18,9 +18,11 @@ import {
   isArray,
   isError,
   isRef,
+  numberSeparators,
   parseDateText,
   parseErrorCode,
   parseNumberText,
+  plainNumberText,
   textToNumber,
   toNumber,
   type ArgSelector,
@@ -446,7 +448,11 @@ export interface RangeIndex {
   numbers: Map<number, Positions>;
   /** By folded text. */
   texts: Map<string, Positions>;
-  /** Text cells that read as a plain number, by that number: a criterion "equals 5" also takes "5". */
+  /**
+   * Text cells that read as a plain number, by that number: a criterion "equals 5" also takes
+   * "5". Text that is none the way files write one is read with the separators of the
+   * locale, as the criterion itself is.
+   */
   numericTexts: Map<number, Positions>;
   yes: number[];
   no: number[];
@@ -469,6 +475,7 @@ function buildIndex(ref: RefValue, context: CalcContext): RangeIndex {
   const index: RangeIndex = { numbers: new Map(), texts: new Map(), numericTexts: new Map(), yes: [], no: [], longText: false };
   const range = ref.range;
   const cols = range.right - range.left + 1;
+  const separators = numberSeparators(context);
   let previous = -1;
   let ordered = true;
   context.forEachCell(ref.sheet, range, (value, row, col) => {
@@ -480,7 +487,7 @@ function buildIndex(ref: RefValue, context: CalcContext): RangeIndex {
       if (value.length > MAX_INDEXED_TEXT) index.longText = true;
       else {
         addPosition(index.texts, foldCase(value), position);
-        const number = textToNumber(value);
+        const number = plainNumberText(value, separators);
         if (number !== undefined) addPosition(index.numericTexts, number, position);
       }
     } else if (value === true) index.yes.push(position);
@@ -511,7 +518,10 @@ export function rangeIndex(ref: RefValue, context: CalcContext): RangeIndex | un
   const key = ref.sheet + ':' + range.top + ':' + range.left + ':' + range.bottom + ':' + range.right;
   const uses = context.memo('uses:' + key, () => ({ count: 0 }));
   if (++uses.count < INDEX_AFTER_USES) return undefined;
-  return context.memo('index:' + key, () => buildIndex(ref, context));
+  // Which text cells read as numbers depends on the separators of the locale.
+  const separators = numberSeparators(context);
+  const written = separators === undefined ? '' : ':' + separators.decimal + separators.group;
+  return context.memo('index:' + key + written, () => buildIndex(ref, context));
 }
 
 /** Positions of the cells a lookup for `key` matches: the same kind of value, text without regard to case. Undefined when the index cannot tell. */
@@ -688,6 +698,8 @@ function criterion(test: (value: Scalar) => boolean, exact?: ExactKey): Criterio
  * Compiles a criterion: `">5"`, `"<=10"`, `"<>x"`, `"=text"`, a plain value to
  * equal, wildcards in text. Text is compared without regard to case; a number
  * equals numeric text; "<", ">" compare only values of the operand's own kind.
+ * A number in the text is read by parseNumberText(): ">7.5" asks for more than 7.5 in
+ * every locale, and so does ">7,5" where the locale of the context writes a decimal comma.
  */
 export function compileCriterion(source: Scalar, context: CalcContext): Criterion {
   let op = '=';
@@ -728,9 +740,9 @@ export function compileCriterion(source: Scalar, context: CalcContext): Criterio
   let exact: ExactKey | undefined;
   if (typeof operand === 'number') {
     const target = operand;
+    const read = textNumbers(context);
     exact = target;
-    equals = (value) =>
-      typeof value === 'number' ? value === target : typeof value === 'string' && textToNumber(value) === target;
+    equals = (value) => (typeof value === 'number' ? value === target : typeof value === 'string' && read(value) === target);
     ordered = (value) => typeof value === 'number' && relation(op, value < target ? -1 : value > target ? 1 : 0);
   } else if (typeof operand === 'boolean') {
     const target = operand;
@@ -759,6 +771,36 @@ export function compileCriterion(source: Scalar, context: CalcContext): Criterio
   if (op === '<>') return criterion((value) => !equals(value));
   return criterion(ordered === undefined ? () => false : ordered);
 }
+
+/** Texts whose reading with the separators of a locale is kept during one recalculation. */
+const MAX_KEPT_TEXTS = 100000;
+
+/**
+ * How a criterion that asks for a number reads the text cells it meets: as a plain number,
+ * and where the locale writes a decimal comma also as the locale writes one. A scan meets
+ * the same texts again and again (every formula of a column asks the same range), so the
+ * second reading is kept for the rest of the recalculation.
+ */
+function textNumbers(context: CalcContext): (text: string) => number | undefined {
+  const separators = numberSeparators(context);
+  if (separators === undefined) return textToNumber;
+  if (context.memo === undefined) return (text) => plainNumberText(text, separators);
+  const kept = context.memo('texts:' + separators.decimal + separators.group, () => new Map<string, number | null>());
+  return (text) => {
+    const plain = textToNumber(text);
+    if (plain !== undefined) return plain;
+    // Longer text is no number however it is read.
+    if (text.length > MAX_KEPT_TEXT_LENGTH) return undefined;
+    const held = kept.get(text);
+    if (held !== undefined) return held === null ? undefined : held;
+    const number = plainNumberText(text, separators);
+    if (kept.size < MAX_KEPT_TEXTS) kept.set(text, number === undefined ? null : number);
+    return number;
+  };
+}
+
+/** Longest text plainNumberText() looks at closely. */
+const MAX_KEPT_TEXT_LENGTH = 64;
 
 export interface Condition {
   grid: Grid;

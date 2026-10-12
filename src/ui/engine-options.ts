@@ -9,7 +9,8 @@ export const CALC_SLICE_MS = 250;
 
 /**
  * Options of the engine of a view: the time one slice may take, and the locale of the view
- * as it is whenever a formula is calculated (UPPER, LOWER and PROPER follow it).
+ * as it is whenever a formula is calculated (UPPER, LOWER and PROPER follow it, and text that
+ * is no number the way files write one is read with its decimal sign).
  */
 export function viewEngineOptions(locale: () => FormatLocale): CalcEngineOptions {
   return { budget: { milliseconds: CALC_SLICE_MS }, locale };
