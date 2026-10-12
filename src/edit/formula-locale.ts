@@ -33,7 +33,11 @@ const ERRORS = ['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/
  * ÇOKEĞERORTALAMA, METNEÇEVİR, SAYIYAÇEVİR, YERİNEKOY, DEĞİŞTİR, MBUL, EHATALIYSA,
  * EBOŞSA, ESAYIYSA, EMETİNSE, EĞERYOKSA, HAFTANINGÜNÜ, SERİAY, SERİTARİH, İŞGÜNÜ,
  * TAMİŞGÜNÜ, NSAT, TAVANAYUVARLA, TABANAYUVARLA, S_SAYI_ÜRET, RASTGELEARADA, ALTTOPLAM,
- * SATIRSAY, SÜTUNSAY, KAYDIR, DOLAYLI, ÖZDEŞ, YİNELE, DAMGA.
+ * SATIRSAY, SÜTUNSAY, KAYDIR, DOLAYLI, ÖZDEŞ, YİNELE, DAMGA, and every name after
+ * TAMİŞGÜNÜ in the list (the mathematical, statistical, text, date, lookup, information,
+ * financial and database names added with the rest of the library).
+ *
+ * A function that has no line here is typed by its English name, in Turkish too.
  */
 const TURKISH_FUNCTIONS: [string, string][] = [
   ['TOPLA', 'SUM'],
@@ -123,6 +127,156 @@ const TURKISH_FUNCTIONS: [string, string][] = [
   ['SERİTARİH', 'EDATE'],
   ['İŞGÜNÜ', 'WORKDAY'],
   ['TAMİŞGÜNÜ', 'NETWORKDAYS'],
+  // Names that are the English ones but for a dotted İ: the engine knows no "SİN".
+  ['SİN', 'SIN'],
+  ['ASİN', 'ASIN'],
+  ['SİNH', 'SINH'],
+  ['ASİNH', 'ASINH'],
+  ['Pİ', 'PI'],
+  ['NOMİNAL', 'NOMINAL'],
+  // The rest of the library, family by family. A function whose Turkish name is the English
+  // one letter for letter (COS, LN, LOG, VAR, RANK, PEARSON, ATAN2 ...) needs no line.
+  ['ÜS', 'EXP'],
+  ['İŞARET', 'SIGN'],
+  ['ÇARPINIM', 'FACT'],
+  ['ÇİFTFAKTÖR', 'FACTDOUBLE'],
+  ['KOMBİNASYON', 'COMBIN'],
+  ['PERMÜTASYON', 'PERMUT'],
+  ['OBEB', 'GCD'],
+  ['OKEK', 'LCM'],
+  ['KYUVARLA', 'MROUND'],
+  ['BÖLÜM', 'QUOTIENT'],
+  ['ÇİFT', 'EVEN'],
+  ['TEK', 'ODD'],
+  ['DERECE', 'DEGREES'],
+  ['RADYAN', 'RADIANS'],
+  ['TOPKARE', 'SUMSQ'],
+  ['KAREKÖKPİ', 'SQRTPI'],
+  ['ROMEN', 'ROMAN'],
+  ['TAVANAYUVARLA.MATEMATİK', 'CEILING.MATH'],
+  ['TABANAYUVARLA.MATEMATİK', 'FLOOR.MATH'],
+  ['TAVANAYUVARLA.DUYARLI', 'CEILING.PRECISE'],
+  ['TABANAYUVARLA.DUYARLI', 'FLOOR.PRECISE'],
+  ['ISO.TAVAN', 'ISO.CEILING'],
+  ['TOPLAMA', 'AGGREGATE'],
+  ['DÇARP', 'MMULT'],
+  ['TOPX2EY2', 'SUMX2MY2'],
+  ['TOPX2AY2', 'SUMX2PY2'],
+  ['TOPXEY2', 'SUMXMY2'],
+  ['ORTALAMAA', 'AVERAGEA'],
+  ['MAKA', 'MAXA'],
+  ['MİNA', 'MINA'],
+  ['ÇOKEĞERMAK', 'MAXIFS'],
+  ['ÇOKEĞERMİN', 'MINIFS'],
+  ['ENÇOK_OLAN', 'MODE'],
+  ['ENÇOK_OLAN.TEK', 'MODE.SNGL'],
+  ['STDSAPMA', 'STDEV'],
+  ['STDSAPMA.S', 'STDEV.S'],
+  ['STDSAPMA.P', 'STDEV.P'],
+  ['STDSAPMAS', 'STDEVP'],
+  ['STDSAPMAA', 'STDEVA'],
+  ['STDSAPMASA', 'STDEVPA'],
+  ['VARS', 'VARP'],
+  ['VARSA', 'VARPA'],
+  ['RANK.EŞİT', 'RANK.EQ'],
+  ['RANK.ORT', 'RANK.AVG'],
+  ['YÜZDEBİRLİK', 'PERCENTILE'],
+  ['YÜZDEBİRLİK.DHL', 'PERCENTILE.INC'],
+  ['YÜZDEBİRLİK.HRC', 'PERCENTILE.EXC'],
+  ['DÖRTTEBİRLİK', 'QUARTILE'],
+  ['DÖRTTEBİRLİK.DHL', 'QUARTILE.INC'],
+  ['DÖRTTEBİRLİK.HRC', 'QUARTILE.EXC'],
+  ['KORELASYON', 'CORREL'],
+  ['EĞİM', 'SLOPE'],
+  ['KESMENOKTASI', 'INTERCEPT'],
+  ['TAHMİN', 'FORECAST'],
+  ['TAHMİN.DOĞRUSAL', 'FORECAST.LINEAR'],
+  ['GEOORT', 'GEOMEAN'],
+  ['HARORT', 'HARMEAN'],
+  ['KIRPORTALAMA', 'TRIMMEAN'],
+  ['SIKLIK', 'FREQUENCY'],
+  ['ORTSAP', 'AVEDEV'],
+  ['SAPKARE', 'DEVSQ'],
+  ['RKARE', 'RSQ'],
+  ['KOVARYANS', 'COVAR'],
+  ['KOVARYANS.P', 'COVARIANCE.P'],
+  ['KOVARYANS.S', 'COVARIANCE.S'],
+  ['NORM.DAĞ', 'NORM.DIST'],
+  ['NORMDAĞ', 'NORMDIST'],
+  ['NORM.TERS', 'NORM.INV'],
+  ['NORMTERS', 'NORMINV'],
+  ['NORM.S.DAĞ', 'NORM.S.DIST'],
+  ['NORMSDAĞ', 'NORMSDIST'],
+  ['NORM.S.TERS', 'NORM.S.INV'],
+  ['NORMSTERS', 'NORMSINV'],
+  ['YAZIM.DÜZENİ', 'PROPER'],
+  ['TEMİZ', 'CLEAN'],
+  ['KOD', 'CODE'],
+  ['SAYIDÜZENLE', 'FIXED'],
+  ['LİRA', 'DOLLAR'],
+  ['SAYIDEĞERİ', 'NUMBERVALUE'],
+  ['ARALIKBİRLEŞTİR', 'CONCAT'],
+  ['METİNBİRLEŞTİR', 'TEXTJOIN'],
+  ['M', 'T'],
+  ['S', 'N'],
+  ['TARİHSAYISI', 'DATEVALUE'],
+  ['ZAMANSAYISI', 'TIMEVALUE'],
+  ['GÜNSAY', 'DAYS'],
+  ['GÜN360', 'DAYS360'],
+  ['HAFTASAY', 'WEEKNUM'],
+  ['ISOHAFTASAY', 'ISOWEEKNUM'],
+  ['YILORAN', 'YEARFRAC'],
+  ['ETARİHLİ', 'DATEDIF'],
+  ['TAMİŞGÜNÜ.ULUSL', 'NETWORKDAYS.INTL'],
+  ['İŞGÜNÜ.ULUSL', 'WORKDAY.INTL'],
+  ['ELEMAN', 'CHOOSE'],
+  ['ADRES', 'ADDRESS'],
+  ['ALANSAY', 'AREAS'],
+  ['DEVRİK_DÖNÜŞÜM', 'TRANSPOSE'],
+  ['ÇAPRAZARA', 'XLOOKUP'],
+  ['ÇAPRAZEŞLEŞTİR', 'XMATCH'],
+  ['KÖPRÜ', 'HYPERLINK'],
+  ['FORMÜLMETNİ', 'FORMULATEXT'],
+  ['ÇOKEĞER', 'IFS'],
+  ['İLKEŞLEŞEN', 'SWITCH'],
+  ['ÖZELVEYA', 'XOR'],
+  ['YOKSAY', 'NA'],
+  ['EHATA', 'ISERR'],
+  ['EYOKSA', 'ISNA'],
+  ['EMETİNDEĞİLSE', 'ISNONTEXT'],
+  ['EMANTIKSALSA', 'ISLOGICAL'],
+  ['ÇİFTMİ', 'ISEVEN'],
+  ['TEKMİ', 'ISODD'],
+  ['EREFSE', 'ISREF'],
+  ['EFORMÜLSE', 'ISFORMULA'],
+  ['HATA.TİPİ', 'ERROR.TYPE'],
+  ['TİP', 'TYPE'],
+  ['SAYFA', 'SHEET'],
+  ['SAYFALAR', 'SHEETS'],
+  ['HÜCRE', 'CELL'],
+  ['DEVRESEL_ÖDEME', 'PMT'],
+  ['BD', 'PV'],
+  ['GD', 'FV'],
+  ['TAKSİT_SAYISI', 'NPER'],
+  ['FAİZ_ORANI', 'RATE'],
+  ['NBD', 'NPV'],
+  ['İÇ_VERİM_ORANI', 'IRR'],
+  ['ANBD', 'XNPV'],
+  ['AİÇVERİMORANI', 'XIRR'],
+  ['FAİZTUTARI', 'IPMT'],
+  ['ANA_PARA_ÖDEMESİ', 'PPMT'],
+  ['DA', 'SLN'],
+  ['AZALANBAKİYE', 'DB'],
+  ['ÇİFTAZALANBAKİYE', 'DDB'],
+  ['YAT', 'SYD'],
+  ['ETKİN', 'EFFECT'],
+  ['VSEÇTOPLA', 'DSUM'],
+  ['VSEÇSAY', 'DCOUNT'],
+  ['VSEÇSAYDOLU', 'DCOUNTA'],
+  ['VSEÇORT', 'DAVERAGE'],
+  ['VSEÇMAK', 'DMAX'],
+  ['VSEÇMİN', 'DMIN'],
+  ['VAL', 'DGET'],
 ];
 
 /**
@@ -146,6 +300,13 @@ const TURKISH_ERRORS: [string, string][] = [
 function nameKey(text: string): string {
   return text.replace(/[iıİ]/g, 'I').toUpperCase();
 }
+
+/**
+ * Turkish names short enough to be the name of a function of a macro or an add-in as well
+ * (as nameKey() has them). Where the workbook has a defined name of that spelling, a call
+ * of it is left as it is typed.
+ */
+const SHORT_NAMES = new Set(['VAL', 'S', 'M', 'KOD', 'TEK', 'TIP', 'DA', 'BD', 'GD', 'YAT']);
 
 let turkishNames: Map<string, string> | undefined;
 
@@ -208,6 +369,31 @@ export interface FormulaLocaleOptions {
    * YANLIŞ) is then that name where it is typed, and not the constant.
    */
   isName?(name: string): boolean;
+  /**
+   * The formula the cell holds while it is edited, as it is stored. A name it calls is a
+   * function of that file - of a macro, of an add-in, or one this table does not know - and
+   * stays that name where it is typed, also when a Turkish function is called the same
+   * ("VAL(" is DGET in Turkish): a formula typed again as it is shown is the formula it was.
+   */
+  stored?: string;
+}
+
+/** The names a stored formula calls, as nameKey() has them. Text in quotes and in brackets is passed over. */
+function calledNames(stored: string): Set<string> {
+  const called = new Set<string>();
+  const n = stored.length;
+  let i = 0;
+  while (i < n) {
+    const c = stored.charCodeAt(i);
+    if (c === 34 || c === 39) i = quotedEnd(stored, i, c);
+    else if (c === 91) i = bracketEnd(stored, i);
+    else if (isWordStart(c)) {
+      const j = wordEnd(stored, i + 1);
+      if (stored.charCodeAt(j) === 40) called.add(nameKey(stored.slice(i, j)));
+      i = j;
+    } else i++;
+  }
+  return called;
 }
 
 /** What a pass over the text met that the caller has to know of. */
@@ -277,6 +463,8 @@ function translate(text: string, toLocal: boolean, names: boolean, findings: Fin
   let i = 0;
   // Inside an array constant the separators are those of columns and rows.
   let braces = 0;
+  // The names the formula of the cell calls already (FormulaLocaleOptions.stored), worked out when first asked for.
+  let kept: Set<string> | undefined;
   while (i < n) {
     const c = text.charCodeAt(i);
     if (c === 34 || c === 39) {
@@ -340,7 +528,17 @@ function translate(text: string, toLocal: boolean, names: boolean, findings: Fin
         if (stored !== undefined) {
           const next = text.charCodeAt(j);
           // A function where it is called, and nowhere else: a sheet or a defined name may be called the same.
-          if (next === 40) word = stored;
+          if (next === 40) {
+            // Not where the file has its own function of that spelling: one the formula of the cell
+            // already calls, or - for the short names only - a defined name. Any other Turkish name
+            // is the function whatever is defined, as in Excel. A name that is the stored one but for its dots
+            // ("SİN") is no other function and is always stored the English way.
+            if (nameKey(stored) !== nameKey(word)) {
+              if (kept === undefined) kept = options !== undefined && typeof options.stored === 'string' && options.stored.length <= MAX_LENGTH ? calledNames(options.stored) : new Set<string>();
+              const own = kept.has(nameKey(word)) || (SHORT_NAMES.has(nameKey(word)) && options !== undefined && typeof options.isName === 'function' && options.isName(word) === true);
+              if (!own) word = stored;
+            } else word = stored;
+          }
           else if (stored === 'TRUE' || stored === 'FALSE') {
             // TRUE and FALSE also where they stand as values. Not where the word names a sheet
             // ("DOĞRU!A1", "DOĞRU:YANLIŞ!A1"), a name of a sheet ("Sayfa1!DOĞRU") or a defined name.

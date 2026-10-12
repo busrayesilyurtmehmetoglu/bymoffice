@@ -17,6 +17,8 @@ export interface InputOptions {
   today?: Date;
   /** Whether the workbook has a defined name of this spelling, for words of a formula that are names in it and constants elsewhere. */
   isName?(name: string): boolean;
+  /** The formula the cell holds now, as stored: the names it calls are not read as the locale's names of other functions (see formulaFromLocal()). */
+  stored?: string;
 }
 
 export interface ParsedInput {

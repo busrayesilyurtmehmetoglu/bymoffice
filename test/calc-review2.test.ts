@@ -405,9 +405,6 @@ test('a use of a function the engine does not support keeps the value of the fil
     ['INDIRECT("R1C1",FALSE)', 5],
     ['INDIRECT("R1C1",0)', 5],
     ['INDIRECT("A1",B2)', 5],
-    ['INDEX((A1:A3,B1:B3),1,1,2)', 'x'],
-    ['INDEX(A1:B3,1,1,B3)', 5],
-    ['SUM(INDEX((A1:A3,B1:B3),0,0,2))', 3],
     ['ROWS((A1:A3,B1:B3))', 3],
     ['TEXT(A2,"gg.aa.yyyy")', '15.03.2023'],
     ['TEXT(A2,"aaaa")', 'Mart'],
@@ -435,6 +432,10 @@ test('a use of a function the engine does not support keeps the value of the fil
     ['TEXT(A1,"General")', 'x', '5'],
     ['TEXT(0.5,"h:mm AM/PM")', 'x', '12:00 PM'],
     ['TEXT(1234.5,"0.0E+0")', 'x', '1.2E+3'],
+    // The reference form of INDEX: one of several areas, picked by a number that may be calculated.
+    ['INDEX((A1:A3,B1:B3),1,1,2)', 'x', 'format'],
+    ['INDEX(A1:B3,1,2,B3)', 99, 'format'],
+    ['SUM(INDEX((A1:A3,B1:B3),0,0,2))', 99, 1],
   ];
   live.forEach(([formula, value], index) => (cells[cellName(index, 9)] = { f: formula, v: value }));
   const workbook = book({ S: cells });

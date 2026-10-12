@@ -120,7 +120,7 @@ function date(year: number, month: number, day: number): number {
 
 test('every extra function has a spec with sane argument counts', () => {
   const names = Object.keys(EXTRA_FUNCTIONS);
-  assert.equal(names.length, 48);
+  assert.equal(names.length, 76);
   for (const name of names) {
     const spec = EXTRA_FUNCTIONS[name];
     assert.equal(name, name.toUpperCase());

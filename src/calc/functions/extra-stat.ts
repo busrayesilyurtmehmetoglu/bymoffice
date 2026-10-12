@@ -157,13 +157,13 @@ const normStandardInverse = mapScalars((args, context) => {
 // ---------------------------------------------------------------------------
 // Two lists side by side (as CORREL and SLOPE read them in stat.ts)
 
-interface Pairs {
+export interface Pairs {
   xs: number[];
   ys: number[];
 }
 
 /** The positions where both lists hold a number. Lists of different sizes are #N/A. */
-function numberPairs(ys: Value, xs: Value, context: CalcContext): Pairs | CalcError {
+export function numberPairs(ys: Value, xs: Value, context: CalcContext): Pairs | CalcError {
   const gy = toGrid(ys, context);
   const gx = toGrid(xs, context);
   if (gy.rows * gy.cols !== gx.rows * gx.cols) return ERROR_NA;

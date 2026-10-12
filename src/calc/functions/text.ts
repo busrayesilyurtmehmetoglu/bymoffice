@@ -2,8 +2,10 @@
 // conversions between text and numbers.
 //
 // Lengths and positions count UTF-16 code units, as Excel does. UPPER, LOWER
-// and PROPER use the language-neutral case mapping of JavaScript; Turkish
-// dotted and dotless i are not treated specially.
+// and PROPER use the language-neutral case mapping of JavaScript, except in a
+// Turkish locale (CalcContext.locale), where the dotted and the dotless i are
+// two letters: "i" and "İ", "ı" and "I". The pairs are written out here;
+// toLocaleUpperCase() is not used, since what it does depends on the engine.
 
 import { formatValue } from '../../format/number-format';
 import {
@@ -53,11 +55,76 @@ function flag(args: Scalar[], index: number, fallback: boolean): boolean | CalcE
 }
 
 /** A function of one text argument. */
-function textFunction(fn: (text: string) => Scalar): CalcFunction {
-  return mapScalars((args) => {
+function textFunction(fn: (text: string, context: CalcContext) => Scalar): CalcFunction {
+  return mapScalars((args, context) => {
     const text = toText(args[0]);
-    return typeof text === 'string' ? fn(text) : text;
+    return typeof text === 'string' ? fn(text, context) : text;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Case
+
+const DOTTED_CAPITAL_I = '\u0130';
+const DOTLESS_SMALL_I = '\u0131';
+/** U+0307, the dot written after a letter: with "I" before it, the dotted capital in two characters. */
+const COMBINING_DOT = 0x307;
+
+/**
+ * Whether letters change case the Turkish way. A locale carries no language tag; the
+ * Turkish one is known by its word for TRUE, as it is where formulas are typed.
+ * UNSURE: Excel follows the language of the system here; not checked on a Turkish one.
+ */
+function turkishCase(context: CalcContext): boolean {
+  const locale = context.locale;
+  return locale !== undefined && locale !== null && locale.trueText === 'DOĞRU';
+}
+
+function upperChar(c: string, turkish: boolean): string {
+  if (turkish) {
+    if (c === 'i') return DOTTED_CAPITAL_I;
+    if (c === DOTLESS_SMALL_I) return 'I';
+  }
+  return c.toUpperCase();
+}
+
+function lowerChar(c: string, turkish: boolean): string {
+  if (turkish) {
+    if (c === 'I') return DOTLESS_SMALL_I;
+    if (c === DOTTED_CAPITAL_I) return 'i';
+  }
+  return c.toLowerCase();
+}
+
+function upper(text: string, context: CalcContext): string {
+  if (!turkishCase(context) || (text.indexOf('i') < 0 && text.indexOf(DOTLESS_SMALL_I) < 0)) return text.toUpperCase();
+  let out = '';
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charAt(i);
+    if (c !== 'i' && c !== DOTLESS_SMALL_I) continue;
+    out += text.substring(from, i).toUpperCase() + upperChar(c, true);
+    // A combining dot written after "i" is the dot the capital already has.
+    if (c === 'i' && text.charCodeAt(i + 1) === COMBINING_DOT) i++;
+    from = i + 1;
+  }
+  return out + text.substring(from).toUpperCase();
+}
+
+function lower(text: string, context: CalcContext): string {
+  if (!turkishCase(context) || (text.indexOf('I') < 0 && text.indexOf(DOTTED_CAPITAL_I) < 0)) return text.toLowerCase();
+  let out = '';
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charAt(i);
+    if (c !== 'I' && c !== DOTTED_CAPITAL_I) continue;
+    // A combining dot written after "I" belongs to it: the two together are one dotted capital.
+    const dotted = c === 'I' && text.charCodeAt(i + 1) === COMBINING_DOT;
+    out += text.substring(from, i).toLowerCase() + (dotted ? 'i' : lowerChar(c, true));
+    if (dotted) i++;
+    from = i + 1;
+  }
+  return out + text.substring(from).toLowerCase();
 }
 
 const concatenate = mapScalars((args) => {
@@ -154,12 +221,26 @@ function isLetter(c: string): boolean {
   return c.toLowerCase() !== c.toUpperCase();
 }
 
-function proper(text: string): string {
+/** A mark written after the letter it belongs to (U+0300 to U+036F): part of that letter, not the end of a word. */
+function isCombiningMark(code: number): boolean {
+  return code >= 0x300 && code <= 0x36f;
+}
+
+function proper(text: string, context: CalcContext): string {
+  const turkish = turkishCase(context);
   let out = '';
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const c = text.charAt(i);
-    out += inWord ? c.toLowerCase() : c.toUpperCase();
+    if (isCombiningMark(text.charCodeAt(i))) {
+      out += c;
+      continue;
+    }
+    if (turkish && (c === 'i' || c === 'I') && text.charCodeAt(i + 1) === COMBINING_DOT) {
+      // The dotted letter in two characters: one letter, written as one.
+      out += inWord ? 'i' : DOTTED_CAPITAL_I;
+      i++;
+    } else out += inWord ? lowerChar(c, turkish) : upperChar(c, turkish);
     inWord = isLetter(c);
   }
   return out;
@@ -496,8 +577,8 @@ export const TEXT_FUNCTIONS: { [name: string]: FunctionSpec } = {
   RIGHT: spec(side(true), 1, 2),
   MID: spec(mid, 3, 3),
   LEN: spec(textFunction((subject) => subject.length), 1, 1),
-  LOWER: spec(textFunction((subject) => subject.toLowerCase()), 1, 1),
-  UPPER: spec(textFunction((subject) => subject.toUpperCase()), 1, 1),
+  LOWER: spec(textFunction(lower), 1, 1),
+  UPPER: spec(textFunction(upper), 1, 1),
   PROPER: spec(textFunction(proper), 1, 1),
   TRIM: spec(textFunction(trimSpaces), 1, 1),
   CLEAN: spec(textFunction(cleanControls), 1, 1),

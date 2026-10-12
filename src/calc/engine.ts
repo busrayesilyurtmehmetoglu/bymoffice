@@ -26,9 +26,10 @@
 // when the graph is built, and rowsChanged() and namesChanged() name them as changed.
 
 import { isoToSerial } from '../format/cell-format';
+import type { FormatLocale } from '../format/locale';
 import { MAX_COLS, MAX_ROWS, parseRange, type Cell, type CellFormula, type CellRange, type Row, type Sheet, type Workbook } from '../model/sheet/types';
 import { sharedMasters, type SharedMasters } from '../ops/ops';
-import { EvaluationAbort, evaluate, evaluationDepth, isBuiltinForm, refRange, toCellValue, type EvaluateOptions } from './eval';
+import { EvaluationAbort, evaluate, evaluationDepth, isBuiltinForm, refRange, toCellValue, unionParts, type EvaluateOptions } from './eval';
 import { FUNCTIONS } from './functions/index';
 import { parseFormula, type Node } from './parse';
 import { shiftFormula } from './refs';
@@ -61,6 +62,12 @@ export interface CalcEngineOptions {
   now?: () => number;
   /** A random number in [0, 1). */
   random?: () => number;
+  /**
+   * The locale functions that change the case of letters follow (UPPER, LOWER, PROPER); asked
+   * every time one is calculated, so a view can answer with the locale it shows at that
+   * moment. English when omitted. A formula is not calculated again because the answer changed.
+   */
+  locale?: () => FormatLocale | undefined;
   /** Reserved for iterative calculation, which is not supported: circular references always give 0. */
   maxIterations?: number;
   /**
@@ -605,6 +612,9 @@ export class CalcEngine {
       col: 0,
       get date1904() {
         return !!workbook.date1904;
+      },
+      get locale() {
+        return options.locale ? options.locale() : undefined;
       },
       cellValue: (sheet, row, col) => engine.cellValue(sheet, row, col),
       forEachCell: (sheet, range, visit) => engine.forEachCell(sheet, range, visit),
@@ -2045,15 +2055,16 @@ export class CalcEngine {
           const spec = builtin ? undefined : this.functions.get(node.name);
           if (UNSUPPORTED_FORMS.has(node.name) || (!builtin && !spec)) return false;
           if (!this.supportsCall(node.name, node.args)) return false;
-          // A union of references is taken apart by AREAS and by functions of any number of arguments.
+          // A union of references is taken apart by AREAS, by functions of any number of arguments
+          // and by INDEX, which picks one of the areas of its first argument.
           const takesUnion = node.name === 'AREAS' || (spec !== undefined && spec.max === undefined);
-          for (const arg of node.args) {
-            let part = arg;
-            while (takesUnion && part && part.type === 'binary' && part.op === ',') {
-              nodes.push(part.right);
-              part = part.left;
-            }
-            if (part) nodes.push(part);
+          for (let k = 0; k < node.args.length; k++) {
+            const arg = node.args[k];
+            if (!arg) continue;
+            if (takesUnion || (k === 0 && node.name === 'INDEX')) {
+              const parts = unionParts(arg);
+              for (let j = 0; j < parts.length; j++) nodes.push(parts[j]);
+            } else nodes.push(arg);
           }
           break;
         }
@@ -2083,11 +2094,6 @@ export class CalcEngine {
         const a1 = args.length > 1 ? args[1] : undefined;
         if (!a1) return true;
         return (a1.type === 'boolean' && a1.value) || (a1.type === 'number' && a1.value !== 0);
-      }
-      case 'INDEX': {
-        // Only the first area of a reference.
-        const area = args.length > 3 ? args[3] : undefined;
-        return !area || (area.type === 'number' && area.value === 1);
       }
       case 'TEXT': {
         // A format that is not a constant is calculated: what it holds is known only then.

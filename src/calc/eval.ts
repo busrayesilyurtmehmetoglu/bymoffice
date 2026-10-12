@@ -423,16 +423,20 @@ function evalUnary(node: Extract<Node, { type: 'unary' }>, state: State): Value 
 type Args = (Node | null)[];
 type Special = (args: Args, state: State) => Value;
 
-/** The references a union is made of, in order. */
-function unionParts(node: Node): Node[] {
+/**
+ * The references a union is made of, in the order they are written. A union inside a
+ * union, on either side ("(A1:A3,(B1:B3,C1:C3))"), is taken apart as well.
+ */
+export function unionParts(node: Node): Node[] {
   const parts: Node[] = [];
-  let current = node;
-  while (current.type === 'binary' && current.op === ',') {
-    parts.push(current.right);
-    current = current.left;
+  // What is still to be looked at, the leftmost on top; no deeper than the tree, which the parser bounds.
+  const pending: Node[] = [node];
+  while (pending.length > 0) {
+    const current = pending.pop() as Node;
+    if (current.type === 'binary' && current.op === ',') pending.push(current.right, current.left);
+    else parts.push(current);
   }
-  parts.push(current);
-  return parts.reverse();
+  return parts;
 }
 
 function evalCall(node: Extract<Node, { type: 'call' }>, state: State): Value {
@@ -731,19 +735,35 @@ function fnIndirect(args: Args, state: State): Value {
 
 function fnIndex(args: Args, state: State): Value {
   if (args.length < 2 || args.length > 4) return ERROR_VALUE;
-  // The first argument takes an array: INDEX(A1:A3*2,3) needs no array formula.
-  const source = args[0] ? evalArrayArg(args[0], state) : null;
-  if (isError(source)) return source;
+  let area = 1;
+  if (args.length > 3 && args[3]) {
+    const given = intArg(args[3], state);
+    if (typeof given !== 'number') return given;
+    area = given;
+  }
+  // The reference form: the first argument may be several areas, "(A1:B2,D1:E2)", and the fourth picks one.
+  const areas = args[0] ? unionParts(args[0]) : [];
+  let source: Value;
+  if (areas.length > 1) {
+    for (let k = 0; k < areas.length; k++) {
+      const ref = refArg(areas[k], state);
+      if (!isRef(ref)) return ref;
+    }
+    if (area < 1) return ERROR_VALUE;
+    if (area > areas.length) return ERROR_REF;
+    source = refArg(areas[area - 1], state);
+  } else {
+    // The first argument takes an array: INDEX(A1:A3*2,3) needs no array formula.
+    source = args[0] ? evalArrayArg(args[0], state) : null;
+    if (isError(source)) return source;
+    // There is one area only. UNSURE: Excel gives #VALUE! for an area below 1; taken from its documentation.
+    if (area < 1) return ERROR_VALUE;
+    if (area !== 1) return ERROR_REF;
+  }
   let row = intArg(args[1], state);
   if (typeof row !== 'number') return row;
   let col: number | CalcError | undefined = args.length > 2 && args[2] ? intArg(args[2], state) : undefined;
   if (col !== undefined && typeof col !== 'number') return col;
-  if (args.length > 3 && args[3]) {
-    const area = intArg(args[3], state);
-    if (typeof area !== 'number') return area;
-    // A union of areas is not supported: there is only the first one.
-    if (area !== 1) return ERROR_REF;
-  }
   const array = isRef(source) ? undefined : isArray(source) ? source : { rows: 1, cols: 1, data: [source] };
   const rows = isRef(source) ? source.range.bottom - source.range.top + 1 : (array as ArrayValue).rows;
   const cols = isRef(source) ? source.range.right - source.range.left + 1 : (array as ArrayValue).cols;

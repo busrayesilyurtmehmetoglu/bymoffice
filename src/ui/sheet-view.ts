@@ -29,7 +29,7 @@ import {
   unmergeRange,
   type StylePatch,
 } from '../ops/format';
-import { CalcEngine } from '../calc/engine';
+import { CalcEngine, type CalcEngineOptions } from '../calc/engine';
 import { ConditionalFormats } from '../format/conditional';
 import { DataValidations, MAX_LIST_ITEMS, ValidationError, tryOps } from '../format/validation';
 import {
@@ -130,6 +130,7 @@ import {
   type PrintPlan,
 } from './doc-print';
 import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
+import { viewEngineOptions } from './engine-options';
 import { FilterMenu, ListMenu } from './filter-menu';
 import { allSheets, dropIndex, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
 
@@ -203,9 +204,6 @@ export interface HistoryMark {
    */
   sheetCells?: { sheet: Sheet; row: number; col: number }[];
 }
-
-/** Longest a recalculation holds the page before it leaves the rest for the next turn. */
-const CALC_SLICE_MS = 250;
 
 /** Most turns a calculation is given at once when something has to wait for its end. */
 const MAX_FINISH_SLICES = 8;
@@ -1216,6 +1214,11 @@ export class WorkbookView {
     };
   }
 
+  /** What every engine of this view is made with: the time one slice may take, and the locale as it is when asked. */
+  private engineOptions(): CalcEngineOptions {
+    return viewEngineOptions(() => this.locale);
+  }
+
   /** Changes the language of number and date formats, and of the view's own labels, and redraws. */
   setLocale(locale: string | FormatLocale): void {
     // What is typed into a dialog of rules is typed the way the locale writes it, and is not read by another one:
@@ -1857,7 +1860,7 @@ export class WorkbookView {
     try {
       // Without an engine nothing was calculated here yet; only a sheet that went with readers gives a reason to start.
       if (!this.engine && (kind === 'names' || (cells !== undefined && cells.length === 0 && !unsure))) return;
-      if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      if (!this.engine) this.engine = new CalcEngine(this.workbook, this.engineOptions());
       const engine = this.engine;
       let addresses: { sheet: number; row: number; col: number }[] | undefined;
       if (cells) {
@@ -1944,7 +1947,7 @@ export class WorkbookView {
   private buildGraph(): void {
     if (this.options.calculate === false) return;
     try {
-      if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      if (!this.engine) this.engine = new CalcEngine(this.workbook, this.engineOptions());
       if (this.engine.graphReady) return;
       this.marksDirty = true;
       this.engine.recalculate([]);
@@ -4280,7 +4283,7 @@ export class WorkbookView {
       if (this.destroyed) return;
       try {
         // A conditional format or an early edit may have made the engine already.
-        const engine = this.engine || new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+        const engine = this.engine || new CalcEngine(this.workbook, this.engineOptions());
         const missing = engine.uncalculated();
         if (missing.length === 0) return;
         this.engine = engine;
@@ -4299,7 +4302,7 @@ export class WorkbookView {
   /** The engine for the formulas of conditional formats: made on first use, also in a read-only view. */
   private conditionalEngine(): CalcEngine | undefined {
     if (this.options.calculate === false) return undefined;
-    if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+    if (!this.engine) this.engine = new CalcEngine(this.workbook, this.engineOptions());
     return this.engine;
   }
 
@@ -5375,7 +5378,7 @@ export class WorkbookView {
   private recalculate(cells: HistoryMark['cells'], rows?: number[]): number[] {
     if (this.options.calculate === false) return [];
     try {
-      if (!this.engine) this.engine = new CalcEngine(this.workbook, { budget: { milliseconds: CALC_SLICE_MS } });
+      if (!this.engine) this.engine = new CalcEngine(this.workbook, this.engineOptions());
       this.marksDirty = true;
       if (!cells) this.engine.invalidate();
       else if (rows) {

@@ -23,6 +23,7 @@ import { EXTRA_DATABASE_FUNCTIONS } from './extra-database';
 import { EXTRA_DATE_FUNCTIONS } from './extra-date';
 import { EXTRA_ENGINEERING_FUNCTIONS } from './extra-engineering';
 import { EXTRA_FINANCIAL_FUNCTIONS } from './extra-financial';
+import { EXTRA_MATH_FUNCTIONS } from './extra-math';
 import { EXTRA_STAT_FUNCTIONS } from './extra-stat';
 import {
   clean,
@@ -338,6 +339,7 @@ const GROUPS = [
   EXTRA_ENGINEERING_FUNCTIONS,
   EXTRA_STAT_FUNCTIONS,
   EXTRA_DATABASE_FUNCTIONS,
+  EXTRA_MATH_FUNCTIONS,
 ];
 
 for (let i = 0; i < GROUPS.length; i++) {

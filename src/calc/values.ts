@@ -3,6 +3,7 @@
 // through these helpers, so the rules live in one place.
 
 import { parseCellInput } from '../edit/input';
+import type { FormatLocale } from '../format/locale';
 import { serialToDate } from '../format/number-format';
 import type { CellRange } from '../model/sheet/types';
 
@@ -402,6 +403,12 @@ export interface CalcContext {
   now(): number;
   /** A random number in [0, 1). */
   random(): number;
+  /**
+   * The locale of whoever looks at the workbook, when there is one: UPPER, LOWER and PROPER
+   * follow its letters (in Turkish "i" is the small "İ" and "ı" the small "I"). Without it
+   * letters change case the way they do in English.
+   */
+  readonly locale?: FormatLocale;
   /** The formula text of a cell without the leading "=", or undefined when the cell holds no formula. */
   cellFormula?(sheet: number, row: number, col: number): string | undefined;
   /**

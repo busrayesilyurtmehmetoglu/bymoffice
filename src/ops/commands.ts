@@ -77,7 +77,10 @@ export function cellFromInput(workbook: Workbook, sheet: Sheet, row: number, col
   const format = resolveCellStyle(workbook.styles, style).numFmt;
   // In a cell formatted as Text, what is typed is the text: "0123" keeps its zero and "=A1" is not a formula.
   if (isTextFormat(format)) return { kind: 'string', value: text.length > MAX_CELL_TEXT ? text.slice(0, MAX_CELL_TEXT) : text, style };
-  const parsed = parseCellInput(text, { locale: options.locale, date1904: workbook.date1904, isName: (name) => hasDefinedName(workbook, name) });
+  // The formula that is there now tells which names are functions of the file's own: typed again, they stay those.
+  const held = getCell(sheet, row, col);
+  const stored = held && held.formula ? held.formula.text : undefined;
+  const parsed = parseCellInput(text, { locale: options.locale, date1904: workbook.date1904, isName: (name) => hasDefinedName(workbook, name), stored });
   if (parsed.invalid) throw new RangeError('The formula cannot be read');
   if (parsed.kind === 'blank' && parsed.formula === undefined) return emptied(sheet, row, col, style);
   // Typing "15.03.2024" or "12%" into a cell without a format of its own gives it one.
