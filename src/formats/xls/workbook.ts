@@ -25,6 +25,8 @@ import {
   type StyleSheet,
   type Workbook,
 } from '../../model/sheet/types';
+import { MAX_SHEET_CHARTS, MAX_WORKBOOK_CHARTS, MAX_WORKBOOK_CHART_POINTS } from '../../model/sheet/chart';
+import { readXlsChart, XLS_MAX_CHART_CACHE_BYTES, type XlsChartContext, type XlsSpan } from './chart';
 import { isKnownCodepage } from './codepage';
 import { REC_MSODRAWING, REC_MSODRAWINGGROUP, REC_OBJ, REC_TXO, XlsPictures, XlsSheetArt } from './drawings';
 import { errorText, formulaText, releaseFormulaBytes, type FormulaContext, type XlsSupBook, type XlsXti } from './formula';
@@ -221,6 +223,8 @@ interface Globals {
   sharedBudget: number;
   /** The picture store of the workbook; its pictures are unpacked when they are first shown. */
   pictures: XlsPictures;
+  /** What the charts are read with, and what all of them together may still cost. */
+  charts: XlsChartContext;
 }
 
 function count(map: Map<number, number>, id: number): void {
@@ -454,7 +458,9 @@ function readGlobals(stream: RecordStream, streamName: string, decrypted = false
     failures: report.untranslatedReasons,
   };
   const sharedBudget = Math.max(SHARED_FORMULA_FLOOR, size * SHARED_FORMULA_FACTOR);
-  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget, pictures };
+  // The references of charts are turned into text like formulas; one that cannot be is no formula of a cell that was left out.
+  const charts: XlsChartContext = { styles: built.styles, fontOf, formula: { ...ctx, failures: new Map() }, date1904, budget: { charts: MAX_WORKBOOK_CHARTS, points: MAX_WORKBOOK_CHART_POINTS, bytes: XLS_MAX_CHART_CACHE_BYTES } };
+  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget, pictures, charts };
 }
 
 /** The defined names of the workbook; a name whose formula cannot be turned into text is left out. */
@@ -547,7 +553,36 @@ interface RangeFormula {
 
 const key = (row: number, col: number) => row * XLS_MAX_COLS + col;
 
-function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: Globals): void {
+/** Thrown for a sheet whose records run into those of a substream that was read before it. */
+class SheetOverlap extends Error {}
+
+/**
+ * The substreams of a workbook that were read, as the bytes each took. No two share records: a
+ * file of a few bytes whose sheets all lead into the same records would cost, for each sheet,
+ * what the records cost once.
+ */
+class Substreams {
+  private readonly taken: [start: number, end: number][] = [];
+
+  constructor(private readonly size: number) {}
+
+  /** How far a substream that starts at `start` may reach; undefined when it starts inside one that was read. */
+  spanFrom(start: number): XlsSpan | undefined {
+    let limit = this.size;
+    for (const [from, to] of this.taken) {
+      if (start >= from && start < to) return undefined;
+      if (from > start && from < limit) limit = from;
+    }
+    return { limit, end: start };
+  }
+
+  /** The bytes a reader looked at, whether it read the substream or gave it up. */
+  take(start: number, span: XlsSpan): void {
+    if (span.end > start) this.taken.push([start, span.end]);
+  }
+}
+
+function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: Globals, span: XlsSpan): void {
   const { bytes, view } = stream;
   const size = bytes.length;
   const { biff8, codepage, xfMap, sharedStrings, ctx, report } = globals;
@@ -610,13 +645,18 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   let p = start + 4 + recordLength(stream, start);
   let depth = 0;
   for (;;) {
+    span.end = p;
+    // The records of another substream start here: this one has none of its own left.
+    if (p > span.limit) throw new SheetOverlap();
     if (p + 4 > size) throw corrupt(`sheet ${name} is not terminated`);
     const id = view.getUint16(p, true);
     const length = view.getUint16(p + 2, true);
     const d = p + 4;
     const next = d + length;
     if (next > size) throw corrupt(`the record at offset ${p} runs past the end of the stream`);
+    if (next > span.limit) throw new SheetOverlap();
     p = next;
+    span.end = p;
 
     // An embedded chart is a substream of its own inside the sheet.
     if (depth > 0) {
@@ -629,6 +669,8 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
       case REC_EOF:
         break;
       case REC_BOF:
+        // The substream of a chart: the chart of the object before it. It is read when the drawing is put together.
+        if (art && length >= 4 && view.getUint16(d + 2, true) === 0x0020) art.chart(d - 4);
         depth++;
         continue;
       case REC_NUMBER: {
@@ -1025,7 +1067,15 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
 
   if (art) {
     // What floats above the cells: shown, never written (an xls file is saved as it was read).
-    const floating = art.finish({ styles: globals.styles, fontOf: globals.fontOf, pictures: globals.pictures, maxRows: XLS_MAX_ROWS, maxCols: XLS_MAX_COLS });
+    let charts = 0;
+    const floating = art.finish({
+      styles: globals.styles,
+      fontOf: globals.fontOf,
+      pictures: globals.pictures,
+      maxRows: XLS_MAX_ROWS,
+      maxCols: XLS_MAX_COLS,
+      chart: (offset) => (offset === undefined ? { problem: 'no records of a chart follow its object' } : charts++ >= MAX_SHEET_CHARTS ? { problem: 'the sheet holds too many charts' } : readXlsChart(stream, offset, globals.charts)),
+    });
     if (floating.drawings) sheet.drawings = floating.drawings;
     if (floating.comments) sheet.comments = floating.comments;
     if (floating.warnings) sheet.warnings = floating.warnings;
@@ -1128,10 +1178,15 @@ export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook', decryp
 
     const sheets: Sheet[] = [];
     const seen = new Set<number>();
+    const substreams = new Substreams(bytes.length);
     globals.sheets.forEach((bound, index) => {
-      const sheet = createSheet({ name: bound.name, sheetId: index + 1, state: bound.state, kind: SHEET_KINDS[bound.type] || 'worksheet', part: '' });
-      // The format has no parts; the sheet is one of the file all the same (see isFileSheet()).
-      sheet.readFromFile = true;
+      const fresh = (): Sheet => {
+        const made = createSheet({ name: bound.name, sheetId: index + 1, state: bound.state, kind: SHEET_KINDS[bound.type] || 'worksheet', part: '' });
+        // The format has no parts; the sheet is one of the file all the same (see isFileSheet()).
+        made.readFromFile = true;
+        return made;
+      };
+      let sheet = fresh();
       sheets.push(sheet);
       // Each sheet has its own substream; one listed twice would be read into memory twice.
       if (seen.has(bound.offset)) throw corrupt(`sheet ${quote(bound.name)} shares its records with another sheet`);
@@ -1142,8 +1197,36 @@ export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook', decryp
       const type = stream.view.getUint16(bound.offset + 6, true);
       if (type === 0x0020) sheet.kind = 'chartsheet';
       else if (type === 0x0040 || type === 0x0006) sheet.kind = 'macrosheet';
-      // Charts are not cells, and macro sheets are never run: both stay empty.
-      if (sheet.kind === 'worksheet') readSheet(stream, bound.offset, sheet, globals);
+      // Macro sheets are never run: they stay empty. A chart sheet holds its chart, not cells.
+      if (sheet.kind === 'worksheet') {
+        const span = substreams.spanFrom(bound.offset);
+        let shared = span === undefined;
+        if (span) {
+          try {
+            readSheet(stream, bound.offset, sheet, globals, span);
+          } catch (error) {
+            if (!(error instanceof SheetOverlap)) throw error;
+            shared = true;
+          }
+          substreams.take(bound.offset, span);
+        }
+        if (shared) {
+          // Nothing of what was read so far is kept: the sheet is there, by its name, and empty.
+          sheet = fresh();
+          sheet.warnings = ['The sheet is not read: its records are those of another sheet'];
+          sheets[index] = sheet;
+        }
+      } else if (type === 0x0020 && globals.biff8) {
+        const span = substreams.spanFrom(bound.offset);
+        const read = span ? readXlsChart(stream, bound.offset, globals.charts, span) : { problem: 'its records are those of another sheet' };
+        if (span) substreams.take(bound.offset, span);
+        if (read.chart) {
+          // The one drawing of a chart sheet: its chart, as large as the chart says it is (points; 12,700 EMU each).
+          const width = Math.round((read.width || 720) * 12700);
+          const height = Math.round((read.height || 540) * 12700);
+          sheet.drawings = [{ anchor: { kind: 'absolute', x: 0, y: 0, width, height }, object: { type: 'chart', chart: read.chart } }];
+        } else sheet.warnings = [`The chart of the sheet is not shown: ${read.problem || 'its records cannot be read'}`];
+      }
     });
 
     const workbook: Workbook = {

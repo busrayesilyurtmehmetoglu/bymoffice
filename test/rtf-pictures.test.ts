@@ -296,3 +296,25 @@ test('a picture inside a field result, a table cell and a note', () => {
   assert.equal(drawingsOf(paragraphsOf(model.footnotes!.items.get(1)!.blocks)[0]).length, 1);
   assert.equal(model.media!.size, 1);
 });
+
+// An embedded object (a chart of Microsoft Graph, a sheet of Excel) is "{\object ... {\*\objdata ...}{\result ...}}":
+// what stands in its result is what is shown. The data of the object is never looked into.
+test('an embedded chart shows the picture of its result: a bitmap as it is, a metafile as a frame without an image', () => {
+  const object = (result: string) =>
+    doc(String.raw`a{\object\objemb\objw3000\objh2000{\*\objclass MSGraph.Chart.8}{\*\objdata 0105000002000000080000004d53477261706800d0cf11e0a1b11ae1}{\result ` + result + String.raw`}}b\par`);
+  const bitmap = read(object(String.raw`{\pict\pngblip\picwgoal3000\pichgoal2000 ` + hexOf(PNG) + '}'));
+  assert.equal(paragraphText(paragraphs(bitmap)[0]), 'ab');
+  const shown = firstDrawing(bitmap);
+  assert.deepEqual([shown.kind, shown.placement, shown.width, shown.height], ['picture', 'inline', 3000 * TWIP, 2000 * TWIP]);
+  assert.deepEqual(Array.from(mediaOf(bitmap, shown)), Array.from(PNG));
+  assert.equal(bitmap.media!.size, 1, 'the data of the object is no picture of the document');
+
+  // A metafile (what Word writes for nearly every object) keeps its place and its size; nothing is drawn in it.
+  const metafile = read(object(String.raw`{\pict\wmetafile8\picw5292\pich3528\picwgoal3000\pichgoal2000 010009000003}`));
+  const frame = firstDrawing(metafile);
+  assert.deepEqual([frame.kind, frame.width, frame.height], ['picture', 3000 * TWIP, 2000 * TWIP]);
+
+  // An object without a result shows nothing.
+  const bare = read(doc(String.raw`a{\object\objemb{\*\objclass Excel.Chart.8}{\*\objdata 0105000002000000}}b\par`));
+  assert.deepEqual([paragraphText(paragraphs(bare)[0]), drawingsOf(paragraphs(bare)[0]).length], ['ab', 0]);
+});

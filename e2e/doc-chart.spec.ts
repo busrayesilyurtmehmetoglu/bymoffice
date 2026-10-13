@@ -1,5 +1,6 @@
 // Charts in the document view: a chart of a Word document is drawn in its
-// frame from the values its part cached, scales with the zoom, is on the
+// frame from the values its part cached (or, for a series without any, from
+// the cells of the workbook embedded beside the part), scales with the zoom, is on the
 // printed page, stays a placeholder when its part cannot be read, and leaves
 // the file as it was.
 //
@@ -8,7 +9,8 @@
 // 600 x 400 px with margins of 40 px; each chart has one series of three
 // columns (50, 100, 25 on an axis from 0 to 100) filled with one plain colour.
 import type { Page } from '@playwright/test';
-import { catAx, chartXml, group, legend, numRef, ser, strRef, valAx } from '../test/chart-fixtures';
+import { catAx, chartXml, group, legend, numRef, ser, sheetData, strRef, valAx } from '../test/chart-fixtures';
+import { buildXlsx, worksheetXml } from '../test/fixtures';
 import { p, r, tbl, tc, tr, words } from '../test/doc-layout-fixtures';
 import { chartParts, columnsChart, floatingChart, inlineChart, partRels } from '../test/docx-chart-fixtures';
 import { ZipArchive } from '../src/zip';
@@ -351,6 +353,32 @@ test.describe('charts of a document', () => {
     });
     expect(text.paragraphs).toBe(2);
     expect(text.warnings.some((line) => /chart1\.xml.*could not be read/.test(line))).toBe(true);
+    await expectResponsive(page);
+  });
+
+  test('a chart whose part caches no values is drawn from the cells of its embedded workbook; the file is saved as it was', async ({ page }) => {
+    const frame = await frameOnPage(page);
+    // The series names Sheet1!$B$2:$B$4 and caches nothing: the workbook beside the part holds 50, 100 and 25 there.
+    const workbook = await buildXlsx({ sheets: [{ name: 'Sheet1', xml: worksheetXml(sheetData([[null, 'Sales'], ['a', 50], ['b', 100], ['c', 25]])) }] });
+    const bytes = await docx(p(inlineChart('rIdC1', FRAME.width, FRAME.height)) + p('Below the chart'), await chartParts([{ rel: 'rIdC1', xml: columnsChart({ uncached: true }), workbook }]));
+    await mountDoc(page, bytes);
+    const green = await onPage(page, GREEN);
+    expectInFrame(green, frame);
+    expectColumns(green);
+    expect((await onPage(page, PLACEHOLDER)).count, 'no placeholder').toBe(0);
+    const read = await page.evaluate(async () => {
+      const doc = await (window as any).__docFile.document();
+      const chart = doc.charts.get('/word/charts/chart1.xml');
+      return { warnings: doc.warnings as string[], notes: chart.notes as string[] };
+    });
+    expect(read.warnings).toEqual([]);
+    expect(read.notes.some((note) => /Read from the embedded workbook/.test(note))).toBe(true);
+    // Nothing of the package was changed: neither the chart part nor the workbook.
+    const same = await page.evaluate(async (input) => {
+      const saved = (await (window as any).__docFile.save()) as Uint8Array;
+      return saved.length === input.length && saved.every((value, i) => value === input[i]);
+    }, Array.from(bytes));
+    expect(same, 'open, show, save: the bytes of the file').toBe(true);
     await expectResponsive(page);
   });
 

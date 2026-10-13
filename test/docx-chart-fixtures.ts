@@ -41,6 +41,10 @@ export interface ColumnsSpec {
   head?: string;
   /** The element name of the chart type. Default "barChart"; "surfaceChart" is a type that is not drawn. */
   type?: string;
+  /** More series, after the first: whole <c:ser> elements. */
+  more?: string;
+  /** With `uncached`: the name of the series is a reference without a cached text. */
+  nameRef?: string;
 }
 
 /** A chart part: one series of columns over a value axis from 0 to 100, so that the height of a column is its value. */
@@ -51,7 +55,7 @@ export function columnsChart(spec: ColumnsSpec = {}): string {
   return chartXml({
     head: spec.head,
     plot:
-      group(spec.type || 'barChart', '<c:barDir val="col"/><c:grouping val="clustered"/>', ser(0, { cat, val, props: spPr(solid(spec.color || '00B050')) }), '<c:gapWidth val="100"/>') +
+      group(spec.type || 'barChart', '<c:barDir val="col"/><c:grouping val="clustered"/>', ser(0, { cat, val, props: spPr(solid(spec.color || '00B050')), tx: spec.nameRef ? `<c:strRef><c:f>${spec.nameRef}</c:f></c:strRef>` : undefined }) + (spec.more || ''), '<c:gapWidth val="100"/>') +
       catAx() +
       valAx('<c:majorGridlines/>', '<c:orientation val="minMax"/><c:max val="100"/><c:min val="0"/>'),
     after: '<c:externalData r:id="rId1"><c:autoUpdate val="0"/></c:externalData>',
@@ -70,6 +74,12 @@ export interface ChartPartSpec {
   rel: string;
   /** The chart part, whole. A Uint8Array is written as it is (for parts that are not XML). */
   xml: string | Uint8Array;
+  /** The bytes of the embedded workbook of the chart. Default: embeddedWorkbook(), a zip that is no workbook. */
+  workbook?: Uint8Array;
+  /** The name of the embedded workbook under word/embeddings/. Default "Microsoft_Excel_Sheet<n>.xlsx". */
+  embedding?: string;
+  /** The relationship of the chart part to its workbook, whole (<Relationship .../>); '' for none. */
+  bookRel?: string;
 }
 
 /**
@@ -85,11 +95,11 @@ export async function chartParts(charts: ChartPartSpec[], first = 1): Promise<Re
     const n = first + i;
     rels.push([chart.rel, 'chart', `charts/chart${n}.xml`]);
     parts.push([`word/charts/chart${n}.xml`, chart.xml]);
-    parts.push([
-      `word/charts/_rels/chart${n}.xml.rels`,
-      `${XML}<Relationships xmlns="${NS_PKG_REL}"><Relationship Id="rId1" Type="${NS_REL}/package" Target="../embeddings/Microsoft_Excel_Sheet${n}.xlsx"/></Relationships>`,
-    ]);
-    parts.push([`word/embeddings/Microsoft_Excel_Sheet${n}.xlsx`, workbook]);
+    const embedding = chart.embedding || `Microsoft_Excel_Sheet${n}.xlsx`;
+    const rel = chart.bookRel !== undefined ? chart.bookRel : `<Relationship Id="rId1" Type="${NS_REL}/package" Target="../embeddings/${embedding}"/>`;
+    parts.push([`word/charts/_rels/chart${n}.xml.rels`, `${XML}<Relationships xmlns="${NS_PKG_REL}">${rel}</Relationships>`]);
+    // Two charts may share one workbook: the entry is written once.
+    if (!parts.some(([name]) => name === `word/embeddings/${embedding}`)) parts.push([`word/embeddings/${embedding}`, chart.workbook || workbook]);
   });
   return { rels, parts };
 }

@@ -175,7 +175,7 @@ test('xls drawings: the members of a group are placed by the coordinates of the 
   assert.equal((drawings?.[1].object as DrawingShape).fill, '#563412');
 });
 
-test('xls drawings: a chart is a placeholder, its substream is skipped; controls are not drawings', () => {
+test('xls drawings: a chart whose substream is no chart is a placeholder, its records are no cells of the sheet; controls are not drawings', () => {
   const chart = [bof(0x0020), number(5, 5, 555), rec(0x00ec, [1, 2, 3]), eof()];
   const records = drawingRecords([
     shape({ kind: 201, ot: 5, id: 1, extra: chart, props: [[0x0380, 'Chart 1']] }),
@@ -194,7 +194,8 @@ test('xls drawings: a chart is a placeholder, its substream is skipped; controls
   );
   assert.equal(getCell(sheet, 5, 5), undefined);
   assert.equal(getCell(sheet, 1, 1)?.value, 7);
-  assert.equal(sheet.warnings, undefined);
+  // A chart that is not read says so (see xls-chart.test.ts for the charts that are).
+  assert.deepEqual(sheet.warnings, ['Chart "Chart 1" is not shown: it holds no Chart record']);
 });
 
 test('xls drawings: a hidden shape is marked hidden and takes no place in the view', () => {

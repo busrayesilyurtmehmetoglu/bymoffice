@@ -63,8 +63,10 @@ test('convert: an xls workbook reports the sheets whose content is not in the mo
   const plain = await convertForEditing(await open(xlsFile(workbookStream({ sheets: [{ name: 'Data', records: sheet }] }))));
   assert.deepEqual([plain!.from, plain!.to, plain!.warnings], ['xls', 'xlsx', []]);
   const charted = await convertForEditing(await open(xlsFile(workbookStream({ sheets: [{ name: 'Data', records: sheet }, { name: 'Chart1', type: 2 }] }))));
-  assert.equal(charted!.warnings.length, 1);
+  // The chart sheet of the fixture holds no records of a chart: the sheet says that its chart is not shown, too.
+  assert.equal(charted!.warnings.length, 2);
   assert.match(charted!.warnings[0], /chart sheet/);
+  assert.match(charted!.warnings[1], /Sheet "Chart1" was read with a warning: The chart of the sheet is not shown/);
 
   assert.equal(await convertForEditing(await open(plain!.bytes)), undefined);
   const docx = await convertForEditing(await open(rtf('text')));

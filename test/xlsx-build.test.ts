@@ -334,6 +334,8 @@ test('xls to xlsx: a chart sheet and a macro sheet keep their names and places a
   assert.deepEqual(after.sheets[2].tabColor, { indexed: 10 });
   assert.deepEqual(report.warnings, [
     'Sheet: the content of a chart sheet is not in the model; it is written as an empty worksheet',
+    // The chart sheet of the fixture holds no records of a chart.
+    'Sheet "Grafik" was read with a warning: The chart of the sheet is not shown: it holds no Chart record',
     'Sheet: the content of a macro sheet is not in the model; it is written as an empty worksheet',
   ]);
   assert.equal(await workbookDifference(before, after), undefined);
@@ -419,6 +421,8 @@ test('xls to xlsx: pictures, shapes, groups and comments are written into drawin
   assert.deepEqual(report.warnings, [
     'Drawing: a picture whose bytes cannot be read (a metafile, or one missing from the file) is written as an empty frame',
     'Drawing: a chart is not in the model and is left out',
+    // The chart object of the fixture has no records of a chart after it.
+    'Sheet "Çizim" was read with a warning: Chart is not shown: no records of a chart follow its object',
   ]);
   assert.deepEqual(report.parts, pkg.partNames().concat('/[Content_Types].xml').sort((a, b) => report.parts.indexOf(a) - report.parts.indexOf(b)));
   assert.deepEqual(

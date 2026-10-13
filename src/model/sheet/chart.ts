@@ -391,6 +391,12 @@ export interface Chart {
    * the operations). Without it they are as the file has them.
    */
   live?: boolean;
+  /**
+   * Set by the reader of the old binary format (xls): the chart is shown and never written from
+   * its model. Its records were read by the specification alone, without a file of Excel to
+   * compare with; a workbook that is saved as xlsx leaves it out and says so.
+   */
+  shownOnly?: boolean;
   /** The chart types of the plot area, in the order of the file. Never empty. */
   groups: ChartGroup[];
   axes: ChartAxis[];
@@ -654,9 +660,9 @@ export function chartKindWritten(kind: ChartKind): boolean {
   return Object.prototype.hasOwnProperty.call(WRITTEN_KINDS, kind);
 }
 
-/** Whether a chart can be written from its model alone: every chart type of it is one the commands make, in its plain form. */
+/** Whether a chart can be written from its model alone: every chart type of it is one the commands make, in its plain form, and no reader said that it is only shown. */
 export function chartWritable(chart: Chart): boolean {
-  return !!chart && Array.isArray(chart.groups) && chart.groups.length > 0 && chart.groups.every((group) => chartKindWritten(group.kind) && !group.threeD && !group.ofPie);
+  return !!chart && chart.shownOnly !== true && Array.isArray(chart.groups) && chart.groups.length > 0 && chart.groups.every((group) => chartKindWritten(group.kind) && !group.threeD && !group.ofPie);
 }
 
 /** The chart types whose series are grouped (side by side, stacked, stacked to a hundred per cent). */

@@ -33,6 +33,7 @@ import type {
   StyleSheet,
   WorkbookMedia,
 } from '../../model/sheet/types';
+import type { XlsChartRead } from './chart';
 import { readerAt, type RecordStream } from './records';
 import { readString16, toSharedString, type RawString } from './strings';
 
@@ -245,6 +246,8 @@ export class XlsPictures {
 interface RawObject {
   type: number;
   id: number;
+  /** A chart: the offset of the BOF record of its substream, which follows the OBJ record. */
+  chart?: number;
 }
 
 interface RawText {
@@ -286,7 +289,12 @@ export interface XlsArtContext {
   /** Last row and column of the format. */
   maxRows: number;
   maxCols: number;
+  /** Reads the chart whose substream starts at the offset; undefined for a chart object no substream follows. Without it charts are placeholders. */
+  chart?(offset: number | undefined): XlsChartRead;
 }
+
+/** Warnings about single charts of one sheet; what goes wrong beyond them is counted in one line. */
+const MAX_CHART_WARNINGS = 20;
 
 /** The drawing of one sheet while its records are read, and what it comes to. */
 export class XlsSheetArt {
@@ -295,6 +303,9 @@ export class XlsSheetArt {
   private readonly texts: RawText[] = [];
   private readonly notes: RawNote[] = [];
   private skipped = 0;
+  /** Why charts of the sheet are placeholders, and how many more are. */
+  private readonly chartProblems: string[] = [];
+  private chartsUnsaid = 0;
 
   constructor(private readonly stream: RecordStream) {}
 
@@ -314,6 +325,13 @@ export class XlsSheetArt {
     if (this.objects.length >= XLS_MAX_SHAPES) return;
     if (length >= 8 && u16(b, d) === 0x15) this.objects.push({ type: u16(b, d + 4), id: u16(b, d + 6) });
     else this.objects.push({ type: -1, id: -1 });
+  }
+
+  /** The BOF record of a chart substream: the chart of the object record before it. */
+  chart(offset: number): void {
+    this.art.expect = -1;
+    const object = this.objects[this.objects.length - 1];
+    if (object && object.type === OT_CHART && object.chart === undefined) object.chart = offset;
   }
 
   /** A TXO record: the text of the shape before it, in the CONTINUE records that follow. */
@@ -419,6 +437,10 @@ export class XlsSheetArt {
     }
     if (comments.length > 0) out.comments = comments;
     if (this.skipped > 0) out.warnings = [`Drawing: ${this.skipped} object(s) could not be read and are not shown`];
+    if (this.chartProblems.length > 0) {
+      out.warnings = (out.warnings || []).concat(this.chartProblems);
+      if (this.chartsUnsaid > 0) out.warnings.push(`More charts that are not shown: ${this.chartsUnsaid}`);
+    }
     return out;
   }
 
@@ -545,7 +567,16 @@ export class XlsSheetArt {
       }
       return group;
     }
-    if (ot === OT_CHART) return { ...base, type: 'placeholder', what: 'chart' };
+    if (ot === OT_CHART) {
+      // A chart that cannot be read for certain stays a placeholder, and the sheet says why.
+      const read = context.chart ? context.chart(shape.object ? shape.object.chart : undefined) : undefined;
+      if (read && read.chart) return { ...base, type: 'chart', chart: read.chart };
+      if (read) {
+        if (this.chartProblems.length < MAX_CHART_WARNINGS) this.chartProblems.push(`Chart${base.name !== undefined ? ` "${base.name.slice(0, 40)}"` : ''} is not shown: ${read.problem || 'its records cannot be read'}`);
+        else this.chartsUnsaid++;
+      }
+      return { ...base, type: 'placeholder', what: 'chart' };
+    }
     if (ot === OT_GROUP) return undefined;
 
     const pib = shape.values.get(P_PICTURE);

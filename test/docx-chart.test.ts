@@ -1,6 +1,7 @@
 // Charts of a Word document: the reader finds the chart part of a frame and
 // reads it with the reader of the workbook charts (from the cached values; the
-// embedded workbook is never opened), the layout gives the frame the chart,
+// embedded workbook is opened only for a series without any, see
+// docx-chart-book.test.ts), the layout gives the frame the chart,
 // the painter draws it inside the frame, and nothing of it is written anew.
 
 import assert from 'node:assert/strict';
@@ -19,10 +20,11 @@ import { DocChartPainter } from '../src/render/doc-chart';
 import { cutLoses } from '../src/ui/doc-clipboard';
 import { documentText } from '../src/ui/doc-view';
 import { ZipArchive } from '../src/zip';
-import { title } from './chart-fixtures';
+import { sheetData, title } from './chart-fixtures';
 import { lay, p, r, tbl, tc, texts, tr, words } from './doc-layout-fixtures';
 import { chartParts, columnsChart, floatingChart, inlineChart, inlineChartDrawing, partRels } from './docx-chart-fixtures';
 import { buildDocx as buildSpec, THEME, type DocxSpec } from './docx-fixtures';
+import { buildXlsx, worksheetXml } from './fixtures';
 
 const CHART1 = '/word/charts/chart1.xml';
 
@@ -148,7 +150,7 @@ test('reader: two frames of one chart part read it once', async () => {
   assert.deepEqual(doc.warnings, []);
 });
 
-test('reader: a series without cached values is read, drawn empty and noted; the embedded workbook is not opened', async () => {
+test('reader: a series without cached values whose embedded workbook is no workbook is read, drawn empty and noted', async () => {
   const doc = await read({ body: p(inlineChart('rIdC1', 300, 200)), ...(await chartParts([{ rel: 'rIdC1', xml: columnsChart({ uncached: true }) }])) });
   const chart = (doc.charts as Map<string, Chart>).get(CHART1);
   assert.deepEqual(firstValues(chart), [null, null, null]);
@@ -481,6 +483,19 @@ test('painting: a chart without cached values paints its frame and no columns', 
   assert.equal(recorded.rects.filter((rect) => rect.fill === GREEN).length, 0);
   assert.ok(!recorded.rects.some((rect) => rect.fill === PLACEHOLDER), 'the chart is drawn, empty: no placeholder');
   assert.ok(recorded.clips.length > 0, 'the frame of the chart was painted');
+});
+
+test('painting: a chart without cached values paints the columns of the cells of its embedded workbook', async () => {
+  const workbook = await buildXlsx({ sheets: [{ name: 'Sheet1', xml: worksheetXml(sheetData([[null, 'Sales'], ['a', 50], ['b', 100], ['c', 25]])) }] });
+  const laid = await lay({ body: p(inlineChart('rIdC1', 300, 200)), ...(await chartParts([{ rel: 'rIdC1', xml: columnsChart({ uncached: true }), workbook }])) });
+  const recorded = recorder();
+  renderPage(recorded.ctx, laid.pages[0], { charts: new DocChartPainter({ cssFont }), background: null });
+  const bars = recorded.rects.filter((rect) => rect.fill === GREEN);
+  assert.equal(bars.length, 3);
+  // 50, 100, 25 on an axis from 0 to 100.
+  assert.ok(Math.abs(bars[0].height / bars[1].height - 0.5) < 0.02, `the first column is half the second: ${bars[0].height} / ${bars[1].height}`);
+  assert.ok(Math.abs(bars[2].height / bars[1].height - 0.25) < 0.02, `the third column is a quarter of the second: ${bars[2].height} / ${bars[1].height}`);
+  assert.deepEqual(recorded.texts.map((entry) => entry.text).filter((text) => /^[abc]$/.test(text)), ['a', 'b', 'c'], 'the categories are the cells');
 });
 
 // --------------------------------------------------------------- lossless

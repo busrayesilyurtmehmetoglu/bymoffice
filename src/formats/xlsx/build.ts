@@ -1406,7 +1406,8 @@ function objectXml(context: DrawingContext, object: DrawingObject, box: Box, dep
     // A chart of the kinds the commands make is written from its model, with the cells it shows cached as they are;
     // what its part held beside the model (formatting, extensions) is not in a file that is built anew.
     if (!chartWritable(object.chart)) {
-      context.notes.add('Drawing: a chart of a type that is not written from the model is left out');
+      // A chart a reader marked as only shown is left out whatever its type: the reason is where it came from.
+      context.notes.add(object.chart && object.chart.shownOnly === true ? 'Drawing: a chart read from an xls file is only shown and is left out' : 'Drawing: a chart of a type that is not written from the model is left out');
       return '';
     }
     if (object.part !== undefined && object.known !== 'all') context.notes.add('Drawing: a chart is written from the model; formatting its part held beside it is not kept');

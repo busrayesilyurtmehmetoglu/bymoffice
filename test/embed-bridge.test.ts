@@ -1258,9 +1258,10 @@ test('bridge: convert opens doc, RTF and xls for editing as docx and xlsx; loade
     } else {
       assert.deepEqual(loaded.sheets.map((sheet: { name: string }) => sheet.name), ['Old', 'Chart1']);
       assert.equal(f.views[0].readOnly, undefined);
-      // The chart sheet is not in the model.
-      assert.equal(loaded.warnings.length, 1);
+      // The chart sheet is written as an empty worksheet; the one of the fixture holds no chart that could be shown, either.
+      assert.equal(loaded.warnings.length, 2);
       assert.match(loaded.warnings[0], /chart sheet/);
+      assert.match(loaded.warnings[1], /The chart of the sheet is not shown/);
     }
     // It can be made read-only and editable again like any docx or xlsx.
     await bridge.receive({ type: 'setReadOnly', id: 'r', readOnly: false });

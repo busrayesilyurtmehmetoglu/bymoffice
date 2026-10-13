@@ -90,7 +90,8 @@ export type {
 export { readXlsx } from './formats/xlsx/workbook';
 export { readXls, readXlsWithReport, type XlsReadReport } from './formats/xls/workbook';
 export { readDocx, type DocxReadOptions } from './formats/docx/document';
-export { MAX_DOC_CHARTS, MAX_DOC_CHART_BYTES, MAX_DOC_CHART_POINTS, type DocChartLimits } from './formats/docx/charts';
+export { MAX_DOC_CHARTS, MAX_DOC_CHART_BOOKS, MAX_DOC_CHART_BOOKS_BYTES, MAX_DOC_CHART_BOOK_BYTES, MAX_DOC_CHART_BYTES, MAX_DOC_CHART_POINTS, type DocChartLimits } from './formats/docx/charts';
+export { XLS_MAX_CHART_CACHE_BYTES, XLS_MAX_CHART_DEPTH, XLS_MAX_CHART_RECORDS } from './formats/xls/chart';
 export { buildDocx, writeDocx, type DocxWriteReport } from './formats/docx/write';
 export { createBlank, type BlankOptions } from './formats/blank';
 export { convertForEditing, openConverted, type ConvertibleFile, type EditableConversion, type OpenedForEditing } from './formats/convert';

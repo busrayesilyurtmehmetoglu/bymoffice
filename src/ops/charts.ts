@@ -178,9 +178,14 @@ function sheetOf(workbook: Workbook, sheetIndex: number): Sheet {
   return sheet;
 }
 
+/** What every command says of a chart a reader marked as only shown (Chart.shownOnly): it is neither changed, moved nor deleted. */
+const SHOWN_ONLY = 'Cannot change this chart: it was read from an xls file and is only shown';
+
+/** The chart of a sheet a command is about to change. Throws RangeError when `id` names none, and for a chart that is only shown. */
 function chartAt(sheet: Sheet, id: number): { drawing: SheetDrawing; object: DrawingChart } {
   const drawing = sheet.drawings && Math.floor(id) === id ? sheet.drawings[id] : undefined;
   if (!drawing || !drawing.object || drawing.object.type !== 'chart') throw new RangeError(`No chart at index ${id}`);
+  if (drawing.object.chart && drawing.object.chart.shownOnly === true) throw new RangeError(SHOWN_ONLY);
   return { drawing, object: drawing.object };
 }
 
@@ -703,6 +708,7 @@ export function chartProblem(workbook: Workbook, sheetIndex: number, id: number,
   const drawing = sheet.drawings ? sheet.drawings[id] : undefined;
   if (!drawing || !drawing.object || drawing.object.type !== 'chart') return `No chart at index ${id}`;
   const object = drawing.object;
+  if (object.chart && object.chart.shownOnly === true) return SHOWN_ONLY;
   if (object.part !== undefined && object.known !== 'all' && object.known !== 'refs') return 'Cannot change this chart: its part holds references the model does not, so it is only moved and deleted';
   if (!patch) return undefined;
   try {
