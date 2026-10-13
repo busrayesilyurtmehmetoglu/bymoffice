@@ -324,6 +324,12 @@ export interface CollabOptions {
   token?: string;
   onState?(state: CollabState): void;
   onPeers?(peers: CollabPeer[]): void;
+  /**
+   * With `autoSave`: how long, in milliseconds, changes wait here for the one participant who saves for all,
+   * before this side saves them itself. At least 1000; by default five delays of auto-save and at least 15 seconds
+   * (a quarter more or less, so that two who wait do not save at the same moment).
+   */
+  saveWatchMs?: number;
 }
 
 /** What mount() answers for a workbook that is edited together. */
@@ -1361,13 +1367,19 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         readOnly: () => readOnlyNow(),
         // Edited together: one participant saves for all, and a conflict with a save of someone in the room is none.
         autoAllowed: () => (saveSync ? saveSync.autoAllowed() : true),
+        autoWaiting: () => (saveSync ? saveSync.waiting() : undefined),
         conflictWait: () => (saveSync ? saveSync.conflictWait() : Promise.resolve(false)),
         autoSave,
         info,
         strings: () => resolveUiStrings(options.locale),
         notice: (message, kind) => notice(message, kind),
-        onState: options.onSaveState,
+        onState: (state) => {
+          // What the bar of the room says of auto-save follows.
+          showRoom();
+          if (options.onSaveState) options.onSaveState(state);
+        },
         onSaved: (bytes) => {
+          if (saveSync) saveSync.ownSaved();
           sayShared(bytes);
           if (options.onSave) options.onSave(bytes);
         },
@@ -1394,6 +1406,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   /** The session, while the workbook is edited together; and the file that was written last, with the step it holds. */
   let session: CollabSession | undefined;
   let saveSync: SaveSync | undefined;
+  let showRoom: () => void = () => undefined;
+  let unstampedSaid = false;
   let written: { bytes: Uint8Array; rev: number | undefined } | undefined;
   /** Tells the others of a save that succeeded, when the bytes are the ones that were written last. */
   const sayShared = (bytes: Uint8Array, tag?: string): void => {
@@ -1412,6 +1426,11 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     const shared = session;
     if (!shared) return take();
     const done = await writeSharedFile(shared, file.package, take);
+    // The file could not be made to say which step it holds: saved all the same, and said once.
+    if (done.unstamped && !unstampedSaid) {
+      unstampedSaid = true;
+      notice(resolveUiStrings(options.locale).collab.noStamp, 'info');
+    }
     // A closed session tells nobody of its saves.
     if (shared.state !== 'closed') written = done;
     return done.bytes;
@@ -1434,6 +1453,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   const changed = () => {
     touched = true;
     if (controller) controller.changed();
+    // In a room this side's work waits for the one who saves for all, and not for ever.
+    if (saveSync) saveSync.localChanged();
   };
   const saveNow = (saveOptions?: SaveNowOptions): Promise<boolean> => (controller ? controller.saveNow(saveOptions) : Promise.resolve(false));
   // With `saveTo`: also text that is typed and in no change yet, which a user who leaves would lose.
@@ -1457,6 +1478,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         over = true;
         container.removeEventListener('keydown', onKeyDown, true);
         if (bound) bound.release();
+        if (saveSync) saveSync.stop();
         if (controller) controller.destroy();
         // The password of a protected file is not kept longer than its view.
         file.close();
@@ -1655,8 +1677,9 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   } else if (collabPlan && readBytes) {
     const plan = collabPlan;
     const show = (): void => {
-      if (session) mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending });
+      if (session) mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending, autoWaits: controller ? controller.state.autoWaits : undefined });
     };
+    showRoom = show;
     /** The file is loaded again from its address and shown in place (the room is at a version this side does not have). */
     const reload = async (): Promise<{ versions: string[]; stamp?: { ep: string; rev: number } }> => {
       if (typeof options.file !== 'string') throw new Error('The file has no address to load it from again');
@@ -1742,6 +1765,9 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
           target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials } : undefined,
           strong: strongETag,
           readOnly: () => mounted.view.readOnly,
+          // What this workbook would be written as now: with it a save of someone else is proven to hold the work done here.
+          watchMs: typeof plan.options.saveWatchMs === 'number' && plan.options.saveWatchMs >= 1000 ? plan.options.saveWatchMs : undefined,
+          ownBytes: async () => (session ? writeSharedFile(session, file.package, () => file.save()) : { bytes: new Uint8Array(0), rev: undefined }),
         })
       : undefined;
     session = new CollabSession(

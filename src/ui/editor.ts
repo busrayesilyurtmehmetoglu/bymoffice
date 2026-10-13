@@ -300,7 +300,7 @@ export class SpreadsheetEditor {
    * Shows the state of editing together and the other participants above the grid; undefined
    * takes the row away. Names are shown as text.
    */
-  setCollab(info: { state: CollabState; peers: readonly CollabPeer[]; pending: number } | undefined): void {
+  setCollab(info: { state: CollabState; peers: readonly CollabPeer[]; pending: number; autoWaits?: 'room' | 'offline' } | undefined): void {
     if (this.destroyed) return;
     if (!info) {
       if (this.collabBar && this.collabBar.parentNode) this.collabBar.parentNode.removeChild(this.collabBar);
@@ -328,6 +328,14 @@ export class SpreadsheetEditor {
     label.textContent = words.state[info.state];
     bar.appendChild(dot);
     bar.appendChild(label);
+    // Auto-save that holds still on purpose says so, and why.
+    if (info.autoWaits) {
+      bar.setAttribute('data-auto-waits', info.autoWaits);
+      const waits = document.createElement('span');
+      waits.className = 'bym-collab-auto';
+      waits.textContent = words.autoWaits[info.autoWaits];
+      bar.appendChild(waits);
+    } else bar.removeAttribute('data-auto-waits');
     const shown = info.peers.slice(0, 8);
     for (const peer of shown) {
       const name = peer.name !== undefined ? peer.name : words.guest(peer.guest);

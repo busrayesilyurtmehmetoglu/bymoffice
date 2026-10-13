@@ -34,7 +34,7 @@ function parseStamp(text: string): CollabStamp | undefined {
   return Number.isSafeInteger(rev) ? { ep: match[1], rev } : undefined;
 }
 
-const ours = (root: XmlElement): XmlElement | undefined => childElements(root, 'property').find((property) => property.attrs.get('name') === NAME);
+const ours = (root: XmlElement): XmlElement[] => childElements(root, 'property').filter((property) => property.attrs.get('name') === NAME);
 
 /** The stamp a file carries; undefined when it has none, or one that is not as this module writes it. */
 export async function readCollabStamp(pkg: OpcPackage): Promise<CollabStamp | undefined> {
@@ -43,8 +43,10 @@ export async function readCollabStamp(pkg: OpcPackage): Promise<CollabStamp | un
     if (!part) return undefined;
     const bytes = await pkg.readPart(part);
     if (bytes.length > MAX_PART_BYTES) return undefined;
-    const property = ours(parseXml(bytes).root);
-    if (!property) return undefined;
+    const all = ours(parseXml(bytes).root);
+    // Two of the name: there is no saying which is meant, and the file says nothing.
+    if (all.length !== 1) return undefined;
+    const property = all[0];
     let text = '';
     for (const value of childElements(property)) for (const node of value.children) if (node.type === 'text') text += node.value;
     return parseStamp(text);
@@ -57,57 +59,74 @@ export async function readCollabStamp(pkg: OpcPackage): Promise<CollabStamp | un
 /**
  * Writes the stamp into the package, or takes it out (`undefined`). The part and its
  * relationship are made when the file has none; a file without a stamp is not touched when
- * there is none to write.
+ * there is none to write. False when the file could not be made to say it: its part of custom
+ * properties is too large or cannot be read (it is left exactly as it is, and no stamp is read
+ * from such a part either).
  */
-export async function writeCollabStamp(pkg: OpcPackage, stamp: CollabStamp | undefined): Promise<void> {
+export async function writeCollabStamp(pkg: OpcPackage, stamp: CollabStamp | undefined): Promise<boolean> {
   const text = stamp ? `${stamp.ep}:${stamp.rev}` : undefined;
   if (text !== undefined && !parseStamp(text)) throw new RangeError('The stamp of the room is not one');
   const part = await partOf(pkg);
   if (part) {
-    const bytes = await pkg.readPart(part);
-    if (bytes.length > MAX_PART_BYTES) return;
-    const doc = parseXml(bytes);
+    let doc;
+    try {
+      const bytes = await pkg.readPart(part);
+      if (bytes.length > MAX_PART_BYTES) return text === undefined;
+      doc = parseXml(bytes);
+    } catch {
+      // Not XML this engine reads (or with a DTD, which it never reads): not a byte of it is touched.
+      return text === undefined;
+    }
     const root = doc.root;
     const had = ours(root);
     if (text === undefined) {
-      if (!had) return;
-      root.children = root.children.filter((node) => node !== had);
+      if (had.length === 0) return true;
+      root.children = root.children.filter((node) => had.indexOf(node as XmlElement) < 0);
       pkg.writePart(part, doc);
-      return;
+      return true;
     }
+    if (had.length === 1) {
+      const only = had[0];
+      const values = childElements(only);
+      const now = values.map((child) => (child.children.length === 1 && child.children[0].type === 'text' ? child.children[0].value : '')).join('');
+      if (now === text && values.length === 1 && localName(values[0].name) === 'lpwstr') return true;
+      only.attrs.set('xmlns:vt', NS_VT);
+      only.children = [{ type: 'element', name: 'vt:lpwstr', attrs: new Map(), children: [{ type: 'text', value: text }] }];
+      pkg.writePart(part, doc);
+      return true;
+    }
+    // None, or several of the name (then none of them is kept).
+    if (had.length > 0) root.children = root.children.filter((node) => had.indexOf(node as XmlElement) < 0);
     const prefix = root.name.indexOf(':') >= 0 ? root.name.slice(0, root.name.indexOf(':') + 1) : '';
-    let pid = 1;
-    for (const property of childElements(root, 'property')) {
-      const n = Number(property.attrs.get('pid'));
-      if (Number.isSafeInteger(n) && n > pid) pid = n;
-    }
-    const value: XmlElement = { type: 'element', name: 'vt:lpwstr', attrs: new Map(), children: [{ type: 'text', value: text }] };
-    if (had) {
-      const now = childElements(had).map((child) => (child.children.length === 1 && child.children[0].type === 'text' ? child.children[0].value : '')).join('');
-      if (now === text && localName(childElements(had)[0]?.name || '') === 'lpwstr') return;
-      had.attrs.set('xmlns:vt', NS_VT);
-      had.children = [value];
-    } else {
-      root.children.push({
-        type: 'element',
-        name: `${prefix}property`,
-        attrs: new Map([
-          ['xmlns:vt', NS_VT],
-          ['fmtid', FMTID],
-          ['pid', String(pid + 1)],
-          ['name', NAME],
-        ]),
-        children: [value],
-      });
-    }
+    // The least number from 2 that no property has (they are 32-bit numbers: "one more than the largest" may be none).
+    const taken = new Set<number>();
+    for (const property of childElements(root, 'property')) taken.add(Number(property.attrs.get('pid')));
+    let pid = 2;
+    while (taken.has(pid)) pid++;
+    root.children.push({
+      type: 'element',
+      name: `${prefix}property`,
+      attrs: new Map([
+        ['xmlns:vt', NS_VT],
+        ['fmtid', FMTID],
+        ['pid', String(pid)],
+        ['name', NAME],
+      ]),
+      children: [{ type: 'element', name: 'vt:lpwstr', attrs: new Map(), children: [{ type: 'text', value: text }] }],
+    });
     pkg.writePart(part, doc);
-    return;
+    return true;
   }
-  if (text === undefined) return;
+  if (text === undefined) return true;
   // No custom properties yet: the part, what declares it, and the relationship that leads to it.
   const relsPart = '/_rels/.rels';
-  if (!pkg.hasPart(relsPart) || pkg.hasPart(DEFAULT_PART)) return;
-  const rels = await pkg.readXml(relsPart);
+  if (!pkg.hasPart(relsPart) || pkg.hasPart(DEFAULT_PART)) return false;
+  let rels;
+  try {
+    rels = await pkg.readXml(relsPart);
+  } catch {
+    return false;
+  }
   const ids = new Set(childElements(rels.root, 'Relationship').map((rel) => rel.attrs.get('Id') || ''));
   let n = ids.size + 1;
   while (ids.has(`rId${n}`)) n++;
@@ -125,6 +144,7 @@ export async function writeCollabStamp(pkg: OpcPackage, stamp: CollabStamp | und
   const encoder = new TextEncoder();
   pkg.writePart(DEFAULT_PART, encoder.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="${NS}" xmlns:vt="${NS_VT}"><property fmtid="${FMTID}" pid="2" name="${NAME}"><vt:lpwstr>${text}</vt:lpwstr></property></Properties>`), CONTENT_TYPE);
   pkg.writePart(relsPart, rels);
+  return true;
 }
 
 /** What writing a file needs of a session a workbook is edited together in. */
@@ -146,7 +166,7 @@ export interface StampingSession {
  * this participant waited, or was typed while the file was written): such a file says nothing
  * of itself.
  */
-export async function writeSharedFile(session: StampingSession, pkg: OpcPackage | undefined, take: () => Promise<Uint8Array>): Promise<{ bytes: Uint8Array; rev: number | undefined }> {
+export async function writeSharedFile(session: StampingSession, pkg: OpcPackage | undefined, take: () => Promise<Uint8Array>): Promise<{ bytes: Uint8Array; rev: number | undefined; unstamped?: true }> {
   if (session.state === 'closed') {
     // On its own for good: the file is of no room any more.
     if (pkg) await writeCollabStamp(pkg, undefined);
@@ -161,7 +181,13 @@ export async function writeSharedFile(session: StampingSession, pkg: OpcPackage 
     let bytes: Uint8Array;
     let touched = false;
     try {
-      if (pkg) await writeCollabStamp(pkg, stamp);
+      if (pkg && stamp !== undefined && !(await writeCollabStamp(pkg, stamp))) {
+        // The file cannot be made to say its step (its custom properties cannot be read): it is saved all the same,
+        // as the file of no step, and whoever opens it joins as with any file the room has not saved.
+        bytes = await take();
+        return { bytes, rev: undefined, unstamped: true };
+      }
+      if (pkg && stamp === undefined) await writeCollabStamp(pkg, undefined);
       bytes = await take();
     } finally {
       touched = session.resume();

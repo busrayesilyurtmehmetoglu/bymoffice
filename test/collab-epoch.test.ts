@@ -283,3 +283,77 @@ test(`rooms that are forgotten at any moment: in the end everybody is in one roo
   }
   assert.ok(choices > 0, 'conflicts happened, and were asked about');
 });
+
+test('over a transport of the application (no way to connect anew) a file the room has not heard of leaves the room and joins again, and gets in once the room has saved', async () => {
+  const { CollabSession } = await import('../src/collab/session');
+  const { open } = await import('../src/index');
+  const { readCollabStamp } = await import('../src/formats/xlsx/collab-stamp');
+  const bytes = await startFile();
+  const net = new Net({ syncPerMinute: 100000 } as object);
+  const random = seeded(9);
+  let stored = bytes;
+  let a: Member;
+  // eslint-disable-next-line prefer-const
+  a = await join(net, 'a', bytes, {
+    onSync: () => {
+      void saveOf(a).then((saved) => {
+        stored = saved;
+        a.session.announceSaved([contentVersion(saved)], a.session.savableRev);
+      });
+    },
+  });
+  net.drain(random);
+  act(a, () => setCellInput(a.wb, 0, 12, 1, 'one'));
+  net.drain(random);
+  // Saved with the room and the step in it, but the room was never told of the save (or did not write it down).
+  stored = await saveOf(a);
+  let file = await open(stored);
+  let wb = await file.workbook();
+  const inner = net.server.connect();
+  inner.onState!(() => undefined);
+  const sent: string[] = [];
+  const got: string[] = [];
+  const notices: string[] = [];
+  // Only what the contract asks of a transport: send, onMessage, close.
+  const plain = {
+    send: (text: string) => {
+      sent.push(JSON.parse(text).t);
+      inner.send(text);
+    },
+    onMessage: (listener: (text: string) => void) =>
+      inner.onMessage((text) => {
+        const message = JSON.parse(text) as { t: string; code?: string };
+        got.push(message.code ? `${message.t}:${message.code}` : message.t);
+        listener(text);
+      }),
+    close: () => inner.close(),
+  };
+  let timers: (() => void)[] = [];
+  const session = new CollabSession(
+    {
+      workbook: () => wb,
+      changed: () => undefined,
+      notice: (notice) => void notices.push(notice.code),
+      unsaved: () => false,
+      reload: async () => {
+        file = await open(stored);
+        wb = await file.workbook();
+        return { versions: [contentVersion(stored)], stamp: await readCollabStamp(file.package!) };
+      },
+    },
+    { transport: plain, versions: [contentVersion(stored)], stamp: await readCollabStamp(file.package!), timer: (run) => (timers.push(run), () => undefined) },
+  );
+  for (let round = 0; round < 60 && session.state !== 'online'; round++) {
+    net.drain(random);
+    await new Promise((resolve) => setImmediate(resolve));
+    const due = timers;
+    timers = [];
+    for (const run of due) run();
+  }
+  assert.equal(got.indexOf('error:bad-message'), -1, `no second "join" from a connection that is in a room: sent ${sent.join()} | got ${got.join()}`);
+  assert.deepEqual(sent.slice(0, 3), ['join', 'leave', 'join'], 'out of the room it does not trust, then in again without the word of the file');
+  assert.equal(session.state, 'online', `in the end it is in the room: got ${got.join()}; said ${notices.join()}`);
+  act(a, () => setCellInput(a.wb, 0, 13, 1, 'two'));
+  net.drain(random);
+  assert.equal(canon(wb), canon(a.wb), 'with the workbook of the room');
+});

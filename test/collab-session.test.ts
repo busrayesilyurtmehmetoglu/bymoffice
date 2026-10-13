@@ -1062,3 +1062,29 @@ test('undo waits for what is on its way, is told when it does not get its turn, 
   assert.ok(s.session.redo(), 'what was undone is made again');
   assert.equal(value(s.wb, 0, 30, 0), 'first', 'the first step is back');
 });
+
+test('the relay of the page: an empty room that is started again on another file is another room; on its own file it is the room it was', async () => {
+  const { MemoryServer } = await import('../src/collab/server');
+  const queue: (() => void)[] = [];
+  const server = new MemoryServer({ deliver: (run) => queue.push(run) });
+  const visit = (join: object): { ep?: string; from?: number; t: string } => {
+    const raw = server.connect();
+    const got: { t: string; ep?: string; from?: number }[] = [];
+    raw.onMessage((text) => got.push(JSON.parse(text)));
+    raw.onState!((state) => {
+      if (state === 'open') raw.send(JSON.stringify(join));
+    });
+    while (queue.length > 0) queue.shift()!();
+    raw.close();
+    while (queue.length > 0) queue.shift()!();
+    return got[0];
+  };
+  const first = visit({ t: 'join', pv: 2, v: ['file-1'], key: 'a' });
+  const same = visit({ t: 'join', pv: 2, v: ['file-1'], key: 'b' });
+  const other = visit({ t: 'join', pv: 2, v: ['file-2'], key: 'c' });
+  const back = visit({ t: 'join', pv: 2, v: ['file-1'], key: 'a', since: 0, ep: first.ep });
+  assert.deepEqual([first.t, same.t, other.t], ['hello', 'hello', 'hello'], 'each of them starts the empty room');
+  assert.equal(same.ep, first.ep, 'on the file it was started with, it is the room it was');
+  assert.notEqual(other.ep, first.ep, 'on another file it is another room');
+  assert.notEqual(back.ep, first.ep, 'and who comes back to the room before it is not in that room: the name says so');
+});

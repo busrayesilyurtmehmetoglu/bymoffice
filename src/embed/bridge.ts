@@ -1934,7 +1934,7 @@ export function createBridge(host: BridgeHost): Bridge {
       onState: (state) => {
         const current = shown;
         if (!current || current.saver !== mine) return;
-        send({ type: 'saveState', dirty: state.dirty, saving: state.saving });
+        send(state.autoWaits ? { type: 'saveState', dirty: state.dirty, saving: state.saving, autoWaits: state.autoWaits } : { type: 'saveState', dirty: state.dirty, saving: state.saving });
       },
     });
     return mine;

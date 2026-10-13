@@ -4,6 +4,8 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join as joinPath } from 'node:path';
 import { test } from 'node:test';
 import { ZipArchive, open } from '../src/index';
 import { contentVersion } from '../src/collab/protocol';
@@ -141,7 +143,7 @@ const NASTY = ['"><x y="', ']]>', '&amp;<&>', "it's", ' lead and trail ', '<!--'
 
 function python(): boolean {
   try {
-    execFileSync('python3', ['-c', 'import xml.etree.ElementTree'], { stdio: 'ignore', timeout: 60000 });
+    execFileSync('python3', ['-I', '-c', 'import xml.etree.ElementTree'], { stdio: 'ignore', timeout: 60000 });
     return true;
   } catch {
     return false;
@@ -156,6 +158,7 @@ test('whatever steps arrive, the file that is saved is well formed and opens', a
   const pick = <T>(list: readonly T[]): T => list[Math.floor(random() * list.length)];
   const int = (low: number, high: number): number => low + Math.floor(random() * (high - low + 1));
   const text = (): string => pick(NASTY);
+  const parts: { [name: string]: string } = {};
   for (let run = 0; run < 25; run++) {
     const net = new Net();
     const a: Member = await join(net, 'a', bytes);
@@ -191,10 +194,20 @@ test('whatever steps arrive, the file that is saved is well formed and opens', a
     assert.equal(again.sheets.length, a.wb.sheets.length, `run ${run}: the file opens with its sheets`);
     if (withPython) {
       const zip = ZipArchive.read(saved);
-      const parts: { [name: string]: string } = {};
-      for (const name of zip.names()) if (/\.(xml|rels|vml)$/.test(name)) parts[name] = Buffer.from(await zip.read(name)).toString('base64');
-      const out = execFileSync('python3', ['-c', 'import sys,json,base64\nimport xml.etree.ElementTree as E\nbad=[]\nfor k,v in json.load(sys.stdin).items():\n  try:\n    E.fromstring(base64.b64decode(v))\n  except Exception as e:\n    bad.append(k+": "+str(e))\nprint(json.dumps(bad))'], { input: JSON.stringify(parts), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60000 });
-      assert.deepEqual(JSON.parse(out), [], `run ${run}: every part is well formed, namespaces and all`);
+      for (const name of zip.names()) if (/\.(xml|rels|vml)$/.test(name)) parts[`run ${run}: ${name}`] = Buffer.from(await zip.read(name)).toString('base64');
+    }
+  }
+  if (withPython) {
+    // One reader for the parts of all runs, which reads them from a file: a process that is handed megabytes on
+    // its standard input now and then never answers. The file lies beside the tests and is gone afterwards.
+    const dir = mkdtempSync(joinPath(process.cwd(), 'test', '.hostile-'));
+    try {
+      const file = joinPath(dir, 'parts.json');
+      writeFileSync(file, JSON.stringify(parts));
+      const out = execFileSync('python3', ['-I', '-c', 'import sys,json,base64\nimport xml.etree.ElementTree as E\nbad=[]\nfor k,v in json.load(open(sys.argv[1])).items():\n  try:\n    E.fromstring(base64.b64decode(v))\n  except Exception as e:\n    bad.append(k+": "+str(e))\nprint(json.dumps(bad))', file], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 120000, stdio: ['ignore', 'pipe', 'inherit'] });
+      assert.deepEqual(JSON.parse(out), [], 'every part of every run is well formed, namespaces and all');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   }
 });

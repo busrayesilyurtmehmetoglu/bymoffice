@@ -84,13 +84,14 @@ export interface CollabServerOptions {
   syncPerMinute?: number;
   /**
    * Saves a minute of one connection that are written to the table of versions (a bucket of as many tokens);
-   * over it a `saved` is passed on without its `rev`. Default 6; 0 is no limit.
+   * over it a `saved` is passed on without its `rev`, and a client that comes back with that file is not told
+   * that the room has heard of it. Default 40, above the thirty a minute a client saves by itself; 0 is no limit.
    */
   savedPerMinute?: number;
   /**
    * Saves a minute of a whole room, whoever says them, that are written to the table of versions (a bucket of
    * as many tokens, beside that of every connection); over it a `saved` is passed on without its `rev`.
-   * Default 30; 0 is no limit.
+   * Default 120; 0 is no limit.
    */
   roomSavedPerMinute?: number;
   /**
@@ -100,8 +101,10 @@ export interface CollabServerOptions {
    */
   formatsPerMinute?: number;
   /**
-   * How many versions that left its table a room remembers, so that they are never written again. When it
-   * remembers that many it writes no new version at all. Default 4096; with 0 no save is ever written down.
+   * How many versions that left its table a room remembers, so that they are not written again: the latest
+   * that left. When another leaves after that, the one that left longest ago is forgotten and may be written
+   * like a version the room never had; the room goes on writing new versions. Default 4096; with 0 no `saved`
+   * is written to the table.
    */
   maxEvictedVersions?: number;
   /**

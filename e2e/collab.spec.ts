@@ -32,6 +32,7 @@ interface Spec {
   readOnly?: boolean;
   saveTo?: boolean;
   autoSave?: boolean;
+  watch?: number;
 }
 
 function mount(page: Page, spec: Spec): Promise<string> {
@@ -53,6 +54,7 @@ function mount(page: Page, spec: Spec): Promise<string> {
     }
     collab.user = { name: given.name, color: given.color };
     collab.onState = (state: string) => w.__states.push(state);
+    if (given.watch) collab.saveWatchMs = given.watch;
     const options: any = {
       file: typeof given.file === 'string' ? given.file : new Uint8Array(given.file),
       locale: 'en',
@@ -101,7 +103,7 @@ function pixelsOf(page: Page, colour: string): Promise<number> {
 }
 
 /** Two pages on one file and one room; the first one holds the room unless the relay of the server does. */
-async function pair(context: BrowserContext, page: Page, request: APIRequestContext, options: { socket?: boolean; saveTo?: boolean; autoSave?: boolean; second?: Partial<Spec> } = {}): Promise<{ a: Page; b: Page; url: string; room: string }> {
+async function pair(context: BrowserContext, page: Page, request: APIRequestContext, options: { socket?: boolean; saveTo?: boolean; autoSave?: boolean; first?: Partial<Spec>; second?: Partial<Spec> } = {}): Promise<{ a: Page; b: Page; url: string; room: string }> {
   const room = unique();
   const url = `/e2e/saved/${room}.xlsx`;
   await seed(request, url, await createBlank('xlsx', { sheetName: 'Data' }));
@@ -114,7 +116,7 @@ async function pair(context: BrowserContext, page: Page, request: APIRequestCont
   (b as any).__problems = problems;
   await page.goto(PAGE);
   await b.goto(PAGE);
-  expect(await mount(page, { file: url, room, via: options.socket ? 'socket' : 'host', name: 'Ada', color: RED, saveTo: options.saveTo, autoSave: options.autoSave })).toBe('ok');
+  expect(await mount(page, { file: url, room, via: options.socket ? 'socket' : 'host', name: 'Ada', color: RED, saveTo: options.saveTo, autoSave: options.autoSave, ...options.first })).toBe('ok');
   expect(await mount(b, { file: url, room, via: options.socket ? 'socket' : 'tab', name: 'Ben', color: BLUE, saveTo: options.saveTo, autoSave: options.autoSave, ...options.second })).toBe('ok');
   await online(page);
   await online(b);
@@ -503,5 +505,30 @@ test('what is being typed when the file is loaded again is said back, not lost w
   await expect.poll(() => notices(b), { message: 'the text is said back' }).toContainEqual(expect.stringMatching(/what you were typing was not applied\. You typed: half a sentence/));
   await online(b);
   expect(await cell(b, 5, 0), 'and it is in no cell').toBe(null);
+  clean(b);
+});
+
+test('the one who would save for all has auto-save off: the other says that it waits, then saves its work itself', async ({ page, context, request }) => {
+  const { a, b, url } = await pair(context, page, request, { saveTo: true, first: { autoSave: false }, second: { autoSave: true, watch: 1500 } });
+  // Which page saves for all is the relay's to say: the test needs the one without auto-save to be it.
+  const leads = await b.evaluate(() => {
+    const collab = (window as any).__mounted.collab;
+    return collab.peers.every((peer: { id: string }) => collab.user.id < peer.id);
+  });
+  test.skip(leads, 'the page with auto-save is the one that saves for all in this run');
+  const errors: string[] = [];
+  b.on('response', (response) => {
+    if (response.request().method() === 'PUT' && response.status() >= 400) errors.push(String(response.status()));
+  });
+  await type(b, 2, 0, 'nobody saves this for me');
+  await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-auto-waits', 'room');
+  await expect(b.locator('#editor .bym-collab-auto')).toHaveText('Not saved yet: another participant saves for all');
+  await expect.poll(() => b.evaluate(() => (window as any).__mounted.hasUnsavedChanges), { message: 'the work is saved by the page itself after a while', timeout: 15000 }).toBe(false);
+  const answer = await request.get(url);
+  const book = await (await open(new Uint8Array(await answer.body()))).workbook();
+  expect(getCell(book.sheets[0], 2, 0)?.value, 'the stored file holds it').toBe('nobody saves this for me');
+  await expect(b.locator('#editor .bym-collab')).not.toHaveAttribute('data-auto-waits', 'room');
+  expect(errors, 'no save was refused').toEqual([]);
+  expect(await a.evaluate(() => (window as any).__errors), 'the other page heard of no error').toEqual([]);
   clean(b);
 });

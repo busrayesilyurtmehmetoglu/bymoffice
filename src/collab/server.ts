@@ -89,6 +89,21 @@ export interface MemoryTransport extends CollabTransport {
   resume(): void;
 }
 
+/**
+ * Remembers a version that left the table, among the latest 4096 that did: the oldest of them is forgotten
+ * when there are more. (The table lets nobody into a room: a version that is written again long after it
+ * left does no harm, while a room that stopped writing versions down would keep out whoever comes back
+ * with a file it saved.)
+ */
+function forget(gone: Set<string>, version: string): void {
+  gone.delete(version);
+  if (gone.size >= 4096) {
+    const oldest = gone.values().next();
+    if (!oldest.done) gone.delete(oldest.value);
+  }
+  gone.add(version);
+}
+
 let epochs = 0;
 /** A name for a room that is started: no two rooms of a page, or of two pages, are likely to share one. */
 function epochName(): string {
@@ -152,6 +167,14 @@ export class MemoryServer {
       return;
     }
     if (message.t === 'ping') return this.say(connection, { t: 'pong' });
+    if (message.t === 'leave') {
+      // Out of its room, and free to join that room again (and no other) over this connection.
+      const left = connection.room;
+      if (!left) return;
+      this.leaveRoom(connection);
+      connection.refused = left.key;
+      return;
+    }
     if (message.t === 'join') {
       const key = message.room !== undefined ? `#${message.room}` : '';
       // One room per connection: who is in a room stays there, and who was told to load its file again joins that room.
@@ -270,7 +293,7 @@ export class MemoryServer {
       room.versions.forEach((rev, version) => {
         if (rev >= room.floor) return;
         room.versions.delete(version);
-        if (room.gone.size < 4096) room.gone.add(version);
+        forget(room.gone, version);
       });
       room.members.forEach((other) => this.say(other, { t: 'op', rev: entry.rev, id: entry.id, from: entry.from, ops: entry.ops }));
       return;
@@ -293,7 +316,6 @@ export class MemoryServer {
       for (const version of message.v) {
         if (room.gone.has(version) || (room.versions.has(version) && room.versions.get(version) !== claimed)) rev = undefined;
       }
-      if (rev !== undefined && room.gone.size >= 4096 && message.v.some((version) => !room.versions.has(version))) rev = undefined;
       if (rev !== undefined) {
         for (const version of message.v) if (!room.versions.has(version)) room.versions.set(version, rev);
         room.latest = message.v.slice();
@@ -305,7 +327,7 @@ export class MemoryServer {
           });
           if (oldest === undefined) break;
           room.versions.delete(oldest);
-          room.gone.add(oldest);
+          forget(room.gone, oldest);
         }
       }
       room.members.forEach((other) => {

@@ -35,13 +35,22 @@
 // it lives. It holds sixteen versions; the oldest save makes room, the versions
 // of the foundation and those of the last save that was written never do. A
 // version that left the table (it was full, or the log moved past its
-// revision) is remembered, and is never written again at any revision: the room
-// has not heard of it any more, whoever names it. A room remembers
-// `maxEvictedVersions` of them; from then on it writes no new version at all. A
-// `saved` whose revision the table contradicts, that names a version that left,
-// that comes after the room stopped writing, or faster than `savedPerMinute`
-// for its connection or than `roomSavedPerMinute` for the room (all its
+// revision) is remembered, and is not written again at any revision while it
+// is: the room has not heard of it any more, whoever names it. A room
+// remembers the latest `maxEvictedVersions` (4096) that left; when another
+// leaves after that, the one that left longest ago is forgotten, and may be
+// written like a version the room never had. The room goes on writing new
+// versions however many have left. (Nobody gets into the room on the word of
+// the table, so that this does no harm; a room that stopped writing would keep
+// out everyone who comes back with a file that was saved in it.) With
+// `maxEvictedVersions` 0 no `saved` is written to the table at all. A `saved`
+// whose revision the table contradicts, that names a version the room
+// remembers as one that left, or that comes faster than `savedPerMinute` (40)
+// for its connection or than `roomSavedPerMinute` (120) for the room (all its
 // connections together), is passed on WITHOUT its `rev`, and writes nothing.
+// The rates are above what a client saves by itself (every two seconds at
+// most, thirty a minute): a save that is not written is not in the `v` of the
+// `hello` of the client that comes back with that very file.
 //
 // What the table is for. It is what those who may write have SAID, so nobody
 // gets into the room on its word (see the rules of `join`). It decides the
@@ -89,6 +98,12 @@
 //      write (it did not ask for `ro`, and `authorize` did not say read-only),
 //      those in the room who may write are sent `sync`: a save of theirs gives
 //      the newcomer a version to load. A room is asked `syncPerMinute` times.
+//
+// A connection that is in a room and has to join it anew (its client does not
+// trust what it joined with, and cannot make a new connection) sends
+// `{ "t": "leave" }`: it is out of the room, the others are told `left`, and it
+// may join that room again as after `reset`. From a connection that is in no
+// room, `leave` is nothing.
 //
 // Use as a library:
 //   import { createCollabServer } from './collab-server.mjs';
@@ -162,12 +177,12 @@ const DEFAULTS = {
   /** 0: no limit. */
   syncPerMinute: 2,
   /** 0: no limit. */
-  savedPerMinute: 6,
+  savedPerMinute: 40,
   /** 0: no limit. */
-  roomSavedPerMinute: 30,
+  roomSavedPerMinute: 120,
   /** 0: no limit. */
   formatsPerMinute: 2000,
-  /** 0: no save is ever written down. */
+  /** 0: no `saved` is written to the table. */
   maxEvictedVersions: 4096,
 };
 
@@ -881,17 +896,24 @@ export function createCollabServer(options = {}) {
   }
 
   /**
-   * Remembers that a version left the table: it is never written again. Once
-   * the room remembers as many as it may, it writes no version at all any more
-   * (see `sealed`), and so has no need to remember what leaves after that.
+   * Remembers that a version left the table: it is not written again while it
+   * is remembered. The memory is of the latest `maxEvictedVersions` that left:
+   * the one that left longest ago goes when it is full. (The table lets nobody
+   * in, so that a version which is forgotten twice over does no harm; a room
+   * that stopped writing versions down would keep out everyone who comes back
+   * with a file it saved.)
    */
   function forget(room, version) {
-    if (room.evicted.size < opt.maxEvictedVersions) room.evicted.add(version);
-  }
-
-  /** The room can no longer tell a version that left its table from one it never had: nothing new is written. */
-  function sealed(room) {
-    return room.evicted.size >= opt.maxEvictedVersions;
+    // A room that is to remember nothing writes nothing down (see `onSaved`).
+    if (!(opt.maxEvictedVersions > 0)) return;
+    room.evicted.delete(version);
+    if (room.evicted.size >= opt.maxEvictedVersions) {
+      for (const oldest of room.evicted) {
+        room.evicted.delete(oldest);
+        break;
+      }
+    }
+    room.evicted.add(version);
   }
 
   /**
@@ -940,7 +962,7 @@ export function createCollabServer(options = {}) {
     room.log.splice(0, count);
     // A version that was founded on stays in `founding`: it cannot be joined
     // from any more, and it cannot be given another revision either. Neither
-    // can a version of a save, which is remembered as one that left.
+    // can a version of a save, for as long as it is remembered as one that left.
     for (const [version, rev] of room.versions) {
       if (rev >= room.floor) continue;
       room.versions.delete(version);
@@ -1005,6 +1027,7 @@ export function createCollabServer(options = {}) {
       else if (message.t === 'presence') fine = onPresence(conn, message);
       else if (message.t === 'saved') fine = onSaved(conn, message);
       else if (message.t === 'ping') fine = send(conn, { t: 'pong' }) || true;
+      else if (message.t === 'leave') fine = onLeave(conn);
       else fine = false;
     } catch (error) {
       // What cannot be written back (too deep for the stack, say) is refused.
@@ -1127,7 +1150,7 @@ export function createCollabServer(options = {}) {
       versions: new Map(),
       /** The versions of the first to come: revision 0, whatever anyone says later. */
       founding: new Set(),
-      /** Versions that left the table (it was full, or the log moved past them): never written again. */
+      /** The latest versions that left the table (it was full, or the log moved past them), oldest first: not written again. */
       evicted: new Set(),
       /** The versions of the last save that was written down: they do not make room in a full table. */
       lastSaved: new Set(),
@@ -1299,6 +1322,20 @@ export function createCollabServer(options = {}) {
     return false;
   }
 
+  /**
+   * `leave`: out of the room over a connection that stays open, for a client
+   * that has to join again and cannot make a new connection. As after `reset`:
+   * the connection may join that room again, and no other, within `joinTimeoutMs`.
+   */
+  function onLeave(conn) {
+    const room = conn.room;
+    if (!room) return true;
+    leave(conn);
+    conn.resetFrom = room.key;
+    startJoinTimer(conn);
+    return true;
+  }
+
   function onSaved(conn, message) {
     const versions = versionList(message.v, 1);
     if (!versions) return false;
@@ -1317,7 +1354,8 @@ export function createCollabServer(options = {}) {
       if (!unknown) {
         // It says what the table says: there is nothing to write.
         out.rev = rev;
-      } else if (!sealed(room) && maySave(conn, room)) {
+      } else if (opt.maxEvictedVersions > 0 && maySave(conn, room)) {
+        // With `maxEvictedVersions` 0 no `saved` is written to the table.
         room.lastSaved = new Set(versions);
         for (const version of versions) setVersion(room, version, rev);
         out.rev = rev;

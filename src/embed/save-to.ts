@@ -151,6 +151,12 @@ export interface SaveState {
    * save could be guarded with. Only there, as true, when it holds.
    */
   autoPaused?: boolean;
+  /**
+   * Auto-save holds still on purpose, with something to save. "room": the file is edited together and another
+   * participant saves for all (this side saves by itself when that does not happen in a while). "offline": the room
+   * cannot be reached, and a file written now would be of no step of it. The Save button works as ever.
+   */
+  autoWaits?: 'room' | 'offline';
 }
 
 export type SaveErrorCode =
@@ -533,6 +539,8 @@ export interface SaveHost {
    * Without it auto-save is this side's alone to do.
    */
   autoAllowed?(): boolean;
+  /** Why auto-save holds still when autoAllowed() says no: told in the state (SaveState.autoWaits). */
+  autoWaiting?(): 'room' | 'offline' | undefined;
   /**
    * A save met a conflict: resolves true when the file turned out to have been saved meanwhile by
    * someone it is edited together with, and that was found to be so (adopt() was called with what the
@@ -688,6 +696,15 @@ export class SaveController implements SaveCommand {
     if (this.auto) {
       state.auto = true;
       if (this.stopped || !this.guarded()) state.autoPaused = true;
+      else if (this.dirty && this.host.autoWaiting) {
+        let waits: 'room' | 'offline' | undefined;
+        try {
+          waits = this.host.autoWaiting();
+        } catch {
+          waits = undefined;
+        }
+        if (waits === 'room' || waits === 'offline') state.autoWaits = waits;
+      }
     }
     return state;
   }
@@ -915,7 +932,8 @@ export class SaveController implements SaveCommand {
     this.running = running;
     this.result = result;
     this.held = this.count;
-    this.ownAtSave = this.own;
+    // (A save that is sent again after a conflict still carries what the first try carried.)
+    this.ownAtSave = this.own || (this.busy && this.ownAtSave);
     this.own = false;
     this.busy = true;
     this.error = undefined;
@@ -1019,8 +1037,16 @@ export class SaveController implements SaveCommand {
 
   /** Looks again whether auto-save has something to send: for a host whose autoAllowed() answers otherwise now. */
   rearm(): void {
-    if (this.destroyed || this.autoTimer !== undefined) return;
+    if (this.destroyed) return;
+    // What the state says of why auto-save waits may be another thing now.
+    this.emit();
+    if (this.autoTimer !== undefined) return;
     this.arm();
+  }
+
+  /** A number that is another one after every change: what was found out about the workbook holds while it stays. */
+  get changes(): number {
+    return this.count;
   }
 
   private disarm(): void {
@@ -1246,7 +1272,8 @@ export class SaveController implements SaveCommand {
       if (this.destroyed) return false;
       // Someone the file is edited together with saved it while this save was on its way (see adopt()):
       // the conflict is with a file this side has heard of since, and the save is sent again with its name.
-      if (error instanceof SaveError && error.code === 'conflict' && !overwrite && tries < 2) {
+      // (In a room several may save one after the other: each such conflict is explained by a save that is heard of, and tried again.)
+      if (error instanceof SaveError && error.code === 'conflict' && !overwrite && tries < (host.conflictWait ? 6 : 2)) {
         if (this.etag !== sentWith) return this.start(overwrite, auto, tries + 1);
         if (this.hinted !== undefined && this.hinted !== sentWith) {
           this.etag = this.hinted;
@@ -1530,7 +1557,7 @@ export class SaveController implements SaveCommand {
   private emit(): void {
     if (this.destroyed) return;
     const state = this.state;
-    const key = `${state.dirty} ${state.saving} ${state.lastSavedAt} ${state.error} ${state.auto} ${state.autoPaused}`;
+    const key = `${state.dirty} ${state.saving} ${state.lastSavedAt} ${state.error} ${state.auto} ${state.autoPaused} ${state.autoWaits}`;
     if (key === this.told) return;
     this.told = key;
     if (this.host.onState) {

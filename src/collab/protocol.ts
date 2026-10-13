@@ -32,7 +32,9 @@ export type ClientMessage =
   | { t: 'op'; base: number; id: string; ops: unknown[] }
   | { t: 'presence'; data: unknown }
   | { t: 'saved'; v: string[]; rev?: number }
-  | { t: 'ping' };
+  | { t: 'ping' }
+  /** Out of the room, over a connection that stays: the next message of it is a `join` of that room again. */
+  | { t: 'leave' };
 
 export type ServerMessage =
   | { t: 'hello'; rev: number; from: number; ep: string; you: string; ro: boolean; pv?: number; v: string[]; peers: PeerMessage[] }
@@ -180,6 +182,8 @@ export function parseClientMessage(textOf: string): ClientMessage {
     }
     case 'ping':
       return { t: 'ping' };
+    case 'leave':
+      return { t: 'leave' };
     default:
       return fail('message');
   }

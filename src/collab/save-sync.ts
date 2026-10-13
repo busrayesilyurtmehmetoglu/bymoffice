@@ -15,7 +15,10 @@ export interface SyncController {
   changed(remote?: boolean): void;
   saveQuietly(): Promise<boolean>;
   rearm(): void;
-  readonly autoSave: unknown;
+  readonly autoSave: { delayMs: number } | undefined;
+  /** Another number after every change. */
+  readonly changes: number;
+  readonly saving: boolean;
 }
 
 /** What is needed of the session. */
@@ -37,22 +40,47 @@ export interface SaveSyncHost {
   fetch?: typeof fetch;
   /** Calls back once after `ms`; answers what cancels it. */
   timer?(run: () => void, ms: number): () => void;
+  now?(): number;
+  /** How long work waits for the one who saves for all, in place of five delays of auto-save and at least WATCH_MIN_MS. */
+  watchMs?: number;
+  /** Between 0 and 1: what keeps two participants from standing in at the same moment. */
+  random?(): number;
+  /**
+   * The file as this workbook would be written now, with the step it holds (undefined: the file of no one step).
+   * With it a save of someone else can be PROVEN to hold this side's own work: the same step gives the same bytes.
+   */
+  ownBytes?(): Promise<{ bytes: Uint8Array; rev: number | undefined }>;
 }
+
+/** A stored file larger than this is not fetched to prove anything: the work stays to be saved from here. */
+export const PROOF_MAX_BYTES = 32 * 1024 * 1024;
+/** How long after word of a save the stored file is looked at (word of another save meanwhile starts the wait over). */
+export const PROOF_DELAY_MS = 400;
+/** The least time this side's own work waits for a save of the room before this side saves it itself. */
+export const WATCH_MIN_MS = 15000;
 
 /** How long a save that met a conflict waits for word of the save that made it. */
 export const CONFLICT_WAIT_MS = 2500;
 
 export interface SaveSync {
   /** A participant says the file was saved. Resolves when what was said has been looked into. */
-  saved(said: { versions: string[]; rev?: number; byLeader?: boolean }): Promise<void>;
+  saved(said: { versions: string[]; rev?: number }): Promise<void>;
   /** The room asks for the file to be saved (someone cannot join). */
   sync(): Promise<boolean>;
   /** Whether the server names the file by this ETag now. */
   storedAs(tag: string): Promise<boolean>;
   /** A change arrived from someone else: there is something to save, and the one who saves for all is to save it. */
   remoteChanged(): void;
+  /** This side changed something: its work waits for a save from now, and not for ever. */
+  localChanged(): void;
   /** Whether this side is the one to save by itself now (SaveHost.autoAllowed). */
   autoAllowed(): boolean;
+  /** Why it is not (SaveHost.autoWaiting). */
+  waiting(): 'room' | 'offline' | undefined;
+  /** A save of this side was taken: its work waits for nothing. */
+  ownSaved(): void;
+  /** Nothing more is looked at or waited for. */
+  stop(): void;
   /** A save here met a conflict (SaveHost.conflictWait): true when a save of someone in the room explains it and was found to be so. */
   conflictWait(): Promise<boolean>;
   /** Who is in the room changed, or the state of the session: the one who saves for all may be this side now. */
@@ -90,7 +118,7 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     for (const waiter of all) waiter(moved);
   };
 
-  const saved = async (said: { versions: string[]; rev?: number; byLeader?: boolean }): Promise<void> => {
+  const saved = async (said: { versions: string[]; rev?: number }): Promise<void> => {
     checking++;
     const before = host.controller.currentETag;
     try {
@@ -103,7 +131,7 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     }
   };
 
-  const look = async (said: { versions: string[]; rev?: number; byLeader?: boolean }): Promise<void> => {
+  const look = async (said: { versions: string[]; rev?: number }): Promise<void> => {
     let tag: string | undefined;
     for (const version of said.versions) if (typeof version === 'string' && version.slice(0, 2) === 'e:') tag = version.slice(2);
     if (tag === undefined) return;
@@ -117,11 +145,64 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     // Not found to be so: nothing is taken to be saved. The ETag is only tried, as a condition, if a save here meets a conflict.
     if (!stored) return host.controller.hint(tag);
     // Saved here as well only when this workbook is, right now, the workbook of the step that was saved.
-    // Changes this side made itself are in the file on the word of one participant only: the one who saves for all
-    // (it is the one this side leaves its saving to). On anybody else's word they stay to be saved: a workbook wrongly
-    // taken to be saved loses work, one wrongly taken to be unsaved is saved once more.
-    const clean = !stale && (!host.controller.ownChanges || said.byLeader === true) && said.rev !== undefined && now.rev === said.rev && now.pending === 0;
-    host.controller.adopt(tag, clean);
+    const atStep = !stale && said.rev !== undefined && now.rev === said.rev && now.pending === 0;
+    if (!host.controller.ownChanges) {
+      host.controller.adopt(tag, atStep);
+      if (atStep) ownSaved();
+      return;
+    }
+    // Work this side did itself is saved when a file holds it, and on nobody's word - whoever says it, and
+    // whatever it is in the room. The name of the file is taken; whether the file holds the work is looked at.
+    host.controller.adopt(tag, false);
+    if (atStep) prove(tag, said.rev as number);
+  };
+
+  const later = (run: () => void, ms: number): (() => void) =>
+    (host.timer ||
+      ((callback, wait) => {
+        const id = setTimeout(callback, wait);
+        return () => clearTimeout(id);
+      }))(run, ms);
+
+  /** The last save that was heard of and is to be looked at: one look, a moment after the last word. */
+  let proving: { tag: string; rev: number; stop: () => void } | undefined;
+  const prove = (tag: string, rev: number): void => {
+    if (!host.ownBytes || !host.target || !ask) return;
+    if (proving) proving.stop();
+    const mine = { tag, rev, stop: later(() => void check(mine), PROOF_DELAY_MS) };
+    proving = mine;
+  };
+  const check = async (mine: { tag: string; rev: number }): Promise<void> => {
+    if (proving !== mine) return;
+    proving = undefined;
+    const target = host.target;
+    const session = host.session();
+    const controller = host.controller;
+    if (!target || !ask || !host.ownBytes || !session) return;
+    const holds = (): boolean => host.session() === session && session.state === 'online' && session.rev === mine.rev && session.pending === 0 && controller.dirty && !controller.saving && controller.currentETag === mine.tag;
+    if (!holds()) return;
+    const changes = controller.changes;
+    try {
+      // The file as it is stored, when it is the one that was named and not too large to look at.
+      const answer = await ask(target.url, { method: 'GET', cache: 'no-store', credentials: target.credentials });
+      const length = Number(answer.headers.get('Content-Length'));
+      if (!answer.ok || host.strong(answer.headers.get('ETag')) !== mine.tag || (length === length && length > PROOF_MAX_BYTES)) {
+        if (answer.body) void answer.body.cancel().catch(() => undefined);
+        return;
+      }
+      const stored = new Uint8Array(await answer.arrayBuffer());
+      if (stored.length > PROOF_MAX_BYTES || !holds() || controller.changes !== changes) return;
+      // The same workbook at the same step is written as the same bytes (the room and the step are among them).
+      const own = await host.ownBytes();
+      if (own.rev !== mine.rev || !holds() || controller.changes !== changes) return;
+      if (own.bytes.length !== stored.length) return;
+      for (let i = 0; i < stored.length; i++) if (own.bytes[i] !== stored[i]) return;
+      controller.adopt(mine.tag, true);
+      ownSaved();
+    } catch {
+      // Not found out: the work stays to be saved.
+    }
+
   };
 
   const sync = async (): Promise<boolean> => {
@@ -133,17 +214,70 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     return host.controller.saveQuietly();
   };
 
-  const autoAllowed = (): boolean => {
+  const clock = (): number => (host.now ? host.now() : Date.now());
+  /** Since when this side has work (its own, or of others) that no file is known to hold; and whether it stands in for the saver now. */
+  let ownSince: number | undefined;
+  let standingIn = false;
+  let watch: (() => void) | undefined;
+  /** How long this side's own work waits for the one who saves for all: five delays of auto-save, a quarter more or less. */
+  let patience: number | undefined;
+  const watchMs = (): number => {
+    if (patience === undefined) {
+      const auto = host.controller.autoSave;
+      const base = host.watchMs !== undefined ? host.watchMs : Math.max(WATCH_MIN_MS, (auto ? auto.delayMs : 0) * 5);
+      patience = Math.round(base * (1 + 0.25 * (host.random ? host.random() : Math.random())));
+    }
+    return patience;
+  };
+  /** Looks at whether this side's own work still waits, and for how long it has. */
+  const look2 = (): void => {
+    if (watch) watch();
+    watch = undefined;
+    const controller = host.controller;
+    if (!controller.dirty) {
+      ownSince = undefined;
+      standingIn = false;
+      return;
+    }
+    if (ownSince === undefined) ownSince = clock();
+    const left = ownSince + watchMs() - clock();
+    if (left > 0) {
+      watch = later(look2, left);
+      return;
+    }
+    // Nobody saved it in all that time (the one who saves for all has auto-save off, cannot save, or is stuck):
+    // this side saves it itself, as any save nobody asked for - conditional on the file it knows.
     const session = host.session();
-    // On its own (in no room, or apart from it) a workbook is saved as any other. In a room one participant saves
-    // for all; who cannot reach the room does not know who that is, and holds still.
-    if (!session || session.state === 'closed' || session.state === 'detached') return true;
-    return session.state === 'online' && session.leads;
+    if (session && session.state === 'online' && !session.leads && !standingIn) {
+      standingIn = true;
+      controller.rearm();
+    }
+  };
+
+  const waiting = (): 'room' | 'offline' | undefined => {
+    const session = host.session();
+    // On its own (in no room, or apart from it) a workbook is saved as any other.
+    if (!session || session.state === 'closed' || session.state === 'detached') return undefined;
+    // Who cannot reach the room has steps the room does not have: a file written now would be of no step of it.
+    if (session.state !== 'online') return 'offline';
+    if (session.leads) return undefined;
+    if (standingIn && host.controller.dirty) return undefined;
+    return 'room';
+  };
+
+  const autoAllowed = (): boolean => waiting() === undefined;
+
+  const localChanged = (): void => {
+    if (ownSince === undefined || !watch) look2();
   };
 
   const remoteChanged = (): void => {
     // Only the one who saves for all starts its delay over a change of someone else.
-    host.controller.changed(!(autoAllowed() && host.controller.autoSave !== undefined));
+    const session = host.session();
+    const saver = session !== undefined && session.state === 'online' && session.leads && host.controller.autoSave !== undefined;
+    host.controller.changed(!saver);
+    // Work of others waits here as well: when nobody who can saves it in a while, this side does.
+    localChanged();
   };
 
   const conflictWait = (): Promise<boolean> => {
@@ -167,8 +301,26 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
   };
 
   const roomChanged = (): void => {
-    if (autoAllowed()) host.controller.rearm();
+    // Also when nothing is to be sent: why auto-save waits is another thing now.
+    host.controller.rearm();
+    if (host.controller.dirty) localChanged();
   };
 
-  return { saved, sync, storedAs, remoteChanged, autoAllowed, conflictWait, roomChanged };
+  const ownSaved = (): void => {
+    if (watch) watch();
+    watch = undefined;
+    ownSince = undefined;
+    standingIn = false;
+    if (host.controller.dirty) look2();
+  };
+
+  const stop = (): void => {
+    if (watch) watch();
+    watch = undefined;
+    if (proving) proving.stop();
+    proving = undefined;
+    answer(false);
+  };
+
+  return { saved, sync, storedAs, remoteChanged, localChanged, ownSaved, autoAllowed, waiting, conflictWait, roomChanged, stop };
 }

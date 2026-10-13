@@ -150,7 +150,7 @@ export interface SessionOptions {
   onState?(state: CollabState): void;
   onPeers?(peers: CollabPeer[]): void;
   /** Someone saved the file: its versions, and whether this participant's workbook is what was saved. */
-  onSaved?(saved: { versions: string[]; rev?: number; clean: boolean; byLeader: boolean }): void;
+  onSaved?(saved: { versions: string[]; rev?: number; clean: boolean }): void;
   /** The relay made this participant one that only reads. */
   onReadOnly?(): void;
   /** Someone cannot join because no file holds the steps of the room: a participant that can save should. */
@@ -664,8 +664,13 @@ export class CollabSession {
 
   private join(): void {
     if (this.reloading) return;
-    // A connection that is in a room joins no second time: the room is joined over a new one.
-    if (this.inRoom && this.reconnect()) return;
+    // A connection that is in a room joins no second time: the room is joined over a new one, or, where the
+    // transport cannot make one (a transport of the application), left first.
+    if (this.inRoom) {
+      if (this.reconnect()) return;
+      this.inRoom = false;
+      this.send({ t: 'leave' });
+    }
     const message: ClientMessage = { t: 'join', v: this.versions, pv: PROTOCOL_VERSION, key: this.key };
     if (this.joined && this.epoch !== undefined) {
       // Back in the room this side was in: from the step it is at. In another room that step means nothing (the relay sees to it).
@@ -934,13 +939,7 @@ export class CollabSession {
         return;
       case 'saved': {
         const clean = message.rev !== undefined && message.rev === this.confirmed && this.pendingSteps.length === 0;
-        // Whether it is the one participant who saves for all that says so: the first, by the names of the relay, of those who write.
-        let byLeader = !this.others.has(message.from) ? false : !(this.others.get(message.from) as PeerMessage).ro;
-        if (byLeader && !this.readonlyNow && this.me !== '' && this.me < message.from) byLeader = false;
-        this.others.forEach((peer) => {
-          if (!peer.ro && peer.id < message.from) byLeader = false;
-        });
-        if (this.options.onSaved) this.options.onSaved({ versions: message.v, rev: message.rev, clean, byLeader });
+        if (this.options.onSaved) this.options.onSaved({ versions: message.v, rev: message.rev, clean });
         return;
       }
       case 'sync':

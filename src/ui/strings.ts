@@ -334,6 +334,8 @@ export interface UiStrings {
     slow: string;
     updating: string;
     typedKept(text: string): string;
+    autoWaits: { room: string; offline: string };
+    noStamp: string;
     copySheet: string;
     tooLarge: string;
     unsupported: string;
@@ -880,6 +882,8 @@ export const STRINGS_EN: UiStrings = {
     undoWait: 'Undo has to wait until your last changes have arrived, and they have not yet: nothing was undone. Try again.',
     slow: 'A change has been on its way for a long time; the connection is made anew.',
     updating: 'The file was changed elsewhere and is loaded again; it cannot be edited until that is done.',
+    noStamp: 'The custom properties of this file cannot be read: it is saved without the mark of the room, and whoever opens it joins when someone in the room has saved again.',
+    autoWaits: { room: 'Not saved yet: another participant saves for all', offline: 'Not saved: auto-save waits for the connection. Save to store the file now' },
     typedKept: (text) => `The file is loaded again, and what you were typing was not applied. You typed: ${text}`,
     dialogClosed: 'Someone else changed the sheet or its rules: the dialog was closed without applying anything.',
     document: 'Editing together is not available for documents yet.',
@@ -1445,6 +1449,8 @@ export const STRINGS_TR: UiStrings = {
     undoWait: 'Geri alma, son değişiklikleriniz yerine ulaşana dek bekler; henüz ulaşmadı: hiçbir şey geri alınmadı. Yeniden deneyin.',
     slow: 'Bir değişiklik uzun süredir yolda; bağlantı yeniden kuruluyor.',
     updating: 'Dosya başka yerde değişti ve yeniden yükleniyor; bitene dek düzenlenemez.',
+    noStamp: 'Bu dosyanın özel özellikleri okunamıyor: dosya oda damgası olmadan kaydedildi; açan kişi odadaki biri yeniden kaydedince katılır.',
+    autoWaits: { room: 'Henüz kaydedilmedi: herkes için başka bir katılımcı kaydediyor', offline: 'Kaydedilmedi: kendiliğinden kaydetme bağlantıyı bekliyor. Şimdi saklamak için Kaydet' },
     typedKept: (text) => `Dosya yeniden yükleniyor; yazmakta olduğunuz uygulanmadı. Yazdığınız: ${text}`,
     dialogClosed: 'Başkası sayfayı ya da kurallarını değiştirdi: kutu hiçbir şey uygulanmadan kapatıldı.',
     document: 'Birlikte düzenleme belgelerde henüz yok.',

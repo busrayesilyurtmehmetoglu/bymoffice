@@ -159,3 +159,54 @@ test('alone: two deletions of rows and two undos put the rows back in their orde
   assert.equal(member.wb.sheets[0].rows.get(2)!.cells[4]!.formula!.text, '$C$4+1', 'the formula reads the cell it read');
   assert.deepEqual(member.notices, [], 'and nothing is said');
 });
+
+test('alone: what was undone above a sheet that cannot be brought back is not made again on another sheet', async () => {
+  const bytes = await startFile();
+  const net = new Net();
+  const member = await join(net, 'p', bytes);
+  const random = seeded(1);
+  net.drain(random);
+  const value = (sheet: string, row: number, col: number): unknown => {
+    const found = member.wb.sheets.find((each) => each.name === sheet);
+    const cells = found && found.rows.get(row);
+    return cells && cells.cells[col] ? cells.cells[col]!.value : null;
+  };
+  const before = [value('Data', 0, 0), value('Other', 0, 0)];
+  for (const step of [() => setCellInput(member.wb, 0, 0, 5, 'A'), () => insertSheet(member.wb, 0, { name: 'Front' }), () => setCellInput(member.wb, 1, 0, 0, 'B on Data')]) {
+    act(member, step);
+    net.drain(random);
+  }
+  assert.equal(value('Data', 0, 0), 'B on Data', 'written on the sheet that is second now');
+  const did: string[] = [];
+  for (const what of ['undo', 'undo', 'undo', 'redo', 'redo', 'redo'] as const) {
+    const done = member.session[what]();
+    net.drain(random);
+    did.push(`${what}:${done ? 'done' : 'no'}`);
+  }
+  // The sheet that was taken away by the undo cannot be put in again: what was undone above it (the cell on the sheet
+  // that was second while the new sheet stood) is not to be made again where the sheets are others now.
+  assert.deepEqual(member.wb.sheets.map((sheet) => sheet.name), ['Data', 'Other'], `the sheets are as they were (${did.join(' ')})`);
+  assert.equal(value('Other', 0, 0), before[1], `nothing was written on the other sheet (${did.join(' ')})`);
+  assert.ok(value('Data', 0, 0) === before[0] || value('Data', 0, 0) === 'B on Data', `the cell holds what it held, or what was typed into it: ${String(value('Data', 0, 0))}`);
+  assert.equal(member.notices.some((notice) => notice.code === 'undo-none' || notice.code === 'undo-gone'), true, 'and it was said that something could not be made again');
+});
+
+test('alone: a session that is closed keeps what waited as steps to undo', async () => {
+  const bytes = await startFile();
+  const net = new Net();
+  const member = await join(net, 'p', bytes);
+  const random = seeded(2);
+  net.drain(random);
+  member.transport.suspend();
+  act(member, () => setCellInput(member.wb, 0, 12, 0, 'first'));
+  act(member, () => setCellInput(member.wb, 0, 13, 0, 'second'));
+  assert.equal(member.session.pending, 2, 'two steps wait');
+  member.session.leave();
+  assert.deepEqual([member.session.state, member.session.canUndo], ['closed', true], 'out of the room, with something to undo');
+  assert.ok(member.session.undo(), 'the last step is undone');
+  assert.ok(member.session.undo(), 'and the one before it');
+  const cellAt = (row: number): unknown => (member.wb.sheets[0].rows.get(row) || { cells: [] }).cells[0]?.value;
+  assert.deepEqual([cellAt(12), cellAt(13)], [undefined, undefined], 'both are taken back');
+  assert.ok(member.session.redo(), 'and made again');
+  assert.equal(cellAt(12), 'first', 'the first one is back');
+});

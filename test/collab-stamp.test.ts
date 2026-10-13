@@ -54,7 +54,7 @@ test('the properties a file has stay as they are; what is no stamp is none', asy
   await writeCollabStamp(pkg, { ep: 'room', rev: 5 });
   const xml = decoder.decode(await pkg.readPart(CUSTOM));
   assert.ok(xml.indexOf('<cp:property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="7" name="Department"><vt:lpwstr>Fleet &amp; Crew</vt:lpwstr></cp:property><!-- kept --><cp:property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="Checked"><vt:bool>true</vt:bool></cp:property>') >= 0, `what was there is there, as it was: ${xml}`);
-  assert.match(xml, /<cp:property [^>]*pid="8" name="BymOfficeCollab"><vt:lpwstr>room:5<\/vt:lpwstr><\/cp:property><\/cp:Properties>$/, 'the stamp comes last, under a number nobody has, in the words of the part');
+  assert.match(xml, /<cp:property [^>]*pid="2" name="BymOfficeCollab"><vt:lpwstr>room:5<\/vt:lpwstr><\/cp:property><\/cp:Properties>$/, 'the stamp comes last, under the least number nobody has, in the words of the part');
   assert.deepEqual(await readCollabStamp(pkg), { ep: 'room', rev: 5 }, 'and is read');
   await writeCollabStamp(pkg, undefined);
   assert.equal(decoder.decode(await pkg.readPart(CUSTOM)).indexOf('BymOfficeCollab'), -1, 'taken out again, it leaves the others');
@@ -92,4 +92,47 @@ test('a file that is written while something is typed into the workbook says no 
   session.state = 'closed';
   const alone = await writeSharedFile(session, pkg, take);
   assert.equal(await readCollabStamp((await open(alone.bytes)).package!), undefined, 'a workbook that left its room for good writes a file of no room');
+});
+
+test('a part of custom properties that cannot be read is not touched, and the file is saved without a stamp; two stamps are none', async () => {
+  const head = '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">';
+  const property = (pid: string, name: string, text: string): string => `<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="${pid}" name="${name}"><vt:lpwstr>${text}</vt:lpwstr></property>`;
+  for (const [name, broken] of [
+    ['cut short', '<Properties xmlns="x"><property'],
+    ['with a document type', `<!DOCTYPE Properties [<!ENTITY e "x">]>${head}${property('2', 'BymOfficeCollab', 'room:1')}</Properties>`],
+  ] as [string, string][]) {
+    const file = await open(await startFile());
+    const pkg = file.package!;
+    assert.equal(await writeCollabStamp(pkg, { ep: 'first', rev: 1 }), true, 'a stamp is written');
+    const bytes = new TextEncoder().encode(broken);
+    pkg.writePart(CUSTOM, bytes);
+    assert.equal(await readCollabStamp(pkg), undefined, `${name}: no stamp is read from it`);
+    assert.equal(await writeCollabStamp(pkg, { ep: 'room', rev: 2 }), false, `${name}: no stamp can be written, and that is answered`);
+    assert.equal(await writeCollabStamp(pkg, undefined), true, `${name}: taking out a stamp that cannot be there is done`);
+    assert.deepEqual(Array.from(await pkg.readPart(CUSTOM)), Array.from(bytes), `${name}: not a byte of the part was touched`);
+    // In a room the file is saved all the same, as the file of no step, and it is said that it carries no stamp.
+    let takes = 0;
+    const session = { state: 'online', savableRev: 2, stampNow: { ep: 'room', rev: 2 }, whenSettled: async () => undefined, pause: () => undefined, resume: () => false };
+    const done = await writeSharedFile(session, pkg, async () => (takes++, pkg.save()));
+    assert.deepEqual([takes, done.rev, done.unstamped], [1, undefined, true], `${name}: saved once, of no step, and told`);
+    assert.deepEqual(Array.from(await (await open(done.bytes)).package!.readPart(CUSTOM)), Array.from(bytes), `${name}: the saved file has the part as it was`);
+  }
+  // Two properties of the name: none is the stamp; writing leaves one, taking out leaves none; the others stay.
+  const file = await open(await startFile());
+  const pkg = file.package!;
+  await writeCollabStamp(pkg, { ep: 'first', rev: 1 });
+  pkg.writePart(CUSTOM, new TextEncoder().encode(`${head}${property('2', 'BymOfficeCollab', 'a:1')}${property('3', 'Kept', 'yes')}${property('2147483647', 'BymOfficeCollab', 'b:2')}</Properties>`));
+  assert.equal(await readCollabStamp(pkg), undefined, 'two stamps say nothing');
+  assert.equal(await writeCollabStamp(pkg, { ep: 'room', rev: 9 }), true, 'a stamp is written over them');
+  let xml = decoder.decode(await pkg.readPart(CUSTOM));
+  assert.deepEqual([xml.split('BymOfficeCollab').length - 1, xml.indexOf('name="Kept"') > 0], [1, true], 'one stamp is left, and the other property');
+  assert.deepEqual(await readCollabStamp(pkg), { ep: 'room', rev: 9 }, 'which is read');
+  pkg.writePart(CUSTOM, new TextEncoder().encode(`${head}${property('2', 'BymOfficeCollab', 'a:1')}${property('3', 'Kept', 'yes')}${property('4', 'BymOfficeCollab', 'b:2')}</Properties>`));
+  await writeCollabStamp(pkg, undefined);
+  xml = decoder.decode(await pkg.readPart(CUSTOM));
+  assert.deepEqual([xml.indexOf('BymOfficeCollab'), xml.indexOf('name="Kept"') > 0], [-1, true], 'taken out, both go and the other stays');
+  // The largest number a property can have is taken: the stamp gets the least free one, not one more than it.
+  pkg.writePart(CUSTOM, new TextEncoder().encode(`${head}${property('2', 'A', 'x')}${property('2147483647', 'B', 'y')}</Properties>`));
+  await writeCollabStamp(pkg, { ep: 'room', rev: 1 });
+  assert.match(decoder.decode(await pkg.readPart(CUSTOM)), /pid="3" name="BymOfficeCollab"/, 'the least number from 2 that nobody has');
 });
