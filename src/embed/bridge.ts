@@ -15,7 +15,8 @@ import type { DocumentEditorOptions } from '../ui/doc-editor';
 import type { DocumentViewOptions } from '../ui/doc-view';
 import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { SheetPrintOptions } from '../ui/sheet-print';
-import type { WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
+import { pdfFileName, type PdfExportOptions } from '../pdf/export';
+import type { SheetPdfExportOptions, WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
@@ -29,6 +30,9 @@ export type BridgeErrorCode =
   | 'not-loaded'
   | 'print-unavailable'
   | 'print-failed'
+  | 'pdf-unavailable'
+  | 'pdf-failed'
+  | 'pdf-too-large'
   | 'read-only'
   | 'no-sheet'
   | 'sheet-refused'
@@ -66,6 +70,13 @@ export interface BridgeDocumentView {
    * dialog was closed. An error with `code: 'unavailable'` says that the window cannot print.
    */
   print?(options?: { dpi?: number }): Promise<unknown>;
+  /**
+   * The document as a PDF file. An error with `code: 'unavailable'` says that
+   * no PDF can be made here.
+   */
+  exportPdf?(options?: PdfExportOptions): Promise<Uint8Array>;
+  /** The same, as the parts the file was written in: what the bridge asks for when the view has it, so that the file is never held twice. */
+  exportPdfParts?(options?: PdfExportOptions): Promise<Uint8Array[]>;
   /** The tracked changes of the document: their number is what the application is told. */
   revisions?(): unknown[];
   /** Accept or reject every tracked change; a view that cannot (a protection) changes nothing. */
@@ -244,6 +255,41 @@ export function base64Encode(bytes: Uint8Array): string {
     parts.push(String.fromCharCode.apply(null, (n === codes.length ? codes : codes.subarray(0, n)) as unknown as number[]));
   }
   return parts.join('');
+}
+
+/**
+ * Bytes of a PDF one `pdf` message carries at most (as base64 they are a
+ * third more). A message is one string, which the page builds, the channel
+ * copies and the application decodes: beyond this the answer is the error
+ * `pdf-too-large`, and the application asks for a lower resolution.
+ */
+export const MAX_BRIDGE_PDF_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The parts of a file as the base64 text of the whole file, without joining
+ * them into one array first: every part is encoded where three bytes end,
+ * and the one or two bytes left over are carried into the next part.
+ */
+export function base64OfParts(parts: readonly Uint8Array[]): string {
+  const pieces: string[] = [];
+  const carry = new Uint8Array(3);
+  let carried = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!(part instanceof Uint8Array)) throw new TypeError('A part of the file is no array of bytes');
+    let at = 0;
+    // Fill what was left over up to three bytes.
+    while (carried > 0 && carried < 3 && at < part.length) carry[carried++] = part[at++];
+    if (carried === 3) {
+      pieces.push(base64Encode(carry));
+      carried = 0;
+    }
+    const whole = at + Math.floor((part.length - at) / 3) * 3;
+    if (whole > at) pieces.push(base64Encode(part.subarray(at, whole)));
+    for (at = whole; at < part.length; at++) carry[carried++] = part[at];
+  }
+  if (carried > 0) pieces.push(base64Encode(carry.subarray(0, carried)));
+  return pieces.join('');
 }
 
 /**
@@ -1701,6 +1747,74 @@ export function createBridge(host: BridgeHost): Bridge {
     );
   };
 
+  /**
+   * Makes a PDF of the document or the workbook and answers with it: `pdf`,
+   * with the file as base64. As with printing, the messages after it do not
+   * wait: the pages of a long file take their time.
+   */
+  const exportPdf = (message: Message, id: string | undefined) => {
+    const dpi = field<number>(message, 'dpi', 'number', false);
+    if (dpi !== undefined && !(dpi > 0 && dpi < Infinity)) throw new BadMessage('"dpi" must be a positive number');
+    const image = field<string>(message, 'image', 'string', false);
+    if (image !== undefined && image !== 'auto' && image !== 'jpeg' && image !== 'lossless') throw new BadMessage('"image" must be "auto", "jpeg" or "lossless"');
+    const quality = field<number>(message, 'quality', 'number', false);
+    if (quality !== undefined && !(quality > 0 && quality <= 1)) throw new BadMessage('"quality" must be a number above 0 and at most 1');
+    const sheets = field<string>(message, 'sheets', 'string', false);
+    if (sheets !== undefined && sheets !== 'active' && sheets !== 'all') throw new BadMessage('"sheets" must be "active" or "all"');
+    const title = field<string>(message, 'title', 'string', false);
+    const author = field<string>(message, 'author', 'string', false);
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const pages = shown.pages;
+    const view = shown.view;
+    if (pages ? !pages.exportPdf && !pages.exportPdfParts : !view || typeof view.exportPdf !== 'function') return fail('pdf-unavailable', 'This view cannot make a PDF', id);
+    let count = 0;
+    const options: SheetPdfExportOptions = {
+      onProgress: (_done, total) => {
+        count = total;
+      },
+    };
+    if (dpi !== undefined) options.dpi = dpi;
+    if (image !== undefined) options.image = image as 'auto' | 'jpeg' | 'lossless';
+    if (quality !== undefined) options.quality = quality;
+    if (title !== undefined) options.title = title;
+    if (author !== undefined) options.author = author;
+    const name = pdfFileName(shown.name, pages ? 'document' : 'workbook');
+    // The file in the parts it was written in, where the view hands them out: it is never held as one array here.
+    let job: Promise<Uint8Array[]>;
+    try {
+      if (pages) job = pages.exportPdfParts ? Promise.resolve(pages.exportPdfParts(options)) : Promise.resolve((pages.exportPdf as NonNullable<BridgeDocumentView['exportPdf']>)(options)).then((bytes) => [bytes]);
+      else {
+        // Of a workbook: the sheet that is shown unless all are asked for; the name of the file is what "&F" in a header stands for.
+        if (sheets !== undefined) options.sheets = sheets as 'active' | 'all';
+        if (shown.name !== undefined) options.fileName = shown.name;
+        const grid = view as WorkbookView;
+        job = typeof grid.exportPdfParts === 'function' ? Promise.resolve(grid.exportPdfParts(options)) : Promise.resolve(grid.exportPdf(options)).then((bytes) => [bytes]);
+      }
+    } catch (error) {
+      job = Promise.reject(error);
+    }
+    const failed = (error: unknown) => fail(error && (error as { code?: unknown }).code === 'unavailable' ? 'pdf-unavailable' : 'pdf-failed', errorText(error), id);
+    job.then((parts) => {
+      // Whatever goes wrong from here on is answered too: the application waits for one of the two.
+      try {
+        if (!Array.isArray(parts)) throw new TypeError('The view gave no file');
+        let size = 0;
+        for (let i = 0; i < parts.length; i++) size += parts[i] ? parts[i].length : 0;
+        if (size > MAX_BRIDGE_PDF_BYTES) {
+          return fail('pdf-too-large', `The PDF has ${size} bytes; a message carries ${MAX_BRIDGE_PDF_BYTES} at most. Ask for a lower "dpi", or for fewer sheets`, id);
+        }
+        const out: Message = { type: 'pdf' };
+        if (id !== undefined) out.id = id;
+        out.data = base64OfParts(parts);
+        out.name = name;
+        out.pages = count;
+        send(out);
+      } catch (error) {
+        failed(error);
+      }
+    }, failed);
+  };
+
   /** The id of a message; it is read first so that every later complaint can carry it. */
   const idOf = (fields: Message): string | undefined => {
     if (typeof fields.id === 'string') return fields.id;
@@ -1720,6 +1834,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'load') return await load(fields, id, mine);
       if (type === 'save') return await save(id);
       if (type === 'print') return print(fields, id);
+      if (type === 'exportPdf') return exportPdf(fields, id);
       if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);

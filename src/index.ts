@@ -20,6 +20,8 @@ import type { DocumentView, DocumentZoom } from './ui/doc-view';
 import { DocumentEditor } from './ui/doc-editor';
 import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import type { SheetPrintOptions } from './ui/sheet-print';
+import type { PdfExportOptions } from './pdf/export';
+import type { SheetPdfExportOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
 import { askOverwrite } from './ui/save-confirm';
 import {
@@ -229,6 +231,8 @@ export {
   type SaveToRequest,
 } from './embed/save-to';
 export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
+export { PdfExportError, type PdfAbortSignal, type PdfDownload, type PdfExportErrorCode, type PdfExportOptions } from './pdf/export';
+export type { SheetPdfExportOptions } from './ui/sheet-view';
 export { defaultPaperFor, headerFooterFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPagePaint, type SheetPlanOptions, type SheetPrintOptions } from './ui/sheet-print';
 export {
   DEFAULT_PAGE_MARGINS,
@@ -635,6 +639,13 @@ export interface MountedSpreadsheet {
    */
   print(options?: SheetPrintOptions): Promise<DocumentPrintResult>;
   /**
+   * The sheet that is shown, or the sheets `sheets` names, as a PDF file:
+   * the pages print() makes, each one a picture with its text lying
+   * invisible over it (the file can be searched and its text copied). What
+   * is being typed is applied first. See WorkbookView.exportPdf().
+   */
+  exportPdf(options?: SheetPdfExportOptions): Promise<Uint8Array>;
+  /**
    * Saves the file to MountOptions.saveTo, as the Save button does: what is
    * being typed is applied first. Resolves to true when it was saved, also
    * when there was nothing to save; to false when it could not be (onNotice
@@ -685,6 +696,13 @@ export interface MountedDocument {
    * also save it as a PDF): see DocumentView.print(). Resolves when the dialog was closed.
    */
   print(options?: DocumentPrintOptions): Promise<DocumentPrintResult>;
+  /**
+   * The document as a PDF file: every page a picture of what is shown, with
+   * its text lying invisible over it (the file can be searched and its text
+   * copied). Also for doc and RTF files that are shown read-only. See
+   * DocumentView.exportPdf().
+   */
+  exportPdf(options?: PdfExportOptions): Promise<Uint8Array>;
   /**
    * Saves the file to MountOptions.saveTo, as the Save button does: what is
    * being typed is applied first. Resolves to true when it was saved, also
@@ -902,6 +920,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       trackChanges: options.trackChanges,
       author: options.author,
       now: options.now,
+      // The name the PDF is downloaded under: the one the page states, or the one the file came with.
+      fileName: options.fileName !== undefined ? options.fileName : fileName,
     });
     const view = editor.view;
     if (file.format !== 'docx') {
@@ -944,6 +964,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     const destroy = tie(editor);
     converted();
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
+    const exportPdf = (pdfOptions?: PdfExportOptions) => view.exportPdf(pdfOptions);
     const mounted: MountedDocument = {
       kind: 'document',
       file,
@@ -952,6 +973,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       editor,
       save,
       print,
+      exportPdf,
       saveNow,
       get hasUnsavedChanges() {
         return unsaved();
@@ -975,6 +997,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       if (options.onChange) options.onChange(change);
     },
     saveCommand: controller,
+    fileName: options.fileName !== undefined ? options.fileName : fileName,
   };
   if (file.format === 'xls') sheetOptions.readOnly = true;
   const editor = new SpreadsheetEditor(container, workbook, sheetOptions);
@@ -1010,6 +1033,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   const destroy = tie(editor);
   converted();
   const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);
+  const exportPdf = (pdfOptions?: SheetPdfExportOptions) => view.exportPdf(pdfOptions);
   const mounted: MountedSpreadsheet = {
     kind: 'spreadsheet',
     file,
@@ -1018,6 +1042,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     editor,
     save,
     print,
+    exportPdf,
     saveNow,
     get hasUnsavedChanges() {
       return unsaved();

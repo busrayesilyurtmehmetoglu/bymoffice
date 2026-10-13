@@ -11,6 +11,10 @@ export interface EditorStrings {
   print: string;
   /** Shown in the status bar while the pages are prepared: "Preparing to print… 3 / 12". */
   printProgress(done: number, total: number): string;
+  /** The button that downloads the workbook as a PDF file. */
+  pdfDownload: string;
+  /** Shown in the status bar while the pages of the PDF are painted: "Making the PDF… 3 / 12". */
+  pdfProgress(done: number, total: number): string;
   fontSize: string;
   bold: string;
   italic: string;
@@ -143,6 +147,8 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   redo: 'Redo',
   print: 'Print',
   printProgress: (done, total) => `Preparing to print\u2026 ${done} / ${total}`,
+  pdfDownload: 'Download as PDF',
+  pdfProgress: (done, total) => `Making the PDF\u2026 ${done} / ${total}`,
   fontSize: 'Font size',
   bold: 'Bold',
   italic: 'Italic',
@@ -245,6 +251,8 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   redo: 'Yinele',
   print: 'Yazdır',
   printProgress: (done, total) => `Yazdırmaya hazırlanıyor\u2026 ${done} / ${total}`,
+  pdfDownload: 'PDF olarak indir',
+  pdfProgress: (done, total) => `PDF hazırlanıyor\u2026 ${done} / ${total}`,
   fontSize: 'Yazı tipi boyutu',
   bold: 'Kalın',
   italic: 'İtalik',

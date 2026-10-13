@@ -10,6 +10,7 @@ import type { DocModel } from '../model/doc/types';
 import type { DocRange } from '../ops/doc/index';
 import { DocToolbar, type DocShellHost } from './doc-toolbar';
 import type { DocumentPrintOptions, DocumentPrintResult } from './doc-print';
+import type { PdfDownload, PdfExportOptions } from '../pdf/export';
 import { DocumentView, type DocumentViewOptions } from './doc-view';
 import { getEditorStrings, type EditorStrings } from './editor-strings';
 import type { SaveCommand } from './save-command';
@@ -195,6 +196,16 @@ export class DocumentEditor {
   /** Prints the document: see DocumentView.print(). */
   print(options?: DocumentPrintOptions): Promise<DocumentPrintResult> {
     return this.view.print(options);
+  }
+
+  /** The document as a PDF file: see DocumentView.exportPdf(). */
+  exportPdf(options?: PdfExportOptions): Promise<Uint8Array> {
+    return this.view.exportPdf(options);
+  }
+
+  /** Makes the PDF and hands it to the browser as a download: see DocumentView.downloadPdf(). */
+  downloadPdf(options?: PdfExportOptions): Promise<PdfDownload> {
+    return this.view.downloadPdf(options);
   }
 
   /** Changes the language of every label. */

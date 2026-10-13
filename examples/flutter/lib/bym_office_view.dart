@@ -60,6 +60,16 @@ class BymOfficeDocument {
   final List<String> warnings;
 }
 
+/// The answer to an `exportPdf`: the PDF file, a name for it (that of the
+/// loaded file with ".pdf") and its number of pages.
+class BymOfficePdf {
+  const BymOfficePdf({required this.bytes, required this.name, required this.pages});
+
+  final Uint8List bytes;
+  final String name;
+  final int pages;
+}
+
 /// The answer to a `save`, or the file the user saved in the page (see
 /// [BymOfficeController.onUserSave]).
 class BymOfficeSavedFile {
@@ -155,6 +165,7 @@ class BymOfficeSelection {
 
 /// An `error` message. [code] is one of: unsupported, corrupt, load-failed,
 /// save-failed, bad-message, not-loaded, print-unavailable, print-failed,
+/// pdf-unavailable, pdf-failed, pdf-too-large,
 /// read-only, no-sheet, sheet-refused (and "timeout" and "closed", which only
 /// this wrapper produces). For sheet-refused the [message] is the reason in
 /// the language of the editor, fit to be shown to the user.
@@ -380,6 +391,31 @@ class BymOfficeController {
     );
   }
 
+  /// The open document or workbook as a PDF file: its pages as pictures, with
+  /// their text lying invisible over them (the file can be searched). [dpi] is
+  /// the resolution of the pictures (72 to 300, 150 when missing), [image]
+  /// "auto" (the default: page by page whichever is smaller), "jpeg" or
+  /// "lossless", [quality] that of the JPEG pictures (above 0, at most 1). A
+  /// file of more than 64 MB is answered with the error `pdf-too-large`: ask
+  /// for a lower [dpi]. For a workbook [sheets] is "active" (the sheet that
+  /// is shown, the default) or "all". Not compiled, like the rest of this file.
+  Future<BymOfficePdf> exportPdf({double? dpi, String? image, double? quality, String? sheets, String? title, String? author}) async {
+    final Map<String, dynamic> answer = await _request(<String, dynamic>{
+      'type': 'exportPdf',
+      if (dpi != null) 'dpi': dpi,
+      if (image != null) 'image': image,
+      if (quality != null) 'quality': quality,
+      if (sheets != null) 'sheets': sheets,
+      if (title != null) 'title': title,
+      if (author != null) 'author': author,
+    });
+    return BymOfficePdf(
+      bytes: await compute(base64Decode, answer['data'] as String),
+      name: answer['name'] as String? ?? 'document.pdf',
+      pages: (answer['pages'] as num?)?.toInt() ?? 0,
+    );
+  }
+
   // These complete when the page confirms the command with `done`.
 
   /// Completes with what holds afterwards: true when the file is read-only.
@@ -587,6 +623,7 @@ class BymOfficeController {
         }
       case 'loaded':
       case 'done':
+      case 'pdf':
         if (id is String) _pending[id]?.complete(message);
       case 'changed':
         _changes.add(BymOfficeChange(

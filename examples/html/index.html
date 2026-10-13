@@ -89,6 +89,8 @@
       <span id="status" role="status"></span>
       <!-- Opens the browser's print dialog, which can also save a PDF. -->
       <button id="print" type="button" hidden>Print</button>
+      <!-- Makes a PDF file of the pages (exportPdf) and downloads it. The editor's own toolbar has such a button too. -->
+      <button id="pdf" type="button" hidden>PDF</button>
     </div>
     <div id="editor"></div>
 
@@ -107,6 +109,7 @@
         var statusEl = document.getElementById('status');
         var printButton = document.getElementById('print');
         printButton.textContent = text.print;
+        var pdfButton = document.getElementById('pdf');
         document.documentElement.lang = lang;
 
         function tell(type, message) {
@@ -233,6 +236,34 @@
               // A workbook: the sheet that is shown; the name of the file is what "&F" in a header stands for.
               var job = result.kind === 'document' ? result.print() : result.print({ fileName: name });
               job.catch(function () {});
+            });
+            // The same pages as a PDF file: the bytes come back, and what is done with them is the page's own
+            // (here: a download; an application would rather send them to its server).
+            pdfButton.hidden = false;
+            pdfButton.addEventListener('click', function () {
+              if (pdfButton.disabled) return;
+              pdfButton.disabled = true;
+              var options = result.kind === 'document' ? { title: name } : { title: name, fileName: name };
+              result
+                .exportPdf(options)
+                .then(function (bytes) {
+                  var url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+                  var link = document.createElement('a');
+                  link.href = url;
+                  link.download = name.replace(/\.[^.]*$/, '') + '.pdf';
+                  document.body.appendChild(link);
+                  link.click();
+                  link.remove();
+                  setTimeout(function () {
+                    URL.revokeObjectURL(url);
+                  }, 60000);
+                })
+                .catch(function () {
+                  // The editor has said what went wrong (onNotice).
+                })
+                .then(function () {
+                  pdfButton.disabled = false;
+                });
             });
             // What was said while the file was opened (it was converted, or could not be) stays until something else is said.
             if (!noticed) status('');

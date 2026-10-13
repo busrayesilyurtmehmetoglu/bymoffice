@@ -13,6 +13,8 @@ import { FormulaBar } from './formula-bar';
 import type { SaveCommand } from './save-command';
 import type { DocumentPrintResult } from './doc-print';
 import type { SheetPrintOptions } from './sheet-print';
+import type { PdfDownload } from '../pdf/export';
+import type { SheetPdfExportOptions } from './sheet-view';
 import { WorkbookView, type WorkbookViewOptions } from './sheet-view';
 import { StatusBar } from './status-bar';
 import { Toolbar, type ShellHost } from './toolbar';
@@ -176,6 +178,8 @@ export class SpreadsheetEditor {
   private notice = '';
   /** What the status bar shows while the pages of a print job are prepared. */
   private printProgress = '';
+  /** The same while the pages of a PDF are painted. */
+  private pdfProgress = '';
   private frame = 0;
   private destroyed = false;
   /** Ends the watch on the save command. */
@@ -257,8 +261,15 @@ export class SpreadsheetEditor {
         if (this.toolbar) this.toolbar.setPrinting(progress !== undefined);
         this.printProgress = progress && progress.total > 0 ? this.strings.printProgress(progress.done, progress.total) : '';
         // In the status bar only: assistive technology heard that printing is being prepared, and hears when it is over.
-        if (this.statusBar && this.view) this.statusBar.showMessage(this.printProgress || this.notice || this.view.statusText);
+        if (this.statusBar && this.view) this.statusBar.showMessage(this.printProgress || this.pdfProgress || this.notice || this.view.statusText);
         if (options.onPrintProgress) options.onPrintProgress(progress);
+      },
+      onPdfProgress: (progress) => {
+        if (this.toolbar) this.toolbar.setExporting(progress !== undefined);
+        this.pdfProgress = progress && progress.total > 0 ? this.strings.pdfProgress(progress.done, progress.total) : '';
+        // In the status bar only, as for printing.
+        if (this.statusBar && this.view) this.statusBar.showMessage(this.printProgress || this.pdfProgress || this.notice || this.view.statusText);
+        if (options.onPdfProgress) options.onPdfProgress(progress);
       },
     };
     try {
@@ -284,6 +295,16 @@ export class SpreadsheetEditor {
   /** Prints the workbook: see WorkbookView.print(). */
   print(options?: SheetPrintOptions): Promise<DocumentPrintResult> {
     return this.view.print(options);
+  }
+
+  /** The workbook as a PDF file: see WorkbookView.exportPdf(). */
+  exportPdf(options?: SheetPdfExportOptions): Promise<Uint8Array> {
+    return this.view.exportPdf(options);
+  }
+
+  /** Makes the PDF and hands it to the browser as a download: see WorkbookView.downloadPdf(). */
+  downloadPdf(options?: SheetPdfExportOptions): Promise<PdfDownload> {
+    return this.view.downloadPdf(options);
   }
 
   /** Changes the language of number and date formats and, for a language tag, of every label. */
@@ -366,7 +387,7 @@ export class SpreadsheetEditor {
     if (this.formulaBar) this.formulaBar.update(single);
     if (this.statusBar) {
       // With nothing else to say: what the view knows about the active cell and the filter of the sheet.
-      this.statusBar.showMessage(this.printProgress || this.notice || view.statusText);
+      this.statusBar.showMessage(this.printProgress || this.pdfProgress || this.notice || view.statusText);
       this.statusBar.setReadOnly(view.readOnly);
       this.statusBar.showSummary(sheet, selection.range, single, this.locale);
     }

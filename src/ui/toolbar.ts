@@ -137,6 +137,10 @@ export class Toolbar {
     this.addButton('redo', () => host.view.redo());
     // Works in a read-only view as well; what goes wrong is said by the view.
     this.addButton('print', () => void host.view.print().catch(() => undefined)).setAttribute('aria-busy', 'false');
+    // One file at a time: a press while one is being made does not ask for a second.
+    this.addButton('pdf', () => {
+      if (!host.view.exportingPdf) void host.view.downloadPdf().catch(() => undefined);
+    }).setAttribute('aria-busy', 'false');
     this.addSeparator();
     this.sizeSelect = this.addSelect('bym-tb-size');
     this.addSeparator();
@@ -262,6 +266,13 @@ export class Toolbar {
     if (button && button.getAttribute('aria-busy') !== value) button.setAttribute('aria-busy', value);
   }
 
+  /** Marks the PDF button as busy while the pages of a PDF are painted. */
+  setExporting(busy: boolean): void {
+    const button = this.buttons.pdf;
+    const value = busy ? 'true' : 'false';
+    if (button && button.getAttribute('aria-busy') !== value) button.setAttribute('aria-busy', value);
+  }
+
   closePopover(): void {
     if (this.popover) this.popover.close('owner');
   }
@@ -347,6 +358,7 @@ export class Toolbar {
       redo: withShortcut(s.redo, 'Y'),
       // The same label as the button of the document bar.
       print: s.print,
+      pdf: s.pdfDownload,
       bold: withShortcut(s.bold, 'B'),
       italic: withShortcut(s.italic, 'I'),
       underline: withShortcut(s.underline, 'U'),

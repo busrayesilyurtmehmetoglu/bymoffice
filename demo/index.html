@@ -352,6 +352,8 @@
             locale: 'tr',
             readOnly: false,
             author: $('doc-author').value,
+            // What the PDF the bar downloads is named after.
+            fileName: record.name,
             onPageChange: (page, count) => {
               $('doc-info').textContent = `Sayfa ${page} / ${count}${docView && !docView.layoutDone ? ' (sayfalar hazırlanıyor)' : ''} · yakınlaştırma %${Math.round((docView ? docView.zoom : 1) * 100)}`;
             },
@@ -440,6 +442,8 @@
             readOnly: $('readonly').checked,
             // Who the notes added to cells are by.
             author: $('sheet-author').value,
+            // What the PDF the toolbar downloads is named after, and what "&F" in its headers stands for.
+            fileName: record.name,
             onChange: () => {
               changes++;
               refreshTools();

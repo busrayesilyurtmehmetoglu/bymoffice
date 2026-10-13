@@ -645,11 +645,12 @@ test.describe('printing from the editor', () => {
     await expect(button).toHaveAttribute('aria-label', 'Print');
     await expect(button).toHaveAttribute('title', 'Print');
     await expect(button).toHaveAttribute('aria-busy', 'false');
-    // It stands after Undo and Redo, before the first separator.
-    expect(await page.evaluate(() => Array.from(document.querySelectorAll('#host .bym-toolbar > *')).slice(0, 4).map((element) => element.getAttribute('data-command') || element.className))).toEqual([
+    // It stands after Undo and Redo; the PDF button follows it, before the first separator.
+    expect(await page.evaluate(() => Array.from(document.querySelectorAll('#host .bym-toolbar > *')).slice(0, 5).map((element) => element.getAttribute('data-command') || element.className))).toEqual([
       'undo',
       'redo',
       'print',
+      'pdf',
       'bym-tb-sep',
     ]);
     // What the button and the status bar show while the second page is being added.
@@ -726,7 +727,7 @@ test.describe('printing from the editor', () => {
       (window as any).__view = mounted.view;
       return Object.keys(mounted).sort();
     }, Array.from(bytes));
-    expect(keys).toEqual(['destroy', 'editor', 'file', 'hasUnsavedChanges', 'kind', 'print', 'save', 'saveNow', 'setAutoSave', 'view', 'workbook']);
+    expect(keys).toEqual(['destroy', 'editor', 'exportPdf', 'file', 'hasUnsavedChanges', 'kind', 'print', 'save', 'saveNow', 'setAutoSave', 'view', 'workbook']);
     await fakePrint(page, false);
     await page.evaluate(() => {
       const w = window as any;

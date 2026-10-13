@@ -47,8 +47,13 @@ import {
   type DocumentPrintResult,
   type PrintDialog,
   type PrintLimits,
+  type PrintPagePlan,
   type PrintPlan,
 } from './doc-print';
+import { PdfDocument } from '../pdf/document';
+import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, toPdfExportError, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { docPageRuns } from '../pdf/text';
+import { joinParts } from '../pdf/writer';
 import { resolveUiStrings, type UiStrings } from './strings';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
@@ -111,6 +116,8 @@ export interface DocumentViewOptions {
   author?: string;
   /** The clock tracked changes take their date from (tests). Default: the system's. */
   now?(): Date;
+  /** The name of the file that is shown: what the PDF the bar downloads is named after ("report.docx" gives "report.pdf"). */
+  fileName?: string;
 }
 
 export interface DocumentViewState {
@@ -601,16 +608,63 @@ function sameSource(a: TextItem, b: TextItem): boolean {
   return true;
 }
 
-/** One call of print(): what it holds while it runs. */
-interface PrintJob {
-  promise: Promise<DocumentPrintResult>;
-  frame?: PrintFrame;
+/** What takes the pages of a job as they are painted: the element a print job shows, the file of a PDF. */
+interface PageSink {
+  /**
+   * Takes the page that was just painted on the canvas. False when the pages
+   * were laid out anew meanwhile (`stale`): the job then starts over.
+   */
+  take(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, index: number, page: LayoutPage, planned: PrintPagePlan, stale: () => boolean): Promise<boolean>;
+  /** Lets go of what was taken. Safe to call twice. */
+  dispose(): void;
+}
+
+/** What painting the pages of a document for paper or for a file holds while it runs. */
+interface PageJob {
+  sink?: PageSink;
   store?: ImageStore;
-  /** Set once the pages are ready and the dialog was asked for. */
-  dialog?: PrintDialog;
   /** Pages ready so far, while they are prepared. */
   progress?: { done: number; total: number };
+  /** For a PDF: throws when the caller does not want the file any more. */
+  check?(): void;
+  /** For a PDF: told of every page that is done. */
+  report?(done: number, total: number): void;
 }
+
+/** One call of print(): what it holds while it runs. */
+interface PrintJob extends PageJob {
+  promise: Promise<DocumentPrintResult>;
+  /** Set once the pages are ready and the dialog was asked for. */
+  dialog?: PrintDialog;
+}
+
+/** What is said when painting the pages ends early: of printing, or of making a PDF. */
+interface PageJobWords {
+  destroyed: string;
+  failedLayout: string;
+  changing: string;
+  noCanvas: string;
+  /** The reason of a job without a canvas. */
+  noCanvasCode: 'failed' | 'unavailable';
+}
+
+const PRINT_WORDS: PageJobWords = {
+  destroyed: 'Printing was cancelled: the view was destroyed',
+  failedLayout: 'The document could not be laid out to its end, so it is not printed',
+  changing: 'The document kept changing while it was prepared for printing',
+  noCanvas: 'No canvas to paint the pages on',
+  noCanvasCode: 'failed',
+};
+
+const PDF_WORDS: PageJobWords = {
+  destroyed: 'Making the PDF was cancelled: the view was destroyed',
+  failedLayout: 'The document could not be laid out to its end, so no PDF is made of it',
+  changing: 'The document kept changing while its PDF was made',
+  noCanvas: 'A PDF cannot be made here: there is no canvas to paint the pages on',
+  noCanvasCode: 'unavailable',
+};
+
+const toPoints = (px: number): number => Math.round(px * 0.75 * 100) / 100;
 
 const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -648,6 +702,7 @@ export class DocumentView {
   private readonly zoomButton: HTMLButtonElement | undefined;
   private readonly fitButton: HTMLButtonElement | undefined;
   private readonly printButton: HTMLButtonElement | undefined;
+  private readonly pdfButton: HTMLButtonElement | undefined;
   private readonly pagesLabel: HTMLSpanElement | undefined;
   private readonly styleHost: Node;
   private readonly painter: CanvasTextMeasurer;
@@ -659,6 +714,9 @@ export class DocumentView {
   private readonly images: ImageStore;
   private readonly pictures: { readPart(part: string): Promise<Uint8Array> };
   private printJob: PrintJob | undefined;
+  /** The PDFs that are being made or wait for their turn; one is made at a time. */
+  private readonly pdfJobs: PageJob[] = [];
+  private pdfTurn: Promise<unknown> = Promise.resolve();
   /** Counts the times the pages were laid out anew: pages prepared for printing before are out of date. */
   private layoutEpoch = 0;
   private readonly pointerEvents: boolean;
@@ -846,6 +904,8 @@ export class DocumentView {
       this.zoomInButton = this.button(bar, 'bym-doc-zoom-in', icon(['M6 12h12', 'M12 6v12']));
       this.fitButton = this.button(bar, 'bym-doc-fit', icon(['M4 5v14', 'M20 5v14', 'M8 12h8', 'm10 9-2.5 3 2.5 3', 'm14 9 2.5 3-2.5 3']));
       this.printButton = this.button(bar, 'bym-doc-print', icon(['M7 8V4h10v4', 'M7 17H5a1 1 0 0 1-1-1v-6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1h-2', 'M7 14h10v6H7z']));
+      // A sheet of paper with its corner folded and an arrow down: the document as a file.
+      this.pdfButton = this.button(bar, 'bym-doc-pdf', icon(['M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z', 'M14 3v4h4', 'M12 10v7', 'm9 14 3 3 3-3']));
       const pagesLabel = document.createElement('span');
       pagesLabel.className = 'bym-doc-pages';
       pagesLabel.style.cssText = 'flex:1 1 0;min-width:0;margin:0 4px 0 12px;overflow:hidden;text-overflow:ellipsis;text-align:right';
@@ -1211,6 +1271,8 @@ export class DocumentView {
     this.images.destroy();
     // A print job under way ends here: its pages leave the document at once.
     if (this.printJob) this.endPrint(this.printJob);
+    // So does a PDF: what it holds is let go of, and its promise is rejected at its next step.
+    for (const job of this.pdfJobs.slice()) this.endPages(job);
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);
   }
@@ -1272,8 +1334,7 @@ export class DocumentView {
   }
 
   private async runPrint(job: PrintJob, options: DocumentPrintOptions): Promise<DocumentPrintResult> {
-    const cancelled = () => new DocumentPrintError('cancelled', 'Printing was cancelled: the view was destroyed');
-    if (this.destroyed) throw cancelled();
+    if (this.destroyed) throw new DocumentPrintError('cancelled', PRINT_WORDS.destroyed);
     // The window of the document the view is in: inside a frame, the frame is what is printed.
     const doc = this.container.ownerDocument || document;
     const win = doc.defaultView;
@@ -1281,36 +1342,25 @@ export class DocumentView {
     this.notify(this.strings.printPreparing, 'info');
     const limits = printLimits(coarsePointer());
     const urls = (win as unknown as { URL?: typeof URL }).URL || URL;
-    let plan: PrintPlan;
-    for (let attempt = 0; ; attempt++) {
-      // The rest of the document is laid out by the view's own slices.
-      while (!this.done && !this.failed) {
-        // A document beyond the limit is refused as soon as it is known to be, not after all of it was laid out.
-        if (this.pages.length > MAX_PRINT_PAGES) break;
-        await sleep(30);
-        if (this.destroyed) throw cancelled();
-      }
-      // Pages up to where the layout gave up are not the document: nothing is printed rather than a part of it.
-      if (this.failed) throw new DocumentPrintError('failed', 'The document could not be laid out to its end, so it is not printed');
-      const sizes: { width: number; height: number }[] = [];
-      for (let i = 0; i < this.pages.length; i++) sizes.push({ width: this.pageWidth(i), height: this.pageHeight(i) });
-      plan = planPrint(sizes, options, limits);
-      const frame = new PrintFrame(doc, plan, supportsNamedPages(win as unknown as { CSS?: { supports?(property: string, value: string): boolean } }), (url) => revokePicture(url, urls));
-      const store = new ImageStore(this.pictures, this.images.budget, () => undefined);
-      job.frame = frame;
-      job.store = store;
-      job.progress = { done: 0, total: plan.pages.length };
-      this.updateBar();
-      const complete = await this.paintForPrint(job, plan, frame, store, limits, doc, urls);
-      store.destroy();
-      job.store = undefined;
-      if (this.destroyed) throw cancelled();
-      if (complete) break;
-      // The document changed under the pages: they are prepared again from the start.
-      frame.dispose();
-      job.frame = undefined;
-      if (attempt >= MAX_PRINT_RESTARTS) throw new DocumentPrintError('failed', 'The document kept changing while it was prepared for printing');
-    }
+    const nextFrame = typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
+    const plan = await this.preparePages(job, options, limits, PRINT_WORDS, (planned) => {
+      const frame = new PrintFrame(doc, planned, supportsNamedPages(win as unknown as { CSS?: { supports?(property: string, value: string): boolean } }), (url) => revokePicture(url, urls));
+      let bytes = 0;
+      return {
+        take: async (canvas, _context, index, _page, _planned, stale) => {
+          const picture = await canvasPicture(canvas, urls, nextFrame);
+          bytes += picture.bytes;
+          if (stale() || bytes > limits.maxBytes) {
+            revokePicture(picture.url, urls);
+            if (this.destroyed || !(bytes > limits.maxBytes)) return false;
+            throw new DocumentPrintError('too-long', 'The pages of the document take too much memory to print at once');
+          }
+          await frame.add(picture.url, this.strings.page(index + 1));
+          return true;
+        },
+        dispose: () => frame.dispose(),
+      };
+    });
     job.progress = undefined;
     const dialog = openPrintDialog(win as unknown as Parameters<typeof openPrintDialog>[0]);
     job.dialog = dialog;
@@ -1321,33 +1371,73 @@ export class DocumentView {
     return { pages: plan.pages.length, dpi: plan.dpi };
   }
 
-  /** Paints the pages of a plan and adds them to the frame; false when the pages were laid out anew meanwhile. */
-  private async paintForPrint(
-    job: PrintJob,
-    plan: PrintPlan,
-    frame: PrintFrame,
-    store: ImageStore,
-    limits: PrintLimits,
-    doc: Document,
-    urls: { createObjectURL(blob: Blob): string; revokeObjectURL(url: string): void },
-  ): Promise<boolean> {
+  /**
+   * What printing and making a PDF share: waits until the document is laid
+   * out, decides the resolution of the pages (planPrint), and paints them one
+   * per turn, each one handed to the sink `open` makes for the plan. When the
+   * document is laid out anew meanwhile, the sink is let go of and the pages
+   * are painted again from the start. The sink of the pages that were all
+   * painted stays in `job.sink`.
+   */
+  private async preparePages(job: PageJob, options: DocumentPrintOptions, limits: PrintLimits, words: PageJobWords, open: (plan: PrintPlan) => PageSink): Promise<PrintPlan> {
+    const cancelled = () => new DocumentPrintError('cancelled', words.destroyed);
+    const doc = this.container.ownerDocument || document;
+    let plan: PrintPlan;
+    for (let attempt = 0; ; attempt++) {
+      // The rest of the document is laid out by the view's own slices.
+      while (!this.done && !this.failed) {
+        // A document beyond the limit is refused as soon as it is known to be, not after all of it was laid out.
+        if (this.pages.length > MAX_PRINT_PAGES) break;
+        await sleep(30);
+        if (this.destroyed) throw cancelled();
+        if (job.check) job.check();
+      }
+      // Pages up to where the layout gave up are not the document: nothing is printed rather than a part of it.
+      if (this.failed) throw new DocumentPrintError('failed', words.failedLayout);
+      const sizes: { width: number; height: number }[] = [];
+      for (let i = 0; i < this.pages.length; i++) sizes.push({ width: this.pageWidth(i), height: this.pageHeight(i) });
+      plan = planPrint(sizes, options, limits);
+      const sink = open(plan);
+      const store = new ImageStore(this.pictures, this.images.budget, () => undefined);
+      job.sink = sink;
+      job.store = store;
+      this.setPageProgress(job, 0, plan.pages.length);
+      const complete = await this.paintPages(job, plan, sink, store, doc, words);
+      store.destroy();
+      job.store = undefined;
+      if (this.destroyed) throw cancelled();
+      if (complete) break;
+      // The document changed under the pages: they are prepared again from the start.
+      sink.dispose();
+      job.sink = undefined;
+      if (attempt >= MAX_PRINT_RESTARTS) throw new DocumentPrintError('failed', words.changing);
+    }
+    return plan;
+  }
+
+  private setPageProgress(job: PageJob, done: number, total: number): void {
+    job.progress = { done, total };
+    this.updateBar();
+    if (job.report) job.report(done, total);
+  }
+
+  /** Paints the pages of a plan and hands them to the sink; false when the pages were laid out anew meanwhile. */
+  private async paintPages(job: PageJob, plan: PrintPlan, sink: PageSink, store: ImageStore, doc: Document, words: PageJobWords): Promise<boolean> {
     const epoch = this.layoutEpoch;
     const stale = () => this.destroyed || this.layoutEpoch !== epoch || !(this.done || this.failed);
     // One canvas for all pages: a page is held as pixels only while it is painted.
     const canvas = doc.createElement('canvas');
-    const win = doc.defaultView;
-    const nextFrame = win && typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
-    let bytes = 0;
     try {
       for (let i = 0; i < plan.pages.length; i++) {
         if (stale()) return false;
+        if (job.check) job.check();
         const page = this.pages[i];
         const planned = plan.pages[i];
         if (!page) return false;
         if (canvas.width !== planned.pixelWidth) canvas.width = planned.pixelWidth;
         if (canvas.height !== planned.pixelHeight) canvas.height = planned.pixelHeight;
         const context = canvas.getContext('2d');
-        if (!context) throw new DocumentPrintError('failed', 'No canvas to paint the pages on');
+        if (!context) throw new DocumentPrintError(words.noCanvasCode, words.noCanvas);
         const paint = () => {
           context.setTransform(1, 0, 0, 1, 0, 0);
           context.fillStyle = '#ffffff';
@@ -1378,16 +1468,8 @@ export class DocumentView {
           if (error instanceof DocumentPrintError) throw error;
           throw new DocumentPrintError('failed', `Page ${i + 1} could not be painted`);
         }
-        const picture = await canvasPicture(canvas, urls, nextFrame);
-        bytes += picture.bytes;
-        if (stale() || bytes > limits.maxBytes) {
-          revokePicture(picture.url, urls);
-          if (this.destroyed || !(bytes > limits.maxBytes)) return false;
-          throw new DocumentPrintError('too-long', 'The pages of the document take too much memory to print at once');
-        }
-        await frame.add(picture.url, this.strings.page(i + 1));
-        job.progress = { done: i + 1, total: plan.pages.length };
-        this.updateBar();
+        if (!(await sink.take(canvas, context, i, page, planned, stale))) return false;
+        this.setPageProgress(job, i + 1, plan.pages.length);
       }
       return !stale();
     } finally {
@@ -1406,14 +1488,24 @@ export class DocumentView {
     return false;
   }
 
-  /** Takes what a print job holds out of the document. Safe to call twice. */
-  private endPrint(job: PrintJob): void {
-    if (job.frame) job.frame.dispose();
+  /** Lets go of what painting the pages of a job holds. Safe to call twice. */
+  private endPages(job: PageJob): void {
+    if (job.sink) job.sink.dispose();
     if (job.store) job.store.destroy();
-    if (job.dialog) job.dialog.finish();
-    job.frame = undefined;
+    job.sink = undefined;
     job.store = undefined;
     job.progress = undefined;
+    const at = this.pdfJobs.indexOf(job);
+    if (at >= 0) {
+      this.pdfJobs.splice(at, 1);
+      if (!this.destroyed) this.updateBar();
+    }
+  }
+
+  /** Takes what a print job holds out of the document. Safe to call twice. */
+  private endPrint(job: PrintJob): void {
+    this.endPages(job);
+    if (job.dialog) job.dialog.finish();
     if (this.printJob !== job) return;
     this.printJob = undefined;
     if (!this.destroyed) this.updateBar();
@@ -1426,6 +1518,139 @@ export class DocumentView {
     if (code === 'cancelled') return;
     const strings = this.strings;
     this.notify(code === 'unavailable' ? strings.printNotAvailable : code === 'too-long' ? strings.printTooLong : strings.printFailed, 'error');
+  }
+
+  // ------------------------------------------------------------------- PDF
+
+  /** Whether a PDF is being made (or waits for the one before it). */
+  get exportingPdf(): boolean {
+    return this.pdfJobs.length > 0;
+  }
+
+  /**
+   * The document as a PDF file: every page as the picture printing makes of
+   * it (what is on the screen, at `dpi` dots per inch), with the text of the
+   * page lying invisible over it, so that the file can be searched and its
+   * text selected and copied. The pages are painted one per turn and written
+   * into the file as they come; a composition under way is ended first, as
+   * saving does. Works in a read-only view too.
+   *
+   * Rejects with a PdfExportError: 'unavailable' where there is no canvas,
+   * 'too-long' beyond the limits on pages and on the size of the file,
+   * 'cancelled' when `signal` is aborted or the view is destroyed; with a
+   * RangeError or a TypeError for an option that cannot be. A second call
+   * while a file is being made waits for it.
+   */
+  exportPdf(options: PdfExportOptions = {}): Promise<Uint8Array> {
+    return this.exportPdfParts(options).then(joinParts);
+  }
+
+  /** As exportPdf(), with the file as the parts it was written in: what a Blob is made of without holding the file twice. */
+  exportPdfParts(options: PdfExportOptions = {}): Promise<Uint8Array[]> {
+    if (this.destroyed) return Promise.reject(new PdfExportError('cancelled', 'The view was destroyed'));
+    let settings: PdfSettings;
+    // A wrong option is refused before any work is done, whatever else is under way.
+    try {
+      settings = pdfSettings(options);
+      checkCancelled(options.signal);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const job: PageJob = {};
+    const nothing = () => undefined;
+    const promise = this.pdfTurn.then(nothing, nothing).then(() =>
+      this.runPdf(job, options, settings).then(
+        (parts) => {
+          this.endPages(job);
+          return parts;
+        },
+        (error) => {
+          this.endPages(job);
+          const told = toPdfExportError(error);
+          this.pdfFailed(told);
+          throw told;
+        },
+      ),
+    );
+    this.pdfTurn = promise;
+    this.pdfJobs.push(job);
+    this.updateBar();
+    return promise;
+  }
+
+  /**
+   * Makes the PDF and hands it to the browser as a download, named after the
+   * file (DocumentViewOptions.fileName; "document.pdf" without one). What
+   * the PDF button of the bar does.
+   */
+  downloadPdf(options: PdfExportOptions = {}): Promise<PdfDownload> {
+    return this.exportPdfParts(options).then((parts) => {
+      const fileName = pdfFileName(this.options.fileName, 'document');
+      if (!downloadParts(this.container.ownerDocument || document, parts, fileName)) throw new PdfExportError('unavailable', 'The PDF cannot be downloaded here');
+      let size = 0;
+      for (let i = 0; i < parts.length; i++) size += parts[i].length;
+      return { fileName, size };
+    });
+  }
+
+  private async runPdf(job: PageJob, options: PdfExportOptions, settings: PdfSettings): Promise<Uint8Array[]> {
+    if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    const doc = this.container.ownerDocument || document;
+    const win = doc.defaultView;
+    // What an input method is composing is part of the document that is written.
+    this.commitEditing();
+    this.notify(this.strings.pdfPreparing, 'info');
+    const nextFrame = win && typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
+    const limits = pdfLimits(coarsePointer());
+    job.check = () => checkCancelled(options.signal);
+    job.report = (done, total) => {
+      if (!options.onProgress || !(done > 0)) return;
+      try {
+        options.onProgress(done, total);
+      } catch {
+        // What the caller does with the news is its own; the file is made all the same.
+      }
+    };
+    let file: PdfDocument | undefined;
+    let parts: Uint8Array[] = [];
+    // Where the characters of a line are, for a line that the edge of the paper cuts off.
+    const measureText = (font: LayoutFont, text: string): number => this.measurer.width(font, text);
+    await this.preparePages(job, { dpi: settings.dpi }, limits, PDF_WORDS, () => {
+      const pdf = new PdfDocument({ title: options.title, author: options.author, date: options.date, maxBytes: limits.maxBytes });
+      const taken: Uint8Array[] = [];
+      file = pdf;
+      parts = taken;
+      return {
+        take: async (canvas, context, _index, page, planned, stale) => {
+          const picture = await canvasPageImage(canvas, context, settings, nextFrame);
+          if (stale()) return false;
+          checkCancelled(options.signal);
+          await pdf.addPage({ width: toPoints(planned.width), height: toPoints(planned.height), image: picture.image, fill: picture.fill, text: { runs: docPageRuns(page, measureText), width: planned.width } });
+          const written = pdf.takeParts();
+          for (let i = 0; i < written.length; i++) taken.push(written[i]);
+          return !stale();
+        },
+        dispose: () => {
+          taken.length = 0;
+        },
+      };
+    });
+    checkCancelled(options.signal);
+    const pdf = file as PdfDocument;
+    await pdf.finish();
+    const written = pdf.takeParts();
+    // The parts are taken from the sink before it is let go of with the job.
+    const out = parts.concat(written);
+    if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    this.notify(this.strings.pdfReady, 'info');
+    return out;
+  }
+
+  private pdfFailed(error: unknown): void {
+    // A wrong option is the caller's to hear about, not the user's; so are the end of a view and a file nobody wants any more.
+    if (this.destroyed || !(error instanceof PdfExportError) || error.code === 'cancelled') return;
+    const strings = this.strings;
+    this.notify(error.code === 'unavailable' ? strings.pdfNotAvailable : error.code === 'too-long' ? strings.pdfTooLong : strings.pdfFailed, 'error');
   }
 
   // ---------------------------------------------------------------- set-up
@@ -1982,12 +2207,25 @@ export class DocumentView {
       const busy = job && !job.dialog ? 'true' : 'false';
       if (this.printButton.getAttribute('aria-busy') !== busy) this.printButton.setAttribute('aria-busy', busy);
     }
+    const file = this.pdfJobs.length > 0 ? this.pdfJobs[0] : undefined;
+    if (this.pdfButton) {
+      const text = strings.pdfDownload;
+      if (this.pdfButton.getAttribute('aria-label') !== text) {
+        this.pdfButton.setAttribute('aria-label', text);
+        this.pdfButton.title = text;
+      }
+      const busy = file ? 'true' : 'false';
+      if (this.pdfButton.getAttribute('aria-busy') !== busy) this.pdfButton.setAttribute('aria-busy', busy);
+    }
     if (this.pagesLabel) {
       const count = this.pages.length;
       const preparing = job && !job.dialog ? job.progress : undefined;
+      const writing = file ? file.progress : undefined;
       // "+": more pages are on their way.
       const text = preparing
         ? strings.printProgress(preparing.done, preparing.total)
+        : writing
+        ? strings.pdfProgress(writing.done, writing.total)
         : count === 0 ? (this.done || this.failed ? '' : strings.preparingPages) : strings.pageOf(this.currentPage, count) + (this.done || this.failed ? '' : '+');
       if (this.pagesLabel.textContent !== text) this.pagesLabel.textContent = text;
     }
@@ -2800,6 +3038,8 @@ export class DocumentView {
     else if (button === this.zoomButton) this.setZoom(1);
     else if (button === this.fitButton) this.setZoom('fit-width');
     else if (button === this.printButton) this.print().catch(() => undefined);
+    // One file at a time: a press while one is being made does not ask for a second.
+    else if (button === this.pdfButton && this.pdfJobs.length === 0) this.downloadPdf().catch(() => undefined);
     // After a press with a pointer the keys belong to the document again; a key press leaves the focus on the button.
     if (event.detail > 0) this.focusInput(true);
   };
@@ -3818,7 +4058,7 @@ export class DocumentView {
    * its author (paler for a resolved thread, stronger for the one whose
    * balloon is shown), a bar where a comment is about a point, and for each
    * thread a mark in the margin beside its first line. Nothing of this is
-   * part of a printed page (see paintForPrint).
+   * part of a printed page (see paintPages).
    */
   private paintComments(context: CanvasRenderingContext2D, slot: Slot, scale: number): void {
     const state = this.commentState();

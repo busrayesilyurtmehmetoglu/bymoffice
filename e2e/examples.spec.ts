@@ -1,5 +1,7 @@
+import { readFile } from 'node:fs/promises';
 import type { Page } from '@playwright/test';
 import { createBlank } from '../src/index';
+import { checkPdf } from '../test/pdf-fixtures';
 import { expect, test } from './helpers';
 
 // examples/html/index.html: the page an application opens (in a tab or an
@@ -240,6 +242,28 @@ test.describe('example page: a file of the site in the editor', () => {
     await waitFor('ready');
     const plain = (await messages())[0];
     expect([plain.type, plain.format, 'convertedFrom' in plain]).toEqual(['ready', 'rtf', false]);
+  });
+
+  test('PDF: the button downloads the pages as a PDF file named after the document, in view mode too', async ({ page }) => {
+    for (const query of ['new=docx&name=Teklif%202026.docx', 'new=docx&name=Teklif%202026.docx&mode=view']) {
+      await page.goto(`${PAGE}?${query}`);
+      await ready(page);
+      await expect(page.locator('#pdf')).toBeVisible();
+      if (!query.includes('view')) {
+        await page.evaluate(() => {
+          const view = (window as any).bymEditor.view;
+          view.setSelection({ story: 'body', path: [0], offset: 0 });
+          view.insertText('Teklif metni');
+        });
+      }
+      const [download] = await Promise.all([page.waitForEvent('download', { timeout: 60_000 }), page.locator('#pdf').click()]);
+      expect(download.suggestedFilename()).toBe('Teklif 2026.pdf');
+      const pdf = checkPdf(new Uint8Array(await readFile(await download.path())));
+      expect(pdf.pages.length).toBe(1);
+      expect(pdf.info.Title).toBe('Teklif 2026.docx');
+      expect(pdf.pages[0].text.trim()).toBe(query.includes('view') ? '' : 'Teklif metni');
+      await expect(page.locator('#pdf')).toBeEnabled();
+    }
   });
 
   test('Print: a document is printed with the button, in view mode too; under the print medium only its pages show; a workbook is printed as well', async ({ page }) => {

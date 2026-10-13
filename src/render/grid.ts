@@ -18,6 +18,7 @@ import { iconGlyph, type CellConditional, type CellDataBar, type ConditionalSour
 import type { FormatLocale } from '../format/locale';
 import type { FormatOptions } from '../format/number-format';
 import { cssFont, FONT_FALLBACK, fontPixels, TextPainter, wrapLines } from './text';
+import { textBlock } from '../pdf/text';
 
 export interface GridTheme {
   background: string;
@@ -1335,6 +1336,9 @@ function drawCellText(
     ctx.rect(clipLeft, y, clipRight - clipLeft, height);
     ctx.clip();
   }
+  // Whoever listens to the text of the page (a PDF) hears that these lines are one cell. Nothing is painted differently.
+  const block = last > first;
+  if (block) textBlock(ctx, true);
   for (let i = first; i <= last; i++) {
     const start = lines[i * 2];
     const end = lines[i * 2 + 1];
@@ -1347,6 +1351,7 @@ function drawCellText(
     const baseline = Math.round(blockTop + i * lineHeight + lineHeight - px * DESCENT);
     drawRange(frame, segments, start, end, Math.round(left), baseline);
   }
+  if (block) textBlock(ctx, false);
   if (clip) {
     ctx.restore();
     painter.invalidate();

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { base64Decode, base64Encode, createBridge, isAllowedUrl, normalizeOrigin, resolveLoadUrl, type BridgeHost } from '../src/embed/bridge';
+import { MAX_BRIDGE_PDF_BYTES, base64Decode, base64Encode, base64OfParts, createBridge, isAllowedUrl, normalizeOrigin, resolveLoadUrl, type BridgeHost } from '../src/embed/bridge';
 import { open as openFile, type OfficeFile } from '../src/index';
 import { openConverted } from '../src/formats/convert';
 import { simpleDoc } from './doc-binary-fixtures';
@@ -2205,4 +2205,149 @@ test('bridge: typing tells nothing of the comments; the list is not even asked f
   counted.d.views[0].options.onChange!();
   assert.equal(asked, before + 1);
   assert.deepEqual(g.sent.filter((message) => message.type === 'comments').map((message) => message.comments), [[{ id: 1, author: 'Ann', text: 'Why?', done: true }]]);
+});
+
+test('bridge: exportPdf answers with the file as base64, its name and its pages; other messages do not wait', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  const jobs: { options: any; resolve(bytes: Uint8Array): void; reject(error: unknown): void }[] = [];
+  const make = f.host.createDocumentView!;
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.ok(d.views[0], 'a document is shown');
+  // A view without exportPdf(): the page says that it cannot.
+  await bridge.receive({ type: 'exportPdf', id: 'p0' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'p0', code: 'pdf-unavailable', message: 'This view cannot make a PDF' });
+  f.host.createDocumentView = (container, doc, options) => {
+    const pages = make.call(f.host, container, doc, options);
+    pages.exportPdf = (pdfOptions) => new Promise<Uint8Array>((resolve, reject) => jobs.push({ options: pdfOptions, resolve, reject }));
+    return pages;
+  };
+  await bridge.receive({ type: 'load', data: DATA, name: 'Rapor 2026.docx' });
+  await bridge.receive({ type: 'exportPdf', id: 'p1' });
+  await bridge.receive({ type: 'exportPdf', id: 'p2', dpi: 96, image: 'lossless', quality: 0.5, title: 'T', author: 'A', sheets: 'all' });
+  const given = (options: any) => {
+    const copy = { ...options };
+    assert.equal(typeof copy.onProgress, 'function', 'the bridge listens to the progress');
+    delete copy.onProgress;
+    return copy;
+  };
+  // A document has no sheets to choose from: a valid choice is left out.
+  assert.deepEqual(jobs.map((job) => given(job.options)), [{}, { dpi: 96, image: 'lossless', quality: 0.5, title: 'T', author: 'A' }]);
+  const before = f.sent.length;
+  await bridge.receive({ type: 'undo', id: 'u' });
+  assert.deepEqual(f.sent.slice(before), [{ type: 'done', id: 'u', command: 'undo' }]);
+  jobs[0].options.onProgress(1, 3);
+  jobs[0].options.onProgress(3, 3);
+  jobs[0].resolve(Uint8Array.from([0x25, 0x50, 0x44, 0x46]));
+  jobs[1].reject(Object.assign(new Error('A PDF cannot be made here'), { code: 'unavailable' }));
+  await settle();
+  assert.deepEqual(f.sent.slice(before + 1), [
+    { type: 'pdf', id: 'p1', data: 'JVBERg==', name: 'Rapor 2026.pdf', pages: 3 },
+    { type: 'error', id: 'p2', code: 'pdf-unavailable', message: 'A PDF cannot be made here' },
+  ]);
+  await bridge.receive({ type: 'exportPdf', id: 'p3' });
+  jobs[2].reject(new Error('Page 2 could not be painted'));
+  await settle();
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'p3', code: 'pdf-failed', message: 'Page 2 could not be painted' });
+  // Without an id the file is sent all the same: it is what was asked for.
+  await bridge.receive({ type: 'exportPdf' });
+  jobs[3].resolve(new Uint8Array(0));
+  await settle();
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'pdf', data: '', name: 'Rapor 2026.pdf', pages: 0 });
+});
+
+test('bridge: exportPdf is refused without a file and with options that cannot be; a workbook gets the choice of sheets and the name of the file', async () => {
+  const f = fake();
+  const jobs: { options: any }[] = [];
+  const make = f.host.createView;
+  f.host.createView = (container, workbook, options) => {
+    const view = make.call(f.host, container, workbook, options);
+    view.exportPdf = ((pdfOptions: unknown) => new Promise<Uint8Array>(() => jobs.push({ options: pdfOptions }))) as unknown as typeof view.exportPdf;
+    return view;
+  };
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'exportPdf', id: 'a' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'a', code: 'not-loaded', message: 'No file is open' });
+  await bridge.receive({ type: 'load', data: DATA, name: 'Budget 2026.xlsx' });
+  const wrong: object[] = [{ dpi: 0 }, { dpi: '150' }, { image: 'png' }, { image: 1 }, { quality: 0 }, { quality: 1.5 }, { quality: 'high' }, { sheets: 'visible' }, { sheets: [0] }, { title: 5 }, { author: true }];
+  for (const options of wrong) {
+    await bridge.receive({ type: 'exportPdf', id: 'c', ...options });
+    assert.equal(f.sent[f.sent.length - 1].code, 'bad-message', JSON.stringify(options));
+  }
+  assert.equal(jobs.length, 0, 'nothing was started for a wrong message');
+  await bridge.receive({ type: 'exportPdf', id: 'p1' });
+  await bridge.receive({ type: 'exportPdf', id: 'p2', sheets: 'all', dpi: 200, image: 'auto' });
+  assert.deepEqual(
+    jobs.map((job) => ({ ...job.options, onProgress: undefined })),
+    [
+      { onProgress: undefined, fileName: 'Budget 2026.xlsx' },
+      { onProgress: undefined, dpi: 200, image: 'auto', sheets: 'all', fileName: 'Budget 2026.xlsx' },
+    ],
+  );
+});
+
+test('bridge: a PDF is put into base64 part by part, whatever the lengths of the parts', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  const make = f.host.createDocumentView!;
+  let whole = 0;
+  // Parts of 1, 4, 2, 0 and 5 bytes: none of them ends where three bytes do.
+  const parts = [[37], [80, 68, 70, 45], [49, 46], [], [52, 10, 255, 0, 128]].map((bytes) => Uint8Array.from(bytes));
+  f.host.createDocumentView = (container, doc, options) => {
+    const pages = make.call(f.host, container, doc, options);
+    pages.exportPdfParts = (pdfOptions) => {
+      pdfOptions!.onProgress!(2, 2);
+      return Promise.resolve(parts);
+    };
+    pages.exportPdf = () => {
+      whole++;
+      return Promise.resolve(new Uint8Array(0));
+    };
+    return pages;
+  };
+  await bridge.receive({ type: 'load', data: DATA, name: 'a.docx' });
+  assert.ok(d.views[0], 'a document is shown');
+  await bridge.receive({ type: 'exportPdf', id: 'p' });
+  await settle();
+  const joined = Buffer.concat(parts.map((part) => Buffer.from(part)));
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'pdf', id: 'p', data: joined.toString('base64'), name: 'a.pdf', pages: 2 });
+  assert.equal(whole, 0, 'the file is not asked for as one array when its parts can be had');
+  assert.equal(base64OfParts([]), '');
+  assert.equal(base64OfParts([Uint8Array.from([1])]), 'AQ==');
+  assert.equal(base64OfParts([Uint8Array.from([1]), Uint8Array.from([2])]), 'AQI=');
+  assert.equal(base64OfParts([Uint8Array.from([1, 2]), Uint8Array.from([3, 4, 5, 6, 7])]), Buffer.from([1, 2, 3, 4, 5, 6, 7]).toString('base64'));
+});
+
+test('bridge: a PDF beyond the limit of a message, and one that cannot be sent, are answered with an error', async () => {
+  const f = fake();
+  const d = withEditableDocument(f);
+  const bridge = createBridge(f.host);
+  const make = f.host.createDocumentView!;
+  let next: unknown;
+  f.host.createDocumentView = (container, doc, options) => {
+    const pages = make.call(f.host, container, doc, options);
+    pages.exportPdfParts = () => Promise.resolve(next as Uint8Array[]);
+    return pages;
+  };
+  await bridge.receive({ type: 'load', data: DATA });
+  assert.ok(d.views[0], 'a document is shown');
+  assert.equal(MAX_BRIDGE_PDF_BYTES, 64 * 1024 * 1024);
+  // One byte more than a message carries, in two parts.
+  next = [new Uint8Array(MAX_BRIDGE_PDF_BYTES), new Uint8Array(1)];
+  await bridge.receive({ type: 'exportPdf', id: 'big' });
+  await settle();
+  const refused = f.sent[f.sent.length - 1];
+  assert.deepEqual([refused.type, refused.id, refused.code], ['error', 'big', 'pdf-too-large']);
+  assert.match(String(refused.message), /dpi/, 'the message says what makes the file smaller');
+  // What the view hands over is no file: the answer is an error, not silence.
+  next = [{ length: 3 }];
+  await bridge.receive({ type: 'exportPdf', id: 'odd' });
+  await settle();
+  assert.deepEqual([f.sent[f.sent.length - 1].type, f.sent[f.sent.length - 1].id, f.sent[f.sent.length - 1].code], ['error', 'odd', 'pdf-failed']);
+  next = null;
+  await bridge.receive({ type: 'exportPdf', id: 'none' });
+  await settle();
+  assert.deepEqual([f.sent[f.sent.length - 1].type, f.sent[f.sent.length - 1].id, f.sent[f.sent.length - 1].code], ['error', 'none', 'pdf-failed']);
 });

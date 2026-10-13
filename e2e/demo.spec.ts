@@ -183,6 +183,9 @@ test.describe('demo page', () => {
     // The toolbar of the editor has the Print button.
     await expect(page.locator('#grid [data-command="print"]')).toBeVisible();
     await expect(page.locator('#grid [data-command="print"]')).toHaveAttribute('aria-label', 'Yazdır');
+    // And, beside it, the button that downloads the workbook as a PDF.
+    await expect(page.locator('#grid [data-command="pdf"]')).toBeVisible();
+    await expect(page.locator('#grid [data-command="pdf"]')).toHaveAttribute('aria-label', 'PDF olarak indir');
 
     await page.locator('#grid .bym-tabs button', { hasText: 'Grafik' }).click();
     await expect(page.locator('#preview-note')).toContainText('Grafik: chartsheet');
@@ -254,6 +257,12 @@ test.describe('demo page', () => {
     await expect(page.locator('#doc .bym-doc-print')).toHaveAttribute('aria-label', 'Yazdır');
     await expect(page.locator('#doc-info')).toContainText('Sayfa 1 / 3');
     await expect(page.locator('#doc-note')).toContainText('Model');
+    // And the one that downloads the document as a PDF, named after the file; the page says what the view says.
+    await expect(page.locator('#doc .bym-doc-pdf')).toHaveAttribute('aria-label', 'PDF olarak indir');
+    const [download] = await Promise.all([page.waitForEvent('download', { timeout: 60_000 }), page.locator('#doc .bym-doc-pdf').click()]);
+    expect(download.suggestedFilename()).toBe('belge.pdf');
+    await expect(page.locator('#doc .bym-doc-pdf')).toHaveAttribute('aria-busy', 'false');
+    await expect(page.locator('#doc-note')).toHaveText('PDF hazır');
     await expect(page.locator('#doc canvas').first()).toBeVisible();
     const dark = await page.locator('#doc canvas').first().evaluate((element) => {
       const canvas = element as HTMLCanvasElement;

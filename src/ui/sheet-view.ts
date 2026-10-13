@@ -141,9 +141,14 @@ import {
   type DocumentPrintResult,
   type PrintDialog,
   type PrintLimits,
+  type PrintPagePlan,
   type PrintPlan,
 } from './doc-print';
-import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
+import { PdfDocument } from '../pdf/document';
+import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, toPdfExportError, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { MAX_PAGE_RUNS, captureText, type PdfTextRun } from '../pdf/text';
+import { joinParts } from '../pdf/writer';
+import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
 import { viewEngineOptions } from './engine-options';
 import { FilterMenu, ListMenu } from './filter-menu';
 import { allSheets, dropIndex, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
@@ -185,7 +190,23 @@ export interface WorkbookViewOptions {
    * and with undefined once that is over: the dialog is open, or the job ended.
    */
   onPrintProgress?(progress: { done: number; total: number } | undefined): void;
+  /** The same while exportPdf() paints the pages of a PDF, and with undefined once the file is there or was given up. */
+  onPdfProgress?(progress: { done: number; total: number } | undefined): void;
+  /** The name of the file that is shown: what "&F" in a header of a PDF stands for, and what the PDF downloadPdf() makes is named after. */
+  fileName?: string;
 }
+
+export interface SheetPdfExportOptions extends PdfExportOptions {
+  /**
+   * 'active' (the default) makes a PDF of the sheet that is shown, 'all' of
+   * every visible worksheet and chart sheet in the order of the tabs; a list
+   * of sheet indexes of exactly those sheets, in the order of the list.
+   */
+  sheets?: 'active' | 'all' | readonly number[];
+  /** What "&F" in a header or footer stands for; WorkbookViewOptions.fileName when it is not given. */
+  fileName?: string;
+}
+
 
 /**
  * What the view stores with every undo step: the sheet shown and its
@@ -552,16 +573,75 @@ const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setT
 /** How long printing waits for a calculation under way before it goes on with what is there. */
 const PRINT_CALC_MS = 30000;
 
-/** One call of print(): what it holds while it runs. */
-interface PrintJob {
-  promise: Promise<DocumentPrintResult>;
-  frame?: PrintFrame;
+/** What takes the pages of a job as they are painted: the element a print job shows, the file of a PDF. */
+interface PageSink {
+  /**
+   * Takes the page that was just painted on the canvas, with the text that
+   * was painted on it when the job asked for that. False when the workbook
+   * was changed meanwhile (`stale`): the job then starts over.
+   */
+  take(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, index: number, entry: SheetJobPage, planned: PrintPagePlan, stale: () => boolean, runs: PdfTextRun[]): Promise<boolean>;
+  /** Lets go of what was taken. Safe to call twice. */
+  dispose(): void;
+}
+
+/** What painting pages for paper or for a file holds while it runs. */
+interface PageJob {
+  sink?: PageSink;
   /** Decoded pictures of the pages that are being painted. */
   store?: ImageStore;
+  progress?: { done: number; total: number };
+  /** Told how far the pages are, and (undefined) that they are over. */
+  report?(progress: { done: number; total: number } | undefined): void;
+  /** For a PDF: throws when the caller does not want the file any more. */
+  check?(): void;
+  /** For a PDF: the text that is painted on a page is caught, for the text of the file. */
+  captureText?: boolean;
+}
+
+/** One call of print(): what it holds while it runs. */
+interface PrintJob extends PageJob {
+  promise: Promise<DocumentPrintResult>;
   /** Set once print() of the window was called. */
   dialog?: PrintDialog;
-  progress?: { done: number; total: number };
 }
+
+/** Which sheets a job is of, and what "&F" stands for. */
+interface PageJobOptions {
+  dpi?: number;
+  sheets?: 'active' | 'all' | readonly number[];
+  fileName?: string;
+}
+
+/** What is said when painting the pages ends early: of printing, or of making a PDF. */
+interface PageJobWords {
+  destroyed: string;
+  typing: string;
+  changing: string;
+  noCanvas: string;
+  /** The reason of a job without a canvas. */
+  noCanvasCode: 'failed' | 'unavailable';
+}
+
+const PRINT_WORDS: PageJobWords = {
+  destroyed: 'Printing was cancelled: the view was destroyed',
+  typing: 'Printing was cancelled: what is being typed cannot be applied',
+  changing: 'The workbook kept changing while it was prepared for printing',
+  noCanvas: 'No canvas to paint the pages on',
+  noCanvasCode: 'failed',
+};
+
+const PDF_WORDS: PageJobWords = {
+  destroyed: 'Making the PDF was cancelled: the view was destroyed',
+  typing: 'Making the PDF was cancelled: what is being typed cannot be applied',
+  changing: 'The workbook kept changing while its PDF was made',
+  noCanvas: 'A PDF cannot be made here: there is no canvas to paint the pages on',
+  noCanvasCode: 'unavailable',
+};
+
+/** Sheets a list of `sheets` may name. */
+const MAX_PDF_SHEETS = 4096;
+const toPoints = (px: number): number => Math.round(px * 0.75 * 100) / 100;
 
 /** Largest size of the box that shows a comment beside its cell, in pixels; longer text scrolls. */
 /** Size of the field a note is typed in, in pixels; larger where a finger has to reach it. */
@@ -935,6 +1015,9 @@ export class WorkbookView {
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
   private printJob: PrintJob | undefined;
+  /** The PDFs that are being made or wait for their turn; one is made at a time. */
+  private readonly pdfJobs: PageJob[] = [];
+  private pdfTurn: Promise<unknown> = Promise.resolve();
   /** Counts the changes of the workbook and of how it is shown: pages prepared for printing before are out of date. */
   private printEpoch = 0;
   /** Language tag the paper of a sheet without one is chosen by. */
@@ -1295,6 +1378,8 @@ export class WorkbookView {
     this.unwatchEmbeddedFont = undefined;
     // A print job under way ends here: its pages leave the document at once.
     if (this.printJob) this.endPrint(this.printJob);
+    // So does a PDF: what it holds is let go of, and its promise is rejected at its next step.
+    for (const job of this.pdfJobs.slice()) this.endPages(job);
     if (this.calcTimer !== undefined) clearTimeout(this.calcTimer);
     if (this.missingTimer !== undefined) clearTimeout(this.missingTimer);
     if (this.noticeTimer !== undefined) clearTimeout(this.noticeTimer);
@@ -1436,25 +1521,66 @@ export class WorkbookView {
     return job.promise;
   }
 
-  private setPrintProgress(job: PrintJob, progress: { done: number; total: number } | undefined): void {
+  private setPageProgress(job: PageJob, progress: { done: number; total: number } | undefined): void {
     job.progress = progress;
-    if (this.printJob === job && !this.destroyed && this.options.onPrintProgress) this.options.onPrintProgress(progress ? { done: progress.done, total: progress.total } : undefined);
+    if ((this.printJob === job || this.pdfJobs.indexOf(job) >= 0) && !this.destroyed && job.report) job.report(progress ? { done: progress.done, total: progress.total } : undefined);
   }
 
   private async runPrint(job: PrintJob, options: SheetPrintOptions): Promise<DocumentPrintResult> {
-    const cancelled = () => new DocumentPrintError('cancelled', 'Printing was cancelled: the view was destroyed');
-    if (this.destroyed) throw cancelled();
+    if (this.destroyed) throw new DocumentPrintError('cancelled', PRINT_WORDS.destroyed);
     // The window of the document the view is in: inside a frame, the frame is what is printed.
     const doc = this.container.ownerDocument || document;
     const win = doc.defaultView;
     if (!win || typeof win.print !== 'function') throw new DocumentPrintError('unavailable', 'Printing is not available here: the window has no print()');
     // What is being typed is part of what is printed, as leaving the cell (the note, the tab) would make it.
     // A note or a name that cannot be taken was said, and its field is open: nothing is printed around it.
-    if (!this.commitPending()) throw new DocumentPrintError('cancelled', 'Printing was cancelled: what is being typed cannot be applied');
+    if (!this.commitPending()) throw new DocumentPrintError('cancelled', PRINT_WORDS.typing);
     this.notify(this.strings.printPreparing, 'info');
-    this.setPrintProgress(job, { done: 0, total: 0 });
+    job.report = (progress) => {
+      if (this.options.onPrintProgress) this.options.onPrintProgress(progress);
+    };
+    this.setPageProgress(job, { done: 0, total: 0 });
     const limits = printLimits(coarsePointer());
     const urls = (win as unknown as { URL?: typeof URL }).URL || URL;
+    const nextFrame = typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
+    const plan = await this.preparePages(job, options, limits, PRINT_WORDS, (planned) => {
+      const frame = new PrintFrame(doc, planned, supportsNamedPages(win as unknown as { CSS?: { supports?(property: string, value: string): boolean } }), (url) => revokePicture(url, urls));
+      let bytes = 0;
+      return {
+        take: async (canvas, _context, index, _entry, _planned, stale) => {
+          const picture = await canvasPicture(canvas, urls, nextFrame);
+          bytes += picture.bytes;
+          if (stale() || bytes > limits.maxBytes) {
+            revokePicture(picture.url, urls);
+            if (this.destroyed || !(bytes > limits.maxBytes)) return false;
+            throw new DocumentPrintError('too-long', 'The pages of the workbook take too much memory to print at once');
+          }
+          await frame.add(picture.url, this.strings.page(index + 1));
+          return true;
+        },
+        dispose: () => frame.dispose(),
+      };
+    });
+    this.setPageProgress(job, undefined);
+    const dialog = openPrintDialog(win as unknown as Parameters<typeof openPrintDialog>[0]);
+    job.dialog = dialog;
+    await dialog.closed;
+    // Takes the place of "preparing": whether anything was printed cannot be told.
+    if (!this.destroyed) this.notify(this.strings.printClosed, 'info');
+    return { pages: plan.pages.length, dpi: plan.dpi };
+  }
+
+  /**
+   * What printing and making a PDF share: waits for a calculation under way,
+   * lays the sheets out on pages (planSheetPages), decides the resolution of
+   * the pages (planPrint), and paints them one per turn, each one handed to
+   * the sink `open` makes for the plan. When the workbook is changed
+   * meanwhile, the sink is let go of and the pages are painted again from the
+   * start. The sink of the pages that were all painted stays in `job.sink`.
+   */
+  private async preparePages(job: PageJob, options: PageJobOptions, limits: PrintLimits, words: PageJobWords, open: (plan: PrintPlan) => PageSink): Promise<PrintPlan> {
+    const cancelled = () => new DocumentPrintError('cancelled', words.destroyed);
+    const doc = this.container.ownerDocument || document;
     let plan: PrintPlan;
     for (let attempt = 0; ; attempt++) {
       // A calculation still under way writes cells turn after turn; the pages wait for its end
@@ -1462,7 +1588,8 @@ export class WorkbookView {
       const waitUntil = Date.now() + PRINT_CALC_MS;
       while (this.engine && this.engine.incomplete && Date.now() < waitUntil) {
         await sleep(30);
-        if (this.destroyed) throw new DocumentPrintError('cancelled', 'Printing was cancelled: the view was destroyed');
+        if (this.destroyed) throw cancelled();
+        if (job.check) job.check();
       }
       const epoch = this.printEpoch;
       const media = this.workbook.media;
@@ -1481,6 +1608,9 @@ export class WorkbookView {
       const sheets: number[] = [];
       if (options.sheets === 'all') {
         for (let i = 0; i < this.workbook.sheets.length; i++) if (this.workbook.sheets[i].state === 'visible') sheets.push(i);
+      } else if (options.sheets !== undefined && options.sheets !== 'active') {
+        // A list: those sheets, as far as the workbook still has them.
+        for (let i = 0; i < options.sheets.length; i++) if (options.sheets[i] < this.workbook.sheets.length) sheets.push(options.sheets[i]);
       } else sheets.push(this.sheetIndex);
       const pages: SheetJobPlan = planSheetPages(this.workbook, sheets, {
         defaultPaper: defaultPaperFor(this.languageTag),
@@ -1503,53 +1633,44 @@ export class WorkbookView {
         options,
         limits,
       );
-      const frame = new PrintFrame(doc, plan, supportsNamedPages(win as unknown as { CSS?: { supports?(property: string, value: string): boolean } }), (url) => revokePicture(url, urls));
-      job.frame = frame;
-      this.setPrintProgress(job, { done: 0, total: plan.pages.length });
-      const complete = await this.paintForPrint(job, epoch, pages, plan, frame, store, limits, doc, urls, options, (sheet) => metricsOf.get(sheet) as SheetMetrics, layerOf);
+      const sink = open(plan);
+      job.sink = sink;
+      this.setPageProgress(job, { done: 0, total: plan.pages.length });
+      const complete = await this.paintPages(job, epoch, pages, plan, sink, store, doc, options, words, (sheet) => metricsOf.get(sheet) as SheetMetrics, layerOf);
       if (store) store.destroy();
       job.store = undefined;
       if (this.destroyed) throw cancelled();
       if (complete) break;
       // The workbook changed under the pages: they are prepared again from the start.
-      frame.dispose();
-      job.frame = undefined;
-      if (attempt >= MAX_PRINT_RESTARTS) throw new DocumentPrintError('failed', 'The workbook kept changing while it was prepared for printing');
+      sink.dispose();
+      job.sink = undefined;
+      if (attempt >= MAX_PRINT_RESTARTS) throw new DocumentPrintError('failed', words.changing);
     }
-    this.setPrintProgress(job, undefined);
-    const dialog = openPrintDialog(win as unknown as Parameters<typeof openPrintDialog>[0]);
-    job.dialog = dialog;
-    await dialog.closed;
-    // Takes the place of "preparing": whether anything was printed cannot be told.
-    if (!this.destroyed) this.notify(this.strings.printClosed, 'info');
-    return { pages: plan.pages.length, dpi: plan.dpi };
+    return plan;
   }
 
-  /** Paints the pages of a plan and adds them to the frame; false when the workbook was changed meanwhile. */
-  private async paintForPrint(
-    job: PrintJob,
+  /** Paints the pages of a plan and hands them to the sink; false when the workbook was changed meanwhile. */
+  private async paintPages(
+    job: PageJob,
     epoch: number,
     pages: SheetJobPlan,
     plan: PrintPlan,
-    frame: PrintFrame,
+    sink: PageSink,
     store: ImageStore | undefined,
-    limits: PrintLimits,
     doc: Document,
-    urls: { createObjectURL(blob: Blob): string; revokeObjectURL(url: string): void },
-    options: SheetPrintOptions,
+    options: PageJobOptions,
+    words: PageJobWords,
     metricsOf: (sheet: Sheet) => SheetMetrics,
     layerOf: (sheet: Sheet) => SheetDrawings | undefined,
   ): Promise<boolean> {
     const stale = () => this.destroyed || this.printEpoch !== epoch;
     // One canvas for all pages: a page is held as pixels only while it is painted.
     const canvas = doc.createElement('canvas');
-    const win = doc.defaultView;
-    const nextFrame = win && typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
     const now = new Date();
-    let bytes = 0;
     try {
       for (let i = 0; i < plan.pages.length; i++) {
         if (stale()) return false;
+        if (job.check) job.check();
         const entry = pages.pages[i];
         const planned = plan.pages[i];
         const sheet = this.workbook.sheets[entry.sheet];
@@ -1557,23 +1678,43 @@ export class WorkbookView {
         if (canvas.width !== planned.pixelWidth) canvas.width = planned.pixelWidth;
         if (canvas.height !== planned.pixelHeight) canvas.height = planned.pixelHeight;
         const context = canvas.getContext('2d');
-        if (!context) throw new DocumentPrintError('failed', 'No canvas to paint the pages on');
+        if (!context) throw new DocumentPrintError(words.noCanvasCode, words.noCanvas);
         const conditional = this.conditionalOf(sheet);
-        const paint = () =>
-          paintSheetPage(context, {
-            workbook: this.workbook,
-            job: entry,
-            total: pages.pages.length,
-            metrics: metricsOf(sheet),
-            pixelWidth: planned.pixelWidth,
-            locale: this.locale,
-            conditional,
-            // A chart sheet is its chart: it has no cells and no layer of drawings over them.
-            drawings: entry.chart ? undefined : layerOf(sheet),
-            charts: entry.chart ? this.chartRenderer() : undefined,
-            fileName: options.fileName,
-            now,
-          });
+        // The text of the page as it was painted last: a page may be painted more than once.
+        const runs: PdfTextRun[] = [];
+        const paint = () => {
+          runs.length = 0;
+          // Listening changes nothing of what is painted: every fillText() goes through to the canvas as it came.
+          // Only what shows is caught: the clips of the painters (a cell cut off by the next one, the margins) and the edge of the canvas are followed.
+          const release = job.captureText
+            ? captureText(
+                context,
+                planned.pixelWidth / entry.layout.paper.width,
+                (run) => {
+                  if (runs.length < MAX_PAGE_RUNS) runs.push(run);
+                },
+                { width: planned.pixelWidth, height: planned.pixelHeight },
+              )
+            : undefined;
+          try {
+            paintSheetPage(context, {
+              workbook: this.workbook,
+              job: entry,
+              total: pages.pages.length,
+              metrics: metricsOf(sheet),
+              pixelWidth: planned.pixelWidth,
+              locale: this.locale,
+              conditional,
+              // A chart sheet is its chart: it has no cells and no layer of drawings over them.
+              drawings: entry.chart ? undefined : layerOf(sheet),
+              charts: entry.chart ? this.chartRenderer() : undefined,
+              fileName: options.fileName,
+              now,
+            });
+          } finally {
+            if (release) release();
+          }
+        };
         // Pictures of the pages before this one may make room for those of this one.
         if (store) store.pass++;
         try {
@@ -1589,15 +1730,8 @@ export class WorkbookView {
           if (error instanceof DocumentPrintError) throw error;
           throw new DocumentPrintError('failed', `Page ${i + 1} could not be painted`);
         }
-        const picture = await canvasPicture(canvas, urls, nextFrame);
-        bytes += picture.bytes;
-        if (stale() || bytes > limits.maxBytes) {
-          revokePicture(picture.url, urls);
-          if (this.destroyed || !(bytes > limits.maxBytes)) return false;
-          throw new DocumentPrintError('too-long', 'The pages of the workbook take too much memory to print at once');
-        }
-        await frame.add(picture.url, this.strings.page(i + 1));
-        this.setPrintProgress(job, { done: i + 1, total: plan.pages.length });
+        if (!(await sink.take(canvas, context, i, entry, planned, stale, runs))) return false;
+        this.setPageProgress(job, { done: i + 1, total: plan.pages.length });
       }
       return !stale();
     } finally {
@@ -1607,18 +1741,25 @@ export class WorkbookView {
     }
   }
 
-  /** Takes what a print job holds out of the document. Safe to call twice. */
-  private endPrint(job: PrintJob): void {
-    if (job.frame) job.frame.dispose();
+  /** Lets go of what painting the pages of a job holds. Safe to call twice. */
+  private endPages(job: PageJob): void {
+    if (job.sink) job.sink.dispose();
     if (job.store) job.store.destroy();
-    if (job.dialog) job.dialog.finish();
-    job.frame = undefined;
+    job.sink = undefined;
     job.store = undefined;
     const reported = job.progress !== undefined;
     job.progress = undefined;
-    if (this.printJob !== job) return;
-    if (reported && !this.destroyed && this.options.onPrintProgress) this.options.onPrintProgress(undefined);
-    this.printJob = undefined;
+    const at = this.pdfJobs.indexOf(job);
+    if (this.printJob !== job && at < 0) return;
+    if (reported && !this.destroyed && job.report) job.report(undefined);
+    if (at >= 0) this.pdfJobs.splice(at, 1);
+  }
+
+  /** Takes what a print job holds out of the document. Safe to call twice. */
+  private endPrint(job: PrintJob): void {
+    this.endPages(job);
+    if (job.dialog) job.dialog.finish();
+    if (this.printJob === job) this.printJob = undefined;
   }
 
   private printFailed(error: unknown): void {
@@ -1631,6 +1772,155 @@ export class WorkbookView {
       code === 'unavailable' ? strings.printNotAvailable : code === 'too-long' ? strings.printSheetTooLong : code === 'empty' ? strings.printNothing : strings.printSheetFailed,
       'error',
     );
+  }
+
+  // ------------------------------------------------------------------- PDF
+
+  /** Whether a PDF is being made (or waits for the one before it). */
+  get exportingPdf(): boolean {
+    return this.pdfJobs.length > 0;
+  }
+
+  /**
+   * The sheet that is shown (or the sheets `sheets` names) as a PDF file:
+   * the pages print() lays the cells out on, each one as the picture
+   * printing makes of it at `dpi` dots per inch, with the text that is
+   * painted on it (cells, headings, header and footer, labels of charts)
+   * lying invisible over it, so that the file can be searched and its text
+   * selected and copied. The pages are painted one per turn and written into
+   * the file as they come. What is being typed is applied first, as saving
+   * does. Works in a read-only view too.
+   *
+   * Rejects with a PdfExportError: 'unavailable' where there is no canvas,
+   * 'empty' when there is nothing on the sheets, 'too-long' beyond the
+   * limits on pages and on the size of the file, 'cancelled' when `signal`
+   * is aborted, the view is destroyed or what is being typed cannot be
+   * applied; with a RangeError or a TypeError for an option that cannot be.
+   * A second call while a file is being made waits for it.
+   */
+  exportPdf(options: SheetPdfExportOptions = {}): Promise<Uint8Array> {
+    return this.exportPdfParts(options).then(joinParts);
+  }
+
+  /** As exportPdf(), with the file as the parts it was written in: what a Blob is made of without holding the file twice. */
+  exportPdfParts(options: SheetPdfExportOptions = {}): Promise<Uint8Array[]> {
+    if (this.destroyed) return Promise.reject(new PdfExportError('cancelled', 'The view was destroyed'));
+    let settings: PdfSettings;
+    let sheets: 'active' | 'all' | number[] | undefined;
+    // A wrong option is refused before any work is done, whatever else is under way.
+    try {
+      settings = pdfSettings(options);
+      const asked = options.sheets;
+      if (asked === undefined || asked === 'active' || asked === 'all') sheets = asked;
+      else {
+        if (!Array.isArray(asked) || asked.length === 0 || asked.length > MAX_PDF_SHEETS) throw new RangeError('"sheets" must be "active", "all" or a list of sheet indexes');
+        sheets = [];
+        for (let i = 0; i < asked.length; i++) {
+          const index = asked[i];
+          if (typeof index !== 'number' || Math.floor(index) !== index || index < 0 || index >= this.workbook.sheets.length) throw new RangeError(`No sheet with index ${String(index)}`);
+          sheets.push(index);
+        }
+      }
+      checkCancelled(options.signal);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const job: PageJob = {};
+    const nothing = () => undefined;
+    const promise = this.pdfTurn.then(nothing, nothing).then(() =>
+      this.runPdf(job, options, settings, sheets).then(
+        (parts) => {
+          this.endPages(job);
+          return parts;
+        },
+        (error) => {
+          this.endPages(job);
+          const told = toPdfExportError(error);
+          this.pdfFailed(told);
+          throw told;
+        },
+      ),
+    );
+    this.pdfTurn = promise;
+    this.pdfJobs.push(job);
+    return promise;
+  }
+
+  /**
+   * Makes the PDF and hands it to the browser as a download, named after the
+   * file (WorkbookViewOptions.fileName; "workbook.pdf" without one). What
+   * the PDF button of the toolbar does.
+   */
+  downloadPdf(options: SheetPdfExportOptions = {}): Promise<PdfDownload> {
+    return this.exportPdfParts(options).then((parts) => {
+      const fileName = pdfFileName(this.options.fileName, 'workbook');
+      if (!downloadParts(this.container.ownerDocument || document, parts, fileName)) throw new PdfExportError('unavailable', 'The PDF cannot be downloaded here');
+      let size = 0;
+      for (let i = 0; i < parts.length; i++) size += parts[i].length;
+      return { fileName, size };
+    });
+  }
+
+  private async runPdf(job: PageJob, options: SheetPdfExportOptions, settings: PdfSettings, sheets: 'active' | 'all' | number[] | undefined): Promise<Uint8Array[]> {
+    if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    const doc = this.container.ownerDocument || document;
+    const win = doc.defaultView;
+    // What is being typed is part of the file, as leaving the cell (the note, the tab) would make it.
+    if (!this.commitPending()) throw new PdfExportError('cancelled', PDF_WORDS.typing);
+    this.notify(this.strings.pdfPreparing, 'info');
+    const nextFrame = win && typeof win.requestAnimationFrame === 'function' ? (callback: () => void) => win.requestAnimationFrame(callback) : undefined;
+    const limits = pdfLimits(coarsePointer());
+    job.captureText = true;
+    job.check = () => checkCancelled(options.signal);
+    job.report = (progress) => {
+      try {
+        if (this.options.onPdfProgress) this.options.onPdfProgress(progress);
+        if (progress && progress.done > 0 && options.onProgress) options.onProgress(progress.done, progress.total);
+      } catch {
+        // What the caller does with the news is its own; the file is made all the same.
+      }
+    };
+    this.setPageProgress(job, { done: 0, total: 0 });
+    let file: PdfDocument | undefined;
+    let parts: Uint8Array[] = [];
+    const fileName = options.fileName !== undefined ? options.fileName : this.options.fileName;
+    await this.preparePages(job, { dpi: settings.dpi, sheets, fileName }, limits, PDF_WORDS, () => {
+      const pdf = new PdfDocument({ title: options.title, author: options.author, date: options.date, maxBytes: limits.maxBytes });
+      const taken: Uint8Array[] = [];
+      file = pdf;
+      parts = taken;
+      return {
+        take: async (canvas, context, _index, entry, _planned, stale, runs) => {
+          const picture = await canvasPageImage(canvas, context, settings, nextFrame);
+          if (stale()) return false;
+          checkCancelled(options.signal);
+          const paper = entry.layout.paper;
+          // The runs are what could be seen when the page was painted: nothing is added to or taken from them here.
+          await pdf.addPage({ width: toPoints(paper.width), height: toPoints(paper.height), image: picture.image, fill: picture.fill, text: { runs: runs.slice(), width: paper.width } });
+          const written = pdf.takeParts();
+          for (let i = 0; i < written.length; i++) taken.push(written[i]);
+          return !stale();
+        },
+        dispose: () => {
+          taken.length = 0;
+        },
+      };
+    });
+    checkCancelled(options.signal);
+    const pdf = file as PdfDocument;
+    await pdf.finish();
+    // The parts are taken from the sink before it is let go of with the job.
+    const out = parts.concat(pdf.takeParts());
+    if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    this.notify(this.strings.pdfReady, 'info');
+    return out;
+  }
+
+  private pdfFailed(error: unknown): void {
+    // A wrong option is the caller's to hear about, not the user's; so are the end of a view and a file nobody wants any more.
+    if (this.destroyed || !(error instanceof PdfExportError) || error.code === 'cancelled') return;
+    const strings = this.strings;
+    this.notify(error.code === 'unavailable' ? strings.pdfNotAvailable : error.code === 'too-long' ? strings.pdfTooLong : error.code === 'empty' ? strings.pdfNothing : strings.pdfFailed, 'error');
   }
 
   // ---------------------------------------------------------------- sheets

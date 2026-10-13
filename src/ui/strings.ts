@@ -246,6 +246,20 @@ export interface UiStrings {
   printSheetFailed: string;
   /** Said when the sheets that were to be printed hold nothing. */
   printNothing: string;
+  // Making a PDF file of a document or a workbook.
+  /** The label of the button that downloads the PDF. */
+  pdfDownload: string;
+  /** Said when the pages are being painted for the file. */
+  pdfPreparing: string;
+  /** Said when the file is there; replaces `pdfPreparing`. */
+  pdfReady: string;
+  /** Shown while the pages are painted: "Making the PDF… 3 / 12". */
+  pdfProgress(done: number, total: number): string;
+  pdfNotAvailable: string;
+  pdfTooLong: string;
+  pdfFailed: string;
+  /** Said when there is nothing to make a PDF of. */
+  pdfNothing: string;
   // The sheet tabs.
   /** Label of the button beside the tabs that adds a sheet after the last one. */
   addSheet: string;
@@ -727,6 +741,14 @@ export const STRINGS_EN: UiStrings = {
   printSheetTooLong: 'The sheet is too long to print at once',
   printSheetFailed: 'The sheet could not be printed',
   printNothing: 'There is nothing to print',
+  pdfDownload: 'Download as PDF',
+  pdfPreparing: 'Making the PDF\u2026',
+  pdfReady: 'The PDF is ready',
+  pdfProgress: (done, total) => `Making the PDF\u2026 ${done} / ${total}`,
+  pdfNotAvailable: 'A PDF cannot be made here',
+  pdfTooLong: 'This is too long to be made into one PDF',
+  pdfFailed: 'The PDF could not be made',
+  pdfNothing: 'There is nothing to make a PDF of',
   addSheet: 'Add sheet',
   insertSheet: 'Insert sheet',
   renameSheet: 'Rename',
@@ -1248,6 +1270,14 @@ export const STRINGS_TR: UiStrings = {
   printSheetTooLong: 'Sayfa bir kerede yazdırılamayacak kadar uzun',
   printSheetFailed: 'Sayfa yazdırılamadı',
   printNothing: 'Yazdırılacak bir şey yok',
+  pdfDownload: 'PDF olarak indir',
+  pdfPreparing: 'PDF hazırlanıyor\u2026',
+  pdfReady: 'PDF hazır',
+  pdfProgress: (done, total) => `PDF hazırlanıyor\u2026 ${done} / ${total}`,
+  pdfNotAvailable: 'Burada PDF oluşturulamıyor',
+  pdfTooLong: 'Bu, tek bir PDF yapılamayacak kadar uzun',
+  pdfFailed: 'PDF oluşturulamadı',
+  pdfNothing: 'PDF yapılacak bir şey yok',
   addSheet: 'Sayfa ekle',
   insertSheet: 'Sayfa ekle',
   renameSheet: 'Yeniden adlandır',
