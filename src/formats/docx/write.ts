@@ -262,6 +262,9 @@ interface SaveState {
 
 const SAVES = new WeakMap<OpcPackage, SaveState>();
 
+/** The encoding an XML declaration at the very start of a text names (after a byte order mark, if any). */
+const DECLARED_ENCODING = /^(\uFEFF?<\?xml\b[^?>]*?\bencoding\s*=\s*)(["'])([^"']*)\2/;
+
 /**
  * The bytes of a part with stretches of its text replaced. The places are
  * those of the text as decodePart() gives it (no byte order mark, line ends
@@ -295,7 +298,9 @@ function splicedPart(original: Uint8Array, splices: { start: number; end: number
     copied = end;
   }
   out += raw.slice(copied);
-  if (!little && !big) return new TextEncoder().encode(out);
+  // The text is taken as UTF-8 and written as UTF-8: a declaration that names another encoding would make a
+  // reader that believes it refuse the part, or read other letters. Only the name of the encoding changes.
+  if (!little && !big) return new TextEncoder().encode(out.replace(DECLARED_ENCODING, (all: string, before: string, quote: string, name: string) => (/^utf-?8$/i.test(name) ? all : `${before}${quote}UTF-8${quote}`)));
   const bytes = new Uint8Array(out.length * 2);
   for (let i = 0; i < out.length; i++) {
     const c = out.charCodeAt(i);

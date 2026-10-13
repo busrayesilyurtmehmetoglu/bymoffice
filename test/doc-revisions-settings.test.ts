@@ -216,3 +216,26 @@ test('review: where the application asked for tracking, turning it on changes no
   await writeDocx(o.pkg, o.doc);
   assert.deepEqual(await o.pkg.save(), o.bytes);
 });
+
+test('tracking: a settings part that declares another encoding is written with a declaration that is true', async () => {
+  // The reader takes the part as UTF-8 whatever it declares; what is written into it is UTF-8 as well, so
+  // the declaration has to say so, or a strict reader refuses the part or reads other letters.
+  for (const declared of ['us-ascii', 'ISO-8859-1', "Windows-1254"]) {
+    const o = await open({ settings: '<w:zoom w:percent="120"/>' });
+    const part = '/word/settings.xml';
+    const text = decoder.decode(await o.pkg.readPart(part));
+    const body = text.slice(text.indexOf('<w:settings'));
+    const quote = declared === 'Windows-1254' ? "'" : '"';
+    o.pkg.writePart(part, new TextEncoder().encode(`<?xml version="1.0" encoding=${quote}${declared}${quote} standalone="yes"?>\r\n${body}`));
+    const again = await OpcPackage.open(await o.pkg.save());
+    const doc = await readDocx(again);
+    run(new DocHistory<DocRange | undefined>(doc), setTrackRevisions(doc, true));
+    await writeDocx(again, doc);
+    const written = decoder.decode(await again.readPart(part));
+    const declaration = written.slice(0, written.indexOf('?>') + 2);
+    assert.match(declaration, /encoding=["']UTF-8["']/, `${declared}: ${declaration}`);
+    assert.match(declaration, /standalone="yes"/, 'the rest of the declaration stays');
+    assert.match(written, /<w:trackRevisions\/>/, 'the setting is written');
+    assert.equal(written.includes('\r\n<w:settings'), true, 'what was not touched stays as it was');
+  }
+});
