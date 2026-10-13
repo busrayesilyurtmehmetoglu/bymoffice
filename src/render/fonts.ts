@@ -121,6 +121,38 @@ interface Entry {
   prefer: boolean;
   loaded: boolean;
   face: Face | undefined;
+  /** Where the font file is: what a PDF embeds the font from. */
+  file: FontFile | undefined;
+}
+
+/** Where the file of a face is: its bytes as they were given, or the address they were loaded from. */
+export interface FontFile {
+  bytes?: Uint8Array;
+  url?: string;
+}
+
+/** A face of the page whose font file is known. */
+export interface FontFileSource extends FontFile {
+  family: string;
+  weight: number;
+  style: 'normal' | 'italic';
+}
+
+/** What is remembered of the source of a face. The bytes are not copied. */
+function fontFileOf(given: unknown, read: string | ArrayBuffer | Uint8Array): FontFile | undefined {
+  if (typeof given === 'string') return { url: given };
+  if (typeof read === 'string') return undefined;
+  return { bytes: read instanceof Uint8Array ? read : new Uint8Array(read) };
+}
+
+/** The registered faces that are in use, with where their font files are. */
+export function registeredFontFiles(): FontFileSource[] {
+  const out: FontFileSource[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.loaded && entry.file) out.push({ family: entry.family, weight: entry.weight, style: entry.style, bytes: entry.file.bytes, url: entry.file.url });
+  }
+  return out;
 }
 
 /** Faces kept at once; more are refused. */
@@ -367,6 +399,8 @@ export interface PageFont {
   add(): void;
   /** Takes it off the page again; it can be added anew. */
   remove(): void;
+  /** Where the font file is, when that is known. */
+  file?: FontFile;
 }
 
 /** Whether fonts can be added to the page: a browser with FontFace and document.fonts. */
@@ -383,8 +417,12 @@ export function loadPageFont(family: string, source: FontSource, weight: number,
   const make = (typeof globalThis !== 'undefined' ? (globalThis as { FontFace?: unknown }).FontFace : undefined) as FaceMaker | undefined;
   const fonts = faceSet();
   if (typeof make !== 'function' || !fonts) return Promise.reject(new Error('Fonts cannot be loaded here: there is no FontFace and document.fonts'));
+  let file: FontFile | undefined;
   return faceSource(source)
-    .then((data) => loadFace(make, family, data, { weight: String(weight), style }))
+    .then((data) => {
+      file = fontFileOf(source, data);
+      return loadFace(make, family, data, { weight: String(weight), style });
+    })
     .then((face) => ({
       add: () => {
         fonts.add(face);
@@ -392,6 +430,7 @@ export function loadPageFont(family: string, source: FontSource, weight: number,
       remove: () => {
         fonts.delete(face);
       },
+      file,
     }));
 }
 
@@ -436,7 +475,7 @@ export function registerFont(font: FontRegistration): Promise<RegisteredFont> {
       else if (!same) faces++;
     }
     if (faces > MAX_FACES) throw new RangeError(`No more than ${MAX_FACES} fonts can be registered`);
-    entry = { family, lower, weight, style, as, asLower: as.map((name) => name.toLowerCase()), prefer: font.prefer === true && as.length > 0, loaded: false, face: undefined };
+    entry = { family, lower, weight, style, as, asLower: as.map((name) => name.toLowerCase()), prefer: font.prefer === true && as.length > 0, loaded: false, face: undefined, file: undefined };
     entries.push(entry);
   } catch (error) {
     return Promise.reject(error);
@@ -446,6 +485,7 @@ export function registerFont(font: FontRegistration): Promise<RegisteredFont> {
   return faceSource(font.source)
     .then((source) => {
       if (!current()) throw gone();
+      entry.file = fontFileOf(font.source, source);
       return loadFace(make, entry.family, source, { weight: String(entry.weight), style: entry.style });
     })
     .then(

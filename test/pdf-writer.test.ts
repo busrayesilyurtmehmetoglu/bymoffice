@@ -588,7 +588,7 @@ popplerTest('Poppler reads the document: pages, sizes, text, pictures and the fo
     { page: 2, width: 4, height: 6, color: 'rgb', encoding: 'image' },
     { page: 3, width: 8, height: 8, color: 'rgb', encoding: 'jpeg' },
   ]);
-  assert.deepEqual(report.fonts, [{ name: FONT_NAME, type: 'CID TrueType', embedded: true, unicode: true }]);
+  assert.deepEqual(report.fonts, [{ name: FONT_NAME, type: 'CID TrueType', embedded: true, subset: false, unicode: true }]);
 });
 
 /** A real JPEG of 8 x 8 grey pixels in three components, made by hand: one block, all coefficients zero. */

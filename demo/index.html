@@ -120,7 +120,12 @@
             <option value="field">yukarıdaki parolayla şifrele</option>
           </select>
           <button id="save-as-xlsx" hidden>xlsx olarak indir</button>
+          <label title="exportPdf({ text }): 'auto' her sayfayı mümkünse vektör (gerçek metin + çizim), değilse görüntü yazar; 'image' her sayfayı görüntü; 'vector' vektör yazılamayan sayfada hata verir.">PDF sayfaları
+            <select id="pdf-text"><option value="auto">kendiliğinden (vektör, olmazsa görüntü)</option><option value="image">görüntü</option><option value="vector">yalnız vektör</option></select>
+          </label>
+          <button id="pdf-make" disabled>PDF üret</button>
         </div>
+        <p class="muted" id="pdf-state"></p>
         <div class="scroll" style="margin-top: 12px"><table id="parts"></table></div>
       </section>
 
@@ -905,6 +910,47 @@
         link.download = selected.name;
         link.click();
         URL.revokeObjectURL(url);
+      });
+
+      // A PDF of the file that is shown, with how each of its pages was written.
+      const pdfButton = $('pdf-make');
+      setInterval(() => {
+        pdfButton.disabled = !(docView || view) || pdfButton.dataset.busy === '1';
+      }, 300);
+      pdfButton.addEventListener('click', async () => {
+        const target = docView || view;
+        if (!target || typeof target.exportPdf !== 'function') return;
+        const state = $('pdf-state');
+        const pages = [];
+        pdfButton.dataset.busy = '1';
+        state.textContent = 'PDF hazırlanıyor…';
+        try {
+          const bytes = await target.exportPdf({
+            text: $('pdf-text').value,
+            // The pages are painted anew when the file changes under them: the list starts over with page 1.
+            onPage: (info) => {
+              if (info.page === 1) pages.length = 0;
+              pages.push(info);
+            },
+          });
+          const vector = pages.filter((info) => info.mode === 'vector').length;
+          const reasons = [];
+          for (const info of pages) if (info.reason && reasons.indexOf(info.reason) < 0) reasons.push(info.reason);
+          // Only ever as text: a reason may quote a font name of the file.
+          state.textContent =
+            `${pages.length} sayfa: ${vector} vektör, ${pages.length - vector} görüntü — ${Math.round(bytes.length / 1024)} KB` +
+            (reasons.length ? ` — görüntü kalma nedeni: ${reasons.slice(0, 3).join(' | ')}` : '');
+          const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = ((selected && selected.name) || 'dosya').replace(/\.[^.]*$/, '') + '.pdf';
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(url), 60000);
+        } catch (error) {
+          state.textContent = `PDF üretilemedi (${error && error.code ? error.code : 'hata'}): ${error && error.message ? error.message : error}`;
+        } finally {
+          pdfButton.dataset.busy = '';
+        }
       });
 
       // Saving to where the file came from: a blank file is put on the server that serves this page, and

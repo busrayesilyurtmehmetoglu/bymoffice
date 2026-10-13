@@ -51,7 +51,7 @@ import {
   type PrintPlan,
 } from './doc-print';
 import { PdfDocument } from '../pdf/document';
-import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, toPdfExportError, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
 import { docPageRuns } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
 import { resolveUiStrings, type UiStrings } from './strings';
@@ -614,7 +614,7 @@ interface PageSink {
    * Takes the page that was just painted on the canvas. False when the pages
    * were laid out anew meanwhile (`stale`): the job then starts over.
    */
-  take(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, index: number, page: LayoutPage, planned: PrintPagePlan, stale: () => boolean): Promise<boolean>;
+  take(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, index: number, page: LayoutPage, planned: PrintPagePlan, stale: () => boolean, paintOn: (context: CanvasRenderingContext2D) => void): Promise<boolean>;
   /** Lets go of what was taken. Safe to call twice. */
   dispose(): void;
 }
@@ -1438,11 +1438,12 @@ export class DocumentView {
         if (canvas.height !== planned.pixelHeight) canvas.height = planned.pixelHeight;
         const context = canvas.getContext('2d');
         if (!context) throw new DocumentPrintError(words.noCanvasCode, words.noCanvas);
-        const paint = () => {
-          context.setTransform(1, 0, 0, 1, 0, 0);
-          context.fillStyle = '#ffffff';
-          context.fillRect(0, 0, planned.pixelWidth, planned.pixelHeight);
-          renderPage(context, page, {
+        // The same painting for the canvas of pixels and for the canvas a PDF is written through.
+        const paintOn = (target: CanvasRenderingContext2D) => {
+          target.setTransform(1, 0, 0, 1, 0, 0);
+          target.fillStyle = '#ffffff';
+          target.fillRect(0, 0, planned.pixelWidth, planned.pixelHeight);
+          renderPage(target, page, {
             scale: planned.pixelWidth / planned.width,
             images: store,
             cssFont: this.painter.cssFont,
@@ -1451,6 +1452,7 @@ export class DocumentView {
             charts: this.charts,
           });
         };
+        const paint = () => paintOn(context);
         // Pictures of the pages before this one may make room for those of this one.
         store.pass++;
         try {
@@ -1468,7 +1470,7 @@ export class DocumentView {
           if (error instanceof DocumentPrintError) throw error;
           throw new DocumentPrintError('failed', `Page ${i + 1} could not be painted`);
         }
-        if (!(await sink.take(canvas, context, i, page, planned, stale))) return false;
+        if (!(await sink.take(canvas, context, i, page, planned, stale, paintOn))) return false;
         this.setPageProgress(job, i + 1, plan.pages.length);
       }
       return !stale();
@@ -1528,16 +1530,20 @@ export class DocumentView {
   }
 
   /**
-   * The document as a PDF file: every page as the picture printing makes of
-   * it (what is on the screen, at `dpi` dots per inch), with the text of the
-   * page lying invisible over it, so that the file can be searched and its
-   * text selected and copied. The pages are painted one per turn and written
-   * into the file as they come; a composition under way is ended first, as
-   * saving does. Works in a read-only view too.
+   * The document as a PDF file. A page whose text is all in fonts whose
+   * files are at hand (the font of the package, registered fonts) is written
+   * as text and drawings: sharp at every size, and small. Any other page is
+   * the picture printing makes of it (what is on the screen, at `dpi` dots
+   * per inch), with the text of the page lying invisible over it. Either way
+   * the file can be searched and its text selected and copied; `text` of the
+   * options chooses. The pages are painted one per turn and written into the
+   * file as they come; a composition under way is ended first, as saving
+   * does. Works in a read-only view too.
    *
    * Rejects with a PdfExportError: 'unavailable' where there is no canvas,
    * 'too-long' beyond the limits on pages and on the size of the file,
-   * 'cancelled' when `signal` is aborted or the view is destroyed; with a
+   * 'cancelled' when `signal` is aborted or the view is destroyed,
+   * 'unsupported' for `text: 'vector'` and a page that cannot be drawn; with a
    * RangeError or a TypeError for an option that cannot be. A second call
    * while a file is being made waits for it.
    */
@@ -1559,7 +1565,11 @@ export class DocumentView {
     const job: PageJob = {};
     const nothing = () => undefined;
     const promise = this.pdfTurn.then(nothing, nothing).then(() =>
-      this.runPdf(job, options, settings).then(
+      pdfWithFallback(settings, (how) => {
+        // A file that is made anew starts from nothing.
+        if (job.sink) job.sink.dispose();
+        return this.runPdf(job, options, how);
+      }).then(
         (parts) => {
           this.endPages(job);
           return parts;
@@ -1615,17 +1625,40 @@ export class DocumentView {
     let parts: Uint8Array[] = [];
     // Where the characters of a line are, for a line that the edge of the paper cuts off.
     const measureText = (font: LayoutFont, text: string): number => this.measurer.width(font, text);
+    const tools = await pdfVectorTools(doc, settings);
+    if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    checkCancelled(options.signal);
     await this.preparePages(job, { dpi: settings.dpi }, limits, PDF_WORDS, () => {
       const pdf = new PdfDocument({ title: options.title, author: options.author, date: options.date, maxBytes: limits.maxBytes });
       const taken: Uint8Array[] = [];
       file = pdf;
       parts = taken;
       return {
-        take: async (canvas, context, _index, page, planned, stale) => {
-          const picture = await canvasPageImage(canvas, context, settings, nextFrame);
-          if (stale()) return false;
-          checkCancelled(options.signal);
-          await pdf.addPage({ width: toPoints(planned.width), height: toPoints(planned.height), image: picture.image, fill: picture.fill, text: { runs: docPageRuns(page, measureText), width: planned.width } });
+        take: async (canvas, context, index, page, planned, stale, paintOn) => {
+          const done = await writePdfPage(
+            pdf,
+            {
+              number: index + 1,
+              width: toPoints(planned.width),
+              height: toPoints(planned.height),
+              pixelWidth: planned.pixelWidth,
+              pixelHeight: planned.pixelHeight,
+              paint: paintOn,
+              picture: async () => {
+                const picture = await canvasPageImage(canvas, context, settings, nextFrame);
+                return { image: picture.image, fill: picture.fill, text: { runs: docPageRuns(page, measureText), width: planned.width } };
+              },
+              proceed: () => {
+                if (stale()) return false;
+                checkCancelled(options.signal);
+                return true;
+              },
+            },
+            settings,
+            tools,
+            options.onPage,
+          );
+          if (!done) return false;
           const written = pdf.takeParts();
           for (let i = 0; i < written.length; i++) taken.push(written[i]);
           return !stale();

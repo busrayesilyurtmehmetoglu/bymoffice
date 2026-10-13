@@ -27,7 +27,7 @@
 // an address: the addresses are made of what the application set and of the
 // fixed file names below.
 
-import { appFontFor, canLoadFonts, fontAliases, fontsVersion, loadPageFont, notifyFontsChanged, splitFontFamily, type FontSource, type PageFont } from './fonts';
+import { appFontFor, canLoadFonts, fontAliases, fontsVersion, loadPageFont, notifyFontsChanged, splitFontFamily, type FontFileSource, type FontSource, type PageFont } from './fonts';
 
 /** The family name the embedded font is added to the page with. */
 export const EMBEDDED_FONT_FAMILY = 'TeX Gyre Bonum';
@@ -213,6 +213,17 @@ export function embeddedFontNames(): string[] {
   return status === 'loaded' || (canLoadFonts() && faces !== undefined) || reachable() ? aliases.slice() : [];
 }
 
+/** The four faces of the embedded font while they are on the page, with where their font files are: what a PDF embeds them from. */
+export function embeddedFontFiles(): FontFileSource[] {
+  const out: FontFileSource[] = [];
+  if (status !== 'loaded' || !onPage || !faces) return out;
+  for (let i = 0; i < EMBEDDED_FONT_FACES.length && i < faces.length; i++) {
+    const file = faces[i] ? faces[i].file : undefined;
+    if (file) out.push({ family: EMBEDDED_FONT_FAMILY, weight: EMBEDDED_FONT_FACES[i].weight, style: EMBEDDED_FONT_FACES[i].style, bytes: file.bytes, url: file.url });
+  }
+  return out;
+}
+
 /** Takes the faces off the page; they are kept. */
 function leavePage(): void {
   if (!onPage || !faces) return;
@@ -316,7 +327,7 @@ const PROBE_TEXT = 'mmmmmmmmmmlliWW@#01';
  * document finds out. True where it cannot be found out: nothing is fetched
  * on a guess.
  */
-function deviceHasFamily(name: string): boolean {
+export function deviceHasFamily(name: string): boolean {
   if (hasFamily) return hasFamily(name) === true;
   if (typeof document === 'undefined') return true;
   const fonts = (document as { fonts?: { check?(font: string): boolean } }).fonts;

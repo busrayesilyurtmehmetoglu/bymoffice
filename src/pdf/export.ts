@@ -3,10 +3,21 @@
 // file. The views paint the pages with the code they print with and hand
 // each one to a PdfDocument; what both need of each other is here. Nothing
 // touches the DOM when the module is imported.
+//
+// A page goes into the file in one of two ways (PdfExportOptions.text): as
+// text in embedded fonts, drawings and pictures of their own ('vector': sharp
+// at every size, small), or as one picture of the page with its text lying
+// invisible over it ('image'). Which one a page can be is decided page by
+// page: see writePdfPage().
 
 import { DocumentPrintError, printLimits, type PrintLimits } from '../ui/doc-print';
+import type { PdfDocument, PdfPage } from './document';
 import { PHOTO_SHARE, TEXT_SHARE, changeShare, imageOfPixels, jpegInfo, packSamples, type PdfImage } from './image';
+import { canvasMeasure, canvasPictures, drawPage, loadPdfFonts, type PdfPageInfo, type PdfVectorTools } from './vector';
+import { cleanReason } from './canvas';
 import { PdfError } from './writer';
+
+export type { PdfPageInfo };
 
 /** Dots per inch the pages are painted at when nothing else is asked for. */
 export const DEFAULT_PDF_DPI = 150;
@@ -40,6 +51,24 @@ export interface PdfExportOptions {
   image?: 'auto' | 'jpeg' | 'lossless';
   /** Quality of the JPEG pictures, above 0 and at most 1. Default 0.85. */
   quality?: number;
+  /**
+   * How a page is written. 'auto' (the default): as text in embedded fonts,
+   * drawings and pictures of their own where every bit of the page can be
+   * written that way, and as a picture of the page (with its text lying
+   * invisible over it) where not - page by page. 'image': every page as a
+   * picture. 'vector': as 'auto', but a page that cannot be written as text
+   * and drawings ends the work with a PdfExportError 'unsupported' that
+   * names the page and the reason.
+   *
+   * A page can be written as text when the font files of all its text are
+   * at hand - the font the package brings along and the fonts registered
+   * with fonts.registerFont() (TrueType or OpenType, with a licence that
+   * allows embedding) - and its fonts have a glyph for every character. Text
+   * in a font of the device leaves its page a picture.
+   */
+  text?: 'auto' | 'image' | 'vector';
+  /** Called for every page once it is in the file, with how it was written. */
+  onPage?(info: PdfPageInfo): void;
   /** Title and author in the information of the file; left out when missing. */
   title?: string;
   author?: string;
@@ -58,21 +87,29 @@ export interface PdfDownload {
   size: number;
 }
 
-export type PdfExportErrorCode = 'unavailable' | 'empty' | 'too-long' | 'cancelled' | 'failed';
+export type PdfExportErrorCode = 'unavailable' | 'empty' | 'too-long' | 'cancelled' | 'unsupported' | 'failed';
 
 /**
  * Why no PDF was made: 'unavailable' where there is no canvas to paint the
  * pages on, 'empty' when there is no page, 'too-long' beyond the limits on
  * pages and bytes, 'cancelled' when the signal was aborted, the view was
- * destroyed or what is being typed could not be applied, 'failed' for
+ * destroyed or what is being typed could not be applied, 'unsupported' when
+ * `text: 'vector'` was asked for and a page cannot be written as text and
+ * drawings (`page` is its number from 1, `reason` says why), 'failed' for
  * everything else.
  */
 export class PdfExportError extends Error {
   readonly code: PdfExportErrorCode;
-  constructor(code: PdfExportErrorCode, message: string) {
+  /** For 'unsupported': the number of the page, from 1. */
+  readonly page?: number;
+  /** For 'unsupported': why the page cannot be written as text and drawings. */
+  readonly reason?: string;
+  constructor(code: PdfExportErrorCode, message: string, page?: number, reason?: string) {
     super(message);
     this.name = 'PdfExportError';
     this.code = code;
+    if (page !== undefined) this.page = page;
+    if (reason !== undefined) this.reason = reason;
   }
 }
 
@@ -80,12 +117,14 @@ export interface PdfSettings {
   dpi: number;
   image: 'auto' | 'jpeg' | 'lossless';
   quality: number;
+  text: 'auto' | 'image' | 'vector';
 }
 
 /**
  * The options as they are used. Throws a RangeError for a `dpi` or a
- * `quality` that is no number in its range and for an unknown `image`, a
- * TypeError for an `onProgress` that is no function or a `signal` that is no object.
+ * `quality` that is no number in its range and for an unknown `image` or
+ * `text`, a TypeError for an `onProgress` or an `onPage` that is no function
+ * or a `signal` that is no object.
  */
 export function pdfSettings(options: PdfExportOptions): PdfSettings {
   if (options === null || typeof options !== 'object') throw new TypeError('The options of a PDF must be an object');
@@ -100,9 +139,95 @@ export function pdfSettings(options: PdfExportOptions): PdfSettings {
     quality = options.quality;
   }
   if (options.image !== undefined && options.image !== 'auto' && options.image !== 'jpeg' && options.image !== 'lossless') throw new RangeError('"image" must be "auto", "jpeg" or "lossless"');
+  if (options.text !== undefined && options.text !== 'auto' && options.text !== 'image' && options.text !== 'vector') throw new RangeError('"text" must be "auto", "image" or "vector"');
   if (options.onProgress !== undefined && typeof options.onProgress !== 'function') throw new TypeError('"onProgress" must be a function');
+  if (options.onPage !== undefined && typeof options.onPage !== 'function') throw new TypeError('"onPage" must be a function');
   if (options.signal !== undefined && (options.signal === null || typeof options.signal !== 'object')) throw new TypeError('"signal" must be an AbortSignal');
-  return { dpi, image: options.image || 'auto', quality };
+  return { dpi, image: options.image || 'auto', quality, text: options.text || 'auto' };
+}
+
+/**
+ * What pages are drawn with when they are written as text and drawings: the
+ * font files of the page (asked for here where only their address is known),
+ * a measurer and a reader of pictures on canvases of the document. Undefined
+ * for `text: 'image'`, and where there is no canvas to measure with.
+ */
+export async function pdfVectorTools(doc: Document, settings: PdfSettings): Promise<PdfVectorTools | undefined> {
+  if (settings.text === 'image') return undefined;
+  const measure = canvasMeasure(doc);
+  if (!measure) return undefined;
+  const fonts = await loadPdfFonts();
+  return { fonts, measure, images: canvasPictures(doc, settings.image, settings.quality) };
+}
+
+/**
+ * Makes a file with `make`; when a font could not be put into it as the file
+ * was ended (PdfError 'font': not expected, since every glyph is looked at
+ * before it is written on a page), the file is made once more with every
+ * page as a picture - or, where only text and drawings were asked for, the
+ * work ends with a PdfExportError 'unsupported'.
+ */
+export async function pdfWithFallback<T>(settings: PdfSettings, make: (settings: PdfSettings) => Promise<T>): Promise<T> {
+  try {
+    return await make(settings);
+  } catch (error) {
+    if (!(error instanceof PdfError) || error.code !== 'font' || settings.text === 'image') throw error;
+    if (settings.text === 'vector') throw new PdfExportError('unsupported', `The file cannot be written as text and drawings: ${cleanReason(error.message)}`, undefined, cleanReason(error.message));
+    return make({ ...settings, text: 'image' });
+  }
+}
+
+export interface PdfPageJob {
+  /** The number of the page, from 1. */
+  number: number;
+  /** Size of the page in points. */
+  width: number;
+  height: number;
+  /** Size of the canvas the page is painted on, in its pixels. */
+  pixelWidth: number;
+  pixelHeight: number;
+  /** Paints the page on a canvas of that size. */
+  paint(context: CanvasRenderingContext2D): void;
+  /** The page as a picture, with its text: asked for only when the page is not written as text and drawings. */
+  picture(): Promise<Pick<PdfPage, 'image' | 'fill' | 'text'>>;
+  /** Called before the page is written into the file; false ends the work without a page (what it throws ends it too). */
+  proceed?(): boolean;
+}
+
+/**
+ * Writes one page into a file, as `settings.text` says: as text and drawings
+ * when `tools` can draw all of it, as its picture otherwise - or not at all,
+ * with a PdfExportError 'unsupported', when only text and drawings were asked
+ * for. Tells `onPage` how the page was written. False when `proceed` said so.
+ */
+export async function writePdfPage(pdf: PdfDocument, job: PdfPageJob, settings: PdfSettings, tools: PdfVectorTools | undefined, onPage?: (info: PdfPageInfo) => void): Promise<boolean> {
+  const info: PdfPageInfo = { page: job.number, mode: 'image' };
+  let written = false;
+  if (settings.text !== 'image') {
+    const drawn = tools ? drawPage(tools, { pixelWidth: job.pixelWidth, pixelHeight: job.pixelHeight, pageWidth: job.width, pageHeight: job.height }, job.paint) : { reason: 'there is no canvas to measure text with' };
+    if (drawn.vector) {
+      if (job.proceed && !job.proceed()) return false;
+      await pdf.addPage({ width: job.width, height: job.height, vector: drawn.vector });
+      info.mode = 'vector';
+      written = true;
+    } else {
+      info.reason = drawn.reason;
+      if (settings.text === 'vector') throw new PdfExportError('unsupported', `Page ${job.number} cannot be written as text and drawings: ${String(drawn.reason)}`, job.number, drawn.reason);
+    }
+  }
+  if (!written) {
+    const picture = await job.picture();
+    if (job.proceed && !job.proceed()) return false;
+    await pdf.addPage({ width: job.width, height: job.height, image: picture.image, fill: picture.fill, text: picture.text });
+  }
+  if (onPage) {
+    try {
+      onPage(info);
+    } catch {
+      // What the caller does with the news is its own; the file is made all the same.
+    }
+  }
+  return true;
 }
 
 /**

@@ -38,6 +38,7 @@ export type BridgeErrorCode =
   | 'print-failed'
   | 'pdf-unavailable'
   | 'pdf-failed'
+  | 'pdf-unsupported'
   | 'pdf-too-large'
   | 'read-only'
   | 'no-sheet'
@@ -2037,8 +2038,10 @@ export function createBridge(host: BridgeHost): Bridge {
 
   /**
    * Makes a PDF of the document or the workbook and answers with it: `pdf`,
-   * with the file as base64. As with printing, the messages after it do not
-   * wait: the pages of a long file take their time.
+   * with the file as base64, the number of its pages and how many of them
+   * were written as text and drawings (`vector`; the others are pictures).
+   * As with printing, the messages after it do not wait: the pages of a long
+   * file take their time.
    */
   const exportPdf = (message: Message, id: string | undefined) => {
     const dpi = field<number>(message, 'dpi', 'number', false);
@@ -2049,6 +2052,8 @@ export function createBridge(host: BridgeHost): Bridge {
     if (quality !== undefined && !(quality > 0 && quality <= 1)) throw new BadMessage('"quality" must be a number above 0 and at most 1');
     const sheets = field<string>(message, 'sheets', 'string', false);
     if (sheets !== undefined && sheets !== 'active' && sheets !== 'all') throw new BadMessage('"sheets" must be "active" or "all"');
+    const text = field<string>(message, 'text', 'string', false);
+    if (text !== undefined && text !== 'auto' && text !== 'image' && text !== 'vector') throw new BadMessage('"text" must be "auto", "image" or "vector"');
     const title = field<string>(message, 'title', 'string', false);
     const author = field<string>(message, 'author', 'string', false);
     if (!shown) return fail('not-loaded', 'No file is open', id);
@@ -2056,11 +2061,18 @@ export function createBridge(host: BridgeHost): Bridge {
     const view = shown.view;
     if (pages ? !pages.exportPdf && !pages.exportPdfParts : !view || typeof view.exportPdf !== 'function') return fail('pdf-unavailable', 'This view cannot make a PDF', id);
     let count = 0;
+    let vector = 0;
     const options: SheetPdfExportOptions = {
       onProgress: (_done, total) => {
         count = total;
       },
+      onPage: (info) => {
+        // Counted anew when the pages are painted again from the start.
+        if (info.page === 1) vector = 0;
+        if (info.mode === 'vector') vector++;
+      },
     };
+    if (text !== undefined) options.text = text as 'auto' | 'image' | 'vector';
     if (dpi !== undefined) options.dpi = dpi;
     if (image !== undefined) options.image = image as 'auto' | 'jpeg' | 'lossless';
     if (quality !== undefined) options.quality = quality;
@@ -2081,7 +2093,10 @@ export function createBridge(host: BridgeHost): Bridge {
     } catch (error) {
       job = Promise.reject(error);
     }
-    const failed = (error: unknown) => fail(error && (error as { code?: unknown }).code === 'unavailable' ? 'pdf-unavailable' : 'pdf-failed', errorText(error), id);
+    const failed = (error: unknown) => {
+      const code = error ? (error as { code?: unknown }).code : undefined;
+      fail(code === 'unavailable' ? 'pdf-unavailable' : code === 'unsupported' ? 'pdf-unsupported' : 'pdf-failed', errorText(error), id);
+    };
     job.then((parts) => {
       // Whatever goes wrong from here on is answered too: the application waits for one of the two.
       try {
@@ -2096,6 +2111,7 @@ export function createBridge(host: BridgeHost): Bridge {
         out.data = base64OfParts(parts);
         out.name = name;
         out.pages = count;
+        out.vector = vector;
         send(out);
       } catch (error) {
         failed(error);

@@ -9,9 +9,9 @@
 // The file is not held as one string or one array: what is written is a list
 // of parts, and the writer only remembers where each object starts.
 
-export type PdfErrorCode = 'invalid' | 'too-large' | 'empty';
+export type PdfErrorCode = 'invalid' | 'too-large' | 'empty' | 'font';
 
-/** Why a PDF could not be written: a value that cannot be, a file beyond the limit, a document without pages. */
+/** Why a PDF could not be written: a value that cannot be, a file beyond the limit, a document without pages, a font that could not be put into the file when it was ended. */
 export class PdfError extends Error {
   readonly code: PdfErrorCode;
   constructor(code: PdfErrorCode, message: string) {

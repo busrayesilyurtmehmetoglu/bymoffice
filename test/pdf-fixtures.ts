@@ -222,8 +222,32 @@ export interface CheckedText {
   mode: number;
   /** Characters (codes of the font) the string holds. */
   codes: number;
-  /** The advance of the string in points: codes x width of a glyph x size x scaling. */
+  /** The advance of the string in points: the widths of its glyphs and the spacing between them, times the size, the scaling and the stretch of the text matrix. */
   advance: number;
+  /** Character spacing (Tc), in units of text space. */
+  spacing: number;
+  /** /BaseFont of the font the string is written in. */
+  font: string;
+  /** The colour the text is filled with: grey or RGB, 0 to 1. */
+  fill: number[];
+  /** The glyph numbers of the string. */
+  glyphs: number[];
+  /** Where each glyph starts, from the start of the string, in units of text space (before the text matrix). */
+  starts: number[];
+}
+
+/** Something a page fills or strokes. */
+export interface CheckedShape {
+  /** "f", "f*", "S" or the like. */
+  operator: string;
+  /** The operators that made the path, with their numbers: ["re", x, y, w, h], ["m", x, y], ... */
+  path: (string | number)[][];
+  /** The colour of the fill (for a fill) or of the stroke: grey or RGB, 0 to 1. */
+  colour: number[];
+  /** Opacity, from the graphics state the page chose. */
+  alpha: number;
+  lineWidth: number;
+  dash: number[];
 }
 
 export interface CheckedImage {
@@ -255,6 +279,10 @@ export interface CheckedPage {
   images: CheckedImage[];
   /** The content stream, decoded. */
   content: string;
+  /** What the page fills and strokes, in the order of the content stream. */
+  shapes: CheckedShape[];
+  /** The paths the page clips with. */
+  clips: (string | number)[][][];
 }
 
 export interface CheckedFont {
@@ -263,7 +291,13 @@ export interface CheckedFont {
   glyphs: number;
   /** Codes with an entry in the ToUnicode map. */
   mapped: number;
+  /** The font file as it is in the PDF: a TrueType file, or a CFF table. */
   file: Uint8Array;
+  kind: 'truetype' | 'cff';
+  /** The widths /W states, by glyph. */
+  widths: Map<number, number>;
+  /** Flags of the font descriptor. */
+  flags: number;
 }
 
 export interface CheckedPdf {
@@ -602,8 +636,14 @@ export function checkPdf(file: Uint8Array): CheckedPdf {
 
   const catalog = dictOf(trailer.Root, '/Root');
   if (nameOf(catalog.Type) !== 'Catalog') throw new Error('/Root is no /Catalog');
-  const fonts = new Map<number, { font: CheckedFont; map: Map<number, string>; width: number }>();
-  const fontOf = (ref: Value | undefined): { font: CheckedFont; map: Map<number, string>; width: number } => {
+  interface FontEntry {
+    font: CheckedFont;
+    map: Map<number, string>;
+    /** The width of a code, in thousandths of the font size. */
+    width(code: number): number;
+  }
+  const fonts = new Map<number, FontEntry>();
+  const fontOf = (ref: Value | undefined): FontEntry => {
     if (!(ref instanceof Ref)) throw new Error('A font of a page is not a reference');
     const known = fonts.get(ref.id);
     if (known) return known;
@@ -613,22 +653,81 @@ export function checkPdf(file: Uint8Array): CheckedPdf {
     const descendants = resolve(font.DescendantFonts);
     if (!Array.isArray(descendants) || descendants.length !== 1) throw new Error('The font has not exactly one descendant');
     const cid = dictOf(descendants[0], 'The descendant font');
-    if (nameOf(cid.Subtype) !== 'CIDFontType2') throw new Error('The descendant font is no CIDFontType2');
+    const subtype = nameOf(cid.Subtype);
+    if (subtype !== 'CIDFontType2' && subtype !== 'CIDFontType0') throw new Error('The descendant font is neither a CIDFontType2 nor a CIDFontType0');
     const system = dictOf(cid.CIDSystemInfo, '/CIDSystemInfo');
     if (!(system.Registry instanceof Str) || !(system.Ordering instanceof Str) || typeof system.Supplement !== 'number') throw new Error('/CIDSystemInfo is incomplete');
     // The codes of the font are glyph numbers and nothing else: the collection Identity-H goes with.
     if (decodeTextString(system.Registry) !== 'Adobe' || decodeTextString(system.Ordering) !== 'Identity' || system.Supplement !== 0) throw new Error('/CIDSystemInfo is not Adobe-Identity-0');
-    if (nameOf(cid.BaseFont) !== nameOf(font.BaseFont)) throw new Error('The two fonts have different names');
+    const baseFont = nameOf(font.BaseFont);
+    if (baseFont === '' || /[^!-~]|[\[\](){}<>/%#]/.test(baseFont)) throw new Error(`The name of the font (${JSON.stringify(baseFont)}) is none a PostScript name may be`);
+    if (nameOf(cid.BaseFont) !== baseFont) throw new Error('The two fonts have different names');
     const descriptor = dictOf(cid.FontDescriptor, '/FontDescriptor');
     for (const key of ['FontName', 'Flags', 'FontBBox', 'ItalicAngle', 'Ascent', 'Descent', 'CapHeight', 'StemV']) if (descriptor[key] === undefined) throw new Error(`The font descriptor has no /${key}`);
+    if (nameOf(descriptor.FontName) !== baseFont) throw new Error('The font descriptor has another name than the font');
+    const box = resolve(descriptor.FontBBox);
+    if (!Array.isArray(box) || box.length !== 4 || box.some((entry) => typeof entry !== 'number') || !((box[2] as number) > (box[0] as number)) || !((box[3] as number) > (box[1] as number))) throw new Error('/FontBBox of the font descriptor is no box');
     // A font whose codes are no Latin letters is symbolic (bit 3) and not nonsymbolic (bit 6).
     const flags = descriptor.Flags as number;
     if (typeof flags !== 'number' || (flags & 4) === 0 || (flags & 32) !== 0) throw new Error(`The flags of the font descriptor (${String(flags)}) do not say that the font is symbolic`);
-    const fontFile = streamOf(descriptor.FontFile2, '/FontFile2');
-    if (fontFile.dict.Length1 !== fontFile.data.length) throw new Error('/Length1 of the font file is not its length');
-    const checked = checkTrueType(fontFile.data);
-    const width = typeof cid.DW === 'number' ? cid.DW : 1000;
-    if (Math.abs((checked.advance * 1000) / checked.unitsPerEm - width) > 0.5) throw new Error('/DW is not the advance of the glyph in the font file');
+    let glyphs: number;
+    let file: Uint8Array;
+    let tables: string[] = [];
+    let kind: 'truetype' | 'cff';
+    /** The advance of a glyph as the font file states it, in thousandths of an em; undefined where the file is not asked. */
+    let advanceOf: ((glyph: number) => number) | undefined;
+    if (subtype === 'CIDFontType2') {
+      const fontFile = streamOf(descriptor.FontFile2, '/FontFile2');
+      if (fontFile.dict.Length1 !== fontFile.data.length) throw new Error('/Length1 of the font file is not its length');
+      const checked = checkTrueType(fontFile.data);
+      glyphs = checked.glyphs;
+      file = fontFile.data;
+      tables = checked.tables;
+      kind = 'truetype';
+      const hmtx = checked.table('hmtx');
+      const metrics = u16(checked.table('hhea'), 34);
+      advanceOf = (glyph) => (u16(hmtx, Math.min(glyph, metrics - 1) * 4) * 1000) / checked.unitsPerEm;
+    } else {
+      const fontFile = streamOf(descriptor.FontFile3, '/FontFile3');
+      if (nameOf(fontFile.dict.Subtype) !== 'CIDFontType0C') throw new Error('/FontFile3 of a CIDFontType0 is no /CIDFontType0C');
+      // A CFF table: version 1, a header of four bytes, an offset size from 1 to 4.
+      const data = fontFile.data;
+      if (data.length < 4 || data[0] !== 1 || data[2] < 4 || data[3] < 1 || data[3] > 4) throw new Error('/FontFile3 does not start as a CFF table');
+      // The glyphs are counted by the font program itself.
+      glyphs = 65536;
+      file = data;
+      kind = 'cff';
+    }
+    const dw = typeof cid.DW === 'number' ? cid.DW : 1000;
+    const widths = new Map<number, number>();
+    if (cid.W !== undefined) {
+      const w = resolve(cid.W);
+      if (!Array.isArray(w)) throw new Error('/W of the font is no array');
+      for (let i = 0; i < w.length; ) {
+        const first = w[i];
+        const next = w[i + 1];
+        if (typeof first !== 'number' || Math.floor(first) !== first || first < 0) throw new Error('/W of the font does not start a run with a code');
+        if (Array.isArray(next)) {
+          next.forEach((entry, index) => {
+            if (typeof entry !== 'number' || entry < 0) throw new Error('/W of the font holds a width that is none');
+            if (widths.has(first + index)) throw new Error(`/W of the font states the width of code ${first + index} twice`);
+            widths.set(first + index, entry);
+          });
+          i += 2;
+        } else if (typeof next === 'number' && typeof w[i + 2] === 'number') {
+          for (let code = first; code <= next && code - first < 65536; code++) widths.set(code, w[i + 2] as number);
+          i += 3;
+        } else throw new Error('/W of the font is not made of runs');
+      }
+    }
+    if (advanceOf) {
+      const advance = advanceOf;
+      widths.forEach((width, code) => {
+        if (code >= glyphs) throw new Error(`/W states the width of glyph ${code}, which the font does not have`);
+        if (Math.abs(advance(code) - width) > 0.51) throw new Error(`/W states ${width} for glyph ${code}; the font file says ${advance(code)}`);
+      });
+      if (widths.size === 0 && Math.abs(advance(1) - dw) > 0.5) throw new Error('/DW is not the advance of the glyph in the font file');
+    }
     let mapped = 0;
     let map = new Map<number, string>();
     if (font.ToUnicode !== undefined) {
@@ -642,12 +741,18 @@ export function checkPdf(file: Uint8Array): CheckedPdf {
       const table = streamOf(toGid, '/CIDToGIDMap').data;
       map.forEach((_text, code) => {
         if (code * 2 + 1 >= table.length) throw new Error(`Code ${code} lies beyond /CIDToGIDMap`);
-        if (u16(table, code * 2) >= checked.glyphs) throw new Error(`Code ${code} is mapped to a glyph the font does not have`);
+        if (u16(table, code * 2) >= glyphs) throw new Error(`Code ${code} is mapped to a glyph the font does not have`);
         // Glyph 0 is "no such character": readers may leave text that is made of it out.
         if (u16(table, code * 2) === 0) throw new Error(`Code ${code} is mapped to the glyph for missing characters`);
       });
-    } else if (nameOf(toGid) !== 'Identity') throw new Error('The font has no /CIDToGIDMap');
-    const entry = { font: { baseFont: nameOf(font.BaseFont), tables: checked.tables, glyphs: checked.glyphs, mapped, file: fontFile.data }, map, width };
+    } else if (subtype === 'CIDFontType2') {
+      if (nameOf(toGid) !== 'Identity') throw new Error('The font has no /CIDToGIDMap');
+      map.forEach((_text, code) => {
+        if (code >= glyphs) throw new Error(`Code ${code} is a glyph the font does not have`);
+        if (code === 0) throw new Error('Code 0, the glyph for missing characters, is in the ToUnicode map');
+      });
+    } else if (toGid !== undefined) throw new Error('A CIDFontType0 has a /CIDToGIDMap');
+    const entry: FontEntry = { font: { baseFont, tables, glyphs, mapped, file, kind, widths, flags }, map, width: (code) => (widths.has(code) ? (widths.get(code) as number) : dw) };
     fonts.set(ref.id, entry);
     return entry;
   };
@@ -714,24 +819,39 @@ export function checkPdf(file: Uint8Array): CheckedPdf {
     const box = resolve(node.MediaBox);
     if (!Array.isArray(box) || box.length !== 4 || box.some((entry) => typeof entry !== 'number')) throw new Error('A page has no /MediaBox');
     const numbers = box as number[];
-    const page: CheckedPage = { width: numbers[2] - numbers[0], height: numbers[3] - numbers[1], texts: [], text: '', images: [], content: '' };
+    const page: CheckedPage = { width: numbers[2] - numbers[0], height: numbers[3] - numbers[1], texts: [], text: '', images: [], content: '', shapes: [], clips: [] };
     if (!(page.width > 0) || !(page.height > 0)) throw new Error('A page has no size');
     const resources = dictOf(node.Resources, '/Resources');
     const xobjects = resources.XObject === undefined ? {} : dictOf(resources.XObject, '/XObject');
     const fontNames = resources.Font === undefined ? {} : dictOf(resources.Font, '/Font');
+    const states = resources.ExtGState === undefined ? {} : dictOf(resources.ExtGState, '/ExtGState');
     const content = node.Contents === undefined ? '' : Buffer.from(streamOf(node.Contents, '/Contents').data).toString('latin1');
     page.content = content;
     // The operators of the content stream, with their operands.
     const parser = new Parser(Buffer.from(content, 'latin1'), 0);
     const operands: Value[] = [];
     let inText = false;
-    let font: { map: Map<number, string>; width: number } | undefined;
-    let size = 0;
-    let scaling = 100;
-    let mode = 0;
+    // What q saves and Q gives back.
+    interface Graphics {
+      ctm: number[];
+      font: FontEntry | undefined;
+      size: number;
+      scaling: number;
+      mode: number;
+      spacing: number;
+      fill: number[];
+      stroke: number[];
+      ca: number;
+      CA: number;
+      lineWidth: number;
+      dash: number[];
+    }
+    let gs: Graphics = { ctm: [1, 0, 0, 1, 0, 0], font: undefined, size: 0, scaling: 100, mode: 0, spacing: 0, fill: [0], stroke: [0], ca: 1, CA: 1, lineWidth: 1, dash: [] };
     let matrix = [1, 0, 0, 1, 0, 0];
-    const stack: number[][] = [];
-    let ctm = [1, 0, 0, 1, 0, 0];
+    const stack: Graphics[] = [];
+    let path: (string | number)[][] = [];
+    /** A clip was asked for: the operator that ends the path makes it. */
+    let clipping = false;
     for (;;) {
       parser.skipWhite();
       if (parser.at >= parser.bytes.length) break;
@@ -747,21 +867,51 @@ export function checkPdf(file: Uint8Array): CheckedPdf {
         if (operands.length !== wanted || operands.some((entry) => typeof entry !== 'number')) throw new Error(`The operator ${operator} needs ${wanted} numbers`);
         return operands as number[];
       };
-      if (operator === 'q') stack.push(ctm.slice());
-      else if (operator === 'Q') {
+      const unit = (count: number): number[] => {
+        const values = numbersOf(count).slice();
+        if (values.some((value) => value < 0 || value > 1)) throw new Error(`The operator ${operator} is given a colour outside 0 to 1`);
+        return values;
+      };
+      const paint = (stroke: boolean): void => {
+        if (path.length === 0) throw new Error(`The operator ${operator} paints a path that is empty`);
+        if (clipping) page.clips.push(path);
+        if (operator !== 'n') page.shapes.push({ operator, path, colour: (stroke ? gs.stroke : gs.fill).slice(), alpha: stroke ? gs.CA : gs.ca, lineWidth: gs.lineWidth, dash: gs.dash.slice() });
+        path = [];
+        clipping = false;
+      };
+      const construct = (count: number): void => {
+        if (inText) throw new Error(`The operator ${operator} builds a path inside a text object`);
+        if (operator !== 'm' && operator !== 're' && path.length === 0) throw new Error(`The operator ${operator} goes on with a path that was not started`);
+        path.push([operator as string | number].concat(numbersOf(count)));
+      };
+      const pathless = (): void => {
+        if (path.length !== 0) throw new Error(`The operator ${operator} stands inside a path`);
+      };
+      if (operator === 'q') {
+        pathless();
+        if (inText) throw new Error('A q inside a text object');
+        stack.push({ ...gs, ctm: gs.ctm.slice(), fill: gs.fill.slice(), stroke: gs.stroke.slice(), dash: gs.dash.slice() });
+        if (stack.length > 28) throw new Error('The graphics state is saved more than 28 times over');
+      } else if (operator === 'Q') {
+        pathless();
+        if (inText) throw new Error('A Q inside a text object');
         const popped = stack.pop();
         if (!popped) throw new Error('A Q without its q');
-        ctm = popped;
+        gs = popped;
       } else if (operator === 'cm') {
+        pathless();
         const m = numbersOf(6);
-        ctm = [m[0] * ctm[0] + m[1] * ctm[2], m[0] * ctm[1] + m[1] * ctm[3], m[2] * ctm[0] + m[3] * ctm[2], m[2] * ctm[1] + m[3] * ctm[3], m[4] * ctm[0] + m[5] * ctm[2] + ctm[4], m[4] * ctm[1] + m[5] * ctm[3] + ctm[5]];
+        const ctm = gs.ctm;
+        gs.ctm = [m[0] * ctm[0] + m[1] * ctm[2], m[0] * ctm[1] + m[1] * ctm[3], m[2] * ctm[0] + m[3] * ctm[2], m[2] * ctm[1] + m[3] * ctm[3], m[4] * ctm[0] + m[5] * ctm[2] + ctm[4], m[4] * ctm[1] + m[5] * ctm[3] + ctm[5]];
       } else if (operator === 'Do') {
+        pathless();
         const key = operands[0];
         if (!(key instanceof Name) || xobjects[key.name] === undefined) throw new Error('A page draws an XObject its resources do not have');
-        const image = imageOf(xobjects[key.name]);
-        image.matrix = ctm.slice();
+        const image = { ...imageOf(xobjects[key.name]) };
+        image.matrix = gs.ctm.slice();
         page.images.push(image);
       } else if (operator === 'BT') {
+        pathless();
         if (inText) throw new Error('A BT inside a text object');
         inText = true;
         matrix = [1, 0, 0, 1, 0, 0];
@@ -771,37 +921,104 @@ export function checkPdf(file: Uint8Array): CheckedPdf {
       } else if (operator === 'Tf') {
         const key = operands[0];
         if (!(key instanceof Name) || fontNames[key.name] === undefined || typeof operands[1] !== 'number') throw new Error('A page uses a font its resources do not have');
-        font = fontOf(fontNames[key.name]);
-        size = operands[1];
-      } else if (operator === 'Tz') scaling = numbersOf(1)[0];
-      else if (operator === 'Tr') mode = numbersOf(1)[0];
-      else if (operator === 'Tm') matrix = numbersOf(6).slice();
-      else if (operator === 'Td') {
+        gs.font = fontOf(fontNames[key.name]);
+        gs.size = operands[1];
+      } else if (operator === 'Tz') gs.scaling = numbersOf(1)[0];
+      else if (operator === 'Tr') gs.mode = numbersOf(1)[0];
+      else if (operator === 'Tc') gs.spacing = numbersOf(1)[0];
+      else if (operator === 'Tm') {
+        if (!inText) throw new Error('A text matrix outside a text object');
+        matrix = numbersOf(6).slice();
+      } else if (operator === 'Td') {
         const d = numbersOf(2);
         matrix = [matrix[0], matrix[1], matrix[2], matrix[3], d[0] * matrix[0] + d[1] * matrix[2] + matrix[4], d[0] * matrix[1] + d[1] * matrix[3] + matrix[5]];
-      } else if (operator === 'Tj') {
+      } else if (operator === 'Tj' || operator === 'TJ') {
         if (!inText) throw new Error('Text outside a text object');
-        const string = operands[0];
-        if (operands.length !== 1 || !(string instanceof Str)) throw new Error('Tj without a string');
-        if (!font) throw new Error('Text before a font was chosen');
-        if (string.bytes.length % 2 !== 0) throw new Error('A string of a two byte font with an odd number of bytes');
-        let text = '';
-        for (let i = 0; i < string.bytes.length; i += 2) {
-          const cid = u16(string.bytes, i);
-          const mappedText = font.map.get(cid);
-          if (mappedText === undefined) throw new Error(`Code ${cid} of a string is not in the ToUnicode map`);
-          text += mappedText;
+        // The strings that are shown, and the numbers between them (TJ): thousandths of the font size the next glyph stands further left by.
+        let pieces: Value[];
+        if (operator === 'Tj') {
+          if (operands.length !== 1 || !(operands[0] instanceof Str)) throw new Error('Tj without a string');
+          pieces = [operands[0]];
+        } else {
+          const array = operands[0];
+          if (operands.length !== 1 || !Array.isArray(array) || array.length === 0 || !(array[0] instanceof Str) || !(array[array.length - 1] instanceof Str)) throw new Error('TJ without an array that starts and ends with a string');
+          pieces = array;
         }
-        const codes = string.bytes.length / 2;
-        page.texts.push({ text, x: matrix[4], y: matrix[5], matrix: matrix.slice(), size, scaling, mode, codes, advance: (codes * font.width * size * scaling) / 100000 });
+        const font = gs.font;
+        if (!font) throw new Error('Text before a font was chosen');
+        let text = '';
+        // In units of text space.
+        let width = 0;
+        const glyphs: number[] = [];
+        const starts: number[] = [];
+        for (const piece of pieces) {
+          if (typeof piece === 'number') {
+            width -= (piece * gs.size) / 1000;
+            continue;
+          }
+          if (!(piece instanceof Str)) throw new Error('TJ with something that is neither a string nor a number');
+          if (piece.bytes.length % 2 !== 0) throw new Error('A string of a two byte font with an odd number of bytes');
+          for (let i = 0; i < piece.bytes.length; i += 2) {
+            const cid = u16(piece.bytes, i);
+            const mappedText = font.map.get(cid);
+            if (mappedText === undefined) throw new Error(`Code ${cid} of a string is not in the ToUnicode map`);
+            text += mappedText;
+            starts.push(width);
+            width += (font.width(cid) * gs.size) / 1000 + gs.spacing;
+            glyphs.push(cid);
+          }
+        }
+        const codes = glyphs.length;
+        const stretch = Math.sqrt(matrix[0] * matrix[0] + matrix[1] * matrix[1]);
+        const advance = (width * gs.scaling * stretch) / 100;
+        page.texts.push({ text, x: matrix[4], y: matrix[5], matrix: matrix.slice(), size: gs.size, scaling: gs.scaling, mode: gs.mode, codes, advance, spacing: gs.spacing, font: font.font.baseFont, fill: gs.fill.slice(), glyphs, starts });
         page.text += text;
-      } else if (operator === 'rg' || operator === 'g' || operator === 're' || operator === 'f' || operator === 'n' || operator === 'W') {
-        // Painting the paper: nothing to follow here.
-      } else throw new Error(`A content stream uses the operator "${operator}", which this check does not know`);
+      } else if (operator === 'rg') gs.fill = unit(3);
+      else if (operator === 'g') gs.fill = unit(1);
+      else if (operator === 'RG') gs.stroke = unit(3);
+      else if (operator === 'G') gs.stroke = unit(1);
+      else if (operator === 'gs') {
+        pathless();
+        const key = operands[0];
+        if (operands.length !== 1 || !(key instanceof Name) || states[key.name] === undefined) throw new Error('A page uses a graphics state its resources do not have');
+        const state = dictOf(states[key.name], 'A graphics state');
+        if (nameOf(state.Type) !== 'ExtGState') throw new Error('A graphics state is no /ExtGState');
+        for (const entry of Object.keys(state)) {
+          if (entry === 'Type') continue;
+          const value = state[entry];
+          if ((entry !== 'ca' && entry !== 'CA') || typeof value !== 'number' || value < 0 || value > 1) throw new Error(`A graphics state sets /${entry}, which this check does not know, or to a value that is no opacity`);
+          if (entry === 'ca') gs.ca = value;
+          else gs.CA = value;
+        }
+      } else if (operator === 'w') {
+        gs.lineWidth = numbersOf(1)[0];
+        if (gs.lineWidth < 0) throw new Error('A line has a width below nothing');
+      } else if (operator === 'J' || operator === 'j') {
+        const value = numbersOf(1)[0];
+        if (value !== 0 && value !== 1 && value !== 2) throw new Error(`The operator ${operator} is given ${value}`);
+      } else if (operator === 'M') {
+        if (numbersOf(1)[0] < 1) throw new Error('A miter limit below 1');
+      } else if (operator === 'd') {
+        const lengths = operands[0];
+        if (operands.length !== 2 || !Array.isArray(lengths) || typeof operands[1] !== 'number' || lengths.some((entry) => typeof entry !== 'number' || entry < 0)) throw new Error('The operator d needs an array of lengths and a phase');
+        if (lengths.length > 0 && !lengths.some((entry) => (entry as number) > 0)) throw new Error('The dashes of a line are all of no length');
+        gs.dash = lengths as number[];
+      } else if (operator === 'm') construct(2);
+      else if (operator === 'l') construct(2);
+      else if (operator === 'c') construct(6);
+      else if (operator === 're') construct(4);
+      else if (operator === 'h') construct(0);
+      else if (operator === 'W' || operator === 'W*') {
+        if (path.length === 0) throw new Error('A clip without a path');
+        clipping = true;
+      } else if (operator === 'f' || operator === 'f*' || operator === 'n') paint(false);
+      else if (operator === 'S') paint(true);
+      else throw new Error(`A content stream uses the operator "${operator}", which this check does not know`);
       operands.length = 0;
     }
     if (inText) throw new Error('A text object without its ET');
     if (stack.length !== 0) throw new Error('A q without its Q');
+    if (path.length !== 0) throw new Error('A path of a page is never painted');
     pages.push(page);
     return 1;
   };
@@ -880,7 +1097,7 @@ export interface PopplerReport {
   reading: string[];
   /** One entry per image: page, size and how it is stored. */
   images: { page: number; width: number; height: number; color: string; encoding: string }[];
-  fonts: { name: string; type: string; embedded: boolean; unicode: boolean }[];
+  fonts: { name: string; type: string; embedded: boolean; subset: boolean; unicode: boolean }[];
   /** What the tools wrote to their error stream: syntax errors and warnings. */
   complaints: string;
 }
@@ -931,7 +1148,7 @@ export function poppler(file: Uint8Array): PopplerReport {
     const fonts: PopplerReport['fonts'] = [];
     for (const line of run('pdffonts', [path]).split('\n').slice(2)) {
       const parsed = /^(\S+)\s+(.+?)\s+(\S+)\s+(yes|no)\s+(yes|no)\s+(yes|no)\s+\d+\s+\d+\s*$/.exec(line);
-      if (parsed) fonts.push({ name: parsed[1], type: parsed[2].trim(), embedded: parsed[4] === 'yes', unicode: parsed[6] === 'yes' });
+      if (parsed) fonts.push({ name: parsed[1], type: parsed[2].trim(), embedded: parsed[4] === 'yes', subset: parsed[5] === 'yes', unicode: parsed[6] === 'yes' });
     }
     return { info, pages, sizes, text, reading, images, fonts, complaints: complaints.trim() };
   } finally {
@@ -958,6 +1175,65 @@ export function popplerPixels(file: Uint8Array, dpi = 72): { width: number; heig
     const height = Number(head[2]);
     const data = ppm.subarray(head[0].length);
     return { width, height, at: (x, y) => [data[(y * width + x) * 3], data[(y * width + x) * 3 + 1], data[(y * width + x) * 3 + 2]] };
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
+export interface PopplerWord {
+  page: number;
+  text: string;
+  /** The box of the word in points, from the top left corner of the page. */
+  xMin: number;
+  yMin: number;
+  xMax: number;
+  yMax: number;
+}
+
+/** The words of a PDF with the boxes Poppler gives them (pdftotext -bbox), page by page, and what the tool complained of. */
+export function popplerWords(file: Uint8Array): { words: PopplerWord[]; complaints: string } {
+  const folder = join(process.cwd(), `tmp-pdf-check-${process.pid}-${++serial}`);
+  mkdirSync(folder, { recursive: true });
+  try {
+    const path = join(folder, 'file.pdf');
+    const errors = join(folder, 'stderr.txt');
+    writeFileSync(path, file);
+    const html = execFileSync('/bin/sh', ['-c', '"$0" "$@" 2>"$ERRORS"', 'pdftotext', '-bbox', '-enc', 'UTF-8', path, '-'], { encoding: 'utf8', env: { ...process.env, ERRORS: errors }, maxBuffer: 256 * 1024 * 1024 });
+    const complaints = execFileSync('/bin/cat', [errors], { encoding: 'utf8' }).trim();
+    const words: PopplerWord[] = [];
+    let page = 0;
+    const decode = (text: string): string =>
+      text
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, '&');
+    for (const line of html.split('\n')) {
+      if (/<page /.test(line)) page++;
+      const word = /<word xMin="([-\d.]+)" yMin="([-\d.]+)" xMax="([-\d.]+)" yMax="([-\d.]+)">(.*)<\/word>/.exec(line);
+      if (word) words.push({ page, xMin: Number(word[1]), yMin: Number(word[2]), xMax: Number(word[3]), yMax: Number(word[4]), text: decode(word[5]) });
+    }
+    return { words, complaints };
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
+/** A page of a PDF as Poppler paints it (see popplerPixels), by its number from 1. */
+export function popplerPage(file: Uint8Array, pageNumber: number, dpi = 72): { width: number; height: number; at(x: number, y: number): [number, number, number]; data: Uint8Array } {
+  const folder = join(process.cwd(), `tmp-pdf-check-${process.pid}-${++serial}`);
+  mkdirSync(folder, { recursive: true });
+  try {
+    const path = join(folder, 'file.pdf');
+    writeFileSync(path, file);
+    const ppm = execFileSync('pdftoppm', ['-r', String(dpi), '-f', String(pageNumber), '-l', String(pageNumber), path], { maxBuffer: 512 * 1024 * 1024 });
+    const head = /^P6\s+(\d+)\s+(\d+)\s+255\s/.exec(ppm.subarray(0, 40).toString('latin1'));
+    if (!head) throw new Error('pdftoppm gave no picture');
+    const width = Number(head[1]);
+    const height = Number(head[2]);
+    const data = ppm.subarray(head[0].length);
+    return { width, height, data, at: (x, y) => [data[(y * width + x) * 3], data[(y * width + x) * 3 + 1], data[(y * width + x) * 3 + 2]] };
   } finally {
     rmSync(folder, { recursive: true, force: true });
   }

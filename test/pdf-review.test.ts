@@ -314,7 +314,7 @@ function canvasOf(width: number, height: number, pixel: (x: number, y: number) =
 }
 
 test('the kind of picture is chosen page by page unless one is asked for', async () => {
-  assert.deepEqual(pdfSettings({}), { dpi: 150, image: 'auto', quality: 0.85 });
+  assert.deepEqual(pdfSettings({}), { dpi: 150, image: 'auto', quality: 0.85, text: 'auto' });
   assert.equal(pdfSettings({ image: 'auto' }).image, 'auto');
   const auto = { dpi: 150, image: 'auto' as const, quality: 0.85 };
   // A page of text: its pixels, and no JPEG is made at all.

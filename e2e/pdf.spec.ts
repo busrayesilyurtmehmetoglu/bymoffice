@@ -4,6 +4,14 @@
 // that follows the specification (test/pdf-fixtures) and, where the machine
 // has them, by the tools of Poppler: the pages, their sizes, their pictures
 // and the text that lies invisible over them.
+//
+// The first two groups are about pages that are pictures: their helper asks
+// for `text: 'image'` unless a test says otherwise. (Their documents and
+// workbooks are set in fonts of the device - Arial, Calibri and what stands
+// in for it - whose files are not at hand, so their pages of text would be
+// pictures by default too; a page without any text would not.) The last
+// group has pages whose fonts have files - the font of the package and a
+// registered one - and compares the two ways a page can be written.
 
 import { readFile } from 'node:fs/promises';
 import { deflateSync } from 'node:zlib';
@@ -11,8 +19,9 @@ import type { Page } from '@playwright/test';
 import { p } from '../test/doc-layout-fixtures';
 import { buildDocx } from '../test/docx-fixtures';
 import { buildXlsx, worksheetXml } from '../test/fixtures';
-import { checkPdf, poppler, popplerOrSay, type CheckedPdf, type PopplerReport } from '../test/pdf-fixtures';
-import { DOC_STYLES, picture } from './fixtures/docx';
+import { checkPdf, poppler, popplerOrSay, popplerPage, popplerWords, type CheckedPdf, type PopplerReport } from '../test/pdf-fixtures';
+import { DOC_STYLES, docSection, fontStyles, picture } from './fixtures/docx';
+import { testFont } from './fixtures/font';
 import { expect, expectResponsive, test } from './helpers';
 
 const MARGINS = '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="300" w:footer="300" w:gutter="0"/>';
@@ -126,14 +135,14 @@ interface Outcome {
   progress: [number, number][];
 }
 
-/** Calls exportPdf() of window.__view (or of the object `holder` names) and brings the file, or the error, out of the page. */
+/** Calls exportPdf() of window.__view (or of the object `holder` names) and brings the file, or the error, out of the page. Pages are pictures unless `options.text` says otherwise. */
 function exportPdf(page: Page, options: object = {}, holder = '__view'): Promise<Outcome> {
   return page.evaluate(
     async ([opts, name]) => {
       const progress: [number, number][] = [];
       const target = (window as any)[name as string];
       try {
-        const bytes: Uint8Array = await target.exportPdf({ ...(opts as object), onProgress: (done: number, total: number) => progress.push([done, total]) });
+        const bytes: Uint8Array = await target.exportPdf({ text: 'image', ...(opts as object), onProgress: (done: number, total: number) => progress.push([done, total]) });
         // As base64, in steps: a file of megabytes is no argument list.
         let binary = '';
         for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
@@ -217,7 +226,7 @@ test.describe('a document as a PDF', () => {
     if (pdf.poppler) {
       expect(pdf.poppler.sizes).toEqual([A4_PT, A4_PT, A4_PT]);
       expect(pdf.poppler.images).toEqual([1, 2, 3].map((number) => ({ page: number, width: 1240, height: 1754, color: 'rgb', encoding: 'jpeg' })));
-      expect(pdf.poppler.fonts).toEqual([{ name: 'BYMGlyphless', type: 'CID TrueType', embedded: true, unicode: true }]);
+      expect(pdf.poppler.fonts).toEqual([{ name: 'BYMGlyphless', type: 'CID TrueType', embedded: true, subset: false, unicode: true }]);
       // The lines of the first page come out in their order, with every letter.
       const lines = pdf.poppler.text[0].split('\n').map((entry) => entry.trim()).filter((entry) => entry !== '');
       expect(lines.slice(0, 3)).toEqual(['Sheet 1', TURKISH, ASTRAL]);
@@ -392,7 +401,7 @@ test.describe('a document as a PDF', () => {
 
   test('an option that cannot be is refused, and a page without a canvas says that no PDF can be made', async ({ page }) => {
     await mountDoc(page, await pagesDocx(1));
-    for (const options of [{ dpi: 0 }, { dpi: 'high' }, { quality: 2 }, { image: 'png' }]) {
+    for (const options of [{ dpi: 0 }, { dpi: 'high' }, { quality: 2 }, { image: 'png' }, { text: 'sharp' }]) {
       const outcome = await exportPdf(page, options);
       expect(outcome.error && outcome.error.name, JSON.stringify(options)).toBe('RangeError');
     }
@@ -701,15 +710,22 @@ test.describe('a PDF through the WebView bridge', () => {
     await send(page, { type: 'setLocale', id: 's', locale: 'tr' });
     expect(await answer(page, 's')).toEqual({ type: 'done', id: 's', command: 'setLocale' });
     const reply = await answer(page, 'p');
-    expect({ type: reply.type, name: reply.name, pages: reply.pages }).toEqual({ type: 'pdf', name: 'Rapor.pdf', pages: 2 });
+    // The document is set in a font of the device: none of its pages is drawn.
+    expect({ type: reply.type, name: reply.name, pages: reply.pages, vector: reply.vector }).toEqual({ type: 'pdf', name: 'Rapor.pdf', pages: 2, vector: 0 });
     const pdf = read(reply.data);
     expect(pdf.checked.pages.length).toBe(2);
     expect(pdf.checked.info.Title).toBe('Başlık');
     expect(words(pdf.checked, 1)).toContain('Sheet 2');
-    for (const [id, wrong] of [['b1', { dpi: 'high' }], ['b2', { image: 'png' }], ['b3', { quality: 0 }], ['b4', { sheets: 'some' }], ['b5', { title: 5 }]] as [string, object][]) {
+    for (const [id, wrong] of [['b1', { dpi: 'high' }], ['b2', { image: 'png' }], ['b3', { quality: 0 }], ['b4', { sheets: 'some' }], ['b5', { title: 5 }], ['b6', { text: 'sharp' }]] as [string, object][]) {
+      // (and a way of writing pages that is none)
       await send(page, { type: 'exportPdf', id, ...wrong });
       expect(await answer(page, id)).toMatchObject({ type: 'error', id, code: 'bad-message' });
     }
+    // Only text and drawings are asked for, and the document is in a font of the device.
+    await send(page, { type: 'exportPdf', id: 'v', text: 'vector' });
+    const refused = await answer(page, 'v');
+    expect({ type: refused.type, code: refused.code }).toEqual({ type: 'error', code: 'pdf-unsupported' });
+    expect(refused.message).toMatch(/^Page 1 cannot be written as text and drawings: /);
     // Closing the file while its pages are painted.
     await send(page, { type: 'exportPdf', id: 'p2' });
     await send(page, { type: 'close', id: 'c' });
@@ -724,5 +740,393 @@ test.describe('a PDF through the WebView bridge', () => {
     expect(words(sheets.checked, 0).indexOf('HEADER Kitap.xlsx')).toBe(0);
     expect(words(sheets.checked, 6)).toBe('İkinci sayfa');
     expect(sheets.checked.pages[0].images[0].filter).toBe('FlateDecode');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pages written as text and drawings
+
+/** A family no device has: the font of the package is told to stand in for it. */
+const ABSENT = 'Bym Absent Bookman';
+/** A family for the font the tests make (every character a box one em wide). */
+const BOXES = 'Bym Pdf Boxes';
+const inFont = (text: string, family: string, more = '') => `<w:r><w:rPr><w:rFonts w:ascii="${family}" w:hAnsi="${family}" w:cs="${family}"/>${more}</w:rPr><w:t xml:space="preserve">${text}</w:t></w:r>`;
+const para = (runs: string, properties = '') => `<w:p>${properties ? `<w:pPr>${properties}</w:pPr>` : ''}${runs}</w:p>`;
+
+/** Words with letters fonts join (fi, fl, ff, ffi, ffl), and one with letters they do not. */
+const JOINED = 'fiyat ofis raflar office waffle difficult fjord';
+
+/** `count` pages set in `family`, 12 pt: a heading in bold, a line with Turkish letters, with `joined` a line of words whose letters fonts join, a line in italics, a shaded paragraph with a border and a few lines of text. */
+function fontDocx(count: number, family: string, extraOnPage?: (page: number) => string, joined = false): Promise<Uint8Array> {
+  let body = '';
+  for (let i = 1; i <= count; i++) {
+    body += para(inFont(`Bölüm ${i}`, family, '<w:b/>'), i > 1 ? '<w:pageBreakBefore/>' : '');
+    body += para(inFont(TURKISH, family));
+    if (joined) body += para(inFont(JOINED, family) + inFont(' ' + JOINED, family, '<w:b/>'));
+    body += para(inFont('Eğik yazılmış bir satır, ', family, '<w:i/>') + inFont('kalın eğik', family, '<w:b/><w:i/>') + inFont(' ve altı çizili', family, '<w:u w:val="single"/>'));
+    body += para(inFont('Gölgeli ve kenarlıklı paragraf', family), '<w:pBdr><w:top w:val="single" w:sz="8" w:space="1" w:color="FF0000"/><w:bottom w:val="single" w:sz="8" w:space="1" w:color="0000FF"/></w:pBdr><w:shd w:val="clear" w:color="auto" w:fill="DDEEFF"/>');
+    body += para(inFont(SENTENCE + SENTENCE + SENTENCE, family));
+    if (extraOnPage) body += extraOnPage(i);
+  }
+  return buildDocx({ styles: fontStyles(family, 24), body: body + A4 });
+}
+
+/** Opens the page of documents with the font of the package standing in for the family no device has. */
+async function openDocPage(page: Page): Promise<void> {
+  await page.goto('/e2e/pages/doc.html');
+  await expect(page.locator('#state')).toHaveText('ready');
+  await page.evaluate((names) => (window as any).BymOffice.fonts.configure({ as: names }), ['Bookman Old Style', ABSENT]);
+}
+
+async function showDoc(page: Page, bytes: Uint8Array, options: object = {}): Promise<void> {
+  await page.evaluate(([input, opts]) => (window as any).__mountDoc(input, opts), [Array.from(bytes), options] as [number[], object]);
+  await page.evaluate(() => ((window as any).__view = (window as any).__docView));
+}
+
+/** Waits until the font of the package is on the page and the document was laid out with it. */
+async function withPackageFont(page: Page): Promise<void> {
+  await expect.poll(() => page.evaluate(() => (window as any).BymOffice.fonts.embedded().status as string), { timeout: 20_000 }).toBe('loaded');
+  await expect.poll(() => page.evaluate(() => (window as any).__view.layoutDone), { timeout: 60_000 }).toBe(true);
+}
+
+/** exportPdf() with what onPage is told. */
+function exportWithPages(page: Page, options: object = {}): Promise<Outcome & { pages: { page: number; mode: string; reason?: string }[] }> {
+  return page.evaluate(async (opts) => {
+    const pages: { page: number; mode: string; reason?: string }[] = [];
+    try {
+      const bytes: Uint8Array = await (window as any).__view.exportPdf({ ...(opts as object), onPage: (info: any) => pages.push({ page: info.page, mode: info.mode, reason: info.reason }) });
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
+      return { data: btoa(binary), progress: [], pages };
+    } catch (error: any) {
+      return { error: { name: String(error && error.name), code: error && error.code, message: String(error && error.message), page: error && error.page, reason: error && error.reason } as any, progress: [], pages };
+    }
+  }, options);
+}
+
+interface Raster {
+  width: number;
+  height: number;
+  data: Uint8Array;
+}
+
+/** A band of rows of a picture with something on it (a line of text, a border): its first and last row, and its ink. */
+interface InkBand {
+  top: number;
+  bottom: number;
+  ink: number;
+}
+
+/**
+ * The bands of rows of a picture that hold ink: a line of text is one (with
+ * what is drawn in its rows: an underline, a shading), a border between two
+ * lines another. The ink of a row is the darkness of its pixels summed, one
+ * for a black pixel; a row counts when it holds a hundredth of what the
+ * fullest row holds.
+ */
+function inkBands(picture: Raster): { bands: InkBand[]; total: number } {
+  const rows = new Array<number>(picture.height).fill(0);
+  for (let y = 0; y < picture.height; y++) {
+    for (let x = 0; x < picture.width; x++) {
+      const at = (y * picture.width + x) * 3;
+      const dark = 1 - (picture.data[at] * 0.299 + picture.data[at + 1] * 0.587 + picture.data[at + 2] * 0.114) / 255;
+      if (dark > 0.02) rows[y] += dark;
+    }
+  }
+  const least = Math.max(1.5, Math.max(...rows) / 100);
+  const bands: InkBand[] = [];
+  let total = 0;
+  for (let y = 0; y < rows.length; y++) {
+    total += rows[y];
+    if (rows[y] < least) continue;
+    const last = bands[bands.length - 1];
+    // Two rows without ink do not end a band: the dots of letters belong to their line.
+    if (last && y - last.bottom <= 3) {
+      last.bottom = y;
+      last.ink += rows[y];
+    } else bands.push({ top: y, bottom: y, ink: rows[y] });
+  }
+  return { bands, total };
+}
+
+/**
+ * Where two pictures of one page differ in what is on them, line by line:
+ * the same bands of rows hold ink in both - as many, each starting and
+ * ending within two pixels - and each band holds the same share of the ink
+ * of its page within a quarter (two painters smooth the edges of letters
+ * differently, and one may paint all text a little bolder: that changes
+ * every line alike). A line of text that is missing or twice there, one that
+ * lies more than two pixels higher or lower, one set in another size or cut
+ * short is a difference. Tried on pages made in Node: a page against its own
+ * picture has none; with a line of forty missing, six pixels lower, or cut
+ * to half its words it has. A line moved sideways is not seen here: the
+ * boxes of the words are compared for that.
+ */
+function inkDifferences(a: Raster, b: Raster): string[] {
+  expect([a.width, a.height]).toEqual([b.width, b.height]);
+  const first = inkBands(a);
+  const second = inkBands(b);
+  if (first.bands.length !== second.bands.length) return [`${first.bands.length} bands of rows with ink against ${second.bands.length}`];
+  const out: string[] = [];
+  for (let i = 0; i < first.bands.length; i++) {
+    const one = first.bands[i];
+    const other = second.bands[i];
+    if (Math.abs(one.top - other.top) > 2 || Math.abs(one.bottom - other.bottom) > 2) out.push(`band ${i + 1}: rows ${one.top} to ${one.bottom} against ${other.top} to ${other.bottom}`);
+    const share = one.ink / first.total;
+    const otherShare = other.ink / second.total;
+    // A band of a row or two is a thin line: where it lies is compared, its ink is spread over its rows as the painter likes.
+    if (one.bottom - one.top >= 3 && Math.abs(share - otherShare) > Math.max(share, otherShare) * 0.25 + 0.0005) out.push(`band ${i + 1} (rows ${one.top} to ${one.bottom}): ${(share * 100).toFixed(2)} % of the ink against ${(otherShare * 100).toFixed(2)} %`);
+  }
+  return out.slice(0, 12);
+}
+
+/** The box around the pixels of a picture that are of a colour, and how many there are. */
+function colourBox(picture: Raster, is: (r: number, g: number, b: number) => boolean): { left: number; top: number; right: number; bottom: number; count: number } {
+  const box = { left: picture.width, top: picture.height, right: -1, bottom: -1, count: 0 };
+  for (let y = 0; y < picture.height; y++) {
+    for (let x = 0; x < picture.width; x++) {
+      const at = (y * picture.width + x) * 3;
+      if (!is(picture.data[at], picture.data[at + 1], picture.data[at + 2])) continue;
+      box.count++;
+      box.left = Math.min(box.left, x);
+      box.right = Math.max(box.right, x);
+      box.top = Math.min(box.top, y);
+      box.bottom = Math.max(box.bottom, y);
+    }
+  }
+  return box;
+}
+
+const RED = (r: number, g: number, b: number): boolean => r > 170 && g < 100 && b < 100;
+const BLUE = (r: number, g: number, b: number): boolean => b > 170 && r < 100 && g < 100;
+/** The shading of the bordered paragraph (#DDEEFF), as a picture keeps it. */
+const SHADING = (r: number, g: number, b: number): boolean => r > 205 && r < 235 && g > 225 && g < 250 && b > 245;
+
+/**
+ * Thin and coloured things of the page (the two borders of the shaded
+ * paragraph, and its shading) lie at the same place in both pictures: what a
+ * comparison of ink by bands is too coarse for.
+ */
+function expectSameMarks(a: Raster, b: Raster, what: string): void {
+  for (const [name, is] of [['the red border', RED], ['the blue border', BLUE], ['the shading', SHADING]] as [string, (r: number, g: number, b: number) => boolean][]) {
+    const first = colourBox(a, is);
+    const second = colourBox(b, is);
+    expect(first.count, `${what}: ${name} is on the drawn page`).toBeGreaterThan(20);
+    expect(second.count, `${what}: ${name} is on the picture of the page`).toBeGreaterThan(20);
+    for (const edge of ['left', 'top', 'right', 'bottom'] as const) {
+      expect(Math.abs(first[edge] - second[edge]), `${what}: the ${edge} edge of ${name} (${first[edge]} against ${second[edge]})`).toBeLessThanOrEqual(2);
+    }
+  }
+}
+
+interface WordBox {
+  text: string;
+  xMin: number;
+  yMin: number;
+  xMax: number;
+  yMax: number;
+}
+
+/** The words of a page in their lines, from the top; within a line from the left. */
+function linesOfWords(words: WordBox[]): WordBox[][] {
+  const sorted = words.slice().sort((a, b) => (a.yMin + a.yMax) / 2 - (b.yMin + b.yMax) / 2);
+  const lines: WordBox[][] = [];
+  for (const word of sorted) {
+    const line = lines[lines.length - 1];
+    const middle = (word.yMin + word.yMax) / 2;
+    if (line && Math.abs((line[0].yMin + line[0].yMax) / 2 - middle) < 5) line.push(word);
+    else lines.push([word]);
+  }
+  return lines.map((line) => line.sort((a, b) => a.xMin - b.xMin));
+}
+
+/**
+ * The words of the drawn page stand where the picture of the page has them:
+ * the same words in the same lines, every line starting and ending within a
+ * point and a half, at the same height. The invisible text of a picture
+ * gives every character of a run the same width, so the edges of the words
+ * inside a run of text are those of the run only at its two ends; they are
+ * held to the run (no word leaves its line by more than the widest letter).
+ */
+function expectSameWords(drawn: WordBox[], pictured: WordBox[], what: string): void {
+  const first = linesOfWords(drawn);
+  const second = linesOfWords(pictured);
+  expect(first.map((line) => line.map((word) => word.text).join(' ')), `${what}: the lines of the drawn page`).toEqual(second.map((line) => line.map((word) => word.text).join(' ')));
+  for (let i = 0; i < first.length; i++) {
+    const a = first[i];
+    const b = second[i];
+    const text = a.map((word) => word.text).join(' ');
+    expect(Math.abs(a[0].xMin - b[0].xMin), `${what}: "${text}" starts at ${a[0].xMin}, in the picture at ${b[0].xMin}`).toBeLessThanOrEqual(1.5);
+    expect(Math.abs(a[a.length - 1].xMax - b[b.length - 1].xMax), `${what}: "${text}" ends at ${a[a.length - 1].xMax}, in the picture at ${b[b.length - 1].xMax}`).toBeLessThanOrEqual(1.5);
+    expect(Math.abs((a[0].yMin + a[0].yMax) / 2 - (b[0].yMin + b[0].yMax) / 2), `${what}: the height of "${text}"`).toBeLessThanOrEqual(4);
+    for (let k = 0; k < a.length; k++) expect(Math.abs(a[k].xMin - b[k].xMin), `${what}: "${a[k].text}" in "${text}" starts at ${a[k].xMin}, in the picture at ${b[k].xMin}`).toBeLessThanOrEqual(14);
+  }
+}
+
+test.describe('pages written as text and drawings', () => {
+  test('a document in the font of the package is written as text in that font, and looks as its picture does', async ({ page }) => {
+    await openDocPage(page);
+    await showDoc(page, await fontDocx(2, ABSENT, undefined, true));
+    await withPackageFont(page);
+    const vector = await exportWithPages(page, { text: 'vector' });
+    // Which ligatures the browser draws is found out by painting with kerning turned off. A browser whose canvas
+    // cannot do that leaves a page with letters its font could join a picture, and says so.
+    const canAsk = await page.evaluate(() => 'fontKerning' in (document.createElement('canvas').getContext('2d') as object));
+    if (!canAsk) {
+      expect(vector.error).toMatchObject({ name: 'PdfExportError', code: 'unsupported', page: 1 });
+      expect((vector.error as any).reason).toMatch(/which ligatures of the font TeXGyreBonum-\w+ the browser draws/);
+      const auto = await exportWithPages(page, {});
+      expect(auto.pages.map((entry) => entry.mode)).toEqual(['image', 'image']);
+      expect(words(read(auto.data).checked, 0)).toContain(JOINED + ' ' + JOINED);
+      return;
+    }
+    expect(vector.error, 'every page can be drawn').toBeUndefined();
+    expect(vector.pages).toEqual([
+      { page: 1, mode: 'vector', reason: undefined },
+      { page: 2, mode: 'vector', reason: undefined },
+    ]);
+    const drawn = read(vector.data);
+    expect(drawn.checked.pages.length).toBe(2);
+    for (const sheet of drawn.checked.pages) {
+      expect([sheet.width, sheet.height]).toEqual([A4_PT.width, A4_PT.height]);
+      expect(sheet.images.length, 'no picture of the page').toBe(0);
+      expect(sheet.texts.length).toBeGreaterThan(4);
+      expect(sheet.texts.every((run) => run.mode === 0), 'the text is painted').toBe(true);
+      expect(sheet.shapes.length, 'the shading, the borders and the underline are drawings').toBeGreaterThan(3);
+    }
+    expect(words(drawn.checked, 0)).toContain(TURKISH);
+    // Whatever ligatures the browser drew, the text is read back letter by letter.
+    expect(words(drawn.checked, 0)).toContain(JOINED + ' ' + JOINED);
+    expect(drawn.checked.fonts.map((font) => font.baseFont).sort()).toEqual(['TeXGyreBonum-Bold', 'TeXGyreBonum-BoldItalic', 'TeXGyreBonum-Italic', 'TeXGyreBonum-Regular']);
+    expect(drawn.checked.fonts.every((font) => font.kind === 'cff')).toBe(true);
+    // The same document as pictures, and as whatever each page can be.
+    const image = await exportWithPages(page, { text: 'image' });
+    expect(image.pages.map((entry) => entry.mode)).toEqual(['image', 'image']);
+    const pictured = read(image.data);
+    expect(pictured.checked.pages.every((sheet) => sheet.images.length === 1 && sheet.texts.every((run) => run.mode === 3))).toBe(true);
+    expect(words(pictured.checked, 0)).toContain(TURKISH);
+    const auto = await exportWithPages(page, {});
+    expect(auto.pages.map((entry) => entry.mode), 'the default writes what can be drawn as drawings').toEqual(['vector', 'vector']);
+    if (drawn.poppler) {
+      expect(drawn.poppler.fonts.map((font) => [font.type, font.embedded, font.unicode])).toEqual([0, 1, 2, 3].map(() => ['CID Type 0C', true, true]));
+      expect(drawn.poppler.images).toEqual([]);
+      const lines = drawn.poppler.text[0].split('\n').map((entry) => entry.trim()).filter((entry) => entry !== '');
+      expect(lines.slice(0, 3)).toEqual(['Bölüm 1', TURKISH, JOINED + ' ' + JOINED]);
+      // The text stands where the picture has it: the invisible text of the picture was placed by the same layout.
+      for (const number of [1, 2]) {
+        const drawnWords = popplerWords(drawn.bytes).words.filter((word) => word.page === number);
+        const picturedWords = popplerWords(pictured.bytes).words.filter((word) => word.page === number);
+        expectSameWords(drawnWords, picturedWords, `page ${number}`);
+        expect(Math.abs(Math.min(...drawnWords.map((word) => word.xMin)) - 36), `page ${number}: the left margin is half an inch`).toBeLessThanOrEqual(1.5);
+        // And the two files look alike when Poppler paints them: the same ink in every band of rows and of
+        // columns, and the borders and the shading of the paragraph where the picture has them.
+        const drawnRaster = popplerPage(drawn.bytes, number, 100);
+        const picturedRaster = popplerPage(pictured.bytes, number, 100);
+        expect(inkDifferences(drawnRaster, picturedRaster), `page ${number}: where the drawn page and its picture differ`).toEqual([]);
+        expectSameMarks(drawnRaster, picturedRaster, `page ${number}`);
+      }
+    }
+    await expectResponsive(page);
+  });
+
+  test('ten pages of text are much smaller as text than as pictures', async ({ page }, info) => {
+    test.setTimeout(240_000);
+    await openDocPage(page);
+    await showDoc(page, await fontDocx(10, ABSENT));
+    await withPackageFont(page);
+    const vector = await made(page, { text: 'vector' });
+    const image = await made(page, { text: 'image' });
+    expect(vector.checked.pages.length).toBe(10);
+    const sizes = { vector: vector.bytes.length, image: image.bytes.length };
+    await info.attach('pdf-vector-sizes', { body: JSON.stringify(sizes), contentType: 'application/json' });
+    // The four faces of the font go in whole (about 200 KB together, compressed); the pages themselves are a few KB each.
+    expect(sizes.vector, `ten drawn pages have ${sizes.vector} bytes`).toBeLessThan(400 * 1024);
+    expect(sizes.vector * 3, `drawn ${sizes.vector} bytes, pictured ${sizes.image} bytes`).toBeLessThan(sizes.image);
+  });
+
+  test('a page in a font of the device stays a picture, and "vector" names it', async ({ page }) => {
+    await openDocPage(page);
+    // The second page has a line in Arial.
+    await showDoc(page, await fontDocx(3, ABSENT, (number) => (number === 2 ? para(inFont('Bu satır Arial ile', 'Arial')) : '')));
+    await withPackageFont(page);
+    const auto = await exportWithPages(page, {});
+    expect(auto.error).toBeUndefined();
+    expect(auto.pages.map((entry) => entry.mode)).toEqual(['vector', 'image', 'vector']);
+    expect(auto.pages[1].reason).toMatch(/font of the device/);
+    const mixed = read(auto.data);
+    expect(mixed.checked.pages.map((sheet) => sheet.images.length)).toEqual([0, 1, 0]);
+    expect(mixed.checked.pages[1].texts.every((run) => run.mode === 3), 'the pictured page has its text lying over it').toBe(true);
+    expect(words(mixed.checked, 1)).toContain('Bu satır Arial ile');
+    expect(mixed.checked.fonts.map((font) => font.baseFont)).toContain('BYMGlyphless');
+    const refused = await exportWithPages(page, { text: 'vector' });
+    expect(refused.data).toBeUndefined();
+    expect(refused.error).toMatchObject({ name: 'PdfExportError', code: 'unsupported', page: 2 });
+    expect((refused.error as any).reason).toMatch(/font of the device/);
+    expect(refused.error!.message).toMatch(/^Page 2 cannot be written as text and drawings/);
+    // A character the font does not have (the lira sign) is painted with another font by the browser.
+    await showDoc(page, await fontDocx(1, ABSENT, () => para(inFont('Tutar: 100 ₺', ABSENT))));
+    await withPackageFont(page);
+    const lira = await exportWithPages(page, {});
+    expect(lira.pages.map((entry) => entry.mode)).toEqual(['image']);
+    expect(lira.pages[0].reason).toMatch(/no glyph for U\+20BA/);
+    await expectResponsive(page);
+  });
+
+  test('a registered TrueType font is cut down to the glyphs that are used; a picture of the page is a picture of its own', async ({ page }) => {
+    await page.goto('/e2e/pages/doc.html');
+    await expect(page.locator('#state')).toHaveText('ready');
+    const font = testFont();
+    await page.evaluate(([bytes, family]) => (window as any).BymOffice.fonts.registerFont({ family, source: new Uint8Array(bytes as number[]) }), [Array.from(font), BOXES] as [number[], string]);
+    const png = photoPng(240, 160);
+    // 240 by 160 px: 180 by 120 points.
+    const body = para(inFont('ABC abc', BOXES)) + para(picture(240, 160)) + para(inFont('xyz', BOXES));
+    await showDoc(page, await buildDocx({ styles: fontStyles(BOXES, 24), body: body + docSection(), rels: [['rIdImg', 'image', 'media/image1.png']], parts: [['word/media/image1.png', png]] }));
+    await expect.poll(() => page.evaluate(() => (window as any).__view.layoutDone), { timeout: 60_000 }).toBe(true);
+    const out = await exportWithPages(page, { text: 'vector' });
+    expect(out.error).toBeUndefined();
+    const pdf = read(out.data);
+    expect(pdf.checked.fonts.length).toBe(1);
+    expect(pdf.checked.fonts[0].kind).toBe('truetype');
+    expect(pdf.checked.fonts[0].baseFont).toMatch(/^[A-Z]{6}\+/);
+    expect(pdf.checked.fonts[0].file.length, 'the subset is smaller than the font').toBeLessThan(font.length);
+    expect(words(pdf.checked, 0)).toBe('ABC abcxyz');
+    // Every glyph of the font is one em wide: the first line is seven ems long.
+    const first = pdf.checked.pages[0].texts[0];
+    expect(near(first.advance, 7 * 12, 0.05), `seven characters of 12 pt are ${first.advance} points wide`).toBe(true);
+    // The photograph is a picture of its own, at its place, not the whole page.
+    expect(pdf.checked.pages[0].images.length).toBe(1);
+    const photo = pdf.checked.pages[0].images[0];
+    expect(photo.width * photo.height, 'far fewer pixels than a page has').toBeLessThan(1240 * 1754 / 4);
+    expect(near(photo.matrix![0], 180, 0.5) && near(photo.matrix![3], 120, 0.5), `the picture is 180 by 120 points (${photo.matrix})`).toBe(true);
+    if (pdf.poppler) {
+      expect(pdf.poppler.fonts.map((entry) => [entry.type, entry.embedded, entry.subset, entry.unicode])).toEqual([['CID TrueType', true, true, true]]);
+      expect(pdf.poppler.images.length).toBe(1);
+    }
+    await page.evaluate((family) => (window as any).BymOffice.fonts.unregisterFont(family), BOXES);
+  });
+
+  test('a sheet whose font was registered is written as its cells, lines and text; the bridge says how many pages were drawn', async ({ page }) => {
+    await page.goto('/e2e/pages/view.html');
+    await expect(page.locator('#state')).toHaveText('ready');
+    const font = testFont();
+    // The font stands in for the font of the cells wherever the device has it or not.
+    await page.evaluate(([bytes, family]) => (window as any).BymOffice.fonts.registerFont({ family, source: new Uint8Array(bytes as number[]), as: ['Calibri'], prefer: true }), [Array.from(font), BOXES] as [number[], string]);
+    const data = `<sheetData><row r="1">${str('A1', 'Urun')}${str('B1', 'Tutar')}</row><row r="2">${str('A2', 'Cay')}${num('B2', 125)}</row><row r="3">${str('A3', 'Kahve')}${num('B3', 40)}</row></sheetData><printOptions gridLines="1"/>${A4_SETUP}`;
+    await page.evaluate(([input, opts]) => (window as any).__mountView(input, opts), [Array.from(await buildXlsx({ sheets: [{ name: 'Data', xml: worksheetXml(data) }] })), { locale: 'en-US' }] as [number[], object]);
+    await expect(page.locator('.bym-canvas')).toBeVisible();
+    const out = await exportWithPages(page, { text: 'vector' });
+    expect(out.error, 'the page of the sheet can be drawn').toBeUndefined();
+    expect(out.pages).toEqual([{ page: 1, mode: 'vector', reason: undefined }]);
+    const pdf = read(out.data);
+    expect(pdf.checked.pages[0].images.length).toBe(0);
+    expect(pdf.checked.pages[0].texts.map((run) => run.text).sort()).toEqual(['125', '40', 'Cay', 'Kahve', 'Tutar', 'Urun']);
+    expect(pdf.checked.pages[0].shapes.some((shape) => shape.operator === 'S' || shape.operator === 'f'), 'the grid lines are drawings').toBe(true);
+    const image = await exportWithPages(page, { text: 'image' });
+    const pictured = read(image.data);
+    if (pdf.poppler) {
+      expect(inkDifferences(popplerPage(pdf.bytes, 1, 100), popplerPage(pictured.bytes, 1, 100)), 'where the drawn sheet and its picture differ').toEqual([]);
+      expectSameWords(popplerWords(pdf.bytes).words, popplerWords(pictured.bytes).words, 'the sheet');
+    }
+    await page.evaluate((family) => (window as any).BymOffice.fonts.unregisterFont(family), BOXES);
   });
 });

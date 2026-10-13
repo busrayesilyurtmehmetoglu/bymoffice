@@ -1,14 +1,20 @@
 // A PDF of pages that are pictures with their text lying invisible over
 // them. Pages are written as they are added: a page is compressed, goes into
 // the file and is let go of, so that a long document never holds more than
-// one of its pictures. What a later stage adds (text drawn with embedded
-// fonts, links) are further resources and operators of a page; the objects,
-// the page tree and the trailer stay as they are here.
+// one of its pictures.
+//
+// A page may instead be what a PDF canvas wrote of it (canvas.ts): drawings,
+// text in embedded fonts and pictures of their own. Such a page brings the
+// fonts and pictures it needs; the document writes each of them once, the
+// fonts at the end, when the glyphs all pages use of them are known.
 
+import type { PdfPicture, PdfVectorPage } from './canvas';
+import { PdfEmbeddedFont } from './embed';
 import { adler32, zlibDeflate } from './flate';
 import { PdfTextFont } from './font';
 import { jpegInfo, packSamples, type PdfImage, type PdfPacked } from './image';
 import { textLayer, type PdfTextRun } from './text';
+import type { PdfFontFace } from './sfnt';
 import { PdfError, PdfWriter, joinParts, latin1, name, pdfDate, pdfNumber, pdfText, type PdfDict, type PdfRef } from './writer';
 
 export interface PdfDocumentOptions {
@@ -33,6 +39,11 @@ export interface PdfPage {
   fill?: [number, number, number];
   /** The text of the page: the runs, and the width of the page in the unit they are measured in. */
   text?: { runs: readonly PdfTextRun[]; width: number };
+  /**
+   * The page as a PDF canvas wrote it. It is the whole page: `image`, `fill`
+   * and `text` are not looked at with it (its text is text already).
+   */
+  vector?: PdfVectorPage;
 }
 
 /** A page of a PDF may be 200 inches long at most. */
@@ -50,6 +61,12 @@ export class PdfDocument {
   private readonly pagesRef: PdfRef;
   private fontRef: PdfRef | undefined;
   private readonly font = new PdfTextFont();
+  /** The fonts of the drawn pages, by their font file. */
+  private readonly faces = new Map<PdfFontFace, PdfEmbeddedFont>();
+  /** The states of opacity the drawn pages use, by what they say. */
+  private readonly states = new Map<string, PdfRef>();
+  /** The pictures of the drawn pages that are in the file, with where. */
+  private readonly pictures = new WeakMap<PdfPicture, PdfRef>();
   private readonly kids: PdfRef[] = [];
   /** Changes with everything that is written: what the identifier of the file is made of. */
   private readonly digest = [0x811c9dc5, 0x01000193, 0x9e3779b9, 0x85ebca6b];
@@ -128,6 +145,57 @@ export class PdfDocument {
     return this.writer.addStream(base, packed.data);
   }
 
+  /** The resources and the content of a page a PDF canvas wrote. */
+  private async drawn(vector: PdfVectorPage, resources: PdfDict): Promise<string> {
+    if (!vector || typeof vector.content !== 'string' || !Array.isArray(vector.fonts) || !Array.isArray(vector.pictures) || !Array.isArray(vector.alphas)) throw new PdfError('invalid', 'A drawn page is not what a PDF canvas gives');
+    if (vector.fonts.length > 0) {
+      const fonts: PdfDict = {};
+      for (let i = 0; i < vector.fonts.length; i++) {
+        const used = vector.fonts[i];
+        let font = this.faces.get(used.face);
+        if (!font) {
+          font = new PdfEmbeddedFont(used.face, this.writer.reserve());
+          this.faces.set(used.face, font);
+        }
+        font.use(used.glyphs);
+        fonts['F' + i] = font.ref;
+      }
+      resources.Font = fonts;
+    }
+    if (vector.pictures.length > 0) {
+      const pictures: PdfDict = {};
+      for (let i = 0; i < vector.pictures.length; i++) {
+        const picture: PdfPicture = vector.pictures[i];
+        // A picture that is in this file already is drawn again, not written again.
+        if (!picture.ref || this.pictures.get(picture) !== picture.ref) {
+          if (!picture.image) throw new PdfError('invalid', 'A picture of a drawn page was written into another file and let go of');
+          picture.ref = await this.image(picture.image);
+          this.pictures.set(picture, picture.ref);
+          // The file has it now: its pixels are not held for the pages to come.
+          picture.image = undefined;
+        }
+        pictures['I' + i] = picture.ref;
+      }
+      resources.XObject = pictures;
+    }
+    if (vector.alphas.length > 0) {
+      const states: PdfDict = {};
+      for (let i = 0; i < vector.alphas.length; i++) {
+        const alpha = vector.alphas[i];
+        const value = Number(pdfNumber(Math.min(1, Math.max(0, alpha.value)), 3));
+        const key = (alpha.stroke ? 'CA' : 'ca') + value;
+        let ref = this.states.get(key);
+        if (!ref) {
+          ref = this.writer.add(alpha.stroke ? { Type: name('ExtGState'), CA: value } : { Type: name('ExtGState'), ca: value });
+          this.states.set(key, ref);
+        }
+        states['G' + i] = ref;
+      }
+      resources.ExtGState = states;
+    }
+    return vector.content;
+  }
+
   /** Writes a page. The next one may be added when the promise is resolved. */
   async addPage(page: PdfPage): Promise<void> {
     if (this.over) throw new PdfError('invalid', 'The PDF is finished: no page can be added to it');
@@ -143,7 +211,10 @@ export class PdfDocument {
       const content: string[] = [];
       const w = pdfNumber(width, 2);
       const h = pdfNumber(height, 2);
-      if (page.image) {
+      if (page.vector) {
+        const drawn = await this.drawn(page.vector, resources);
+        if (drawn !== '') content.push(drawn);
+      } else if (page.image) {
         resources.XObject = { Im0: await this.image(page.image) };
         // An image is one unit wide and high: the matrix makes it the page.
         content.push(`q ${w} 0 0 ${h} 0 0 cm /Im0 Do Q`);
@@ -152,7 +223,7 @@ export class PdfDocument {
         const part = (value: number): string => pdfNumber(Math.min(255, Math.max(0, typeof value === 'number' && isFinite(value) ? value : 255)) / 255, 3);
         if (!(fill[0] === 255 && fill[1] === 255 && fill[2] === 255)) content.push(`${part(fill[0])} ${part(fill[1])} ${part(fill[2])} rg 0 0 ${w} ${h} re f`);
       }
-      const text = page.text;
+      const text = page.vector ? undefined : page.text;
       if (text && text.width > 0 && isFinite(text.width)) {
         const scale = width / text.width;
         const layer = textLayer(text.runs, { height: height / scale, scale, font: this.font });
@@ -190,6 +261,20 @@ export class PdfDocument {
       await this.font.write(writer, this.fontRef, options.nativeCompression !== false);
       // Which characters the codes of the text are is part of what the file says.
       this.mix(adler32(latin1(this.font.toUnicode())));
+    }
+    const faces = Array.from(this.faces.values());
+    const names = new Set<string>();
+    for (let i = 0; i < faces.length; i++) {
+      let map: string;
+      try {
+        map = await faces[i].write(writer, options.nativeCompression !== false, names);
+      } catch (error) {
+        // The glyphs were found sound when they were written on their pages: this is not expected. The file cannot
+        // be ended; whoever makes it makes it anew without this font.
+        if (error instanceof PdfError && error.code !== 'invalid') throw error;
+        throw new PdfError('font', `The font ${faces[i].face.name} could not be put into the file: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.mix(adler32(latin1(map)));
     }
     writer.add({ Type: name('Pages'), Kids: this.kids, Count: this.kids.length }, this.pagesRef);
     const root = writer.add({ Type: name('Catalog'), Pages: this.pagesRef });

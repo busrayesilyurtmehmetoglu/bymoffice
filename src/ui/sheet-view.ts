@@ -145,7 +145,7 @@ import {
   type PrintPlan,
 } from './doc-print';
 import { PdfDocument } from '../pdf/document';
-import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, toPdfExportError, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
 import { MAX_PAGE_RUNS, captureText, type PdfTextRun } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
 import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
@@ -583,7 +583,7 @@ interface PageSink {
    * was painted on it when the job asked for that. False when the workbook
    * was changed meanwhile (`stale`): the job then starts over.
    */
-  take(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, index: number, entry: SheetJobPage, planned: PrintPagePlan, stale: () => boolean, runs: PdfTextRun[]): Promise<boolean>;
+  take(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, index: number, entry: SheetJobPage, planned: PrintPagePlan, stale: () => boolean, runs: PdfTextRun[], paintOn: (context: CanvasRenderingContext2D) => void): Promise<boolean>;
   /** Lets go of what was taken. Safe to call twice. */
   dispose(): void;
 }
@@ -1705,24 +1705,27 @@ export class WorkbookView {
               )
             : undefined;
           try {
-            paintSheetPage(context, {
-              workbook: this.workbook,
-              job: entry,
-              total: pages.pages.length,
-              metrics: metricsOf(sheet),
-              pixelWidth: planned.pixelWidth,
-              locale: this.locale,
-              conditional,
-              // A chart sheet is its chart: it has no cells and no layer of drawings over them.
-              drawings: entry.chart ? undefined : layerOf(sheet),
-              charts: entry.chart ? this.chartRenderer() : undefined,
-              fileName: options.fileName,
-              now,
-            });
+            paintOn(context);
           } finally {
             if (release) release();
           }
         };
+        // The same painting for the canvas of pixels and for the canvas a PDF is written through.
+        const paintOn = (target: CanvasRenderingContext2D) =>
+          paintSheetPage(target, {
+            workbook: this.workbook,
+            job: entry,
+            total: pages.pages.length,
+            metrics: metricsOf(sheet),
+            pixelWidth: planned.pixelWidth,
+            locale: this.locale,
+            conditional,
+            // A chart sheet is its chart: it has no cells and no layer of drawings over them.
+            drawings: entry.chart ? undefined : layerOf(sheet),
+            charts: entry.chart ? this.chartRenderer() : undefined,
+            fileName: options.fileName,
+            now,
+          });
         // Pictures of the pages before this one may make room for those of this one.
         if (store) store.pass++;
         try {
@@ -1738,7 +1741,7 @@ export class WorkbookView {
           if (error instanceof DocumentPrintError) throw error;
           throw new DocumentPrintError('failed', `Page ${i + 1} could not be painted`);
         }
-        if (!(await sink.take(canvas, context, i, entry, planned, stale, runs))) return false;
+        if (!(await sink.take(canvas, context, i, entry, planned, stale, runs, paintOn))) return false;
         this.setPageProgress(job, { done: i + 1, total: plan.pages.length });
       }
       return !stale();
@@ -1791,11 +1794,14 @@ export class WorkbookView {
 
   /**
    * The sheet that is shown (or the sheets `sheets` names) as a PDF file:
-   * the pages print() lays the cells out on, each one as the picture
+   * the pages print() lays the cells out on. A page whose text is all in
+   * fonts whose files are at hand (registered fonts, the font of the
+   * package) and that is drawn without gradients is written as text and
+   * drawings: sharp at every size, and small. Any other page is the picture
    * printing makes of it at `dpi` dots per inch, with the text that is
    * painted on it (cells, headings, header and footer, labels of charts)
-   * lying invisible over it, so that the file can be searched and its text
-   * selected and copied. The pages are painted one per turn and written into
+   * lying invisible over it. Either way the file can be searched and its text
+   * selected and copied; `text` of the options chooses. The pages are painted one per turn and written into
    * the file as they come. What is being typed is applied first, as saving
    * does. Works in a read-only view too.
    *
@@ -1803,7 +1809,8 @@ export class WorkbookView {
    * 'empty' when there is nothing on the sheets, 'too-long' beyond the
    * limits on pages and on the size of the file, 'cancelled' when `signal`
    * is aborted, the view is destroyed or what is being typed cannot be
-   * applied; with a RangeError or a TypeError for an option that cannot be.
+   * applied, 'unsupported' for `text: 'vector'` and a page that cannot be
+   * drawn; with a RangeError or a TypeError for an option that cannot be.
    * A second call while a file is being made waits for it.
    */
   exportPdf(options: SheetPdfExportOptions = {}): Promise<Uint8Array> {
@@ -1836,7 +1843,11 @@ export class WorkbookView {
     const job: PageJob = {};
     const nothing = () => undefined;
     const promise = this.pdfTurn.then(nothing, nothing).then(() =>
-      this.runPdf(job, options, settings, sheets).then(
+      pdfWithFallback(settings, (how) => {
+        // A file that is made anew starts from nothing.
+        if (job.sink) job.sink.dispose();
+        return this.runPdf(job, options, how, sheets);
+      }).then(
         (parts) => {
           this.endPages(job);
           return parts;
@@ -1892,19 +1903,42 @@ export class WorkbookView {
     let file: PdfDocument | undefined;
     let parts: Uint8Array[] = [];
     const fileName = options.fileName !== undefined ? options.fileName : this.options.fileName;
+    const tools = await pdfVectorTools(doc, settings);
+    if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    checkCancelled(options.signal);
     await this.preparePages(job, { dpi: settings.dpi, sheets, fileName }, limits, PDF_WORDS, () => {
       const pdf = new PdfDocument({ title: options.title, author: options.author, date: options.date, maxBytes: limits.maxBytes });
       const taken: Uint8Array[] = [];
       file = pdf;
       parts = taken;
       return {
-        take: async (canvas, context, _index, entry, _planned, stale, runs) => {
-          const picture = await canvasPageImage(canvas, context, settings, nextFrame);
-          if (stale()) return false;
-          checkCancelled(options.signal);
+        take: async (canvas, context, index, entry, planned, stale, runs, paintOn) => {
           const paper = entry.layout.paper;
-          // The runs are what could be seen when the page was painted: nothing is added to or taken from them here.
-          await pdf.addPage({ width: toPoints(paper.width), height: toPoints(paper.height), image: picture.image, fill: picture.fill, text: { runs: runs.slice(), width: paper.width } });
+          const done = await writePdfPage(
+            pdf,
+            {
+              number: index + 1,
+              width: toPoints(paper.width),
+              height: toPoints(paper.height),
+              pixelWidth: planned.pixelWidth,
+              pixelHeight: planned.pixelHeight,
+              paint: paintOn,
+              picture: async () => {
+                const picture = await canvasPageImage(canvas, context, settings, nextFrame);
+                // The runs are what could be seen when the page was painted: nothing is added to or taken from them here.
+                return { image: picture.image, fill: picture.fill, text: { runs: runs.slice(), width: paper.width } };
+              },
+              proceed: () => {
+                if (stale()) return false;
+                checkCancelled(options.signal);
+                return true;
+              },
+            },
+            settings,
+            tools,
+            options.onPage,
+          );
+          if (!done) return false;
           const written = pdf.takeParts();
           for (let i = 0; i < written.length; i++) taken.push(written[i]);
           return !stale();
