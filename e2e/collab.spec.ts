@@ -185,7 +185,8 @@ test('the selection of the other page is drawn in its colour with its name, and 
   // A frame of two pixels around a cell and a label: hundreds of pixels of exactly that colour.
   await expect.poll(() => pixelsOf(a, BLUE), { message: 'the frame and the label in the colour of the second page' }).toBeGreaterThan(200);
   expect(await pixelsOf(b, BLUE), 'nobody draws their own frame').toBe(0);
-  expect(await pixelsOf(b, RED), 'the second page draws the first one').toBeGreaterThan(200);
+  // What the others select arrives in its own time (presence is gathered before it is drawn): asked for until it is there.
+  await expect.poll(() => pixelsOf(b, RED), { message: 'the second page draws the first one' }).toBeGreaterThan(200);
   await expect(a.locator('#editor .bym-collab-peer')).toHaveText('Ben');
   await expect(a.locator('#editor .bym-tab .bym-tab-peer')).toHaveCount(1);
   await expect(a.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'online');
