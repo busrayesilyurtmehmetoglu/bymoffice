@@ -130,7 +130,8 @@ test.describe('tracked changes of tables, pictures, links and pasted content', (
     await settled(page);
     // The cells are still there, and so is their text, as deleted text.
     expect(await tableShape(page)).toEqual([2, 2]);
-    expect(await paragraphs(page)).toEqual(['First paragraph.', 'a1', '', 'a2', '', 'Last one.']);
+    // (The cells of a row are one line of the text of the document, with a tab between them; deleted text is none of it.)
+    expect(await paragraphs(page)).toEqual(['First paragraph.', 'a1\t', 'a2\t', 'Last one.']);
     const xml = await savedXml(page);
     expect(count(xml, '<w:cellDel ')).toBe(2);
     expect(xml).toContain('<w:delText>b1</w:delText>');

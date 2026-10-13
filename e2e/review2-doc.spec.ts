@@ -1,8 +1,10 @@
 // Second review of documents that track their changes: a copy that holds no text (a picture
-// alone) cannot be pasted as a tracked insertion, and the user is told so instead of nothing.
+// alone). It used to be refused, with a notice, while a paste was tracked as text only; a paste
+// is tracked whole now, so the picture goes in as a tracked insertion, which rejecting takes out.
 import type { Page } from '@playwright/test';
 import { p, r } from '../test/doc-layout-fixtures';
 import { docx, DOC_STYLES, picture, png, RED, BLUE } from './fixtures/docx';
+import { ZipArchive } from '../src/zip';
 import { expect, test } from './helpers';
 
 const STYLES = DOC_STYLES + '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>';
@@ -64,7 +66,15 @@ function clipboard(page: Page, kind: 'copy' | 'paste', give: { text?: string; ht
   );
 }
 
-test('review 2: in a document that tracks changes, pasting a copy of a picture alone changes nothing and says why', async ({ page }) => {
+/** The document part of the file the editor saves. */
+async function savedXml(page: Page): Promise<string> {
+  const bytes = await page.evaluate(async () => Array.from((await (window as any).__mounted.save()) as Uint8Array));
+  return new TextDecoder().decode(await ZipArchive.read(new Uint8Array(bytes)).read('word/document.xml'));
+}
+
+const count = (text: string, part: string): number => text.split(part).length - 1;
+
+test('review 2: in a document that tracks changes, a copy of a picture alone is pasted as a tracked insertion, which rejecting takes out again', async ({ page }) => {
   await mountEdit(page, await sample());
   // The picture and nothing else.
   await select(page, [0], 2, 2, true);
@@ -73,11 +83,24 @@ test('review 2: in a document that tracks changes, pasting a copy of a picture a
   expect(copied.html).not.toBe('');
   await select(page, [1], 0, 0);
   const before = await page.evaluate(() => (window as any).BymOffice.documentText((window as any).__view.document));
+  expect(count(await savedXml(page), '<w:drawing>')).toBe(1);
   await clipboard(page, 'paste', copied);
   await settled(page);
+  // A picture is no text: the text is what it was, and nothing had to be said.
   expect(await page.evaluate(() => (window as any).BymOffice.documentText((window as any).__view.document))).toBe(before);
-  expect(await page.evaluate(() => (window as any).__notices.slice())).toEqual([
-    { message: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed', kind: 'info' },
-  ]);
-  expect(await page.evaluate(() => (window as any).__view.canUndo)).toBe(false);
+  expect(await page.evaluate(() => (window as any).__notices.slice())).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__view.canUndo)).toBe(true);
+  // The second picture is in the second paragraph, inside an insertion of the editor, and it is the one change.
+  const xml = await savedXml(page);
+  expect(count(xml, '<w:drawing>')).toBe(2);
+  expect(xml).toMatch(/<w:ins w:id="\d+" w:author="Me" w:date="2026-10-05T09:08:07Z"><w:r>(<w:rPr>.*?<\/w:rPr>)?<w:drawing>/);
+  expect(count(xml, '<w:ins ')).toBe(1);
+  expect(await page.evaluate(() => ((window as any).__view.revisions() as any[]).map((revision) => [revision.kind, revision.author]))).toEqual([['insert', 'Me']]);
+  // Rejected, the document has the one picture it had.
+  expect(await page.evaluate(() => (window as any).__view.rejectAllRevisions())).toBe(true);
+  await settled(page);
+  const rejected = await savedXml(page);
+  expect(count(rejected, '<w:drawing>')).toBe(1);
+  expect(rejected).not.toContain('<w:ins ');
+  expect(await page.evaluate(() => (window as any).__view.revisions().length)).toBe(0);
 });

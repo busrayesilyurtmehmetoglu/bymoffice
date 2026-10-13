@@ -237,7 +237,8 @@ test.describe('tracked changes', () => {
     for (const command of ['insertTable', 'insertPicture', 'insertLink', 'rowsColumns', 'bold', 'alignCenter', 'bulletList']) await expect(toolbarButton(page, command)).toBeEnabled();
     expect(await page.evaluate(() => (window as any).__view.deleteColumn())).toBe(false);
     expect((await notices(page)).length).toBe(2);
-    expect(await paragraphs(page)).toEqual(['First paragraph.', 'wide', 'a2', 'b2', 'Second one.']);
+    // (The cells of a row are one line of the text of the document, with a tab between them.)
+    expect(await paragraphs(page)).toEqual(['First paragraph.', 'wide', 'a2\tb2', 'Second one.']);
   });
 
   test('in Turkish the refusal is said in Turkish', async ({ page }) => {
@@ -314,7 +315,7 @@ test.describe('tracked changes', () => {
     expect(await page.evaluate(() => (window as any).__view.getSelectedText())).toBe('paragraph.\nSecond one.');
   });
 
-  test('a cut over what the same author inserted takes out the typed text only: the note and the field stay, as deletions', async ({ page }) => {
+  test('a cut takes out for good only what was typed since the document was opened: an insertion the file brought under the same name stays, deleted, with its note and its field', async ({ page }) => {
     const field =
       '<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> DATE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>today</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>';
     const own = `<w:ins w:id="7" w:author="Ada" w:date="2020-01-01T00:00:00Z">${r('x')}<w:r><w:footnoteReference w:id="2"/></w:r>${field}${r('y')}</w:ins>`;
@@ -325,6 +326,11 @@ test.describe('tracked changes', () => {
     });
     await mountEdit(page, bytes, { author: 'Ada' });
     const before = await savedXml(page);
+    // Typed now, by the same author: this is the editor's own.
+    await select(page, [0], 9);
+    await page.keyboard.type('z');
+    await settled(page);
+    expect((await paragraphs(page))[0]).toBe('axtodayybz');
     await page.evaluate(() => (window as any).__view.selectAll());
     await page.evaluate(() => (window as any).__view.focus());
     const cut = await page.evaluate(() => {
@@ -352,11 +358,17 @@ test.describe('tracked changes', () => {
     expect(xml).toContain('<w:footnoteReference w:id="2"/>');
     expect(xml).toContain('<w:delInstrText xml:space="preserve"> DATE </w:delInstrText>');
     expect(xml).toContain('<w:delText>today</w:delText>');
-    expect(xml).not.toContain('>x<');
-    expect(xml).not.toContain('>y<');
+    // What was typed in this session is gone without a trace. The insertion the file brought carries the name of
+    // the editor, but it is not theirs to take out (somebody may be waiting to reject it): its text is deleted in it.
+    expect(xml).not.toContain('>z<');
+    expect(xml).toContain('<w:ins w:id="7" w:author="Ada" w:date="2020-01-01T00:00:00Z"><w:del ');
+    expect(xml).toContain('<w:r><w:delText>x</w:delText></w:r>');
+    expect(xml).toContain('<w:r><w:delText>y</w:delText></w:r>');
     // The note is still in its part.
     const saved = await page.evaluate(async () => Array.from((await (window as any).__mounted.save()) as Uint8Array));
     expect(new TextDecoder().decode(await ZipArchive.read(new Uint8Array(saved)).read('word/footnotes.xml'))).toContain('the note');
+    // The cut, then the typing.
+    await page.evaluate(() => (window as any).__view.undo());
     await page.evaluate(() => (window as any).__view.undo());
     expect(await savedXml(page)).toBe(before);
   });
