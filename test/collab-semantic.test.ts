@@ -176,8 +176,18 @@ export async function run(seed: number, mode: 'rc' | 'sort', verbose = false): P
   for (const p of ps) for (const t of p.sent) { const m = JSON.parse(t); if (m.t === 'op') { keyOf.set(m.id.split(':')[0], p.name); break; } }
   const placed: { who: string; it: Intent }[] = []; const placedIds = new Set<string>();
   for (const e of net.log()) { const [key, seq] = e.id.split(':'); const who = `${keyOf.get(key)}:${seq}`; const it = intents.get(who); if (!it) return `log entry ${e.id} has no intent (${who})`; placed.push({ who, it }); placedIds.add(who); }
+  // With sorting, rows and columns that come or go beside a sort are dropped and said (no rule for them is known to
+  // be right): there a row is gone when a deletion that was PLACED took it, and what was not placed must have been said.
   const goneR = new Set<string>(), goneC = new Set<string>();
-  for (const [, it] of intents) if (it.k === 'del') for (const m of it.ms) (it.axis === 'row' ? goneR : goneC).add(m);
+  for (const [who, it] of intents) if (it.k === 'del' && (mode === 'rc' || placedIds.has(who))) for (const m of it.ms) (it.axis === 'row' ? goneR : goneC).add(m);
+  if (mode === 'sort') {
+    for (const p of ps) {
+      let unplaced = 0;
+      for (const [who] of intents) if (who.split(':')[0] === p.name && !placedIds.has(who)) unplaced++;
+      const said = p.notices.filter((nn) => nn.code === 'dropped').reduce((sum, nn) => sum + (nn.count || 0), 0);
+      if (unplaced !== p.s.stats.dropped + p.s.stats.quiet || said !== p.s.stats.dropped) return `${p.name}: ${unplaced} steps were not placed, ${p.s.stats.dropped} dropped (${said} said) and ${p.s.stats.quiet} had nothing left to do`;
+    }
+  }
   const wb = ps[0].wb; const { rowM, colM } = markers(wb);
   const fail = (s: string) => `${s}\n   steps: ${verbose ? order.join('\n     ') : order.length}\n   placed: ${placed.map((x) => x.who).join(' ')}`;
   // survivors
@@ -187,7 +197,7 @@ export async function run(seed: number, mode: 'rc' | 'sort', verbose = false): P
   const seqR = rowM.filter(Boolean).map((m) => Number(m!.slice(1))); if (mode === 'rc') for (let i = 1; i < seqR.length; i++) if (seqR[i] < seqR[i - 1]) return fail(`rows out of order ${seqR}`);
   // unplaced steps: must be justified
   for (const [who, it] of intents) {
-    if (placedIds.has(who)) continue;
+    if (placedIds.has(who) || mode === 'sort') continue;
     if (it.k === 'w' || it.k === 'f') { if (!goneR.has(it.rm) && !goneC.has(it.cm)) return fail(`LOST WRITE ${who} ${JSON.stringify(it)}: never placed though its row and column are there`); }
     else if (it.k === 'del') { /* fine: all its rows are gone (checked above) */ }
     else if (it.k === 'ins') return fail(`insertion ${who} ${JSON.stringify(it)} was never placed`);

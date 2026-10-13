@@ -601,6 +601,9 @@ export class SaveController implements SaveCommand {
   private error: string | undefined;
   private etag: string | undefined;
   private hinted: string | undefined;
+  /** Something was changed here, by this side itself, that no save of this side holds. */
+  private own = false;
+  private ownAtSave = false;
   private running: Promise<boolean> | undefined;
   /** What the call that started the save under way was answered with: the end of that save, or of the question it led to. */
   private result: Promise<boolean> | undefined;
@@ -718,6 +721,11 @@ export class SaveController implements SaveCommand {
     return this.question !== undefined;
   }
 
+  /** Whether this side itself changed something that no save of its own holds (what someone else changed does not count). */
+  get ownChanges(): boolean {
+    return this.own || (this.busy && this.ownAtSave);
+  }
+
   /** The ETag the next save is sent with, when there is one. */
   get currentETag(): string | undefined {
     return this.etag;
@@ -730,6 +738,7 @@ export class SaveController implements SaveCommand {
    */
   changed(remote = false): void {
     if (this.destroyed) return;
+    if (!remote) this.own = true;
     this.count++;
     this.changedAt = this.now();
     if (this.dirtySince === undefined) this.dirtySince = this.changedAt;
@@ -749,7 +758,7 @@ export class SaveController implements SaveCommand {
    * Someone the file is edited together with saved it: `etag` is what the target names the file by
    * from now on (the next save here is sent with it, so that it is not refused as a conflict), and
    * `clean` says that the file that was saved is the file as it is here, which then has nothing to
-   * save. A question about a conflict that is open is taken away: what it asked about was overwritten.
+   * save.
    */
   adopt(etag: string | undefined, clean: boolean): void {
     if (this.destroyed) return;
@@ -762,8 +771,22 @@ export class SaveController implements SaveCommand {
       this.lastSavedAt = this.host.now ? this.host.now() : Date.now();
       this.disarm();
     }
-    this.dismissConflict();
+    // A question about a conflict that is open stays open: whether to write over what the target holds is the user's to say.
     this.emit();
+  }
+
+  /**
+   * Saves as auto-save does (what is being typed is not applied, a conflict is told and not asked
+   * about), now, whether or not auto-save is on: for a save the room asked for. False when nothing
+   * was sent: a save is under way, something is being typed, the file cannot be written, or the
+   * save would not be guarded.
+   */
+  saveQuietly(): Promise<boolean> {
+    if (this.destroyed || this.running || this.question || !this.dirty || !this.host.writable() || !this.guarded()) return Promise.resolve(false);
+    if (this.host.readOnly && this.host.readOnly()) return Promise.resolve(false);
+    if (this.host.pending && this.host.pending()) return Promise.resolve(false);
+    if (this.blockedConversion) return Promise.resolve(false);
+    return this.launch(false, true);
   }
 
   /**
@@ -880,6 +903,8 @@ export class SaveController implements SaveCommand {
     this.running = running;
     this.result = result;
     this.held = this.count;
+    this.ownAtSave = this.own;
+    this.own = false;
     this.busy = true;
     this.error = undefined;
     this.autoRun = auto;
@@ -1300,6 +1325,8 @@ export class SaveController implements SaveCommand {
 
   /** `detail`: what the application said of its failure, one line; shown with "refused" only. */
   private failed(error: SaveError, detail = ''): boolean {
+    // What this side changed is still in no file.
+    if (this.ownAtSave) this.own = true;
     const strings = this.host.strings();
     let text: string;
     switch (error.code) {

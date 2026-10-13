@@ -6436,6 +6436,8 @@ export class WorkbookView {
       'read-only': [words.readOnly, 'error'],
       detached: [words.detached, 'error'],
       waiting: [words.waiting, 'info'],
+      'undo-wait': [words.undoWait, 'error'],
+      slow: [words.slow, 'info'],
     };
     const line = said[notice.code];
     if (line) this.notify(line[0], line[1]);
@@ -6500,9 +6502,17 @@ export class WorkbookView {
       this.notifyLater(this.strings.collab.dialogClosed, 'error');
     }
     // A formula that is being typed says cells and sheets as they were: it cannot be told what it meant.
+    // Only when cells moved on the sheet the formula is on, or the formula names another sheet (then any sheet may be the one it reads).
     if (this.edit && change.shifts.length > 0 && /^\s*=/.test(this.editText)) {
-      this.cancelEditing();
-      this.notifyLater(this.strings.collab.formulaGone, 'error');
+      const typedText = this.editText;
+      const home = this.workbook.sheets.indexOf(this.edit.home);
+      const far = typedText.indexOf('!') >= 0;
+      const touches = change.sheets || home < 0 || change.shifts.some((shift) => (shift.k === 'rc' || shift.k === 'perm' ? far || shift.s === home || shift.s === this.sheetIndex : true));
+      if (touches) {
+        this.cancelEditing();
+        // What was typed is said back: it is not lost with the edit.
+        this.notifyLater(this.strings.collab.formulaGone(typedText.length > 500 ? `${typedText.slice(0, 500)}…` : typedText), 'error');
+      }
     }
     const old = this.sheetIndex;
     const was = this.states.get(this.shown);

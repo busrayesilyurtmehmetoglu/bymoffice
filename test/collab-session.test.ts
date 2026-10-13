@@ -17,7 +17,7 @@ import type { Op } from '../src/ops/ops';
 import { addConditionalRule, conditionalRules, removeConditionalRule, setValidation, validationsIn } from '../src/ops/rules';
 import { copySheet, deleteSheet, insertSheet, renameSheet } from '../src/ops/sheets';
 import { sortRange } from '../src/ops/sort';
-import { Net, act, assertSame, join, saveOf, seeded, startFile, type Member } from './collab-fixtures';
+import { Net, act, assertSame, join, saveOf, seeded, settleAll, startFile, type Member } from './collab-fixtures';
 
 const value = (wb: Workbook, sheet: number, row: number, col: number): unknown => {
   const cell = getCell(wb.sheets[sheet], row, col);
@@ -347,10 +347,7 @@ test('a participant whose file is not the one of the room loads it again; withou
     loads++;
     return saved;
   });
-  for (let i = 0; i < 50; i++) {
-    net.drain(random);
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await settleAll(net, random, [a, b]);
   assert.equal(loads, 1, 'the file was loaded again once');
   assert.equal(b.session.state, 'online', 'and b joined with it');
   assertSame([a, b], 'after the reload');
@@ -422,10 +419,7 @@ test('the log of a room that was cut: who comes back from before the cut loads t
   a.session.announceSaved([contentVersion(latest)], a.session.savableRev);
   net.drain(random);
   b.transport.resume();
-  for (let i = 0; i < 50; i++) {
-    net.drain(random);
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await settleAll(net, random, [a, b]);
   // b holds a change that is in no file: its workbook is not given up for the file without being asked.
   assert.equal(loads, 0, 'the file was not loaded again');
   assert.equal(b.session.state, 'detached', 'b is detached from the room');
@@ -435,10 +429,7 @@ test('the log of a room that was cut: who comes back from before the cut loads t
   assert.equal(b.session.pending, 0, 'what it changes now is told to nobody');
   // Its user says: give it up for the file as it is stored.
   b.session.reload();
-  for (let i = 0; i < 50; i++) {
-    net.drain(random);
-    await new Promise((resolve) => setImmediate(resolve));
-  }
+  await settleAll(net, random, [a, b]);
   assert.equal(loads, 1, 'now the file is loaded again');
   assert.equal(b.session.state, 'online', 'and the room joined');
   assertSame([a, b], 'after the reload');
@@ -744,7 +735,11 @@ test('a new change forgets what was undone; a step that is too large is refused 
   const s = await alone();
   s.hello(0, 0);
   s.session.submit(setCellInput(s.wb, 0, 30, 0, 'one'));
-  s.session.undo();
+  const sentOne = s.sent.filter((message) => message.t === 'op')[0] as { id: string; ops: unknown[] };
+  assert.equal(s.session.undo(), undefined, 'an undo waits while the step is on its way');
+  assert.equal(value(s.wb, 0, 30, 0), 'one', 'nothing is undone yet');
+  s.tell({ t: 'op', rev: 1, id: sentOne.id, from: 'me', ops: sentOne.ops });
+  assert.equal(value(s.wb, 0, 30, 0), undefined, 'it is undone once the step is placed');
   assert.equal(s.session.canRedo, true, 'what was undone can be made again');
   s.session.submit(setCellInput(s.wb, 0, 31, 0, 'two'));
   assert.equal(s.session.canRedo, false, 'until something else is done');
@@ -778,7 +773,7 @@ test('what is said: part of a change that went, an undo that brings not everythi
   net.drain(random);
   act(c, () => setCellInput(c.wb, 0, 30, 0, 'never sent'));
   c.session.reload();
-  for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+  await c.loading;
   assert.deepEqual(c.notices, [{ code: 'reloaded', count: 1 }], 'a change that was given up with the file is counted');
 });
 
@@ -866,4 +861,123 @@ test('the relay of the page: a full room, a presence that is too large, a strang
   while (queue.length > 0) queue.shift()!();
   assert.deepEqual(told.map((message) => message.t), ['reset'], 'a room without steps that has somebody in it is not started anew for a stranger');
   assert.equal(watched.some((message) => message.t === 'sync'), true, 'and those in it are asked to save');
+});
+
+test('the relay of the page: a key that joins again takes the place of its connection; who is asked to save, and how often; a "saved" of a step nobody saw', async () => {
+  const { MemoryServer } = await import('../src/collab/server');
+  const queue: (() => void)[] = [];
+  let clock = 0;
+  const server = new MemoryServer({ deliver: (run) => queue.push(run), now: () => clock });
+  const drain = (): void => {
+    while (queue.length > 0) queue.shift()!();
+  };
+  type Got = { t: string; code?: string; rev?: number; v?: string[]; from?: string; you?: string };
+  const connect = (join: object): { got: Got[]; send(message: object): void } => {
+    const raw = server.connect();
+    const got: Got[] = [];
+    raw.onMessage((text) => got.push(JSON.parse(text)));
+    raw.onState!((state) => {
+      if (state === 'open') raw.send(JSON.stringify(join));
+    });
+    return { got, send: (message) => raw.send(JSON.stringify(message)) };
+  };
+  const writer = connect({ t: 'join', pv: 1, v: ['v1'], key: 'secret-of-a' });
+  const reader = connect({ t: 'join', pv: 1, v: ['v1'], key: 'secret-of-b', ro: true });
+  drain();
+  assert.deepEqual([writer.got[0].t, reader.got[0].t], ['hello', 'hello'], 'both are in');
+  assert.equal(JSON.stringify(writer.got.concat(reader.got)).indexOf('secret-of-'), -1, 'the key of a participant is told to nobody');
+  // The same key again: the old connection is told that it was replaced, and the new one is in.
+  const again = connect({ t: 'join', pv: 1, v: ['v1'], key: 'secret-of-a' });
+  drain();
+  assert.equal(again.got[0].t, 'hello', 'the key joins again');
+  assert.deepEqual(writer.got.filter((message) => message.t === 'error').map((message) => message.code), ['replaced'], 'and the connection it had is told so');
+  // Another version of the contract is no participant.
+  const old = connect({ t: 'join', pv: 2, v: ['v1'], key: 'c' });
+  drain();
+  assert.equal(old.got[0].t, 'error', 'a contract the relay does not speak');
+  // Who cannot join: those who write are asked to save, those who only read are not; and a reader who cannot join asks nobody.
+  const asked = (who: { got: Got[] }): number => who.got.filter((message) => message.t === 'sync').length;
+  connect({ t: 'join', pv: 1, v: ['other'], key: 'd', ro: true });
+  drain();
+  assert.deepEqual([asked(again), asked(reader)], [0, 0], 'someone who only reads makes nobody save');
+  connect({ t: 'join', pv: 1, v: ['other'], key: 'e' });
+  drain();
+  assert.deepEqual([asked(again), asked(reader)], [1, 0], 'someone who writes does; who only reads is not asked');
+  connect({ t: 'join', pv: 1, v: ['other'], key: 'f' });
+  connect({ t: 'join', pv: 1, v: ['other'], key: 'g' });
+  drain();
+  assert.equal(asked(again), 2, 'twice a minute and no more');
+  clock += 61000;
+  connect({ t: 'join', pv: 1, v: ['other'], key: 'h' });
+  drain();
+  assert.equal(asked(again), 3, 'and again a minute later');
+  // "saved": of a step the room does not have, the step is not passed on; nor may a version move to another step.
+  const told = (): Got[] => reader.got.filter((message) => message.t === 'saved');
+  again.send({ t: 'saved', v: ['v2'], rev: 7 });
+  drain();
+  assert.deepEqual(told().map((message) => message.rev), [undefined], 'a step nobody has seen is not named to the others');
+  again.send({ t: 'op', id: 'x:1', base: 0, ops: [{ t: 'cells', s: 0, c: [] }] });
+  drain();
+  again.send({ t: 'saved', v: ['v3'], rev: 1 });
+  again.send({ t: 'saved', v: ['v3'], rev: 0 });
+  again.send({ t: 'saved', v: ['v1'], rev: 1 });
+  drain();
+  assert.deepEqual(told().slice(1).map((message) => message.rev), [1, undefined, undefined], 'a version stays at the step it was first saved at, also the one the room started with');
+  const late = connect({ t: 'join', pv: 1, v: ['v3'], key: 'i' });
+  const first = connect({ t: 'join', pv: 1, v: ['v1'], key: 'j' });
+  drain();
+  assert.deepEqual([late.got[0].t, late.got[0].rev, late.got[0].from], ['hello', 1, 1], 'who has the saved file starts behind its step');
+  assert.deepEqual([first.got[0].t, first.got[0].from], ['hello', 0], 'who has the first file gets every step');
+});
+
+test('one participant saves for the others: who writes and whose name of the relay comes first', async () => {
+  const net = new Net();
+  const random = seeded(3);
+  const bytes = await startFile();
+  const members = [await join(net, 'a', bytes), await join(net, 'b', bytes), await join(net, 'c', bytes, { readOnly: true })];
+  net.drain(random);
+  const writers = members.filter((member) => !member.session.readOnly);
+  assert.equal(writers.length, 2, 'two of the three write');
+  assert.deepEqual(members.filter((member) => member.session.leads).length, 1, 'exactly one of them saves for the others');
+  const leader = members.find((member) => member.session.leads)!;
+  assert.equal(leader.session.readOnly, false, 'and it is one who writes');
+  const ids = writers.map((member) => (member.session as unknown as { me: string }).me).sort();
+  assert.equal((leader.session as unknown as { me: string }).me, ids[0], 'the one whose name comes first');
+  leader.session.leave();
+  net.drain(random);
+  const next = members.filter((member) => member !== leader && member.session.leads);
+  assert.deepEqual(next.map((member) => member.name), writers.filter((member) => member !== leader).map((member) => member.name), 'when it leaves, the other writer does');
+});
+
+test('a file that is loaded again takes the place of what waited: nothing of the old workbook is sent after it', async () => {
+  const net = new Net();
+  const random = seeded(5);
+  const bytes = await startFile();
+  const a = await join(net, 'a', bytes);
+  let stored = bytes;
+  const b = await join(net, 'b', bytes, {}, async () => stored);
+  net.drain(random);
+  act(a, () => setCellInput(a.wb, 0, 2, 0, 'kept'));
+  net.drain(random);
+  stored = await saveOf(a);
+  a.session.announceSaved([contentVersion(stored)], a.session.savableRev);
+  net.drain(random);
+  // b goes offline with a step waiting and comes back with the file as it is saved now.
+  b.transport.suspend();
+  act(b, () => setCellInput(b.wb, 0, 3, 0, 'never sent'));
+  assert.equal(b.session.pending, 1, 'a step waits');
+  const sent: string[] = [];
+  const send = b.transport.send.bind(b.transport);
+  b.transport.send = (text: string) => {
+    sent.push(text);
+    send(text);
+  };
+  b.session.reload();
+  await settleAll(net, random, [a, b]);
+  b.transport.resume();
+  await settleAll(net, random, [a, b]);
+  assert.equal(b.session.pending, 0, 'nothing waits after the load');
+  assert.equal(sent.some((text) => text.indexOf('never sent') >= 0), false, 'and the step of the workbook that went was sent to nobody');
+  assert.deepEqual(b.notices.map((notice) => notice.code), ['reloaded'], 'which is said');
+  assertSame([a, b], 'after the load');
 });

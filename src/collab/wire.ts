@@ -302,6 +302,14 @@ function readFormat(value: unknown): WireFormat {
   return out;
 }
 
+/** The table of cell formats of this workbook has no room for the formats of a step. */
+export class StyleTableFull extends Error {
+  constructor() {
+    super('The workbook has too many cell formats');
+    this.name = 'StyleTableFull';
+  }
+}
+
 /** The texts of the records of a style table, for finding one that is there already; kept beside the table. */
 const KEYS = new WeakMap<object, string[]>();
 
@@ -322,6 +330,10 @@ function internRecord<T>(list: T[], value: T, styles: StyleSheet): number {
   return list.length - 1;
 }
 
+const XF_KEYS = new WeakMap<object, { count: number; at: Map<string, number> }>();
+const flat = (record: object | undefined): string => stable(record || {});
+const formatKey = (format: CellFormat): string => `${format.numFmtId}|${format.fontId}|${format.fillId}|${format.borderId}|${format.xfId}|${format.quotePrefix}|${flat(format.alignment)}|${flat(format.protection)}`;
+
 /** The index of a format that arrived among the cell formats of the workbook; added when it is not there. */
 export function internFormat(styles: StyleSheet, format: WireFormat): number {
   const numFmtId = typeof format.n === 'number' ? format.n : ensureNumberFormat(styles, format.n);
@@ -335,10 +347,22 @@ export function internFormat(styles: StyleSheet, format: WireFormat): number {
   if (format.x !== undefined && format.x < styles.cellStyleXfs.length) wanted.xfId = format.x;
   if (format.a) wanted.alignment = format.a;
   if (format.p) wanted.protection = format.p;
-  for (let i = 0; i < styles.cellXfs.length; i++) if (sameFormat(styles.cellXfs[i], wanted)) return i;
-  if (styles.cellXfs.length >= MAX_CELL_FORMATS) throw new RangeError('The workbook has too many cell formats');
+  // Found by a text of the record, kept beside the table (as for fonts): a step may bring hundreds of formats.
+  const list = styles.cellXfs;
+  let known = XF_KEYS.get(list);
+  if (!known || known.count > list.length) {
+    known = { count: 0, at: new Map() };
+    XF_KEYS.set(list, known);
+  }
+  for (; known.count < list.length; known.count++) {
+    const key = formatKey(list[known.count]);
+    if (!known.at.has(key)) known.at.set(key, known.count);
+  }
+  const found = known.at.get(formatKey(wanted));
+  if (found !== undefined && sameFormat(list[found], wanted)) return found;
+  if (list.length >= MAX_CELL_FORMATS) throw new StyleTableFull();
   styles.modified = true;
-  return styles.cellXfs.push(wanted) - 1;
+  return list.push(wanted) - 1;
 }
 
 /** Every place of an operation that names a format, read and written through `map`. */
@@ -656,6 +680,12 @@ function readOp(value: unknown, style: (place: unknown) => number): WireOp {
  */
 export function decodeStep(raw: unknown, styles: StyleSheet): WireOp[] {
   const items = arr(raw, MAX_STEP_OPS + 1, 'step');
+  // Room for every format the step brings, before any is added: a table that is full here is this workbook's
+  // matter (another participant's may have room), and the step is neither applied in part nor called no step.
+  if (items.length > 0 && items[0] !== null && typeof items[0] === 'object' && Array.isArray((items[0] as { f?: unknown }).f)) {
+    const count = (items[0] as { f: unknown[] }).f.length;
+    if (count <= MAX_STEP_FORMATS && styles.cellXfs.length + count > MAX_CELL_FORMATS) throw new StyleTableFull();
+  }
   let formats: WireFormat[] = [];
   let first = 0;
   if (items.length > 0 && items[0] !== null && typeof items[0] === 'object' && (items[0] as { t?: unknown }).t === 'st') {

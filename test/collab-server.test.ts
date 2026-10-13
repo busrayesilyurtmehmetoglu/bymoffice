@@ -63,7 +63,7 @@ class Client {
   /** Every text the server sent, kept for the tests that look for a leak. */
   readonly seen: string[] = [];
   closed = false;
-  /** The `key` it joined with: every operation it sends is named after it. */
+  /** The `key` it joined with: a secret of its own, which the tests also use to tell its operations apart. */
   key = '';
   private rest: Buffer = Buffer.alloc(0);
   private wake: (() => void) | null = null;
@@ -846,6 +846,7 @@ test('the log is cut at its limits, and what was cut can no longer be joined fro
     assert.deepEqual(await a.c.json(), { t: 'sync' });
     cut.send({ t: 'join', v: ['v1'] });
     assert.deepEqual(await cut.json(), { t: 'reset', rev: 5, v: ['v2'] }, 'the version of revision 0 was forgotten');
+    assert.deepEqual(await a.c.json(), { t: 'sync' }, 'the room is asked twice a minute');
     cut.send({ t: 'join', v: [], since: 2 });
     assert.equal((await cut.json()).from, 2, 'the floor itself can be joined from');
     for (const rev of [3, 4, 5]) assert.equal((await cut.json()).rev, rev);
@@ -986,7 +987,7 @@ test('a connection that asked to be read-only is refused its operations and its 
     stranger.send({ t: 'join', v: ['v2'] });
     assert.equal((await stranger.json()).t, 'reset', 'and the version was not written down');
     assert.deepEqual(await writer.c.json(), { t: 'sync' });
-    assert.deepEqual(await reader.c.json(), { t: 'sync' });
+    // The reader is not asked to save: it could not.
     assert.equal(server.rooms()[0].rev, 0);
     await operations(writer.c, 0, 1);
     assert.equal((await reader.c.json()).rev, 1, 'it still hears the operations of the others');
@@ -1226,75 +1227,111 @@ test('the protocol version of a room is that of the first to join it, and anothe
   });
 });
 
-test('a key is one to forty letters, digits, underscores and hyphens', async () => {
+test('a key is one to sixty-four letters, digits, underscores and hyphens', async () => {
   await withServer({}, async (port) => {
-    for (const key of ['', 'k'.repeat(41), 'a b', 'a:b', 'ş', 'a.b', 'a#b', 7, null, ['a']]) {
+    for (const key of ['', 'k'.repeat(65), 'a b', 'a:b', 'ş', 'a.b', 'a#b', 7, null, ['a']]) {
       await turnedAway(port, { v: ['v1'], key }, 1008, 'bad-message').catch((error) => {
         throw new Error(`key ${JSON.stringify(key)}: ${error.message}`);
       });
     }
-    for (const key of ['a', 'Az09_-', 'k'.repeat(40)]) {
+    for (const key of ['a', 'Az09_-', 'k'.repeat(40), 'k'.repeat(64)]) {
       const { answer } = await knock(port, { v: ['v1'], key });
       assert.equal(answer.t, 'hello', `key ${key}`);
     }
   });
 });
 
-test('an operation is taken only under the key of its connection', async () => {
+test('the id of an operation is any text of one to a hundred characters, with a key or without', async () => {
   await withServer({}, async (port, server) => {
     const me = await joined(port, { v: ['v1'], key: 'me' });
     const other = await joined(port, { v: ['v1'], key: 'other' });
     assert.equal((await me.c.json()).t, 'peer');
-    for (const id of ['other:1', 'me', 'me1', 'ME:1', ' me:1', ':1', 'meme:1']) {
-      me.c.send({ t: 'op', base: 0, id, ops: [1] });
-      assert.deepEqual(await me.c.json(), { t: 'nack', id, rev: 0, reason: 'id' }, `id ${id}`);
+    let rev = 0;
+    for (const id of ['other:1', 'me', 'ME:1', ' me:1', ':1', '1', 'ş', 'x'.repeat(100)]) {
+      me.c.send({ t: 'op', base: rev, id, ops: [1] });
+      rev++;
+      assert.deepEqual(await me.c.json(), { t: 'op', rev, id, from: me.hello.you, ops: [1] }, `id ${id}`);
+      assert.deepEqual(await other.c.json(), { t: 'op', rev, id, from: me.hello.you, ops: [1] }, `id ${id}, as the other hears it`);
     }
-    assert.equal(me.c.closed, false, 'a wrong id does not close the connection');
-    assert.equal(server.rooms()[0].rev, 0, 'none of them was taken');
-    me.c.send({ t: 'op', base: 0, id: 'me:1', ops: [1] });
-    assert.deepEqual(await me.c.json(), { t: 'op', rev: 1, id: 'me:1', from: me.hello.you, ops: [1] });
-    assert.deepEqual(
-      await other.c.json(),
-      { t: 'op', rev: 1, id: 'me:1', from: me.hello.you, ops: [1] },
-      'the refused ones were not passed on: this is the first thing the other hears',
-    );
-
-    // Without a key nothing can be written.
+    // A connection that gave no key writes like any other.
     const keyless = await joined(port, { v: ['v1'], key: undefined });
-    assert.equal((await keyless.c.json()).rev, 1);
-    for (const id of ['x:1', 'undefined:1', ':1', '1']) {
-      keyless.c.send({ t: 'op', base: 1, id, ops: [1] });
-      assert.deepEqual(await keyless.c.json(), { t: 'nack', id, rev: 1, reason: 'id' }, `id ${id} without a key`);
+    for (let index = 1; index <= rev; index++) assert.equal((await keyless.c.json()).rev, index, 'the log is played to it');
+    keyless.c.send({ t: 'op', base: rev, id: 'no-key', ops: [1] });
+    assert.deepEqual(await keyless.c.json(), { t: 'op', rev: rev + 1, id: 'no-key', from: keyless.hello.you, ops: [1] });
+    assert.equal(server.rooms()[0].rev, rev + 1);
+    // What is no id at all is still a bad message.
+    for (const id of ['', 'x'.repeat(101), 7, null]) {
+      const odd = await joined(port, { v: ['v1'] }, '/odd');
+      odd.c.send({ t: 'op', base: 0, id, ops: [1] });
+      await odd.c.closes(1008, 'bad-message').catch((error) => {
+        throw new Error(`id ${JSON.stringify(id)}: ${error.message}`);
+      });
     }
-    assert.equal(server.rooms()[0].rev, 1);
-    // A connection that only reads is told that first.
+    // A connection that only reads is told so.
     const reader = await joined(port, { v: ['v1'], key: undefined, ro: true });
-    assert.equal((await reader.c.json()).rev, 1);
-    reader.c.send({ t: 'op', base: 1, id: 'x:1', ops: [1] });
-    assert.deepEqual(await reader.c.json(), { t: 'nack', id: 'x:1', rev: 1, reason: 'read-only' });
+    reader.c.send({ t: 'op', base: rev + 1, id: 'x:1', ops: [1] });
+    for (;;) {
+      const back = await reader.c.json();
+      if (back.t === 'op') continue;
+      assert.deepEqual(back, { t: 'nack', id: 'x:1', rev: rev + 1, reason: 'read-only' });
+      break;
+    }
   });
 });
 
-test('a key that someone in the room is using is taken', async () => {
+test('whoever joins with the key of a connection of the room takes its place', async () => {
+  await withServer({ maxConnectionsPerRoom: 2 }, async (port, server) => {
+    const old = await joined(port, { v: ['v1'], key: 'same', user: { name: 'Ada' } });
+    const witness = await joined(port, { v: ['v1'], key: 'witness' });
+    assert.equal((await old.c.json()).t, 'peer');
+
+    // The room is full, and the one that comes back gets in all the same: it is not one more.
+    const back = await joined(port, { v: ['v1'], key: 'same', user: { name: 'Ada' } });
+    await old.c.closes(1008, 'replaced');
+    assert.deepEqual(await witness.c.json(), { t: 'left', id: old.hello.you }, 'the others hear the old one go');
+    assert.deepEqual(
+      await witness.c.json(),
+      { t: 'peer', id: back.hello.you, user: { name: 'Ada' }, ro: false },
+      'and then the new one come',
+    );
+    assert.deepEqual(
+      back.hello.peers.map((peer: any) => peer.id),
+      [witness.hello.you],
+      'the one it replaced is not among its peers',
+    );
+    assert.notEqual(back.hello.you, old.hello.you, 'it is a connection of its own');
+    assert.equal(server.rooms()[0].connections, 2);
+    back.c.send({ t: 'op', base: 0, id: 'after', ops: [1] });
+    assert.equal((await witness.c.json()).id, 'after', 'the new one writes');
+
+    // Another key is one more, and the room is full.
+    await turnedAway(port, { v: ['v1'], key: 'third' }, 1013, 'room-full');
+    // A join that is turned back with `reset` takes nobody's place.
+    const stale = await knock(port, { v: ['v0'], key: 'same', ro: true });
+    assert.equal(stale.answer.t, 'reset');
+    await back.c.json().then((message) => assert.equal(message.id, 'after', 'its own operation comes back to it'));
+    await back.c.settled().catch(() => {
+      throw new Error('a join that did not get in closed the connection whose key it had');
+    });
+    assert.equal(server.rooms()[0].connections, 2);
+  });
   await withServer({}, async (port, server) => {
     const a = await joined(port, { v: ['v1'], key: 'same' });
-    await turnedAway(port, { v: ['v1'], key: 'same' }, 1008, 'key-taken');
-    assert.equal(server.rooms()[0].connections, 1);
-    await a.c.settled().catch(() => {
-      throw new Error('the one that was turned away was announced to the room');
-    });
+    // Another room has its own keys.
     const elsewhere = await joined(port, { v: ['v1'], key: 'same' }, '/elsewhere');
-    assert.equal(elsewhere.hello.t, 'hello', 'another room has its own keys');
     const side = await joined(port, { v: ['v1'], key: 'same', room: 'side' });
-    assert.equal(side.hello.t, 'hello');
     // Two connections without a key do not share one.
-    await joined(port, { v: ['v1'], key: undefined });
-    await joined(port, { v: ['v1'], key: undefined });
-    // The key is free again when its connection is gone.
-    a.c.end();
-    await until('the first to leave', () => server.rooms().find((room) => room.key === '/doc')?.connections === 2);
-    const again = await joined(port, { v: ['v1'], key: 'same' });
-    assert.equal(again.hello.peers.length, 2);
+    const one = await joined(port, { v: ['v1'], key: undefined });
+    const two = await joined(port, { v: ['v1'], key: undefined });
+    assert.equal((await a.c.json()).t, 'peer');
+    assert.equal((await a.c.json()).t, 'peer');
+    assert.equal((await one.c.json()).t, 'peer');
+    for (const client of [a.c, elsewhere.c, side.c, one.c, two.c]) {
+      await client.settled().catch(() => {
+        throw new Error('a connection of another room or one without a key was replaced');
+      });
+    }
+    assert.equal(server.rooms().find((room) => room.key === '/doc')?.connections, 3);
   });
 });
 
@@ -1511,51 +1548,105 @@ test('a room remembers sixteen versions; the oldest save is forgotten first, the
   });
 });
 
-test('the room is asked to save when a newcomer has a file it does not know', async () => {
-  await withServer({}, async (port) => {
+test('the writers of a room are asked to save when someone who may write has a file the room does not know', async () => {
+  let time = 1000;
+  const options: CollabServerOptions = {
+    now: () => time,
+    authorize: ({ token }) => (token === 'viewer' ? { readOnly: true } : true),
+  };
+  await withServer(options, async (port, server) => {
     const a = await joined(port, { v: ['v1'] });
+    const b = await joined(port, { v: ['v1'] });
     const reader = await joined(port, { v: ['v1'], ro: true });
-    assert.equal((await a.c.json()).t, 'peer');
+    const viewer = await joined(port, { v: ['v1'], token: 'viewer' });
+    assert.equal(viewer.hello.ro, true, 'authorize made it read-only');
+    for (const count of [3, 2, 1]) {
+      const client = [a, b, reader][3 - count].c;
+      for (let i = 0; i < count; i++) assert.equal((await client.json()).t, 'peer');
+    }
     await operations(a.c, 0, 1);
-    assert.equal((await reader.c.json()).rev, 1);
+    for (const client of [b.c, reader.c, viewer.c]) assert.equal((await client.json()).rev, 1);
+    const quiet = async (why: string): Promise<void> => {
+      for (const client of [a.c, b.c, reader.c, viewer.c]) {
+        await client.settled().catch(() => {
+          throw new Error(why);
+        });
+      }
+    };
+
+    // Whoever could not write what it is asking for has nothing to ask.
+    const readOnly = await knock(port, { v: ['v0'], ro: true });
+    assert.equal(readOnly.answer.t, 'reset');
+    await quiet('a join that asked to read made the room save');
+    const viewing = await knock(port, { v: ['v0'], token: 'viewer' });
+    assert.equal(viewing.answer.t, 'reset');
+    await quiet('a join that authorize lets only read made the room save');
 
     const first = await knock(port, { v: ['v0'] });
     assert.equal(first.answer.t, 'reset');
     assert.deepEqual(await a.c.json(), { t: 'sync' });
-    assert.deepEqual(await reader.c.json(), { t: 'sync' }, 'everyone in the room hears it');
-    // Not again for five seconds, whoever is reset.
+    assert.deepEqual(await b.c.json(), { t: 'sync' }, 'every writer hears it');
+    await quiet('a connection that cannot save was asked to');
+
+    // Two a minute for the room, whoever is reset and however often.
     first.c.send({ t: 'join', v: ['v0'] });
     assert.equal((await first.c.json()).t, 'reset');
+    assert.deepEqual(await a.c.json(), { t: 'sync' });
+    assert.deepEqual(await b.c.json(), { t: 'sync' });
+    for (let i = 0; i < 5; i++) {
+      first.c.send({ t: 'join', v: ['v0'] });
+      assert.equal((await first.c.json()).t, 'reset');
+    }
     const second = await knock(port, { v: [], since: 9 });
     assert.equal(second.answer.t, 'reset');
-    await a.c.settled().catch(() => {
-      throw new Error('a second sync followed the first at once');
-    });
+    await quiet('a third sync followed within the minute');
     await first.c.settled().catch(() => {
       throw new Error('a connection that is in no room heard something');
     });
+    time += 29000;
+    first.c.send({ t: 'join', v: ['v0'] });
+    assert.equal((await first.c.json()).t, 'reset');
+    await quiet('half a token is no token');
+    time += 2000;
+    first.c.send({ t: 'join', v: ['v0'] });
+    assert.equal((await first.c.json()).t, 'reset');
+    assert.deepEqual(await a.c.json(), { t: 'sync' }, 'after half a minute there is one more');
+    assert.deepEqual(await b.c.json(), { t: 'sync' });
+    first.c.send({ t: 'join', v: ['v0'] });
+    assert.equal((await first.c.json()).t, 'reset');
+    await quiet('and only one');
+
     // A join that gets in asks for nothing.
     const fine = await joined(port, { v: ['v1'] }, '/quiet');
     await joined(port, { v: ['v1'] }, '/quiet');
     assert.equal((await fine.c.json()).t, 'peer');
     await fine.c.settled();
-  });
-  await withServer({ syncIntervalMs: 150 }, async (port, server) => {
-    const a = await joined(port, { v: ['v1'] });
-    await operations(a.c, 0, 1);
-    const first = await knock(port, { v: ['v0'] });
-    assert.equal(first.answer.t, 'reset');
-    assert.deepEqual(await a.c.json(), { t: 'sync' });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    first.c.send({ t: 'join', v: ['v0'] });
-    assert.equal((await first.c.json()).t, 'reset');
-    assert.deepEqual(await a.c.json(), { t: 'sync' }, 'after the interval it is asked again');
-    // With nobody in the room there is nobody to ask.
+
+    // With no writer in the room there is nobody to ask, and nothing is spent.
+    time += 600000;
     a.c.end();
-    await until('the room to be empty', () => server.rooms()[0].connections === 0);
-    first.c.send({ t: 'join', v: ['v0'] });
-    assert.equal((await first.c.json()).t, 'reset');
-    await first.c.settled();
+    b.c.end();
+    await until('the writers to be gone', () => server.rooms().find((room) => room.key === '/doc')?.connections === 2);
+    for (const client of [reader.c, viewer.c]) {
+      assert.equal((await client.json()).t, 'left');
+      assert.equal((await client.json()).t, 'left');
+    }
+    for (let i = 0; i < 3; i++) {
+      first.c.send({ t: 'join', v: ['v0'] });
+      assert.equal((await first.c.json()).t, 'reset');
+    }
+    for (const client of [reader.c, viewer.c]) {
+      await client.settled().catch(() => {
+        throw new Error('readers were asked to save');
+      });
+    }
+    const writer = await joined(port, { v: ['v1'] });
+    assert.equal((await writer.c.json()).rev, 1);
+    for (let i = 0; i < 2; i++) {
+      first.c.send({ t: 'join', v: ['v0'] });
+      assert.equal((await first.c.json()).t, 'reset');
+      assert.deepEqual(await writer.c.json(), { t: 'sync' }, 'the asking that reached nobody was not counted');
+    }
   });
 });
 
@@ -1780,6 +1871,9 @@ test('the path of a room is the path the request resolves to', async () => {
       ['/y'],
     );
     const refused = ['/x/%2e%2e/y', '/x/%2E%2E/y', '/x/.%2e/y', '/x/%2e./y', '/x/%2e/y', '/x/%2e', '/p#q', '/p?x=1#q', '/#'];
+    // What a segment may not be once it is decoded, and what cannot be decoded.
+    refused.push('/p/a%2fb', '/p/%2F', '/p/a%5cb', '/p/%5C', '/p/%00', '/p/a%00', '/p/%1f', '/p/%0a', '/p/%7f', '/p/%c2%85');
+    refused.push('/p/%', '/p/%zz', '/p/%6', '/p/%c3', '/p/%ff', '/p/%ed%a0%80', '/p%23q', '/%23');
     for (const path of refused) {
       const odd = await connect(port, { path });
       assert.equal(odd.status, 400, path);
@@ -1788,17 +1882,43 @@ test('the path of a room is the path the request resolves to', async () => {
     // Dots that are part of a name are a name.
     const dotted = await joined(port, { v: ['v1'] }, '/a..b/.c/d%2ee');
     assert.equal(dotted.hello.peers.length, 0);
-    // The path cannot be made to look like a path and a room.
+    // The path cannot be made to look like a path and a room: a `#` is in no path, however it is written.
     const side = await joined(port, { v: ['v1'], room: 'q' }, '/p');
-    const encoded = await joined(port, { v: ['v1'] }, '/p%23q');
-    assert.equal(encoded.hello.peers.length, 0, 'an encoded # stays encoded');
     assert.equal(side.hello.peers.length, 0);
     await turnedAway(port, { v: ['v1'], room: 'a#b' }, 1008, 'bad-message', '/p');
     assert.deepEqual(
       server.rooms().map((room) => room.key),
-      ['/y', '/a..b/.c/d%2ee', '/p#q', '/p%23q'],
+      ['/y', '/a..b/.c/d.e', '/p#q'],
     );
     a.c.end();
+  });
+  await withServer({}, async (port, server) => {
+    // A room has one name, however its path is spelled.
+    const plain = await joined(port, { v: ['v1'] }, '/p/a');
+    const spelled = await joined(port, { v: ['v1'] }, '/p/%61');
+    assert.equal(spelled.hello.peers.length, 1, '/p/%61 is /p/a');
+    const more = await joined(port, { v: ['v1'] }, '/%70/a?x=%2f');
+    assert.equal(more.hello.peers.length, 2, 'the query is not the path');
+    const wide = await joined(port, { v: ['v1'] }, '/p/%C5%9F%20x');
+    const lower = await joined(port, { v: ['v1'] }, '/p/%c5%9f%20x');
+    assert.equal(lower.hello.peers.length, 1, 'the case of the digits does not matter');
+    // It is decoded once: what is left is a name.
+    const twice = await joined(port, { v: ['v1'] }, '/p/%2561');
+    assert.equal(twice.hello.peers.length, 0);
+    assert.deepEqual(
+      server.rooms().map((room) => room.key),
+      ['/p/a', '/p/ş x', '/p/%61'],
+    );
+    plain.c.end();
+    wide.c.end();
+  });
+  await withServer({ path: '/collab/' }, async (port) => {
+    const spelled = await connect(port, { path: '/%63ollab/doc' });
+    assert.equal(spelled.status, 101, 'the prefix is looked for in the decoded path');
+    spelled.end();
+    const other = await connect(port, { path: '/collab%2fdoc' });
+    assert.equal(other.status, 400, 'an encoded slash does not make the prefix');
+    await other.gone();
   });
   await withServer({ path: '/collab/' }, async (port) => {
     const out = await connect(port, { path: '/collab/../other' });
@@ -1961,15 +2081,20 @@ test('garbage does not bring the server down', async () => {
   });
 });
 
-test('a message nested deeper than the stack is a bad message, not a crash', async () => {
+test('operations nested deeper than 256 levels are a bad message, however deep', async () => {
   await withServer({}, async (port) => {
+    const nested = (id: string, depth: number): Buffer =>
+      frameBytes(1, `{"t":"op","base":0,"id":"${id}","ops":${'['.repeat(depth - 1)}{"k":"[[[{{{"}${']'.repeat(depth - 1)}}`);
     const { c } = await joined(port);
-    const depth = 200000;
-    c.bytes(frameBytes(1, `{"t":"op","base":0,"id":"${c.id('deep')}","ops":[${'['.repeat(depth)}${']'.repeat(depth)}]}`));
-    const answer = await c.json();
-    // Whether the runtime can parse and write such a thing is its own business.
-    if (answer.t === 'error') assert.deepEqual(answer, { t: 'error', code: 'bad-message' });
-    else assert.equal(answer.rev, 1);
+    c.bytes(nested('deepest', 256));
+    assert.equal((await c.json()).rev, 1, '256 levels, `ops` counted, are passed on');
+    for (const depth of [257, 10000, 200000]) {
+      const odd = await joined(port, { v: ['v1'] }, `/deep/${depth}`);
+      odd.c.bytes(nested('deep', depth));
+      await odd.c.closes(1008, 'bad-message').catch((error) => {
+        throw new Error(`${depth} levels: ${error.message}`);
+      });
+    }
     const after = await joined(port, { v: ['v1'] }, '/after');
     await after.c.settled();
   });
@@ -2118,5 +2243,396 @@ test('the WebSocket of the platform talks to the server', async (t) => {
     assert.deepEqual(await a.next(), { t: 'left', id: helloB.you });
     await until('the room to have one connection', () => server.rooms()[0].connections === 1);
     a.socket.close();
+  });
+});
+
+// --- Second hardening --------------------------------------------------------
+
+/** Every string and every name of a property in `value`. */
+function textsOf(value: unknown): string[] {
+  const seen = new Set<unknown>();
+  const texts: string[] = [];
+  const walk = (item: unknown, depth: number): void => {
+    if (typeof item === 'string') texts.push(item);
+    if (typeof item !== 'object' || item === null || seen.has(item) || depth > 8) return;
+    seen.add(item);
+    for (const name of Object.keys(item)) {
+      texts.push(name);
+      walk((item as any)[name], depth + 1);
+    }
+  };
+  walk(value, 0);
+  return texts;
+}
+
+test('the key of a join is in no message of the server, in nothing it logs and not in rooms()', async () => {
+  const mark = 'K3y-0f-';
+  const events: unknown[] = [];
+  await withServer({ log: (event) => events.push(event), savedPerMinute: 0, syncPerMinute: 0 }, async (port, server) => {
+    const clients: Client[] = [];
+    const a = await joined(port, { v: ['v1'], key: `${mark}ada`, user: { name: 'Ada' } });
+    const b = await joined(port, { v: ['v1'], key: `${mark}bob` });
+    const late: Client[] = [a.c, b.c];
+    assert.equal((await a.c.json()).t, 'peer');
+    a.c.send({ t: 'op', base: 0, id: 'first', ops: [1] });
+    assert.equal((await b.c.json()).t, 'op');
+    a.c.send({ t: 'op', base: 0, id: 'stale', ops: [1] });
+    a.c.send({ t: 'presence', data: { at: 1 } });
+    assert.equal((await b.c.json()).t, 'presence');
+    a.c.send({ t: 'saved', v: ['v2'], rev: 1 });
+    assert.equal((await b.c.json()).t, 'saved');
+    // One that is reset and then gets in, one that is replaced, one that is turned away for what it says.
+    const reset = await knock(port, { v: ['v0'], key: `${mark}cem` });
+    assert.equal(reset.answer.t, 'reset');
+    reset.c.send({ t: 'join', v: ['v2'], key: `${mark}cem` });
+    assert.equal((await reset.c.json()).t, 'hello');
+    /** Whatever else it was told before, the connection is turned away with `code`. */
+    const turned = async (c: Client, code: string): Promise<void> => {
+      for (;;) {
+        const message = await c.json();
+        if (message.t !== 'error') continue;
+        assert.deepEqual(message, { t: 'error', code });
+        return c.gone();
+      }
+    };
+    const again = await joined(port, { v: ['v1'], key: `${mark}bob` });
+    await turned(b.c, 'replaced');
+    const odd = await joined(port, { v: ['v1'], key: `${mark}odd` });
+    odd.c.send({ t: 'nonsense', key: `${mark}odd` });
+    await turned(odd.c, 'bad-message');
+    const second = await joined(port, { v: ['v1'], key: `${mark}two` });
+    second.c.send({ t: 'join', v: ['v1'], key: `${mark}two` });
+    await turned(second.c, 'bad-message');
+    const deep = await joined(port, { v: ['v1'], key: `${mark}deep` });
+    deep.c.bytes(frameBytes(1, `{"t":"presence","key":"${mark}deep","data":${'['.repeat(200000)}${']'.repeat(200000)}}`));
+    await deep.c.settled().catch(() => undefined);
+    clients.push(...late, reset.c, again.c, odd.c, second.c, deep.c);
+    await a.c.settled().catch(() => undefined);
+    assert.deepEqual(
+      textsOf(server.rooms()).filter((text) => text.includes(mark)),
+      [],
+      'rooms() carries a key',
+    );
+    a.c.end();
+    again.c.end();
+    reset.c.end();
+    deep.c.end();
+    await until('everyone to be gone', () => server.rooms().every((room) => room.connections === 0));
+
+    let messages = 0;
+    for (const client of clients) {
+      for (const text of client.seen) {
+        messages++;
+        assert.equal(text.includes(mark), false, `a message carries a key: ${text.slice(0, 300)}`);
+      }
+    }
+    assert.equal(messages > 15, true, `the clients were told things: ${messages} messages`);
+    assert.equal(events.length > 15, true, `the log was written to: ${events.length} events`);
+    assert.deepEqual(
+      textsOf(events).filter((text) => text.includes(mark)),
+      [],
+      'the log carries a key',
+    );
+  });
+});
+
+/** The next message that is not about who comes and goes or a call to save. */
+async function next(c: Client): Promise<any> {
+  for (;;) {
+    const message = await c.json();
+    if (message.t !== 'peer' && message.t !== 'left' && message.t !== 'sync') return message;
+  }
+}
+
+/** Says `saved` and gives back what `listener` hears of it. */
+async function says(speaker: Client, listener: Client, v: string[], rev: number): Promise<any> {
+  speaker.send({ t: 'saved', v, rev });
+  const heard = await next(listener);
+  assert.equal(heard.t, 'saved', `a save was to be passed on, ${JSON.stringify(heard)} came`);
+  assert.deepEqual(heard.v, v, 'the versions are passed on whatever becomes of the revision');
+  return heard;
+}
+
+test('a version that fell out of the full table cannot be written again, at any revision', async () => {
+  await withServer({ savedPerMinute: 0 }, async (port) => {
+    const a = await joined(port, { v: ['e0'] });
+    const b = await joined(port, { v: ['e0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    await operations(a.c, 0, 3);
+    for (let rev = 1; rev <= 3; rev++) assert.equal((await b.c.json()).rev, rev);
+    assert.equal((await says(a.c, b.c, ['e1', 'h1'], 3)).rev, 3, 'the true save');
+    await operations(a.c, 3, 6);
+    for (let rev = 4; rev <= 9; rev++) assert.equal((await b.c.json()).rev, rev);
+    const control = await joined(port, { v: ['e1'], ro: true });
+    assert.equal(control.hello.from, 3, 'while it is in the table, e1 is joined from 3');
+
+    // One who may write says so straight away: the table says otherwise.
+    assert.equal('rev' in (await says(b.c, a.c, ['e1'], 9)), false, 'e1 is of revision 3');
+    // It fills the table until e1 falls out, and says it again.
+    let junk = 0;
+    for (let message = 0; message < 4; message++) {
+      const names = [0, 1, 2, 3, 4, 5, 6, 7].map(() => `junk${junk++}`);
+      assert.equal((await says(b.c, a.c, names, 9)).rev, 9);
+    }
+    const fallen = await knock(port, { v: ['e1'], ro: true });
+    assert.equal(fallen.answer.t, 'reset', 'e1 fell out of the table');
+    for (const version of ['e1', 'h1', 'junk0']) {
+      for (const rev of [9, 3, 0]) {
+        const heard = await says(b.c, a.c, [version], rev);
+        assert.equal('rev' in heard, false, `${version} is written at ${rev} after it fell out: ${JSON.stringify(heard)}`);
+      }
+    }
+    // One of them spoils a save, as a version that is taken does.
+    assert.equal('rev' in (await says(b.c, a.c, ['brand-new', 'e1'], 9)), false);
+    for (const version of ['e1', 'h1', 'junk0', 'brand-new']) {
+      const stale = await knock(port, { v: [version], ro: true });
+      assert.equal(stale.answer.t, 'reset', `whoever has ${version} is told to load the file again, not caught up from a lie`);
+      assert.equal(stale.answer.rev, 9);
+    }
+    // The honest save that follows is written as before.
+    await operations(a.c, 9, 1);
+    assert.equal((await next(b.c)).rev, 10);
+    assert.equal((await says(a.c, b.c, ['e2'], 10)).rev, 10);
+    assert.equal((await joined(port, { v: ['e2'] })).hello.from, 10);
+  });
+});
+
+test('a version that the log moved past cannot be written again', async () => {
+  await withServer({ maxLogEntries: 2, savedPerMinute: 0 }, async (port, server) => {
+    const a = await joined(port, { v: ['orig'] });
+    const b = await joined(port, { v: ['orig'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    await operations(a.c, 0, 3);
+    for (let rev = 1; rev <= 3; rev++) assert.equal((await b.c.json()).rev, rev);
+    assert.equal(server.rooms()[0].floor, 1);
+    assert.equal((await says(a.c, b.c, ['s1'], 1)).rev, 1);
+    assert.equal((await says(a.c, b.c, ['s3'], 3)).rev, 3);
+    await operations(a.c, 3, 2);
+    for (let rev = 4; rev <= 5; rev++) assert.equal((await b.c.json()).rev, rev);
+    assert.equal(server.rooms()[0].floor, 3, 'revision 1 is no longer in the log');
+    for (const rev of [5, 3, 4]) {
+      assert.equal('rev' in (await says(a.c, b.c, ['s1'], rev)), false, `s1 is written at ${rev} after the log moved past it`);
+    }
+    const stale = await knock(port, { v: ['s1'], ro: true });
+    assert.deepEqual(stale.answer, { t: 'reset', rev: 5, v: ['s3'] });
+    assert.equal((await joined(port, { v: ['s3'] })).hello.from, 3, 's3 is still in the log');
+  });
+});
+
+test('the versions of the foundation and those of the last save do not fall out of the full table', async () => {
+  await withServer({ savedPerMinute: 0 }, async (port) => {
+    const a = await joined(port, { v: ['f0', 'f1'] });
+    const b = await joined(port, { v: ['f0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    await operations(a.c, 0, 2);
+    assert.equal((await b.c.json()).rev, 1);
+    assert.equal((await b.c.json()).rev, 2);
+    assert.equal((await says(a.c, b.c, ['x'], 1)).rev, 1);
+    assert.equal((await says(a.c, b.c, [1, 2, 3, 4, 5, 6, 7].map((index) => `j${index}`), 1)).rev, 1);
+    assert.equal((await says(a.c, b.c, [8, 9, 10, 11, 12, 13].map((index) => `j${index}`), 1)).rev, 1);
+    // The table is full: f0 f1 x j1..j13. This save names x, the oldest, again, and seven new ones.
+    const last = ['x', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7'];
+    assert.equal((await says(a.c, b.c, last, 1)).rev, 1);
+    assert.equal((await joined(port, { v: ['x'] })).hello.from, 1, 'x is of the last save: it did not make room');
+    assert.equal((await joined(port, { v: ['n7'] })).hello.from, 1);
+    assert.equal((await joined(port, { v: ['j8'] })).hello.from, 1, 'j8 was not the oldest');
+    assert.equal((await knock(port, { v: ['j7'], ro: true })).answer.t, 'reset', 'the seven oldest of the others made room');
+    // A save of eight new ones: the last save is this one now, and the foundation stays.
+    const newest = [1, 2, 3, 4, 5, 6, 7, 8].map((index) => `m${index}`);
+    assert.equal((await says(a.c, b.c, newest, 2)).rev, 2);
+    assert.equal((await joined(port, { v: ['m1'] })).hello.from, 2);
+    assert.equal((await joined(port, { v: ['f1'] })).hello.from, 0, 'the foundation is kept');
+    assert.equal((await joined(port, { v: ['f0'] })).hello.from, 0);
+    assert.equal((await knock(port, { v: ['x'], ro: true })).answer.t, 'reset', 'x is of the last save no more');
+  });
+});
+
+test('a room remembers only so many versions that fell out; after that no save is written down', async () => {
+  await withServer({ maxEvictedVersions: 2, savedPerMinute: 0 }, async (port) => {
+    const a = await joined(port, { v: ['f'] });
+    const b = await joined(port, { v: ['f'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    await operations(a.c, 0, 2);
+    assert.equal((await b.c.json()).rev, 1);
+    assert.equal((await b.c.json()).rev, 2);
+    const names = (prefix: string): string[] => [0, 1, 2, 3, 4, 5, 6, 7].map((index) => `${prefix}${index}`);
+    assert.equal((await says(a.c, b.c, names('a'), 1)).rev, 1);
+    assert.equal((await says(a.c, b.c, names('b'), 1)).rev, 1, 'one fell out: a0');
+    assert.equal((await says(a.c, b.c, names('c'), 1)).rev, 1, 'eight more fell out, and two are remembered');
+    // What fell out cannot be told from what was never there: nothing new is written from here on.
+    const heard = await says(a.c, b.c, ['new'], 2);
+    assert.equal('rev' in heard, false, `a version was written when the room could no longer tell: ${JSON.stringify(heard)}`);
+    assert.equal('rev' in (await says(a.c, b.c, ['a0'], 2)), false);
+    assert.equal('rev' in (await says(a.c, b.c, ['a5'], 2)), false, 'a5 fell out when nothing more was remembered');
+    assert.equal('rev' in (await says(b.c, a.c, ['new'], 2)), false, 'whoever says it');
+    for (const version of ['new', 'a0', 'a5']) {
+      assert.equal((await knock(port, { v: [version], ro: true })).answer.t, 'reset', `${version} is not in the table`);
+    }
+    // A save that only says what the table says is passed on whole, and what is in the table is joined from.
+    assert.equal((await says(a.c, b.c, ['c0', 'c7'], 1)).rev, 1);
+    assert.equal('rev' in (await says(a.c, b.c, ['c0'], 2)), false);
+    assert.equal((await joined(port, { v: ['c7'] })).hello.from, 1);
+    assert.equal((await joined(port, { v: ['f'] })).hello.from, 0);
+  });
+});
+
+test('a connection has only so many saves a minute written down', async () => {
+  let time = 5000;
+  await withServer({ now: () => time }, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const b = await joined(port, { v: ['v0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    await operations(a.c, 0, 1);
+    assert.equal((await b.c.json()).rev, 1);
+    for (let i = 1; i <= 6; i++) assert.equal((await says(a.c, b.c, [`s${i}`], 1)).rev, 1, `save ${i} of the default six`);
+    // What only repeats the table costs nothing; what is refused for another reason neither.
+    assert.equal((await says(a.c, b.c, ['s1', 's6'], 1)).rev, 1);
+    assert.equal('rev' in (await says(a.c, b.c, ['s1'], 0)), false);
+    const seventh = await says(a.c, b.c, ['s7'], 1);
+    assert.equal('rev' in seventh, false, `the seventh save of the minute was written down: ${JSON.stringify(seventh)}`);
+    assert.equal(a.c.closed, false, 'the connection is not closed');
+    assert.equal((await knock(port, { v: ['s7'], ro: true })).answer.t, 'reset', 's7 is not in the table');
+    // The limit is of the connection.
+    assert.equal((await says(b.c, a.c, ['t1'], 1)).rev, 1);
+    time += 9000;
+    assert.equal('rev' in (await says(a.c, b.c, ['s8'], 1)), false, 'nine seconds are not a save');
+    time += 2000;
+    assert.equal((await says(a.c, b.c, ['s9'], 1)).rev, 1, 'eleven seconds are');
+    assert.equal('rev' in (await says(a.c, b.c, ['s10'], 1)), false, 'and only one');
+    // What was not written for its rate was not spoiled: it can be said again.
+    time += 10000;
+    assert.equal((await says(a.c, b.c, ['s7'], 1)).rev, 1);
+    assert.equal((await joined(port, { v: ['s7'] })).hello.from, 1);
+  });
+  await withServer({ now: () => time, savedPerMinute: 2 }, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const b = await joined(port, { v: ['v0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    assert.equal((await says(a.c, b.c, ['s1'], 0)).rev, 0);
+    assert.equal((await says(a.c, b.c, ['s2'], 0)).rev, 0);
+    assert.equal('rev' in (await says(a.c, b.c, ['s3'], 0)), false, 'the rate is what the option says');
+  });
+});
+
+test('a connection adds only so many formats a minute', async () => {
+  let time = 0;
+  const table = (count: number): unknown => ({ t: 'st', f: new Array(count).fill({ b: 1 }) });
+  await withServer({ now: () => time, formatsPerMinute: 10 }, async (port, server) => {
+    const a = await joined(port);
+    const b = await joined(port);
+    assert.equal((await a.c.json()).t, 'peer');
+    const send = async (c: Client, base: number, id: string, ops: unknown[]): Promise<any> => {
+      c.send({ t: 'op', base, id, ops });
+      return c.json();
+    };
+    assert.equal((await send(a.c, 0, 'six', [table(6), { n: 1 }])).rev, 1, 'six of ten');
+    assert.deepEqual(await send(a.c, 1, 'five', [table(5)]), { t: 'nack', id: 'five', rev: 1, reason: 'rate' }, 'four are left');
+    assert.equal(server.rooms()[0].rev, 1, 'what is refused is not placed');
+    // An operation that is not placed adds nothing, and costs nothing.
+    assert.deepEqual(await send(a.c, 0, 'stale', [table(4)]), { t: 'nack', id: 'stale', rev: 1 });
+    assert.equal((await send(a.c, 1, 'four', [table(4)])).rev, 2, 'the refusal took nothing from the bucket');
+    assert.deepEqual(await send(a.c, 2, 'one', [table(1)]), { t: 'nack', id: 'one', rev: 2, reason: 'rate' });
+    // Only the first operation of a message is looked at, and only when it is a table of formats.
+    assert.equal((await send(a.c, 2, 'none', [table(0)])).rev, 3);
+    assert.equal((await send(a.c, 3, 'later', [{ n: 1 }, table(50)])).rev, 4);
+    assert.equal((await send(a.c, 4, 'other', [{ t: 'st', f: 'text' }, { t: 'sx', f: [1, 2, 3] }])).rev, 5);
+    // The limit is of the connection.
+    for (let rev = 1; rev <= 5; rev++) assert.equal((await b.c.json()).rev, rev);
+    assert.equal((await send(b.c, 5, 'ten', [table(10)])).rev, 6);
+    assert.equal((await a.c.json()).rev, 6);
+    // The bucket fills at ten a minute, up to ten.
+    time += 30000;
+    assert.deepEqual(await send(a.c, 6, 'early', [table(6)]), { t: 'nack', id: 'early', rev: 6, reason: 'rate' });
+    assert.equal((await send(a.c, 6, 'half', [table(5)])).rev, 7, 'half a minute is five formats');
+    time += 600000;
+    assert.deepEqual(await send(a.c, 7, 'huge', [table(11)]), { t: 'nack', id: 'huge', rev: 7, reason: 'rate' }, 'more than a full bucket');
+    assert.equal((await send(a.c, 7, 'full', [table(10)])).rev, 8);
+    assert.equal(a.c.closed, false, 'the connection is not closed');
+  });
+  await withServer({ now: () => time }, async (port) => {
+    const { c } = await joined(port);
+    c.send({ t: 'op', base: 0, id: 'most', ops: [table(2000)] });
+    assert.equal((await c.json()).rev, 1, 'the default is two thousand');
+    c.send({ t: 'op', base: 1, id: 'more', ops: [table(1)] });
+    assert.deepEqual(await c.json(), { t: 'nack', id: 'more', rev: 1, reason: 'rate' });
+  });
+  await withServer({ now: () => time, formatsPerMinute: 0 }, async (port) => {
+    const { c } = await joined(port);
+    c.send({ t: 'op', base: 0, id: 'any', ops: [table(5000)] });
+    assert.equal((await c.json()).rev, 1, '0 is no limit');
+  });
+});
+
+test('the operations are passed on in the very text they came in', async () => {
+  await withServer({}, async (port) => {
+    const a = await joined(port);
+    const b = await joined(port);
+    assert.equal((await a.c.json()).t, 'peer');
+    const cases: [string, string, string][] = [
+      ['numbers and the order of names', '{"t":"op","base":0,"id":"n1","ops":[{"b":1,"a":1e2},1.0,1e400,-0,0.10,1E+2]}', '[{"b":1,"a":1e2},1.0,1e400,-0,0.10,1E+2]'],
+      ['white space', '{ "ops" :\t[ 1 ,\n{ "k" : [ ] } ] , "t":"op","base":1,"id":"n2"}', '[ 1 ,\n{ "k" : [ ] } ]'],
+      ['escapes', '{"t":"op","base":2,"id":"n3","ops":["\\u00e9\\ud83d\\ude00\\/\\"]}","\\ud800","é😀"]}', '["\\u00e9\\ud83d\\ude00\\/\\"]}","\\ud800","é😀"]'],
+      ['a name written twice: the last one counts', '{"t":"op","ops":[1.0],"base":3,"id":"n4","ops":[2.0]}', '[2.0]'],
+      ['a name written with an escape', '{"t":"op","base":4,"id":"n5","\\u006fps":[3.0]}', '[3.0]'],
+      ['the same text inside a string and inside another value', '{"t":"op","id":"\\"ops\\":[9]","x":{"ops":[8.0]},"base":5,"ops":[4.0],"y":["ops",{"ops":[7.0]}]}', '[4.0]'],
+      ['names that mean something to an object', '{"t":"op","base":6,"id":"n7","ops":[{"__proto__":{"x":1.0},"constructor":2.0}]}', '[{"__proto__":{"x":1.0},"constructor":2.0}]'],
+    ];
+    const told: string[] = [];
+    for (const [name, text, ops] of cases) {
+      a.c.bytes(frameBytes(1, text));
+      const back = await a.c.json();
+      assert.equal(back.t, 'op', `${name}: the operation was to be placed, ${JSON.stringify(back)} came`);
+      const id = JSON.parse(text).id;
+      const expected = `{"t":"op","rev":${back.rev},"id":${JSON.stringify(id)},"from":${JSON.stringify(a.hello.you)},"ops":${ops}}`;
+      told.push(expected);
+      assert.equal(a.c.seen[a.c.seen.length - 1], expected, `${name}: as the sender hears it`);
+      assert.equal((await b.c.json()).rev, back.rev);
+      assert.equal(b.c.seen[b.c.seen.length - 1], expected, `${name}: as the other hears it`);
+    }
+    // The log plays the same text.
+    const late = await joined(port);
+    for (let i = 0; i < cases.length; i++) assert.equal((await late.c.json()).rev, i + 1);
+    assert.deepEqual(late.c.seen.slice(1), told, 'the log');
+    assert.equal((await a.c.json()).t, 'peer');
+    // What the text says is still checked: `ops` that is no list is a bad message.
+    a.c.bytes(frameBytes(1, '{"t":"op","base":7,"id":"n8","ops":[1],"ops":{"0":1}}'));
+    await a.c.closes(1008, 'bad-message');
+  });
+});
+
+test('a room that is founded again forgets nothing it has let go of', async () => {
+  await withServer({ savedPerMinute: 0, idleRoomMs: 600000 }, async (port, server) => {
+    const empty = (): Promise<void> => until('the room to be empty', () => server.rooms()[0].connections === 0);
+    const first = await joined(port, { v: ['f'] });
+    const witness = await joined(port, { v: ['f'] });
+    assert.equal((await says(first.c, witness.c, ['s'], 0)).rev, 0);
+    first.c.end();
+    witness.c.end();
+    await empty();
+    // Nothing was written: whoever comes now founds the room, on its own file.
+    const b = await joined(port, { v: ['g'] });
+    const c = await joined(port, { v: ['g'] });
+    assert.equal(c.hello.from, 0);
+    assert.equal((await b.c.json()).t, 'peer');
+    await operations(b.c, 0, 2);
+    for (const rev of [1, 2]) assert.equal((await c.c.json()).rev, rev);
+    for (const version of ['f', 's']) {
+      const heard = await says(b.c, c.c, [version], 2);
+      assert.equal('rev' in heard, false, `${version}, which the room knew as revision 0, is written at 2: ${JSON.stringify(heard)}`);
+      assert.equal((await knock(port, { v: [version], ro: true })).answer.t, 'reset');
+    }
+  });
+  await withServer({ idleRoomMs: 600000 }, async (port, server) => {
+    const empty = (): Promise<void> => until('the room to be empty', () => server.rooms()[0].connections === 0);
+    for (const version of ['f', 'g']) {
+      const { c } = await joined(port, { v: [version] });
+      c.end();
+      await empty();
+    }
+    // A room is founded on what the first to come has, whatever it has let go of before.
+    const a = await joined(port, { v: ['f'] });
+    const b = await joined(port, { v: ['f'] });
+    assert.equal(b.hello.from, 0);
+    assert.equal((await says(a.c, b.c, ['f'], 0)).rev, 0, 'and that is revision 0 again');
   });
 });

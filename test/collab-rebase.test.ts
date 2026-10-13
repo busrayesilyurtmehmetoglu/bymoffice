@@ -43,7 +43,7 @@ test('formulas are written for the cells they meant, on their sheet and by its n
 test('rows that go: read through rows that came and went beside them', () => {
   assert.deepEqual(at(mapRec(del(3, 3), rows(true, 1, 2)).rec?.w), [5, 3], 'rows put in above move the run');
   assert.deepEqual(at(mapRec(del(3, 3), rows(true, 6, 2)).rec?.w), [3, 3], 'rows put in below leave it');
-  assert.deepEqual(at(mapRec(del(3, 3), rows(true, 4, 2)).rec?.w), [3, 5], 'rows put in inside it go with it');
+  assert.deepEqual((mapRec(del(3, 3), rows(true, 4, 2)).recs || []).map((rec) => at(rec.w)), [[6, 2], [3, 1]], 'rows that someone else put in inside it stay: the rows below them go, then the row above them');
   assert.deepEqual(at(mapRec(del(3, 3), rows(true, 3, 2)).rec?.w), [5, 3], 'rows put in at its first row are above it');
   assert.deepEqual(at(mapRec(del(3, 3), rows(false, 4, 4)).rec?.w), [3, 1], 'what someone else deleted of it is done');
   assert.equal(mapRec(del(3, 3), rows(false, 2, 5)).noop, true, 'all of it deleted already: nothing left to do, nothing lost');
@@ -61,7 +61,7 @@ test('rows that come: where they are put, also inside a run that went, and who s
 
 test('what was applied beside a step is read through the step, the same way round', () => {
   // The step deleted rows 3..5; beside it rows were put in at 4: they went with the run, and are no more.
-  assert.deepEqual(mapShift(rows(true, 4, 2), rows(false, 3, 3)), [], 'rows put in inside a run the step deleted are gone for what comes after');
+  assert.deepEqual(mapShift(rows(true, 4, 2), rows(false, 3, 3)), [rows(true, 3, 2)], 'rows put in inside a run the step deleted stay, where the run was');
   assert.deepEqual(mapShift(rows(true, 3, 2), rows(false, 3, 3)), [rows(true, 3, 2)], 'at its first row they stay');
   assert.deepEqual(mapShift(rows(true, 6, 2), rows(false, 3, 3)), [rows(true, 3, 2)], 'below it they follow');
   // The step put a row in at 4; beside it rows 3..5 went: the row that was put in stays, the rows on either side of it went.
@@ -104,8 +104,8 @@ test('a step keeps or drops as a whole, and what was applied beside it comes out
   const step: Rec[] = [del(3, 3), { w: cell(5, 1), nm: undefined }];
   const beside: Carry[] = [{ sh: rows(true, 4, 2), w: { t: 'ins', s: 0, x: 'row', at: 4, n: 2 } }];
   const moved = transformStep(step, beside);
-  assert.deepEqual((moved.recs || []).map((rec) => at(rec.w)), [[3, 5], [0, [[5, 1]]]], 'the run swallowed the new rows, and the cell below it is where it was');
-  assert.deepEqual(moved.carry.filter((item) => item.sh), [], 'for what comes after the step, the rows that were put in are not there');
+  assert.deepEqual((moved.recs || []).map((rec) => at(rec.w)), [[6, 2], [3, 1], [0, [[7, 1]]]], 'the run goes around the new rows, and the cell below it is below them');
+  assert.deepEqual(moved.carry.map((item) => item.sh), [rows(true, 3, 2)], 'for what comes after the step, the rows that were put in stand where the run was');
   const lost = transformStep([{ w: cell(5, 1) }, { w: cell(9, 1) }], [{ sh: rows(false, 9, 1) }]);
   assert.deepEqual([lost.recs, lost.noop], [undefined, false], 'one operation without a place drops the step');
   const done = transformStep([del(3, 2)], [{ sh: rows(false, 0, 9) }]);

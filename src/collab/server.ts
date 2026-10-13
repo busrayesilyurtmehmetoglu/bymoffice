@@ -16,8 +16,10 @@ export interface MemoryServerOptions {
   maxLogBytes?: number;
   /** Most connections a room takes. Default 64. */
   maxConnections?: number;
-  /** How often at most those in a room are asked to save because someone cannot join. Default 5000. */
-  syncIntervalMs?: number;
+  /** How often in a minute at most those in a room are asked to save because someone cannot join. Default 2. */
+  syncPerMinute?: number;
+  /** The clock. Default: Date.now. */
+  now?(): number;
   /**
    * Runs what delivers a message; a test orders the deliveries with it. `lane` names the
    * connection and the direction: what is delivered on one lane has to keep its order.
@@ -42,7 +44,7 @@ interface Connection {
   ro: boolean;
   presence: unknown;
   gone: boolean;
-  /** What every step of this connection is named with (see ClientMessage "join"). */
+  /** The secret this connection joined with: nobody else is told it (see ClientMessage "join"). */
   key: string | undefined;
   /** The step it joined at: it has seen the room from there on. */
   from: number;
@@ -61,7 +63,12 @@ interface Room {
   members: Set<Connection>;
   /** The version of the contract its first participant spoke. */
   pv: number | undefined;
-  syncAt: number;
+  /** The versions the last "saved" that was taken named: never let go of. */
+  latest: string[];
+  /** Versions the table let go of: never written again. */
+  gone: Set<string>;
+  /** When those in the room were last asked to save. */
+  syncs: number[];
 }
 
 /** What a channel between tabs has to be able to do (a BroadcastChannel). */
@@ -145,22 +152,20 @@ export class MemoryServer {
       }
       let room = this.roomsByKey.get(key);
       const made = !room;
-      if (!room) room = { key, rev: 0, floor: 0, log: [], bytes: 0, versions: new Map(), members: new Set(), pv: undefined, syncAt: 0 };
+      if (!room) room = { key, rev: 0, floor: 0, log: [], bytes: 0, versions: new Map(), members: new Set(), pv: undefined, latest: [], gone: new Set(), syncs: [] };
       const pv = message.pv === undefined ? 1 : message.pv;
       if (room.pv !== undefined && room.pv !== pv) {
         this.say(connection, { t: 'error', code: 'version' });
         this.drop(connection);
         return;
       }
-      let taken = false;
+      // The key is a secret between a participant and the relay: who knows it is that participant, coming back over a
+      // new connection, and takes the place of the old one (which the relay may not have seen go yet).
       room.members.forEach((other) => {
-        if (message.key !== undefined && other.key === message.key) taken = true;
+        if (message.key === undefined || other.key !== message.key) return;
+        this.say(other, { t: 'error', code: 'replaced' });
+        this.drop(other);
       });
-      if (taken) {
-        this.say(connection, { t: 'error', code: 'key-taken' });
-        this.drop(connection);
-        return;
-      }
       if (room.members.size >= (this.options.maxConnections === undefined ? 64 : this.options.maxConnections)) {
         this.say(connection, { t: 'error', code: 'room-full' });
         this.drop(connection);
@@ -198,10 +203,14 @@ export class MemoryServer {
         this.say(connection, { t: 'reset', rev: room.rev, v: known.slice(0, 8) });
         connection.refused = key;
         // Nobody can come in while no file holds the steps of the room: those who are in it are asked to save.
-        const now = Date.now();
-        if (room.members.size > 0 && now - room.syncAt >= (this.options.syncIntervalMs === undefined ? 5000 : this.options.syncIntervalMs)) {
-          room.syncAt = now;
-          room.members.forEach((other) => this.say(other, { t: 'sync' }));
+        // Only for someone who may write (a reader has no say in when a file is saved), only those who can save are asked, and not often.
+        const now = this.options.now ? this.options.now() : Date.now();
+        room.syncs = room.syncs.filter((at) => now - at < 60000);
+        if (message.ro !== true && room.members.size > 0 && room.syncs.length < (this.options.syncPerMinute === undefined ? 2 : this.options.syncPerMinute)) {
+          room.syncs.push(now);
+          room.members.forEach((other) => {
+            if (!other.ro) this.say(other, { t: 'sync' });
+          });
         }
         return;
       }
@@ -229,8 +238,6 @@ export class MemoryServer {
     if (!room) return;
     if (message.t === 'op') {
       if (connection.ro) return this.say(connection, { t: 'nack', id: message.id, rev: room.rev, reason: 'read-only' });
-      // A step is named with what its connection joined under: nobody names a step as someone else would.
-      if (connection.key === undefined || message.id.slice(0, connection.key.length + 1) !== `${connection.key}:`) return this.say(connection, { t: 'nack', id: message.id, rev: room.rev, reason: 'id' });
       if (message.base !== room.rev) return this.say(connection, { t: 'nack', id: message.id, rev: room.rev });
       room.rev++;
       const entry: Entry = { rev: room.rev, id: message.id, from: connection.id, ops: message.ops, bytes: utf8Length(text) };
@@ -244,7 +251,9 @@ export class MemoryServer {
         room.floor = oldest.rev;
       }
       room.versions.forEach((rev, version) => {
-        if (rev < room.floor) room.versions.delete(version);
+        if (rev >= room.floor) return;
+        room.versions.delete(version);
+        if (room.gone.size < 4096) room.gone.add(version);
       });
       room.members.forEach((other) => this.say(other, { t: 'op', rev: entry.rev, id: entry.id, from: entry.from, ops: entry.ops }));
       return;
@@ -260,17 +269,26 @@ export class MemoryServer {
     if (message.t === 'saved') {
       if (connection.ro) return;
       // Only a step the sender has seen the room at; and what a version is known to hold stays what it is.
-      const rev = message.rev !== undefined && message.rev >= room.floor && message.rev >= connection.from && message.rev <= room.rev ? message.rev : undefined;
+      const claimed = message.rev !== undefined && message.rev >= room.floor && message.rev >= connection.from && message.rev <= room.rev ? message.rev : undefined;
+      // What a version is known to hold stays what it is, and a version the table let go of is never written
+      // again: a "saved" that says otherwise is passed on without its step.
+      let rev = claimed;
+      for (const version of message.v) {
+        if (room.gone.has(version) || (room.versions.has(version) && room.versions.get(version) !== claimed)) rev = undefined;
+      }
+      if (rev !== undefined && room.gone.size >= 4096 && message.v.some((version) => !room.versions.has(version))) rev = undefined;
       if (rev !== undefined) {
         for (const version of message.v) if (!room.versions.has(version)) room.versions.set(version, rev);
+        room.latest = message.v.slice();
         // The oldest go when there are too many, but never what the room started with.
         while (room.versions.size > 16) {
           let oldest: string | undefined;
           room.versions.forEach((at, version) => {
-            if (oldest === undefined && at > 0) oldest = version;
+            if (oldest === undefined && at > 0 && room.latest.indexOf(version) < 0) oldest = version;
           });
           if (oldest === undefined) break;
           room.versions.delete(oldest);
+          room.gone.add(oldest);
         }
       }
       room.members.forEach((other) => {

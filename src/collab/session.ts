@@ -14,7 +14,7 @@ import { applyOp, type Op } from '../ops/ops';
 import { MAX_PRESENCE_BYTES, MAX_STEP_BYTES, cleanUser, parseServerMessage, utf8Length, type ClientMessage, type CollabUser, type PeerMessage } from './protocol';
 import { carryOf, inverseShift, mapPosition, transformStep, type Carry } from './rebase';
 import { CollabUnsupportedError, WireError, type Rec, type Shift, type WireOp } from './types';
-import { MAX_STEP_OPS, applyWire, decodeStep, encodeOp, encodeStep, shiftOf, type Applied } from './wire';
+import { MAX_STEP_OPS, StyleTableFull, applyWire, decodeStep, encodeOp, encodeStep, shiftOf, stable, type Applied } from './wire';
 
 /** What carries the messages: a socket, a channel of the application, anything that keeps their order. */
 export interface CollabTransport {
@@ -67,6 +67,8 @@ export interface SessionChange {
   shifts: Shift[];
   /** The rules or the charts of a sheet changed. */
   lists?: boolean;
+  /** The change is this participant's own (an undo that waited for its turn), not someone else's. */
+  local?: boolean;
 }
 
 export type CollabNoticeCode =
@@ -99,7 +101,11 @@ export type CollabNoticeCode =
   /** The room is at another version of the file, and this workbook holds changes no file has: it stays, and is to be saved. */
   | 'detached'
   /** The room cannot be joined yet: someone in it has to save first. It is tried again. */
-  | 'waiting';
+  | 'waiting'
+  /** Undo was asked for while changes of this participant were still on their way, and they did not arrive in time. */
+  | 'undo-wait'
+  /** A step has been on its way for a long time: the connection is made anew. */
+  | 'slow';
 
 export interface CollabNotice {
   code: CollabNoticeCode;
@@ -170,10 +176,17 @@ interface Step {
   recs: Rec[];
   /** The operations of the model that take the step back exactly, in the order they are applied in. */
   inverse: Op[];
-  /** What undoes or redoes the step, on whichever stack it stands. */
-  entry?: StackEntry;
   /** What applying it changed. */
   change: SessionChange;
+  /** A change, or the undoing or the making again of one. */
+  kind: 'edit' | 'undo' | 'redo';
+  /** The operations that take it back as a step of their own, to be applied right after it; null when it cannot be taken back. */
+  undo: Rec[] | null;
+  lossy: boolean;
+  /** Something else was changed here after this undoing: what it took back is not to be made again. */
+  final?: boolean;
+  /** What the caller gave with the step: handed back with its undoing. */
+  meta?: unknown;
 }
 
 /** Colours participants are told apart by when they give none. */
@@ -187,6 +200,10 @@ const PRESENCE_MS = 100;
 const MAX_RELOADS = 6;
 /** How long what the others say of where they are is gathered before it is passed on. */
 const PEERS_MS = 50;
+/** How long an undo waits for the steps of its participant to be placed. */
+const UNDO_WAIT_MS = 3000;
+/** How long a step may be on its way before the connection is taken to be stuck. */
+const FLY_MS = 30000;
 
 function hashOf(text: string): number {
   let h = 0x811c9dc5;
@@ -233,6 +250,13 @@ export class CollabSession {
   /** The order was asked for again after a step was missing, and the answer is not there yet. */
   private resyncing = false;
   private badStepSaid = false;
+  /** What the steps of this session are named with, for everybody to see; the key is told to the relay alone. */
+  private readonly tag = `${hashOf(String(Math.random())).toString(36)}${hashOf(String(Date.now())).toString(36)}`;
+  /** Undo and redo that wait for the steps on their way. */
+  private wanted: ('undo' | 'redo')[] = [];
+  private wantedTimer: (() => void) | undefined;
+  private flyTimer: (() => void) | undefined;
+  private slowSaid = false;
   /** The step the workbook was at when it joined with its file. */
   private startedAt = 0;
   private lastSaved: ClientMessage | undefined;
@@ -329,11 +353,11 @@ export class CollabSession {
   }
 
   get canUndo(): boolean {
-    return this.undoStack.length > 0;
+    return this.undoStack.length > 0 || this.pendingSteps.some((step) => step.kind !== 'undo');
   }
 
   get canRedo(): boolean {
-    return this.redoStack.length > 0;
+    return this.redoStack.length > 0 || this.pendingSteps.some((step) => step.kind === 'undo' && !step.final);
   }
 
   // ------------------------------------------------------------------ editing
@@ -345,6 +369,8 @@ export class CollabSession {
    */
   submit(ops: readonly Op[], meta?: unknown): Submitted {
     if (this.readonlyNow) throw new CollabUnsupportedError('readOnly', 'The relay takes no changes from this participant');
+    // While the file is loaded again the workbook is about to be another one: what is changed in it now would be lost here and sent to the others.
+    if (this.reloading) throw new CollabUnsupportedError('other', 'The file is being loaded again');
     if (ops.length > MAX_STEP_OPS) throw new CollabUnsupportedError('size', 'The change is too large to be shared in one step');
     const workbook = this.host.workbook();
     const recs: Rec[] = [];
@@ -387,28 +413,58 @@ export class CollabSession {
       throw error;
     }
     if (recs.length === 0) return { change, skipped, inverse: [] };
-    const entry: StackEntry = { recs: undoable ? ([] as Rec[]).concat(...undo) : null, lossy, meta };
-    this.placed(recs, inverse, entry, 'edit', change);
+    this.redoStack = [];
+    for (const step of this.pendingSteps) if (step.kind === 'undo') step.final = true;
+    this.wanted = [];
+    this.placed({ id: '', recs, inverse, change, kind: 'edit', undo: undoable ? ([] as Rec[]).concat(...undo) : null, lossy, meta });
     return { change, skipped, inverse };
   }
 
-  /** Undoes the last step of this participant that can be undone; undefined when nothing was done (which was said). */
+  /**
+   * Undoes the last step of this participant. What is undone is always a step the relay has
+   * placed: while steps of this participant are still on their way, the undoing waits for them
+   * (undefined is answered now, and SessionHost.changed() is told when it was done; when they do
+   * not arrive in a few seconds it is said and nothing is undone). Undefined also when there is
+   * nothing to undo or the step cannot be undone, which is said.
+   */
   undo(): (Submitted & { meta: unknown }) | undefined {
-    return this.travel(this.undoStack, 'undo');
+    return this.ask('undo');
   }
 
   redo(): (Submitted & { meta: unknown }) | undefined {
-    return this.travel(this.redoStack, 'redo');
+    return this.ask('redo');
   }
 
-  /** What the step that undo() would take back was given as `meta`. */
-  get undoMeta(): unknown {
-    const top = this.undoStack[this.undoStack.length - 1];
-    return top ? top.meta : undefined;
+  private ask(kind: 'undo' | 'redo'): (Submitted & { meta: unknown }) | undefined {
+    if (this.readonlyNow || this.reloading) return undefined;
+    if (this.pendingSteps.length === 0 || this.current === 'closed' || this.current === 'detached') return this.travel(kind);
+    this.wanted.push(kind);
+    if (!this.wantedTimer) {
+      this.wantedTimer = this.timer(() => {
+        this.wantedTimer = undefined;
+        if (this.wanted.length === 0) return;
+        this.wanted = [];
+        this.host.notice({ code: 'undo-wait' });
+      }, UNDO_WAIT_MS);
+    }
+    return undefined;
   }
 
-  private travel(stack: StackEntry[], kind: 'undo' | 'redo'): (Submitted & { meta: unknown }) | undefined {
-    const entry = stack.pop();
+  /** The undoing that waited for the steps of this participant to be placed: done now, one at a time. */
+  private runWanted(): void {
+    if (this.wanted.length === 0 || this.pendingSteps.length > 0) return;
+    const kind = this.wanted.shift() as 'undo' | 'redo';
+    if (this.wanted.length === 0 && this.wantedTimer) {
+      this.wantedTimer();
+      this.wantedTimer = undefined;
+    }
+    const done = this.travel(kind);
+    if (done) this.host.changed({ ...done.change, local: true });
+    else this.runWanted();
+  }
+
+  private travel(kind: 'undo' | 'redo'): (Submitted & { meta: unknown }) | undefined {
+    const entry = (kind === 'undo' ? this.undoStack : this.redoStack).pop();
     if (!entry) return undefined;
     if (!entry.recs || entry.gone || entry.recs.length === 0) {
       // The step stays behind: the one before it is next.
@@ -425,32 +481,22 @@ export class CollabSession {
       return undefined;
     }
     if (entry.lossy) this.host.notice({ code: 'undo-lossy' });
-    const back: StackEntry = { recs: done.undo, lossy: done.lossy, meta: entry.meta };
-    this.placed(done.recs, done.inverse, back, kind, done.change);
+    this.placed({ id: '', recs: done.recs, inverse: done.inverse, change: done.change, kind, undo: done.undo, lossy: done.lossy, meta: entry.meta });
     return { change: done.change, skipped: 0, inverse: done.inverse, meta: entry.meta };
   }
 
-  /** A step that was applied here: the stacks are read through it, its own entry is put on its stack, and it is queued. */
-  private placed(recs: Rec[], inverse: Op[], entry: StackEntry, kind: 'edit' | 'undo' | 'redo', change: SessionChange): void {
+  /** A step that was applied here is queued for the relay; in a session that tells nobody it is a step like one the relay placed. */
+  private placed(step: Step): void {
     const carry: Carry[] = [];
-    for (const rec of recs) {
+    for (const rec of step.recs) {
       const sh = shiftOf(rec.w, rec.nm, rec.wide);
       if (sh) carry.push({ sh });
     }
-    if (carry.length > 0) {
-      this.throughStack(this.undoStack, carry, false);
-      this.throughStack(this.redoStack, carry, false);
-      this.movePresences(carry);
-    }
-    if (kind === 'edit') this.redoStack = [];
-    const stack = kind === 'undo' ? this.redoStack : this.undoStack;
-    stack.push(entry);
-    const limit = this.options.undoLimit === undefined ? 200 : this.options.undoLimit;
-    while (stack.length > limit) stack.shift();
-    // A session that is over applies what it is given and tells nobody.
+    if (carry.length > 0) this.movePresences(carry);
     if (this.paused > 0) this.touchedWhilePaused = true;
-    if (this.current === 'closed' || this.current === 'detached' || this.readonlyNow) return;
-    this.pendingSteps.push({ id: `${this.key}:${++this.seq}`, recs, inverse, entry, change });
+    if (this.current === 'closed' || this.current === 'detached') return this.settle(step);
+    step.id = `${this.tag}:${++this.seq}`;
+    this.pendingSteps.push(step);
     this.stats.made++;
     if (this.pendingSteps.length > BACKLOG_NOTICE && !this.backlogSaid) {
       this.backlogSaid = true;
@@ -459,11 +505,37 @@ export class CollabSession {
     this.pump();
   }
 
-  private throughStack(stack: StackEntry[], carry: readonly Carry[], undo: boolean, skip?: Set<StackEntry>): void {
+  /**
+   * A step of this participant has its place in the order (or, in a session that tells nobody, was
+   * made): what undoes the steps before it is read through it, and what undoes it is kept. The
+   * stacks are always about the workbook as the relay has it, without the steps that still wait.
+   */
+  private settle(step: Step): void {
+    const carry: Carry[] = [];
+    for (const rec of step.recs) {
+      const sh = shiftOf(rec.w, rec.nm, rec.wide);
+      if (sh) carry.push({ sh });
+    }
+    if (carry.length > 0) {
+      this.throughStack(this.undoStack, carry, false);
+      this.throughStack(this.redoStack, carry, false);
+    }
+    if (step.kind === 'undo' && step.final) return;
+    const stack = step.kind === 'undo' ? this.redoStack : this.undoStack;
+    stack.push({ recs: step.undo, lossy: step.lossy, meta: step.meta });
+    const limit = this.options.undoLimit === undefined ? 200 : this.options.undoLimit;
+    while (stack.length > limit) stack.shift();
+  }
+
+  private throughStack(stack: StackEntry[], carry: readonly Carry[], undo: boolean): void {
     for (const entry of stack) {
-      if (!entry.recs || entry.gone || (skip && skip.has(entry))) continue;
+      if (!entry.recs || entry.gone) continue;
       const moved = transformStep(entry.recs, carry, undo);
-      if (moved.recs) entry.recs = moved.recs;
+      // An undo is whole or it is nothing: what someone else changed since is not taken back in part. Nor is one
+      // that would bring back, or take away, another run of rows or columns than it was made for (a later step of
+      // this participant cut into the run).
+      const shape = (recs: readonly Rec[]): string => recs.map((rec) => (rec.w.t === 'ins' || rec.w.t === 'del' ? `${rec.w.t}${rec.w.x}${rec.w.n}` : rec.w.t === 'cells' ? `c${rec.w.c.length}` : rec.w.t)).join();
+      if (moved.recs && !moved.partial && shape(moved.recs) === shape(entry.recs)) entry.recs = moved.recs;
       else entry.gone = true;
     }
   }
@@ -538,9 +610,23 @@ export class CollabSession {
     const step = this.pendingSteps[0];
     this.flying = step.id;
     this.send({ t: 'op', base: this.confirmed, id: step.id, ops: encodeStep(step.recs.map((rec) => rec.w), this.host.workbook().styles) });
+    // A step that is neither placed nor refused for a long time: the connection is not what it seems.
+    if (this.flyTimer) this.flyTimer();
+    const id = step.id;
+    this.flyTimer = this.timer(() => {
+      this.flyTimer = undefined;
+      if (this.flying !== id || this.current !== 'online') return;
+      if (!this.slowSaid) {
+        this.slowSaid = true;
+        this.host.notice({ code: 'slow' });
+      }
+      this.flying = undefined;
+      if (!this.reconnect()) this.pump();
+    }, FLY_MS);
   }
 
   private checkSettled(): void {
+    if (this.pendingSteps.length === 0 && this.wanted.length > 0 && this.current === 'online') this.runWanted();
     if (this.pendingSteps.length > 0 || this.settled.length === 0) return;
     const waiting = this.settled;
     this.settled = [];
@@ -639,6 +725,16 @@ export class CollabSession {
     } catch {
       return this.fatal('peer');
     }
+    try {
+      this.handle(message);
+    } catch (error) {
+      // Nothing that arrives may throw out of here. The workbook is kept as it is, apart from the room.
+      const now = this.current as CollabState;
+      if (now !== 'closed' && now !== 'detached') this.detach();
+    }
+  }
+
+  private handle(message: ReturnType<typeof parseServerMessage>): void {
     switch (message.t) {
       case 'hello': {
         // The log from before where this side is brings steps it has, which are passed over; one that starts
@@ -684,10 +780,12 @@ export class CollabSession {
         // This participant's own step, as the relay placed it: by its name and by what it says. A step that
         // only has the name (anybody can read the names) is someone else's.
         if (this.pendingSteps.length > 0 && this.pendingSteps[0].id === message.id && this.sameAsFirst(message.ops)) {
-          this.pendingSteps.shift();
+          const mine = this.pendingSteps.shift() as Step;
           this.stats.placed++;
           this.confirmed = message.rev;
           this.flying = undefined;
+          this.slowSaid = false;
+          this.settle(mine);
           if (this.pendingSteps.length < BACKLOG_NOTICE) this.backlogSaid = false;
         } else if (!this.remote(message.ops)) return;
         else this.confirmed = message.rev;
@@ -753,6 +851,8 @@ export class CollabSession {
         return;
       case 'error':
         // The relay still holds the connection this one takes the place of (it has not noticed yet that it is gone): tried again a little later.
+        // This side's own new connection took the place of this one: nothing to say.
+        if (message.code === 'replaced') return;
         if (message.code === 'key-taken' && this.keyTries++ < 5) {
           this.timer(() => {
             if (this.current !== 'closed' && this.current !== 'detached') this.reconnect();
@@ -777,7 +877,8 @@ export class CollabSession {
 
   private sameAsFirst(ops: unknown[]): boolean {
     const step = this.pendingSteps[0];
-    return JSON.stringify(encodeStep(step.recs.map((rec) => rec.w), this.host.workbook().styles)) === JSON.stringify(ops);
+    // As values, not as text: a relay may write the same operations with their members in another order.
+    return stable(encodeStep(step.recs.map((rec) => rec.w), this.host.workbook().styles)) === stable(ops);
   }
 
   /** Takes every pending step back and forgets it. */
@@ -791,7 +892,6 @@ export class CollabSession {
     for (let i = this.pendingSteps.length - 1; i >= 0; i--) {
       const step = this.pendingSteps[i];
       for (const op of step.inverse) applyOp(workbook, op);
-      this.forget(step.entry);
     }
     this.pendingSteps = [];
     this.flying = undefined;
@@ -806,14 +906,6 @@ export class CollabSession {
     if (this.badStepSaid) return;
     this.badStepSaid = true;
     this.host.notice({ code: 'bad-step' });
-  }
-
-  private forget(entry: StackEntry | undefined): void {
-    if (!entry) return;
-    for (const stack of [this.undoStack, this.redoStack]) {
-      const at = stack.indexOf(entry);
-      if (at >= 0) stack.splice(at, 1);
-    }
   }
 
   /**
@@ -837,7 +929,10 @@ export class CollabSession {
 
   private detach(): void {
     // What waited is in the workbook, and stays there; nobody will be told of it.
+    for (const step of this.pendingSteps) this.settle(step);
     this.pendingSteps = [];
+    this.wanted = [];
+    this.lastSaved = undefined;
     this.flying = undefined;
     this.joined = false;
     this.resyncing = false;
@@ -886,6 +981,8 @@ export class CollabSession {
     if (!reload || ++this.reloads > MAX_RELOADS) return this.fatal('stale');
     const lost = this.pendingSteps.length;
     this.reloading = true;
+    this.wanted = [];
+    this.lastSaved = undefined;
     this.pendingSteps = [];
     this.flying = undefined;
     this.undoStack = [];
@@ -938,6 +1035,9 @@ export class CollabSession {
     try {
       wires = decodeStep(raw, workbook.styles);
     } catch (error) {
+      // No room for its formats here, which says nothing of the others: the step cannot be passed over (they
+      // apply it), and cannot be applied. The workbook leaves the room as it is.
+      if (error instanceof StyleTableFull) throw error;
       if (!(error instanceof WireError) && !(error instanceof RangeError)) throw error;
       // No step of a workbook. Everybody reads it the same way and passes it over; the room goes on.
       this.badStep();
@@ -967,54 +1067,69 @@ export class CollabSession {
     }
 
     let carry: Carry[] = theirs.map(carryOf);
+    // What undoes the steps the relay has placed is about the workbook without the waiting steps: it is read
+    // through what arrived, as it arrived, and gives way wherever that changed the same thing.
+    this.throughStack(this.undoStack, carry, true);
+    this.throughStack(this.redoStack, carry, true);
+    this.movePresences(carry);
     const kept: Step[] = [];
-    const fresh = new Set<StackEntry>();
     let dropped = 0;
     let partial = 0;
+    let undone = 0;
+    let rest = false;
     for (const step of pending) {
-      const moved = transformStep(step.recs, carry);
+      // An undoing that waits gives way like any undoing: where someone else changed the same thing it is not applied at all.
+      const undoing = step.kind !== 'edit';
+      const moved = rest ? undefined : transformStep(step.recs, carry, undoing);
       let done: ReturnType<CollabSession['applyRecs']> | undefined;
-      if (moved.recs) {
+      if (moved && moved.recs && !(undoing && moved.partial)) {
         try {
           done = this.applyRecs(workbook, moved.recs);
         } catch (error) {
           if (!(error instanceof RangeError)) throw error;
         }
       }
-      if (done) {
+      if (moved && done) {
         step.recs = done.recs;
         step.inverse = done.inverse;
-        if (step.entry) {
-          step.entry.recs = done.undo;
-          step.entry.lossy = done.lossy;
-          fresh.add(step.entry);
+        step.undo = done.undo;
+        // Rows or columns that came or went while rows or columns of the same sheet came or went beside them: what
+        // taking them back would have to bring back is not known to come out right. Such a step is not one to undo.
+        for (const rec of done.recs) {
+          if (rec.w.t !== 'ins' && rec.w.t !== 'del') continue;
+          const sheet = rec.w.s;
+          if (carry.some((item) => item.sh !== undefined && item.sh.k === 'rc' && item.sh.s === sheet)) step.undo = null;
         }
+        step.lossy = done.lossy;
         step.change = done.change;
         merge(done.change);
         if (moved.partial) partial++;
         carry = moved.carry;
         kept.push(step);
-      } else {
-        if (!moved.noop) dropped++;
-        else this.stats.quiet++;
-        this.forget(step.entry);
-        if (this.flying === step.id) this.flying = undefined;
-        // What was made after it was made on a workbook that had it.
-        const back: Carry[] = [];
-        for (let i = step.recs.length - 1; i >= 0; i--) {
-          const sh = shiftOf(step.recs[i].w, step.recs[i].nm, step.recs[i].wide);
-          if (sh) back.push({ sh: inverseShift(sh) });
-        }
-        carry = back.concat(carry);
+        continue;
       }
+      if (moved && moved.noop) this.stats.quiet++;
+      else {
+        this.stats.dropped++;
+        if (undoing) undone++;
+        else dropped++;
+      }
+      if (this.flying === step.id) this.flying = undefined;
+      // Where the steps that were made after it belong cannot be told any more: they go with it.
+      if (moved && moved.poison) rest = true;
+      if (rest) continue;
+      // What was made after it was made on a workbook that had it.
+      const back: Carry[] = [];
+      for (let i = step.recs.length - 1; i >= 0; i--) {
+        const sh = shiftOf(step.recs[i].w, step.recs[i].nm, step.recs[i].wide);
+        if (sh) back.push({ sh: inverseShift(sh) });
+      }
+      carry = back.concat(carry);
     }
     this.pendingSteps = kept;
-    this.throughStack(this.undoStack, carry, true, fresh);
-    this.throughStack(this.redoStack, carry, true, fresh);
-    this.movePresences(carry);
     for (const item of carry) if (item.sh) change.shifts.push(item.sh);
-    this.stats.dropped += dropped;
     if (dropped > 0) this.host.notice({ code: 'dropped', count: dropped });
+    if (undone > 0) this.host.notice({ code: 'undo-gone', count: undone });
     if (partial > 0) this.host.notice({ code: 'partial', count: partial });
     this.host.changed(change);
     return true;

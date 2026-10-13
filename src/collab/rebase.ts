@@ -328,6 +328,11 @@ export function mapRec(rec: Rec, shift: Shift, first = false): Mapped {
       }
       if (!onSheet || shift.k !== 'rc' || shift.axis !== op.x) return moved(s === op.s ? op : { ...op, s }, nm);
       if (op.t === 'ins') return moved({ ...op, s, at: mapInsertion(op.at, shift, first) }, nm);
+      if (shift.ins && shift.at > op.at && shift.at < op.at + op.n && !first) {
+        // Rows that someone else put in between the rows that are to go were never seen by whoever deletes: they
+        // stay, and the rows on either side of them go - the lower ones first, which moves nothing above them.
+        return { recs: [{ w: { ...op, s, at: shift.at + shift.n, n: op.at + op.n - shift.at }, nm }, { w: { ...op, s, n: shift.at - op.at }, nm }] };
+      }
       const band = mapBand(op.at, op.n, shift);
       return band ? moved({ ...op, s, at: band[0], n: band[1] }, nm) : { noop: true };
     }
@@ -413,8 +418,7 @@ export function mapShift(shift: Shift, over: Shift): Shift[] {
       if (over.k === 'rc') {
         if (over.s !== shift.s || over.axis !== shift.axis) return [shift];
         if (shift.ins) {
-          // Rows put in inside a run that the other one deleted went with that run (see mapBand()).
-          if (!over.ins && shift.at > over.at && shift.at < over.at + over.n) return [];
+          // Rows put in inside a run that the step deleted stay (the step goes around them): they stand where the run was.
           return [{ ...shift, at: mapInsertion(shift.at, over, true) }];
         }
         if (over.ins && over.at > shift.at && over.at < shift.at + shift.n) {
@@ -505,6 +509,18 @@ const key = (row: number, col: number): number => row * MAX_COLS + col;
 function clash(op: WireOp, other: WireOp, undo: boolean): { drop: true } | { op: WireOp } | undefined {
   if (op.s !== other.s) return undefined;
   if (op.t === 'filter' && other.t === 'filter') return { drop: true };
+  // Cells that are merged and something that is written into them, either way round: what a merge empties is what
+  // its author saw, and what is written into a merged range may be hidden under it. No rule is known to be right.
+  const merged = op.t === 'merges' ? op : other.t === 'merges' ? other : undefined;
+  const written = op.t === 'cells' || op.t === 'notes' ? op : other.t === 'cells' || other.t === 'notes' ? other : undefined;
+  if (merged && written) {
+    // A note of a merged cell is the note of its first cell: where a note belongs depends on every merged range of its sheet.
+    if (written.t === 'notes') return { drop: true };
+    const places: [number, number][] = written.c.map((entry) => [entry[0], entry[1]]);
+    for (const range of merged.add) {
+      for (const [row, col] of places) if (row >= range[0] && row <= range[2] && col >= range[1] && col <= range[3]) return { drop: true };
+    }
+  }
   if (op.t === 'sort' && other.t === 'sort') {
     const apart = op.g[2] < other.g[0] || op.g[0] > other.g[2] || op.g[3] < other.g[1] || op.g[1] > other.g[3];
     return apart ? undefined : { drop: true };
@@ -550,6 +566,11 @@ export interface Transformed {
   partial: boolean;
   /** The step is dropped and nothing was lost: what it wanted is so already. */
   noop: boolean;
+  /**
+   * The step is dropped, and with it everything that was made after it: where those later steps
+   * belong cannot be told any more (a sheet was moved, or rows and a sort of one sheet met).
+   */
+  poison?: boolean;
 }
 
 /**
@@ -560,6 +581,19 @@ export interface Transformed {
 export function transformStep(recs: readonly Rec[], carry: readonly Carry[], undo = false): Transformed {
   let partial = false;
   let dropped = false;
+  let poison = false;
+  /**
+   * The meetings for which no rule is known to be right: a sheet that is moved beside anything that
+   * names a sheet by its place, and rows or columns that come or go on a sheet that is sorted beside
+   * them. The step is dropped, and what was made after it as well.
+   */
+  const unruled = (mine: Shift | undefined, other: Shift | undefined): boolean => {
+    if ((mine && mine.k === 'sMove') || (other && other.k === 'sMove')) return true;
+    if (!mine || !other) return false;
+    if (mine.k === 'rc' && other.k === 'perm') return mine.s === other.s;
+    if (mine.k === 'perm' && other.k === 'rc') return mine.s === other.s;
+    return false;
+  };
   /** One operation through a list of carried items; the items come back as they are to be read behind it. */
   const pass = (rec: Rec, items: readonly Carry[]): { recs: Rec[]; items: Carry[] } => {
     let cur = rec;
@@ -578,6 +612,27 @@ export function transformStep(recs: readonly Rec[], carry: readonly Carry[], und
         }
       }
       const mine = shiftOf(cur.w, cur.nm, cur.wide);
+      if (unruled(mine, item.sh)) {
+        dropped = true;
+        poison = true;
+        return { recs: [], items: [] };
+      }
+      // Taking rows or columns back (or bringing them back) after someone else put rows or columns into that sheet or
+      // took some away: where they belong, and what belongs into them, is not known to come out right. Not undone.
+      if (undo && mine && mine.k === 'rc' && item.sh && item.sh.k === 'rc' && item.sh.s === mine.s) {
+        dropped = true;
+        return { recs: [], items: [] };
+      }
+      // Merged ranges and rows or columns that come or go on their sheet, either way round: dropped as well.
+      if (cur.w.t === 'merges' && item.sh && item.sh.k === 'rc' && item.sh.s === cur.w.s) {
+        dropped = true;
+        return { recs: [], items: [] };
+      }
+      if (mine && mine.k === 'rc' && item.w && item.w.t === 'merges' && item.w.s === mine.s) {
+        dropped = true;
+        poison = true;
+        return { recs: [], items: [] };
+      }
       let result: Mapped = { rec: cur };
       if (item.sh) {
         result = mapRec(cur, item.sh, false);
@@ -618,7 +673,7 @@ export function transformStep(recs: readonly Rec[], carry: readonly Carry[], und
   const out: Rec[] = [];
   for (const rec of recs) {
     const done = pass(rec, over);
-    if (dropped) return { carry: carry.slice(), partial: false, noop: false };
+    if (dropped) return { carry: carry.slice(), partial: false, noop: false, poison };
     for (const made of done.recs) out.push(made);
     over = done.items;
   }

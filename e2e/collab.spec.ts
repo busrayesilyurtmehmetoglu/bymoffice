@@ -404,3 +404,56 @@ test('what one page is typing stays open while the other one writes, moves with 
   expect(await cell(b, 10, 3), 'nothing was written').toBe(null);
   clean(b);
 });
+
+test('a room that started anew detaches a page with unsaved work: the work stays, it says so, and after a save it joins again', async ({ page, context, request }) => {
+  const { a, b } = await pair(context, page, request, { saveTo: true });
+  await type(b, 0, 0, 'unsaved work');
+  await settled(b);
+  // The page goes offline; the relay forgets the room (as one that was started anew does); the page comes back.
+  await b.evaluate(() => (window as any).__transport.suspend());
+  await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'offline');
+  await a.evaluate(() => (window as any).__relay.roomsByKey.clear());
+  await b.evaluate(() => (window as any).__transport.resume());
+  await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'detached');
+  await expect(b.locator('#editor .bym-collab-state')).toHaveText('Detached: your changes are here only. Save the file');
+  expect(await cell(b, 0, 0), 'the work is still there').toBe('unsaved work');
+  expect(await notices(b)).toContainEqual(expect.stringMatching(/^error: The file was changed elsewhere, or the room was started anew.*Nothing was thrown away/));
+  await type(b, 1, 0, 'still editing');
+  expect(await b.evaluate(() => (window as any).__mounted.collab.pending), 'what is changed now is told to nobody').toBe(0);
+  // Saved: the file holds everything, and the page joins a room with it.
+  expect(await b.evaluate(() => (window as any).__mounted.saveNow()), 'the page saved').toBe(true);
+  await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'online');
+  expect(await cell(b, 1, 0)).toBe('still editing');
+  clean(b);
+});
+
+test('while the file is loaded again nothing can be typed into the workbook that is about to go', async ({ page, context, request }) => {
+  const { a, b, url } = await pair(context, page, request, { saveTo: true });
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let asked = 0;
+  await b.route(`**${url}`, async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    asked++;
+    await held;
+    await route.continue();
+  });
+  await b.evaluate(() => (window as any).__mounted.collab.reload());
+  await expect.poll(() => asked, { message: 'the file is asked for' }).toBe(1);
+  expect(await b.evaluate(() => (window as any).__mounted.view.readOnly), 'the view is closed to editing meanwhile').toBe(true);
+  expect(await notices(b)).toContainEqual(expect.stringMatching(/loaded again; it cannot be edited until that is done/));
+  await b.evaluate(() => {
+    try {
+      (window as any).__mounted.view.setCellInput(3, 0, 'typed into a workbook that goes');
+    } catch {
+      // Refusing with an error is as good as refusing without one.
+    }
+  });
+  expect(await cell(b, 3, 0), 'nothing was written').toBe(null);
+  release();
+  await expect.poll(() => b.evaluate(() => (window as any).__mounted.view.readOnly), { message: 'the file was loaded and the view can be edited again' }).toBe(false);
+  await online(b);
+  await type(b, 3, 0, 'typed afterwards');
+  await expect.poll(() => cell(a, 3, 0), { message: 'what is typed afterwards reaches the others' }).toBe('typed afterwards');
+  clean(b);
+});

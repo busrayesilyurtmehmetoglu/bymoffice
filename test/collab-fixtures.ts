@@ -104,6 +104,8 @@ export interface Member {
   changes: SessionChange[];
   /** Steps this participant made that were applied here (whether or not they stayed). */
   made: number;
+  /** The file being loaded again, while it is: for a test to wait for, in place of guessing how long it takes. */
+  loading?: Promise<void>;
 }
 
 /**
@@ -120,11 +122,18 @@ export async function join(net: Net, name: string, bytes: Uint8Array, options: P
       changed: (change) => member.changes.push(change),
       notice: (notice) => member.notices.push(notice),
       reload: reload
-        ? async () => {
-            const next = await reload();
-            member.file = await open(next);
-            member.wb = await member.file.workbook();
-            return [contentVersion(next)];
+        ? () => {
+            const load = (async () => {
+              const next = await reload();
+              member.file = await open(next);
+              member.wb = await member.file.workbook();
+              return [contentVersion(next)];
+            })();
+            member.loading = load.then(
+              () => new Promise<void>((resolve) => setImmediate(resolve)),
+              () => undefined,
+            );
+            return load;
           }
         : undefined,
     },
@@ -232,4 +241,23 @@ export function assertSame(members: Member[], label: string): void {
   for (let i = 1; i < texts.length; i++) {
     if (texts[i] !== texts[0]) assert.fail(`${label}: ${members[i].name} differs from ${members[0].name} ${firstDifference(texts[0], texts[i])}`);
   }
+}
+
+/**
+ * Delivers every message and waits for every file that is being loaded again, until nothing
+ * is on its way and nothing is loading: without guessing how many turns a load takes.
+ */
+export async function settleAll(net: Net, random: () => number, members: Member[]): Promise<void> {
+  for (let round = 0; round < 200; round++) {
+    net.drain(random);
+    const loads = members.map((member) => member.loading).filter((load): load is Promise<void> => load !== undefined);
+    for (const member of members) member.loading = undefined;
+    if (loads.length > 0) {
+      await Promise.all(loads);
+      continue;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (net.waiting === 0 && !members.some((member) => member.loading !== undefined)) return;
+  }
+  assert.fail('The loads never ran out');
 }

@@ -345,6 +345,7 @@ test('a conflict with a file that someone else saved while this save was on its 
   await settle();
   assert.equal(r.asked, 1, 'the user is asked');
   r.controller.adopt('"v9"', false);
-  assert.equal(await again, false, 'the question is taken away when someone else saved: the save did not happen');
-  assert.equal(r.controller.asking, false, 'nothing is asked any more');
+  assert.equal(r.controller.asking, true, 'the question stays open when someone else saved: whether to write over a file is the user\'s to say');
+  r.controller.dismissConflict();
+  assert.equal(await again, false, 'the save did not happen');
 });

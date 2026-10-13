@@ -330,12 +330,15 @@ export interface UiStrings {
     readOnly: string;
     detached: string;
     waiting: string;
+    undoWait: string;
+    slow: string;
+    updating: string;
     copySheet: string;
     tooLarge: string;
     unsupported: string;
     sheetDeleted(name: string): string;
     editGone: string;
-    formulaGone: string;
+    formulaGone(text: string): string;
     dialogClosed: string;
     document: string;
   };
@@ -872,7 +875,10 @@ export const STRINGS_EN: UiStrings = {
     unsupported: 'This cannot be done while the workbook is edited together.',
     sheetDeleted: (name) => `Sheet ${name} was deleted. This cannot be undone while the workbook is edited together.`,
     editGone: 'The cell you were typing in was deleted by someone else.',
-    formulaGone: 'Someone else moved cells or renamed a sheet while you were typing a formula: what you typed may have meant other cells, and was not applied.',
+    formulaGone: (text) => `Someone else moved cells or renamed a sheet while you were typing a formula: what you typed may have meant other cells, and was not applied. You typed: ${text}`,
+    undoWait: 'Undo has to wait until your last changes have arrived, and they have not yet: nothing was undone. Try again.',
+    slow: 'A change has been on its way for a long time; the connection is made anew.',
+    updating: 'The file was changed elsewhere and is loaded again; it cannot be edited until that is done.',
     dialogClosed: 'Someone else changed the sheet or its rules: the dialog was closed without applying anything.',
     document: 'Editing together is not available for documents yet.',
   },
@@ -1433,7 +1439,10 @@ export const STRINGS_TR: UiStrings = {
     unsupported: 'Bu, kitap birlikte düzenlenirken yapılamaz.',
     sheetDeleted: (name) => `${name} sayfası silindi. Kitap birlikte düzenlenirken bu geri alınamaz.`,
     editGone: 'Yazdığınız hücreyi başkası sildi.',
-    formulaGone: 'Siz formül yazarken başkası hücreleri kaydırdı ya da bir sayfayı yeniden adlandırdı: yazdığınız başka hücreleri kastediyor olabilirdi, uygulanmadı.',
+    formulaGone: (text) => `Siz formül yazarken başkası hücreleri kaydırdı ya da bir sayfayı yeniden adlandırdı: yazdığınız başka hücreleri kastediyor olabilirdi, uygulanmadı. Yazdığınız: ${text}`,
+    undoWait: 'Geri alma, son değişiklikleriniz yerine ulaşana dek bekler; henüz ulaşmadı: hiçbir şey geri alınmadı. Yeniden deneyin.',
+    slow: 'Bir değişiklik uzun süredir yolda; bağlantı yeniden kuruluyor.',
+    updating: 'Dosya başka yerde değişti ve yeniden yükleniyor; bitene dek düzenlenemez.',
     dialogClosed: 'Başkası sayfayı ya da kurallarını değiştirdi: kutu hiçbir şey uygulanmadan kapatıldı.',
     document: 'Birlikte düzenleme belgelerde henüz yok.',
   },

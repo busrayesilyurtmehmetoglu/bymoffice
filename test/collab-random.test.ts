@@ -93,7 +93,8 @@ function settle(net: Net, members: Member[], random: () => number): void {
 /** Every step a participant made was placed, or dropped and said. */
 function accounted(members: Member[], label: string): void {
   for (const member of members) {
-    const said = member.notices.filter((notice) => notice.code === 'dropped').reduce((sum, notice) => sum + (notice.count || 0), 0);
+    // A step that was dropped is said as that, and an undoing that was dropped as an undoing that is gone (with how many).
+    const said = member.notices.filter((notice) => notice.code === 'dropped' || (notice.code === 'undo-gone' && notice.count !== undefined)).reduce((sum, notice) => sum + (notice.count || 0), 0);
     const stats = member.session.stats;
     assert.equal(said, stats.dropped, `${label}: ${member.name} was told of every dropped step`);
     assert.equal(stats.placed + stats.dropped + stats.quiet, stats.made, `${label}: every step of ${member.name} was placed or dropped`);
@@ -166,8 +167,9 @@ export async function run(seed: number, options: { files?: boolean; late?: boole
     for (const notice of member.notices) tally(`notice ${notice.code}`);
   }
   // Everybody takes back what can be taken back.
-  for (let round = 0; round < 3; round++) {
-    for (const member of members) for (let i = 0; i < 300 && member.session.canUndo; i++) member.session.undo();
+  // An undoing waits until the steps of its participant are placed: one at a time, with the messages delivered in between.
+  for (let round = 0; round < 400 && members.some((member) => member.session.canUndo); round++) {
+    for (const member of members) if (member.session.canUndo) member.session.undo();
     net.drain(random);
   }
   settle(net, members, random);

@@ -39,8 +39,11 @@ test(`a step and its undoing leave what the history leaves, or it is said (${SEE
     let last: string | undefined;
     let same = true;
     for (let i = 0; i <= before && same; i++) {
+      const made = member.session.stats.made;
       last = change(member, ours);
       const other = change({ wb: plain, name: 'p' }, theirs, onHistory);
+      // A change that changes nothing (the text a cell has already) is a step of the history and none of the session: such a run says nothing.
+      if (last !== undefined && member.session.stats.made === made) same = false;
       // A paste whose rules are left out is another step than the one of the history: such a run says nothing.
       if (last !== other || canon(member.wb) !== canon(plain)) same = false;
     }

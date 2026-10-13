@@ -16,33 +16,59 @@
 // connections, rooms, logs and rates) keep a client from using up the process;
 // they do not decide who may come in.
 //
-// A room is the path the request resolves to (without the query) plus the
-// `room` of the `join` message. It has a revision `rev` that starts at 0, a log
-// of the operations that made the revisions after `floor`, a version of the
-// protocol `pv` (that of the first to join it) and a small table that says at
-// which revision a version of the file (an ETag, a hash: any text) was
-// saved. An operation is accepted only when its `base` is the room's `rev`;
-// otherwise its sender gets a `nack` and tries again on top of what it missed.
-// What the table says of a version is written once and never changed: the
-// versions the room was founded on are revision 0 for as long as it lives.
+// A room is the path of the request plus the `room` of the `join` message. The
+// path is taken as it resolves (`/x/../y` is `/y`), without the query, with
+// every segment percent-decoded: `/p/%61` and `/p/a` are one room. A path that
+// cannot be decoded, or in which a decoded segment holds `/`, `\`, `#` or a
+// control character, or is `.` or `..`, is answered with 400. `path` and
+// `authorize` see the decoded path.
+//
+// A room has a revision `rev` that starts at 0, a log of the operations that
+// made the revisions after `floor`, a version of the protocol `pv` (that of the
+// first to join it) and a small table that says at which revision a version of
+// the file (an ETag, a hash: any text) was saved. An operation is accepted only
+// when its `base` is the room's `rev`; otherwise its sender gets a `nack` and
+// tries again on top of what it missed.
+//
+// The table of versions. What it says of a version is written once and never
+// changed: the versions the room was founded on are revision 0 for as long as
+// it lives. It holds sixteen versions; the oldest save makes room, the versions
+// of the foundation and those of the last save that was written never do. A
+// version that left the table (it was full, or the log moved past its
+// revision) is remembered, and is never written again at any revision: whoever
+// joins with it gets `reset`. A room remembers `maxEvictedVersions` of them;
+// from then on it writes no new version at all. A `saved` whose revision the
+// table contradicts, that names a version that left, that comes after the room
+// stopped writing or faster than `savedPerMinute` for its connection, is passed
+// on WITHOUT its `rev`, and writes nothing.
 //
 // A connection is in one room at most, and joins it once. A `join` may carry a
-// `key`; every operation of the connection must then be named `<key>:...`, and
-// a connection without a key writes nothing. Two connections of a room never
-// have the same key at the same time.
+// `key`: a SECRET of the client, that the relay puts in no message, in no line
+// of its log and not in `rooms()`. A join that gets in with the key of a
+// connection that is in the room takes its place: the old connection is told
+// `replaced` and closed. That is how a client that lost its connection gets
+// back in before the relay has noticed. The `id` of an operation is any text
+// the client likes; it is passed on and means nothing to the relay.
+//
+// The relay passes the operations on in the very text they came in. It looks at
+// one thing: an operation that opens with `{ "t": "st", "f": [...] }` adds
+// formats to the file, and a connection adds `formatsPerMinute` of them (the
+// length of `f`); over it the operation is refused with `nack`, reason `rate`.
 //
 // The four rules of `join`, tried in this order:
 //   a. `since` is given and floor <= since <= rev: the connection is caught up
 //      from `since` (it has seen everything up to there).
-//   b. one of its versions `v` is known and was saved at a revision that is
-//      still in the log: it is caught up from that revision (the newest match).
+//   b. one of its versions `v` is in the table and was saved at a revision that
+//      is still in the log: it is caught up from that revision (the newest
+//      match).
 //   c. the room is fresh (rev 0, nobody else in it): its versions are written
 //      down as revision 0 and it starts from there.
 //   d. otherwise it gets `reset` with the newest versions the room knows. It
 //      stays connected but is in no room until it has loaded that file and
-//      joined the same room again, for which it has `joinTimeoutMs`. Those who
-//      are in the room are sent `sync`: a save of theirs gives the newcomer a
-//      version to load.
+//      joined the same room again, for which it has `joinTimeoutMs`. If it may
+//      write (it did not ask for `ro`, and `authorize` did not say read-only),
+//      those in the room who may write are sent `sync`: a save of theirs gives
+//      the newcomer a version to load. A room is asked `syncPerMinute` times.
 //
 // Use as a library:
 //   import { createCollabServer } from './collab-server.mjs';
@@ -76,10 +102,18 @@ const MAX_TOKEN_LENGTH = 4096;
 const MAX_OP_ID = 100;
 /** Ten thousand operations and the table of formats that may come with them. */
 const MAX_OPS_PER_MESSAGE = 10001;
+/**
+ * How deep the lists and objects of `ops` may be nested, `ops` itself counted.
+ * The relay passes the text on without building it again, so nothing else
+ * would keep a text from the clients that their parsers cannot walk.
+ */
+const MAX_OPS_DEPTH = 256;
 const MAX_PROTOCOL_VERSION = 1000;
-const USER_KEY = /^[A-Za-z0-9_-]{1,40}$/;
+const USER_KEY = /^[A-Za-z0-9_-]{1,64}$/;
 /** A segment of a path that is `.` or `..` with a dot that is written `%2e`. */
 const ENCODED_DOT_SEGMENT = /(?:^|[/\\])(?:%2e\.?|\.%2e|%2e%2e)(?=[/\\]|$)/i;
+/** What a segment of a path may not hold once it is decoded: separators, the mark of a room, control characters. */
+const FORBIDDEN_IN_SEGMENT = /[/\\#\u0000-\u001f\u007f-\u009f]/;
 const MAX_PRESENCE_BYTES = 16 * 1024;
 /** How long a connection that was sent a close frame may take to go away. */
 const CLOSE_LINGER_MS = 2000;
@@ -105,7 +139,14 @@ const DEFAULTS = {
   opsBurst: 200,
   /** 0: no limit. */
   presencePerSecond: 20,
-  syncIntervalMs: 5000,
+  /** 0: no limit. */
+  syncPerMinute: 2,
+  /** 0: no limit. */
+  savedPerMinute: 6,
+  /** 0: no limit. */
+  formatsPerMinute: 2000,
+  /** 0: no save is ever written down. */
+  maxEvictedVersions: 4096,
 };
 
 const WARNING =
@@ -118,18 +159,29 @@ const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 function noop() {}
 
 /** Milliseconds that only go forward. */
-function now() {
+function monotonic() {
   return performance.now();
 }
 
-/** A bucket of `burst` tokens that fills at `rate` a second; false when it is empty. */
-function takeToken(bucket, rate, burst) {
-  const time = now();
-  bucket.tokens = Math.min(burst, bucket.tokens + ((time - bucket.at) * rate) / 1000);
-  bucket.at = time;
-  if (bucket.tokens < 1) return false;
-  bucket.tokens -= 1;
-  return true;
+/**
+ * The path of a request with every segment decoded, so that a room has one
+ * name however its path is spelled; null when a segment cannot be decoded or
+ * would not be one segment any more (see FORBIDDEN_IN_SEGMENT), or is a dot
+ * segment after all.
+ */
+function decodePath(pathname) {
+  const segments = pathname.split('/');
+  for (let index = 0; index < segments.length; index++) {
+    let segment;
+    try {
+      segment = decodeURIComponent(segments[index]);
+    } catch {
+      return null;
+    }
+    if (segment === '.' || segment === '..' || FORBIDDEN_IN_SEGMENT.test(segment)) return null;
+    segments[index] = segment;
+  }
+  return segments.join('/');
 }
 
 function isObject(value) {
@@ -138,6 +190,96 @@ function isObject(value) {
 
 function isCount(value) {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Whether `code` is white space between the tokens of JSON. */
+function isJsonSpace(code) {
+  return code === 0x20 || code === 0x0a || code === 0x0d || code === 0x09;
+}
+
+/**
+ * The text of the value that the name `ops` has in `text`, an object that
+ * JSON.parse has read without complaint: the same value JSON.parse found (the
+ * last one, if the name is there more than once), as its sender wrote it, and
+ * how deep it is nested. Null when it is not found, which is not to happen.
+ *
+ * Only the outermost object is walked, with a counter and no recursion, and
+ * nothing is decided here that JSON.parse has not decided already.
+ */
+function rawOps(text) {
+  const length = text.length;
+  let at = 0;
+  /** The index after the string that opens at `from`. */
+  const afterString = (from) => {
+    let index = from + 1;
+    while (index < length) {
+      const code = text.charCodeAt(index);
+      if (code === 0x5c) index += 2;
+      else if (code === 0x22) return index + 1;
+      else index++;
+    }
+    return -1;
+  };
+  const skipSpace = () => {
+    while (at < length && isJsonSpace(text.charCodeAt(at))) at++;
+  };
+  skipSpace();
+  if (text.charCodeAt(at) !== 0x7b) return null;
+  at++;
+  let found = null;
+  for (;;) {
+    skipSpace();
+    const first = text.charCodeAt(at);
+    if (first === 0x7d) return found;
+    if (first === 0x2c) {
+      at++;
+      continue;
+    }
+    if (first !== 0x22) return null;
+    const nameEnd = afterString(at);
+    if (nameEnd < 0) return null;
+    const name = text.slice(at, nameEnd);
+    at = nameEnd;
+    skipSpace();
+    if (text.charCodeAt(at) !== 0x3a) return null;
+    at++;
+    skipSpace();
+    const start = at;
+    const opens = text.charCodeAt(at);
+    let deepest = 0;
+    if (opens === 0x22) {
+      at = afterString(at);
+      if (at < 0) return null;
+    } else if (opens === 0x5b || opens === 0x7b) {
+      let depth = 0;
+      while (at < length) {
+        const code = text.charCodeAt(at);
+        if (code === 0x22) {
+          at = afterString(at);
+          if (at < 0) return null;
+          continue;
+        }
+        if (code === 0x5b || code === 0x7b) {
+          depth++;
+          if (depth > deepest) deepest = depth;
+        } else if (code === 0x5d || code === 0x7d) depth--;
+        at++;
+        if (depth === 0) break;
+      }
+      if (depth !== 0) return null;
+    } else {
+      // A number, true, false or null: it ends where the next token begins.
+      while (at < length) {
+        const code = text.charCodeAt(at);
+        if (code === 0x2c || code === 0x7d || isJsonSpace(code)) break;
+        at++;
+      }
+    }
+    // A name may be written with escapes: `"\u006fps"` is `ops` as well.
+    if (name === '"ops"' || (name.includes('\\') && JSON.parse(name) === 'ops')) {
+      found = { text: text.slice(start, at), depth: deepest };
+    }
+  }
 }
 
 /** A server frame: never masked, never fragmented. */
@@ -195,6 +337,7 @@ function readOptions(options) {
   out.origins = Array.isArray(options.origins) ? options.origins.map(String) : null;
   out.authorize = typeof options.authorize === 'function' ? options.authorize : null;
   out.log = typeof options.log === 'function' ? options.log : null;
+  out.now = typeof options.now === 'function' ? options.now : monotonic;
   return out;
 }
 
@@ -215,6 +358,25 @@ export function createCollabServer(options = {}) {
   let warned = false;
   const opsBurst = Math.max(1, opt.opsBurst);
   const presenceBurst = Math.max(1, Math.ceil(opt.presencePerSecond));
+  const syncBurst = Math.max(1, Math.ceil(opt.syncPerMinute));
+  const savedBurst = Math.max(1, Math.ceil(opt.savedPerMinute));
+  const formatsBurst = Math.max(1, Math.ceil(opt.formatsPerMinute));
+  const now = opt.now;
+
+  /**
+   * A bucket of `burst` tokens that fills at `rate` a second; false when it
+   * holds fewer than `count`, and then nothing is taken.
+   */
+  function takeToken(bucket, rate, burst, count = 1) {
+    const time = now();
+    // A clock that is handed in may stand still or step back; the bucket does not empty for it.
+    const passed = time > bucket.at ? time - bucket.at : 0;
+    bucket.tokens = Math.min(burst, bucket.tokens + (passed * rate) / 1000);
+    bucket.at = time;
+    if (bucket.tokens < count) return false;
+    bucket.tokens -= count;
+    return true;
+  }
   /** The servers whose upgrades are served → the listener that was added. */
   const attached = new Map();
   let ownServer = null;
@@ -266,7 +428,10 @@ export function createCollabServer(options = {}) {
     if (target.includes('#') || ENCODED_DOT_SEGMENT.test(mark < 0 ? target : target.slice(0, mark))) {
       return refuse(socket, 400, 'Bad Request');
     }
-    const pathname = url.pathname;
+    // One room, one name: `/p/%61` is `/p/a`. The prefix is looked for in the
+    // decoded path, and so is everything that is said of the path from here on.
+    const pathname = decodePath(url.pathname);
+    if (pathname === null) return refuse(socket, 400, 'Bad Request');
     if (opt.path && !pathname.startsWith(opt.path)) {
       // Somebody else may be serving this path on the same server.
       if (server.listenerCount('upgrade') > 1) {
@@ -287,7 +452,7 @@ export function createCollabServer(options = {}) {
       headers['sec-websocket-version'] === '13' &&
       typeof key === 'string' &&
       /^[A-Za-z0-9+/]{22}==$/.test(key) &&
-      pathname.length <= MAX_PATH_LENGTH;
+      url.pathname.length <= MAX_PATH_LENGTH;
     if (!wanted) return refuse(socket, 400, 'Bad Request', 'Sec-WebSocket-Version: 13\r\n');
     const origin = typeof headers.origin === 'string' ? headers.origin : undefined;
     if (opt.origins && (origin === undefined || !opt.origins.includes(origin))) {
@@ -318,12 +483,14 @@ export function createCollabServer(options = {}) {
       room: null,
       /** The key of the room a `join` of it was answered with `reset`: the only room it may still join. */
       resetFrom: null,
-      /** The `key` of its join: what the ids of its operations start with. */
+      /** The `key` of its join, while it is in a room: a secret, said to nobody. */
       key: undefined,
       /** The revision it joined from: what came before, it has not seen. */
       from: 0,
       opTokens: { tokens: opsBurst, at: now() },
       presenceTokens: { tokens: presenceBurst, at: now() },
+      savedTokens: { tokens: savedBurst, at: now() },
+      formatTokens: { tokens: formatsBurst, at: now() },
       /** A `join` was received: the first message has been what it must be. */
       greeted: false,
       ro: false,
@@ -401,11 +568,14 @@ export function createCollabServer(options = {}) {
     }
   }
 
-  /** What an error says, without the token of the connection if it found its way in. */
-  function describe(error, conn, token) {
+  /** What an error says, without the token and the key of the connection if they found their way in. */
+  function describe(error, conn, token, key) {
     let text = String((error && error.message) || error);
     for (const secret of [token, conn.queryToken]) {
       if (typeof secret === 'string' && secret) text = text.split(secret).join('[token]');
+    }
+    for (const secret of [key, conn.key]) {
+      if (typeof secret === 'string' && secret) text = text.split(secret).join('[key]');
     }
     return text.slice(0, 300);
   }
@@ -666,6 +836,7 @@ export function createCollabServer(options = {}) {
     const room = conn.room;
     if (!room) return;
     conn.room = null;
+    conn.key = undefined;
     conn.presence = undefined;
     conn.hasPresence = false;
     room.conns.delete(conn);
@@ -686,15 +857,33 @@ export function createCollabServer(options = {}) {
     room.idleTimer.unref();
   }
 
-  /** Writes down where a version was saved. What is written is never written again. */
+  /**
+   * Remembers that a version left the table: it is never written again. Once
+   * the room remembers as many as it may, it writes no version at all any more
+   * (see `sealed`), and so has no need to remember what leaves after that.
+   */
+  function forget(room, version) {
+    if (room.evicted.size < opt.maxEvictedVersions) room.evicted.add(version);
+  }
+
+  /** The room can no longer tell a version that left its table from one it never had: nothing new is written. */
+  function sealed(room) {
+    return room.evicted.size >= opt.maxEvictedVersions;
+  }
+
+  /**
+   * Writes down where a version was saved. The oldest save makes room in a
+   * full table; the versions the room was founded on and those of the save
+   * that is being written (`room.lastSaved`) never do.
+   */
   function setVersion(room, version, rev) {
     if (room.versions.has(version) || room.founding.has(version)) return;
     room.versions.set(version, rev);
     if (room.versions.size <= MAX_VERSIONS_PER_ROOM) return;
-    // The oldest save makes room; the versions the room was founded on stay.
     for (const old of room.versions.keys()) {
-      if (room.founding.has(old)) continue;
+      if (room.founding.has(old) || room.lastSaved.has(old)) continue;
       room.versions.delete(old);
+      forget(room, old);
       return;
     }
   }
@@ -727,9 +916,12 @@ export function createCollabServer(options = {}) {
     room.floor = room.log[count - 1].rev;
     room.log.splice(0, count);
     // A version that was founded on stays in `founding`: it cannot be joined
-    // from any more, and it cannot be given another revision either.
+    // from any more, and it cannot be given another revision either. Neither
+    // can a version of a save, which is remembered as one that left.
     for (const [version, rev] of room.versions) {
-      if (rev < room.floor) room.versions.delete(version);
+      if (rev >= room.floor) continue;
+      room.versions.delete(version);
+      if (!room.founding.has(version)) forget(room, version);
     }
   }
 
@@ -786,14 +978,14 @@ export function createCollabServer(options = {}) {
     let fine;
     try {
       if (message.t === 'join') fine = onJoin(conn, message);
-      else if (message.t === 'op') fine = onOp(conn, message);
+      else if (message.t === 'op') fine = onOp(conn, message, text);
       else if (message.t === 'presence') fine = onPresence(conn, message);
       else if (message.t === 'saved') fine = onSaved(conn, message);
       else if (message.t === 'ping') fine = send(conn, { t: 'pong' }) || true;
       else fine = false;
     } catch (error) {
       // What cannot be written back (too deep for the stack, say) is refused.
-      log({ type: 'error', id: conn.id, message: describe(error, conn, message.token) });
+      log({ type: 'error', id: conn.id, message: describe(error, conn, message.token, message.key) });
       fine = false;
     }
     if (fine === false) fail(conn, 'bad-message', 1008);
@@ -861,7 +1053,7 @@ export function createCollabServer(options = {}) {
           conn.socket.resume();
           while (conn.held.length && !conn.blocked && !conn.dead && !conn.closing) feed(conn, conn.held.shift());
         } catch (error) {
-          log({ type: 'error', id: conn.id, message: describe(error, conn, token) });
+          log({ type: 'error', id: conn.id, message: describe(error, conn, token, userKey) });
           drop(conn, 'error');
         }
       });
@@ -875,21 +1067,22 @@ export function createCollabServer(options = {}) {
       return true;
     }
     const known = rooms.get(join.key);
+    // The connection of the room that joined with the same key: whoever knows
+    // the key is that client, come back, and takes its place if it gets in.
+    let holder = null;
     if (known) {
       if (known.pv !== join.pv) {
         fail(conn, 'version', 1008);
         return true;
       }
-      if (known.conns.size >= opt.maxConnectionsPerRoom) {
-        fail(conn, 'room-full', 1013);
-        return true;
-      }
       if (join.userKey !== undefined) {
         for (const other of known.conns) {
-          if (other.key !== join.userKey) continue;
-          fail(conn, 'key-taken', 1008);
-          return true;
+          if (other.key === join.userKey) holder = other;
         }
+      }
+      if (known.conns.size - (holder ? 1 : 0) >= opt.maxConnectionsPerRoom) {
+        fail(conn, 'room-full', 1013);
+        return true;
       }
     } else if (rooms.size >= opt.maxRooms) {
       fail(conn, 'server-full', 1013);
@@ -907,9 +1100,13 @@ export function createCollabServer(options = {}) {
       versions: new Map(),
       /** The versions of the first to come: revision 0, whatever anyone says later. */
       founding: new Set(),
+      /** Versions that left the table (it was full, or the log moved past them): never written again. */
+      evicted: new Set(),
+      /** The versions of the last save that was written down: they do not make room in a full table. */
+      lastSaved: new Set(),
       conns: new Set(),
       idleTimer: null,
-      lastSync: -Infinity,
+      syncTokens: { tokens: syncBurst, at: now() },
     };
 
     const fresh = room.rev === 0 && room.conns.size === 0;
@@ -929,10 +1126,18 @@ export function createCollabServer(options = {}) {
       if (from >= 0) {
         matched = versions.filter((version) => room.versions.get(version) === from);
       } else if (fresh) {
-        // Nothing was written here yet: the room is founded again.
+        // Nothing was written here yet: the room is founded again. What it
+        // knew until now leaves the table like any other version.
+        for (const version of [...room.versions.keys(), ...room.founding]) {
+          if (!versions.includes(version)) forget(room, version);
+        }
         room.versions.clear();
+        room.lastSaved = new Set();
         room.founding = new Set(versions);
-        for (const version of versions) room.versions.set(version, 0);
+        for (const version of versions) {
+          room.versions.set(version, 0);
+          room.evicted.delete(version);
+        }
         from = 0;
         matched = versions;
       }
@@ -943,15 +1148,19 @@ export function createCollabServer(options = {}) {
       conn.resetFrom = room.key;
       startJoinTimer(conn);
       send(conn, { t: 'reset', rev: room.rev, v: latestVersions(room) });
-      // Those who are in the room are asked to save: what they save is a
-      // version the newcomer can load.
-      const time = now();
-      if (room.conns.size && time - room.lastSync >= opt.syncIntervalMs) {
-        room.lastSync = time;
-        broadcast(room, { t: 'sync' });
+      // Those who can save are asked to: what they save is a version the
+      // newcomer can load. Only one who could write is worth a save of the
+      // room, and the room is asked only so often, whoever is turned back.
+      if (!join.ro && verdict.readOnly !== true) {
+        const writers = [...room.conns].filter((other) => !other.ro);
+        if (writers.length && (!(opt.syncPerMinute > 0) || takeToken(room.syncTokens, opt.syncPerMinute / 60, syncBurst))) {
+          const frame = encodeMessage({ t: 'sync' });
+          for (const other of writers) write(other, frame);
+        }
       }
       return true;
     }
+    if (holder) fail(holder, 'replaced', 1008);
     if (!known) {
       rooms.set(room.key, room);
       log({ type: 'room-created', room: room.key, pv: room.pv });
@@ -987,11 +1196,13 @@ export function createCollabServer(options = {}) {
     return true;
   }
 
-  function onOp(conn, message) {
+  function onOp(conn, message, text) {
     const { base, id, ops } = message;
     if (!isCount(base)) return false;
     if (typeof id !== 'string' || id.length < 1 || id.length > MAX_OP_ID) return false;
     if (!Array.isArray(ops) || ops.length < 1 || ops.length > MAX_OPS_PER_MESSAGE) return false;
+    const raw = rawOps(text);
+    if (raw && raw.depth > MAX_OPS_DEPTH) return false;
     const room = conn.room;
     if (!room) return true;
     const nack = (reason) => {
@@ -1001,11 +1212,20 @@ export function createCollabServer(options = {}) {
     if (conn.ro) return nack('read-only');
     // Every attempt to write is counted, whatever becomes of it.
     if (opt.opsPerSecond > 0 && !takeToken(conn.opTokens, opt.opsPerSecond, opsBurst)) return nack('rate');
-    // An id says whose operation it is: nobody writes under the key of another.
-    if (conn.key === undefined || !id.startsWith(`${conn.key}:`)) return nack('id');
     if (base !== room.rev) return nack();
-    // The operations are written back as they were read; nothing looks inside.
-    const frame = encodeMessage({ t: 'op', rev: room.rev + 1, id, from: conn.id, ops });
+    // The one thing that is looked at: an operation that opens with a table of
+    // formats, `{ "t": "st", "f": [...] }`, adds that many formats to the file
+    // of everyone, and a connection adds only so many a minute. Counted when
+    // the operation would be placed: one that is sent again costs once.
+    const table = ops[0];
+    if (opt.formatsPerMinute > 0 && isObject(table) && table.t === 'st' && Array.isArray(table.f)) {
+      if (!takeToken(conn.formatTokens, opt.formatsPerMinute / 60, formatsBurst, table.f.length)) return nack('rate');
+    }
+    // The operations go out in the very text they came in (every number, every
+    // name in its place); only when that text is not found are they written
+    // back as they were read.
+    const head = `{"t":"op","rev":${room.rev + 1},"id":${JSON.stringify(id)},"from":${JSON.stringify(conn.id)},"ops":`;
+    const frame = encodeFrame(OP_TEXT, Buffer.from(`${head}${raw ? raw.text : JSON.stringify(ops)}}`, 'utf8'));
     room.rev++;
     room.log.push({ rev: room.rev, id, from: conn.id, frame, bytes: frame.length, sequence: ++logSequence });
     room.logBytes += frame.length;
@@ -1045,11 +1265,23 @@ export function createCollabServer(options = {}) {
     const rev = message.rev;
     // A revision is believed only when its sender has seen it (it joined at or
     // before it) and when the table does not say otherwise of one of the
-    // versions. What is not believed is passed on without the revision.
+    // versions: one that has another revision, or one that left the table.
+    // What is not believed is passed on without the revision.
     const seen = isCount(rev) && rev >= room.floor && rev >= conn.from && rev <= room.rev;
-    if (seen && versions.every((version) => (revisionOf(room, version) ?? rev) === rev)) {
-      for (const version of versions) setVersion(room, version, rev);
-      out.rev = rev;
+    if (seen && versions.every((version) => !room.evicted.has(version) && (revisionOf(room, version) ?? rev) === rev)) {
+      const unknown = versions.some((version) => revisionOf(room, version) === undefined);
+      if (!unknown) {
+        // It says what the table says: there is nothing to write.
+        out.rev = rev;
+      } else if (
+        !sealed(room) &&
+        // A connection has only so many saves a minute written down.
+        (!(opt.savedPerMinute > 0) || takeToken(conn.savedTokens, opt.savedPerMinute / 60, savedBurst))
+      ) {
+        room.lastSaved = new Set(versions);
+        for (const version of versions) setVersion(room, version, rev);
+        out.rev = rev;
+      }
     }
     broadcast(room, out, conn);
     return true;

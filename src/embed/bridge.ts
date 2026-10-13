@@ -1541,7 +1541,7 @@ export function createBridge(host: BridgeHost): Bridge {
       {
         workbook: () => book,
         changed: (change) => {
-          if (shown === current) view.collabChanged(change);
+          if (shown === current) view.collabChanged(change, change.local !== true);
         },
         notice: (said) => {
           if (shown === current) view.collabNotice(said);

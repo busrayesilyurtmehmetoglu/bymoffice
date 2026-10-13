@@ -2,7 +2,10 @@ import type { IncomingMessage, Server } from 'node:http';
 
 /** What `authorize` is asked. */
 export interface CollabAuthorizeRequest {
-  /** The key of the room: the path the request resolves to, then `#` and the `room` of the join if it named one. */
+  /**
+   * The key of the room: the path the request resolves to, with every segment percent-decoded (`/p/%61` is
+   * `/p/a`), then `#` and the `room` of the join if it named one. A decoded path never holds a `#`.
+   */
   room: string;
   /** The `token` of the join message, or else the `token` of the query. */
   token: string | undefined;
@@ -15,7 +18,7 @@ export interface CollabAuthorizeRequest {
 export type CollabVerdict = boolean | { readOnly?: boolean };
 
 /**
- * A line of diagnosis. It never carries a token. `{ type: 'warning', message }` is the relay saying that it
+ * A line of diagnosis. It never carries a token or the `key` of a join. `{ type: 'warning', message }` is the relay saying that it
  * was started without `authorize` and without `origins`.
  */
 export interface CollabLogEvent {
@@ -31,7 +34,10 @@ export interface CollabLogEvent {
  * `authorize` and without `origins` says so once (to `log`, or else to `console.warn`).
  */
 export interface CollabServerOptions {
-  /** Only paths that start with this are upgraded (the path as it resolves: `/a/../b` is `/b`). Default: every path. */
+  /**
+   * Only paths that start with this are upgraded (the path as it resolves and decoded: `/a/../b` is `/b`,
+   * `/%62` is `/b`). Default: every path.
+   */
   path?: string;
   /** The origins that are let in. Given, an upgrade from another origin or without one is answered with 403. */
   origins?: string[];
@@ -68,8 +74,31 @@ export interface CollabServerOptions {
   opsBurst?: number;
   /** Presence messages a connection may send a second; over it they are dropped. Default 20; 0 is no limit. */
   presencePerSecond?: number;
-  /** The least time between two `sync` messages to a room. Default 5 seconds. */
-  syncIntervalMs?: number;
+  /**
+   * How often a minute the writers of a room are sent `sync` (a bucket of as many tokens). Default 2; 0 is no
+   * limit.
+   */
+  syncPerMinute?: number;
+  /**
+   * Saves a minute of one connection that are written to the table of versions (a bucket of as many tokens);
+   * over it a `saved` is passed on without its `rev`. Default 6; 0 is no limit.
+   */
+  savedPerMinute?: number;
+  /**
+   * Formats a minute one connection may add: the length of `f` of an operation that opens with
+   * `{ "t": "st", "f": [...] }` (a bucket of as many tokens); over it the operation is refused with `nack`,
+   * reason `rate`. Default 2000; 0 is no limit.
+   */
+  formatsPerMinute?: number;
+  /**
+   * How many versions that left its table a room remembers, so that they are never written again. When it
+   * remembers that many it writes no new version at all. Default 4096; with 0 no save is ever written down.
+   */
+  maxEvictedVersions?: number;
+  /**
+   * The clock of the rates: milliseconds that only go forward. Default `performance.now()`. For tests.
+   */
+  now?(): number;
   /** Without it everyone who can reach the relay may read and write every room. */
   authorize?(request: CollabAuthorizeRequest): CollabVerdict | Promise<CollabVerdict>;
   log?(event: CollabLogEvent): void;

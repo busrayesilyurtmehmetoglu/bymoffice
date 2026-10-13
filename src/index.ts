@@ -31,6 +31,7 @@ import type { PdfExportOptions } from './pdf/export';
 import type { SheetPdfExportOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
 import { askOverwrite } from './ui/save-confirm';
+import { createSaveSync } from './collab/save-sync';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
 import {
   SaveController,
@@ -1398,27 +1399,6 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     else session.announceSaved(versions, written.rev);
   };
   /**
-   * Whether the file at the address that is saved to is known by this ETag now: what someone else
-   * says about a save is asked of the server before it is believed. Nothing of the file is fetched.
-   */
-  const storedAs = async (tag: string): Promise<boolean> => {
-    if (!saveTarget || saveTarget.kind !== 'request' || strongETag(tag) === undefined) return false;
-    const ask = (method: string, headers?: { [name: string]: string }): Promise<Response> => fetch(saveTarget.url, { method, cache: 'no-store', credentials: saveTarget.credentials, headers });
-    try {
-      let answer = await ask('HEAD');
-      if (answer.status === 405 || answer.status === 501) {
-        // A server without HEAD: the file is asked for only if it is another one.
-        answer = await ask('GET', { 'If-None-Match': tag });
-        const same = answer.status === 304 || (answer.ok && strongETag(answer.headers.get('ETag')) === tag);
-        if (answer.body) void answer.body.cancel().catch(() => undefined);
-        return same;
-      }
-      return answer.ok && strongETag(answer.headers.get('ETag')) === tag;
-    } catch {
-      return false;
-    }
-  };
-  /**
    * Writes the file while the workbook is edited together: once what was changed here has its
    * place in the common order (or after a short wait), and with what arrives held back until
    * the file is written, so that it is the workbook of one moment.
@@ -1684,7 +1664,20 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     /** The file is loaded again from its address and shown in place (the room is at a version this side does not have). */
     const reload = async (): Promise<string[]> => {
       if (typeof options.file !== 'string') throw new Error('The file has no address to load it from again');
-      const response = await fetch(options.file, { cache: 'no-store' });
+      // Until the file is there nothing is typed into the workbook that is about to go.
+      const editable = !view.readOnly;
+      if (editable) editor.setReadOnly(true);
+      view.showNotice(resolveUiStrings(options.locale).collab.updating, 'info');
+      try {
+        return await loadAgain();
+      } catch (error) {
+        if (editable) mounted.editor.setReadOnly(false);
+        throw error;
+      }
+    };
+    const loadAgain = async (): Promise<string[]> => {
+      const address = options.file as string;
+      const response = await fetch(address, { cache: 'no-store' });
       if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
       const tag = fileETag(response);
       const named = response.headers.get('ETag');
@@ -1742,10 +1735,19 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         if (session) session.leave();
       },
     };
+    const saveSync = controller
+      ? createSaveSync({
+          controller,
+          session: () => session,
+          target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials } : undefined,
+          strong: strongETag,
+          readOnly: () => mounted.view.readOnly,
+        })
+      : undefined;
     session = new CollabSession(
       {
         workbook: () => workbook,
-        changed: (change) => view.collabChanged(change),
+        changed: (change) => view.collabChanged(change, change.local !== true),
         notice: (said) => view.collabNotice(said),
         reload: typeof options.file === 'string' ? reload : undefined,
         // With `saveTo`: changes that no save holds. Without it: anything changed at all.
@@ -1769,27 +1771,10 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
           if (plan.options.onPeers) plan.options.onPeers(peers);
           if (handle.onPeers) handle.onPeers(peers);
         },
-        onSaved: (saved) => {
-          let tag: string | undefined;
-          for (const version of saved.versions) if (version.slice(0, 2) === 'e:') tag = version.slice(2);
-          if (!controller || tag === undefined) return;
-          const named = tag;
-          const shared = session;
-          // What a participant says is not believed as it is: the server is asked whether the file is that one.
-          void storedAs(named).then((stored) => {
-            if (!shared || shared !== session || shared.state !== 'online') return;
-            if (!stored) return controller.hint(named);
-            // Saved here as well only if this workbook is, right now, the workbook of the step that was saved.
-            controller.adopt(named, saved.rev !== undefined && shared.rev === saved.rev && shared.pending === 0);
-          });
-        },
+        onSaved: (saved) => void (saveSync ? saveSync.saved(saved) : undefined),
         onReadOnly: () => mounted.editor.setReadOnly(true),
         // Someone cannot join because no file holds the steps of the room: the one participant who saves for the others does.
-        onSync: () => {
-          if (!controller || !session || !session.leads || mounted.view.readOnly) return;
-          if (!controller.dirty) controller.changed(true);
-          void controller.saveNow();
-        },
+        onSync: () => void (saveSync ? saveSync.sync() : undefined),
       },
     );
     view.attachCollab(session);
