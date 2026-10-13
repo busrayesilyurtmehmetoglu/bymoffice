@@ -47,7 +47,7 @@ import {
   type StyleSheet,
   type Workbook,
 } from '../model/sheet/types';
-import type { Op } from './ops';
+import { withCommand, type Op } from './ops';
 
 // ---------------------------------------------------------------------------
 // Ranges
@@ -491,6 +491,10 @@ export function validationProblem(workbook: Workbook, sheetIndex: number, ranges
  * extension list, and for a sheet that has no room for another rule.
  */
 export function setValidation(workbook: Workbook, sheetIndex: number, ranges: CellRange | readonly CellRange[], settings: ValidationSettings | undefined): Op[] {
+  return withCommand(setValidationPlain(workbook, sheetIndex, ranges, settings), 'setValidation', [ranges, settings]);
+}
+
+function setValidationPlain(workbook: Workbook, sheetIndex: number, ranges: CellRange | readonly CellRange[], settings: ValidationSettings | undefined): Op[] {
   const sheet = worksheetAt(workbook, sheetIndex, 'data validation');
   const target = targetRanges(ranges);
   const wanted = checkedValidation(settings);
@@ -1528,6 +1532,10 @@ function refuseExtension(rule: ConditionalRule, what: string, says = false): voi
  * sheet that has no room for another rule.
  */
 export function addConditionalRule(workbook: Workbook, sheetIndex: number, ranges: CellRange | readonly CellRange[], settings: ConditionalSettings): Op[] {
+  return withCommand(addConditionalRulePlain(workbook, sheetIndex, ranges, settings), 'addConditionalRule', [ranges, settings]);
+}
+
+function addConditionalRulePlain(workbook: Workbook, sheetIndex: number, ranges: CellRange | readonly CellRange[], settings: ConditionalSettings): Op[] {
   const sheet = worksheetAt(workbook, sheetIndex, 'conditional formats');
   const target = targetRanges(ranges);
   const rule = ruleFromSettings(settings, { row: target[0].top, col: target[0].left }, undefined, workbook.styles, (color) => resolveColor(color, workbook.styles));
@@ -1566,6 +1574,10 @@ export interface ConditionalPatch {
  * is only kept (likewise), and for what a rule cannot say.
  */
 export function updateConditionalRule(workbook: Workbook, sheetIndex: number, index: number, patch: ConditionalPatch): Op[] {
+  return withCommand(updateConditionalRulePlain(workbook, sheetIndex, index, patch), 'updateConditionalRule', [index, patch]);
+}
+
+function updateConditionalRulePlain(workbook: Workbook, sheetIndex: number, index: number, patch: ConditionalPatch): Op[] {
   const sheet = worksheetAt(workbook, sheetIndex, 'conditional formats');
   const slots = slotsInOrder(workbook, sheet);
   const slot = slotAt(slots, index);
@@ -1590,6 +1602,10 @@ export function updateConditionalRule(workbook: Workbook, sheetIndex: number, in
 
 /** Deletes the rule at `index`. Throws RangeError for an index that names no rule and for a rule only the extension list has. */
 export function removeConditionalRule(workbook: Workbook, sheetIndex: number, index: number): Op[] {
+  return withCommand(removeConditionalRulePlain(workbook, sheetIndex, index), 'removeConditionalRule', [index]);
+}
+
+function removeConditionalRulePlain(workbook: Workbook, sheetIndex: number, index: number): Op[] {
   const sheet = worksheetAt(workbook, sheetIndex, 'conditional formats');
   const slots = slotsInOrder(workbook, sheet);
   const slot = slotAt(slots, index);
@@ -1604,6 +1620,10 @@ export function removeConditionalRule(workbook: Workbook, sheetIndex: number, in
  * the number of that rule is kept as it is, and with it the order of all.
  */
 export function moveConditionalRule(workbook: Workbook, sheetIndex: number, index: number, to: number): Op[] {
+  return withCommand(moveConditionalRulePlain(workbook, sheetIndex, index, to), 'moveConditionalRule', [index, to]);
+}
+
+function moveConditionalRulePlain(workbook: Workbook, sheetIndex: number, index: number, to: number): Op[] {
   const sheet = worksheetAt(workbook, sheetIndex, 'conditional formats');
   const slots = slotsInOrder(workbook, sheet);
   const slot = slotAt(slots, index);
@@ -1624,6 +1644,10 @@ export function moveConditionalRule(workbook: Workbook, sheetIndex: number, inde
  * extension list has is among those that would change.
  */
 export function clearConditionalRules(workbook: Workbook, sheetIndex: number, ranges?: CellRange | readonly CellRange[]): Op[] {
+  return withCommand(clearConditionalRulesPlain(workbook, sheetIndex, ranges), 'clearConditionalRules', [ranges]);
+}
+
+function clearConditionalRulesPlain(workbook: Workbook, sheetIndex: number, ranges?: CellRange | readonly CellRange[]): Op[] {
   const sheet = worksheetAt(workbook, sheetIndex, 'conditional formats');
   const current = sheet.conditionalFormats;
   if (!current || current.length === 0) return [];

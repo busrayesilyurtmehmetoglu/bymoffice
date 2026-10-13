@@ -31,7 +31,8 @@ const names = packed.files.map((file) => file.path);
 for (const wanted of ['package.json', 'README.md', 'CHANGELOG.md', 'dist/bymoffice.min.js', 'dist/bymoffice.esm.js', 'dist/bymoffice.webview.html', 'dist/types/index.d.ts']) {
   if (!names.includes(wanted)) fail(`the archive lacks ${wanted}`);
 }
-const stray = names.filter((name) => !/^(package\.json|README\.md|CHANGELOG\.md|THIRD-PARTY-NOTICES\.md|LICENSE[^/]*|dist\/.+)$/.test(name));
+// server/: the example relay for collaborative editing (two files, no dependencies).
+const stray = names.filter((name) => !/^(package\.json|README\.md|CHANGELOG\.md|THIRD-PARTY-NOTICES\.md|LICENSE[^/]*|dist\/.+|server\/collab-server\.(mjs|d\.mts))$/.test(name));
 if (stray.length) fail(`the archive holds files that are not part of the package: ${stray.slice(0, 5).join(', ')}`);
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 

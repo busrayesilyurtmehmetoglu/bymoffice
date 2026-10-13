@@ -50,7 +50,7 @@ Sayfa, aşağıdaki kanallardan **var olan ilkine** gönderir (her gönderimde y
 Kanal, sayfa yüklendikten sonra da eklenebilir. Kanal yokken gönderilemeyen iletiler saklanır ve kanal 50 ms aralıklarla, **son başarılı gönderimden sonra** en çok 10 saniye aranır. Süre dolduktan sonra da uygulamanın her `receive` çağrısında saklanan iletiler (önce `ready`) yeniden denenir. Saklananlar için kurallar:
 
 - `ready`, `loaded`, `saved`, `error`, `done` asla düşürülmez ve sıraları korunur.
-- Durum bildiren iletilerden (`changed`, `selection`, `sheet`, `sheets`, `saveState`) her türden yalnız sonuncusu tutulur; birleştirilen `changed` iletisinin `sheets` alanı, yerine geçtiklerinin sayfalarını da içerir.
+- Durum bildiren iletilerden (`changed`, `selection`, `sheet`, `sheets`, `saveState`, `collabState`) her türden yalnız sonuncusu tutulur; birleştirilen `changed` iletisinin `sheets` alanı, yerine geçtiklerinin sayfalarını da içerir.
 - Saklanan iletilerin toplamı 64 milyon karakteri aşarsa en eski `saved` iletileri, aynı `id` ile `error` / `save-failed` iletisine çevrilir (dosya baytları bırakılır, isteğin yanıtı kaybolmaz). Bırakılan ileti **kullanıcının kaydıysa** (`by: "user"`; `id`'si yoktur) `error` iletisi `id` yerine o kaydın **`saveId`**'sini taşır ve kayıt **hemen** başarısız sayılır: sayfa 60 saniyeyi beklemeden "Dosya kaydedilemedi" der, `saveState.saving` `false` olur ve o `saveId` için sonradan gelen `saveResult` `bad-message` alır.
 
 Uygulama, sayfanın gönderdiği iletiye **aynı çağrının içinden** `receive` ile yanıt verebilir (ör. `ready` gelir gelmez `load`); köprünün gönderim kuyruğu buna dayanıklıdır.
@@ -453,3 +453,21 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 - **Kendiliğinden kaydetme** (`load.save.auto`): çalışırken açılıp kapatılamaz; durduğunu ayrı bir ileti söylemez (son `saveState` `dirty: true, saving: false` kalır); sayfa gizlenirken verilen ileti uygulamaya ulaşmayabilir. Gerçek WebView'de denenmedi.
 - **Kullanıcının kaydetmesi** (`load.save`): sonuç 60 saniye beklenir ve bu süre iletiyle değiştirilemez; kaydedilmemiş değişiklik varken sayfadan ayrılma uyarısı yoktur (uygulamanın işi); `saved` iletisi teslim edilemeden çok büyürse (64 M karakter sınırı) `save-failed` hatasına döner ve kayıt zaman aşımıyla başarısız sayılır. Gerçek WebView'de denenmedi.
 - Aynı anda tek dosya açıktır.
+
+## Birlikte düzenleme: `load.collab` ve `collabState`
+
+`load` iletisi `collab` alanı taşıyabilir: bir aktarıcının adresi (`"wss://…"`) ya da `{ "url": "wss://…", "room"?: "…", "user"?: { "name"?: "…", "color"?: "#RRGGBB" }, "token"?: "…" }`. Çalışma kitabı (dönüştürülmemiş xlsx) o odaya katılır; kurallar ve kapsam kılavuzdaki "Birlikte düzenleme" bölümüyle ve [`collab-sozlesmesi.md`](collab-sozlesmesi.md) ile aynıdır. Adres `ws://` ya da `wss://` değilse `load` `bad-message` ile reddedilir. Özel taşıyıcı köprüde yoktur (gömen yerel kod `BridgeHost.createTransport(url)` verebilir).
+
+Sayfa, oturumun durumu ya da öbür katılımcıların listesi her değiştiğinde şunu gönderir:
+
+```json
+{ "type": "collabState", "state": "online", "rev": 12, "pending": 0,
+  "peers": [{ "id": "c3", "name": "Ayşe", "color": "#D93025", "readOnly": false }] }
+```
+
+- `state`: `connecting`, `online`, `offline` (bağlantı yok; düzenleme sürer, değişiklikler birikir), `closed` (oturum bitti). Belge, xls ya da dönüştürülmüş dosyada `collab` verilirse dosya yine açılır ve bir kez `{ "type": "collabState", "state": "closed", "reason": "unsupported", … }` gönderilir.
+- `peers[].name` öbür katılımcının verdiği **metindir** (`null`: ad vermemiş); uygulama onu metin olarak göstermelidir.
+- `changed` iletisindeki `canUndo` / `canRedo`, birlikte düzenlenen kitapta **katılımcının kendi** adımlarını söyler.
+- `state` ayrıca `detached` olabilir: oda başka bir sürümde ve bu kitapta kaydedilmemiş değişiklik var; kitap yerinde kalır, uygulama dosyayı kaydetmeli ve güncelini yeniden `load` etmelidir (köprü dosyayı kendisi yeniden yükleyemez).
+- Kayıt: kullanıcının kaydı (`saved by:"user"`/`"auto"`) için uygulama `saveResult ok` dedikten **sonra** sayfa öbür katılımcılara o baytların özetini ve tuttuğu adımı bildirir (uygulamanın `save` komutuyla çektiği baytlar bildirilmez: saklandıklarını sayfa bilemez). Başka bir katılımcının bildirdiği kayıt uygulamaya `{ "type": "collabSaved", "etag": "…" | null, "rev": sayı | null, "versions": […] }` iletisiyle aktarılır; bunun doğru olup olmadığını **uygulama** kendi sunucusuna sorarak doğrular — sayfa hiçbir şeyi kaydedilmiş saymaz. Aktarıcı katılımcıyı salt okunur yaparsa görünüm salt okunur olur.
+- **Kısıt:** köprü sayfasının içerik güvenlik ilkesi `connect-src 'self' blob: data:` der; aktarıcı sayfayla **aynı kökende** değilse tarayıcı bağlantıyı engeller. Başka kökendeki aktarıcı için sayfanın kendi kopyanızdaki ilkesine o adresi eklemeniz gerekir.

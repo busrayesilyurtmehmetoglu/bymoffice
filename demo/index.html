@@ -45,6 +45,9 @@
       #doc { height: 640px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #saveto-editor { height: 460px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #saveto-editor[hidden] { display: none; }
+      #collab-editors { display: flex; gap: 10px; flex-wrap: wrap; }
+      #collab-editors[hidden] { display: none; }
+      #collab-editors > div { flex: 1 1 420px; min-width: 0; height: 420px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
       #status { font-weight: 600; overflow-wrap: anywhere; }
       #summary { font-size: 13px; color: var(--muted); }
       pre { margin: 0; padding: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: 420px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -188,6 +191,23 @@
         <p class="muted" id="saveto-state">Henüz açılmadı.</p>
         <p class="muted" id="saveto-notice"></p>
         <div id="saveto-editor" hidden></div>
+      </section>
+
+      <section id="collab-section">
+        <h2>Birlikte düzenleme (<code>collab</code>)</h2>
+        <p class="muted">
+          İki düzenleyici aynı boş çalışma kitabını açar ve aynı odaya katılır: birine yazdığınız öbüründe görünür, seçimler renkli çerçeveyle ve adla gösterilir,
+          <b>Geri al</b> yalnız o düzenleyicinin kendi adımını geri alır. "Bağlantıyı kes" ikinci düzenleyiciyi çevrimdışı yapar (yazmaya devam edebilirsiniz); yeniden bağlanınca bekleyen değişiklikler gönderilir.
+          Oda varsayılan olarak <b>bu sayfanın içindedir</b> (<code>BymOffice.collab.memoryServer()</code>, hiçbir şey sayfadan çıkmaz); kutu işaretliyse sayfayı sunan yerel sunucunun aktarıcısı (WebSocket) kullanılır.
+        </p>
+        <div class="row">
+          <label title="collab: 'ws://…/e2e/collab/oda' — yalnız sayfa pnpm demo ile sunulduğunda."><input type="checkbox" id="collab-socket" /> Sunucunun aktarıcısıyla (WebSocket)</label>
+          <button id="collab-start">İki düzenleyiciyi aç</button>
+          <button id="collab-cut" disabled>İkincinin bağlantısını kes</button>
+        </div>
+        <p class="muted" id="collab-state">Henüz açılmadı.</p>
+        <p class="muted" id="collab-notice"></p>
+        <div id="collab-editors" hidden><div id="collab-a"></div><div id="collab-b"></div></div>
       </section>
 
       <section>
@@ -952,6 +972,61 @@
         } catch (error) {
           $('saveto-notice').textContent = `Okunamadı: ${error.message}`;
         }
+      });
+
+      // Editing together: two editors on one blank workbook, in a room of this page or of the server.
+      let collabPair = [];
+      let collabRelay;
+      let collabCut = false;
+      const collabSay = () => {
+        $('collab-state').textContent = collabPair
+          .map((mounted, i) => (mounted.collab ? `${i + 1}. düzenleyici: ${mounted.collab.state}, adım ${mounted.collab.rev}, bekleyen ${mounted.collab.pending}, öbürleri ${mounted.collab.peers.length}` : `${i + 1}. düzenleyici: birlikte düzenlenmiyor`))
+          .join(' · ');
+      };
+      $('collab-start').addEventListener('click', async () => {
+        for (const mounted of collabPair) mounted.destroy();
+        collabPair = [];
+        if (collabRelay) collabRelay.close();
+        collabRelay = undefined;
+        collabCut = false;
+        $('collab-cut').textContent = 'İkincinin bağlantısını kes';
+        $('collab-notice').textContent = '';
+        const socket = $('collab-socket').checked;
+        if (socket && !/^https?:$/.test(location.protocol)) return void ($('collab-state').textContent = 'Sunucunun aktarıcısı, sayfa bir sunucudan açıldığında çalışır: pnpm demo.');
+        try {
+          const bytes = await BymOffice.createBlank('xlsx', { locale: 'tr' });
+          const room = `demo-${Math.random().toString(36).slice(2, 10)}`;
+          if (!socket) collabRelay = BymOffice.collab.memoryServer();
+          $('collab-editors').hidden = false;
+          const users = [{ name: 'Ayşe', color: '#D93025' }, { name: 'Deniz', color: '#1A73E8' }];
+          for (let i = 0; i < 2; i++) {
+            const transport = socket ? BymOffice.collab.socketTransport(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/e2e/collab/${room}`) : collabRelay.connect();
+            const mounted = await BymOffice.mount($(i === 0 ? 'collab-a' : 'collab-b'), {
+              file: bytes.slice(),
+              locale: 'tr',
+              collab: { transport, user: users[i], onState: collabSay, onPeers: collabSay },
+              onChange: collabSay,
+              onNotice: (notice) => {
+                $('collab-notice').textContent = `${i + 1}. düzenleyici: ${notice.message}`;
+              },
+            });
+            mounted.__transport = transport;
+            collabPair.push(mounted);
+          }
+          $('collab-cut').disabled = false;
+          collabSay();
+        } catch (error) {
+          $('collab-state').textContent = `Açılamadı: ${error.message}`;
+        }
+      });
+      $('collab-cut').addEventListener('click', () => {
+        const second = collabPair[1];
+        if (!second) return;
+        collabCut = !collabCut;
+        if (collabCut) second.__transport.suspend();
+        else second.__transport.resume();
+        $('collab-cut').textContent = collabCut ? 'İkinciyi yeniden bağla' : 'İkincinin bağlantısını kes';
+        setTimeout(collabSay, 100);
       });
 
       convertButton.addEventListener('click', async () => {

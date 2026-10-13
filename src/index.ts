@@ -24,6 +24,7 @@ import type { PdfExportOptions } from './pdf/export';
 import type { SheetPdfExportOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
 import { askOverwrite } from './ui/save-confirm';
+import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
 import {
   SaveController,
   bindSaveToPage,
@@ -32,6 +33,7 @@ import {
   nameFromUrl,
   resolveAutoSave,
   resolveSaveTarget,
+  strongETag,
   saveInfoOf,
   type AutoSave,
   type SaveNowOptions,
@@ -273,6 +275,103 @@ export type { EditProgress } from './layout/doc/layout';
  * for Bookman Old Style on devices that lack it) is fetched from, or turns
  * it off; embedded() tells its state. See EmbeddedFontsOptions.
  */
+export { collab } from './collab/index';
+export {
+  CollabSession,
+  CollabUnsupportedError,
+  MemoryServer,
+  broadcastTransport,
+  contentVersion,
+  socketTransport,
+  type CollabNotice,
+  type CollabPeer,
+  type CollabPresence,
+  type CollabState,
+  type CollabTransport,
+  type CollabUser,
+  type MemoryServerOptions,
+  type PausableTransport,
+  type SessionChange,
+} from './collab/index';
+
+/** Editing a workbook together with others: where the relay is, and who this participant is. See MountOptions.collab. */
+export interface CollabOptions {
+  /** The address of the relay ("ws://…" or "wss://…"); everybody who opens the same address (and room) edits together. */
+  url?: string;
+  /** A channel of the application in place of `url`: see CollabTransport. */
+  transport?: CollabTransport;
+  /** A room at the address, when one address serves several files. */
+  room?: string;
+  /** The name and the colour ("#RRGGBB") the others see. */
+  user?: CollabUser;
+  /** Sent to the relay in the first message, for it to decide who may join. Never shown, never logged here. */
+  token?: string;
+  onState?(state: CollabState): void;
+  onPeers?(peers: CollabPeer[]): void;
+}
+
+/** What mount() answers for a workbook that is edited together. */
+export interface MountedCollab {
+  readonly state: CollabState;
+  /** How many steps of the common order the workbook holds. */
+  readonly rev: number;
+  /** How many changes made here wait for the relay. */
+  readonly pending: number;
+  readonly peers: CollabPeer[];
+  /** This participant as the others see it. */
+  readonly user: CollabPeer;
+  onState?: (state: CollabState) => void;
+  onPeers?: (peers: CollabPeer[]) => void;
+  /**
+   * For an application that saves by itself (with save(), without `saveTo`): tells the others that
+   * the bytes save() last answered with were saved, and under which ETag when the server names one.
+   */
+  saved(bytes: Uint8Array, etag?: string): void;
+  /**
+   * Gives the workbook up for the file as it is stored and joins the room with that. For a session
+   * that is `detached` (the room is at another version of the file, and this workbook holds changes
+   * no file has): the other way out is to save, after which the room is joined by itself. Changes
+   * that are in no file are lost.
+   */
+  reload(): void;
+  /** Leaves the room. The workbook stays; what is changed from here on is told to nobody. */
+  leave(): void;
+}
+
+interface CollabPlan {
+  transport(): CollabTransport;
+  options: CollabOptions;
+}
+
+/** What `collab` asks for; undefined when it asks for nothing. Throws TypeError for what cannot be a relay. */
+function resolveCollab(value: unknown): CollabPlan | undefined {
+  if (value === undefined || value === null || value === false) return undefined;
+  if (typeof value === 'string') {
+    if (!isSocketUrl(value)) throw new TypeError('"collab" is the address of a relay: "ws://…" or "wss://…"');
+    return { transport: () => socketTransport(value), options: {} };
+  }
+  if (typeof value !== 'object') throw new TypeError('"collab" is an address or an object with "url" or "transport"');
+  const given = value as CollabOptions;
+  const transport = given.transport;
+  if (transport !== undefined && transport !== null) {
+    if (typeof transport !== 'object' || typeof transport.send !== 'function' || typeof transport.onMessage !== 'function' || typeof transport.close !== 'function') {
+      throw new TypeError('"collab.transport" has the methods send, onMessage and close');
+    }
+    return { transport: () => transport, options: given };
+  }
+  const url = given.url;
+  if (!isSocketUrl(url)) throw new TypeError('"collab.url" is the address of a relay: "ws://…" or "wss://…"');
+  return { transport: () => socketTransport(url), options: given };
+}
+
+/** What a file is known by among those who edit it together: the ETag its address named, and its bytes. */
+function fileVersions(etag: string | null | undefined, bytes: Uint8Array): string[] {
+  const versions: string[] = [];
+  if (typeof etag === 'string' && etag !== '' && etag.length <= 190) versions.push(`e:${etag}`);
+  versions.push(contentVersion(bytes));
+  return versions;
+}
+
 export const fonts = { registerFont, registeredFonts, unregisterFont, configure: configureEmbeddedFonts, embedded: embeddedFontsState };
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
@@ -511,6 +610,15 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * A function given as `saveTo` is told `info.auto: true` for these saves.
    */
   autoSave?: AutoSave;
+  /**
+   * Edits the workbook together with everybody who opens the same address: the address of a
+   * relay ("wss://example.com/collab/42"), or an object (see CollabOptions) with `url` or a
+   * `transport` of the application, and `user`, `room`, `token`. An xlsx only: for a document, a
+   * file of another format or one that was converted, a notice says that it is not edited
+   * together, and the file is shown as without the option. Throws TypeError for anything that
+   * is neither an address nor such an object.
+   */
+  collab?: string | CollabOptions;
   /** With `saveTo`: called whenever there is something else to say about saving. */
   onSaveState?(state: SaveState): void;
   /**
@@ -627,6 +735,12 @@ export interface MountedSpreadsheet {
   view: WorkbookView;
   /** The editor around the grid: toolbar, formula bar and status bar. */
   editor: SpreadsheetEditor;
+  /**
+   * Set when the workbook is edited together with others (MountOptions.collab). When the file
+   * was changed elsewhere it is loaded again in place: `file`, `workbook`, `view` and `editor`
+   * are then other objects, on this same result.
+   */
+  collab?: MountedCollab;
   /**
    * The file with every change made in the view, as bytes. A cell that is
    * being edited is written first, as leaving it would do.
@@ -751,10 +865,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   // Before anything is fetched: a `saveTo` that cannot be saved to is a mistake of the page, and is told at once.
   const saveTarget = options.saveTo === undefined || options.saveTo === false || options.saveTo === null ? undefined : resolveSaveTarget(options.saveTo, typeof input === 'string' ? input : undefined, base);
   // The same for auto-save: its times are read, and it has nowhere to save to without `saveTo`.
+  // And for editing together: an address that is none is told before anything is fetched.
+  const collabPlan = resolveCollab(options.collab);
   const autoSave = resolveAutoSave(options.autoSave);
   if (autoSave && !saveTarget) throw new TypeError('"autoSave" needs "saveTo": there is nowhere to save to');
   /** The ETag the file came with: what a save to the same address is sent with. */
   let etag: string | null = null;
+  let readETag: string | null = null;
   let fileName: string | undefined;
   if (typeof input === 'string') {
     fileName = nameFromUrl(input, base);
@@ -762,9 +879,17 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
     // Not the ETag of an answer that came from another address than the one that is saved to.
     etag = fileETag(response);
+    // For those who edit together the file is also known by the ETag of an answer that was redirected.
+    readETag = response.headers.get('ETag');
     input = await response.arrayBuffer();
   } else if (typeof Blob !== 'undefined' && input instanceof Blob && typeof (input as { name?: unknown }).name === 'string') {
     fileName = (input as unknown as { name: string }).name || undefined;
+  }
+  /** The bytes of the file as it came: what it is known by when it is edited together. */
+  let readBytes: Uint8Array | undefined;
+  if (collabPlan) {
+    readBytes = input instanceof Uint8Array ? input : input instanceof ArrayBuffer ? new Uint8Array(input) : new Uint8Array(await (input as Blob).arrayBuffer());
+    input = readBytes;
   }
   let file = await open(input);
   let conversion: MountConversion | undefined;
@@ -820,7 +945,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
         strings: () => resolveUiStrings(options.locale),
         notice: (message, kind) => notice(message, kind),
         onState: options.onSaveState,
-        onSaved: options.onSave,
+        onSaved: (bytes) => {
+          sayShared(bytes);
+          if (options.onSave) options.onSave(bytes);
+        },
         onError: options.onError,
         // A save the server refused with 412: the user is asked over the editor, unless the page said
         // `onConflict: 'fail'` (the controller looks at that). A function of the application knows its own conflicts.
@@ -841,6 +969,60 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
         etag,
       })
     : undefined;
+  /** The session, while the workbook is edited together; and the file that was written last, with the step it holds. */
+  let session: CollabSession | undefined;
+  let written: { bytes: Uint8Array; rev: number | undefined } | undefined;
+  /** Tells the others of a save that succeeded, when the bytes are the ones that were written last. */
+  const sayShared = (bytes: Uint8Array, tag?: string): void => {
+    if (!session || !written || written.bytes !== bytes) return;
+    const versions = fileVersions(tag !== undefined ? tag : controller ? controller.currentETag : undefined, bytes);
+    // A workbook that was detached from the room is in a file now: with that file it joins again.
+    if (session.state === 'detached') session.rejoin(versions);
+    else session.announceSaved(versions, written.rev);
+  };
+  /**
+   * Whether the file at the address that is saved to is known by this ETag now: what someone else
+   * says about a save is asked of the server before it is believed. Nothing of the file is fetched.
+   */
+  const storedAs = async (tag: string): Promise<boolean> => {
+    if (!saveTarget || saveTarget.kind !== 'request' || strongETag(tag) === undefined) return false;
+    const ask = (method: string, headers?: { [name: string]: string }): Promise<Response> => fetch(saveTarget.url, { method, cache: 'no-store', credentials: saveTarget.credentials, headers });
+    try {
+      let answer = await ask('HEAD');
+      if (answer.status === 405 || answer.status === 501) {
+        // A server without HEAD: the file is asked for only if it is another one.
+        answer = await ask('GET', { 'If-None-Match': tag });
+        const same = answer.status === 304 || (answer.ok && strongETag(answer.headers.get('ETag')) === tag);
+        if (answer.body) void answer.body.cancel().catch(() => undefined);
+        return same;
+      }
+      return answer.ok && strongETag(answer.headers.get('ETag')) === tag;
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * Writes the file while the workbook is edited together: once what was changed here has its
+   * place in the common order (or after a short wait), and with what arrives held back until
+   * the file is written, so that it is the workbook of one moment.
+   */
+  const sharedBytes = async (take: () => Promise<Uint8Array>): Promise<Uint8Array> => {
+    const shared = session;
+    if (!shared || shared.state === 'closed') return take();
+    if (shared.state === 'online') await shared.whenSettled(3000);
+    const rev = shared.savableRev;
+    shared.pause();
+    let bytes: Uint8Array;
+    let touched = false;
+    try {
+      bytes = await take();
+    } finally {
+      touched = shared.resume();
+    }
+    // A file into which something was typed while it was written is the file of no one step.
+    written = { bytes, rev: touched ? undefined : rev };
+    return bytes;
+  };
   /** What ties the controller to the page: the question before leaving, the hidden page, the view that turns read-only. */
   let bound: { unsaved(): boolean; release(): void } | undefined;
   /** `unapplied`: whether text is typed in the view that is in no change yet (see SavePage). */
@@ -886,8 +1068,15 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       }
       destroyEditor();
     };
+    // For a file that is loaded again in place: the editor goes, what mount() holds stays.
+    detach = () => {
+      over = true;
+      container.removeEventListener('keydown', onKeyDown, true);
+      destroyEditor();
+    };
     return () => editor.destroy();
   };
+  let detach: () => void = () => undefined;
   const onKeyDown = (event: KeyboardEvent) => {
     if ((!controller && !options.onSave) || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || (event.key !== 's' && event.key !== 'S')) return;
     event.preventDefault();
@@ -963,6 +1152,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     watchReadOnly(view, () => false);
     const destroy = tie(editor);
     converted();
+    // Said, not thrown: the document is shown and edited as without the option.
+    if (collabPlan) view.showNotice(resolveUiStrings(options.locale).collab.document, 'error');
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
     const exportPdf = (pdfOptions?: PdfExportOptions) => view.exportPdf(pdfOptions);
     const mounted: MountedDocument = {
@@ -988,20 +1179,25 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     return mounted;
   }
 
-  const workbook = await file.workbook();
+  let workbook = await file.workbook();
   // An xls file cannot be written yet: it is shown read-only, so that no edit is lost on saving.
   const sheetOptions: SpreadsheetEditorOptions = {
     ...options,
     onChange: (change) => {
-      changed();
+      // What someone else changed is there to be saved, but is theirs to save by itself.
+      if (change.remote && controller) {
+        touched = true;
+        // Saved by itself by one participant only (the one who leads), so that the others do not save over each other.
+        controller.changed(!(session !== undefined && session.leads && controller.autoSave !== undefined));
+      } else changed();
       if (options.onChange) options.onChange(change);
     },
     saveCommand: controller,
     fileName: options.fileName !== undefined ? options.fileName : fileName,
   };
   if (file.format === 'xls') sheetOptions.readOnly = true;
-  const editor = new SpreadsheetEditor(container, workbook, sheetOptions);
-  const view = editor.view;
+  let editor = new SpreadsheetEditor(container, workbook, sheetOptions);
+  let view = editor.view;
   if (file.format === 'xls') {
     // Nothing may turn editing on: saving would give the original bytes and the edits would be lost.
     const lockView = view.setReadOnly.bind(view);
@@ -1012,7 +1208,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   save = async () => {
     // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
     if (!view.commitPending()) throw new Error('Cannot save: a note or a sheet name that is being typed cannot be applied, or a dialog of rules is open with changes (confirm or close it first)');
-    return file.save();
+    return sharedBytes(() => file.save());
   };
   commit = () => {
     try {
@@ -1024,13 +1220,13 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     }
   };
   pendingInput = () => view.hasPendingInput();
-  saveAsIs = () => file.save();
+  saveAsIs = () => sharedBytes(() => file.save());
   notice = (message, kind) => view.showNotice(message, kind);
   focusView = () => view.focus();
   editorRoot = () => editor.element;
   readOnlyNow = () => view.readOnly;
   watchReadOnly(view, () => view.hasUnappliedText());
-  const destroy = tie(editor);
+  const destroyTied = tie(editor);
   converted();
   const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);
   const exportPdf = (pdfOptions?: SheetPdfExportOptions) => view.exportPdf(pdfOptions);
@@ -1040,7 +1236,7 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     workbook,
     view,
     editor,
-    save,
+    save: () => save(),
     print,
     exportPdf,
     saveNow,
@@ -1048,8 +1244,130 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       return unsaved();
     },
     setAutoSave,
-    destroy,
+    destroy: () => {
+      if (session) session.leave();
+      mounted.editor.destroy();
+    },
   };
+  void destroyTied;
+
+  if (collabPlan && (file.format !== 'xlsx' || conversion)) {
+    // Everybody in a room has to read the very same file: one that was converted here is not it.
+    view.showNotice(resolveUiStrings(options.locale).collab.unsupported, 'error');
+  } else if (collabPlan && readBytes) {
+    const plan = collabPlan;
+    const show = (): void => {
+      if (session) mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending });
+    };
+    /** The file is loaded again from its address and shown in place (the room is at a version this side does not have). */
+    const reload = async (): Promise<string[]> => {
+      if (typeof options.file !== 'string') throw new Error('The file has no address to load it from again');
+      const response = await fetch(options.file, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
+      const tag = fileETag(response);
+      const named = response.headers.get('ETag');
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const next = await open(bytes);
+      if (next.format !== 'xlsx') throw new Error('The file is no longer a workbook that can be edited together');
+      const nextBook = await next.workbook();
+      const shownSheet = view.activeSheet;
+      if (bound) bound.release();
+      detach();
+      file = next;
+      workbook = nextBook;
+      editor = new SpreadsheetEditor(container, workbook, { ...sheetOptions, sheet: shownSheet < workbook.sheets.length ? shownSheet : undefined });
+      view = editor.view;
+      watchReadOnly(view, () => view.hasUnappliedText());
+      tie(editor);
+      mounted.file = file;
+      mounted.workbook = workbook;
+      mounted.view = view;
+      mounted.editor = editor;
+      view.attachCollab(session);
+      // The file as it is on the server is what is shown: there is nothing to save, and the next save names it.
+      if (controller) controller.adopt(tag === null ? undefined : tag, true);
+      touched = false;
+      show();
+      return fileVersions(named, bytes);
+    };
+    const handle: MountedCollab = {
+      get state() {
+        return session ? session.state : 'closed';
+      },
+      get rev() {
+        return session ? session.rev : 0;
+      },
+      get pending() {
+        return session ? session.pending : 0;
+      },
+      get peers() {
+        return session ? session.peers : [];
+      },
+      get user() {
+        return (session as CollabSession).user;
+      },
+      saved: (bytes, tag) => sayShared(bytes, typeof tag === 'string' ? tag : undefined),
+      reload: () => {
+        if (session) session.reload();
+      },
+      leave: () => {
+        if (session) session.leave();
+      },
+    };
+    session = new CollabSession(
+      {
+        workbook: () => workbook,
+        changed: (change) => view.collabChanged(change),
+        notice: (said) => view.collabNotice(said),
+        reload: typeof options.file === 'string' ? reload : undefined,
+        // With `saveTo`: changes that no save holds. Without it: anything changed at all.
+        unsaved: () => (controller ? controller.dirty : touched),
+      },
+      {
+        transport: plan.transport(),
+        versions: fileVersions(readETag, readBytes),
+        user: plan.options.user,
+        room: plan.options.room,
+        token: plan.options.token,
+        readOnly: view.readOnly,
+        onState: (state) => {
+          show();
+          if (plan.options.onState) plan.options.onState(state);
+          if (handle.onState) handle.onState(state);
+        },
+        onPeers: (peers) => {
+          view.collabPeersChanged(peers);
+          show();
+          if (plan.options.onPeers) plan.options.onPeers(peers);
+          if (handle.onPeers) handle.onPeers(peers);
+        },
+        onSaved: (saved) => {
+          let tag: string | undefined;
+          for (const version of saved.versions) if (version.slice(0, 2) === 'e:') tag = version.slice(2);
+          if (!controller || tag === undefined) return;
+          const named = tag;
+          const shared = session;
+          // What a participant says is not believed as it is: the server is asked whether the file is that one.
+          void storedAs(named).then((stored) => {
+            if (!shared || shared !== session || shared.state !== 'online') return;
+            if (!stored) return controller.hint(named);
+            // Saved here as well only if this workbook is, right now, the workbook of the step that was saved.
+            controller.adopt(named, saved.rev !== undefined && shared.rev === saved.rev && shared.pending === 0);
+          });
+        },
+        onReadOnly: () => mounted.editor.setReadOnly(true),
+        // Someone cannot join because no file holds the steps of the room: the one participant who saves for the others does.
+        onSync: () => {
+          if (!controller || !session || !session.leads || mounted.view.readOnly) return;
+          if (!controller.dirty) controller.changed(true);
+          void controller.saveNow();
+        },
+      },
+    );
+    view.attachCollab(session);
+    mounted.collab = handle;
+    show();
+  }
   if (conversion) mounted.conversion = conversion;
   return mounted;
 }

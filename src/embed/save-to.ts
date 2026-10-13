@@ -600,6 +600,7 @@ export class SaveController implements SaveCommand {
   private lastSavedAt: number | undefined;
   private error: string | undefined;
   private etag: string | undefined;
+  private hinted: string | undefined;
   private running: Promise<boolean> | undefined;
   /** What the call that started the save under way was answered with: the end of that save, or of the question it led to. */
   private result: Promise<boolean> | undefined;
@@ -722,8 +723,12 @@ export class SaveController implements SaveCommand {
     return this.etag;
   }
 
-  /** Says that the file was changed (an undo and a redo are changes as well). */
-  changed(): void {
+  /**
+   * Says that the file was changed (an undo and a redo are changes as well). `remote`: by someone
+   * the file is edited together with; such a change is one to save, but it is whoever made it
+   * who saves it by itself (auto-save is not set going here).
+   */
+  changed(remote = false): void {
     if (this.destroyed) return;
     this.count++;
     this.changedAt = this.now();
@@ -737,7 +742,39 @@ export class SaveController implements SaveCommand {
       this.changing--;
     }
     // Every change starts the delay of auto-save again.
-    this.arm();
+    if (!remote) this.arm();
+  }
+
+  /**
+   * Someone the file is edited together with saved it: `etag` is what the target names the file by
+   * from now on (the next save here is sent with it, so that it is not refused as a conflict), and
+   * `clean` says that the file that was saved is the file as it is here, which then has nothing to
+   * save. A question about a conflict that is open is taken away: what it asked about was overwritten.
+   */
+  adopt(etag: string | undefined, clean: boolean): void {
+    if (this.destroyed) return;
+    const strong = strongETag(etag);
+    if (strong !== undefined) this.etag = strong;
+    if (clean && !this.busy) {
+      this.savedCount = this.count;
+      this.error = undefined;
+      this.dirtySince = undefined;
+      this.lastSavedAt = this.host.now ? this.host.now() : Date.now();
+      this.disarm();
+    }
+    this.dismissConflict();
+    this.emit();
+  }
+
+  /**
+   * Someone the file is edited together with says it was saved under this ETag, and it could not be
+   * found out whether that is so: nothing is taken to be saved. The ETag is only tried, once, when a
+   * save of this side comes back as a conflict - still as a condition: the save is taken only if the
+   * file is the one that was named.
+   */
+  hint(etag: string | undefined): void {
+    if (this.destroyed) return;
+    this.hinted = strongETag(etag);
   }
 
   run(): void {
@@ -1128,8 +1165,10 @@ export class SaveController implements SaveCommand {
     if (abort) abort();
   }
 
-  private async start(overwrite: boolean, auto: boolean): Promise<boolean> {
+  private async start(overwrite: boolean, auto: boolean, tries = 0): Promise<boolean> {
     const host = this.host;
+    /** What the file was known by when it was sent: see adopt(). */
+    let sentWith: string | undefined;
     // saveNow() has marked the save as under way; this is the first the host hears of it.
     this.emit();
     let bytes: Uint8Array;
@@ -1151,10 +1190,21 @@ export class SaveController implements SaveCommand {
       // A copy: what the host hands out is not written to.
       if (overwrite && target.kind === 'function') info = { ...info, overwrite: true };
       if (auto) info = { ...info, auto: true };
+      sentWith = this.etag;
       if (target.kind === 'function') await this.call(target.save, bytes, info);
       else await this.request(target, bytes, info, overwrite);
     } catch (error) {
       if (this.destroyed) return false;
+      // Someone the file is edited together with saved it while this save was on its way (see adopt()):
+      // the conflict is with a file this side has heard of since, and the save is sent again with its name.
+      if (error instanceof SaveError && error.code === 'conflict' && !overwrite && tries < 2) {
+        if (this.etag !== sentWith) return this.start(overwrite, auto, tries + 1);
+        if (this.hinted !== undefined && this.hinted !== sentWith) {
+          this.etag = this.hinted;
+          this.hinted = undefined;
+          return this.start(overwrite, auto, tries + 1);
+        }
+      }
       if (error instanceof SaveError) {
         // Before it is told: a save the user asks for from inside the telling is another save.
         const wasAuto = this.autoRun;

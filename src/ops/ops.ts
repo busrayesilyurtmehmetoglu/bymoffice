@@ -152,12 +152,14 @@ export type Op =
       type: 'setDataValidations';
       sheet: number;
       validations: DataValidation[] | undefined;
+      by?: OpCommand;
     }
   | {
       /** Replaces the conditional formats of a sheet (undefined: none); as "setDataValidations". */
       type: 'setConditionalFormats';
       sheet: number;
       formats: ConditionalFormat[] | undefined;
+      by?: OpCommand;
     }
   | {
       /**
@@ -168,6 +170,7 @@ export type Op =
       type: 'setDrawings';
       sheet: number;
       drawings: SheetDrawing[] | undefined;
+      by?: OpCommand;
     }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
@@ -260,6 +263,26 @@ export type Op =
       /** As for "restore". */
       weight?: number;
     };
+
+/**
+ * The command that made an operation which replaces a whole list (rules, drawings): its name and
+ * what it was called with after the workbook and the sheet. Applying the operation never looks at
+ * it. Collaborative editing sends the command in place of the list, which names things of the
+ * file each participant read (see src/collab/wire.ts); an operation without it is not sent.
+ */
+export interface OpCommand {
+  name: string;
+  args: unknown[];
+}
+
+/** Notes on the one operation a command made which command that was (see OpCommand). */
+export function withCommand(ops: Op[], name: string, args: unknown[]): Op[] {
+  if (ops.length === 1) {
+    const op = ops[0];
+    if (op.type === 'setDataValidations' || op.type === 'setConditionalFormats' || op.type === 'setDrawings') op.by = { name, args };
+  }
+  return ops;
+}
 
 /** The row properties an operation may set. */
 export type RowProps = Partial<Pick<Row, 'height' | 'customHeight' | 'hidden' | 'style'>>;
@@ -658,7 +681,7 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
  * row under it must not silently become one.
  * The writer does the same to the source element of a filter that was not changed otherwise.
  */
-function shiftAutoFilter(filter: AutoFilter, edit: SheetStructuralEdit): AutoFilter | undefined {
+export function shiftAutoFilter(filter: AutoFilter, edit: SheetStructuralEdit): AutoFilter | undefined {
   const header = filter.range.top;
   if (edit.kind === 'delete' && edit.axis === 'row' && edit.at <= header && edit.at + edit.count > header) return undefined;
   const range = adjustRange(filter.range, edit);

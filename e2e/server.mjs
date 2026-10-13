@@ -11,6 +11,7 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createCollabServer } from '../server/collab-server.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PORT = Number(process.env.E2E_PORT ?? 4317);
@@ -179,6 +180,10 @@ const server = createServer(async (req, res) => {
   if (req.method === 'HEAD') return res.end();
   createReadStream(file).on('error', () => res.destroy()).pipe(res);
 });
+
+// The relay for the tests of editing together and for the demo page: rooms under /e2e/collab/, in
+// memory, for pages of this server only.
+createCollabServer({ path: '/e2e/collab/', origins: [`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`] }).attach(server);
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`e2e static server: http://127.0.0.1:${PORT}/ (root ${ROOT})`);

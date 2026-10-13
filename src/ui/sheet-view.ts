@@ -106,7 +106,7 @@ import {
 import { Popover, type PopoverItem } from './popover';
 import { PALETTE, PALETTE_COLUMNS } from './toolbar';
 import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
-import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
+import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridPeer, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
 import { ChartRenderer, type ChartRendererOptions } from '../render/chart';
 import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
@@ -150,6 +150,9 @@ import { MAX_PAGE_RUNS, captureText, type PdfTextRun } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
 import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
 import { viewEngineOptions } from './engine-options';
+import { mapPosition } from '../collab/rebase';
+import type { CollabNotice, CollabPeer, CollabSession, SessionChange } from '../collab/session';
+import { CollabUnsupportedError } from '../collab/types';
 import { FilterMenu, ListMenu } from './filter-menu';
 import { allSheets, dropIndex, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
 
@@ -169,8 +172,8 @@ export interface WorkbookViewOptions {
   calculate?: boolean;
   /** Who the notes added in this view are by. Default "Author". A note that is edited keeps its author. */
   author?: string;
-  /** Called after every change to the workbook, including undo and redo. */
-  onChange?(change: { sheets: number[] }): void;
+  /** Called after every change to the workbook, including undo and redo. `remote`: the change came from someone else the workbook is edited together with. */
+  onChange?(change: { sheets: number[]; remote?: boolean }): void;
   /**
    * Called with every message the view has for the user, in the language of
    * the view: what an action was refused for ('error'), or a hint ('info').
@@ -976,6 +979,11 @@ export class WorkbookView {
   private dialogStays = false;
   /** Set while a dialog of rules applies its own change: the one change that does not have to settle the dialog first. */
   private applyingRules = false;
+  /** The session the workbook is edited together in (see attachCollab()); its steps take the place of the history's. */
+  private collab: CollabSession | undefined;
+  private collabPeers: CollabPeer[] = [];
+  /** The change that is being told to onChange came from someone else. */
+  private remoteChange = false;
   /** The names (folded) the sheets had when the selection was last copied: see copyOutdated(). */
   private copiedNames: string[] | undefined;
   /** Set while a dialog is closed by the view itself: it then does not hand over to the dialog it was opened from. */
@@ -2219,7 +2227,7 @@ export class WorkbookView {
       sheetOp: kind,
     };
     const done: HistoryMark = { ...before };
-    const inverse = this.history.apply(ops, before, done);
+    const inverse = this.takeStep(ops, before, done);
     const now = this.workbook.sheets;
     // A new sheet is shown, and so is one that was hidden and is shown again; a sheet that stays is still shown,
     // wherever it is now; else the nearest one with a tab.
@@ -2318,7 +2326,7 @@ export class WorkbookView {
     const name = this.workbook.sheets[index].name;
     this.applySheetOps('delete', ops, index);
     // After what is said about the cell that is active now.
-    this.notifyLater(this.strings.sheetDeleted(name));
+    this.notifyLater(this.collab ? this.strings.collab.sheetDeleted(name) : this.strings.sheetDeleted(name));
     return true;
   }
 
@@ -3306,7 +3314,9 @@ export class WorkbookView {
       comments: floating && state.sheet.comments && state.sheet.comments.length > 0 ? floating : undefined,
       // What the formula being typed was pointed at, on the sheet it is on.
       reference: (this.edit || this.rulesDialog) && this.point && this.point.sheet === state.sheet ? this.point.range : undefined,
+      peers: this.collab ? this.gridPeers() : undefined,
     });
+    if (this.collab) this.collab.setPresence({ sheet: this.sheetIndex, row: state.active.row, col: state.active.col, range: { ...state.range } });
     // Rules whose formulas took too long are finished in the next frames.
     if (conditional && conditional.pending) this.schedule();
     // The input follows its cell through every scroll and resize.
@@ -5684,6 +5694,7 @@ export class WorkbookView {
    */
   localizeError(error: unknown): string {
     const strings = this.strings;
+    if (error instanceof CollabUnsupportedError) return error.what === 'copySheet' ? strings.collab.copySheet : error.what === 'size' ? strings.collab.tooLarge : error.what === 'readOnly' ? strings.collab.readOnly : strings.collab.unsupported;
     // A data validation speaks for itself: the words are those of the file.
     if (error instanceof ValidationError) return error.display;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
@@ -6262,7 +6273,7 @@ export class WorkbookView {
     if (moves) for (let i = 0; i < this.workbook.sheets.length; i++) if (sheets.indexOf(i) < 0) sheets.push(i);
     const before = this.mark(sheets, structural);
     const done = this.mark(sheets, structural, after);
-    const inverse = this.history.apply(ops, before, done);
+    const inverse = this.takeStep(ops, before, done);
     // The cells written, so that what depends on them can be calculated again after the step and after
     // undoing it. They are read from the inverse: it also names the cells an operation changed on its
     // own, such as the dependants of a shared formula whose master was overwritten.
@@ -6306,6 +6317,13 @@ export class WorkbookView {
       return !this.renaming && !this.noteEdit;
     }
     this.closeMenu();
+    if (this.collab) {
+      // Only this participant's own steps, sent as steps of their own: see CollabSession.undo().
+      const went = redo ? this.collab.redo() : this.collab.undo();
+      if (!went) return false;
+      this.collabChanged(went.change, false);
+      return true;
+    }
     const listBefore = this.workbook.sheets;
     const namesBefore = this.workbook.definedNames;
     const step = redo ? this.history.redo() : this.history.undo();
@@ -6351,7 +6369,229 @@ export class WorkbookView {
     this.commitScroll();
     this.announce();
     this.schedule();
-    if (this.options.onChange) this.options.onChange({ sheets: sheets.slice() });
+    if (this.options.onChange) this.options.onChange(this.remoteChange ? { sheets: sheets.slice(), remote: true } : { sheets: sheets.slice() });
+  }
+
+  // ------------------------------------------------------- editing together
+
+  /** One undo step: of the history, or (edited together) of the session, which also sends it. */
+  private takeStep(ops: Op[], before: HistoryMark, done: HistoryMark): Op[] {
+    if (!this.collab) return this.history.apply(ops, before, done);
+    const result = this.collab.submit(ops);
+    if (result.skipped > 0) this.notifyLater(this.strings.collab.skipped);
+    return result.inverse;
+  }
+
+  /** The words about editing together, in the language of the view: for a shell that shows who is there. */
+  get collabStrings(): UiStrings['collab'] {
+    return this.strings.collab;
+  }
+
+  /** Whether there is a step to undo: of this participant's own when the workbook is edited together. */
+  get canUndo(): boolean {
+    return this.collab ? this.collab.canUndo : this.history.canUndo;
+  }
+
+  get canRedo(): boolean {
+    return this.collab ? this.collab.canRedo : this.history.canRedo;
+  }
+
+  /**
+   * Makes the view a participant of a session: every change goes through it from here on (the
+   * history of the view is not used), and what the others do is shown. For mount(), which
+   * makes the session and tells the view what it says (collabChanged(), collabNotice(), collabPeersChanged()).
+   */
+  attachCollab(session: CollabSession | undefined): void {
+    this.collab = session;
+    this.collabPeers = session ? session.peers : [];
+    this.markTabs();
+    this.schedule();
+  }
+
+  /** The others, as the session lists them now. */
+  collabPeersChanged(peers: CollabPeer[]): void {
+    if (this.destroyed) return;
+    this.collabPeers = peers;
+    this.markTabs();
+    this.schedule();
+  }
+
+  collabNotice(notice: CollabNotice): void {
+    if (this.destroyed) return;
+    const words = this.strings.collab;
+    const n = notice.count === undefined ? 1 : notice.count;
+    const said: { [code in CollabNotice['code']]: [string, 'error' | 'info'] } = {
+      dropped: [words.dropped(n), 'error'],
+      partial: [words.partial, 'error'],
+      'undo-gone': [words.undoGone, 'error'],
+      'undo-none': [words.undoNone, 'error'],
+      'undo-lossy': [words.undoLossy, 'info'],
+      skipped: [words.skipped, 'info'],
+      peer: [words.peer, 'error'],
+      stale: [words.stale, 'error'],
+      reloaded: [words.reloaded(n), 'error'],
+      refused: [words.refused, 'error'],
+      backlog: [words.backlog(n), 'info'],
+      'bad-step': [words.badStep, 'error'],
+      'read-only': [words.readOnly, 'error'],
+      detached: [words.detached, 'error'],
+      waiting: [words.waiting, 'info'],
+    };
+    const line = said[notice.code];
+    if (line) this.notify(line[0], line[1]);
+  }
+
+  /** The frames of the others who are on the shown sheet. */
+  private gridPeers(): GridPeer[] {
+    const out: GridPeer[] = [];
+    for (const peer of this.collabPeers) {
+      if (!peer.presence || peer.presence.sheet !== this.sheetIndex) continue;
+      out.push({ range: peer.presence.range, color: peer.color, label: peer.name !== undefined ? peer.name : this.strings.collab.guest(peer.guest) });
+    }
+    return out;
+  }
+
+  /** A dot in the colour of each participant on the tab of the sheet they are on. */
+  private markTabs(): void {
+    const tabs = this.tabs.children;
+    for (let i = 0; i < tabs.length; i++) {
+      const tab = tabs[i] as HTMLElement;
+      const old = tab.querySelectorAll('.bym-tab-peer');
+      for (let k = 0; k < old.length; k++) tab.removeChild(old[k]);
+      const at = this.tabSheetOf(tab);
+      // A tab whose name is being typed holds a field, and is left alone.
+      if (at < 0 || tab.firstElementChild) continue;
+      let dots = 0;
+      for (const peer of this.collabPeers) {
+        if (!peer.presence || peer.presence.sheet !== at || dots >= 3) continue;
+        const dot = document.createElement('span');
+        dot.className = 'bym-tab-peer';
+        dot.setAttribute('aria-hidden', 'true');
+        dot.setAttribute('data-peer', peer.id);
+        dot.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;margin-left:5px;vertical-align:middle;background:${/^#[0-9A-Fa-f]{6}$/.test(peer.color) ? peer.color : '#5F6368'}`;
+        tab.appendChild(dot);
+        dots++;
+      }
+    }
+  }
+
+  /**
+   * The workbook was changed under the view by the session: a step of someone else was placed
+   * (with this participant's own waiting steps taken back and applied again), or (`remote`
+   * false) a step of this participant was undone. The sheet that is shown, its selection and a
+   * cell that is being typed in follow what moved; everything that is drawn is worked out anew.
+   */
+  collabChanged(change: SessionChange, remote = true): void {
+    if (this.destroyed) return;
+    // Cells that only got another content leave whatever the user is in the middle of alone: a drag, a size that is
+    // being pulled, a menu. Only when positions or the list of sheets moved under them are they given up.
+    const moved = change.sheets || change.shifts.some((shift) => shift.k !== 'sName');
+    if (moved) {
+      this.endChartDrag(false, 0);
+      this.endTabDrag();
+      this.endDrag();
+      this.endTouch();
+      this.closeMenu();
+    }
+    // A dialog of rules names its rule by its place and its cells by where they were: it is closed, and nothing of it is applied.
+    if (this.rulesDialog && (moved || change.lists === true || change.shifts.length > 0)) {
+      const open = this.rulesDialog;
+      this.dismiss(() => open.close());
+      this.notifyLater(this.strings.collab.dialogClosed, 'error');
+    }
+    // A formula that is being typed says cells and sheets as they were: it cannot be told what it meant.
+    if (this.edit && change.shifts.length > 0 && /^\s*=/.test(this.editText)) {
+      this.cancelEditing();
+      this.notifyLater(this.strings.collab.formulaGone, 'error');
+    }
+    const old = this.sheetIndex;
+    const was = this.states.get(this.shown);
+    type At = { s: number; row: number; col: number } | undefined;
+    let active: At = was ? { s: old, row: was.active.row, col: was.active.col } : undefined;
+    let focus: At = was ? { s: old, row: was.focus.row, col: was.focus.col } : undefined;
+    let first: At = was ? { s: old, row: was.range.top, col: was.range.left } : undefined;
+    let last: At = was ? { s: old, row: was.range.bottom, col: was.range.right } : undefined;
+    let typed: At = this.edit && this.edit.home === this.shown ? { s: old, row: this.edit.row, col: this.edit.col } : undefined;
+    let noted: At = this.noteEdit && this.noteEdit.sheet === this.shown ? { s: old, row: this.noteEdit.row, col: this.noteEdit.col } : undefined;
+    let shownAt: At = { s: old, row: 0, col: 0 };
+    let typedGone = false;
+    let notedGone = false;
+    // What is typed on a sheet that is not the one shown cannot be followed: it is given up when anything moved.
+    if (moved && this.edit && this.edit.home !== this.shown) typedGone = true;
+    if (moved && this.noteEdit && this.noteEdit.sheet !== this.shown) notedGone = true;
+    for (const shift of change.shifts) {
+      if (shift.k === 'sName') continue;
+      if (shift.k === 'perm') {
+        // A cell that is being typed in, or noted, goes with its row; the selection stays where it is.
+        for (const at of [typed, noted]) {
+          if (at && shift.s === at.s && at.row >= shift.top && at.row <= shift.bottom && at.col >= shift.left && at.col <= shift.right) at.row = shift.top + shift.target[at.row - shift.top];
+        }
+        continue;
+      }
+      if (active) active = mapPosition(active, shift);
+      if (focus) focus = mapPosition(focus, shift);
+      if (first) first = mapPosition(first, shift);
+      if (last) last = mapPosition(last, shift);
+      if (shownAt) shownAt = mapPosition(shownAt, shift);
+      if (typed) {
+        typed = mapPosition(typed, shift, true);
+        if (!typed) typedGone = true;
+      }
+      if (noted) {
+        noted = mapPosition(noted, shift, true);
+        if (!noted) notedGone = true;
+      }
+    }
+    if (this.noteEdit && (notedGone || this.workbook.sheets.indexOf(this.noteEdit.sheet) < 0)) {
+      this.finishNote(false);
+      this.notifyLater(this.strings.collab.editGone, 'error');
+    } else if (this.noteEdit && noted) {
+      this.noteEdit.row = noted.row;
+      this.noteEdit.col = noted.col;
+    }
+    const sheets = this.workbook.sheets;
+    if (this.edit && (typedGone || (this.edit.home !== this.shown && sheets.indexOf(this.edit.home) < 0) || (this.edit.home === this.shown && !shownAt))) {
+      this.cancelEditing();
+      this.notifyLater(this.strings.collab.editGone, 'error');
+    } else if (this.edit && typed) {
+      this.edit.row = typed.row;
+      this.edit.col = typed.col;
+    }
+    // The sheet that was shown: the very one, or the one that stands where it went (a sheet this participant added is made anew when its step is applied again).
+    let show = sheets.indexOf(this.shown);
+    if (show < 0 && shownAt) show = shownAt.s;
+    if (show < 0 || show >= sheets.length || sheets[show].state !== 'visible') show = Math.max(sheetToShow(sheets, Math.min(old, sheets.length - 1)), 0);
+    this.states.forEach((_state, sheet) => {
+      if (sheets.indexOf(sheet) < 0) this.states.delete(sheet);
+    });
+    const target = sheets[show];
+    if (target && shownAt && shownAt.s === show && active && focus && first && last && last.row >= first.row && last.col >= first.col) {
+      const state = this.stateOf(target);
+      state.active = { row: clamp(active.row, first.row, last.row), col: clamp(active.col, first.col, last.col) };
+      state.focus = { row: clamp(focus.row, first.row, last.row), col: clamp(focus.col, first.col, last.col) };
+      state.range = { top: first.row, left: first.col, bottom: last.row, right: last.col };
+    }
+    if (change.sheets || show !== this.sheetIndex || target !== this.shown) this.syncSheets(show, 'insert');
+    // The formulas: those that read what changed, or all of them when cells moved or a sheet went.
+    if (this.options.calculate !== false) {
+      if (this.engine && this.engine.incomplete) this.finishCalculation(this.engine);
+      let cells = change.cells;
+      if (cells && cells.length > MAX_RECALC_CELLS) cells = undefined;
+      if (change.shifts.some((shift) => shift.k === 'sDel')) cells = undefined;
+      // An engine knows the sheets by their places: after the list changed, or with a calculation left unfinished, another one starts.
+      if (change.sheets || (this.engine && this.engine.incomplete)) this.engine = undefined;
+      if (!cells) this.recalculate(undefined);
+      else if (cells.length > 0 || change.layout) this.recalculate(cells, change.layout ? allSheets(sheets.length) : undefined);
+    }
+    this.marksDirty = true;
+    this.remoteChange = remote;
+    try {
+      this.afterChange(allSheets(sheets.length), true);
+    } finally {
+      this.remoteChange = false;
+    }
+    this.markTabs();
+    this.syncInput();
   }
 
   private restoreSelection(selection: { active: CellPos; range: CellRange }): void {

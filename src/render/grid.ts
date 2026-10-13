@@ -53,6 +53,15 @@ export interface GridSelection {
   range: CellRange;
 }
 
+/** Where someone else who edits the workbook is: a frame in their colour around what they selected, with their name on it. */
+export interface GridPeer {
+  range: CellRange;
+  /** "#RRGGBB". */
+  color: string;
+  /** Drawn as text, never read as markup. */
+  label: string;
+}
+
 /** The filter of a sheet as the grid draws it: a button in each header cell, and the rows it governs. */
 export interface GridFilter {
   /** The header row is the first row of the range. */
@@ -126,6 +135,8 @@ export interface GridScene {
   comments?: GridCommentSource;
   /** The cells a formula that is being typed was pointed at: framed with a dashed line. */
   reference?: CellRange;
+  /** The selections of the other participants on this sheet. */
+  peers?: readonly GridPeer[];
 }
 
 /** Space between a cell edge and its text, in pixels. */
@@ -299,6 +310,7 @@ interface Frame {
   drawings: GridDrawingSource | undefined;
   comments: GridCommentSource | undefined;
   reference: CellRange | undefined;
+  peers: readonly GridPeer[] | undefined;
   dpr: number;
   /** Grid lines are drawn, and how wide: on screen as the sheet says and one pixel, on paper as its print options say and thinner. */
   gridLines: boolean;
@@ -343,6 +355,7 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: scene.comments && typeof scene.comments.has === 'function' ? scene.comments : undefined,
     reference: scene.reference ? clampRange(scene.reference) : undefined,
+    peers: scene.peers && scene.peers.length > 0 ? scene.peers : undefined,
     dpr,
     gridLines: sheet.view.showGridLines !== false,
     gridLineWidth: 1,
@@ -486,6 +499,7 @@ export function renderGridPrint(ctx: CanvasRenderingContext2D, scene: GridPrintS
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: undefined,
     reference: undefined,
+    peers: undefined,
     dpr: scale,
     gridLines: scene.gridLines === true,
     gridLineWidth: PRINT_GRID_LINE,
@@ -943,6 +957,7 @@ function drawPane(frame: Frame, view: PaneView): void {
   if (frame.filter) drawFilterButtons(frame, view, frame.filter);
   if (frame.dropdown) drawDropdown(frame, view, frame.dropdown);
   if (frame.drawings) drawFloating(frame, view, frame.drawings);
+  if (frame.peers) for (let i = 0; i < frame.peers.length; i++) drawPeer(frame, view, frame.peers[i]);
   if (frame.selection) drawSelection(frame, view, frame.selection);
   if (frame.reference) drawReference(frame, view, frame.reference);
 
@@ -1795,6 +1810,50 @@ function drawSelection(frame: Frame, view: PaneView, selection: GridSelection): 
   ctx.lineWidth = 2;
   ctx.strokeRect(x0, y0, x1 - x0 - 1, y1 - y0 - 1);
   ctx.lineWidth = 1;
+}
+
+/** Longest name drawn on the frame of a participant. */
+const MAX_PEER_LABEL = 24;
+const PEER_FONT = '11px sans-serif';
+
+/** The frame around what another participant selected, and their name at its top-left corner. */
+function drawPeer(frame: Frame, view: PaneView, peer: GridPeer): void {
+  const { ctx } = frame;
+  if (!/^#[0-9A-Fa-f]{6}$/.test(peer.color)) return;
+  const metrics = frame.layout.metrics;
+  const { cols, rows } = view;
+  const rect = view.pane.rect;
+  const range = clampRange(peer.range);
+  if (!range) return;
+  const x0 = Math.round(cols.origin + metrics.cols.offset(range.left));
+  const x1 = Math.round(cols.origin + metrics.cols.offset(range.right + 1));
+  const y0 = Math.round(rows.origin + metrics.rows.offset(range.top));
+  const y1 = Math.round(rows.origin + metrics.rows.offset(range.bottom + 1));
+  if (x1 <= x0 || y1 <= y0 || x1 < rect.x || y1 < rect.y || x0 > rect.x + rect.width + 1 || y0 > rect.y + rect.height + 1) return;
+  // Only the part in the pane is stroked, as for a reference.
+  const left = Math.max(x0, rect.x - 8);
+  const top = Math.max(y0, rect.y - 8);
+  const right = Math.min(x1, rect.x + rect.width + 8);
+  const bottom = Math.min(y1, rect.y + rect.height + 8);
+  ctx.strokeStyle = peer.color;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(left, top, right - left - 1, bottom - top - 1);
+  ctx.lineWidth = 1;
+  const label = peer.label.length > MAX_PEER_LABEL ? `${peer.label.slice(0, MAX_PEER_LABEL - 1)}\u2026` : peer.label;
+  if (label !== '' && x0 >= rect.x - 1 && y0 >= rect.y - 1) {
+    ctx.font = PEER_FONT;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const width = Math.ceil(ctx.measureText(label).width) + 8;
+    const height = 14;
+    // Above the range where there is room, else inside its first row.
+    const ly = y0 - height >= rect.y ? y0 - height : y0;
+    ctx.fillStyle = peer.color;
+    ctx.fillRect(x0 - 1, ly, width, height);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText(label, x0 + 3, ly + height / 2 + 0.5);
+  }
+  frame.painter.invalidate();
 }
 
 /** The dashed frame around the cells a formula being typed was pointed at. */

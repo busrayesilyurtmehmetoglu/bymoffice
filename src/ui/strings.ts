@@ -296,6 +296,37 @@ export interface UiStrings {
   /** Label of the field a sheet is renamed in. */
   sheetName: string;
   /** Said after a sheet was deleted. */
+  /** What is said while a workbook is edited together with others. */
+  collab: {
+    /** A participant who gave no name. */
+    guest(n: number): string;
+    state: { connecting: string; online: string; offline: string; detached: string; closed: string };
+    /** The title of the list of participants: how many others are there. */
+    others(n: number): string;
+    dropped(n: number): string;
+    partial: string;
+    undoGone: string;
+    undoNone: string;
+    undoLossy: string;
+    skipped: string;
+    peer: string;
+    stale: string;
+    reloaded(n: number): string;
+    refused: string;
+    backlog(n: number): string;
+    badStep: string;
+    readOnly: string;
+    detached: string;
+    waiting: string;
+    copySheet: string;
+    tooLarge: string;
+    unsupported: string;
+    sheetDeleted(name: string): string;
+    editGone: string;
+    formulaGone: string;
+    dialogClosed: string;
+    document: string;
+  };
   sheetDeleted(name: string): string;
   /** Said when a reference was put into the formula being typed by pointing at cells: "Reference B5:D9". */
   referenceAdded(reference: string): string;
@@ -797,6 +828,34 @@ export const STRINGS_EN: UiStrings = {
   cannotHideLastSheet: 'The last visible sheet cannot be hidden',
   cannotSortThreaded: 'A range with a threaded comment cannot be sorted yet',
   sheetName: 'Sheet name',
+  collab: {
+    guest: (n) => `Guest ${n}`,
+    state: { connecting: 'Connecting…', online: 'Editing together', offline: 'Offline: changes are sent when the connection is back', detached: 'Detached: your changes are here only. Save the file', closed: 'Not connected: changes stay here' },
+    others: (n) => (n === 1 ? '1 other person is here' : `${n} other people are here`),
+    dropped: (n) => (n === 1 ? 'One of your changes could not be applied because someone else deleted or changed what it was about.' : `${n} of your changes could not be applied because someone else deleted or changed what they were about.`),
+    partial: 'Part of one of your changes was not applied: someone else deleted the rows, columns or sheet it was in.',
+    undoGone: 'This step cannot be undone any more: someone else changed or deleted what it was about.',
+    undoNone: 'This step cannot be undone while the workbook is edited together.',
+    undoLossy: 'The cells are back; notes, links and rules that went with them are not.',
+    skipped: 'Rules and charts do not travel with cells while the workbook is edited together; the cells were changed.',
+    peer: 'Something that is no change of this workbook arrived; editing together has ended. Your changes stay here.',
+    stale: 'The file was changed elsewhere and could not be loaded again; editing together has ended.',
+    reloaded: (n) => (n === 1 ? 'The file was loaded again; one change that was not sent yet was lost.' : `The file was loaded again; ${n} changes that were not sent yet were lost.`),
+    refused: 'The server does not take changes from here; editing together has ended.',
+    backlog: (n) => `${n} changes wait to be sent.`,
+    badStep: 'Someone sent a change that is none for this workbook. It was left out for everybody.',
+    readOnly: 'The server takes no changes from you: the workbook is read-only here.',
+    detached: 'The file was changed elsewhere, or the room was started anew, while this workbook holds changes that are in no file. Nothing was thrown away: your changes are here, and nobody else sees them. Save the file to go on together.',
+    waiting: 'The room cannot be joined yet: someone who is in it has to save the file first. Trying again…',
+    copySheet: 'A sheet cannot be copied while the workbook is edited together.',
+    tooLarge: 'This change is too large to be shared in one step.',
+    unsupported: 'This cannot be done while the workbook is edited together.',
+    sheetDeleted: (name) => `Sheet ${name} was deleted. This cannot be undone while the workbook is edited together.`,
+    editGone: 'The cell you were typing in was deleted by someone else.',
+    formulaGone: 'Someone else moved cells or renamed a sheet while you were typing a formula: what you typed may have meant other cells, and was not applied.',
+    dialogClosed: 'Someone else changed the sheet or its rules: the dialog was closed without applying anything.',
+    document: 'Editing together is not available for documents yet.',
+  },
   sheetDeleted: (name) => `Sheet ${name} was deleted. Undo brings it back.`,
   referenceAdded: (reference) => `Reference ${reference}`,
   editSheetGone: 'The sheet of the cell is gone; what was typed was not written.',
@@ -1322,6 +1381,34 @@ export const STRINGS_TR: UiStrings = {
   cannotHideLastSheet: 'Görünen son sayfa gizlenemez',
   cannotSortThreaded: 'Yorum zinciri içeren aralık henüz sıralanamıyor',
   sheetName: 'Sayfa adı',
+  collab: {
+    guest: (n) => `Misafir ${n}`,
+    state: { connecting: 'Bağlanıyor…', online: 'Birlikte düzenleniyor', offline: 'Çevrimdışı: değişiklikler bağlantı gelince gönderilir', detached: 'Kopuk: değişiklikleriniz yalnız burada. Dosyayı kaydedin', closed: 'Bağlı değil: değişiklikler burada kalır' },
+    others: (n) => `${n} kişi daha burada`,
+    dropped: (n) => (n === 1 ? 'Bir değişikliğiniz, ilgili yeri başkası sildiği ya da değiştirdiği için uygulanamadı.' : `${n} değişikliğiniz, ilgili yeri başkası sildiği ya da değiştirdiği için uygulanamadı.`),
+    partial: 'Bir değişikliğinizin bir bölümü uygulanmadı: içinde olduğu satırları, sütunları ya da sayfayı başkası sildi.',
+    undoGone: 'Bu adım artık geri alınamaz: ilgili yeri başkası değiştirdi ya da sildi.',
+    undoNone: 'Bu adım, kitap birlikte düzenlenirken geri alınamaz.',
+    undoLossy: 'Hücreler geri geldi; onlarla giden notlar, bağlantılar ve kurallar gelmedi.',
+    skipped: 'Kitap birlikte düzenlenirken kurallar ve grafikler hücrelerle birlikte taşınmaz; hücreler değişti.',
+    peer: 'Bu kitabın değişikliği olmayan bir ileti geldi; birlikte düzenleme sona erdi. Değişiklikleriniz burada duruyor.',
+    stale: 'Dosya başka yerde değişti ve yeniden yüklenemedi; birlikte düzenleme sona erdi.',
+    reloaded: (n) => (n === 1 ? 'Dosya yeniden yüklendi; henüz gönderilmemiş bir değişiklik kayboldu.' : `Dosya yeniden yüklendi; henüz gönderilmemiş ${n} değişiklik kayboldu.`),
+    refused: 'Sunucu buradan değişiklik almıyor; birlikte düzenleme sona erdi.',
+    backlog: (n) => `${n} değişiklik gönderilmeyi bekliyor.`,
+    badStep: 'Biri bu kitabın değişikliği olmayan bir şey gönderdi. Herkeste atlandı.',
+    readOnly: 'Sunucu sizden değişiklik almıyor: kitap burada salt okunur.',
+    detached: 'Dosya başka yerde değişti ya da oda yeniden başladı; bu kitapta ise hiçbir dosyada olmayan değişiklikler var. Hiçbir şey atılmadı: değişiklikleriniz burada ve başkası görmüyor. Birlikte devam etmek için dosyayı kaydedin.',
+    waiting: 'Odaya şu an katılınamıyor: odadakilerden birinin önce dosyayı kaydetmesi gerekiyor. Yeniden deneniyor…',
+    copySheet: 'Kitap birlikte düzenlenirken sayfa kopyalanamaz.',
+    tooLarge: 'Bu değişiklik tek adımda paylaşılamayacak kadar büyük.',
+    unsupported: 'Bu, kitap birlikte düzenlenirken yapılamaz.',
+    sheetDeleted: (name) => `${name} sayfası silindi. Kitap birlikte düzenlenirken bu geri alınamaz.`,
+    editGone: 'Yazdığınız hücreyi başkası sildi.',
+    formulaGone: 'Siz formül yazarken başkası hücreleri kaydırdı ya da bir sayfayı yeniden adlandırdı: yazdığınız başka hücreleri kastediyor olabilirdi, uygulanmadı.',
+    dialogClosed: 'Başkası sayfayı ya da kurallarını değiştirdi: kutu hiçbir şey uygulanmadan kapatıldı.',
+    document: 'Birlikte düzenleme belgelerde henüz yok.',
+  },
   sheetDeleted: (name) => `${name} sayfası silindi. Geri al ile geri gelir.`,
   referenceAdded: (reference) => `Başvuru ${reference}`,
   editSheetGone: 'Hücrenin sayfası artık yok; yazılan kaydedilmedi.',

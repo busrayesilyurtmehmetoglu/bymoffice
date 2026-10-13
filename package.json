@@ -36,6 +36,7 @@
   },
   "files": [
     "dist",
+    "server",
     "CHANGELOG.md",
     "LICENSE",
     "THIRD-PARTY-NOTICES.md"

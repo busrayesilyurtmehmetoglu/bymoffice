@@ -19,6 +19,7 @@ import { pdfFileName, type PdfExportOptions } from '../pdf/export';
 import type { SheetPdfExportOptions, WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
+import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabTransport, type CollabUser } from '../collab/index';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
 export type BridgeErrorCode =
@@ -143,6 +144,11 @@ export interface BridgeHost {
    * is no channel to send it on yet; the message is then kept and sent later.
    */
   post(json: string): boolean | void;
+  /**
+   * What carries the messages of a `load` with `collab` to its relay. Default: a WebSocket to the
+   * address (socketTransport()).
+   */
+  createTransport?(url: string): CollabTransport;
   /** Sent in `ready`; the package version, which is also the version of the contract. */
   version: string;
   /** The page's own address. A `load` with a `url` is resolved against it; without it only blob: and data: URLs load. */
@@ -408,7 +414,7 @@ const DEFAULT_SAVE_RESULT_TIMEOUT_MS = 60000;
 const MAX_RESULT_MESSAGE_CHARS = 200;
 
 /** Messages that say how things are now: of those waiting for a channel only the newest of each kind is kept. */
-const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet' || type === 'sheets' || type === 'saveState';
+const isStatus = (type: string) => type === 'changed' || type === 'selection' || type === 'sheet' || type === 'sheets' || type === 'saveState' || type === 'collabState';
 
 /** Longest name of a sheet a message may carry. What a sheet may be called is the view's to say; this only bounds what is looked at. */
 const MAX_NAME_CHARS = 255;
@@ -678,6 +684,10 @@ interface Shown {
   commentsOnly?: boolean;
   /** A `load` with `save`: what the Save button and Ctrl+S of the page run. */
   saver?: SaveController;
+  /** A `load` with `collab`: the session the workbook is edited together in. */
+  collab?: CollabSession;
+  /** The file that was written last while it is edited together, and the step it holds (undefined: of no one step). */
+  written?: { bytes: Uint8Array; rev: number | undefined };
   /** The language the file was loaded with or `setLocale` chose: what a save is spoken of in. */
   locale?: string;
 }
@@ -893,6 +903,7 @@ export function createBridge(host: BridgeHost): Bridge {
       shown.saver.destroy();
       saveStateLeft = true;
     }
+    if (shown.collab) shown.collab.leave();
     if (awaited) awaited.stop();
     awaited = undefined;
     shown = undefined;
@@ -1041,6 +1052,30 @@ export function createBridge(host: BridgeHost): Bridge {
       if (typeof saveField !== 'boolean') throw new BadMessage('"save" must be a boolean or an object ({ auto })');
       userSaves = saveField;
     }
+    // `collab`: the address of a relay, or an object with it and who this participant is.
+    let collab: { url: string; room?: string; token?: string; user?: CollabUser } | undefined;
+    const collabField = message.collab;
+    if (typeof collabField === 'string') collab = { url: collabField };
+    else if (typeof collabField === 'object' && collabField !== null && !Array.isArray(collabField)) {
+      const given = collabField as { url?: unknown; room?: unknown; token?: unknown; user?: unknown };
+      if (typeof given.url !== 'string') throw new BadMessage('"collab.url" must be the address of a relay');
+      collab = { url: given.url };
+      if (given.room !== undefined) {
+        if (typeof given.room !== 'string' || given.room.length > 200) throw new BadMessage('"collab.room" must be a short text');
+        collab.room = given.room;
+      }
+      if (given.token !== undefined) {
+        if (typeof given.token !== 'string' || given.token.length > 4096) throw new BadMessage('"collab.token" must be a text');
+        collab.token = given.token;
+      }
+      if (typeof given.user === 'object' && given.user !== null) {
+        const user = given.user as { name?: unknown; color?: unknown };
+        collab.user = {};
+        if (typeof user.name === 'string') collab.user.name = user.name;
+        if (typeof user.color === 'string') collab.user.color = user.color;
+      }
+    } else if (collabField !== undefined && collabField !== null) throw new BadMessage('"collab" must be the address of a relay or an object ({ url, room, user, token })');
+    if (collab && !isSocketUrl(collab.url)) throw new BadMessage('"collab" must be the address of a relay: "ws://…" or "wss://…"');
     if (author !== undefined && author.length > 255) throw new BadMessage('"author" is too long');
     if ((data === undefined ? 0 : 1) + (url === undefined ? 0 : 1) + (blank === undefined ? 0 : 1) !== 1) {
       throw new BadMessage('"load" needs exactly one of "data", "url" and "blank"');
@@ -1240,6 +1275,8 @@ export function createBridge(host: BridgeHost): Bridge {
       setLocale(locale);
       setState('open');
       loaded(0, [], true);
+      // A document is not edited together yet: it is shown as without the field, and the application is told.
+      if (collab) send({ type: 'collabState', state: 'closed', reason: 'unsupported', rev: 0, pending: 0, peers: [] });
       return;
     }
     if (!workbook) return;
@@ -1270,9 +1307,12 @@ export function createBridge(host: BridgeHost): Bridge {
     const options: SpreadsheetEditorOptions = {
       onChange: (change) => {
         if (!view) return;
-        if (shown && shown.view === view && shown.saver) shown.saver.changed();
+        // What someone else changed is there to be saved, but is theirs to save by itself.
+        if (shown && shown.view === view && shown.saver) shown.saver.changed(change.remote === true);
         tellSheets();
-        send({ type: 'changed', sheets: change.sheets, canUndo: view.history.canUndo, canRedo: view.history.canRedo });
+        // A view that is edited together answers for the steps of its participant; any other view by its history.
+        const shared = typeof view.canUndo === 'boolean';
+        send({ type: 'changed', sheets: change.sheets, canUndo: shared ? view.canUndo : view.history.canUndo, canRedo: shared ? view.canRedo : view.history.canRedo });
       },
       // At most one selection message per frame, and only the last selection of that frame.
       onSelectionChange: (selection, sheetIndex) => {
@@ -1320,6 +1360,79 @@ export function createBridge(host: BridgeHost): Bridge {
     const list = sheetList(workbook);
     sheetsSent = JSON.stringify(list);
     loaded(view.activeSheet, list, false);
+    if (collab) joinCollab(shown, view, book, collab, file.format !== 'xlsx' || convertedFrom !== undefined ? undefined : bytes, locked || readOnly === true);
+  };
+
+  /**
+   * Makes the workbook that is shown one that is edited together (a `load` with `collab`) and
+   * tells the application of the session with `collabState`: at once, and whenever its state or
+   * the list of the others changes. `bytes`: the file as it was loaded, undefined for one that
+   * cannot be edited together (not an xlsx, or converted to be one here).
+   */
+  const joinCollab = (current: Shown, view: WorkbookView, book: Workbook, plan: { url: string; room?: string; token?: string; user?: CollabUser }, bytes: Uint8Array | undefined, readOnly: boolean): void => {
+    if (!bytes) {
+      send({ type: 'collabState', state: 'closed', reason: 'unsupported', rev: 0, pending: 0, peers: [] });
+      return;
+    }
+    let session: CollabSession | undefined;
+    const tell = (): void => {
+      if (!session || shown !== current) return;
+      send({
+        type: 'collabState',
+        state: session.state,
+        rev: session.rev,
+        pending: session.pending,
+        // Names are whatever the others said: text, to be shown as text.
+        peers: session.peers.map((peer) => ({ id: peer.id, name: peer.name === undefined ? null : peer.name, color: peer.color, readOnly: peer.readOnly })),
+      });
+    };
+    let transport: CollabTransport;
+    try {
+      transport = host.createTransport ? host.createTransport(plan.url) : socketTransport(plan.url);
+    } catch (error) {
+      send({ type: 'collabState', state: 'closed', reason: 'unsupported', rev: 0, pending: 0, peers: [] });
+      return;
+    }
+    session = new CollabSession(
+      {
+        workbook: () => book,
+        changed: (change) => {
+          if (shown === current) view.collabChanged(change);
+        },
+        notice: (said) => {
+          if (shown === current) view.collabNotice(said);
+        },
+        // With a save of the page: what the application has not stored. Without one the page cannot know, and nothing is taken to be saved.
+        unsaved: current.saver ? () => (current.saver as SaveController).dirty : undefined,
+      },
+      {
+        transport,
+        versions: [contentVersion(bytes)],
+        user: plan.user,
+        room: plan.room,
+        token: plan.token,
+        readOnly,
+        onState: tell,
+        // What someone else says was saved is passed on as it was said: whether it is so is the application's to find out.
+        onSaved: (saved) => {
+          if (shown !== current) return;
+          let etag: string | null = null;
+          for (const version of saved.versions) if (version.slice(0, 2) === 'e:') etag = version.slice(2);
+          send({ type: 'collabSaved', etag, rev: saved.rev === undefined ? null : saved.rev, versions: saved.versions });
+        },
+        onReadOnly: () => {
+          if (shown === current) view.setReadOnly(true);
+        },
+        onPeers: (peers) => {
+          if (shown !== current) return;
+          view.collabPeersChanged(peers);
+          tell();
+        },
+      },
+    );
+    current.collab = session;
+    view.attachCollab(session);
+    tell();
   };
 
   /** Tells the application the comments of the document, when they are not what it was told last. */
@@ -1521,6 +1634,30 @@ export function createBridge(host: BridgeHost): Bridge {
     if (id !== undefined) send(answer);
   };
 
+  /**
+   * The bytes of the file. For a workbook that is edited together what arrives is held back
+   * while the file is written, so that it is the workbook of one moment, and the others are
+   * told what these bytes are known by and which step they hold: whoever loads them later
+   * joins the room from there.
+   */
+  const sharedBytes = async (current: Shown): Promise<Uint8Array> => {
+    const session = current.collab;
+    if (!session || session.state === 'closed') return current.file.save();
+    if (session.state === 'online') await session.whenSettled(3000);
+    const rev = session.savableRev;
+    session.pause();
+    let bytes: Uint8Array;
+    let touched = false;
+    try {
+      bytes = await current.file.save();
+    } finally {
+      touched = session.resume();
+    }
+    // Told to the others only once the application says it has stored the file (see userSaver()).
+    current.written = { bytes, rev: touched ? undefined : rev };
+    return bytes;
+  };
+
   /** The file that is shown as bytes, with what is being typed in it. */
   const writeShown = async (current: Shown): Promise<Uint8Array> => {
     // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
@@ -1531,7 +1668,7 @@ export function createBridge(host: BridgeHost): Bridge {
     // A composition still under way belongs to the document that is written.
     if (pages && pages.commitEditing) pages.commitEditing();
     const changes = pages ? pages.changeCount : undefined;
-    const bytes = await current.file.save();
+    const bytes = await sharedBytes(current);
     // A change made while the file was written is not in these bytes.
     if (pages && pages.markSaved && pages.changeCount === changes) pages.markSaved();
     return bytes;
@@ -1541,7 +1678,7 @@ export function createBridge(host: BridgeHost): Bridge {
   const writeShownAsIs = async (current: Shown): Promise<Uint8Array> => {
     const pages = current.pages;
     const changes = pages ? pages.changeCount : undefined;
-    const bytes = await current.file.save();
+    const bytes = await sharedBytes(current);
     if (pages && pages.markSaved && pages.changeCount === changes) pages.markSaved();
     return bytes;
   };
@@ -1571,7 +1708,12 @@ export function createBridge(host: BridgeHost): Bridge {
           // Before the message goes: an application that answers from inside the call finds the save waiting.
           const result = awaitResult(saveId);
           send(out);
-          return result;
+          // The application stored the file: now the others are told what it is known by and which step it holds.
+          return result.then(() => {
+            const current = shown;
+            if (!current || current.saver !== mine || !current.collab || !current.written || current.written.bytes !== bytes) return;
+            current.collab.announceSaved([contentVersion(bytes)], current.written.rev);
+          });
         },
       },
       writable: () => shown !== undefined && shown.saver === mine && !shown.locked,

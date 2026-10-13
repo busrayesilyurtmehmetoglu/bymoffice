@@ -43,7 +43,7 @@ import {
   type Workbook,
 } from '../model/sheet/types';
 import { drawingAnchorNow } from '../render/sheet-drawings';
-import type { Op } from './ops';
+import { withCommand, type Op } from './ops';
 import type { RuleLists } from './rules';
 
 /** The chart types that are made here. "column": upright bars; "bar": bars that lie. */
@@ -607,6 +607,10 @@ function setDrawings(sheetIndex: number, list: SheetDrawing[]): Op[] {
  * cells of the workbook, an unknown type, too many drawings).
  */
 export function addChart(workbook: Workbook, sheetIndex: number, spec: ChartSpec): Op[] {
+  return withCommand(addChartPlain(workbook, sheetIndex, spec), 'addChart', [spec]);
+}
+
+function addChartPlain(workbook: Workbook, sheetIndex: number, spec: ChartSpec): Op[] {
   const sheet = placedSheetOf(workbook, sheetIndex);
   if (!spec || typeof spec !== 'object') throw new RangeError('A chart needs a type and a range of cells');
   const type = checkType(spec.type);
@@ -641,6 +645,10 @@ export function addChart(workbook: Workbook, sheetIndex: number, spec: ChartSpec
  * shares a wrapper of alternatives with another drawing (SheetDrawing.wrapped).
  */
 export function removeChart(workbook: Workbook, sheetIndex: number, id: number): Op[] {
+  return withCommand(removeChartPlain(workbook, sheetIndex, id), 'removeChart', [id]);
+}
+
+function removeChartPlain(workbook: Workbook, sheetIndex: number, id: number): Op[] {
   const sheet = placedSheetOf(workbook, sheetIndex);
   const { drawing } = chartAt(sheet, id);
   const inFile = fileDrawing(drawing);
@@ -670,6 +678,10 @@ function changed(sheet: Sheet, drawing: SheetDrawing, change: Partial<Pick<Sheet
  * covers). Returns no operation when the chart is there already.
  */
 export function moveChart(workbook: Workbook, sheetIndex: number, id: number, anchor: DrawingAnchor | CellRange): Op[] {
+  return withCommand(moveChartPlain(workbook, sheetIndex, id, anchor), 'moveChart', [id, anchor]);
+}
+
+function moveChartPlain(workbook: Workbook, sheetIndex: number, id: number, anchor: DrawingAnchor | CellRange): Op[] {
   const sheet = placedSheetOf(workbook, sheetIndex);
   const { drawing } = chartAt(sheet, id);
   const wanted = checkedAnchor(anchor);
@@ -857,6 +869,10 @@ function settled(chart: Chart, read: Chart): Chart {
  * Returns no operation when nothing would change. Throws RangeError for what cannot be done.
  */
 export function updateChart(workbook: Workbook, sheetIndex: number, id: number, patch: ChartPatch): Op[] {
+  return withCommand(updateChartPlain(workbook, sheetIndex, id, patch), 'updateChart', [id, patch]);
+}
+
+function updateChartPlain(workbook: Workbook, sheetIndex: number, id: number, patch: ChartPatch): Op[] {
   const sheet = sheetOf(workbook, sheetIndex);
   const { drawing, object } = chartAt(sheet, id);
   if (!patch || typeof patch !== 'object') return [];

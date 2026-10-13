@@ -40,6 +40,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 
 | Özellik | Durum |
 |---|---|
+| Birlikte düzenlemede (`collab`): **belgeler (docx)**; sayfa kopyalama; yapıştırmayla kural/grafik taşıma; sayfa silmenin, kural ve grafik komutlarının geri alınması; satır/sütun silmenin geri alınmasında notların, bağlantıların, kuralların geri gelmesi; aktarıcıda kalıcılık; köprü sayfasında başka kökendeki aktarıcı (sayfanın içerik güvenlik ilkesi `connect-src 'self'` der) | Yok. Yapılamayan işlem yapılmaz ve bildirilir; belgede `collab` verilirse bildirim gelir ve dosya tek başına düzenlenir |
 | Formüllerde: dinamik dizi taşması, `LET`/`LAMBDA`, tablo başvuruları (`Tablo[Sütun]`), başka dosyaya ve 3B (`Sayfa1:Sayfa3!A1`) başvurular, `;` ile argüman ayırma | Yok. Böyle bir formül içeren hücre dosyadaki son değerini korur ya da `#REF!`/`#NAME?` verir; formül metni kaydederken bozulmaz |
 | Formüllerde yerel çıktı ve Türkçe biçim kodu: `TEXT`, `FIXED`, `DOLLAR` çıktısının ve sayıdan metne dönüşümün (`&`, `CONCAT`) yerel ayırıcılarla (`1.234,50`) ve Türkçe ay/gün adlarıyla gelmesi; `TEXT` içinde Türkçe Excel'in gösterdiği kod (`#.##0,00`, `gg.aa.yyyy`) | Yok. Türkçe görünümde de çıktı dosya biçimindedir (`=METNEÇEVİR(1234,5;"#,##0.00")` → `1,234.50`, `=1,5&""` → `1.5`, ay adı `March`; Türkçe ad için kodda `[$-41F]`), biçim kodu İngilizce yazılır. Okuma yerelidir: `"7,5"` sayı olarak okunur ("Metindeki sayılar ve yerel ayar"). Türkçe Excel'de yazılmış dosyadaki sonuç, girdisi değişmedikçe korunur |
 | Tablo ya da form denetimi içeren sayfalarda, içinde pivot tablo bulunan çalışma kitaplarında, ve **başvuruları izlenemeyen bir grafiği** olan kitaplarda (grafik sayfası, pivot grafiği, `chartex`, okunmayan tür, uzantısında ya da veri etiketinde ayrıca formül taşıyan grafik, iki çerçevenin gösterdiği tek grafik parçası) satır/sütun ekleme-silme | Reddedilir (bu içeriklerin başvuruları kaydırılmıyor; sessizce bozulmasınlar diye); hücre düzenleme ve biçimlendirme serbesttir. Resim ve yorum içeren sayfalarda, ve **bütün grafiklerinin başvuruları modelde olan** kitaplarda serbesttir (`workbook.chartsFollow`; "Grafik ekleme ve düzenleme") |
@@ -515,6 +516,76 @@ Kendiliğinden kayıt, düğmeyle kayıtla **aynı yoldan** geçer: aynı anda t
 - `destroy()` zamanlayıcıyı kaldırır; ardından hiçbir istek gitmez.
 
 Bilinmesi gerekenler: beklemede olduğunu `onSaveState`'in `autoPaused: true` alanı söyler (neden: `error` doluysa o hata, boşsa ETag yokluğu); `setAutoSave(true)` duranı yeniden başlatmaz (bunu `saveNow()` ya da kullanıcının kaydı yapar). Sürükleme yalnız ızgara ve belge sayfası içindekidir (sekme sürükleme, kutu taşıma sayılmaz). Belge düzenleyicisinin araç çubuğundaki açık alanlar (bağlantı adresi gibi) "yazılmakta olan" sayılmaz; kendiliğinden kayıt onlara dokunmaz, modelin o anki halini yazar. Gizlenen sayfada istek tarayıcı tarafından kesilebilir (`keepalive` kullanılmaz: gövde sınırı 64 KB'dir); "son şans" bir güvence değildir. Cihazın saati geri alınırsa bekleme süreleri o andan yeniden sayılır (hiçbir bekleme kurulduğu süreden uzun sürmez); ileri alınırsa bekleyen kayıt hemen gider. UNSURE: gerçek cihazda IME ve sanal klavyeyle, arka plana alınan mobil sekmede denenmedi; ETag'i yanıtında göndermeyen gerçek bir sunucu çatısıyla denenmedi (çoğu çatı `PUT` yanıtına kendiliğinden ETag koymaz: kendiliğinden kaydetme için sunucunuzun kayıt yanıtında yeni **güçlü** ETag'i göndermesi gerekir, yoksa ilk kendiliğinden kayıttan sonra bekler).
+
+### Birlikte düzenleme (`collab`)
+
+Aynı çalışma kitabını (xlsx) birden çok kişi **aynı anda** düzenler; herkes öbürlerinin seçimini görür. Tek seçenek yeter:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js"></script>
+<div id="editor" style="height: 600px"></div>
+<script>
+  BymOffice.mount(document.getElementById('editor'), {
+    file: '/files/42',                       // herkes dosyayı kendi adresinden açar
+    saveTo: true,                            // isteğe bağlı: aynı yere kaydet
+    collab: 'wss://example.com/collab/42',   // aynı adresi açan herkes birlikte düzenler
+  });
+</script>
+```
+
+`collab` bir **aktarıcının** (relay) adresidir. Aktarıcı dosyayı tutmaz ve işlemlerin içine bakmaz; yalnız sıra verir. Depoda bağımlılıksız bir örneği vardır (pakete de girer): `node server/collab-server.mjs --port 8787 --origin https://uygulamaniz.example` — **kalıcılığı yoktur** (bellek), süreç kapanınca odalar gider. Kendi arka ucunuzda yazmak için kurallar ve iletilerin tam şeması: [`docs/collab-sozlesmesi.md`](collab-sozlesmesi.md).
+
+Nesne biçimi:
+
+```js
+collab: {
+  url: 'wss://example.com/collab',           // ya da transport (aşağıda)
+  room: 'dosya-42',                          // aynı adreste birden çok dosya için
+  user: { name: 'Ayşe', color: '#D93025' },  // öbürlerinin gördüğü ad ve renk
+  token: '…',                                // aktarıcıya ilk iletide gider (yetki sizin aktarıcınızda)
+  onState(state) {}, onPeers(peers) {},
+}
+```
+
+- **Ad ve renk:** `user` verilmezse katılımcı "Misafir N" olarak ve paletten bir renkle gösterilir. Adlar her yerde **düz metin** olarak basılır.
+- **`token`** yalnız `join` iletisinde gider; motor onu hiçbir bildirime yazmaz. Kimin katılabileceğine aktarıcınız karar verir: **odaya giren herkes dosyanın içeriğini öğrenir.**
+- **Özel taşıyıcı:** `collab: { transport: { send(text), onMessage(cb), onState?(cb), close() }, user }` — kendi kanalınız (Pusher, Reverb…). O zaman sözleşmedeki dört kuralı uygulayan taraf sizin arka ucunuzdur.
+- **Sunucusuz deneme:** `const relay = BymOffice.collab.memoryServer()` sayfa içinde bir aktarıcıdır. Aynı sayfadaki düzenleyiciler için `collab: { transport: relay.connect() }`; aynı tarayıcının **sekmeleri** için bir sekmede `relay.serve('oda')`, hepsinde `collab: { transport: BymOffice.collab.broadcastTransport('oda') }` (oda, onu tutan sekmeyle birlikte gider; test ve demo içindir). `BymOffice.collab.socketTransport(adres)` yerleşik WebSocket taşıyıcısıdır; üçünün de `suspend()` / `resume()` yöntemi bağlantıyı elle kesip açar.
+
+`mount()` sonucu:
+
+```js
+mounted.collab.state     // 'connecting' | 'online' | 'offline' | 'detached' | 'closed'
+mounted.collab.rev       // ortak sıradan kaç adımın kitapta olduğu
+mounted.collab.pending   // aktarıcının henüz sıraya koymadığı yerel adım sayısı
+mounted.collab.peers     // [{ id, name?, color, guest, readOnly, presence? }]
+mounted.collab.user      // bu katılımcı, öbürlerinin gördüğü gibi
+mounted.collab.onState = (state) => {};   mounted.collab.onPeers = (peers) => {};
+mounted.collab.saved(bytes, etag?)        // saveTo'suz, kendi kaydeden uygulama için (aşağıda)
+mounted.collab.reload()  // 'detached' iken: kitabı bırakıp sunucudaki dosyayı yükler ve yeniden katılır
+mounted.collab.leave()   // odadan çıkar; kitap kalır, sonraki değişiklikler kimseye gitmez
+```
+
+**Nasıl davranır**
+
+- Yazdığınız hemen görünür ve aktarıcıya gider; başkasının değişikliği araya girerse sizinki yeni duruma göre yeniden yerleştirilir (satır/sütun/sayfa eklenip silinince konumlar ve formüller kayar). **Aynı hücreye** iki kişi yazarsa aktarıcının sonra sıraya koyduğu kalır — herkeste aynı. Biçim ile değer ayrı değişikliklerdir: biri kalın yaparken öbürü değer yazarsa ikisi de kalır.
+- **Hedefi yok olan değişiklik düşer ve söylenir:** başkasının sildiği satıra/sütuna/sayfaya yazdıysanız görünümde ve `onNotice`'te "Bir değişikliğiniz, ilgili yeri başkası sildiği ya da değiştirdiği için uygulanamadı." bildirimi gelir. Hangi işlemin neye göre kaydığı ya da düştüğü: sözleşmedeki "Yeniden temellendirme kuralları" tablosu.
+- **Geri al / yinele yalnız kendi adımlarınızı** geri alır (başkasınınkini değil) ve herkese gider. Başkası aynı hücreyi sonradan değiştirdiyse o hücre geri alınmaz. **Geri alınamayanlar** (söylenir): sayfa silme, kural (veri doğrulama, koşullu biçim) ve grafik komutları. Satır/sütun silmenin geri alınması hücreleri, biçimleri, boyutları, birleşimleri ve formülleri geri getirir; onlarla giden notları, bağlantıları ve kuralları getirmez (söylenir).
+- **Çevrimdışı:** bağlantı kopunca durum `offline` olur, düzenleme sürer; değişiklikler birikir (`pending`) ve bağlanınca gönderilir. Yerleşik taşıyıcı üstel bekleme ile (0,5 sn → 30 sn) yeniden bağlanır, 25 sn'de bir kalp atışı yollar. 500'den çok bekleyen değişiklikte bir kez uyarı verilir.
+- **Öbürlerinin seçimi** ızgarada kendi renginde çerçeve ve ad etiketiyle çizilir; bulundukları sayfanın sekmesinde renkli nokta durur; düzenleyicinin üstünde bağlantı durumu ve katılımcı rozetleri gösterilir (`.bym-collab`, `data-state`). Seçimler saniyede en çok on kez gönderilir.
+- **Kayıt (`saveTo`):** bir kişi kaydedince öbürleri bunu **sunucuya sorarak doğrular** (`saveTo` adresine `HEAD`): ETag tutuyorsa onu benimser (sonraki kayıtları 412 almaz) ve kitapları kaydedilenle aynıysa "kaydedilmiş" olur; doğrulanamayan iddia hiçbir şeyi kaydedilmiş saydırmaz. Başkasının değişikliği dosyayı kaydedilmemiş yapar; **kendiliğinden kaydetme** (`autoSave`) açıksa onu odada tek bir katılımcı kaydeder (öbürleri doğrulayıp temizlenir). Sürümü odada bilinmeyen biri katılmak isterse aktarıcı odadakilerden kaydetmelerini ister ve o tek katılımcı kaydeder. `saveTo` kullanmayıp `mounted.save()` ile kendi kaydeden uygulama, kayıt başarılı olunca `mounted.collab.saved(bytes, etag)` çağırmalıdır (aynı `save()` çağrısının döndürdüğü baytlarla); yoksa dosyayı sonradan açan biri odaya katılamaz.
+- **Oda başka bir sürümdeyse** (dosya başka yerde değişti, aktarıcı yeniden başladı ya da boş oda silindi): kitabınız **temizse** dosya adresinden sessizce yeniden yüklenir ve yeniden katılınır (`mounted.file`, `.workbook`, `.view`, `.editor` aynı sonuç nesnesinde yenileriyle değişir). Kitabınızda **kaydedilmemiş değişiklik varsa hiçbir şey atılmaz**: oturum `detached` ("kopuk") olur, kitap yerinde kalır, değişiklikleriniz kimseye gitmez ve bir bildirim bunu söyler. **Kaydedin** (`saveTo` ile; sunucudaki dosya sizinkinden farklıysa olağan çakışma sorusu sorulur) — kayıttan sonra oturum kendiliğinden yeniden katılır; ya da `mounted.collab.reload()` ile sunucudaki dosyaya dönün (değişiklikleriniz kaybolur). Dosya bir adresten gelmediyse yeniden yükleme yoktur: temiz kitapta oturum kapanır (`closed`).
+- **Salt okunur görünüm** (`readOnly: true`) odaya izleyici olarak katılır: her şeyi görür, hiçbir şey göndermez.
+- **Formüller** her tarayıcıda yerel hesaplanır; değerler gönderilmez. `NOW`, `RAND` gibi uçucu fonksiyonlar kişiden kişiye farklı görünebilir; dosyaya kimin kaydı yazılırsa onun değerleri girer.
+- `collab` verilmeyen düzenleyicide hiçbir şey değişmez.
+
+**Güvenlik:** odaya giren herkes dosyanın içeriğini okur ve değiştirebilir; kimin girebileceğine **yalnız aktarıcınız** karar verir (`authorize` üretimde şarttır, örnek sunucu onsuz başlatılınca uyarır). Motor öbür katılımcılara güvenmez: gelen her değişiklik şemaya göre okunur ve dosyaya yalnız metin olarak girebilir, geçersiz bir değişiklik herkeste atlanır (bir kez söylenir), "kaydedildi" iddiası sunucuya sorulmadan benimsenmez, aktarıcının salt okunur yaptığı katılımcının görünümü salt okunur olur ve bunu söyler.
+
+**Birlikte düzenlenirken yapılamayanlar** (yapılmaz ve söylenir): dizi formüllü ya da veri tablolu hücrenin içeriğini ve geçişli dolgulu hücrenin biçimini değiştirmek; XML'de yer alamayan karakter (denetim karakteri) taşıyan metin; sayfa kopyalama; kopyala/kes-yapıştırın kuralları (veri doğrulama, koşullu biçim) taşıması — hücreler, biçimler ve notlar taşınır, kurallar yerinde kalır; 900 KB'tan büyük tek adım (çok büyük yapıştırma).
+
+**Kapsam:** yalnız dönüştürülmemiş xlsx. Belgede (docx), xls'te ve `convert: true` ile dönüştürülen dosyada `collab` verilirse dosya seçenek yokmuş gibi açılır ve bir bildirim bunu söyler (`mounted.collab` tanımsızdır). `collab` adres ya da böyle bir nesne değilse `mount()` hiçbir şey indirmeden `TypeError` ile reddeder.
+
+**UNSURE / denenmeyenler:** gerçek bir üretim aktarıcısıyla (Reverb, Pusher) ve TLS arkasında denenmedi; iki ayrı makine arasında denenmedi (testler aynı tarayıcının iki sayfası, Node'da gerçek soketler); kural/grafik komutlarının "sıra" adlandırması (kuralın listedeki yeri, grafiğin `id`'si) dosyayı farklı anlarda açmış katılımcılarda aynı kabul edilir (rastgele testlerde tutuyor, Excel'in yazdığı dosyalarla denenmedi); başkası hücreleri kaydırdığında ya da kuralları değiştirdiğinde açık kural kutusu **uygulanmadan kapanır** ve yazılmakta olan **formül** uygulanmaz (ikisi de söylenir; düz metin yazımı satırıyla birlikte kayar); başkası satır eklediğinde her formül yeniden hesaplanır (yerel satır eklemede olduğu gibi) — çok formüllü kitapta yavaşlatır.
 
 ### Eski biçimleri düzenleme: `convert`
 
@@ -1634,6 +1705,7 @@ Sayfada yapabilecekleriniz:
 - "Boş docx oluştur ve aç" / "Boş xlsx oluştur ve aç" ile `createBlank()` çıktısını açmak.
 - **"Aynı yere kaydetme (`saveTo`)"** bölümünde `saveTo`'yu denemek: "Boş xlsx ile dene" / "Boş docx ile dene" burada üretilen boş bir dosyayı sayfayı sunan yerel sunucuya koyar (`/e2e/saved/demo-….xlsx`, her sayfa açılışında ayrı bir ad; yalnız bellekte tutulur, sunucu durunca gider) ve `mount({ file: adres, saveTo })` ile açar. "Hedef" listesi dört yolu seçtirir: alındığı adres (`saveTo: true`, `PUT` + `If-Match`), aynı adres ama çakışmada editörün sormadığı kip (`saveTo: { onConflict: 'fail' }`), işlev kaydedici (baytları sayfada tutar), ve hep 503 dönen adres (hata bildirimi). "Sunucudaki kopyayı değiştir (412)" dosyayı başkası kaydetmiş gibi değiştirir: sonraki kayıt 412 alır ve üzerine yazılmaz; editör "Üzerine yaz / Vazgeç" onayını gösterir (`onConflict: 'fail'` seçildiyse yalnız bildirir). Sayfanın kendi "Üzerine yaz" düğmesi `saveNow({ overwrite: true })` çağırır (onay açıksa onu da kapatır). "Sunucudaki kopyayı oku" kaydedileni yeniden açıp ilk hücreyi/metni gösterir. Bu bölüm yalnız `pnpm demo` ile (sayfa sunucudan açılınca) çalışır.
 - Aynı bölümde **"Kendiliğinden kaydet"** kutusu `autoSave: true` ile açar (dosya açıkken işaret değişirse `mounted.setAutoSave(…)`): yazıp 2 saniye bekleyince durum satırı "Kaydedildi" olur, satırın sonunda `auto: true` görünür; "Sunucudaki kopyayı değiştir (412)" ile çakışmada onayın kendiliğinden açılmadığı, Kaydet'e basınca açıldığı görülür.
+- **"Birlikte düzenleme (`collab`)"** bölümünde "İki düzenleyiciyi aç" ile aynı boş kitabı yan yana iki düzenleyicide açmak (Ayşe ve Deniz): birine yazdığınız öbüründe görünür, seçimler renkli çerçeve ve adla çizilir, Geri al yalnız o düzenleyicinin adımını geri alır. Oda sayfanın içindedir (`BymOffice.collab.memoryServer()`); "Sunucunun aktarıcısıyla (WebSocket)" kutusu işaretliyse `pnpm demo` sunucusundaki aktarıcı (`/e2e/collab/…`) kullanılır. "İkincinin bağlantısını kes" çevrimdışı düzenlemeyi denetir; alttaki satır her düzenleyicinin durumunu, adımını ve bekleyen değişiklik sayısını gösterir.
 - "Eski cihaz kipi" ile tarayıcının yerleşik sıkıştırmasını kapatıp motorun kendi kodunu sınamak.
 - **"Font dosyası"** ile kendi font dosyanızı (ttf, otf, woff, woff2) yanındaki alana yazdığınız belge font adının (varsayılan `Bookman Old Style`) yerine kaydetmek (`registerFont`); açık belge ve tablo kendiliğinden yeniden dizilir. "Fontları kaldır" kayıtları siler.
 - **"Paketle gelen font"** kutusu TeX Gyre Bonum'u açıp kapatır (`BymOffice.fonts.configure({ baseUrl: null })`); yanındaki satır durumunu ve dosyaların isteneceği adresi gösterir. Bookman Old Style kullanan bir belge açınca "yüklendi" olur.

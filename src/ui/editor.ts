@@ -17,6 +17,7 @@ import type { PdfDownload } from '../pdf/export';
 import type { SheetPdfExportOptions } from './sheet-view';
 import { WorkbookView, type WorkbookViewOptions } from './sheet-view';
 import { StatusBar } from './status-bar';
+import type { CollabPeer, CollabState } from '../collab/session';
 import { Toolbar, type ShellHost } from './toolbar';
 
 export interface SpreadsheetEditorOptions extends WorkbookViewOptions {
@@ -290,6 +291,60 @@ export class SpreadsheetEditor {
     // The Save button follows what there is to save.
     if (options.saveCommand && this.toolbar) this.unwatchSave = options.saveCommand.watch(() => this.refresh());
     this.sync();
+  }
+
+  /** The row that says whether the workbook is edited together and who else is there; made when it is first needed. */
+  private collabBar: HTMLDivElement | undefined;
+
+  /**
+   * Shows the state of editing together and the other participants above the grid; undefined
+   * takes the row away. Names are shown as text.
+   */
+  setCollab(info: { state: CollabState; peers: readonly CollabPeer[]; pending: number } | undefined): void {
+    if (this.destroyed) return;
+    if (!info) {
+      if (this.collabBar && this.collabBar.parentNode) this.collabBar.parentNode.removeChild(this.collabBar);
+      this.collabBar = undefined;
+      return;
+    }
+    const words = this.view.collabStrings;
+    let bar = this.collabBar;
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'bym-collab';
+      bar.setAttribute('role', 'status');
+      bar.style.cssText = 'display:flex;align-items:center;gap:6px;flex:0 0 auto;padding:3px 8px;font:12px system-ui,sans-serif;color:#3c4043;background:#f8f9fa;border-bottom:1px solid #dadce0;overflow:hidden;white-space:nowrap';
+      this.root.insertBefore(bar, this.gridHost);
+      this.collabBar = bar;
+    }
+    while (bar.firstChild) bar.removeChild(bar.firstChild);
+    bar.setAttribute('data-state', info.state);
+    bar.setAttribute('data-peers', String(info.peers.length));
+    const dot = document.createElement('span');
+    dot.setAttribute('aria-hidden', 'true');
+    dot.style.cssText = `display:inline-block;width:8px;height:8px;border-radius:50%;background:${info.state === 'online' ? '#188038' : info.state === 'connecting' ? '#E37400' : '#D93025'}`;
+    const label = document.createElement('span');
+    label.className = 'bym-collab-state';
+    label.textContent = words.state[info.state];
+    bar.appendChild(dot);
+    bar.appendChild(label);
+    const shown = info.peers.slice(0, 8);
+    for (const peer of shown) {
+      const name = peer.name !== undefined ? peer.name : words.guest(peer.guest);
+      const badge = document.createElement('span');
+      badge.className = 'bym-collab-peer';
+      badge.setAttribute('data-peer', peer.id);
+      badge.title = name;
+      badge.textContent = name;
+      badge.style.cssText = `display:inline-block;max-width:120px;overflow:hidden;text-overflow:ellipsis;padding:1px 7px;border-radius:9px;color:#fff;background:${/^#[0-9A-Fa-f]{6}$/.test(peer.color) ? peer.color : '#5F6368'}`;
+      bar.appendChild(badge);
+    }
+    if (info.peers.length > shown.length) {
+      const more = document.createElement('span');
+      more.textContent = `+${info.peers.length - shown.length}`;
+      bar.appendChild(more);
+    }
+    bar.setAttribute('aria-label', info.peers.length > 0 ? `${words.state[info.state]}. ${words.others(info.peers.length)}` : words.state[info.state]);
   }
 
   /** Prints the workbook: see WorkbookView.print(). */

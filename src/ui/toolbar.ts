@@ -213,8 +213,8 @@ export class Toolbar {
       chart.setAttribute('aria-label', insert);
       chart.title = insert;
     }
-    this.setDisabled('undo', view.readOnly || typing || !view.history.canUndo);
-    this.setDisabled('redo', view.readOnly || typing || !view.history.canRedo);
+    this.setDisabled('undo', view.readOnly || typing || !view.canUndo);
+    this.setDisabled('redo', view.readOnly || typing || !view.canRedo);
     this.updateSave(typing);
     const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
