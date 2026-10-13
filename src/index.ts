@@ -319,9 +319,13 @@ export {
   type CollabTransport,
   type CollabUser,
   type MemoryServerOptions,
+  type CollabNoticeCode,
   type PausableTransport,
   type SessionChange,
+  type SessionHost as CollabSessionHost,
+  type SessionOptions as CollabSessionOptions,
 } from './collab/index';
+export { readCollabStamp, writeSharedFile, type CollabStamp, type SharedFile, type StampingSession } from './formats/xlsx/collab-stamp';
 
 /** Editing a workbook together with others: where the relay is, and who this participant is. See MountOptions.collab. */
 export interface CollabOptions {

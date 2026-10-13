@@ -84,6 +84,13 @@ export interface CalcEngineOptions {
 
 export interface RecalculateOptions {
   /**
+   * The cells are named by the list of sheets the engine read last, which the workbook no
+   * longer has: the engine does not look at the list of now and works with the graph it has.
+   * For the caller that tells the engine what a sheet that went took along, and calls
+   * invalidate() right after (see recalculateForSheets() of the view).
+   */
+  sheetsOfBefore?: boolean;
+  /**
    * With a recalculation of everything: every formula counts as changed, so what is
    * calculated replaces the value of the file also where the two differ. For use after an
    * edit that can change any value without naming cells (rows or columns deleted, a defined
@@ -247,6 +254,8 @@ interface Column {
 interface SheetState {
   index: number;
   model: Sheet;
+  /** The name the sheet had when it was read. */
+  name: string;
   recs: Map<number, FormulaRec>;
   /** Formulas that read one cell, by the key of that cell. */
   cellDeps: Map<number, FormulaRec[]>;
@@ -532,6 +541,12 @@ export class CalcEngine {
   private unsupportedCells = new Map<string, CellAddress>();
   private costlyCells = new Map<string, CellAddress>();
   private mismatchedCells = new Map<string, CellAddress>();
+  /**
+   * Formula cells that were read and left out of the graph (not parsed, not supported, a
+   * shared formula without its master, a data table): a look through the model for formulas
+   * the engine was not told about passes them by.
+   */
+  private looked = new WeakSet<Cell>();
   /** Cells whose value an engine wrote (see OWN). */
   private readonly own = OWN;
   /**
@@ -722,7 +737,9 @@ export class CalcEngine {
   /**
    * Formula cells that hold no value: a file written by a program that does not calculate
    * stores its formulas that way. recalculate(engine.uncalculated()) gives them their values.
-   * Cells the engine cannot calculate are not listed once it has looked at them.
+   * Cells the engine cannot calculate are not listed once it has looked at them (see
+   * `unparsed`); a formula written since the engine read the workbook is listed, whether or
+   * not the engine was told about it.
    */
   uncalculated(): CellAddress[] {
     const out: CellAddress[] = [];
@@ -735,8 +752,9 @@ export class CalcEngine {
           if (!cell || !cell.formula || hasValue(cell) || col >= MAX_COLS || cell.formula.type === 'dataTable') return;
           if (sh) {
             const rec = sh.recs.get(keyOf(index, col));
-            // Not in the graph: it cannot be parsed, or its master is missing. Over budget: it was tried.
-            if (rec ? rec.formula === cell.formula && rec.costly : !this.wantCells.some((want) => want.sheet === s && want.row === index && want.col === col)) return;
+            // Over budget: it was tried. Read and left out of the graph: it cannot be parsed, or its
+            // master is missing. Not in the graph and never read: written since, and waiting.
+            if (rec ? rec.formula === cell.formula && rec.costly : this.looked.has(cell) && !this.wantCells.some((want) => want.sheet === s && want.row === index && want.col === col)) return;
           }
           out.push({ sheet: s, row: index, col });
         });
@@ -746,13 +764,24 @@ export class CalcEngine {
   }
 
   /**
-   * Recalculates what depends on the given cells (all formulas when `changed` is omitted).
+   * Recalculates what depends on the given cells (all formulas when `changed` is omitted:
+   * the model is then looked through for formulas that were written, replaced or removed
+   * without the engine being told, and those are calculated like cells that were named,
+   * with or without `overwrite`).
    * Writes results into the model by replacing cell objects (never mutating them) and
    * marks sheet.changedRows / sheet.modified for cells whose value changed.
    * Returns the cells whose value changed, per sheet.
    *
    * `changed` has to name every cell whose content or formula was changed since the last
    * call. Never throws: a formula that cannot be calculated gets an error value.
+   *
+   * The list of sheets is looked at by every call: when it is not the one the engine read
+   * (a sheet inserted, deleted, moved or renamed), the graph is forgotten as by invalidate()
+   * and built again; when a sheet went that formulas of the graph read, or a calculation was
+   * under way, everything is calculated with `overwrite` as well (and `incomplete` is set until
+   * it is): the formulas that read the sheet were rewritten, and the engine was not told which
+   * they are. Calling invalidate() first, as the view does, keeps the choice of what to
+   * calculate with the caller.
    *
    * The call stops when its budget (options.budget) is used up and sets `incomplete`. What
    * was calculated by then is written; the other formulas keep their previous values, never
@@ -761,7 +790,7 @@ export class CalcEngine {
    * call is not calculated again by the calls that go on with the rest.
    */
   recalculate(changed?: CellAddress[], options?: RecalculateOptions): { sheet: number; cells: { row: number; col: number }[] }[] {
-    this.prepare();
+    this.prepare(options !== undefined && options.sheetsOfBefore === true);
     this.batchOpen = false;
     this.startBudget();
     for (const sh of this.sheets) {
@@ -771,6 +800,8 @@ export class CalcEngine {
     if (!Array.isArray(changed)) {
       this.wantAll = true;
       if (options && options.overwrite === true) this.wantOverwrite = true;
+      // A graph that was built before may have missed what was written since.
+      if (this.built) this.findUnknown();
     } else {
       for (const cell of changed) {
         if (!cell || !this.sheets[cell.sheet] || !isIndex(cell.row, MAX_ROWS) || !isIndex(cell.col, MAX_COLS)) continue;
@@ -888,8 +919,43 @@ export class CalcEngine {
   }
 
   /**
+   * Formula cells of the model that the graph does not have as they are: written, replaced
+   * or removed since the graph was built without the engine being told. They are taken as
+   * cells named to recalculate(). One pass over the cells of the workbook.
+   */
+  private findUnknown(): void {
+    const want = this.wantCells;
+    const looked = this.looked;
+    for (const sh of this.sheets) {
+      const recs = sh.recs;
+      const s = sh.index;
+      let known = 0;
+      sh.model.rows.forEach((row, index) => {
+        if (!isIndex(index, MAX_ROWS) || !row || !row.cells) return;
+        const cells = row.cells;
+        const length = cells.length < MAX_COLS ? cells.length : MAX_COLS;
+        for (let col = 0; col < length; col++) {
+          const cell = cells[col];
+          if (!cell || !cell.formula) continue;
+          const rec = recs.get(keyOf(index, col));
+          if (rec && rec.formula === cell.formula) known++;
+          else if (rec || !looked.has(cell)) want.push({ sheet: s, row: index, col });
+        }
+      });
+      if (known === recs.size) continue;
+      // Formulas of the graph whose cells are gone or hold something else.
+      recs.forEach((rec) => {
+        const row = sh.model.rows.get(rec.row);
+        const cell = row && row.cells ? row.cells[rec.col] : undefined;
+        if (!cell || !cell.formula) want.push({ sheet: s, row: rec.row, col: rec.col });
+      });
+    }
+  }
+
+  /**
    * Call after rows or columns were inserted or deleted, sheets changed, or defined names
-   * changed: forgets the dependency graph. The recalculation that follows builds it again,
+   * changed: forgets the dependency graph. (A list of sheets that changed is noticed without
+   * it as well: see recalculate().) The recalculation that follows builds it again,
    * in slices when it is large. When the edit can have changed what formulas are worth
    * (rows deleted, a name redefined), recalculate everything with `overwrite`.
    */
@@ -909,6 +975,7 @@ export class CalcEngine {
     this.unsupportedCells = new Map();
     this.costlyCells = new Map();
     this.mismatchedCells = new Map();
+    this.looked = new WeakSet();
     this.staleCells = undefined;
     // Whatever was left over is calculated with everything else: the caller recalculates all after this.
     this.incomplete = false;
@@ -1829,13 +1896,28 @@ export class CalcEngine {
   // The dependency graph
 
   /** Sheets and names: all that evaluating one formula needs. */
-  private prepare(): void {
-    if (this.prepared) return;
+  private prepare(sheetsOfBefore = false): void {
+    if (this.prepared) {
+      const gone = sheetsOfBefore ? undefined : this.sheetsChanged();
+      if (gone === undefined) return;
+      // The graph knows sheets by their places and names: it is of a workbook that is no more.
+      // What a calculation under way had left, and what read a sheet that went, cannot be told
+      // apart from the rest any more: everything is calculated, and the values of the file give
+      // way. An engine that has no graph yet knows nothing that could be lost with it.
+      const all = this.incomplete || (gone && this.built);
+      this.invalidate();
+      if (all) {
+        this.wantAll = true;
+        this.wantOverwrite = true;
+        this.incomplete = true;
+      }
+    }
     this.prepared = true;
     const workbook = this.workbook;
     this.sheets = (workbook.sheets || []).map((model, index) => ({
       index,
       model,
+      name: model.name,
       recs: new Map(),
       cellDeps: new Map(),
       rowBands: new Map(),
@@ -1857,6 +1939,26 @@ export class CalcEngine {
       if (!this.sheetByName.has(key)) this.sheetByName.set(key, sh.index);
     });
     this.readNames(undefined);
+  }
+
+  /**
+   * Whether the list of sheets is no longer the one that was read: undefined when it is;
+   * true when a sheet went that formulas of the graph read, or may have read (a formula that
+   * chooses its cells while calculating reads any sheet); false when sheets only came, moved
+   * or got other names, or the ones that went were read by nothing.
+   */
+  private sheetsChanged(): boolean | undefined {
+    const now = this.workbook.sheets || [];
+    const read = this.sheets;
+    let same = now.length === read.length;
+    for (let k = 0; same && k < read.length; k++) same = read[k].model === now[k] && read[k].name === now[k].name;
+    if (same) return undefined;
+    for (let k = 0; k < read.length; k++) {
+      const sh = read[k];
+      if (now.indexOf(sh.model) >= 0) continue;
+      if (this.volatiles.size > 0 || sh.cellDeps.size > 0 || sh.rowBands.size > 0 || sh.colBands.size > 0 || sh.wide.entries.length > 0) return true;
+    }
+    return false;
   }
 
   /**
@@ -1931,14 +2033,20 @@ export class CalcEngine {
   private addFormula(sh: SheetState, row: number, col: number, cell: Cell, holder: MastersHolder): void {
     const formula = cell.formula as CellFormula;
     // The inputs of a data table are substituted by Excel itself; its cells keep their values.
-    if (formula.type === 'dataTable') return;
+    if (formula.type === 'dataTable') {
+      this.looked.add(cell);
+      return;
+    }
     let text = formula.text;
     let dRow = 0;
     let dCol = 0;
     if (formula.type === 'shared' && text === '') {
       const master = formula.si === undefined ? undefined : (holder.masters || (holder.masters = sharedMasters(sh.model))).get(formula.si);
       // Without its master the cell cannot be calculated; it keeps its value.
-      if (!master) return;
+      if (!master) {
+        this.looked.add(cell);
+        return;
+      }
       text = master.text;
       dRow = row - master.row;
       dCol = col - master.col;
@@ -1948,6 +2056,7 @@ export class CalcEngine {
       node = parseFormula(text);
     } catch (error) {
       this.unparsedCells.set(`${sh.index}:${row}:${col}`, { sheet: sh.index, row, col });
+      this.looked.add(cell);
       return;
     }
     // What cannot be calculated here keeps the value the file has for it. Without such a value
@@ -1959,6 +2068,7 @@ export class CalcEngine {
         this.unsupportedCells.set(`${sh.index}:${row}:${col}`, { sheet: sh.index, row, col });
         // A name it lacks may be defined later (see namesChanged()).
         if (this.metNames.length > 0) this.unsupportedNames.set(`${sh.index}:${row}:${col}`, this.metNames);
+        this.looked.add(cell);
         return;
       }
     }

@@ -29,9 +29,13 @@ import {
   EMPTY_RUN_PROPS,
   findWrapper,
   paragraphText,
+  partNamespaces,
+  setPartNamespaces,
   type Block,
   type Comment,
   type DocModel,
+  type DocStyle,
+  type DocStyles,
   type ExtraXml,
   type Inline,
   type Paragraph,
@@ -506,6 +510,51 @@ function styleProps<T extends ParaProps | RunProps>(doc: DocModel, style: string
   return props as T;
 }
 
+/** An id no style of the document has: the one Word uses, or that with the least number that is free. */
+function freeStyleId(styles: Map<string, DocStyle>, wanted: string): string {
+  let id = wanted;
+  for (let n = 1; styles.has(id); n++) id = wanted + n;
+  return id;
+}
+
+/**
+ * Brings the two styles Word gives a comment, each only when the document has no style Word
+ * would take for it (see styleNamed): the mark of a comment ("annotation reference", 8 pt) and
+ * the text of a comment ("annotation text", 10 pt), based on the default styles of their kinds
+ * when the document has those. Styles the document has are not touched, and an id that is
+ * taken (by a style of another kind) is left to its style. Without them a comment is shown in
+ * the size of the text, its mark as large as a letter.
+ *
+ * UNSURE: this is the least Word needs, not all it writes for a first comment: its "annotation
+ * text" is linked to a character style ("Comment Text Char") and sets the line spacing, and
+ * the styles of the subject of a comment and of the text of a balloon come with it.
+ */
+function ensureCommentStyles(doc: DocModel, draft: Draft): void {
+  const had = doc.styles.styles;
+  const reference = styleNamed(doc, 'character', 'annotation reference', 'CommentReference');
+  const text = styleNamed(doc, 'paragraph', 'annotation text', 'CommentText');
+  if (reference !== undefined && text !== undefined) return;
+  const styles = new Map(had);
+  const base = (type: 'paragraph' | 'character'): string | undefined => {
+    const id = doc.styles.defaultIds[type];
+    const style = id === undefined ? undefined : had.get(id);
+    return style && style.type === type ? id : undefined;
+  };
+  const make = (id: string, type: 'paragraph' | 'character', name: string, size: number): void => {
+    const style: DocStyle = { id, type, name, isDefault: false, uiPriority: 99, semiHidden: true, unhideWhenUsed: true, run: { size, sizeCs: size } };
+    const basedOn = base(type);
+    if (basedOn !== undefined) style.basedOn = basedOn;
+    styles.set(id, style);
+  };
+  if (reference === undefined) make(freeStyleId(styles, 'CommentReference'), 'character', 'annotation reference', 16);
+  if (text === undefined) make(freeStyleId(styles, 'CommentText'), 'paragraph', 'annotation text', 20);
+  const next: DocStyles = { ...doc.styles, styles };
+  // The new table stands for the same part.
+  const spelt = partNamespaces(doc.styles);
+  if (spelt) setPartNamespaces(next, spelt);
+  draft.apply({ type: 'setStyles', styles: next });
+}
+
 const referenceProps = (doc: DocModel): RunProps => styleProps<RunProps>(doc, styleNamed(doc, 'character', 'annotation reference', 'CommentReference'), EMPTY_RUN_PROPS);
 
 /** The content of a comment that says `text`: a paragraph for each line, the first with the mark of the comment before it. */
@@ -683,6 +732,7 @@ export function addComment(doc: DocModel, at: DocPosition | DocRange, text: stri
   const who = trackingFor(doc, { trackChanges: true, author: options && options.author, date: options && options.date });
   if (!who) return bad(COMMENT_NOT_HERE);
   return build(doc, (draft) => {
+    ensureCommentStyles(doc, draft);
     const id = nextRevisionId(doc);
     const comment: Comment = { id, author: who.author, date: who.date, blocks: contentOf(doc, clean), paraId: freshParaId(doc, id) };
     const initials = options && typeof options.initials === 'string' ? options.initials : initialsOf(who.author);
@@ -753,7 +803,8 @@ function paragraphAt(doc: DocModel, place: Place): Paragraph {
 /**
  * Adds an answer to a comment: a comment of its own that says which thread
  * it belongs to (the first comment of the thread of `id`), with marks beside
- * those of that comment. Throws RangeError(COMMENT_FIXED) for a comment
+ * those of that comment, after the marks of the answers the thread has
+ * there already. Throws RangeError(COMMENT_FIXED) for a comment
  * whose marks cannot be followed (nothing refers to it, or they sit in
  * content that is kept whole).
  */
@@ -768,6 +819,7 @@ export function replyToComment(doc: DocModel, id: number, text: string, options?
   if (!who) return bad(COMMENT_FIXED);
   const at = anchors as Anchors;
   return build(doc, (draft) => {
+    ensureCommentStyles(doc, draft);
     const replyId = nextRevisionId(doc);
     const next = new Map(items);
     // The thread is known by the paragraph id of its first comment.
@@ -780,10 +832,26 @@ export function replyToComment(doc: DocModel, id: number, text: string, options?
     next.set(replyId, reply);
     draft.apply({ type: 'setComments', items: next });
 
-    // The marks of the answer, each right after the one of the first comment; a range only when that has both of its ends in the text.
-    const entries: { place: Place; value: 'start' | 'end' | 'ref' }[] = [{ place: at.refs[0], value: 'ref' }];
+    // The marks of the answer, each right after the last one the thread has of its kind beside the one of the first
+    // comment, so that the answers stand in the text in the order they were given; a range only when the first
+    // comment has both of its ends in the text.
+    const all = anchorsOf(doc);
+    const thread = threadOf(items, root);
+    const last = (kind: 'starts' | 'ends' | 'refs'): Place => {
+      let place = at[kind][0];
+      for (const member of thread) {
+        const other = member === root ? undefined : all.get(member.id);
+        const found = other && !other.fixed ? other[kind][0] : undefined;
+        // Only a mark in the same paragraph: one that a file has elsewhere is not a place beside the first comment.
+        if (!found || found.inline <= place.inline || found.index !== place.index || found.story !== place.story) continue;
+        if (found.container.length !== place.container.length || found.container.some((step, k) => step !== place.container[k])) continue;
+        place = found;
+      }
+      return place;
+    };
+    const entries: { place: Place; value: 'start' | 'end' | 'ref' }[] = [{ place: last('refs'), value: 'ref' }];
     if (at.starts.length && at.ends.length && at.starts[0].inline >= 0 && at.ends[0].inline >= 0) {
-      entries.push({ place: at.starts[0], value: 'start' }, { place: at.ends[0], value: 'end' });
+      entries.push({ place: last('starts'), value: 'start' }, { place: last('ends'), value: 'end' });
     }
     groupPlaces(entries).forEach((group) => {
       const paragraph = paragraphAt(doc, group.place);

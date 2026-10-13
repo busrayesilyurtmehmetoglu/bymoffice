@@ -297,6 +297,60 @@ test('replyToComment adds a comment of the thread with marks beside those of the
   assert.equal(doc.comments!.modified, undefined);
 });
 
+test('the marks of answers stand in the order the answers were given', async () => {
+  const { doc, history } = await open(ONE, { comments: [{ id: 1, author: 'Ann', text: 'Why two?' }] });
+  const first = replyToComment(doc, 1, 'Because.');
+  run(history, first);
+  const a = first.id as number;
+  const second = replyToComment(doc, 1, 'Indeed.');
+  run(history, second);
+  const b = second.id as number;
+  // An answer to an answer goes to the end of the thread as well.
+  const third = replyToComment(doc, a, 'Quite.');
+  run(history, third);
+  const c = third.id as number;
+  assert.equal(shape(para(doc, 0)), `One |[1|[${a}|[${b}|[${c}|two|1]|${a}]|${b}]|${c}]|*1|*${a}|*${b}|*${c}| three.`);
+  assert.deepEqual(listComments(doc).map((comment) => comment.id), [1, a, b, c]);
+  checkInvariants(doc);
+  history.undo();
+  history.undo();
+  history.undo();
+  assert.equal(shape(para(doc, 0)), 'One |[1|two|1]|*1| three.');
+});
+
+test('an answer goes after the marks of the last answer wherever a file has them, and the marks of the file stay', async () => {
+  // As Word writes a thread: each end with its reference.
+  const word = p(r('One ') + cStart(1) + cStart(2) + r('two') + cEnd(1) + cRef(1) + cEnd(2) + cRef(2) + r(' three.'));
+  const comments = [
+    { id: 1, author: 'Ann', text: 'Why two?', paraId: '00000001' },
+    { id: 2, author: 'Bob', text: 'Because.', paraId: '00000002' },
+    { id: 3, author: 'Cid', text: 'Elsewhere.', paraId: '00000003' },
+  ];
+  let opened = await open(word + p(cStart(3) + r('Other') + cEnd(3) + cRef(3)), { comments, extended: [['00000001'], ['00000002', '00000001'], ['00000003']] });
+  let reply = replyToComment(opened.doc, 1, 'Indeed.');
+  run(opened.history, reply);
+  let id = reply.id as number;
+  assert.equal(shape(para(opened.doc, 0)), `One |[1|[2|[${id}|two|1]|*1|2]|${id}]|*2|*${id}| three.`);
+  assert.equal(shape(para(opened.doc, 1)), '[3|Other|3]|*3');
+
+  // A file whose marks are not in the order of its answers keeps them so; the new answer is the last of the thread in the text too.
+  const mixed = p(r('One ') + cStart(1) + cStart(3) + cStart(2) + r('two') + cEnd(1) + cEnd(3) + cEnd(2) + cRef(1) + cRef(3) + cRef(2) + r(' three.'));
+  opened = await open(mixed, { comments, extended: [['00000001'], ['00000002', '00000001'], ['00000003', '00000001']] });
+  reply = replyToComment(opened.doc, 1, 'Indeed.');
+  run(opened.history, reply);
+  id = reply.id as number;
+  assert.equal(shape(para(opened.doc, 0)), `One |[1|[3|[2|[${id}|two|1]|3]|2]|${id}]|*1|*3|*2|*${id}| three.`);
+
+  // An answer whose marks are in another paragraph than those of the first comment: the new one stays beside the first.
+  const apart = p(r('One ') + cStart(1) + r('two') + cEnd(1) + cRef(1) + r(' three.')) + p(cStart(2) + r('Other') + cEnd(2) + cRef(2));
+  opened = await open(apart, { comments: comments.slice(0, 2), extended: [['00000001'], ['00000002', '00000001']] });
+  reply = replyToComment(opened.doc, 1, 'Indeed.');
+  run(opened.history, reply);
+  id = reply.id as number;
+  assert.equal(shape(para(opened.doc, 0)), `One |[1|[${id}|two|1]|${id}]|*1|*${id}| three.`);
+  assert.equal(shape(para(opened.doc, 1)), '[2|Other|2]|*2');
+});
+
 test('a comment nothing refers to cannot be answered', async () => {
   const { doc } = await open(p('Plain.'), { comments: [{ id: 4, text: 'Lost' }] });
   assert.throws(() => replyToComment(doc, 4, 'x'), new RangeError(COMMENT_FIXED));
@@ -475,13 +529,17 @@ test('the comment at a place is the one whose text holds it, the shortest when s
   assert.equal(commentAtPosition(list, pos(1, 2)), undefined);
 });
 
-test('the styles of comments are used only where the document has them', async () => {
+test('a document without the styles of comments gets them with its first comment, and loses them when that is taken back', async () => {
   const { doc, history } = await open(p('One two.'), { styles: COMMENT_STYLES.slice(0, COMMENT_STYLES.indexOf('<w:style w:type="paragraph" w:styleId="CommentText">')) });
+  const before = doc.styles;
+  assert.equal(before.styles.has('CommentReference') || before.styles.has('CommentText'), false);
   const edit = addComment(doc, range(pos(0, 0), pos(0, 3)), 'x');
   run(history, edit);
   const ref = para(doc, 0).children.find((inline) => inline.type === 'run' && inline.content.some((item) => item.type === 'commentReference'));
-  assert.equal(ref && ref.type === 'run' ? ref.props.style : 'none', undefined);
-  assert.equal((doc.comments!.items.get(edit.id as number)!.blocks[0] as Paragraph).props.style, undefined);
+  assert.equal(ref && ref.type === 'run' ? ref.props.style : 'none', 'CommentReference');
+  assert.equal((doc.comments!.items.get(edit.id as number)!.blocks[0] as Paragraph).props.style, 'CommentText');
+  history.undo();
+  assert.equal(doc.styles, before);
 });
 
 test('very many comments in one thread are listed in time that grows with their number, not with its square', async () => {

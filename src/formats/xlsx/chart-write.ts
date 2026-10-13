@@ -248,10 +248,13 @@ function groupXml(group: ChartGroup, cells: ChartCells | undefined): string {
   return `${out}</c:${name}>`;
 }
 
-/** The rich text of a title: one paragraph for each line. */
+/**
+ * The rich text of a title: one paragraph for each line. No language is named (`lang` is optional): the workbook
+ * says none, and a wrong one has the spelling checker of the application mark the whole title.
+ */
 function richXml(value: string): string {
   let out = '<c:rich><a:bodyPr/><a:lstStyle/>';
-  for (const line of value.split('\n')) out += `<a:p><a:r><a:rPr lang="en-US"/><a:t>${text(line)}</a:t></a:r></a:p>`;
+  for (const line of value.split('\n')) out += `<a:p><a:r><a:t>${text(line)}</a:t></a:r></a:p>`;
   return `${out}</c:rich>`;
 }
 
@@ -307,6 +310,7 @@ const isSpace = (node: XmlNode): boolean => node.type === 'text' && /^[ \t\r\n]*
  * Whether two elements say the same: their names as they are written (prefixes included: a part
  * that spells its namespaces another way is not one the engine wrote), their attributes
  * (declarations of namespaces aside) and their content, white space between elements aside.
+ * `a` is what the engine writes now, `b` the part of a file.
  */
 function sameTree(a: XmlElement, b: XmlElement, budget: { left: number }): boolean {
   if (--budget.left < 0 || a.name !== b.name) return false;
@@ -321,7 +325,9 @@ function sameTree(a: XmlElement, b: XmlElement, budget: { left: number }): boole
   for (const [name, value] of left) if (right.get(name) !== value) return false;
   const kids = (el: XmlElement): XmlNode[] => el.children.filter((node) => (node.type === 'element' || node.type === 'text') && !isSpace(node));
   const mine = kids(a);
-  const theirs = kids(b);
+  // Until the titles stopped naming a language every run of a title began with <a:rPr lang="en-US"/>: a part
+  // that has that and nothing else there is one the engine wrote.
+  const theirs = kids(b).filter((node) => !(node.type === 'element' && node.name === 'a:rPr' && a.name === 'a:r' && node.children.length === 0 && node.attrs.size === 1 && node.attrs.get('lang') === 'en-US'));
   if (mine.length !== theirs.length) return false;
   for (let i = 0; i < mine.length; i++) {
     const x = mine[i];

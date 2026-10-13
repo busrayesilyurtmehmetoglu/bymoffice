@@ -7,6 +7,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildXlsx } from '../src/formats/xlsx/build';
 import { parseXml, type SheetDrawing, type XmlElement } from '../src/index';
+import { setCellInput } from '../src/ops/commands';
+import { ZipArchive } from '../src/zip';
 import { addChart, moveChart, removeChart, sheetCharts, updateChart, CHART_TYPES } from '../src/ops/charts';
 import { FOREIGN, bare, chartsOf, load, names, packageProblems, part, relationProblems, reopen, salesBook, same, save, text } from './chart-edit-fixtures';
 import { chartFrameOf } from './chart-fixtures';
@@ -232,4 +234,49 @@ test('chart write: a file built anew from the model holds its charts, written fr
     ['line', 'all', 'New'],
   ]);
   assert.deepEqual(read[0].chart.groups[0].series[0].values?.cache.values, [10, 20, 30], 'the cells are cached as they are');
+});
+
+test('chart write: a title names no language, since the workbook says none', async () => {
+  const doc = await load(await salesBook());
+  doc.history.apply(addChart(doc.wb, 0, { type: 'column', range: ALL, title: 'Satışlar: ğüşıöç\nİkinci satır' }), undefined, undefined);
+  doc.history.apply(updateChart(doc.wb, 0, sheetCharts(doc.wb, 0)[0].id, { axisTitles: { category: 'Aylar', value: 'Tutar (₺)' } }), undefined, undefined);
+  const saved = await save(doc);
+  await whole(saved, 'the package is whole');
+  const xml = await text(saved, 'xl/charts/chart1.xml');
+  assert.equal((xml.match(/<c:title>/g) || []).length, 3, 'the chart and both axes have a title');
+  // "en-US" on Turkish text makes a spelling checker underline all of it; without the attribute the application decides.
+  assert.equal(xml.indexOf(' lang='), -1, 'no language is claimed');
+  assert.match(xml, /<c:rich><a:bodyPr\/><a:lstStyle\/><a:p><a:r><a:t>Satışlar: ğüşıöç<\/a:t><\/a:r><\/a:p><a:p><a:r><a:t>İkinci satır<\/a:t><\/a:r><\/a:p><\/c:rich>/);
+  const read = chartsOf((await reopen(saved)).sheets[0]);
+  assert.equal(read[0].chart.title?.text, 'Satışlar: ğüşıöç\nİkinci satır');
+  assert.deepEqual(read[0].chart.axes.map((axis) => axis.title?.text), ['Aylar', 'Tutar (₺)']);
+});
+
+test('chart write: a chart this engine wrote when its titles still named a language is known as its own, and loses the language when it is changed', async () => {
+  const doc = await load(await salesBook());
+  doc.history.apply(addChart(doc.wb, 0, { type: 'column', range: ALL, title: 'Sales\nby month' }), undefined, undefined);
+  doc.history.apply(updateChart(doc.wb, 0, sheetCharts(doc.wb, 0)[0].id, { axisTitles: { value: 'Amount' } }), undefined, undefined);
+  const saved = await save(doc);
+  // The part as it was written before: every run of a title said lang="en-US".
+  const zip = ZipArchive.read(saved);
+  const now = await text(saved, 'xl/charts/chart1.xml');
+  const then = now.split('<a:r><a:t>').join('<a:r><a:rPr lang="en-US"/><a:t>');
+  assert.equal(then.split('lang="en-US"').length - 1, 3);
+  zip.set('xl/charts/chart1.xml', new TextEncoder().encode(then));
+  const old = await zip.write();
+  const again = await load(old);
+  const chart = chartsOf(again.wb.sheets[0])[0];
+  assert.equal(chart.known, 'all');
+  assert.equal(chart.chart.title?.text, 'Sales\nby month');
+  // Saved without a change of the chart: the part is the one of the file.
+  again.history.apply(setCellInput(again.wb, 0, 9, 9, 'x'), undefined, undefined);
+  assert.equal(await text(await save(again), 'xl/charts/chart1.xml'), then);
+  // Changed in what only a chart of its own allows (the type): written anew, as it is written now.
+  again.history.apply(updateChart(again.wb, 0, sheetCharts(again.wb, 0)[0].id, { type: 'line' }), undefined, undefined);
+  const rewritten = await save(again);
+  await whole(rewritten, 'the package is whole');
+  assert.equal((await text(rewritten, 'xl/charts/chart1.xml')).indexOf(' lang='), -1);
+  // Another language, or more than the language, is not what the engine wrote.
+  zip.set('xl/charts/chart1.xml', new TextEncoder().encode(now.split('<a:r><a:t>').join('<a:r><a:rPr lang="tr-TR" b="1"/><a:t>')));
+  assert.equal(chartsOf((await load(await zip.write())).wb.sheets[0])[0].known, 'refs');
 });

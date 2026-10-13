@@ -104,7 +104,19 @@ console.log(JSON.stringify(out));
 // 4. The types, resolved the way a bundler does and the way Node does.
 writeFileSync(
   join(consumer, 'use.ts'),
-  `import { open, mount, type OfficeFile, type MountedView, type Workbook, type DocModel } from 'bymoffice';
+  `import { open, mount, collab, readCollabStamp, writeSharedFile, CollabSession, contentVersion, type CollabSessionHost, type CollabSessionOptions, type CollabStamp, type SharedFile, type OfficeFile, type MountedView, type Workbook, type DocModel } from 'bymoffice';
+// A session without mount(): the file is read with the step of its room and written with it.
+export async function shared(bytes: Uint8Array): Promise<SharedFile> {
+  const file: OfficeFile = await open(bytes);
+  const workbook: Workbook = await file.workbook();
+  const stamp: CollabStamp | undefined = file.package ? await readCollabStamp(file.package) : undefined;
+  const host: CollabSessionHost = { workbook: () => workbook, changed: () => undefined, notice: () => undefined };
+  const options: CollabSessionOptions = { transport: collab.memoryServer().connect(), versions: [contentVersion(bytes)], stamp };
+  const session = new CollabSession(host, options);
+  const saved = await collab.writeSharedFile(session, file.package, () => file.save());
+  session.announceSaved([contentVersion(saved.bytes)], saved.rev);
+  return writeSharedFile(session, file.package, () => file.save());
+}
 export async function read(bytes: Uint8Array): Promise<string> {
   const file: OfficeFile = await open(bytes);
   if (file.kind === 'spreadsheet') {

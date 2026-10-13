@@ -42,7 +42,10 @@ function fresh(text: string): Uint8Array {
   return new TextEncoder().encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="${NS}" xmlns:vt="${NS_VT}"><property fmtid="${FMTID}" pid="2" name="${NAME}"><vt:lpwstr>${text}</vt:lpwstr></property></Properties>`);
 }
 
-/** The stamp a file carries; undefined when it has none, or one that is not as this module writes it. */
+/**
+ * The stamp a file carries; undefined when it has none, or one that is not as this module writes
+ * it. What a CollabSession is given as `stamp` when it is made for the file (`file.package`).
+ */
 export async function readCollabStamp(pkg: OpcPackage): Promise<CollabStamp | undefined> {
   try {
     const part = await partOf(pkg);
@@ -168,6 +171,15 @@ export interface StampingSession {
   resume(): boolean;
 }
 
+/** A file written by writeSharedFile(). */
+export interface SharedFile {
+  bytes: Uint8Array;
+  /** The step of the room the file holds; undefined when it is the file of no one step. */
+  rev: number | undefined;
+  /** The file could not be made to say its step (its custom properties cannot be read or are too large). */
+  unstamped?: true;
+}
+
 /**
  * Writes the file of a workbook that is edited together: once what was changed here has its
  * place in the common order (or after a short wait), with what arrives held back until the file
@@ -176,8 +188,12 @@ export interface StampingSession {
  * `rev`: the step the file holds, undefined when it is the file of no one step (something of
  * this participant waited, or was typed while the file was written): such a file says nothing
  * of itself.
+ *
+ * `pkg` is the package of the file (`file.package`) and `take` writes it (`() => file.save()`);
+ * mount() saves this way, and a program that runs a CollabSession without mount() does the same,
+ * then tells the room with `session.announceSaved(versions, rev)`.
  */
-export async function writeSharedFile(session: StampingSession, pkg: OpcPackage | undefined, take: () => Promise<Uint8Array>): Promise<{ bytes: Uint8Array; rev: number | undefined; unstamped?: true }> {
+export async function writeSharedFile(session: StampingSession, pkg: OpcPackage | undefined, take: () => Promise<Uint8Array>): Promise<SharedFile> {
   if (session.state === 'closed') {
     // On its own for good: the file is of no room any more.
     if (pkg) await writeCollabStamp(pkg, undefined);

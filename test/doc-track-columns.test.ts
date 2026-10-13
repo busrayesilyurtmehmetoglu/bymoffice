@@ -336,3 +336,50 @@ test('column: rejecting a change of the formatting of a row leaves the columns t
   checkTables(o.doc);
   assert.deepEqual(listRevisions(o.doc).list, []);
 });
+
+// --------------------------------------------------------------------- widths
+
+test('column: a tracked insertion leaves the widths an untracked one leaves, accepted it is that table and rejected the table of before', async () => {
+  const cells = (w: number) => tr(tc('one', W(w)) + tc('two', W(w))) + tr(tc('tri', W(w)) + tc('four', W(w)));
+  // A table as wide as the text, of no width of its own (what insertTable() makes), and one of a fixed width.
+  const auto = p('alpha') + `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="4536"/><w:gridCol w:w="4536"/></w:tblGrid>${cells(4536)}</w:tbl>` + p('omega');
+  const fixed = p('alpha') + table(cells(4536), [4536, 4536]) + p('omega');
+  const widths = (doc: DocModel) => {
+    const t = tableOf(doc);
+    return { width: t.props.width, grid: t.grid, cells: t.rows.map((row) => row.cells.map((one) => (one.props.width ? one.props.width.value : undefined))) };
+  };
+  for (const [what, source, width] of [['auto', auto, { type: 'auto', value: 0 }], ['fixed', fixed, { type: 'dxa', value: 9072 }]] as const) {
+    const plain = await open(source, { settings: '' });
+    const before = widths(plain.doc);
+    run(plain.history, insertColumn(plain.doc, cell(0, 1), 'right'));
+    assert.deepEqual(revisionsOf(plain.doc), [], `${what}: nothing is tracked without tracking`);
+    const want = widths(plain.doc);
+    // UNSURE (not compared with Word): the new column is as wide as the one beside it and the others keep
+    // their widths, so the table is that much wider, also when it then is wider than the text.
+    assert.deepEqual(want.grid, [4536, 4536, 4536], what);
+    assert.deepEqual(want.cells, [[4536, 4536, 4536], [4536, 4536, 4536]], what);
+    assert.deepEqual(want.width, width.type === 'dxa' ? { type: 'dxa', value: 13608 } : width, what);
+
+    const tracked = await open(source);
+    run(tracked.history, insertColumn(tracked.doc, cell(0, 1), 'right', ME));
+    assert.equal(revisionsOf(tracked.doc).length, 1, what);
+    assert.deepEqual(widths(tracked.doc), want, `${what}: tracked`);
+    checkTables(tracked.doc, what);
+    await checkFile(tracked, what);
+    const reopened = await checkReopened(tracked, what);
+    assert.deepEqual(widths(reopened), want, `${what}: tracked, read again`);
+    assert.deepEqual(tableOf(reopened).gridChange && tableOf(reopened).gridChange!.grid, [4536, 4536], `${what}: the grid of before is in the file`);
+
+    run(tracked.history, acceptAll(tracked.doc));
+    assert.deepEqual(widths(tracked.doc), want, `${what}: accepted`);
+    assert.equal(tableOf(tracked.doc).gridChange, undefined, what);
+    checkTables(tracked.doc, what);
+    await checkFile(tracked, what);
+    tracked.history.undo();
+    run(tracked.history, rejectAll(tracked.doc));
+    assert.deepEqual(widths(tracked.doc), before, `${what}: rejected`);
+    assert.equal(tableOf(tracked.doc).gridChange, undefined, what);
+    checkTables(tracked.doc, what);
+    await checkFile(tracked, what);
+  }
+});

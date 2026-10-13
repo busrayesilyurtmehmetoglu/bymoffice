@@ -67,7 +67,7 @@ export interface SheetCalcEngine {
   /** The dependency graph is built and nothing waits to be put into it. */
   readonly graphReady: boolean;
   invalidate(): void;
-  recalculate(changed?: SheetCellAddress[], options?: { overwrite?: boolean }): unknown;
+  recalculate(changed?: SheetCellAddress[], options?: { overwrite?: boolean; sheetsOfBefore?: boolean }): unknown;
 }
 
 /** What happened to the list of sheets, as far as formulas care. */
@@ -129,7 +129,8 @@ export function recalculateForSheets(engine: SheetCalcEngine, change: SheetListC
     engine.recalculate(undefined, { overwrite: true });
     return;
   }
-  engine.recalculate(cells);
+  // By the list of before: the engine would otherwise see that the list changed and forget the graph by itself.
+  engine.recalculate(cells, { sheetsOfBefore: true });
   const left = engine.incomplete;
   engine.invalidate();
   if (left) engine.recalculate(undefined, { overwrite: true });

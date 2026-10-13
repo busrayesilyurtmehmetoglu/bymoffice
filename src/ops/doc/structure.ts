@@ -334,7 +334,10 @@ function cellWidened(props: CellProps, by: number): CellProps {
  * Inserts a column left or right of the cell a position is in, as wide as
  * the column beside it. Every row gets a cell at that place in the grid; a
  * cell that spans the place becomes one column wider instead, which is what
- * Word does with merged cells.
+ * Word does with merged cells. The other columns keep their widths: the
+ * table is one column wider, with or without tracking, also when it then is
+ * wider than the text (UNSURE: not compared with Word, which may narrow the
+ * columns of a table that fills the page instead).
  *
  * Where changes are tracked every new cell is a tracked insertion
  * (<w:cellIns>) and the table keeps the grid it had (<w:tblGridChange>). A
