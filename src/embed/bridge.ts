@@ -21,6 +21,7 @@ import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
 import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
 import { readCollabStamp, writeSharedFile, type CollabStamp } from '../formats/xlsx/collab-stamp';
+import { listPeople } from '../collab/people';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabTransport, type CollabUser } from '../collab/index';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
@@ -1532,6 +1533,8 @@ export function createBridge(host: BridgeHost): Bridge {
         pending: session.pending,
         // Names are whatever the others said: text, to be shown as text.
         peers: session.peers.map((peer) => ({ id: peer.id, name: peer.name === undefined ? null : peer.name, color: peer.color, readOnly: peer.readOnly })),
+        // Everybody in the file, this participant first: as the page lists them (a name for everyone, "Guest N" for who gave none).
+        people: listPeople(session.user, session.peers, session.state, view.collabStrings ? view.collabStrings.guest : (n: number) => `Guest ${n}`).list.map((who) => (who.sheet === undefined ? { id: who.id, name: who.name, color: who.color, self: who.self, readOnly: who.readOnly } : { id: who.id, name: who.name, color: who.color, self: who.self, readOnly: who.readOnly, sheet: who.sheet })),
       });
     };
     let transport: CollabTransport;
@@ -1934,7 +1937,7 @@ export function createBridge(host: BridgeHost): Bridge {
       onState: (state) => {
         const current = shown;
         if (!current || current.saver !== mine) return;
-        send(state.autoWaits ? { type: 'saveState', dirty: state.dirty, saving: state.saving, autoWaits: state.autoWaits } : { type: 'saveState', dirty: state.dirty, saving: state.saving });
+        send({ type: 'saveState', dirty: state.dirty, saving: state.saving });
       },
     });
     return mine;

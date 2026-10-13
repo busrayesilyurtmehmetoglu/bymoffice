@@ -180,6 +180,8 @@ const DEFAULTS = {
   savedPerMinute: 40,
   /** 0: no limit. */
   roomSavedPerMinute: 120,
+  /** Joins of one connection in a minute (0: any number); over it the connection is closed with `join-rate`. */
+  joinsPerMinute: 10,
   /** 0: no limit. */
   formatsPerMinute: 2000,
   /** 0: no `saved` is written to the table. */
@@ -1040,6 +1042,18 @@ export function createCollabServer(options = {}) {
   function onJoin(conn, message) {
     const versions = versionList(message.v, 0);
     if (!versions) return false;
+    // Only so many joins a minute from one connection (`joinsPerMinute`): one
+    // that leaves and joins over and over costs an `authorize` each time, and
+    // tells the whole room of it each time.
+    if (opt.joinsPerMinute > 0) {
+      const at = now();
+      conn.joins = (conn.joins || []).filter((time) => at - time < 60000);
+      if (conn.joins.length >= opt.joinsPerMinute) {
+        fail(conn, 'join-rate', 1008);
+        return true;
+      }
+      conn.joins.push(at);
+    }
     const since = message.since;
     if (since !== undefined && !isCount(since)) return false;
     const ep = message.ep;
@@ -1221,7 +1235,15 @@ export function createCollabServer(options = {}) {
     }
 
     conn.ro = join.ro || verdict.readOnly === true;
+    // Who the participant is, when `authorize` says: its name (and colour) stand
+    // in place of what the client says of itself. What the client says is what
+    // it says; what `authorize` says is what the application found out.
     conn.user = join.user;
+    if (verdict && typeof verdict === 'object' && isObject(verdict.user)) {
+      conn.user = { ...join.user };
+      if (typeof verdict.user.name === 'string') conn.user.name = clip(verdict.user.name, MAX_USER_NAME);
+      if (typeof verdict.user.color === 'string') conn.user.color = clip(verdict.user.color, MAX_USER_COLOR);
+    }
     conn.key = join.userKey;
     conn.from = from;
     conn.resetFrom = null;
@@ -1239,7 +1261,7 @@ export function createCollabServer(options = {}) {
     // The log goes out in one piece; its bytes are not held against the client
     // until the socket has been empty once.
     conn.socket.cork();
-    send(conn, { t: 'hello', pv: room.pv, ep: room.ep, rev: room.rev, from, you: conn.id, ro: conn.ro, v: matched, peers });
+    send(conn, { t: 'hello', pv: room.pv, ep: room.ep, rev: room.rev, from, you: conn.id, user: conn.user, ro: conn.ro, v: matched, peers });
     for (let index = from - room.floor; index < room.log.length && !conn.dead; index++) {
       conn.allowance += room.log[index].bytes;
       write(conn, room.log[index].frame);

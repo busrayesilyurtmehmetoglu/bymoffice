@@ -37,7 +37,7 @@ export type ClientMessage =
   | { t: 'leave' };
 
 export type ServerMessage =
-  | { t: 'hello'; rev: number; from: number; ep: string; you: string; ro: boolean; pv?: number; v: string[]; peers: PeerMessage[] }
+  | { t: 'hello'; rev: number; from: number; ep: string; user?: CollabUser; you: string; ro: boolean; pv?: number; v: string[]; peers: PeerMessage[] }
   | { t: 'op'; rev: number; id: string; from: string; ops: unknown[] }
   | { t: 'nack'; id: string; rev: number; reason?: string }
   | { t: 'reset'; rev: number; v: string[] }
@@ -66,12 +66,35 @@ function versions(value: unknown, min: number): string[] {
 }
 
 /** A name and a colour as they may be shown: plain text of one line, a colour of six hex digits. */
+/** Most code points of a name that is shown. */
+export const MAX_NAME_LENGTH = 64;
+
+/**
+ * A name as it is shown: text of someone else. Control characters become spaces; characters that
+ * turn the direction of the text around, or hide in it (marks and overrides of direction, isolates,
+ * joiners of no width, the byte order mark), are taken out, so that a name cannot rearrange or
+ * imitate what stands beside it; runs of space are one space; and it is cut at 64 code points
+ * (never through one).
+ */
+export function cleanName(value: string): string {
+  const plain = value
+    .slice(0, 4096)
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g, ' ')
+    .replace(/[\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const points = Array.from(plain);
+  // A half of a pair that stands alone is no character.
+  const whole = points.filter((point) => !(point.length === 1 && point.charCodeAt(0) >= 0xd800 && point.charCodeAt(0) <= 0xdfff));
+  return whole.slice(0, MAX_NAME_LENGTH).join('').trim();
+}
+
 export function cleanUser(value: unknown): CollabUser {
   const user: CollabUser = {};
   if (!value || typeof value !== 'object') return user;
   const from = value as { name?: unknown; color?: unknown };
   if (typeof from.name === 'string') {
-    const name = from.name.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g, ' ').trim().slice(0, 64);
+    const name = cleanName(from.name);
     if (name !== '') user.name = name;
   }
   if (typeof from.color === 'string' && /^#[0-9A-Fa-f]{6}$/.test(from.color)) user.color = from.color.toUpperCase();
@@ -106,7 +129,10 @@ export function parseServerMessage(textOf: string): ServerMessage {
       if (!isRev(m.rev) || !isRev(m.from) || m.from > m.rev) return fail('hello');
       if (!Array.isArray(m.peers) || m.peers.length > MAX_PEERS) return fail('hello');
       if (typeof m.ep !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(m.ep)) return fail('hello');
-      return { t: 'hello', rev: m.rev, from: m.from, ep: m.ep, you: text(m.you, 100, 'hello'), ro: m.ro === true, v: m.v === undefined ? [] : versions(m.v, 0), peers: m.peers.map(peer) };
+      const hello: ServerMessage = { t: 'hello', rev: m.rev, from: m.from, ep: m.ep, you: text(m.you, 100, 'hello'), ro: m.ro === true, v: m.v === undefined ? [] : versions(m.v, 0), peers: m.peers.map(peer) };
+      // The participant as the room has it, when the relay says (it may have given the name itself).
+      if (m.user !== undefined) (hello as { user?: CollabUser }).user = cleanUser(m.user);
+      return hello;
     }
     case 'op':
       if (!isRev(m.rev) || !Array.isArray(m.ops)) return fail('op');

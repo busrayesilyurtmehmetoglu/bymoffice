@@ -821,7 +821,9 @@ test('"saved" is no news of a clean workbook for who has a step waiting', async 
   const net = new Net();
   const random = seeded(51);
   const heard: boolean[] = [];
-  const a = await join(net, 'a', bytes);
+  // The save is said again a moment after someone came in: the moment passes when the test says so.
+  let timers: (() => void)[] = [];
+  const a = await join(net, 'a', bytes, { timer: (run) => (timers.push(run), () => undefined) });
   const b = await join(net, 'b', bytes, { onSaved: (saved) => heard.push(saved.clean) });
   net.drain(random);
   b.transport.suspend();
@@ -830,7 +832,13 @@ test('"saved" is no news of a clean workbook for who has a step waiting', async 
   b.transport.resume();
   a.session.announceSaved(['e:"t"'], 0);
   // The announcement arrives while the step of b is still on its way.
-  for (let i = 0; i < 200 && heard.length === 0; i++) net.step(random);
+  for (let i = 0; i < 200 && heard.length === 0; i++) {
+    if (!net.step(random)) {
+      const due = timers;
+      timers = [];
+      for (const run of due) run();
+    }
+  }
   net.drain(random);
   assert.equal(heard.length >= 1, true, 'b heard of the save');
   assert.equal(b.session.rev === 0 ? heard[0] : false, false, 'and is not told that its workbook is the one that was saved');
@@ -1087,4 +1095,41 @@ test('the relay of the page: an empty room that is started again on another file
   assert.equal(same.ep, first.ep, 'on the file it was started with, it is the room it was');
   assert.notEqual(other.ep, first.ep, 'on another file it is another room');
   assert.notEqual(back.ep, first.ep, 'and who comes back to the room before it is not in that room: the name says so');
+});
+
+test('the relay of the page takes only so many joins a minute of one connection; and a save is said again once for however many come in', async () => {
+  const { MemoryServer, MAX_JOINS_PER_MINUTE } = await import('../src/collab/server');
+  const queue: (() => void)[] = [];
+  const server = new MemoryServer({ deliver: (run) => queue.push(run), now: () => 5000 });
+  const raw = server.connect();
+  const got: { t: string; code?: string }[] = [];
+  raw.onMessage((text) => got.push(JSON.parse(text)));
+  raw.onState!((state) => {
+    if (state === 'open') raw.send(JSON.stringify({ t: 'join', pv: 2, v: ['v1'], key: 'a' }));
+  });
+  const drain = (): void => {
+    while (queue.length > 0) queue.shift()!();
+  };
+  drain();
+  for (let i = 1; i < MAX_JOINS_PER_MINUTE + 1; i++) {
+    raw.send(JSON.stringify({ t: 'leave' }));
+    raw.send(JSON.stringify({ t: 'join', pv: 2, v: ['v1'], key: 'a' }));
+    drain();
+  }
+  assert.deepEqual(got.filter((message) => message.t === 'hello').length, MAX_JOINS_PER_MINUTE, 'ten joins get in');
+  assert.deepEqual(got[got.length - 1], { t: 'error', code: 'join-rate' }, 'the eleventh ends the connection');
+  // Three come in at once: what was last saved is said to them once, a moment later.
+  const s = await alone();
+  s.hello(0, 0);
+  s.session.announceSaved(['e:"v2"'], 0);
+  const said = (): number => s.sent.filter((message) => message.t === 'saved').length;
+  assert.equal(said(), 1, 'the save is said');
+  let timers: (() => void)[] = [];
+  (s.session as unknown as { timer: (run: () => void, ms: number) => () => void }).timer = (run) => (timers.push(run), () => undefined);
+  for (const id of ['p1', 'p2', 'p3']) s.tell({ t: 'peer', id, user: {}, ro: false });
+  assert.equal(said(), 1, 'not again at once, for each who comes');
+  const due = timers;
+  timers = [];
+  for (const run of due) run();
+  assert.equal(said(), 2, 'once, for all three');
 });

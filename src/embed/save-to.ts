@@ -486,6 +486,8 @@ export interface SaveStrings {
   saved: string;
   saveFailed(detail: string): string;
   saveConflict: string;
+  /** A save nobody asked for that met the saves of others in a room again and again. */
+  saveRoomBusy: string;
   saveRedirected: string;
   saveConvertedNotAllowed(to: string): string;
   saveDenied: string;
@@ -624,6 +626,8 @@ export class SaveController implements SaveCommand {
   /** Something was changed here, by this side itself, that no save of this side holds. */
   private own = false;
   private ownAtSave = false;
+  /** The save that failed last met one save of the room after the other (see start()). */
+  private crowded = false;
   private running: Promise<boolean> | undefined;
   /** What the call that started the save under way was answered with: the end of that save, or of the question it led to. */
   private result: Promise<boolean> | undefined;
@@ -795,6 +799,14 @@ export class SaveController implements SaveCommand {
     if (strong !== undefined) this.etag = strong;
     if (clean && !this.busy) {
       this.savedCount = this.count;
+      // The file holds everything, this side's own work too: from here on it is saved like anybody's, and auto-save,
+      // whatever stopped it, has nothing to be stopped over.
+      this.own = false;
+      this.ownAtSave = false;
+      this.stopped = false;
+      this.retries = 0;
+      this.notBefore = undefined;
+      this.autoTold = undefined;
       this.error = undefined;
       this.dirtySince = undefined;
       this.lastSavedAt = this.host.now ? this.host.now() : Date.now();
@@ -1281,17 +1293,23 @@ export class SaveController implements SaveCommand {
           return this.start(overwrite, auto, tries + 1);
         }
         if (host.conflictWait) {
-          // The word of that save may be a moment behind the conflict it made.
-          let moved = false;
-          try {
-            moved = await host.conflictWait();
-          } catch {
-            moved = false;
+          // The word of that save may be a moment behind the conflict it made: waited for, and once more.
+          for (let wait = 0; wait < 2; wait++) {
+            let moved = false;
+            try {
+              moved = await host.conflictWait();
+            } catch {
+              moved = false;
+            }
+            if (this.destroyed) return false;
+            if (this.etag !== sentWith) return this.start(overwrite, auto, tries + 1);
+            if (moved) break;
           }
-          if (this.destroyed) return false;
-          if (moved && this.etag !== sentWith) return this.start(overwrite, auto, tries + 1);
         }
       }
+      // In a room, a save nobody asked for that met save after save of the others: the room is busy, which is no
+      // conflict to stop over. It waits, and tries again.
+      this.crowded = error instanceof SaveError && error.code === 'conflict' && auto && !overwrite && host.conflictWait !== undefined && tries > 0;
       if (error instanceof SaveError) {
         // Before it is told: a save the user asks for from inside the telling is another save.
         const wasAuto = this.autoRun;
@@ -1393,7 +1411,7 @@ export class SaveController implements SaveCommand {
     let text: string;
     switch (error.code) {
       case 'conflict':
-        text = strings.saveConflict;
+        text = this.crowded ? strings.saveRoomBusy : strings.saveConflict;
         break;
       case 'denied':
         text = strings.saveDenied;
@@ -1427,7 +1445,7 @@ export class SaveController implements SaveCommand {
     // What auto-save does about it. A request that did not get through, one without an answer in time and
     // a server that failed (5xx) are tried again, each time after twice the wait; anything else is not
     // mended by trying, and holds auto-save still until the user saves.
-    const again = error.code === 'network' || error.code === 'timeout' || (error.code === 'http' && error.status !== undefined && error.status >= 500);
+    const again = error.code === 'network' || error.code === 'timeout' || (error.code === 'http' && error.status !== undefined && error.status >= 500) || (error.code === 'conflict' && this.crowded);
     if (again) {
       this.retries++;
       this.hold(Math.min(AUTO_SAVE_MAX_RETRY_MS, AUTO_SAVE_RETRY_MS * Math.pow(2, Math.min(this.retries - 1, 30))));

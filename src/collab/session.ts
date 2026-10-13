@@ -206,6 +206,8 @@ interface Step {
 /** Colours participants are told apart by when they give none. */
 export const PEER_COLORS = ['#D93025', '#1A73E8', '#188038', '#E37400', '#9334E6', '#00838F', '#C2185B', '#5F6368'];
 
+/** How long after someone came in the last save is said again (to everybody who came meanwhile, once). */
+const RESEND_SAVED_MS = 1500;
 /** Most pending steps before it is said that many changes wait. */
 const BACKLOG_NOTICE = 500;
 /** How often a selection is sent at most. */
@@ -300,6 +302,8 @@ export class CollabSession {
   private redoStack: StackEntry[] = [];
   private versions: string[];
   private me = '';
+  private resendTimer: (() => void) | undefined;
+  private seenAs: CollabUser | undefined;
   private others: Map<string, PeerMessage> = new Map();
   private peerList: CollabPeer[] = [];
   private readonlyNow: boolean;
@@ -367,7 +371,7 @@ export class CollabSession {
 
   /** This participant as the others see it; `id` is empty until the relay named the connection. */
   get user(): CollabPeer {
-    return this.lookOf(this.me, cleanUser(this.options.user), this.readonlyNow);
+    return this.lookOf(this.me, this.seenAs || cleanUser(this.options.user), this.readonlyNow, this.presenceNow);
   }
 
   get readOnly(): boolean {
@@ -853,6 +857,8 @@ export class CollabSession {
         this.waitingSaid = false;
         this.target = message.rev;
         this.me = message.you;
+        // As the room has this participant: the relay may have named it itself.
+        this.seenAs = message.user;
         if (message.ro && !this.readonlyNow) {
           this.readonlyNow = true;
           // Asked for by nobody here: whoever edits is told, and what waits is taken back.
@@ -932,7 +938,13 @@ export class CollabSession {
         this.others.set(message.id, { id: message.id, user: message.user, ro: message.ro });
         this.refreshPeers();
         // Who comes in has not heard what this side last saved: the file it read may be an older one than the one that is stored.
-        if (this.lastSaved) this.send(this.lastSaved);
+        // Once for however many come in a moment: each word of a save makes everybody ask the server.
+        if (this.lastSaved && !this.resendTimer) {
+          this.resendTimer = this.timer(() => {
+            this.resendTimer = undefined;
+            if (this.lastSaved && this.current === 'online') this.send(this.lastSaved);
+          }, RESEND_SAVED_MS);
+        }
         return;
       case 'left':
         if (this.others.delete(message.id)) this.refreshPeers();

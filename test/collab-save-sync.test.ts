@@ -175,7 +175,7 @@ test('when the room asks for a save, the one who leads saves, as a save nobody a
 function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => void; put?: (name: string, texts: string[]) => void } = {}) {
   const encoder = new TextEncoder();
   const fileOf = (book: string[], rev: number): Uint8Array => encoder.encode(JSON.stringify({ rev, book }));
-  const server = { etag: '"v1"', n: 1, body: fileOf([], 0), puts: [] as { by: string; match: string | undefined; status: number }[] };
+  const server = { etag: '"v1"', n: 1, body: fileOf([], 0), puts: [] as { by: string; match: string | undefined; status: number }[], gets: [] as string[], asked: [] as (string | undefined)[] };
   let clock = 1000;
   const order: string[] = [];
   const sides = Array.from({ length: count }, (_unused, index) => {
@@ -196,8 +196,12 @@ function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => 
           body: { cancel: async () => undefined },
           arrayBuffer: async () => (body || new Uint8Array(0)).slice().buffer,
         }) as unknown as Response;
+      if (method !== 'PUT') server.asked.push(headers['X-Who']);
       if (method === 'HEAD') return reply(200, server.etag);
-      if (method !== 'PUT') return reply(200, server.etag, server.body);
+      if (method !== 'PUT') {
+        server.gets.push(name);
+        return reply(200, server.etag, server.body);
+      }
       // The answer takes a moment: two saves that were sent at once are both on their way before either is answered.
       await Promise.resolve();
       const ok = headers['If-Match'] === server.etag;
@@ -253,13 +257,14 @@ function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => 
     sync = createSaveSync({
       controller,
       session: () => session,
-      target: { url: target.url, credentials: 'same-origin' },
+      target: { url: target.url, credentials: 'same-origin', headers: [['X-Who', 'a user'], ['Content-Type', 'x/y'], ['If-Match', 'never']] },
+      people: () => count,
       strong: strongETag,
       readOnly: () => false,
       fetch: serve,
       timer,
       now: () => clock,
-      random: () => index / 10,
+      random: () => ((index * 7919 + 13) % 97) / 97,
       ownBytes: async () => ({ bytes: fileOf(book, session.rev), rev: session.pending === 0 ? session.rev : undefined }),
     });
     const fire = (): boolean => {
@@ -503,4 +508,49 @@ test(`whenever a participant is told it has nothing to save, the stored file hol
     if (liar < 0) for (const side of r.sides) if (side.controller.autoSave) assert.equal(side.controller.dirty, false, `seed ${seed}: ${side.name} has nothing left to save in the end`);
   }
   assert.ok(cleaned > RUNS && lies > RUNS / 4, `participants were told they are saved (${cleaned}) and lies were told (${lies})`);
+});
+
+test('after the room could not be reached for a while, those who waited do not all save at once; nobody is stopped, and everybody ends with nothing to save', async () => {
+  for (const count of [2, 4, 8, 12]) {
+    const r = room(count);
+    // Everybody typed; then the relay is gone for longer than anybody waits.
+    for (let who = 0; who < count; who++) r.edit(who, `typed by ${who}`);
+    for (const side of r.sides) {
+      side.session.state = 'offline';
+      side.sync.roomChanged();
+    }
+    await r.pass(120000);
+    assert.equal(r.server.puts.length, 0, `${count}: nothing is saved while the room cannot be reached`);
+    for (const side of r.sides) {
+      side.session.state = 'online';
+      side.sync.roomChanged();
+    }
+    await r.pass(180000);
+    const refused = r.server.puts.filter((put) => put.status === 412).length;
+    assert.ok(refused <= count, `${count}: no storm of saves that meet each other (${refused} of ${r.server.puts.length} were refused)`);
+    assert.deepEqual(r.sides.filter((side) => side.controller.state.autoPaused).map((side) => side.name), [], `${count}: auto-save is stopped for nobody`);
+    assert.deepEqual(r.sides.filter((side) => side.controller.dirty).map((side) => side.name), [], `${count}: everybody has nothing left to save`);
+    assert.deepEqual(r.sides.reduce((all: string[], side) => all.concat(side.errors), []).filter((code) => code !== 'conflict'), [], `${count}: no other error`);
+    assert.deepEqual(r.stored(), r.sides[0].book, `${count}: the stored file is the workbook`);
+  }
+});
+
+test('work that was proven to be saved is saved like anybody\'s from then on: the file is not fetched again for every save of the room', async () => {
+  const r = room(3);
+  const [, b, c] = r.sides;
+  // b types once; the saver saves; b looks at the file, once, and has nothing to save.
+  r.edit(1, 'typed by b');
+  await r.pass(3000);
+  assert.deepEqual([b.controller.dirty, r.server.gets.filter((who) => who === 'b').length], [false, 1], 'looked at once, and saved');
+  assert.equal(b.controller.ownChanges, false, 'its work is in a file: nothing of its own is unsaved');
+  // From here on the others type, for a long time: b takes the word of each save (the server confirms the name), and fetches nothing.
+  for (let i = 0; i < 20; i++) {
+    r.edit(i % 2 === 0 ? 0 : 2, `more ${i}`);
+    await r.pass(3000);
+  }
+  assert.equal(r.server.gets.filter((who) => who === 'b').length, 1, 'the file was fetched no further time by who typed once');
+  assert.equal(b.controller.dirty, false, 'and it has nothing to save');
+  assert.ok(r.server.gets.filter((who) => who === 'c').length <= 10, 'who types is the one who looks');
+  // What the page sends with a save to say who it is goes with the questions as well; what is about a body or a condition does not.
+  assert.deepEqual(Array.from(new Set(r.server.asked)), ['a user'], 'every HEAD and GET carried the header of the page');
 });

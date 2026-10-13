@@ -183,6 +183,9 @@ export interface BroadcastTransportOptions {
  * MemoryServer.serve(name). Until the room answers it is asked for again and again; when the
  * tab that holds it goes, the transport is closed until a room answers again.
  */
+/** How often a tab tells the relay of a page that it is still there; three times as long without a word, and the relay lets it go. */
+export const TAB_ALIVE_MS = 10000;
+
 export function broadcastTransport(name: string, options: BroadcastTransportOptions = {}): PausableTransport {
   if (!options.channel && typeof BroadcastChannel === 'undefined') throw new TypeError('There is no BroadcastChannel here');
   const port = options.channel || (new BroadcastChannel(channelName(String(name))) as unknown as ChannelLike);
@@ -200,9 +203,25 @@ export function broadcastTransport(name: string, options: BroadcastTransportOpti
     asking = setInterval(knock, options.retryMs === undefined ? 300 : options.retryMs);
     knock();
   };
+  /** While it is open the relay hears of this tab every few seconds: one that is closed, or gone to sleep for good, is let go of there. */
+  let beat: ReturnType<typeof setInterval> | undefined;
+  const alive = (): void => {
+    if (beat !== undefined) return;
+    beat = setInterval(() => port.postMessage({ to: 'relay', from: id, kind: 'alive' }), TAB_ALIVE_MS);
+    const timer = beat as unknown as { unref?(): void };
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+  // A page that goes says so, where the browser lets it.
+  const gone = (): void => {
+    if (isOpen) port.postMessage({ to: 'relay', from: id, kind: 'close' });
+  };
+  const page = typeof window !== 'undefined' && typeof window.addEventListener === 'function' ? window : undefined;
+  if (page) page.addEventListener('pagehide', gone);
   const cut = (tell: boolean): void => {
     if (asking !== undefined) clearInterval(asking);
     asking = undefined;
+    if (beat !== undefined) clearInterval(beat);
+    beat = undefined;
     if (isOpen) {
       isOpen = false;
       if (tell) port.postMessage({ to: 'relay', from: id, kind: 'close' });
@@ -219,6 +238,7 @@ export function broadcastTransport(name: string, options: BroadcastTransportOpti
       // The room answered a second knock: the connection it knows is a new one.
       if (isOpen && state) state('closed');
       isOpen = true;
+      alive();
       if (state) state('open');
     } else if (data.kind === 'bye') {
       cut(false);
@@ -241,6 +261,7 @@ export function broadcastTransport(name: string, options: BroadcastTransportOpti
       cut(true);
       over = true;
       wanted = false;
+      if (page) page.removeEventListener('pagehide', gone);
       port.onmessage = null;
       port.close();
     },

@@ -191,7 +191,12 @@ test('the selection of the other page is drawn in its colour with its name, and 
   expect(await pixelsOf(b, BLUE), 'nobody draws their own frame').toBe(0);
   // What the others select arrives in its own time (presence is gathered before it is drawn): asked for until it is there.
   await expect.poll(() => pixelsOf(b, RED), { message: 'the second page draws the first one' }).toBeGreaterThan(200);
-  await expect(a.locator('#editor .bym-collab-peer')).toHaveText('Ben');
+  // Where there is room the other is shown by its letter; on a narrow screen by the number alone.
+  if (!(await a.locator('#editor .bym-collab').getAttribute('data-narrow'))) {
+    await expect(a.locator('#editor .bym-collab-peer')).toHaveAttribute('title', 'Ben');
+    await expect(a.locator('#editor .bym-collab-peer')).toHaveText('B');
+  }
+  await expect(a.locator('#editor .bym-collab-count')).toHaveText('2');
   await expect(a.locator('#editor .bym-tab .bym-tab-peer')).toHaveCount(1);
   await expect(a.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'online');
   // The page that leaves takes its frame along.
@@ -368,8 +373,11 @@ test('the demo page opens two editors that edit together, in a room of the page 
     await page.locator('#collab-socket').setChecked(socket);
     await page.locator('#collab-start').click();
     await expect(page.locator('#collab-state')).toContainText('2. düzenleyici: online', { timeout: 15000 });
-    await expect(page.locator('#collab-a .bym-collab-peer')).toHaveText('Deniz');
-    await expect(page.locator('#collab-b .bym-collab-peer')).toHaveText('Ayşe');
+    if (!(await page.locator('#collab-a .bym-collab').getAttribute('data-narrow'))) {
+      await expect(page.locator('#collab-a .bym-collab-peer')).toHaveAttribute('title', 'Deniz');
+      await expect(page.locator('#collab-b .bym-collab-peer')).toHaveAttribute('title', 'Ayşe');
+    }
+    await expect(page.locator('#collab-a .bym-collab-count')).toHaveText('2');
     await page.locator('#collab-a .bym-input').focus();
     await page.keyboard.type('12');
     await page.keyboard.press('Enter');
@@ -532,3 +540,142 @@ test('the one who would save for all has auto-save off: the other says that it w
   expect(await a.evaluate(() => (window as any).__errors), 'the other page heard of no error').toEqual([]);
   clean(b);
 });
+
+test('who is in the file: the number, the list, who only reads, a guest, and nobody who has left', async ({ page, context, request }) => {
+  const { a, b, url, room } = await pair(context, page, request, {});
+  // Alone it would say 1; with two it says 2, on both pages.
+  await expect(a.locator('#editor .bym-collab-count')).toHaveText('2');
+  await expect(b.locator('#editor .bym-collab-count')).toHaveText('2');
+  await expect(a.locator('#editor .bym-collab-count')).toHaveAttribute('aria-label', '2 people in this file');
+  // A third comes: without a name, and only to read.
+  const c = await context.newPage();
+  await c.goto(PAGE);
+  expect(await mount(c, { file: url, room, via: 'tab', readOnly: true })).toBe('ok');
+  await online(c);
+  await expect(a.locator('#editor .bym-collab-count')).toHaveText('3');
+  await expect(a.locator('#editor .bym-collab')).toHaveAttribute('data-people', '3');
+  const narrow = (await a.locator('#editor .bym-collab').getAttribute('data-narrow')) === 'true';
+  await expect(a.locator('#editor .bym-collab-peer')).toHaveCount(narrow ? 0 : 2);
+  // The list opens from the keyboard, and Escape closes it and gives the button the focus back.
+  const button = a.locator('#editor .bym-collab-count');
+  await expect(button).toHaveAttribute('aria-expanded', 'false');
+  await button.focus();
+  await a.keyboard.press('Enter');
+  await expect(button).toHaveAttribute('aria-expanded', 'true');
+  const rows = a.locator('#editor .bym-collab-people [role="listitem"]');
+  await expect(a.locator('#editor .bym-collab-people')).toHaveAttribute('role', 'list');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0)).toHaveText(/^Ada\s*\(you\)/);
+  await expect(rows.nth(0)).toHaveAttribute('data-self', 'true');
+  await expect(rows.nth(1).locator('.bym-collab-person-name')).toHaveText('Ben');
+  await expect(rows.nth(2).locator('.bym-collab-person-name')).toHaveText(/^Guest [1-9][0-9]?$/);
+  await expect(rows.nth(2)).toContainText('viewing only');
+  await expect(rows.nth(2)).toHaveAttribute('data-read-only', 'true');
+  // The dot of a row is the colour the selection of that participant is drawn in.
+  expect(await rows.nth(1).locator('.bym-collab-person-color').evaluate((dot) => getComputedStyle(dot).backgroundColor)).toBe('rgb(26, 115, 232)');
+  // Everybody is called the same by everybody: the guest sees itself under the name the others see.
+  const guest = await rows.nth(2).locator('.bym-collab-person-name').textContent();
+  expect(await c.evaluate(() => (window as any).__mounted.collab.people[0]), 'the guest, to itself').toMatchObject({ name: guest, self: true, readOnly: true });
+  expect(await a.evaluate(() => (window as any).__mounted.collab.people.map((who: any) => [who.name, who.self, who.readOnly]))).toEqual([['Ada', true, false], ['Ben', false, false], [guest, false, true]]);
+  // Where someone is: said in the list once it is known.
+  await b.evaluate(() => (window as any).__mounted.view.select({ top: 2, left: 1, bottom: 2, right: 1 }));
+  await expect(rows.nth(1)).toContainText('on Data');
+  await a.keyboard.press('Escape');
+  await expect(button).toHaveAttribute('aria-expanded', 'false');
+  await expect(a.locator('#editor .bym-collab-people')).toHaveCount(0);
+  expect(await a.evaluate(() => document.activeElement && document.activeElement.className), 'the focus is on the button again').toBe('bym-collab-count');
+  // Space opens it as well; a press elsewhere closes it.
+  await a.keyboard.press('Space');
+  await expect(button).toHaveAttribute('aria-expanded', 'true');
+  await a.locator('#editor canvas').first().click({ position: { x: 200, y: 120 } });
+  await expect(button).toHaveAttribute('aria-expanded', 'false');
+  // Whoever leaves is gone from the number, the circles and the list: by closing its page, and by leaving the room.
+  await button.click();
+  await c.close();
+  await expect(button).toHaveText('2', { timeout: 15000 });
+  await expect(rows).toHaveCount(2);
+  await b.evaluate(() => (window as any).__mounted.collab.leave());
+  await expect(button).toHaveText('1');
+  await expect(rows).toHaveCount(1);
+  await expect(a.locator('#editor .bym-collab-peer')).toHaveCount(0);
+  expect(await b.evaluate(() => (window as any).__mounted.collab.people.length), 'who left lists itself alone').toBe(1);
+  clean(b);
+});
+
+test('who is in the file, on a narrow screen: the number, and no circles', async ({ page, context, request }) => {
+  await page.setViewportSize({ width: 360, height: 640 });
+  const { a } = await pair(context, page, request, {});
+  await expect(a.locator('#editor .bym-collab-count')).toHaveText('2');
+  await expect(a.locator('#editor .bym-collab')).toHaveAttribute('data-narrow', 'true');
+  await expect(a.locator('#editor .bym-collab-peer')).toHaveCount(0);
+  await a.locator('#editor .bym-collab-count').click();
+  await expect(a.locator('#editor .bym-collab-people [role="listitem"]')).toHaveCount(2);
+  const box = await a.locator('#editor .bym-collab-people').boundingBox();
+  expect(box && box.x >= 0 && box.x + box.width <= 360, 'the list is inside the screen').toBe(true);
+});
+
+test('a name is text, whatever it holds: markup, characters that turn the text around, a name that is far too long', async ({ page, context, request }) => {
+  const nasty = '<img src=x onerror="window.__owned=1">‮gnp.exe ' + 'x'.repeat(500);
+  const { a } = await pair(context, page, request, { second: { name: nasty } });
+  await a.locator('#editor .bym-collab-count').click();
+  const name = a.locator('#editor .bym-collab-people [role="listitem"]').nth(1).locator('.bym-collab-person-name');
+  const shown = (await name.textContent()) || '';
+  expect(shown.startsWith('<img src=x onerror="window.__owned=1">gnp.exe'), `shown as text, without what turns it around: ${shown.slice(0, 60)}`).toBe(true);
+  expect(Array.from(shown).length, 'no longer than a name may be').toBeLessThanOrEqual(64);
+  expect(await a.evaluate(() => [(window as any).__owned, document.querySelectorAll('#editor img').length]), 'nothing of it became markup').toEqual([undefined, 0]);
+});
+
+for (const way of ['cancel', 'load', 'save'] as const) {
+  test(`a workbook that was kept apart meets a file someone else saved: the user is asked, and "${way}" does what it says`, async ({ page, context, request }) => {
+    const { a, b, url } = await pair(context, page, request, { saveTo: true });
+    await type(b, 0, 0, 'mine, unsaved');
+    await settled(b);
+    await b.evaluate(() => (window as any).__transport.suspend());
+    await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'offline');
+    await a.evaluate(() => (window as any).__relay.roomsByKey.clear());
+    await b.evaluate(() => (window as any).__transport.resume());
+    await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'detached');
+    // Meanwhile the file was saved by someone else.
+    await seed(request, url, await createBlank('xlsx', { sheetName: 'Saved by someone else' }));
+    const saving = b.evaluate(() => (window as any).__mounted.saveNow());
+    const question = b.locator('#editor [data-bym-confirm="collab-fork"]');
+    await expect(question).toBeVisible();
+    await expect(question.locator('.bym-confirm-title')).toHaveText('The stored file is not the one you opened');
+    await expect(question.locator('[data-bym-action]')).toHaveText(['Download my copy', 'Load the stored file', 'Save mine over it', 'Cancel']);
+    await expect(question.locator('[data-bym-action="cancel"]')).toBeFocused();
+    // The two answers that lose something answer only after a moment.
+    await expect(question.locator('[data-bym-action="load"]')).not.toHaveAttribute('aria-disabled', 'true');
+    if (way === 'cancel') {
+      await b.keyboard.press('Escape');
+      expect(await saving, 'nothing was saved').toBe(false);
+      await expect(question).toHaveCount(0);
+      await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'detached');
+      expect(await cell(b, 0, 0), 'the work is still there').toBe('mine, unsaved');
+      expect(await b.evaluate(() => (window as any).__mounted.hasUnsavedChanges), 'and still unsaved').toBe(true);
+    } else if (way === 'load') {
+      // A copy first: the question stays open, and a file is handed to the user.
+      const download = b.waitForEvent('download');
+      await question.locator('[data-bym-action="download"]').click();
+      const file = await download;
+      expect(file.suggestedFilename(), 'the copy has the name of a workbook').toMatch(/\.xlsx$/);
+      await expect(question).toBeVisible();
+      await question.locator('[data-bym-action="load"]').click();
+      expect(await saving, 'nothing was saved').toBe(false);
+      await expect(question).toHaveCount(0);
+      await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'online');
+      expect(await b.evaluate(() => (window as any).__mounted.workbook.sheets[0].name), 'the stored file is shown').toBe('Saved by someone else');
+      expect(await cell(b, 0, 0), 'and what was typed went with the choice').toBe(null);
+    } else {
+      await question.locator('[data-bym-action="overwrite"]').click();
+      expect(await saving, 'the save went through').toBe(true);
+      await expect(question).toHaveCount(0);
+      await expect(b.locator('#editor .bym-collab')).toHaveAttribute('data-state', 'online');
+      const answer = await request.get(url);
+      const stored = await (await open(new Uint8Array(await answer.body()))).workbook();
+      expect(getCell(stored.sheets[0], 0, 0)?.value, 'the stored file is this workbook').toBe('mine, unsaved');
+      expect(stored.sheets[0].name, 'and what someone else saved is no longer there').toBe('Data');
+    }
+    // The one thing the console says is the refusal the question is about.
+    expect(((b as any).__problems as string[]).filter((line) => line.indexOf('412') < 0), 'no other error on the page').toEqual([]);
+  });
+}

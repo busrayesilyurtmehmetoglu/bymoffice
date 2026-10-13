@@ -14,8 +14,13 @@ export interface CollabAuthorizeRequest {
   request: IncomingMessage;
 }
 
-/** `true` lets the connection write, `{ readOnly: true }` lets it read, `false` turns it away. */
-export type CollabVerdict = boolean | { readOnly?: boolean };
+/**
+ * `true` lets the connection write, `{ readOnly: true }` lets it read, `false` turns it away. `user`: who
+ * the participant is, as the application found out (from the token, a session): its `name` and `color`
+ * are told to the room IN PLACE of what the client says of itself, and to the client in its `hello`.
+ * Without it the names in a room are what the participants say, and prove nothing.
+ */
+export type CollabVerdict = boolean | { readOnly?: boolean; user?: { name?: string; color?: string } };
 
 /**
  * A line of diagnosis. It never carries a token or the `key` of a join. `{ type: 'warning', message }` is the relay saying that it
@@ -94,6 +99,8 @@ export interface CollabServerOptions {
    * Default 120; 0 is no limit.
    */
   roomSavedPerMinute?: number;
+  /** How many times one connection may join in a minute (after `reset` or `leave`); over it the connection is closed with `error join-rate`. Default 10; 0: any number. */
+  joinsPerMinute?: number;
   /**
    * Formats a minute one connection may add: the length of `f` of an operation that opens with
    * `{ "t": "st", "f": [...] }` (a bucket of as many tokens); over it the operation is refused with `nack`,

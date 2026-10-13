@@ -3,6 +3,7 @@
 // stay as they are.
 
 import type { OpcPackage } from '../../opc';
+import { ZipArchive } from '../../zip';
 import { childElements, localName, parseXml, type XmlElement } from '../../xml';
 
 /** The room (as its relay names it: a new name every time the room is started) and the step of its order a file holds. */
@@ -35,6 +36,11 @@ function parseStamp(text: string): CollabStamp | undefined {
 }
 
 const ours = (root: XmlElement): XmlElement[] => childElements(root, 'property').filter((property) => property.attrs.get('name') === NAME);
+
+/** The part of custom properties with the stamp alone. */
+function fresh(text: string): Uint8Array {
+  return new TextEncoder().encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="${NS}" xmlns:vt="${NS_VT}"><property fmtid="${FMTID}" pid="2" name="${NAME}"><vt:lpwstr>${text}</vt:lpwstr></property></Properties>`);
+}
 
 /** The stamp a file carries; undefined when it has none, or one that is not as this module writes it. */
 export async function readCollabStamp(pkg: OpcPackage): Promise<CollabStamp | undefined> {
@@ -83,6 +89,12 @@ export async function writeCollabStamp(pkg: OpcPackage, stamp: CollabStamp | und
       if (had.length === 0) return true;
       root.children = root.children.filter((node) => had.indexOf(node as XmlElement) < 0);
       pkg.writePart(part, doc);
+      return true;
+    }
+    // A part that holds the stamp and nothing else is written as it is when it is made: the same workbook at the
+    // same step is the same file, whoever writes it and however often it was stamped before.
+    if (had.length === 1 && root.children.filter((node) => node.type === 'element').length === 1 && root.name === 'Properties' && root.attrs.get('xmlns') === NS) {
+      pkg.writePart(part, fresh(text));
       return true;
     }
     if (had.length === 1) {
@@ -141,8 +153,7 @@ export async function writeCollabStamp(pkg: OpcPackage, stamp: CollabStamp | und
     ]),
     children: [],
   });
-  const encoder = new TextEncoder();
-  pkg.writePart(DEFAULT_PART, encoder.encode(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Properties xmlns="${NS}" xmlns:vt="${NS_VT}"><property fmtid="${FMTID}" pid="2" name="${NAME}"><vt:lpwstr>${text}</vt:lpwstr></property></Properties>`), CONTENT_TYPE);
+  pkg.writePart(DEFAULT_PART, fresh(text), CONTENT_TYPE);
   pkg.writePart(relsPart, rels);
   return true;
 }
@@ -195,4 +206,55 @@ export async function writeSharedFile(session: StampingSession, pkg: OpcPackage 
     if (touched && stamp !== undefined) continue;
     return { bytes, rev: touched ? undefined : rev };
   }
+}
+
+/** Most bytes, unpacked, of two packages that are compared part by part. */
+const MAX_COMPARED_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Whether two packages are the same file whatever they were packed with: the same parts by name, each with
+ * the same content. (The order of the parts, how each was compressed and what the archive says beside them do
+ * not count: two browsers write the same workbook as different bytes.) False for what is no archive.
+ */
+export async function samePackage(a: Uint8Array, b: Uint8Array): Promise<boolean> {
+  try {
+    const first = ZipArchive.read(a);
+    const second = ZipArchive.read(b);
+    const names = first.names().slice().sort();
+    const others = second.names().slice().sort();
+    if (names.length !== others.length) return false;
+    for (let i = 0; i < names.length; i++) if (names[i] !== others[i]) return false;
+    let total = 0;
+    for (const name of names) {
+      const x = await first.read(name);
+      const y = await second.read(name);
+      total += x.length + y.length;
+      if (total > MAX_COMPARED_BYTES || x.length !== y.length) return false;
+      for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remembers what the package says of a room, and answers what puts it back: for a file that is
+ * written only to be looked at (the proof that a save of someone else holds this workbook), which is
+ * to leave the package as a save of the user left it.
+ */
+export async function keepStamp(pkg: OpcPackage): Promise<() => void> {
+  const kept: [string, Uint8Array | undefined][] = [];
+  try {
+    const part = (await partOf(pkg)) || DEFAULT_PART;
+    for (const name of [part, '/_rels/.rels']) kept.push([name, pkg.hasPart(name) ? await pkg.readPart(name) : undefined]);
+  } catch {
+    return () => undefined;
+  }
+  return () => {
+    for (const [name, bytes] of kept) {
+      if (bytes) pkg.writePart(name, bytes);
+      else if (pkg.hasPart(name)) pkg.deletePart(name);
+    }
+  };
 }

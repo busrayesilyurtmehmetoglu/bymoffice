@@ -7,6 +7,7 @@ import { broadcastTransport, socketTransport } from './transport';
 
 export { contentVersion, parseClientMessage, parseServerMessage, type ClientMessage, type CollabUser, type ServerMessage } from './protocol';
 export { MemoryServer, type MemoryServerOptions, type MemoryTransport } from './server';
+export { MAX_PEOPLE, listPeople, type CollabPerson, type People } from './people';
 export { CollabSession, PEER_COLORS, type CollabNotice, type CollabNoticeCode, type CollabPeer, type CollabPresence, type CollabState, type CollabTransport, type SessionChange, type SessionHost, type SessionOptions } from './session';
 export { broadcastTransport, isSocketUrl, socketTransport, type BroadcastTransportOptions, type PausableTransport, type SocketTransportOptions } from './transport';
 export { CollabUnsupportedError, WireError, type WireOp } from './types';

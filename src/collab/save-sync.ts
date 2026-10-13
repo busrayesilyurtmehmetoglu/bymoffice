@@ -33,7 +33,9 @@ export interface SaveSyncHost {
   controller: SyncController;
   session(): SyncSession | undefined;
   /** Where the file is saved to with a request; undefined for a function of the application (which checks for itself). */
-  target: { url: string; credentials: RequestCredentials } | undefined;
+  target: { url: string; credentials: RequestCredentials; headers?: [string, string][] } | undefined;
+  /** How many are in the room, this participant too: the more, the wider apart they stand in for a saver who does not save. */
+  people?(): number;
   /** An ETag that `If-Match` can be sent with, or undefined. */
   strong(etag: string | null | undefined): string | undefined;
   readOnly(): boolean;
@@ -50,12 +52,21 @@ export interface SaveSyncHost {
    * With it a save of someone else can be PROVEN to hold this side's own work: the same step gives the same bytes.
    */
   ownBytes?(): Promise<{ bytes: Uint8Array; rev: number | undefined }>;
+  /**
+   * Whether two files are the same file whatever they were packed with (two browsers do not compress alike):
+   * the same parts, each with the same content. Without it: the same bytes.
+   */
+  sameFile?(stored: Uint8Array, own: Uint8Array): Promise<boolean>;
 }
 
 /** A stored file larger than this is not fetched to prove anything: the work stays to be saved from here. */
 export const PROOF_MAX_BYTES = 32 * 1024 * 1024;
 /** How long after word of a save the stored file is looked at (word of another save meanwhile starts the wait over). */
 export const PROOF_DELAY_MS = 400;
+/** For how long what the server said of the name of the file is taken to hold when the same name is said again. */
+export const CONFIRMED_FOR_MS = 5000;
+/** How far apart, for each further participant, those who wait are spread. */
+export const WATCH_SLOT_MS = 3000;
 /** The least time this side's own work waits for a save of the room before this side saves it itself. */
 export const WATCH_MIN_MS = 15000;
 
@@ -87,13 +98,59 @@ export interface SaveSync {
   roomChanged(): void;
 }
 
+/** The body of an answer, read no further than `limit` bytes: undefined when it is longer (what is left of it is not fetched). */
+async function bodyOf(answer: Response, limit: number): Promise<Uint8Array | undefined> {
+  const stream = answer.body as (ReadableStream<Uint8Array> & { getReader?: unknown }) | null;
+  if (!stream || typeof stream.getReader !== 'function') {
+    const all = new Uint8Array(await answer.arrayBuffer());
+    return all.length > limit ? undefined : all;
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const part = await reader.read();
+    if (part.done) break;
+    length += part.value.length;
+    if (length > limit) {
+      void reader.cancel().catch(() => undefined);
+      return undefined;
+    }
+    chunks.push(part.value);
+  }
+  const out = new Uint8Array(length);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return out;
+}
+
+/** The headers of the page for its target, without those that are about a body or a condition. */
+function sent(target: { headers?: [string, string][] }): { [name: string]: string } {
+  const out: { [name: string]: string } = {};
+  for (const [name, value] of target.headers || []) if (!/^(content-|if-)/i.test(name)) out[name] = value;
+  return out;
+}
+
 export function createSaveSync(host: SaveSyncHost): SaveSync {
   const ask = host.fetch || (typeof fetch !== 'undefined' ? fetch : undefined);
 
+  /** What the server was last found to name the file by, and when: the same word again within a moment asks nothing. */
+  let confirmed: { tag: string; at: number } | undefined;
   const storedAs = async (tag: string): Promise<boolean> => {
+    if (confirmed && confirmed.tag === tag && nowMs() - confirmed.at < CONFIRMED_FOR_MS) return true;
+    const found = await asks(tag);
+    confirmed = found ? { tag, at: nowMs() } : undefined;
+    return found;
+  };
+  const nowMs = (): number => (host.now ? host.now() : Date.now());
+  const asks = async (tag: string): Promise<boolean> => {
     const target = host.target;
     if (!target || !ask || host.strong(tag) === undefined) return false;
-    const request = (method: string, headers?: { [name: string]: string }): Promise<Response> => ask(target.url, { method, cache: 'no-store', credentials: target.credentials, headers });
+    // With what the file is asked for when it is saved (a server that knows its users by a header knows them here too).
+    const request = (method: string, headers?: { [name: string]: string }): Promise<Response> => ask(target.url, { method, cache: 'no-store', credentials: target.credentials, headers: { ...sent(target), ...(headers || {}) } });
     try {
       let answer = await request('HEAD');
       if (answer.status === 405 || answer.status === 501) {
@@ -184,19 +241,23 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     const changes = controller.changes;
     try {
       // The file as it is stored, when it is the one that was named and not too large to look at.
-      const answer = await ask(target.url, { method: 'GET', cache: 'no-store', credentials: target.credentials });
+      const answer = await ask(target.url, { method: 'GET', cache: 'no-store', credentials: target.credentials, headers: sent(target) });
       const length = Number(answer.headers.get('Content-Length'));
       if (!answer.ok || host.strong(answer.headers.get('ETag')) !== mine.tag || (length === length && length > PROOF_MAX_BYTES)) {
         if (answer.body) void answer.body.cancel().catch(() => undefined);
         return;
       }
-      const stored = new Uint8Array(await answer.arrayBuffer());
-      if (stored.length > PROOF_MAX_BYTES || !holds() || controller.changes !== changes) return;
+      const stored = await bodyOf(answer, PROOF_MAX_BYTES);
+      if (!stored || !holds() || controller.changes !== changes) return;
       // The same workbook at the same step is written as the same bytes (the room and the step are among them).
       const own = await host.ownBytes();
       if (own.rev !== mine.rev || !holds() || controller.changes !== changes) return;
-      if (own.bytes.length !== stored.length) return;
-      for (let i = 0; i < stored.length; i++) if (own.bytes[i] !== stored[i]) return;
+      if (host.sameFile) {
+        if (!(await host.sameFile(stored, own.bytes)) || !holds() || controller.changes !== changes) return;
+      } else {
+        if (own.bytes.length !== stored.length) return;
+        for (let i = 0; i < stored.length; i++) if (own.bytes[i] !== stored[i]) return;
+      }
       controller.adopt(mine.tag, true);
       ownSaved();
     } catch {
@@ -225,7 +286,11 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     if (patience === undefined) {
       const auto = host.controller.autoSave;
       const base = host.watchMs !== undefined ? host.watchMs : Math.max(WATCH_MIN_MS, (auto ? auto.delayMs : 0) * 5);
-      patience = Math.round(base * (1 + 0.25 * (host.random ? host.random() : Math.random())));
+      // Wider apart the more there are: one save takes a moment, and the word of it clears the others before
+      // their turn comes. (A quarter of the wait at least, for two.)
+      const people = Math.max(2, host.people ? host.people() : 2);
+      const spread = Math.max(base * 0.25, (people - 1) * WATCH_SLOT_MS);
+      patience = Math.round(base + spread * (host.random ? host.random() : Math.random()));
     }
     return patience;
   };
@@ -239,7 +304,11 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
       standingIn = false;
       return;
     }
-    if (ownSince === undefined) ownSince = clock();
+    if (ownSince === undefined) {
+      ownSince = clock();
+      // Another draw for every wait.
+      patience = undefined;
+    }
     const left = ownSince + watchMs() - clock();
     if (left > 0) {
       watch = later(look2, left);
@@ -300,7 +369,19 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     });
   };
 
+  let wasOnline = false;
   const roomChanged = (): void => {
+    const session = host.session();
+    const online = session !== undefined && session.state === 'online';
+    // Back in the room: the wait starts over, for everybody at a moment of their own. (Who waited through the
+    // time the room could not be reached would otherwise all stand in at once.)
+    if (online && !wasOnline) {
+      ownSince = undefined;
+      standingIn = false;
+      if (watch) watch();
+      watch = undefined;
+    }
+    wasOnline = online;
     // Also when nothing is to be sent: why auto-save waits is another thing now.
     host.controller.rearm();
     if (host.controller.dirty) localChanged();

@@ -198,6 +198,8 @@ export interface UiStrings {
   saveFailed(detail: string): string;
   /** The server holds another file than the one that was opened (HTTP 412). */
   saveConflict: string;
+  /** A save nobody asked for met the saves of others in the room again and again. */
+  saveRoomBusy: string;
   /** The question a conflict leads to (see SaveToRequest.onConflict): its title, what it explains, and its two answers. */
   saveConflictTitle: string;
   saveConflictQuestion: string;
@@ -315,6 +317,12 @@ export interface UiStrings {
     state: { connecting: string; online: string; offline: string; detached: string; closed: string };
     /** The title of the list of participants: how many others are there. */
     others(n: number): string;
+    /** What the button of the participants says: how many are in the file, this one too. */
+    peopleCount(n: number): string;
+    morePeople(n: number): string;
+    you: string;
+    viewOnly: string;
+    onSheet(name: string): string;
     dropped(n: number): string;
     partial: string;
     undoGone: string;
@@ -335,6 +343,8 @@ export interface UiStrings {
     updating: string;
     typedKept(text: string): string;
     autoWaits: { room: string; offline: string };
+    /** The question when the stored file is another one than the workbook that was kept apart from its room was opened as. */
+    fork: { title: string; question: string; load: string; save: string; download: string; downloaded: string };
     noStamp: string;
     copySheet: string;
     tooLarge: string;
@@ -756,6 +766,7 @@ export const STRINGS_EN: UiStrings = {
   notConverted: (from) => `This ${from} file could not be converted to be edited; it is shown read-only`,
   saved: 'Saved',
   saveFailed: (detail) => (detail ? `The file could not be saved (${detail})` : 'The file could not be saved'),
+  saveRoomBusy: 'Not saved yet: several people are saving this file at once. Auto-save waits and tries again.',
   saveConflict: 'The file was not saved: the file on the server is not the one you opened (someone else changed it, or an earlier save of yours was written although its answer did not arrive)',
   saveConflictTitle: 'The file was changed on the server',
   saveConflictQuestion:
@@ -858,6 +869,11 @@ export const STRINGS_EN: UiStrings = {
     guest: (n) => `Guest ${n}`,
     state: { connecting: 'Connecting…', online: 'Editing together', offline: 'Offline: changes are sent when the connection is back', detached: 'Detached: your changes are here only. Save the file', closed: 'Not connected: changes stay here' },
     others: (n) => (n === 1 ? '1 other person is here' : `${n} other people are here`),
+    peopleCount: (n) => (n === 1 ? '1 person in this file' : `${n} people in this file`),
+    morePeople: (n) => `and ${n} more`,
+    you: '(you)',
+    viewOnly: 'viewing only',
+    onSheet: (name) => `on ${name}`,
     dropped: (n) => (n === 1 ? 'One of your changes could not be applied because someone else deleted or changed what it was about.' : `${n} of your changes could not be applied because someone else deleted or changed what they were about.`),
     partial: 'Part of one of your changes was not applied: someone else deleted the rows, columns or sheet it was in.',
     undoGone: 'This step cannot be undone any more: someone else changed or deleted what it was about.',
@@ -883,6 +899,14 @@ export const STRINGS_EN: UiStrings = {
     slow: 'A change has been on its way for a long time; the connection is made anew.',
     updating: 'The file was changed elsewhere and is loaded again; it cannot be edited until that is done.',
     noStamp: 'The custom properties of this file cannot be read: it is saved without the mark of the room, and whoever opens it joins when someone in the room has saved again.',
+    fork: {
+      title: 'The stored file is not the one you opened',
+      question: 'Your workbook is apart from the others, and the file was saved by someone else meanwhile. Load the stored file (your unsaved changes are lost; save a copy first if you need them), or save yours over it (what the others saved is lost).',
+      load: 'Load the stored file',
+      save: 'Save mine over it',
+      download: 'Download my copy',
+      downloaded: 'Your copy was downloaded.',
+    },
     autoWaits: { room: 'Not saved yet: another participant saves for all', offline: 'Not saved: auto-save waits for the connection. Save to store the file now' },
     typedKept: (text) => `The file is loaded again, and what you were typing was not applied. You typed: ${text}`,
     dialogClosed: 'Someone else changed the sheet or its rules: the dialog was closed without applying anything.',
@@ -1327,6 +1351,7 @@ export const STRINGS_TR: UiStrings = {
   notConverted: (from) => `Bu ${from} dosyası düzenlenebilecek biçime çevrilemedi; salt okunur gösteriliyor`,
   saved: 'Kaydedildi',
   saveFailed: (detail) => (detail ? `Dosya kaydedilemedi (${detail})` : 'Dosya kaydedilemedi'),
+  saveRoomBusy: 'Henüz kaydedilmedi: bu dosyayı aynı anda birkaç kişi kaydediyor. Kendiliğinden kaydetme bekleyip yeniden deneyecek.',
   saveConflict: 'Dosya kaydedilmedi: sunucudaki dosya sizin açtığınızdan farklı (başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir)',
   saveConflictTitle: 'Dosya sunucuda değişmiş',
   saveConflictQuestion:
@@ -1425,6 +1450,11 @@ export const STRINGS_TR: UiStrings = {
     guest: (n) => `Misafir ${n}`,
     state: { connecting: 'Bağlanıyor…', online: 'Birlikte düzenleniyor', offline: 'Çevrimdışı: değişiklikler bağlantı gelince gönderilir', detached: 'Kopuk: değişiklikleriniz yalnız burada. Dosyayı kaydedin', closed: 'Bağlı değil: değişiklikler burada kalır' },
     others: (n) => `${n} kişi daha burada`,
+    peopleCount: (n) => `Bu dosyada ${n} kişi`,
+    morePeople: (n) => `ve ${n} kişi daha`,
+    you: '(siz)',
+    viewOnly: 'yalnız görüntülüyor',
+    onSheet: (name) => `${name} sayfasında`,
     dropped: (n) => (n === 1 ? 'Bir değişikliğiniz, ilgili yeri başkası sildiği ya da değiştirdiği için uygulanamadı.' : `${n} değişikliğiniz, ilgili yeri başkası sildiği ya da değiştirdiği için uygulanamadı.`),
     partial: 'Bir değişikliğinizin bir bölümü uygulanmadı: içinde olduğu satırları, sütunları ya da sayfayı başkası sildi.',
     undoGone: 'Bu adım artık geri alınamaz: ilgili yeri başkası değiştirdi ya da sildi.',
@@ -1450,6 +1480,14 @@ export const STRINGS_TR: UiStrings = {
     slow: 'Bir değişiklik uzun süredir yolda; bağlantı yeniden kuruluyor.',
     updating: 'Dosya başka yerde değişti ve yeniden yükleniyor; bitene dek düzenlenemez.',
     noStamp: 'Bu dosyanın özel özellikleri okunamıyor: dosya oda damgası olmadan kaydedildi; açan kişi odadaki biri yeniden kaydedince katılır.',
+    fork: {
+      title: 'Saklanan dosya sizin açtığınız değil',
+      question: 'Kitabınız öbürlerinden ayrı düştü ve dosyayı bu arada başkası kaydetti. Saklanan dosyayı yükleyin (kaydedilmemiş değişiklikleriniz gider; gerekiyorsa önce kopyanızı indirin) ya da kendinizinkini üzerine kaydedin (öbürlerinin kaydettiği gider).',
+      load: 'Saklanan dosyayı yükle',
+      save: 'Benimkini üzerine kaydet',
+      download: 'Kopyamı indir',
+      downloaded: 'Kopyanız indirildi.',
+    },
     autoWaits: { room: 'Henüz kaydedilmedi: herkes için başka bir katılımcı kaydediyor', offline: 'Kaydedilmedi: kendiliğinden kaydetme bağlantıyı bekliyor. Şimdi saklamak için Kaydet' },
     typedKept: (text) => `Dosya yeniden yükleniyor; yazmakta olduğunuz uygulanmadı. Yazdığınız: ${text}`,
     dialogClosed: 'Başkası sayfayı ya da kurallarını değiştirdi: kutu hiçbir şey uygulanmadan kapatıldı.',

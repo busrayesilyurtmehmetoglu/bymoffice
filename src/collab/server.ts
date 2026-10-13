@@ -7,6 +7,7 @@
 // answered with "nack" to its author alone. Whoever joins gets the log from where its file
 // (or its last step) is. Selections and "saved" are passed on and not kept in the log.
 
+import { TAB_ALIVE_MS } from './transport';
 import { MAX_MESSAGE_CHARS, MAX_PRESENCE_BYTES, parseClientMessage, utf8Length, type CollabUser, type ServerMessage } from './protocol';
 import type { CollabTransport } from './session';
 
@@ -37,6 +38,8 @@ interface Entry {
 }
 
 interface Connection {
+  /** When it sent its last joins. */
+  joins?: number[];
   id: string;
   push(text: string): void;
   room: Room | undefined;
@@ -103,6 +106,9 @@ function forget(gone: Set<string>, version: string): void {
   }
   gone.add(version);
 }
+
+/** Most joins of one connection in a minute. */
+export const MAX_JOINS_PER_MINUTE = 10;
 
 let epochs = 0;
 /** A name for a room that is started: no two rooms of a page, or of two pages, are likely to share one. */
@@ -176,6 +182,15 @@ export class MemoryServer {
       return;
     }
     if (message.t === 'join') {
+      // Only so many joins a minute from one connection: leaving and joining over and over tells everybody of it every time.
+      const at = this.options.now ? this.options.now() : Date.now();
+      connection.joins = (connection.joins || []).filter((time) => at - time < 60000);
+      if (connection.joins.length >= MAX_JOINS_PER_MINUTE) {
+        this.say(connection, { t: 'error', code: 'join-rate' });
+        this.drop(connection);
+        return;
+      }
+      connection.joins.push(at);
       const key = message.room !== undefined ? `#${message.room}` : '';
       // One room per connection: who is in a room stays there, and who was told to load its file again joins that room.
       if (connection.room || (connection.refused !== undefined && connection.refused !== key)) {
@@ -269,7 +284,7 @@ export class MemoryServer {
       });
       room.members.add(connection);
       connection.room = room;
-      this.say(connection, { t: 'hello', rev: room.rev, from, ep: room.ep, you: connection.id, ro: connection.ro, pv, v: Array.from(new Set(named)), peers });
+      this.say(connection, { t: 'hello', rev: room.rev, from, ep: room.ep, user: connection.user, you: connection.id, ro: connection.ro, pv, v: Array.from(new Set(named)), peers });
       for (const entry of room.log) if (entry.rev > from) this.say(connection, { t: 'op', rev: entry.rev, id: entry.id, from: entry.from, ops: entry.ops });
       return;
     }
@@ -395,15 +410,37 @@ export class MemoryServer {
   serve(name: string, channel?: ChannelLike): () => void {
     const port = channel || (new BroadcastChannel(channelName(name)) as unknown as ChannelLike);
     const connections = new Map<string, Connection>();
+    /** When each tab was last heard of: one that was closed without a word is let go of, so that nobody stays listed who is gone. */
+    const heard = new Map<string, number>();
+    const clock = (): number => (this.options.now ? this.options.now() : Date.now());
+    const sweep = setInterval(() => {
+      const now = clock();
+      connections.forEach((connection, from) => {
+        if (now - (heard.get(from) || 0) <= TAB_ALIVE_MS * 3.5) return;
+        this.drop(connection);
+        connections.delete(from);
+        heard.delete(from);
+        port.postMessage({ to: from, kind: 'bye' });
+      });
+    }, TAB_ALIVE_MS);
+    const timer = sweep as unknown as { unref?(): void };
+    if (typeof timer.unref === 'function') timer.unref();
     port.onmessage = (event) => {
       const data = event.data as { to?: unknown; from?: unknown; kind?: unknown; text?: unknown } | null;
       if (!data || data.to !== 'relay' || typeof data.from !== 'string' || data.from.length > 64) return;
       const from = data.from;
       let connection = connections.get(from);
+      if (connection) heard.set(from, clock());
+      if (data.kind === 'alive') {
+        // A tab the relay let go of (it slept too long) is told, and opens anew.
+        if (!connection || connection.gone) port.postMessage({ to: from, kind: 'bye' });
+        return;
+      }
       if (data.kind === 'open') {
         if (connection) this.drop(connection);
         connection = this.accept((text) => port.postMessage({ to: from, kind: 'msg', text }));
         connections.set(from, connection);
+        heard.set(from, clock());
         port.postMessage({ to: from, kind: 'accept' });
       } else if (data.kind === 'close') {
         if (connection) this.drop(connection);
@@ -415,6 +452,7 @@ export class MemoryServer {
       }
     };
     const stop = (): void => {
+      clearInterval(sweep);
       connections.forEach((connection, from) => {
         this.drop(connection);
         port.postMessage({ to: from, kind: 'bye' });

@@ -680,7 +680,8 @@ test('messages that are not what the contract says are bad messages', async () =
 test('an operation on the current revision goes to everyone, its sender too, and a stale one is refused', async () => {
   await withServer({}, async (port, server) => {
     const a = await joined(port, { v: ['v1'], user: { name: 'Ada', color: '#c00' } });
-    assert.deepEqual(a.hello, { t: 'hello', pv: 1, ep: a.hello.ep, rev: 0, from: 0, you: a.hello.you, ro: false, v: ['v1'], peers: [] });
+    assert.deepEqual(a.hello, { t: 'hello', pv: 1, ep: a.hello.ep, rev: 0, from: 0, you: a.hello.you, user: a.hello.user, ro: false, v: ['v1'], peers: [] });
+    assert.equal(typeof a.hello.user, 'object', 'hello tells the participant who it is to the room');
     assert.equal(typeof a.hello.you, 'string');
     assert.match(a.hello.ep, EPOCH, 'hello tells the name of the room');
     const b = await joined(port, { v: ['v1'] });
@@ -1446,6 +1447,60 @@ test('a connection that leaves its room may join that room again over the same c
     b.c.send({ t: 'leave' });
     b.c.send({ t: 'join', v: ['v1'], room: 'other' });
     await b.c.closes(1008, 'bad-message');
+  });
+});
+
+test('who a participant is, is what `authorize` says: its name stands in place of what the client says of itself', async () => {
+  await withServer(
+    {
+      authorize: ({ token }) => (token === 'known' ? { user: { name: 'Named by the application', color: '#112233' } } : token === 'reader' ? { readOnly: true, user: { name: 'A reader' } } : true),
+    },
+    async (port) => {
+      const first = await joined(port, { v: ['v0'], token: 'anyone', user: { name: 'What I say I am', color: '#ABCDEF' } });
+      assert.deepEqual(first.hello.user, { name: 'What I say I am', color: '#ABCDEF' }, 'without a word of the application a participant is who it says it is, and is told so');
+      const known = await joined(port, { v: ['v0'], token: 'known', user: { name: 'Somebody else entirely', color: '#FFFFFF' } });
+      assert.deepEqual(known.hello.user, { name: 'Named by the application', color: '#112233' }, 'the name and the colour of the application, told to the participant itself');
+      assert.deepEqual((await first.c.json()).user, { name: 'Named by the application', color: '#112233' }, 'and to the room');
+      assert.deepEqual(known.hello.peers.map((peer) => peer.user), [{ name: 'What I say I am', color: '#ABCDEF' }], 'the others as the room has them');
+      const reader = await joined(port, { v: ['v0'], token: 'reader', user: { name: 'An editor, honest', color: '#00FF00' } });
+      assert.deepEqual([reader.hello.user, reader.hello.ro], [{ name: 'A reader', color: '#00FF00' }, true], 'a name alone leaves the colour the client gave');
+    },
+  );
+});
+
+test('a connection joins only so many times a minute: one that leaves and joins over and over is closed', async () => {
+  let time = 1000;
+  await withServer({ now: () => time }, async (port) => {
+    const a = await joined(port, { v: ['v1'] });
+    const b = await joined(port, { v: ['v1'], ro: true });
+    assert.equal((await a.c.json()).t, 'peer');
+    // Nine more times it leaves and joins (ten joins in all): each is told to the room.
+    for (let i = 0; i < 9; i++) {
+      b.c.send({ t: 'leave' });
+      assert.equal((await a.c.json()).t, 'left', `leave ${i + 1} is told`);
+      b.c.send({ t: 'join', v: ['v1'], ro: true });
+      assert.equal((await b.c.json()).t, 'hello', `join ${i + 2} of the minute gets in`);
+      assert.equal((await a.c.json()).t, 'peer');
+    }
+    b.c.send({ t: 'leave' });
+    assert.equal((await a.c.json()).t, 'left');
+    b.c.send({ t: 'join', v: ['v1'], ro: true });
+    await b.c.closes(1008, 'join-rate');
+    // The limit is of the connection, and of the minute.
+    const c = await joined(port, { v: ['v1'], ro: true });
+    assert.equal(c.hello.t, 'hello', 'another connection joins');
+    time += 61000;
+    c.c.send({ t: 'leave' });
+    c.c.send({ t: 'join', v: ['v1'], ro: true });
+    assert.equal((await c.c.json()).t, 'hello', 'and a minute later a connection joins again');
+  });
+  await withServer({ joinsPerMinute: 0 }, async (port) => {
+    const b = await joined(port, { v: ['v1'] });
+    for (let i = 0; i < 15; i++) {
+      b.c.send({ t: 'leave' });
+      b.c.send({ t: 'join', v: ['v1'] });
+      assert.equal((await b.c.json()).t, 'hello', `0 is no limit: join ${i + 2}`);
+    }
   });
 });
 

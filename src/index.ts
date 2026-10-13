@@ -31,8 +31,9 @@ import type { PdfExportOptions } from './pdf/export';
 import type { SheetPdfExportOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
 import { askOverwrite } from './ui/save-confirm';
+import { listPeople, type CollabPerson, type People } from './collab/people';
 import { createSaveSync, type SaveSync } from './collab/save-sync';
-import { readCollabStamp, writeSharedFile } from './formats/xlsx/collab-stamp';
+import { keepStamp, readCollabStamp, samePackage, writeSharedFile } from './formats/xlsx/collab-stamp';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
 import {
   SaveController,
@@ -301,6 +302,7 @@ export {
   socketTransport,
   type CollabNotice,
   type CollabPeer,
+  type CollabPerson,
   type CollabPresence,
   type CollabState,
   type CollabTransport,
@@ -324,6 +326,8 @@ export interface CollabOptions {
   token?: string;
   onState?(state: CollabState): void;
   onPeers?(peers: CollabPeer[]): void;
+  /** Who is in the file changed (someone came, left, was renamed, went to another sheet, can only read now): the list, this participant first. */
+  onPeople?(people: CollabPerson[]): void;
   /**
    * With `autoSave`: how long, in milliseconds, changes wait here for the one participant who saves for all,
    * before this side saves them itself. At least 1000; by default five delays of auto-save and at least 15 seconds
@@ -344,6 +348,14 @@ export interface MountedCollab {
   readonly user: CollabPeer;
   onState?: (state: CollabState) => void;
   onPeers?: (peers: CollabPeer[]) => void;
+  /**
+   * Everybody in the file, this participant first (`self`), then the others in the order the relay named them:
+   * `{ id, name, color, self, readOnly, sheet? }`. `name` is what the participant said (or the relay gave it), or
+   * "Guest N" in the language of the view: what someone says of itself, no proof of who it is. Out of the room
+   * (offline, detached, closed) the list is this participant alone. At most 200 are listed.
+   */
+  readonly people: CollabPerson[];
+  onPeople?: (people: CollabPerson[]) => void;
   /**
    * For an application that saves by itself (with save(), without `saveTo`): tells the others that
    * the bytes save() last answered with were saved, and under which ETag when the server names one.
@@ -387,6 +399,27 @@ function resolveCollab(value: unknown): CollabPlan | undefined {
 }
 
 /** What a file is known by among those who edit it together: the ETag its address named, and its bytes. */
+/** Hands the user a file to keep: a link that is pressed for them. False where a page cannot do that. */
+function downloadFile(doc: Document, bytes: Uint8Array, name: string): boolean {
+  const win = doc.defaultView;
+  const urls = win ? win.URL : undefined;
+  if (!win || !urls || typeof urls.createObjectURL !== 'function' || typeof Blob === 'undefined') return false;
+  const url = urls.createObjectURL(new Blob([bytes as unknown as BlobPart], { type: 'application/octet-stream' }));
+  const link = doc.createElement('a');
+  link.href = url;
+  // The name is the application's or the file's: a name of a file, never a path.
+  link.download = name.replace(/[\\/:*?"<>|\u0000-\u001F]+/g, '_').slice(0, 200) || 'workbook.xlsx';
+  link.style.display = 'none';
+  doc.body.appendChild(link);
+  try {
+    link.click();
+  } finally {
+    doc.body.removeChild(link);
+    win.setTimeout(() => urls.revokeObjectURL(url), 60000);
+  }
+  return true;
+}
+
 function fileVersions(etag: string | null | undefined, bytes: Uint8Array): string[] {
   const versions: string[] = [];
   if (typeof etag === 'string' && etag !== '' && etag.length <= 190) versions.push(`e:${etag}`);
@@ -1391,9 +1424,49 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
             ? (question) => {
                 // A view that is only read is not asked to overwrite anything: the conflict was told, and that is all.
                 if (readOnlyNow() || !editorRoot) return question.answer(false);
+                const words = resolveUiStrings(options.locale);
+                // A workbook that was kept apart from its room meets a file someone else saved: a fork, and three ways out of it.
+                const apart = session;
+                if (apart && apart.state === 'detached' && typeof options.file === 'string') {
+                  const fork = words.collab.fork;
+                  return askOverwrite({
+                    root: editorRoot(),
+                    kind: 'collab-fork',
+                    strings: { saveConflictTitle: fork.title, saveConflictQuestion: fork.question, saveOverwrite: fork.save, saveCancel: words.saveCancel },
+                    detail: question.detail,
+                    answer: question.answer,
+                    focusView: () => focusView(),
+                    also: [
+                      {
+                        name: 'download',
+                        label: fork.download,
+                        stays: true,
+                        // The workbook as it is here, as a file of the user's: nothing is lost by what is chosen next.
+                        run: () => {
+                          void saveAsIs().then(
+                            (bytes) => {
+                              if (downloadFile(document, bytes, options.fileName !== undefined ? options.fileName : fileName || 'workbook.xlsx')) notice(fork.downloaded, 'info');
+                            },
+                            () => undefined,
+                          );
+                        },
+                      },
+                      {
+                        name: 'load',
+                        label: fork.load,
+                        destructive: true,
+                        run: () => {
+                          // The save is given up, and the workbook with it: the stored file is loaded, and the room joined with it.
+                          question.answer(false);
+                          apart.reload();
+                        },
+                      },
+                    ],
+                  });
+                }
                 return askOverwrite({
                   root: editorRoot(),
-                  strings: resolveUiStrings(options.locale),
+                  strings: words,
                   detail: question.detail,
                   answer: question.answer,
                   focusView: () => focusView(),
@@ -1676,8 +1749,19 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     view.showNotice(resolveUiStrings(options.locale).collab.unsupported, 'error');
   } else if (collabPlan && readBytes) {
     const plan = collabPlan;
+    let peopleTold = '';
+    const peopleNow = (): People => (session ? listPeople(session.user, session.peers, session.state, resolveUiStrings(options.locale).collab.guest) : { list: [], more: 0, count: 0 });
     const show = (): void => {
-      if (session) mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending, autoWaits: controller ? controller.state.autoWaits : undefined });
+      if (!session) return;
+      const people = peopleNow();
+      mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending, autoWaits: controller ? controller.state.autoWaits : undefined, people });
+      // Whoever listens hears of the list when it is another one.
+      const key = JSON.stringify(people.list);
+      if (key === peopleTold) return;
+      peopleTold = key;
+      if (plan.options.onPeople) plan.options.onPeople(people.list);
+      const out = mounted.collab;
+      if (out && out.onPeople) out.onPeople(people.list);
     };
     showRoom = show;
     /** The file is loaded again from its address and shown in place (the room is at a version this side does not have). */
@@ -1747,6 +1831,9 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       get peers() {
         return session ? session.peers : [];
       },
+      get people() {
+        return peopleNow().list;
+      },
       get user() {
         return (session as CollabSession).user;
       },
@@ -1762,12 +1849,24 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       ? createSaveSync({
           controller,
           session: () => session,
-          target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials } : undefined,
+          target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials, headers: saveTarget.headers } : undefined,
+          people: () => (session ? session.peers.length + 1 : 1),
           strong: strongETag,
           readOnly: () => mounted.view.readOnly,
           // What this workbook would be written as now: with it a save of someone else is proven to hold the work done here.
           watchMs: typeof plan.options.saveWatchMs === 'number' && plan.options.saveWatchMs >= 1000 ? plan.options.saveWatchMs : undefined,
-          ownBytes: async () => (session ? writeSharedFile(session, file.package, () => file.save()) : { bytes: new Uint8Array(0), rev: undefined }),
+          ownBytes: async () => {
+            if (!session) return { bytes: new Uint8Array(0), rev: undefined };
+            // A file that is written to be looked at leaves the package as it was: what it says of the room is put back.
+            const restore = file.package ? await keepStamp(file.package) : () => undefined;
+            try {
+              return await writeSharedFile(session, file.package, () => file.save());
+            } finally {
+              restore();
+            }
+          },
+          // Part by part, unpacked: two browsers do not compress alike.
+          sameFile: samePackage,
         })
       : undefined;
     session = new CollabSession(

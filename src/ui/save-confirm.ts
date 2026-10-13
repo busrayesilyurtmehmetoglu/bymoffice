@@ -39,6 +39,14 @@ export interface OverwritePromptOptions {
   focusView?(): void;
   /** Calls back after `ms` and returns what calls that off. Default: the window's timer. */
   timer?(callback: () => void, ms: number): () => void;
+  /** What the question is about, for whoever looks for it in the page (`data-bym-confirm`). Default "save-conflict". */
+  kind?: string;
+  /**
+   * More answers, before "overwrite": each a button. One that is `destructive` answers no sooner than
+   * "overwrite" does, and not to a key that is held down. One that `stays` leaves the question open
+   * (saving a copy first); any other closes it, without `answer` being called: `run` is the answer.
+   */
+  also?: { name: string; label: string; destructive?: boolean; stays?: boolean; run(): void }[];
 }
 
 /**
@@ -104,7 +112,7 @@ export function askOverwrite(options: OverwritePromptOptions): () => void {
   const panel = document.createElement('div');
   panel.className = 'bym-confirm';
   panel.setAttribute('role', 'alertdialog');
-  panel.setAttribute('data-bym-confirm', 'save-conflict');
+  panel.setAttribute('data-bym-confirm', options.kind || 'save-conflict');
   panel.style.cssText =
     'display:flex;flex-direction:column;box-sizing:border-box;width:360px;max-width:100%;max-height:100%;min-width:0;min-height:0;overflow:hidden;' +
     'background:#fff;border:1px solid #dadce0;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.28)';
@@ -175,6 +183,38 @@ export function askOverwrite(options: OverwritePromptOptions): () => void {
     actions.appendChild(element);
     return element;
   };
+  /** The answers that change something for good: they answer only once the question has been there a moment. */
+  const guarded: HTMLButtonElement[] = [];
+  for (const more of options.also || []) {
+    const element = document.createElement('button');
+    element.type = 'button';
+    element.className = `bym-confirm-button bym-confirm-${more.name}`;
+    element.setAttribute('data-bym-action', more.name);
+    element.style.cssText =
+      '-webkit-appearance:none;appearance:none;display:block;flex:none;box-sizing:border-box;float:none;width:auto;' +
+      `height:${coarse ? 40 : 32}px;min-width:72px;min-height:0;max-width:100%;max-height:none;margin:8px 0 0 8px;padding:0 14px;` +
+      'border:1px solid #dadce0;border-radius:6px;font:inherit;line-height:1.2;letter-spacing:normal;text-transform:none;text-indent:0;text-shadow:none;' +
+      'text-decoration:none;opacity:1;white-space:nowrap;cursor:pointer;touch-action:manipulation;' +
+      (more.destructive ? 'background:#b3261e;border-color:#b3261e;color:#fff' : 'background:#fff;color:#202124');
+    element.textContent = more.label;
+    element.addEventListener('click', (event) => {
+      if (closed) return;
+      if (more.destructive && (!armed || (held && event.detail === 0))) return;
+      if (more.stays) return more.run();
+      try {
+        more.run();
+      } finally {
+        close();
+      }
+    });
+    if (more.destructive) {
+      element.setAttribute('aria-disabled', 'true');
+      element.style.opacity = '.55';
+      element.style.cursor = 'default';
+      guarded.push(element);
+    }
+    actions.appendChild(element);
+  }
   // In reading order the answer that changes nothing comes last, and has the focus.
   const overwriteButton = button(strings.saveOverwrite, 'overwrite', true);
   const cancelButton = button(strings.saveCancel, 'cancel', false);
@@ -220,7 +260,9 @@ export function askOverwrite(options: OverwritePromptOptions): () => void {
   const onMouseDown = (event: MouseEvent): void => {
     const target = event.target as Node | null;
     event.preventDefault();
-    const pressed = target && overwriteButton.contains(target) ? overwriteButton : target && cancelButton.contains(target) ? cancelButton : undefined;
+    let pressed: HTMLElement | undefined;
+    const answers = actions.children;
+    for (let i = 0; i < answers.length; i++) if (target && answers[i].contains(target)) pressed = answers[i] as HTMLElement;
     if (pressed) return pressed.focus({ preventScroll: true });
     const active = (backdrop.getRootNode() as Document | ShadowRoot).activeElement;
     if (!active || !backdrop.contains(active)) cancelButton.focus({ preventScroll: true });
@@ -266,6 +308,11 @@ export function askOverwrite(options: OverwritePromptOptions): () => void {
     overwriteButton.removeAttribute('aria-disabled');
     overwriteButton.style.opacity = '1';
     overwriteButton.style.cursor = 'pointer';
+    for (const element of guarded) {
+      element.removeAttribute('aria-disabled');
+      element.style.opacity = '1';
+      element.style.cursor = 'pointer';
+    }
   }, OVERWRITE_ARM_MS);
 
   function close(): void {

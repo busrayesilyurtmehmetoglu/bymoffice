@@ -5,7 +5,9 @@
 // Nothing in this module touches the DOM at import time, so it can be
 // imported where there is no document.
 
+import type { People } from '../collab/people';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
+import { PeopleButton } from './collab-people';
 import type { CellRange, Sheet, Workbook } from '../model/sheet/types';
 import type { GridSelection } from '../render/grid';
 import { getEditorStrings, type EditorStrings } from './editor-strings';
@@ -295,14 +297,17 @@ export class SpreadsheetEditor {
 
   /** The row that says whether the workbook is edited together and who else is there; made when it is first needed. */
   private collabBar: HTMLDivElement | undefined;
+  private peopleButton: PeopleButton | undefined;
 
   /**
    * Shows the state of editing together and the other participants above the grid; undefined
    * takes the row away. Names are shown as text.
    */
-  setCollab(info: { state: CollabState; peers: readonly CollabPeer[]; pending: number; autoWaits?: 'room' | 'offline' } | undefined): void {
+  setCollab(info: { state: CollabState; peers: readonly CollabPeer[]; pending: number; autoWaits?: 'room' | 'offline'; people?: People } | undefined): void {
     if (this.destroyed) return;
     if (!info) {
+      if (this.peopleButton) this.peopleButton.destroy();
+      this.peopleButton = undefined;
       if (this.collabBar && this.collabBar.parentNode) this.collabBar.parentNode.removeChild(this.collabBar);
       this.collabBar = undefined;
       return;
@@ -317,42 +322,57 @@ export class SpreadsheetEditor {
       this.root.insertBefore(bar, this.gridHost);
       this.collabBar = bar;
     }
-    while (bar.firstChild) bar.removeChild(bar.firstChild);
+    let button = this.peopleButton;
+    if (!button) {
+      button = new PeopleButton(this.root, words);
+      this.peopleButton = button;
+      bar.appendChild(button.element);
+    }
+    // Everything but the button is made anew (the button stays where it is: it may have the focus, and its list may be open).
+    for (const child of Array.from(bar.childNodes)) if (child !== button.element) bar.removeChild(child);
     bar.setAttribute('data-state', info.state);
     bar.setAttribute('data-peers', String(info.peers.length));
     const dot = document.createElement('span');
     dot.setAttribute('aria-hidden', 'true');
-    dot.style.cssText = `display:inline-block;width:8px;height:8px;border-radius:50%;background:${info.state === 'online' ? '#188038' : info.state === 'connecting' ? '#E37400' : '#D93025'}`;
+    dot.style.cssText = `display:inline-block;flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:${info.state === 'online' ? '#188038' : info.state === 'connecting' ? '#E37400' : '#D93025'}`;
     const label = document.createElement('span');
     label.className = 'bym-collab-state';
+    label.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis';
     label.textContent = words.state[info.state];
-    bar.appendChild(dot);
-    bar.appendChild(label);
+    bar.insertBefore(dot, button.element);
+    bar.insertBefore(label, button.element);
     // Auto-save that holds still on purpose says so, and why.
     if (info.autoWaits) {
       bar.setAttribute('data-auto-waits', info.autoWaits);
       const waits = document.createElement('span');
       waits.className = 'bym-collab-auto';
+      waits.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis';
       waits.textContent = words.autoWaits[info.autoWaits];
-      bar.appendChild(waits);
+      bar.insertBefore(waits, button.element);
     } else bar.removeAttribute('data-auto-waits');
-    const shown = info.peers.slice(0, 8);
-    for (const peer of shown) {
-      const name = peer.name !== undefined ? peer.name : words.guest(peer.guest);
-      const badge = document.createElement('span');
-      badge.className = 'bym-collab-peer';
-      badge.setAttribute('data-peer', peer.id);
-      badge.title = name;
-      badge.textContent = name;
-      badge.style.cssText = `display:inline-block;max-width:120px;overflow:hidden;text-overflow:ellipsis;padding:1px 7px;border-radius:9px;color:#fff;background:${/^#[0-9A-Fa-f]{6}$/.test(peer.color) ? peer.color : '#5F6368'}`;
-      bar.appendChild(badge);
-    }
-    if (info.peers.length > shown.length) {
+    // Who is in the file: how many (this participant too), always; the first of the others by their letters, where there is room.
+    const people: People = info.people || { list: [], more: 0, count: 1 + info.peers.length };
+    const view = this.view;
+    button.update(people, words, (index) => {
+      const sheet = view.workbook.sheets[index];
+      return sheet ? sheet.name : undefined;
+    });
+    bar.setAttribute('data-people', String(people.count));
+    const narrow = this.root.clientWidth > 0 && this.root.clientWidth < 480;
+    if (narrow) bar.setAttribute('data-narrow', 'true');
+    else bar.removeAttribute('data-narrow');
+    const others = people.list.filter((who) => !who.self);
+    const shown = narrow ? [] : others.slice(0, 3);
+    for (const who of shown) bar.appendChild(PeopleButton.avatar(who.name, who.color, who.id));
+    const rest = people.count - 1 - shown.length;
+    if (!narrow && rest > 0) {
       const more = document.createElement('span');
-      more.textContent = `+${info.peers.length - shown.length}`;
+      more.className = 'bym-collab-more';
+      more.setAttribute('aria-hidden', 'true');
+      more.textContent = `+${rest}`;
       bar.appendChild(more);
     }
-    bar.setAttribute('aria-label', info.peers.length > 0 ? `${words.state[info.state]}. ${words.others(info.peers.length)}` : words.state[info.state]);
+    bar.setAttribute('aria-label', `${words.state[info.state]}. ${words.peopleCount(people.count)}`);
   }
 
   /** Prints the workbook: see WorkbookView.print(). */
@@ -404,6 +424,8 @@ export class SpreadsheetEditor {
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     window.removeEventListener('resize', this.onResize);
+    if (this.peopleButton) this.peopleButton.destroy();
+    this.peopleButton = undefined;
     this.root.removeEventListener('keydown', this.onKeyDown);
     if (this.unwatchSave) this.unwatchSave();
     this.unwatchSave = undefined;
