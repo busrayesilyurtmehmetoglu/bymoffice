@@ -203,6 +203,18 @@ export interface UiStrings {
   saveConflictQuestion: string;
   saveOverwrite: string;
   saveCancel: string;
+  /** The question for the password of a password-protected file: title, explanation, the label of the field, its two answers. */
+  passwordTitle: string;
+  passwordQuestion: string;
+  passwordLabel: string;
+  /** The password that was tried is not the file's; `attempts` passwords were tried so far. */
+  passwordWrong(attempts: number): string;
+  /** Shown while a password is being checked. */
+  passwordChecking: string;
+  passwordOpen: string;
+  passwordCancel: string;
+  /** The encrypted file that was opened has no integrity check. */
+  noIntegrityCheck: string;
   /** The server answered the save with a redirect, which is not followed. */
   saveRedirected: string;
   /** A converted file is not saved over its original without the page's consent; `to` is "docx" or "xlsx". */
@@ -744,6 +756,14 @@ export const STRINGS_EN: UiStrings = {
     'The file was changed on the server after you opened it (someone else changed it, or an earlier save of yours was written although its answer did not arrive). If you save, the changes there are overwritten.',
   saveOverwrite: 'Overwrite',
   saveCancel: 'Cancel',
+  passwordTitle: 'Password required',
+  passwordQuestion: 'This file is protected with a password.',
+  passwordLabel: 'Password',
+  passwordWrong: (attempts) => (attempts > 1 ? `Wrong password (${attempts} attempts). Try again.` : 'Wrong password. Try again.'),
+  passwordChecking: 'Checking the password…',
+  passwordOpen: 'Open',
+  passwordCancel: 'Cancel',
+  noIntegrityCheck: 'This file has no integrity check: its content may have been changed by someone who does not know the password',
   saveRedirected: 'The file was not saved: the server sent the request to another address; you may have been signed out',
   saveConvertedNotAllowed: (to) => `Changes to this file cannot be saved here: it was converted to ${to}, and this page has not allowed saving that in place of the original file`,
   saveDenied: 'The file was not saved: you are not allowed to save it',
@@ -1301,6 +1321,14 @@ export const STRINGS_TR: UiStrings = {
     'Dosya, siz açtıktan sonra sunucuda değişmiş (başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir). Kaydederseniz oradaki değişikliklerin üzerine yazılır.',
   saveOverwrite: 'Üzerine yaz',
   saveCancel: 'Vazgeç',
+  passwordTitle: 'Parola gerekli',
+  passwordQuestion: 'Bu dosya parola ile korunuyor.',
+  passwordLabel: 'Parola',
+  passwordWrong: (attempts) => (attempts > 1 ? `Parola yanlış (${attempts} deneme). Yeniden deneyin.` : 'Parola yanlış. Yeniden deneyin.'),
+  passwordChecking: 'Parola denetleniyor…',
+  passwordOpen: 'Aç',
+  passwordCancel: 'Vazgeç',
+  noIntegrityCheck: 'Bu dosyanın bütünlük denetimi yok: içeriğini parolayı bilmeyen biri değiştirmiş olabilir',
   saveRedirected: 'Dosya kaydedilmedi: sunucu isteği başka bir adrese yönlendirdi; oturumunuzun süresi dolmuş olabilir',
   saveConvertedNotAllowed: (to) => `Bu dosyadaki değişiklikler buraya kaydedilemez: dosya ${to} biçimine çevrildi ve sayfa bunun özgün dosyanın yerine kaydedilmesine izin vermedi`,
   saveDenied: 'Dosya kaydedilmedi: kaydetme yetkiniz yok',

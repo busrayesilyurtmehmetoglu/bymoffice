@@ -65,6 +65,11 @@
         <div id="drop">
           <p><strong>Dosyaları buraya sürükleyin</strong> ya da seçin (docx, xlsx, doc, xls; birden çok olabilir).</p>
           <input type="file" id="file" multiple />
+          <p class="muted" style="margin: 8px 0 0">
+            <label title="BymOffice.open(bytes, { password }): parola korumalı (şifreli) docx, xlsx, doc ve xls için. Boş bırakılırsa şifreli dosya 'parola gerekli' der.">
+              Parola (şifreli dosyalar için): <input type="password" id="open-password" autocomplete="off" spellcheck="false" />
+            </label>
+          </p>
         </div>
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
@@ -109,6 +114,11 @@
         <div id="detail" class="muted"></div>
         <div class="row">
           <button id="save" class="primary" disabled>Yeniden kaydet ve indir</button>
+          <select id="save-password" title="file.save(), file.save({ password: null }), file.save({ password }): parolayla açılan dosya kendiliğinden aynı parolayla şifreli kaydedilir; kaldırmak ya da değiştirmek açık eylemdir.">
+            <option value="keep">açıldığı gibi (şifreliyse aynı parolayla)</option>
+            <option value="none">parolasız (save({ password: null }))</option>
+            <option value="field">yukarıdaki parolayla şifrele</option>
+          </select>
           <button id="save-as-xlsx" hidden>xlsx olarak indir</button>
         </div>
         <div class="scroll" style="margin-top: 12px"><table id="parts"></table></div>
@@ -262,15 +272,16 @@
       });
 
       /** Saves, reopens and compares every part with the original. */
-      async function verify(file, bytes) {
+      async function verify(file, bytes, password) {
         if (!file.package) {
           const saved = await file.save();
           return sameBytes(saved, bytes)
             ? { level: 'warn', text: 'özgün baytlar (ikili yazıcı henüz yok)' }
             : { level: 'bad', text: 'kaydedilen baytlar farklı' };
         }
+        // A file that was opened with a password is saved encrypted again: it is read back with the same password.
         const saved = await file.save();
-        const again = await BymOffice.open(saved);
+        const again = await BymOffice.open(saved, { password });
         const before = file.package.partNames();
         const after = again.package.partNames();
         if (before.join('\n') !== after.join('\n')) return { level: 'bad', text: 'parça listesi değişti' };
@@ -279,21 +290,29 @@
             return { level: 'bad', text: `içerik değişti: ${part}` };
           }
         }
-        return { level: 'ok', text: `${before.length} parça aynı` };
+        return { level: 'ok', text: `${before.length} parça aynı${file.passwordProtected ? ' (şifreli kaydedildi, parolayla yeniden açıldı)' : ''}` };
       }
 
       async function process(name, bytes) {
         const record = { name, bytes, ms: 0, check: null };
         const started = performance.now();
         try {
-          record.file = await BymOffice.open(bytes);
+          // The password of the field, for files that are encrypted; it is not kept in the record.
+          const password = $('open-password').value || undefined;
+          record.file = await BymOffice.open(bytes, { password });
           record.ms = performance.now() - started;
-          record.check = await verify(record.file, bytes);
+          record.check = await verify(record.file, bytes, password);
         } catch (error) {
           record.ms = performance.now() - started;
           record.file = undefined;
           record.error = error && error.message ? error.message : String(error);
           record.unsupported = error instanceof BymOffice.UnsupportedFileError;
+          // PasswordError: "required", "wrong", "unsupported", "damaged".
+          if (error instanceof BymOffice.PasswordError) {
+            record.password = error.code;
+            if (error.code === 'required') record.error = 'Parola korumalı dosya: parolayı yukarıdaki alana yazıp dosyayı yeniden seçin';
+            else if (error.code === 'wrong') record.error = 'Parola yanlış: düzeltip dosyayı yeniden seçin';
+          }
         }
         records.push(record);
         return record;
@@ -304,7 +323,7 @@
         for (const record of records) {
           const result = record.file
             ? el('span', record.check.text, `badge ${record.check.level}`)
-            : el('span', record.unsupported ? 'desteklenmiyor' : 'hata', `badge ${record.unsupported ? 'warn' : 'bad'}`);
+            : el('span', record.password === 'required' || record.password === 'wrong' ? 'parola' : record.unsupported ? 'desteklenmiyor' : 'hata', `badge ${record.unsupported || record.password ? 'warn' : 'bad'}`);
           const tr = row([
             record.name,
             record.file ? `${record.file.format} (${record.file.container})` : '—',
@@ -507,7 +526,10 @@
         }
 
         const file = record.file;
-        status.textContent = `Biçim: ${file.format} (${file.container})`;
+        const encryption = file.encryption;
+        status.textContent =
+          `Biçim: ${file.format} (${file.container})` +
+          (encryption ? ` — şifreli: ${encryption.scheme}, ${encryption.cipher}${encryption.cipher === 'XOR' ? '' : `-${encryption.keyBits}`}${encryption.hash ? `, ${encryption.hash}` : ''}${encryption.integrity ? ', HMAC doğrulandı' : ''}` : '');
         detail.textContent = `${record.name} · ${number(record.bytes.length)} bayt · ${record.ms.toFixed(1)} ms · ${record.check.text}`;
         const open = async (tr, title, read, asText) => {
           for (const other of parts.querySelectorAll('tr.selected')) other.className = '';
@@ -867,7 +889,17 @@
         if (!selected || !selected.file) return;
         // A cell still being edited is written first, as leaving it would do.
         if (view && view.isEditing) view.commitEditing();
-        const url = URL.createObjectURL(new Blob([await selected.file.save()]));
+        // How the file leaves: as it is kept, without a password, or with the password of the field.
+        const mode = $('save-password').value;
+        const options = mode === 'none' ? { password: null } : mode === 'field' ? { password: $('open-password').value } : undefined;
+        let bytes;
+        try {
+          bytes = await selected.file.save(options);
+        } catch (error) {
+          detail.textContent = `Kaydedilemedi: ${error.message}`;
+          return;
+        }
+        const url = URL.createObjectURL(new Blob([bytes]));
         const link = document.createElement('a');
         link.href = url;
         link.download = selected.name;
@@ -1032,6 +1064,7 @@
       convertButton.addEventListener('click', async () => {
         if (!selected || !selected.file || !selected.file.saveAsXlsx) return;
         try {
+          // A protected xls gives an xlsx that is encrypted with the same password.
           const url = URL.createObjectURL(new Blob([await selected.file.saveAsXlsx()]));
           const link = document.createElement('a');
           link.href = url;

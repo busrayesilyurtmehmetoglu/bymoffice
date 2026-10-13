@@ -278,7 +278,7 @@ function readName(stream: RecordStream, offset: number, biff8: boolean, codepage
   return { name, hidden: (flags & 0x0001) !== 0, sheet, data: r.rest(), tokenSize };
 }
 
-function readGlobals(stream: RecordStream, streamName: string): Globals {
+function readGlobals(stream: RecordStream, streamName: string, decrypted = false): Globals {
   const { bytes, view } = stream;
   const size = bytes.length;
   if (size < 4) throw corrupt('the workbook stream is empty');
@@ -328,7 +328,9 @@ function readGlobals(stream: RecordStream, streamName: string): Globals {
     else if (depth === 0) {
       switch (id) {
         case REC_FILEPASS:
-          throw new XlsUnsupportedError('Password-protected xls files are not supported');
+          // A stream that was decrypted (see crypto/legacy.ts) still has the record: it is as long as it was.
+          if (decrypted) break;
+          throw new XlsUnsupportedError('Password-protected xls files have to be opened with their password');
         case REC_CODEPAGE:
           if (length >= 2) {
             codepage = view.getUint16(data, true);
@@ -1114,11 +1116,14 @@ function countReason(map: Map<string, number>, reason: string): void {
 
 const SHEET_KINDS: Readonly<Record<number, SheetKind>> = { 0: 'worksheet', 1: 'macrosheet', 2: 'chartsheet', 6: 'macrosheet' };
 
-/** Reads the bytes of a Workbook (BIFF8) or Book (BIFF5) stream. `streamName` is the name the stream has in the file. */
-export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook'): XlsReadResult {
+/**
+ * Reads the bytes of a Workbook (BIFF8) or Book (BIFF5) stream. `streamName` is the name the stream has in the file.
+ * `decrypted` says that the stream was password-protected and is given decrypted: its FILEPASS record is passed over.
+ */
+export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook', decrypted = false): XlsReadResult {
   const stream = recordStream(bytes);
   try {
-    const globals = readGlobals(stream, streamName);
+    const globals = readGlobals(stream, streamName, decrypted);
     if (globals.sheets.length === 0) throw corrupt('the workbook has no sheets');
 
     const sheets: Sheet[] = [];

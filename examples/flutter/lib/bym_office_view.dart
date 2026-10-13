@@ -34,8 +34,24 @@ class BymOfficeDocument {
     this.isDocument = false,
     this.readOnly = false,
     this.convertedFrom,
+    this.encrypted = false,
+    this.defaultPassword = false,
+    this.integrity = true,
     this.warnings = const <String>[],
   });
+
+  /// True when the file is encrypted with the password Office uses when the
+  /// user gave none: it opened without a question, and anyone can open it.
+  final bool defaultPassword;
+
+  /// False when the file is encrypted and carries no integrity check: its
+  /// content may have been changed by someone who does not know the password.
+  /// The application should tell the user.
+  final bool integrity;
+
+  /// True when the file was opened with a password: what [BymOfficeController.save]
+  /// and the saves of the page hand over is encrypted with the same password.
+  final bool encrypted;
 
   /// The format of the file that is shown and saved: "docx", "xlsx", "doc",
   /// "xls" or "rtf". After a conversion this is the new format.
@@ -163,8 +179,24 @@ class BymOfficeSelection {
   final String active;
 }
 
+/// A `passwordRequired` message: the file of a `load` is password-protected
+/// and its password is missing or wrong. Answer with
+/// [BymOfficeController.sendPassword].
+class BymOfficePasswordRequest {
+  const BymOfficePasswordRequest({required this.wrong, required this.attempts, this.format});
+
+  /// The password that was tried last was wrong.
+  final bool wrong;
+
+  /// How many passwords were tried and failed.
+  final int attempts;
+
+  /// "ooxml" (a docx or an xlsx), "doc" or "xls".
+  final String? format;
+}
+
 /// An `error` message. [code] is one of: unsupported, corrupt, load-failed,
-/// save-failed, bad-message, not-loaded, print-unavailable, print-failed,
+/// password-cancelled, password-not-expected, save-failed, bad-message, not-loaded, print-unavailable, print-failed,
 /// pdf-unavailable, pdf-failed, pdf-too-large,
 /// read-only, no-sheet, sheet-refused (and "timeout" and "closed", which only
 /// this wrapper produces). For sheet-refused the [message] is the reason in
@@ -237,6 +269,7 @@ class BymOfficeController {
   final StreamController<BymOfficeRevisions> _revisions = StreamController<BymOfficeRevisions>.broadcast();
   final StreamController<List<BymOfficeComment>> _comments = StreamController<List<BymOfficeComment>>.broadcast();
   final StreamController<BymOfficeException> _errors = StreamController<BymOfficeException>.broadcast();
+  final StreamController<BymOfficePasswordRequest> _passwords = StreamController<BymOfficePasswordRequest>.broadcast();
   final StreamController<String> _links = StreamController<String>.broadcast();
   final StreamController<BymOfficeSavedFile> _userSaves = StreamController<BymOfficeSavedFile>.broadcast();
   int _nextId = 0;
@@ -302,6 +335,17 @@ class BymOfficeController {
   /// Every `error` message, including those that also fail a request.
   Stream<BymOfficeException> get onError => _errors.stream;
 
+  /// The file of a [load] needs its password: answer with [sendPassword].
+  /// The page asks the user as well, in a dialog of its own, unless the load
+  /// said `passwordPrompt: false`; whichever answers first counts. The load
+  /// keeps waiting meanwhile, and so does its [requestTimeout].
+  Stream<BymOfficePasswordRequest> get onPasswordRequired => _passwords.stream;
+
+  /// Answers [onPasswordRequired]: the password, or null to give up (the
+  /// load then fails with "password-cancelled"). The page never sends the
+  /// password back; do not log what is posted here.
+  Future<void> sendPassword(String? password) => _post(<String, dynamic>{'type': 'password', 'value': password});
+
   /// Opens a file. If it cannot be opened, the file that was open stays open.
   ///
   /// [convert] opens doc, RTF and xls files for editing by converting them to
@@ -313,6 +357,11 @@ class BymOfficeController {
   /// `delayMs` and `maxWaitMs`) does the same and also makes the page save by
   /// itself, two seconds after the last change unless the map says otherwise:
   /// those files arrive on [onUserSave] with [BymOfficeSavedFile.byAuto].
+  ///
+  /// [password] opens a password-protected file; without it, or when it is
+  /// wrong, [onPasswordRequired] fires and the page asks the user in a dialog
+  /// of its own ([passwordPrompt] false turns that dialog off). Such a file is
+  /// saved encrypted with the same password ([BymOfficeDocument.encrypted]).
   Future<BymOfficeDocument> load(
     Uint8List bytes, {
     String? name,
@@ -323,11 +372,23 @@ class BymOfficeController {
     bool? toolbar,
     bool? userSaves,
     Object? autoSave,
+    String? password,
+    bool? passwordPrompt,
   }) async {
     _checkAlive();
     // Base64 of a large file takes a while; keep it off the UI thread.
     final String data = await compute(base64Encode, bytes);
-    return _load(<String, dynamic>{'data': data}, name: name, locale: locale, readOnly: readOnly, sheet: sheet, convert: convert, toolbar: toolbar, userSaves: userSaves, autoSave: autoSave);
+    return _load(
+      <String, dynamic>{'data': data, if (password != null) 'password': password, if (passwordPrompt != null) 'passwordPrompt': passwordPrompt},
+      name: name,
+      locale: locale,
+      readOnly: readOnly,
+      sheet: sheet,
+      convert: convert,
+      toolbar: toolbar,
+      userSaves: userSaves,
+      autoSave: autoSave,
+    );
   }
 
   /// Starts with a new, empty file instead of opening one. [kind] is "docx"
@@ -373,6 +434,9 @@ class BymOfficeController {
       isDocument: answer['kind'] == 'document',
       readOnly: answer['readOnly'] == true,
       convertedFrom: answer['convertedFrom'] as String?,
+      encrypted: answer['encrypted'] == true,
+      defaultPassword: answer['defaultPassword'] == true,
+      integrity: answer['integrity'] != false,
       // UNVERIFIED: the cast of a decoded JSON list of strings.
       warnings: (answer['warnings'] as List<dynamic>? ?? const <dynamic>[]).map((dynamic entry) => entry.toString()).toList(),
     );
@@ -636,6 +700,12 @@ class BymOfficeController {
           sheet: (message['sheet'] as num).toInt(),
           range: message['range'] as String,
           active: message['active'] as String,
+        ));
+      case 'passwordRequired':
+        _passwords.add(BymOfficePasswordRequest(
+          wrong: message['wrong'] == true,
+          attempts: (message['attempts'] as num? ?? 0).toInt(),
+          format: message['format'] as String?,
         ));
       case 'revisions':
         _revisions.add(BymOfficeRevisions(count: (message['count'] as num).toInt(), trackChanges: message['trackChanges'] == true));

@@ -19,6 +19,7 @@ import { pdfFileName, type PdfExportOptions } from '../pdf/export';
 import type { SheetPdfExportOptions, WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
+import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabTransport, type CollabUser } from '../collab/index';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
@@ -26,6 +27,8 @@ export type BridgeErrorCode =
   | 'unsupported'
   | 'corrupt'
   | 'load-failed'
+  | 'password-cancelled'
+  | 'password-not-expected'
   | 'save-failed'
   | 'bad-message'
   | 'not-loaded'
@@ -41,8 +44,18 @@ export type BridgeErrorCode =
   | 'no-document'
   | 'comment-refused';
 
-/** What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed. */
-export type BridgeState = 'empty' | 'loading' | 'open' | 'error';
+/**
+ * What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed;
+ * "password": a file on its way waits for its password (the question is asked inside the container).
+ */
+export type BridgeState = 'empty' | 'loading' | 'open' | 'error' | 'password';
+
+/**
+ * The longest password a message may carry, in characters. More than the 255 that a password which is SET may
+ * have (MAX_PASSWORD_CHARS): a file is opened with whatever password it has, and saved with it again; the bridge
+ * has no message that sets a new one.
+ */
+const MAX_PASSWORD_FIELD = 1024;
 
 /**
  * What the bridge needs of a document view. Only destroy() is required: a
@@ -120,7 +133,14 @@ export interface BridgeHost {
   /** The element the editor is shown in. */
   container: HTMLElement;
   /** The engine's open(). */
-  open(bytes: Uint8Array): Promise<OfficeFile>;
+  open(bytes: Uint8Array, options?: { password?: string; signal?: { readonly aborted: boolean } }): Promise<OfficeFile>;
+  /**
+   * Makes the question for the password of a password-protected file,
+   * asked inside the container next to the `passwordRequired` message: the
+   * user's answer and the application's `password` message count alike,
+   * whichever comes first. Without it only the application is asked.
+   */
+  passwordPrompt?(container: HTMLElement, locale: string | undefined, onCancel: () => void): { ask(request: PasswordRequest): Promise<string | null>; close(): void };
   /** Shows a workbook in the container: `new WorkbookView(container, workbook, options)`. */
   createView(container: HTMLElement, workbook: Workbook, options: WorkbookViewOptions): WorkbookView;
   /**
@@ -906,6 +926,8 @@ export function createBridge(host: BridgeHost): Bridge {
     if (shown.collab) shown.collab.leave();
     if (awaited) awaited.stop();
     awaited = undefined;
+    // The password of a protected file is not kept longer than the file is shown.
+    if (typeof shown.file.close === 'function') shown.file.close();
     shown = undefined;
     sheetCount = undefined;
     if (view) view.destroy();
@@ -925,10 +947,36 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /** Gives up whatever load is under way or waiting. */
+  /** A load that waits for the password of its file: what answers it, and what calls the check of a password off. */
+  let passwordAsked: { answer(value: string | null): void; signal: { aborted: boolean }; close(): void } | undefined;
+
   const supersede = (reason: string): number => {
     generation++;
     if (cancelFetch) cancelFetch(reason);
+    // A load that waits for a password, or checks one, is over: nobody is asked any more.
+    if (passwordAsked) {
+      const asked = passwordAsked;
+      passwordAsked = undefined;
+      asked.signal.aborted = true;
+      asked.close();
+      asked.answer(null);
+    }
     return generation;
+  };
+
+  /** The `password` message: the application's answer to `passwordRequired`. Its value is never sent back, in no message. */
+  const passwordGiven = (fields: Message, id: string | undefined) => {
+    const value = fields.value;
+    if (value !== null && typeof value !== 'string') throw new BadMessage('"value" must be the password as a string, or null to give up');
+    if (typeof value === 'string' && value.length > MAX_PASSWORD_FIELD) throw new BadMessage('"value" is too long');
+    // Nobody is asking: no file is loading, or the password that was given last is still being checked. The message is
+    // not kept for a question that may come: the application answers the `passwordRequired` it gets, each one once.
+    if (!passwordAsked) return fail('password-not-expected', 'No password is being asked for: answer a "passwordRequired" message, once', id);
+    const asked = passwordAsked;
+    // The application answered: the question inside the page is taken away (a wrong password brings it back).
+    asked.close();
+    asked.answer(value);
+    done('password', id);
   };
 
   const flushSelection = () => {
@@ -1025,7 +1073,23 @@ export function createBridge(host: BridgeHost): Bridge {
     }).then((bytes) => register(Object.assign({}, font, { source: bytes })));
   };
 
+  /**
+   * A file that was opened and is not the one that is shown in the end (the load was overtaken, the conversion or
+   * the view failed) is closed: the password of a protected file is not kept for a file nobody sees.
+   */
   const load = async (message: Message, id: string | undefined, mine: number) => {
+    const held: OfficeFile[] = [];
+    try {
+      return await loadFile(message, id, mine, held);
+    } finally {
+      for (let i = 0; i < held.length; i++) {
+        const file = held[i];
+        if ((!shown || shown.file !== file) && typeof file.close === 'function') file.close();
+      }
+    }
+  };
+
+  const loadFile = async (message: Message, id: string | undefined, mine: number, held: OfficeFile[]) => {
     const data = field<string>(message, 'data', 'string', false);
     const url = field<string>(message, 'url', 'string', false);
     const name = field<string>(message, 'name', 'string', false);
@@ -1037,6 +1101,9 @@ export function createBridge(host: BridgeHost): Bridge {
     const toolbar = field<boolean>(message, 'toolbar', 'boolean', false);
     const author = field<string>(message, 'author', 'string', false);
     const trackChanges = field<boolean>(message, 'trackChanges', 'boolean', false);
+    const password = field<string>(message, 'password', 'string', false);
+    const passwordPrompt = field<boolean>(message, 'passwordPrompt', 'boolean', false);
+    if (password !== undefined && password.length > MAX_PASSWORD_FIELD) throw new BadMessage('"password" is too long');
     // `save`: true, or an object that also says whether the page saves by itself ({ auto }).
     const saveField = message.save;
     let userSaves = false;
@@ -1139,7 +1206,73 @@ export function createBridge(host: BridgeHost): Bridge {
     let convertedFrom: string | undefined;
     let warnings: string[] | undefined;
     try {
-      file = await host.open(bytes);
+      // A password-protected file: the password of the `load` is tried, then the application and the user are asked
+      // (`passwordRequired`, and the question inside the page) for as long as the password is wrong.
+      const signal = { aborted: false };
+      let prompt: { ask(request: PasswordRequest): Promise<string | null>; close(): void } | undefined;
+      let given = password;
+      let attempts = 0;
+      try {
+        for (;;) {
+          try {
+            // One derivation for each password: a password that was given is tried alone (see OpenOptions.password).
+            file = await host.open(bytes, given === undefined ? { signal } : { password: given, signal });
+            held.push(file);
+            break;
+          } catch (error) {
+            const code = error instanceof Error && error.name === 'PasswordError' ? (error as { code?: unknown }).code : undefined;
+            if (overtaken()) return;
+            // The user gave up in the question of the page while a password was being checked.
+            if (code === 'cancelled') return refuse('password-cancelled', 'The file was not opened: no password was given for it');
+            if (code !== 'required' && code !== 'wrong') throw error;
+            if (code === 'wrong') attempts++;
+            const request: PasswordRequest = { attempts, wrong: code === 'wrong' };
+            const answer = await new Promise<string | null>((resolve) => {
+              let over = false;
+              const asked = {
+                signal,
+                close: () => {
+                  if (prompt) prompt.close();
+                  prompt = undefined;
+                },
+                answer: (value: string | null) => {
+                  if (over) return;
+                  over = true;
+                  if (passwordAsked === asked) passwordAsked = undefined;
+                  resolve(value);
+                },
+              };
+              passwordAsked = asked;
+              const out: Message = { type: 'passwordRequired', wrong: request.wrong, attempts };
+              if (id !== undefined) out.id = id;
+              const format = (error as { format?: unknown }).format;
+              if (typeof format === 'string') out.format = format;
+              send(out);
+              if (passwordPrompt !== false && host.passwordPrompt) {
+                try {
+                  if (!prompt) {
+                    // Giving up there also ends the check of a password that is under way.
+                    prompt = host.passwordPrompt(host.container, locale, () => {
+                      signal.aborted = true;
+                    });
+                  }
+                  // The question is over the editor, or over an empty page: the page shows the container for it.
+                  if (!shown) setState('password');
+                  prompt.ask(request).then(asked.answer, () => asked.answer(null));
+                } catch {
+                  // No question inside the page: the application is asked alone.
+                }
+              }
+            });
+            if (overtaken()) return;
+            if (answer === null) return refuse('password-cancelled', 'The file was not opened: no password was given for it');
+            if (!shown) setState('loading');
+            given = answer;
+          }
+        }
+      } finally {
+        if (prompt) prompt.close();
+      }
       if (overtaken()) return;
       const showable = (): void => {
         if (file.kind === 'document' && (!file.document || !host.createDocumentView)) {
@@ -1152,7 +1285,10 @@ export function createBridge(host: BridgeHost): Bridge {
         const opened = await openConverted(file, host.open);
         if (overtaken()) return;
         if (opened.conversion) {
+          // The converted file took the password of its original over: the original lets go of it.
+          if (typeof file.close === 'function') file.close();
           file = opened.file;
+          held.push(file);
           convertedFrom = opened.conversion.from;
           warnings = opened.conversion.warnings;
           showable();
@@ -1169,7 +1305,9 @@ export function createBridge(host: BridgeHost): Bridge {
       }
     } catch (error) {
       if (overtaken()) return;
-      return refuse(error instanceof Error && error.name === 'UnsupportedFileError' ? 'unsupported' : 'corrupt', errorText(error));
+      // An encryption that is not read is a file that is not supported; an encrypted file that is damaged is a damaged file.
+      const unsupported = error instanceof Error && (error.name === 'UnsupportedFileError' || (error.name === 'PasswordError' && (error as { code?: unknown }).code === 'unsupported'));
+      return refuse(unsupported ? 'unsupported' : 'corrupt', errorText(error));
     }
     if (overtaken()) return;
     const fontFailures = await fontsSettled;
@@ -1191,6 +1329,12 @@ export function createBridge(host: BridgeHost): Bridge {
       if (id !== undefined) out.id = id;
       out.format = file.format;
       if (document) out.kind = 'document';
+      // The file was opened with a password: what `saved` hands over is encrypted with it again.
+      if (file.passwordProtected === true) out.encrypted = true;
+      // With the password everyone knows: the file is encrypted and keeps nothing secret.
+      if (file.encryption && file.encryption.defaultPassword === true) out.defaultPassword = true;
+      // Encrypted without an integrity check: its content could have been changed by someone who does not know the password.
+      if (file.warnings && file.warnings.some((warning) => warning.code === 'no-integrity')) out.integrity = false;
       out.sheets = sheets;
       out.activeSheet = activeSheet;
       // The file is shown read-only whatever was asked for, and `setReadOnly` will not change that.
@@ -1701,6 +1845,7 @@ export function createBridge(host: BridgeHost): Bridge {
           // One count for both kinds: the letter only says who started the save.
           const saveId = `${info.auto === true ? 'a' : 'u'}${++userSaves}`;
           const out: Message = { type: 'saved', by: info.auto === true ? 'auto' : 'user', saveId, data: base64Encode(bytes), format: info.format };
+          if (shown && shown.file.passwordProtected === true) out.encrypted = true;
           // The user was asked and chose to keep their own file: the application writes it whatever it holds.
           if (info.overwrite === true) out.overwrite = true;
           if (info.name !== undefined) out.name = info.name;
@@ -1846,6 +1991,7 @@ export function createBridge(host: BridgeHost): Bridge {
     const out: Message = { type: 'saved' };
     if (id !== undefined) out.id = id;
     out.data = data;
+    if (current.file.passwordProtected === true) out.encrypted = true;
     if (current.name !== undefined) out.name = current.name;
     // The application gave another format than it gets back: the message says which.
     if (current.convertedFrom !== undefined) {
@@ -2031,6 +2177,7 @@ export function createBridge(host: BridgeHost): Bridge {
   /**
    * `hello` and `close` do not wait for their turn: they must work while a load hangs. Nor does
    * `saveResult`: it answers a save of the file that is shown now, not of the one a load that waits will show.
+   * Nor does `password`: the load it answers is the one that is under way.
    */
   const handleNow = (fields: Message, type: string) => {
     let id: string | undefined;
@@ -2038,6 +2185,7 @@ export function createBridge(host: BridgeHost): Bridge {
       id = idOf(fields);
       if (type === 'hello') return send({ type: 'ready', version: host.version });
       if (type === 'saveResult') return saveResult(fields, id);
+      if (type === 'password') return passwordGiven(fields, id);
       supersede('the file was closed');
       closeShown();
       setState('empty');
@@ -2085,7 +2233,7 @@ export function createBridge(host: BridgeHost): Bridge {
         fields = undefined;
       }
       const type = fields && fields.type;
-      if (fields && (type === 'hello' || type === 'close' || type === 'saveResult')) {
+      if (fields && (type === 'hello' || type === 'close' || type === 'saveResult' || type === 'password')) {
         // A `hello` that is the first thing to arrive has just been answered by start().
         if (type !== 'hello' || announced) handleNow(fields, type as string);
         return Promise.resolve();
@@ -2250,6 +2398,8 @@ export function installBridge(options: InstallBridgeOptions): Bridge {
   const bridge = createBridge({
     container: options.container,
     open: options.open,
+    // Asked inside the page as well as of the application: an application that does not know the message still gets its file opened.
+    passwordPrompt: (container, locale, onCancel) => new PasswordPrompt({ container, strings: resolveUiStrings(locale), onCancel }),
     createView: options.createView,
     createDocumentView: options.createDocumentView,
     createEditor: options.createEditor,

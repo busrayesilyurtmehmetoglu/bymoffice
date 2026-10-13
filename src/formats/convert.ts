@@ -5,6 +5,8 @@
 
 import type { DocModel } from '../model/doc/types';
 import type { Workbook } from '../model/sheet/types';
+import { encryptPackage } from '../crypto/ooxml';
+import { assertProtectionAlive, inheritProtection, sessionOf } from '../crypto/session';
 import { buildDocx, emptyWriteReport } from './docx/write';
 import { buildXlsx } from './xlsx/build';
 
@@ -22,8 +24,14 @@ export interface EditableConversion {
   from: 'doc' | 'rtf' | 'xls';
   /** The format of `bytes`. */
   to: 'docx' | 'xlsx';
-  /** The new file; opening it gives the file that is edited and saved. */
+  /**
+   * The new file; opening it gives the file that is edited and saved. For a file that has a password
+   * (it was opened with one, or setPassword() gave it one) these bytes are encrypted with that password,
+   * and open() needs it: nothing that is made from a protected file is ever given out without its password.
+   */
   bytes: Uint8Array;
+  /** Set (true) when `bytes` is encrypted. */
+  encrypted?: true;
   /** What the conversion could not carry over, as the writers report it; empty when nothing the model held was lost. */
   warnings: string[];
 }
@@ -49,6 +57,20 @@ export function needsConversion(format: string): format is 'doc' | 'rtf' | 'xls'
  * with an error named UnsupportedFileError.
  */
 export async function convertForEditing(file: ConvertibleFile): Promise<EditableConversion | undefined> {
+  if (!needsConversion(file.format)) return undefined;
+  // A protected file that was closed has forgotten its password: it is not converted at all.
+  assertProtectionAlive(file);
+  const written = await convertPlain(file);
+  const session = sessionOf(file);
+  if (written && session) {
+    written.bytes = await encryptPackage(written.bytes, session);
+    written.encrypted = true;
+  }
+  return written;
+}
+
+/** The conversion itself: the new package, never encrypted. Stays inside the engine. */
+async function convertPlain(file: ConvertibleFile): Promise<EditableConversion | undefined> {
   const from = file.format;
   if (!needsConversion(from)) return undefined;
   if (file.kind === 'document') {
@@ -80,10 +102,16 @@ export async function openConverted<F extends ConvertibleFile>(file: F, open: (b
     await file.document();
   } else await file.workbook();
   try {
-    const written = await convertForEditing(file);
+    // Before anything is written: the new file could not be given the password of a file that has forgotten its own.
+    assertProtectionAlive(file);
+    const written = await convertPlain(file);
     if (!written) return { file };
     const converted = await open(written.bytes);
     if (converted.format !== written.to) throw new Error(`The converted file is not a ${written.to} file`);
+    // A password-protected original: the new file is saved with the same password, and says how its original was encrypted.
+    inheritProtection(file, converted);
+    const encryption = (file as { encryption?: unknown }).encryption;
+    if (encryption !== undefined) (converted as { encryption?: unknown }).encryption = encryption;
     // The model of the new file is what will be shown: it has to be readable.
     if (converted.kind === 'document') {
       if (!converted.document) throw new Error('The converted file cannot be shown');

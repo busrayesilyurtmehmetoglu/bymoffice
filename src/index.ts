@@ -1,4 +1,11 @@
 import { CfbFile } from './cfb';
+import { MAX_PASSWORD_CHARS } from './crypto/agile';
+import { PasswordError, type EncryptedFormat } from './crypto/errors';
+import { decryptDocStreams, decryptXlsStream, docEncryptionFlags, findFilePass } from './crypto/legacy';
+import { DEFAULT_PASSWORD, decryptPackage, encryptPackage, isEncryptedPackage, packageEncryption, type FileEncryption } from './crypto/ooxml';
+import { PasswordSession, bindProtection, sessionOf, type Protection } from './crypto/session';
+import { PasswordPrompt, type PasswordRequest } from './ui/password-dialog';
+import { openAsking } from './ui/password-flow';
 import { readDoc } from './formats/doc/document';
 import { readRtf } from './formats/rtf/document';
 import { readDocx } from './formats/docx/document';
@@ -6,7 +13,7 @@ import { buildDocx, writeDocx } from './formats/docx/write';
 import { needsConversion, openConverted } from './formats/convert';
 import { documentPictures } from './model/doc/pictures';
 import { hasPermissionRanges, type DocModel } from './model/doc/types';
-import { readXls } from './formats/xls/workbook';
+import { readXls, readXlsStream } from './formats/xls/workbook';
 import { readXlsx } from './formats/xlsx/workbook';
 import { buildXlsx } from './formats/xlsx/build';
 import { resolveUiStrings } from './ui/strings';
@@ -42,6 +49,13 @@ import {
 } from './embed/save-to';
 
 export { CfbFile, type CfbEntry } from './cfb';
+export { allocateCfb, writeCfb, type CfbLayout, type CfbStreamSize } from './cfb-write';
+export { PasswordError, type EncryptedFormat, type PasswordErrorCode } from './crypto/errors';
+export { xorPasswordCandidates } from './crypto/legacy';
+export { DEFAULT_PASSWORD, type FileEncryption } from './crypto/ooxml';
+export { MAX_PASSWORD_CHARS } from './crypto/agile';
+export { MAX_SPIN_COUNT } from './crypto/work';
+export type { PasswordRequest } from './ui/password-dialog';
 export { OpcPackage, type Relationship } from './opc';
 export { ZipArchive, type ZipEntry } from './zip';
 export * from './xml';
@@ -376,6 +390,55 @@ export const fonts = { registerFont, registeredFonts, unregisterFont, configure:
 
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
 
+/** What open() takes besides the file. */
+export interface OpenOptions {
+  /**
+   * The password of a password-protected file. Without one such a file
+   * rejects with PasswordError "required" (unless it is encrypted with the
+   * password Office uses when the user gave none: such a file just opens).
+   * Has no effect on a file that is not encrypted.
+   */
+  password?: string;
+  /**
+   * An open file whose password opens this one as well: for another version of the same file (one that was
+   * saved meanwhile and is loaded again), without the application having to keep the password. Used when
+   * `password` is not given. A file that has no password, or was closed, counts as none given.
+   */
+  passwordOf?: OfficeFile;
+  /** Calls the opening of an encrypted file off: an AbortSignal fits. The call then rejects with PasswordError "cancelled". */
+  signal?: { readonly aborted: boolean };
+  /**
+   * Refuses an encrypted docx or xlsx that carries no integrity check (agile encryption without `dataIntegrity`)
+   * with PasswordError "damaged". Without it such a file is opened, and says so in `warnings`: its content
+   * could have been changed by someone who does not know the password, and nothing would show.
+   */
+  requireIntegrity?: boolean;
+}
+
+/** Something a file that was opened has to say about itself. */
+export interface FileWarning {
+  /**
+   * "no-integrity": the file is encrypted (agile encryption) and has no integrity check, so that its content
+   * could have been changed without the password. Files the engine writes always carry the check.
+   */
+  code: 'no-integrity';
+  /** In English, for developers; mount() tells the user in the language of the view. */
+  message: string;
+}
+
+/** What save(), saveAsDocx() and saveAsXlsx() take. */
+export interface SaveOptions {
+  /**
+   * What this one save is encrypted with: a password, or `null` for a file
+   * without one. Left out, the file is saved the way it is kept: with the
+   * password it was opened with, or the one setPassword() last named. A
+   * password that is set here is 255 characters at most.
+   */
+  password?: string | null;
+  /** Calls the encryption off: the save then rejects with PasswordError "cancelled". */
+  signal?: { readonly aborted: boolean };
+}
+
 export interface OfficeFile {
   format: OfficeFormat;
   kind: 'document' | 'spreadsheet';
@@ -384,6 +447,30 @@ export interface OfficeFile {
   package?: OpcPackage;
   /** Present for doc/xls. */
   cfb?: CfbFile;
+  /** Set when the file that was opened was encrypted with a password: how. */
+  encryption?: FileEncryption;
+  /** Set when there is something to be told about the file (see FileWarning); mount() passes it on through onNotice. */
+  warnings?: FileWarning[];
+  /**
+   * Whether the file is saved encrypted: it was opened with a password, or
+   * setPassword() named one. Such a file is never saved without its
+   * password unless that is asked for (`save({ password: null })`,
+   * `setPassword(null)`).
+   */
+  readonly passwordProtected: boolean;
+  /**
+   * Changes what the file is saved with from now on: another password, or
+   * none (`null`). Throws TypeError for an empty password, and RangeError
+   * for one of more than 255 characters. For doc, xls and RTF, which are
+   * not written, it changes what saveAsDocx() and saveAsXlsx() give.
+   */
+  setPassword(password: string | null): void;
+  /**
+   * Zeroes the password the engine keeps for saving. Afterwards a save of a
+   * password-protected file rejects, rather than write it without one.
+   * mount() calls this when its view is destroyed.
+   */
+  close(): void;
   /**
    * The spreadsheet model: sheets, cells, styles. Read on first use and then
    * kept. Rejects with UnsupportedFileError for documents and, until the BIFF
@@ -398,20 +485,27 @@ export interface OfficeFile {
   /**
    * The document as a docx file. For a docx this is save(); for doc and RTF,
    * which cannot be written, the model is written out as a new docx (shapes
-   * lose their geometry, theme colours become plain ones).
+   * lose their geometry, theme colours become plain ones). A password-protected
+   * file gives an encrypted docx (see SaveOptions).
    */
-  saveAsDocx?(): Promise<Uint8Array>;
+  saveAsDocx?(options?: SaveOptions): Promise<Uint8Array>;
   /**
    * The spreadsheet as an xlsx file. For an xlsx this is save(); for xls, which
    * cannot be written, the model is written out as a new xlsx: what the model
    * holds, not what the xls reader leaves out (charts, macros, print settings).
+   * A password-protected file gives an encrypted xlsx (see SaveOptions).
    */
-  saveAsXlsx?(): Promise<Uint8Array>;
+  saveAsXlsx?(options?: SaveOptions): Promise<Uint8Array>;
   /**
-   * The file as bytes. For xlsx, changes made to the model are written into
-   * it; everything that was not changed keeps its original bytes.
+   * The file as bytes. For xlsx and docx, changes made to the model are
+   * written into it; everything that was not changed keeps its original
+   * bytes. A file that is password-protected is encrypted again (agile
+   * encryption: AES-256, SHA-512), with new salts and keys every time; where
+   * that cannot be done the call rejects and gives no bytes. doc, xls and
+   * RTF give the bytes they were opened from, still encrypted if they were;
+   * asked for another password, or for none, they reject.
    */
-  save(): Promise<Uint8Array>;
+  save(options?: SaveOptions): Promise<Uint8Array>;
 }
 
 /** The input is not a Word or Excel file this engine can open. */
@@ -430,83 +524,323 @@ function isRtf(bytes: Uint8Array): boolean {
 const notASpreadsheet = (): Promise<Workbook> =>
   Promise.reject(new UnsupportedFileError('This file is a document, not a spreadsheet'));
 
+/** What goes on inside open() and is not for applications. */
+interface OpenInternals {
+  /** The password the file is saved with although it was not opened with one: a file that was converted from an encrypted one. */
+  session?: PasswordSession;
+  /** How the original of this file was encrypted. */
+  encryption?: FileEncryption;
+  /** What the encrypted file this one was inside has to say (see FileWarning). */
+  warnings?: FileWarning[];
+}
+
+function checkPassword(password: string): void {
+  if (typeof password !== 'string') throw new TypeError('A password is a string, or null for a file without one');
+  if (password === '') throw new TypeError('A file is not encrypted with an empty password; use null to save it without one');
+  if (password.length > MAX_PASSWORD_CHARS) throw new RangeError(`A file is encrypted with a password of at most ${MAX_PASSWORD_CHARS} characters`);
+}
+
+/** A session of its own with the password an open file is kept with; undefined for a file without one, or one that was closed. */
+function lentSession(file: OfficeFile | undefined): PasswordSession | undefined {
+  const session = file ? sessionOf(file) : undefined;
+  return session && !session.forgotten ? session.clone() : undefined;
+}
+
+/**
+ * Opens an encrypted file with the password of the options, or, when none
+ * was given, with the one Office encrypts with when the user gave none. A
+ * password that was given and is wrong is wrong: nothing else is tried
+ * behind it. Gives what `attempt` gave, the session of the password that
+ * opened the file, and whether that was the password everyone knows.
+ */
+async function unlock<T>(
+  attempt: (password: Uint8Array) => T | Promise<T>,
+  options: OpenOptions,
+  format: EncryptedFormat,
+): Promise<{ value: T; session: PasswordSession; byDefault: boolean }> {
+  // The password of another open file (see OpenOptions.passwordOf), when no password was given.
+  const lent = options.password === undefined || options.password === null ? lentSession(options.passwordOf) : undefined;
+  const given = lent !== undefined || (options.password !== undefined && options.password !== null);
+  const password = lent ? undefined : given ? String(options.password) : DEFAULT_PASSWORD;
+  const session = lent || PasswordSession.of(password as string);
+  try {
+    try {
+      return { value: await attempt(session.password), session, byDefault: password === DEFAULT_PASSWORD };
+    } catch (error) {
+      session.forget();
+      if (!(error instanceof PasswordError) || error.code !== 'wrong') throw error;
+    }
+    throw given ? new PasswordError('wrong', 'The password is not the password of this file') : new PasswordError('required', 'The file is protected with a password');
+  } catch (error) {
+    if (error instanceof PasswordError) error.format = format;
+    throw error;
+  }
+}
+
+/**
+ * How much of a stream is looked at to tell whether a file is encrypted: the start of the header of a Word
+ * document (its flags), and the first records of a workbook (FILEPASS is the second or the third, and small).
+ * A file that is not encrypted has none of its streams read before its model is asked for.
+ */
+const DOC_HEAD = 32;
+const XLS_HEAD = 1024;
+
+/** The content of a stream, or nothing for an entry that is no stream (a storage of that name) or cannot be read: the reader says what is wrong with it. */
+function streamOf(cfb: CfbFile, path: string): Uint8Array {
+  try {
+    return cfb.stream(path);
+  } catch (error) {
+    return new Uint8Array(0);
+  }
+}
+
+/**
+ * Whether a file is encrypted with a password, and what kind of file it is
+ * as far as that shows without the password ("ooxml": a docx or an xlsx).
+ * Undefined for a file that is not encrypted, and for one that is no Word or
+ * Excel file. Nothing is decrypted: this is quick.
+ */
+export function encryptionOf(input: Uint8Array | ArrayBuffer): { format: EncryptedFormat; encryption?: FileEncryption } | undefined {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (!CfbFile.isCfb(bytes)) return undefined;
+  let cfb: CfbFile;
+  try {
+    cfb = CfbFile.read(bytes);
+  } catch (error) {
+    return undefined;
+  }
+  if (cfb.has('WordDocument')) return docEncryptionFlags(cfb.head('WordDocument', DOC_HEAD)) ? { format: 'doc' } : undefined;
+  const book = cfb.has('Workbook') ? 'Workbook' : cfb.has('Book') ? 'Book' : undefined;
+  if (book) return findFilePass(cfb.head(book, XLS_HEAD)) ? { format: 'xls' } : undefined;
+  if (!isEncryptedPackage(cfb)) return undefined;
+  try {
+    return { format: 'ooxml', encryption: packageEncryption(cfb) };
+  } catch (error) {
+    // Encrypted in a way that is not read: open() says how.
+    return { format: 'ooxml' };
+  }
+}
+
 /**
  * Opens a Word or Excel file. The format is detected from the content, never
- * from the file name.
+ * from the file name. A password-protected file (docx and xlsx: agile and
+ * standard encryption; doc and xls: RC4, RC4 CryptoAPI and XOR obfuscation)
+ * is opened with `options.password`; without one, or with a wrong one, the
+ * call rejects with PasswordError ("required", "wrong"), and with
+ * "unsupported" or "damaged" for a file that cannot be decrypted at all.
  */
-export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<OfficeFile> {
+export async function open(input: Uint8Array | ArrayBuffer | Blob, options: OpenOptions = {}): Promise<OfficeFile> {
+  return openWith(input, options, {});
+}
+
+async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOptions, internals: OpenInternals): Promise<OfficeFile> {
   const bytes =
     input instanceof Uint8Array
       ? input
       : new Uint8Array(input instanceof ArrayBuffer ? input : await input.arrayBuffer());
 
+  // What the file is saved with; the same object for as long as the file is open.
+  const protection: Protection = { session: internals.session };
+  /** The package as it leaves: encrypted when the file is, or when the save asks for it. */
+  const protect = async (plain: Uint8Array, saveOptions?: SaveOptions): Promise<Uint8Array> => {
+    const asked = saveOptions ? saveOptions.password : undefined;
+    const signal = saveOptions ? saveOptions.signal : undefined;
+    if (asked === null) return plain;
+    if (asked !== undefined) {
+      checkPassword(asked);
+      const once = PasswordSession.of(asked);
+      try {
+        return await encryptPackage(plain, once, { signal });
+      } finally {
+        once.forget();
+      }
+    }
+    return protection.session ? encryptPackage(plain, protection.session, { signal }) : plain;
+  };
+  /** A format that is not written gives the bytes it was opened from: it cannot be asked for other ones. */
+  const asOpened =
+    (format: string) =>
+    async (saveOptions?: SaveOptions): Promise<Uint8Array> => {
+      if (saveOptions && saveOptions.password !== undefined) {
+        const instead = format === 'xls' ? 'xlsx (saveAsXlsx)' : 'docx (saveAsDocx)';
+        throw new Error(`A ${format} file is saved as the bytes it was opened from: its password cannot be changed, set or taken away. Save it as ${instead} instead`);
+      }
+      return bytes;
+    };
+  const finish = (file: Omit<OfficeFile, 'passwordProtected' | 'setPassword' | 'close'>): OfficeFile => {
+    const out = file as OfficeFile;
+    Object.defineProperty(out, 'passwordProtected', { get: () => protection.session !== undefined, enumerable: true });
+    out.setPassword = (password: string | null): void => {
+      if (password !== null) checkPassword(password);
+      if (protection.session) protection.session.forget();
+      protection.session = password === null ? undefined : PasswordSession.of(password);
+    };
+    out.close = (): void => {
+      // The session stays, forgotten: a save now rejects instead of writing the file without its password.
+      if (protection.session) protection.session.forget();
+    };
+    if (internals.encryption && !out.encryption) out.encryption = internals.encryption;
+    if (internals.warnings && internals.warnings.length > 0) out.warnings = internals.warnings;
+    bindProtection(out, protection);
+    return out;
+  };
+
   if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
     const pkg = await OpcPackage.open(bytes);
     const main = await pkg.mainPart();
     const contentType = (main && pkg.contentTypeOf(main)) || '';
-    const base = { container: 'ooxml' as const, package: pkg, save: () => pkg.save() };
+    const base = { container: 'ooxml' as const, package: pkg };
     if (/wordprocessingml|ms-word/.test(contentType)) {
       let model: Promise<DocModel> | undefined;
       // Saving writes the edited stories of the model into the package first; a model that
       // was never read, or read and not changed, leaves the package as it is.
-      const save = async () => {
+      const save = async (saveOptions?: SaveOptions) => {
         if (model) {
           const doc = await model.catch(() => undefined);
           if (doc) await writeDocx(pkg, doc);
         }
-        return pkg.save();
+        return protect(await pkg.save(), saveOptions);
       };
-      return { format: 'docx', kind: 'document', ...base, save, workbook: notASpreadsheet, document: () => (model ??= readDocx(pkg)), saveAsDocx: save };
+      return finish({ format: 'docx', kind: 'document', ...base, save, workbook: notASpreadsheet, document: () => (model ??= readDocx(pkg)), saveAsDocx: save });
     }
     if (/spreadsheetml|ms-excel/.test(contentType)) {
       let workbook: Promise<Workbook> | undefined;
       // Saving writes the changes made to the model into the package first; a model
       // that was never read, or read and not changed, leaves the package as it is.
-      const save = async () => {
+      const save = async (saveOptions?: SaveOptions) => {
         if (workbook) {
           // A file whose model could not be read was not changed either: it is saved as it is.
           const model = await workbook.catch(() => undefined);
           if (model) await writeXlsx(pkg, model);
         }
-        return pkg.save();
+        return protect(await pkg.save(), saveOptions);
       };
-      return { format: 'xlsx', kind: 'spreadsheet', ...base, save, workbook: () => (workbook ??= readXlsx(pkg)), saveAsXlsx: save };
+      return finish({ format: 'xlsx', kind: 'spreadsheet', ...base, save, workbook: () => (workbook ??= readXlsx(pkg)), saveAsXlsx: save });
     }
     throw new UnsupportedFileError(`Unsupported OOXML document type: ${contentType || 'unknown'}`);
   }
 
   if (CfbFile.isCfb(bytes)) {
     const cfb = CfbFile.read(bytes);
-    // No binary writer yet, and nothing can be modified, so saving returns the original bytes.
-    const base = { container: 'cfb' as const, cfb, save: async () => bytes };
+    // No binary writer, and nothing can be modified, so saving returns the original bytes.
+    const base = { container: 'cfb' as const, cfb };
     if (cfb.has('WordDocument')) {
+      // An encrypted document is decrypted here, so that a missing or wrong password is told by open() and not by the first read.
+      let source: Pick<CfbFile, 'has' | 'stream'> = cfb;
+      let encryption: FileEncryption | undefined;
+      // Only the start of the stream is looked at: a document without a password has nothing read here.
+      const flags = docEncryptionFlags(cfb.head('WordDocument', DOC_HEAD));
+      if (flags) {
+        const word = streamOf(cfb, 'WordDocument');
+        const other = flags.table === '1Table' ? '0Table' : '1Table';
+        const tableName = cfb.has(flags.table) ? flags.table : cfb.has(other) ? other : undefined;
+        if (tableName === undefined) throw new Error('Invalid doc: the file has no table stream');
+        const streams = { word, table: cfb.stream(tableName), data: cfb.has('Data') ? cfb.stream('Data') : new Uint8Array(0) };
+        const opened = await unlock((password) => decryptDocStreams(streams, password), options, 'doc');
+        protection.session = opened.session;
+        encryption = opened.value.encryption;
+        if (opened.byDefault) encryption.defaultPassword = true;
+        const plain: Record<string, Uint8Array> = { WordDocument: opened.value.word, [tableName]: opened.value.table };
+        if (cfb.has('Data')) plain.Data = opened.value.data;
+        source = {
+          has: (path: string) => Object.prototype.hasOwnProperty.call(plain, path),
+          stream: (path: string) => {
+            if (!Object.prototype.hasOwnProperty.call(plain, path)) throw new Error(`Stream not found: ${path}`);
+            return plain[path];
+          },
+        };
+      }
       let model: Promise<DocModel> | undefined;
       const document = () =>
         (model ??= Promise.resolve().then(() => {
           try {
-            return readDoc(cfb);
+            return readDoc(source);
           } catch (error) {
             if (error instanceof Error && error.name === 'UnsupportedFileError') throw new UnsupportedFileError(error.message);
             throw error;
           }
         }));
-      return { format: 'doc', kind: 'document', ...base, workbook: notASpreadsheet, document, saveAsDocx: async () => buildDocx(await document()) };
+      const file = finish({
+        format: 'doc',
+        kind: 'document',
+        ...base,
+        save: asOpened('doc'),
+        workbook: notASpreadsheet,
+        document,
+        saveAsDocx: async (saveOptions?: SaveOptions) => protect(await buildDocx(await document()), saveOptions),
+      });
+      if (encryption) file.encryption = encryption;
+      return file;
     }
     if (cfb.has('Workbook') || cfb.has('Book')) {
+      // A file saved for both Excel 97 and Excel 95 has both streams; the newer one says more.
+      const name = cfb.has('Workbook') ? 'Workbook' : 'Book';
+      let decrypted: Uint8Array | undefined;
+      let encryption: FileEncryption | undefined;
+      // Only the first records are looked at: a workbook without a password has nothing read here.
+      if (findFilePass(cfb.head(name, XLS_HEAD))) {
+        const stream = streamOf(cfb, name);
+        const opened = await unlock((password) => decryptXlsStream(stream, password), options, 'xls');
+        protection.session = opened.session;
+        decrypted = opened.value.bytes;
+        encryption = opened.value.encryption;
+        if (opened.byDefault) encryption.defaultPassword = true;
+      }
       let model: Promise<Workbook> | undefined;
-      // Read on first use. What the reader cannot open (encrypted, older than BIFF5) is reported as unsupported.
+      // Read on first use. What the reader cannot open (older than BIFF5) is reported as unsupported.
       const workbook = () =>
         (model ??= Promise.resolve().then(() => {
           try {
-            return readXls(cfb);
+            return decrypted ? readXlsStream(decrypted, name, true).workbook : readXls(cfb);
           } catch (error) {
             if (error instanceof Error && error.name === 'UnsupportedFileError') throw new UnsupportedFileError(error.message);
             throw error;
           }
         }));
-      return { format: 'xls', kind: 'spreadsheet', ...base, workbook, saveAsXlsx: async () => buildXlsx(await workbook()) };
+      const file = finish({
+        format: 'xls',
+        kind: 'spreadsheet',
+        ...base,
+        save: asOpened('xls'),
+        workbook,
+        saveAsXlsx: async (saveOptions?: SaveOptions) => protect(await buildXlsx(await workbook()), saveOptions),
+      });
+      if (encryption) file.encryption = encryption;
+      return file;
     }
-    if (cfb.has('EncryptedPackage')) throw new UnsupportedFileError('Password-protected files are not supported yet');
+    if (isEncryptedPackage(cfb)) {
+      // A docx or an xlsx with a password: the package is inside, encrypted. Which of the two it is, the package says.
+      const opened = await unlock((password) => decryptPackage(cfb, password, { signal: options.signal, requireIntegrity: options.requireIntegrity }), options, 'ooxml');
+      const plain = opened.value.bytes;
+      const encryption = opened.value.encryption;
+      if (opened.byDefault) encryption.defaultPassword = true;
+      // Agile encryption without its HMAC: the file opens, and whoever opens it is told.
+      const warnings: FileWarning[] = [];
+      if (encryption.scheme === 'agile' && !encryption.integrity) {
+        warnings.push({ code: 'no-integrity', message: 'This encrypted file has no integrity check: its content could have been changed by someone who does not know the password' });
+      }
+      if (!(plain[0] === 0x50 && plain[1] === 0x4b)) {
+        opened.session.forget();
+        const error = new PasswordError('damaged', 'The encrypted file is damaged: what was decrypted is not a docx or xlsx package');
+        error.format = 'ooxml';
+        throw error;
+      }
+      try {
+        return await openWith(plain, {}, { session: opened.session, encryption, warnings });
+      } catch (error) {
+        opened.session.forget();
+        // Nothing vouched for what was decrypted: that it does not read as a package is most likely what that lets through.
+        if (warnings.length > 0 && !(error instanceof PasswordError)) {
+          const damaged = new PasswordError(
+            'damaged',
+            `The encrypted file is damaged: it has no integrity check, and what was decrypted cannot be read (${error instanceof Error ? error.message.slice(0, 160) : 'unreadable'})`,
+          );
+          damaged.format = 'ooxml';
+          throw damaged;
+        }
+        throw error;
+      }
+    }
     throw new UnsupportedFileError('Compound file is not a Word or Excel document');
   }
 
@@ -514,23 +848,69 @@ export async function open(input: Uint8Array | ArrayBuffer | Blob): Promise<Offi
   if (isRtf(bytes)) {
     let model: Promise<DocModel> | undefined;
     // Nothing writes RTF and nothing can be changed, so saving returns the original bytes.
-    return {
+    return finish({
       format: 'rtf',
       kind: 'document',
       container: 'rtf',
-      save: async () => bytes,
+      save: asOpened('RTF'),
       workbook: notASpreadsheet,
       document: () => (model ??= Promise.resolve().then(() => readRtf(bytes))),
-      saveAsDocx: async () => buildDocx(await (model ??= Promise.resolve().then(() => readRtf(bytes)))),
-    };
+      saveAsDocx: async (saveOptions?: SaveOptions) => protect(await buildDocx(await (model ??= Promise.resolve().then(() => readRtf(bytes)))), saveOptions),
+    });
   }
 
   throw new UnsupportedFileError('Not a Word or Excel file');
 }
 
+/**
+ * Opens a file for a view, asking for the password of a password-protected
+ * one: `onPassword` when there is one, otherwise a dialog inside
+ * `container`. Rejects with PasswordError "cancelled" when the question is
+ * given up, and with "required" or "wrong" where there is nobody to ask.
+ */
+async function openForView(
+  input: Uint8Array | ArrayBuffer | Blob,
+  options: Pick<MountOptions, 'password' | 'onPassword' | 'locale' | 'requireIntegrity'>,
+  container: HTMLElement | undefined,
+): Promise<OfficeFile> {
+  // Read once: every password that is tried reads the same bytes.
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input instanceof ArrayBuffer ? input : await input.arrayBuffer());
+  return openAsking(
+    (password, signal) => openWith(bytes, { password, signal, requireIntegrity: options.requireIntegrity }, {}),
+    options,
+    container && typeof document !== 'undefined' ? (onCancel) => new PasswordPrompt({ container, strings: resolveUiStrings(options.locale), onCancel }) : undefined,
+  );
+}
+
 export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveCommand'> {
   /** The file itself, or a URL to fetch it from. The format is detected from the content. */
   file: Uint8Array | ArrayBuffer | Blob | string;
+  /**
+   * The password of a password-protected file (see OpenOptions.password).
+   * When it is missing or wrong the user is asked: see `onPassword`. The
+   * file is then saved with the password that opened it, by save(), by
+   * saveNow(), by auto-save and by the Save button alike; `file.setPassword()`
+   * of the result changes that, and `save({ password })` does for one save.
+   */
+  password?: string;
+  /**
+   * Called when a password-protected file needs a password: none was given,
+   * or the one that was tried is wrong. `attempts` counts the passwords that
+   * were tried and failed. Return the password, or null to give up (mount()
+   * then rejects with PasswordError "cancelled"); a promise of either is
+   * waited for. It is called again for as long as the password is wrong.
+   *
+   * Without it the editor asks by itself, in a dialog inside the container
+   * (a field of type "password"; Escape gives up). The password is not kept
+   * in the page: the field is emptied when its content is taken.
+   */
+  onPassword?(request: PasswordRequest): string | null | undefined | Promise<string | null | undefined>;
+  /**
+   * Refuses an encrypted file that has no integrity check (see OpenOptions.requireIntegrity). Without it such a
+   * file is shown, and the user is told through the notice of the view and onNotice that its content could have
+   * been changed by someone who does not know the password.
+   */
+  requireIntegrity?: boolean;
   /**
    * Where the file is saved to, by the Save button of the toolbar, by Ctrl+S
    * or Cmd+S in the view and by saveNow():
@@ -743,9 +1123,11 @@ export interface MountedSpreadsheet {
   collab?: MountedCollab;
   /**
    * The file with every change made in the view, as bytes. A cell that is
-   * being edited is written first, as leaving it would do.
+   * being edited is written first, as leaving it would do. A file that was
+   * opened with a password is encrypted with it again (see SaveOptions); once
+   * the view is destroyed the password is forgotten, and such a save rejects.
    */
-  save(): Promise<Uint8Array>;
+  save(options?: SaveOptions): Promise<Uint8Array>;
   /**
    * Prints the sheet that is shown, or every visible sheet, through the
    * print dialog of the browser (which can also save a PDF): see
@@ -803,8 +1185,12 @@ export interface MountedDocument {
   view: DocumentView;
   /** The editor around the pages: the formatting toolbar. */
   editor: DocumentEditor;
-  /** The file as bytes: a docx with the changes made in the editor; doc and RTF, which are read-only, as the bytes they were opened from. */
-  save(): Promise<Uint8Array>;
+  /**
+   * The file as bytes: a docx with the changes made in the editor; doc and RTF, which are read-only, as the bytes they
+   * were opened from. A file that was opened with a password is encrypted with it again (see SaveOptions); once the
+   * view is destroyed the password is forgotten, and such a save rejects.
+   */
+  save(options?: SaveOptions): Promise<Uint8Array>;
   /**
    * Prints the document through the print dialog of the browser (which can
    * also save it as a PDF): see DocumentView.print(). Resolves when the dialog was closed.
@@ -854,6 +1240,17 @@ const FONT_WAIT_MS = 3000;
  * Other formats reject with UnsupportedFileError.
  */
 export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
+  // A file that was opened and is not shown after all (its conversion or its view failed) lets go of its password.
+  const opened: OfficeFile[] = [];
+  try {
+    return await mountFile(container, options, opened);
+  } catch (error) {
+    for (let i = 0; i < opened.length; i++) opened[i].close();
+    throw error;
+  }
+}
+
+async function mountFile(container: HTMLElement, options: MountOptions, held: OfficeFile[]): Promise<MountedView> {
   // Before anything is measured: the first text in a family the embedded font stands in for is what fetches it.
   if (options.fonts === false || options.fontsUrl === null) configureEmbeddedFonts({ baseUrl: null });
   else if (options.fontsUrl !== undefined) configureEmbeddedFonts({ baseUrl: options.fontsUrl });
@@ -885,13 +1282,21 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
   } else if (typeof Blob !== 'undefined' && input instanceof Blob && typeof (input as { name?: unknown }).name === 'string') {
     fileName = (input as unknown as { name: string }).name || undefined;
   }
-  /** The bytes of the file as it came: what it is known by when it is edited together. */
+  /**
+   * The bytes of the file as it came: what it is known by when it is edited together. For a password-protected
+   * file these are its encrypted bytes, the ones everybody in the room fetched: a file that was encrypted again
+   * is another sequence of bytes every time (new salts), so a version never stands for "this content", only
+   * for "these bytes at the address", which is what the versions of a save name as well (see sayShared()).
+   */
   let readBytes: Uint8Array | undefined;
   if (collabPlan) {
     readBytes = input instanceof Uint8Array ? input : input instanceof ArrayBuffer ? new Uint8Array(input) : new Uint8Array(await (input as Blob).arrayBuffer());
     input = readBytes;
   }
-  let file = await open(input);
+  let file = await openForView(input, options, container);
+  held.push(file);
+  /** What the file that was given has to say; a converted file is another object. */
+  const fileWarnings = file.warnings || [];
   let conversion: MountConversion | undefined;
   /** Why a file that had to be converted was not: it is then shown as it is, read-only. */
   let notConverted: string | undefined;
@@ -899,26 +1304,38 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     if (file.kind === 'document' && !file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
     // The model is written out as a new file of the format that can be saved, and that file is what is opened.
     const from = file.format;
-    const opened = await openConverted(file, open);
+    const opened = await openConverted(file, (bytes: Uint8Array) => open(bytes));
     if (opened.conversion) {
+      // The converted file took the password of its original over.
+      file.close();
       file = opened.file;
+      held.push(file);
       conversion = { from: opened.conversion.from, to: file.format as 'docx' | 'xlsx', warnings: opened.conversion.warnings };
     } else if (opened.failed !== undefined) notConverted = from;
   }
   const fontFailures = await fontsSettled;
   const converted = (): void => {
+    said();
+    // What the file has to say of itself is said through the view, and last: it is heard (in the live region of the
+    // view) also where the page does not listen, and it is what stays there.
+    for (let i = 0; i < fileWarnings.length; i++) {
+      if (fileWarnings[i].code === 'no-integrity') notice(resolveUiStrings(options.locale).noIntegrityCheck, 'error');
+    }
+  };
+  const said = (): void => {
     if (!options.onNotice) return;
     // In the language the views speak for the same option.
     const strings = resolveUiStrings(options.locale);
     for (let i = 0; i < fontFailures.length; i++) {
       options.onNotice({ message: strings.fontNotLoaded(fontFailures[i].family, fontFailures[i].pending), kind: fontFailures[i].pending ? 'info' : 'error' });
     }
+    // Last of what is said when the file is shown is what matters most: the view shows the notice that came last.
     if (conversion) options.onNotice({ message: strings.openedConverted(conversion.from, conversion.to), kind: 'info' });
     else if (notConverted !== undefined) options.onNotice({ message: strings.notConverted(notConverted), kind: 'error' });
     // Said before anything is typed: what is changed in this file has nowhere to go (see MountOptions.saveTo).
     if (conversion && controller && controller.blockedConversion) options.onNotice({ message: strings.saveConvertedNotAllowed(conversion.to), kind: 'error' });
   };
-  let save: () => Promise<Uint8Array>;
+  let save: (saveOptions?: SaveOptions) => Promise<Uint8Array>;
   // What the two kinds of view answer differently; set once the view is there.
   let commit: () => boolean = () => true;
   /** Whether the user is in the middle of something, and the file as the model is: what auto-save asks and takes. */
@@ -1065,6 +1482,8 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
         container.removeEventListener('keydown', onKeyDown, true);
         if (bound) bound.release();
         if (controller) controller.destroy();
+        // The password of a protected file is not kept longer than its view.
+        file.close();
       }
       destroyEditor();
     };
@@ -1120,11 +1539,11 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       view.setReadOnly = () => lockView(true);
       editor.setReadOnly = () => lockEditor(true);
     }
-    save = async () => {
+    save = async (saveOptions?: SaveOptions) => {
       // A composition still under way belongs to the document that is written.
       view.commitEditing();
       const changes = view.changeCount;
-      const bytes = await file.save();
+      const bytes = await file.save(saveOptions);
       // A change made while the file was written is not in these bytes.
       if (view.changeCount === changes) view.markSaved();
       return bytes;
@@ -1195,6 +1614,9 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     saveCommand: controller,
     fileName: options.fileName !== undefined ? options.fileName : fileName,
   };
+  // The editor has no use for the password, and does not keep it.
+  delete (sheetOptions as { password?: unknown }).password;
+  delete (sheetOptions as { onPassword?: unknown }).onPassword;
   if (file.format === 'xls') sheetOptions.readOnly = true;
   let editor = new SpreadsheetEditor(container, workbook, sheetOptions);
   let view = editor.view;
@@ -1205,10 +1627,10 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
     view.setReadOnly = () => lockView(true);
     editor.setReadOnly = () => lockEditor(true);
   }
-  save = async () => {
+  save = async (saveOptions?: SaveOptions) => {
     // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
     if (!view.commitPending()) throw new Error('Cannot save: a note or a sheet name that is being typed cannot be applied, or a dialog of rules is open with changes (confirm or close it first)');
-    return sharedBytes(() => file.save());
+    return sharedBytes(() => file.save(saveOptions));
   };
   commit = () => {
     try {
@@ -1267,12 +1689,18 @@ export async function mount(container: HTMLElement, options: MountOptions): Prom
       const tag = fileETag(response);
       const named = response.headers.get('ETag');
       const bytes = new Uint8Array(await response.arrayBuffer());
-      const next = await open(bytes);
-      if (next.format !== 'xlsx') throw new Error('The file is no longer a workbook that can be edited together');
+      // A password-protected file: its next version is opened with the password this one is kept with.
+      const next = await open(bytes, { passwordOf: file, requireIntegrity: options.requireIntegrity });
+      if (next.format !== 'xlsx') {
+        next.close();
+        throw new Error('The file is no longer a workbook that can be edited together');
+      }
       const nextBook = await next.workbook();
       const shownSheet = view.activeSheet;
       if (bound) bound.release();
       detach();
+      // The file that was shown lets go of its password; the new one holds its own.
+      file.close();
       file = next;
       workbook = nextBook;
       editor = new SpreadsheetEditor(container, workbook, { ...sheetOptions, sheet: shownSheet < workbook.sheets.length ? shownSheet : undefined });

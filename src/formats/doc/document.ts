@@ -102,6 +102,9 @@ const MAX_PARAGRAPHS = 2000000;
 const DOP2002_SIZE = 594;
 const DOP2003_SIZE = 616;
 
+/** Where the streams of a document come from: a compound file, or the decrypted streams of one that was password-protected. */
+export type DocStreamSource = Pick<CfbFile, 'has' | 'stream'>;
+
 export interface ReadDocOptions {
   /** Paragraphs the document may have before it is refused; 2,000,000 when missing. A host with little memory may lower it. */
   maxParagraphs?: number;
@@ -207,7 +210,7 @@ class DocReader {
   private sections: SectionProps[] = [];
   private readonly maxParagraphs: number;
 
-  constructor(cfb: CfbFile, options: ReadDocOptions) {
+  constructor(cfb: DocStreamSource, options: ReadDocOptions) {
     const limit = options.maxParagraphs;
     this.maxParagraphs = limit !== undefined && limit >= 1 && limit < MAX_PARAGRAPHS ? Math.floor(limit) : MAX_PARAGRAPHS;
     if (!cfb.has('WordDocument')) throw invalid('the file has no WordDocument stream');
@@ -1039,6 +1042,6 @@ class DocReader {
  * "Invalid doc:" for a file whose text cannot be read or that has more
  * paragraphs than the reader takes.
  */
-export function readDoc(cfb: CfbFile, options: ReadDocOptions = {}): DocModel {
+export function readDoc(cfb: DocStreamSource, options: ReadDocOptions = {}): DocModel {
   return new DocReader(cfb, options).read();
 }

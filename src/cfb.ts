@@ -1,5 +1,5 @@
-// Compound File Binary reader: the container behind legacy .doc and .xls.
-// Read-only for now; the writer comes with binary-format saving.
+// Compound File Binary reader: the container behind legacy .doc and .xls,
+// and of a password-protected docx or xlsx. The writer is cfb-write.ts.
 
 const SIGNATURE = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const MAX_REGULAR_SECTOR = 0xfffffffa;
@@ -150,6 +150,28 @@ export class CfbFile {
 
   has(path: string): boolean {
     return this.raw.has(path);
+  }
+
+  /**
+   * The first bytes of a stream, `size` at most, without reading the rest of it: enough to tell what a
+   * stream is. Empty for a path that is no stream.
+   */
+  head(path: string, size: number): Uint8Array {
+    const entry = this.raw.get(path);
+    if (!entry || entry.type !== TYPE_STREAM) return new Uint8Array(0);
+    const want = Math.max(0, Math.min(size, entry.size));
+    const mini = entry.size < this.miniCutoff;
+    const unit = mini ? MINI_SECTOR_SIZE : this.sectorSize;
+    const table = mini ? this.miniFat : this.fat;
+    const out = new Uint8Array(want);
+    let sector = entry.start;
+    for (let at = 0, steps = 0; at < want && sector <= MAX_REGULAR_SECTOR && steps <= table.length; at += unit, steps++) {
+      const offset = mini ? sector * MINI_SECTOR_SIZE : this.offsetOf(sector);
+      const source = mini ? this.miniStream : this.bytes;
+      out.set(source.subarray(offset, Math.min(source.length, offset + Math.min(unit, want - at))), at);
+      sector = table[sector] ?? NO_STREAM;
+    }
+    return out;
   }
 
   /** Returns the content of a stream. */

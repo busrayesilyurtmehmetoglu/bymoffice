@@ -95,6 +95,7 @@
             unsupported: 'Bu dosya türü desteklenmiyor',
             corrupt: 'Dosya bozuk, açılamadı',
             'load-failed': 'Dosya yüklenemedi',
+            'password-cancelled': 'Parola girilmedi; dosya açılmadı',
             engine: 'Bu cihazda düzenleyici çalıştırılamıyor',
           },
           en: {
@@ -104,6 +105,7 @@
             unsupported: 'This type of file is not supported',
             corrupt: 'The file is damaged and could not be opened',
             'load-failed': 'The file could not be loaded',
+            'password-cancelled': 'No password was given; the file was not opened',
             engine: 'The editor cannot run on this device',
           },
         };
@@ -116,7 +118,8 @@
         // Only the page's own words are shown: what went wrong in detail is for the application, not the user.
         function show(state, code) {
           shown = state === 'error' && words[language][code] ? code : state;
-          status.hidden = state === 'open';
+          // "password": the question for the password of a file is asked inside the editor's element.
+          status.hidden = state === 'open' || state === 'password';
           title.textContent = words[language][shown] || '';
         }
         setLanguage(navigator.language);

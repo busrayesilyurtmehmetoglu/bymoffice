@@ -55,4 +55,4 @@ Yalnız değiştirilen parçalar yeniden üretilir. Her yeni özellik `pnpm corp
 - [ ] Aşama 6: grafikler, pivot, PDF çıktısı
 - [ ] Aşama 7: eşzamanlı düzenleme
 
-Bilinen eksikler: parola korumalı dosyalar; docx, doc, RTF ve xls düzenleme (salt okunur açılırlar). Ayrıntı: `docs/kullanim-kilavuzu.md`.
+Parola korumalı (şifreli) dosyalar açılır; docx ve xlsx aynı parolayla şifreli kaydedilir. Bilinen eksikler: doc, RTF ve xls kendi biçimlerinde düzenlenemez (salt okunur açılır, docx/xlsx'e çevrilerek düzenlenir). Ayrıntı: `docs/kullanim-kilavuzu.md`.

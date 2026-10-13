@@ -92,6 +92,13 @@ await editor.setReadOnly(true);
 final belge = await editor.load(docxBytes, name: 'yazı.docx', toolbar: true);
 print(belge.isDocument);   // true; belge.sheets boştur
 
+// Parola korumalı dosya: parola biliniyorsa `password` ile; bilinmiyorsa sayfa kullanıcıya kendi kutusunda sorar
+// ve `onPasswordRequired` de ateşlenir (kendi kutunuzu gösterecekseniz `passwordPrompt: false` verin ve
+// `sendPassword(parola)` ile yanıtlayın; `sendPassword(null)` vazgeçer → BymOfficeException('password-cancelled')).
+// Dosya aynı parolayla şifreli kaydedilir (`sifreli.encrypted == true`). Yüklemenin 60 sn'lik zaman aşımı
+// parola beklenirken de işler: `BymOfficeController(requestTimeout: …)` ile uzatın. (Bu ek derlenmedi.)
+final sifreli = await editor.load(bytes, name: 'gizli.xlsx', password: 'Parola1234_');
+
 // Eski biçimler (doc, RTF, xls): `convert: true` ile docx/xlsx'e çevrilip düzenlenir.
 final eski = await editor.load(docBytes, name: 'eski.doc', convert: true);
 print('${eski.convertedFrom} -> ${eski.format}');   // doc -> docx

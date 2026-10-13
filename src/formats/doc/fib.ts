@@ -89,8 +89,8 @@ export function readFib(word: Uint8Array): Fib {
   if (nFib < NFIB_WORD97) throw new UnsupportedDocError('Documents of Word 95 and earlier are not supported');
   const flags = u16(word, 10);
   if (flags & 0x0100) {
-    // fEncrypted; with fObfuscated the "encryption" is the XOR scheme, which is not read either.
-    throw new UnsupportedDocError('Password-protected documents are not supported yet');
+    // fEncrypted: the streams have to be decrypted first (see crypto/legacy.ts), which clears the flag.
+    throw new UnsupportedDocError('Password-protected documents have to be opened with their password');
   }
   if (word.length < FC_LCB) throw invalid('the file header is cut short');
   const pairs = u16(word, FC_LCB - 2);
