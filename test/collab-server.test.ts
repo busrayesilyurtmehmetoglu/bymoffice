@@ -258,6 +258,21 @@ async function until(what: string, ready: () => boolean, ms = WAIT): Promise<voi
   }
 }
 
+/** The name of a room, as `hello` tells it and as a `join` may say it. */
+const EPOCH = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Joins as a client does whose file says where it was saved: with the revision and with the name the room had
+ * then. Only to read, so that nobody is asked for anything. The `hello` it gets; its `v` are those of `v` the
+ * room has heard of.
+ */
+async function comesBack(port: number, ep: string, since: number, v: string[], path = '/doc'): Promise<any> {
+  const { hello } = await joined(port, { v, since, ep, ro: true }, path);
+  assert.equal(hello.from, since, `a join with the name of the room is caught up from the revision it names: ${JSON.stringify(hello)}`);
+  assert.equal(hello.ep, ep, 'the room is the one that was named');
+  return hello;
+}
+
 /** Sends `count` operations one after another and waits for each to come back. */
 async function operations(c: Client, from: number, count: number, ops: unknown[] = [1]): Promise<void> {
   for (let i = 0; i < count; i++) {
@@ -665,9 +680,11 @@ test('messages that are not what the contract says are bad messages', async () =
 test('an operation on the current revision goes to everyone, its sender too, and a stale one is refused', async () => {
   await withServer({}, async (port, server) => {
     const a = await joined(port, { v: ['v1'], user: { name: 'Ada', color: '#c00' } });
-    assert.deepEqual(a.hello, { t: 'hello', pv: 1, rev: 0, from: 0, you: a.hello.you, ro: false, v: ['v1'], peers: [] });
+    assert.deepEqual(a.hello, { t: 'hello', pv: 1, ep: a.hello.ep, rev: 0, from: 0, you: a.hello.you, ro: false, v: ['v1'], peers: [] });
     assert.equal(typeof a.hello.you, 'string');
+    assert.match(a.hello.ep, EPOCH, 'hello tells the name of the room');
     const b = await joined(port, { v: ['v1'] });
+    assert.equal(b.hello.ep, a.hello.ep, 'everyone in the room is told the same name');
     assert.deepEqual(b.hello.peers, [{ id: a.hello.you, user: { name: 'Ada', color: '#c00' }, ro: false }]);
     assert.notEqual(b.hello.you, a.hello.you, 'every connection has its own id');
     assert.deepEqual(await a.c.json(), { t: 'peer', id: b.hello.you, user: {}, ro: false });
@@ -711,12 +728,12 @@ test('a connection that comes back with `since` gets the operations it missed', 
     const a = await joined(port);
     await operations(a.c, 0, 3);
     const back = await connect(port);
-    back.send({ t: 'join', v: ['something else'], since: 1, key: 'back' });
+    back.send({ t: 'join', v: ['something else'], since: 1, ep: a.hello.ep, key: 'back' });
     const hello = await back.json();
     assert.deepEqual(
-      { t: hello.t, rev: hello.rev, from: hello.from, v: hello.v },
-      { t: 'hello', rev: 3, from: 1, v: [] },
-      'since decides, whatever the versions say',
+      { t: hello.t, ep: hello.ep, rev: hello.rev, from: hello.from, v: hello.v },
+      { t: 'hello', ep: a.hello.ep, rev: 3, from: 1, v: [] },
+      'since decides in the room it names, whatever the versions say',
     );
     assert.deepEqual(await back.json(), { t: 'op', rev: 2, id: a.c.id('op1'), from: a.hello.you, ops: [1] });
     assert.deepEqual(await back.json(), { t: 'op', rev: 3, id: a.c.id('op2'), from: a.hello.you, ops: [1] });
@@ -726,16 +743,17 @@ test('a connection that comes back with `since` gets the operations it missed', 
     assert.equal((await back.json()).rev, 4);
 
     const current = await connect(port);
-    current.send({ t: 'join', v: [], since: 4 });
+    current.send({ t: 'join', v: [], since: 4, ep: a.hello.ep });
     assert.equal((await current.json()).from, 4);
     await current.settled();
   });
 });
 
-test('a known version joins from the revision it was saved at, and the newest one that matches wins', async () => {
+test('a version that was saved is not joined from by itself: its client names the revision and the room', async () => {
   await withServer({}, async (port) => {
     const a = await joined(port, { v: ['v1', 'v1-etag'] });
     assert.deepEqual(a.hello.v, ['v1', 'v1-etag'], 'the first to come writes its versions at revision 0');
+    const ep = a.hello.ep;
     await operations(a.c, 0, 2);
     const b = await joined(port, { v: ['v1-etag'] });
     assert.deepEqual({ from: b.hello.from, rev: b.hello.rev, v: b.hello.v }, { from: 0, rev: 2, v: ['v1-etag'] });
@@ -749,13 +767,29 @@ test('a known version joins from the revision it was saved at, and the newest on
     await operations(a.c, 2, 1);
     assert.equal((await b.c.json()).rev, 3);
 
-    const late = await joined(port, { v: ['v2'] });
-    assert.deepEqual({ from: late.hello.from, rev: late.hello.rev, v: late.hello.v }, { from: 2, rev: 3, v: ['v2'] });
+    // The table knows v2 as revision 2, and that is no ground to start from: anybody who may write could have said it.
+    const late = await knock(port, { v: ['v2'], key: 'late' });
+    assert.deepEqual(late.answer, { t: 'reset', rev: 3, v: ['v2'] }, 'a version of a save does not get in by itself');
+    assert.deepEqual(await a.c.json(), { t: 'sync' });
+    assert.deepEqual(await b.c.json(), { t: 'sync' });
+    // The same client, with what its file says of itself: the revision, and the room it was saved in.
+    late.c.send({ t: 'join', v: ['v2'], since: 2, ep, key: 'late' });
+    const hello = await late.c.json();
+    assert.deepEqual(
+      { t: hello.t, ep: hello.ep, from: hello.from, rev: hello.rev, v: hello.v },
+      { t: 'hello', ep, from: 2, rev: 3, v: ['v2'] },
+      'the room says that it has heard of the version',
+    );
     assert.deepEqual(await late.c.json(), { t: 'op', rev: 3, id: a.c.id('op2'), from: a.hello.you, ops: [1] });
     await late.c.settled();
+    assert.equal((await a.c.json()).t, 'peer');
+    assert.equal((await b.c.json()).t, 'peer');
 
-    const both = await joined(port, { v: ['v1', 'v2', 'unknown'] });
-    assert.deepEqual({ from: both.hello.from, v: both.hello.v }, { from: 2, v: ['v2'] }, 'the newest match');
+    // With `since`, hello names every version the room has heard of; without, only the foundation counts.
+    const named = await comesBack(port, ep, 2, ['v1', 'v2', 'unknown']);
+    assert.deepEqual(named.v, ['v1', 'v2'], 'those of the foundation and those of a save, and no other');
+    const both = await joined(port, { v: ['v2', 'v1', 'unknown'] });
+    assert.deepEqual({ from: both.hello.from, v: both.hello.v }, { from: 0, v: ['v1'] }, 'the save beside it does not move the join');
 
     // A save that names a revision the room does not have is passed on without it.
     assert.equal((await a.c.json()).t, 'peer');
@@ -769,8 +803,9 @@ test('a known version joins from the revision it was saved at, and the newest on
     b.c.send({ t: 'saved', v: ['v7'], rev: 1.5 });
     assert.deepEqual(await a.c.json(), { t: 'saved', from: b.hello.you, v: ['v7'] });
     const stranger = await connect(port);
-    stranger.send({ t: 'join', v: ['v9', 'v8', 'v7'] });
-    assert.deepEqual(await stranger.json(), { t: 'reset', rev: 3, v: ['v2'] }, 'none of them was written down');
+    stranger.send({ t: 'join', v: ['v9', 'v8', 'v7'], ro: true });
+    assert.deepEqual(await stranger.json(), { t: 'reset', rev: 3, v: ['v2'] }, 'the newest the room knows is still v2');
+    assert.deepEqual((await comesBack(port, ep, 3, ['v9', 'v8', 'v7'])).v, [], 'none of them was written down');
   });
 });
 
@@ -841,13 +876,14 @@ test('the log is cut at its limits, and what was cut can no longer be joined fro
     assert.deepEqual({ rev: room.rev, floor: room.floor, logEntries: room.logEntries }, { rev: 5, floor: 2, logEntries: 3 });
 
     const cut = await connect(port);
-    cut.send({ t: 'join', v: [], since: 1 });
+    const ep = a.hello.ep;
+    cut.send({ t: 'join', v: [], since: 1, ep });
     assert.deepEqual(await cut.json(), { t: 'reset', rev: 5, v: ['v2'] }, 'revision 1 is below the floor');
     assert.deepEqual(await a.c.json(), { t: 'sync' });
     cut.send({ t: 'join', v: ['v1'] });
     assert.deepEqual(await cut.json(), { t: 'reset', rev: 5, v: ['v2'] }, 'the version of revision 0 was forgotten');
     assert.deepEqual(await a.c.json(), { t: 'sync' }, 'the room is asked twice a minute');
-    cut.send({ t: 'join', v: [], since: 2 });
+    cut.send({ t: 'join', v: [], since: 2, ep });
     assert.equal((await cut.json()).from, 2, 'the floor itself can be joined from');
     for (const rev of [3, 4, 5]) assert.equal((await cut.json()).rev, rev);
     await cut.settled();
@@ -856,8 +892,9 @@ test('the log is cut at its limits, and what was cut can no longer be joined fro
     await operations(a.c, 5, 1);
     assert.equal(server.rooms()[0].floor, 3);
     const late = await connect(port);
-    late.send({ t: 'join', v: ['v2'] });
+    late.send({ t: 'join', v: ['v2'], since: 2, ep, ro: true });
     assert.deepEqual(await late.json(), { t: 'reset', rev: 6, v: [] }, 'v2 was saved at revision 2, below the floor');
+    assert.deepEqual((await comesBack(port, ep, 3, ['v1', 'v2'])).v, ['v1'], 'the table let go of v2; the foundation is not forgotten');
   });
   await withServer({ maxLogBytes: 4000 }, async (port, server) => {
     const a = await joined(port);
@@ -1479,11 +1516,12 @@ test('a version is written down once: a save cannot move the version a room was 
     // One version that is taken spoils the whole save.
     forger.c.send({ t: 'saved', v: ['v5', 'orig-etag'], rev: 5 });
     assert.deepEqual(await a.c.json(), { t: 'saved', from: forger.hello.you, v: ['v5', 'orig-etag'] });
-    const second = await joined(port, { v: ['v2'] });
-    assert.equal(second.hello.from, 2, 'v2 is still revision 2');
+    forger.c.send({ t: 'saved', v: ['v2'], rev: 2 });
+    assert.deepEqual(await a.c.json(), { t: 'saved', from: forger.hello.you, v: ['v2'], rev: 2 }, 'v2 is still revision 2');
     const third = await knock(port, { v: ['v5'] });
-    assert.equal(third.answer.t, 'reset', 'v5 was not written down');
+    assert.equal(third.answer.t, 'reset', 'v5 is no ground to join on');
     assert.deepEqual(third.answer.v, ['v2']);
+    assert.deepEqual((await comesBack(port, a.hello.ep, 2, ['v2', 'v5'])).v, ['v2'], 'v2 is known and v5 was not written down');
   });
 });
 
@@ -1504,7 +1542,7 @@ test('a save names only a revision its sender has seen', async () => {
   await withServer({}, async (port) => {
     const a = await joined(port, { v: ['v1'] });
     await operations(a.c, 0, 3);
-    const b = await joined(port, { v: [], since: 2 });
+    const b = await joined(port, { v: [], since: 2, ep: a.hello.ep });
     assert.equal(b.hello.from, 2);
     assert.equal((await b.c.json()).rev, 3);
     assert.equal((await a.c.json()).t, 'peer');
@@ -1524,9 +1562,13 @@ test('a save names only a revision its sender has seen', async () => {
 
     for (const version of ['below', 'beyond']) {
       const stranger = await knock(port, { v: [version] });
-      assert.deepEqual(stranger.answer, { t: 'reset', rev: 3, v: ['at-three'] }, `${version} was not written down`);
+      assert.deepEqual(stranger.answer, { t: 'reset', rev: 3, v: ['at-three'] }, `${version} is no ground to join on`);
     }
-    assert.equal((await joined(port, { v: ['at-two'] })).hello.from, 2);
+    assert.deepEqual(
+      (await comesBack(port, a.hello.ep, 2, ['below', 'beyond', 'at-two', 'at-three', 'at-one'])).v,
+      ['at-two', 'at-three', 'at-one'],
+      'what named a revision its sender had not seen was not written down',
+    );
   });
 });
 
@@ -1540,11 +1582,14 @@ test('a room remembers sixteen versions; the oldest save is forgotten first, the
     }
     await a.c.settled();
     const first = await knock(port, { v: ['r1-0', 'r1-7', 'r2-0'] });
-    assert.equal(first.answer.t, 'reset', 'the nine oldest saves made room for newer ones');
+    assert.equal(first.answer.t, 'reset');
     first.c.send({ t: 'join', v: ['v0'] });
     assert.equal((await first.c.json()).from, 0, 'the version of the foundation is kept');
-    assert.equal((await joined(port, { v: ['r2-1'] })).hello.from, 2);
-    assert.equal((await joined(port, { v: ['r3-7'] })).hello.from, 3);
+    assert.deepEqual(
+      (await comesBack(port, a.hello.ep, 3, ['r1-0', 'r1-7', 'r2-0', 'r2-1', 'r3-0', 'r3-7', 'v0'])).v,
+      ['r2-1', 'r3-0', 'r3-7', 'v0'],
+      'the nine oldest saves made room for newer ones',
+    );
   });
 });
 
@@ -2284,7 +2329,7 @@ test('the key of a join is in no message of the server, in nothing it logs and n
     // One that is reset and then gets in, one that is replaced, one that is turned away for what it says.
     const reset = await knock(port, { v: ['v0'], key: `${mark}cem` });
     assert.equal(reset.answer.t, 'reset');
-    reset.c.send({ t: 'join', v: ['v2'], key: `${mark}cem` });
+    reset.c.send({ t: 'join', v: ['v2'], since: 1, ep: a.hello.ep, key: `${mark}cem` });
     assert.equal((await reset.c.json()).t, 'hello');
     /** Whatever else it was told before, the connection is turned away with `code`. */
     const turned = async (c: Client, code: string): Promise<void> => {
@@ -2363,8 +2408,8 @@ test('a version that fell out of the full table cannot be written again, at any 
     assert.equal((await says(a.c, b.c, ['e1', 'h1'], 3)).rev, 3, 'the true save');
     await operations(a.c, 3, 6);
     for (let rev = 4; rev <= 9; rev++) assert.equal((await b.c.json()).rev, rev);
-    const control = await joined(port, { v: ['e1'], ro: true });
-    assert.equal(control.hello.from, 3, 'while it is in the table, e1 is joined from 3');
+    const ep = a.hello.ep;
+    assert.deepEqual((await comesBack(port, ep, 3, ['e1'])).v, ['e1'], 'while it is in the table, the room has heard of e1');
 
     // One who may write says so straight away: the table says otherwise.
     assert.equal('rev' in (await says(b.c, a.c, ['e1'], 9)), false, 'e1 is of revision 3');
@@ -2374,8 +2419,7 @@ test('a version that fell out of the full table cannot be written again, at any 
       const names = [0, 1, 2, 3, 4, 5, 6, 7].map(() => `junk${junk++}`);
       assert.equal((await says(b.c, a.c, names, 9)).rev, 9);
     }
-    const fallen = await knock(port, { v: ['e1'], ro: true });
-    assert.equal(fallen.answer.t, 'reset', 'e1 fell out of the table');
+    assert.deepEqual((await comesBack(port, ep, 3, ['e1'])).v, [], 'e1 fell out of the table');
     for (const version of ['e1', 'h1', 'junk0']) {
       for (const rev of [9, 3, 0]) {
         const heard = await says(b.c, a.c, [version], rev);
@@ -2384,16 +2428,17 @@ test('a version that fell out of the full table cannot be written again, at any 
     }
     // One of them spoils a save, as a version that is taken does.
     assert.equal('rev' in (await says(b.c, a.c, ['brand-new', 'e1'], 9)), false);
-    for (const version of ['e1', 'h1', 'junk0', 'brand-new']) {
-      const stale = await knock(port, { v: [version], ro: true });
-      assert.equal(stale.answer.t, 'reset', `whoever has ${version} is told to load the file again, not caught up from a lie`);
-      assert.equal(stale.answer.rev, 9);
-    }
+    assert.deepEqual(
+      (await comesBack(port, ep, 9, ['e1', 'h1', 'junk0', 'brand-new', 'junk31'])).v,
+      ['junk31'],
+      'whoever has one of them is not told that the room knows its file',
+    );
     // The honest save that follows is written as before.
-    await operations(a.c, 9, 1);
+    a.c.send({ t: 'op', base: 9, id: a.c.id('op9'), ops: [1] });
+    assert.equal((await next(a.c)).rev, 10);
     assert.equal((await next(b.c)).rev, 10);
     assert.equal((await says(a.c, b.c, ['e2'], 10)).rev, 10);
-    assert.equal((await joined(port, { v: ['e2'] })).hello.from, 10);
+    assert.deepEqual((await comesBack(port, ep, 10, ['e2'])).v, ['e2']);
   });
 });
 
@@ -2415,7 +2460,7 @@ test('a version that the log moved past cannot be written again', async () => {
     }
     const stale = await knock(port, { v: ['s1'], ro: true });
     assert.deepEqual(stale.answer, { t: 'reset', rev: 5, v: ['s3'] });
-    assert.equal((await joined(port, { v: ['s3'] })).hello.from, 3, 's3 is still in the log');
+    assert.deepEqual((await comesBack(port, a.hello.ep, 3, ['s1', 's3'])).v, ['s3'], 's3 is still in the log');
   });
 });
 
@@ -2433,17 +2478,22 @@ test('the versions of the foundation and those of the last save do not fall out 
     // The table is full: f0 f1 x j1..j13. This save names x, the oldest, again, and seven new ones.
     const last = ['x', 'n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7'];
     assert.equal((await says(a.c, b.c, last, 1)).rev, 1);
-    assert.equal((await joined(port, { v: ['x'] })).hello.from, 1, 'x is of the last save: it did not make room');
-    assert.equal((await joined(port, { v: ['n7'] })).hello.from, 1);
-    assert.equal((await joined(port, { v: ['j8'] })).hello.from, 1, 'j8 was not the oldest');
-    assert.equal((await knock(port, { v: ['j7'], ro: true })).answer.t, 'reset', 'the seven oldest of the others made room');
+    const ep = a.hello.ep;
+    assert.deepEqual(
+      (await comesBack(port, ep, 1, ['x', 'n7', 'j8', 'j7', 'j1'])).v,
+      ['x', 'n7', 'j8'],
+      'x is of the last save: it did not make room; the seven oldest of the others did',
+    );
     // A save of eight new ones: the last save is this one now, and the foundation stays.
     const newest = [1, 2, 3, 4, 5, 6, 7, 8].map((index) => `m${index}`);
     assert.equal((await says(a.c, b.c, newest, 2)).rev, 2);
-    assert.equal((await joined(port, { v: ['m1'] })).hello.from, 2);
-    assert.equal((await joined(port, { v: ['f1'] })).hello.from, 0, 'the foundation is kept');
+    assert.deepEqual(
+      (await comesBack(port, ep, 2, ['m1', 'm8', 'f1', 'f0', 'x'])).v,
+      ['m1', 'm8', 'f1', 'f0'],
+      'x is of the last save no more; the foundation is kept',
+    );
+    assert.equal((await joined(port, { v: ['f1'] })).hello.from, 0, 'the foundation is joined from');
     assert.equal((await joined(port, { v: ['f0'] })).hello.from, 0);
-    assert.equal((await knock(port, { v: ['x'], ro: true })).answer.t, 'reset', 'x is of the last save no more');
   });
 });
 
@@ -2465,13 +2515,11 @@ test('a room remembers only so many versions that fell out; after that no save i
     assert.equal('rev' in (await says(a.c, b.c, ['a0'], 2)), false);
     assert.equal('rev' in (await says(a.c, b.c, ['a5'], 2)), false, 'a5 fell out when nothing more was remembered');
     assert.equal('rev' in (await says(b.c, a.c, ['new'], 2)), false, 'whoever says it');
-    for (const version of ['new', 'a0', 'a5']) {
-      assert.equal((await knock(port, { v: [version], ro: true })).answer.t, 'reset', `${version} is not in the table`);
-    }
+    assert.deepEqual((await comesBack(port, a.hello.ep, 2, ['new', 'a0', 'a5'])).v, [], 'none of them is in the table');
     // A save that only says what the table says is passed on whole, and what is in the table is joined from.
     assert.equal((await says(a.c, b.c, ['c0', 'c7'], 1)).rev, 1);
     assert.equal('rev' in (await says(a.c, b.c, ['c0'], 2)), false);
-    assert.equal((await joined(port, { v: ['c7'] })).hello.from, 1);
+    assert.deepEqual((await comesBack(port, a.hello.ep, 1, ['c7', 'f'])).v, ['c7', 'f']);
     assert.equal((await joined(port, { v: ['f'] })).hello.from, 0);
   });
 });
@@ -2491,7 +2539,7 @@ test('a connection has only so many saves a minute written down', async () => {
     const seventh = await says(a.c, b.c, ['s7'], 1);
     assert.equal('rev' in seventh, false, `the seventh save of the minute was written down: ${JSON.stringify(seventh)}`);
     assert.equal(a.c.closed, false, 'the connection is not closed');
-    assert.equal((await knock(port, { v: ['s7'], ro: true })).answer.t, 'reset', 's7 is not in the table');
+    assert.deepEqual((await comesBack(port, a.hello.ep, 1, ['s6', 's7'])).v, ['s6'], 's7 is not in the table');
     // The limit is of the connection.
     assert.equal((await says(b.c, a.c, ['t1'], 1)).rev, 1);
     time += 9000;
@@ -2502,7 +2550,7 @@ test('a connection has only so many saves a minute written down', async () => {
     // What was not written for its rate was not spoiled: it can be said again.
     time += 10000;
     assert.equal((await says(a.c, b.c, ['s7'], 1)).rev, 1);
-    assert.equal((await joined(port, { v: ['s7'] })).hello.from, 1);
+    assert.deepEqual((await comesBack(port, a.hello.ep, 1, ['s7'])).v, ['s7']);
   });
   await withServer({ now: () => time, savedPerMinute: 2 }, async (port) => {
     const a = await joined(port, { v: ['v0'] });
@@ -2621,6 +2669,7 @@ test('a room that is founded again forgets nothing it has let go of', async () =
       assert.equal('rev' in heard, false, `${version}, which the room knew as revision 0, is written at 2: ${JSON.stringify(heard)}`);
       assert.equal((await knock(port, { v: [version], ro: true })).answer.t, 'reset');
     }
+    assert.deepEqual((await comesBack(port, b.hello.ep, 2, ['f', 's', 'g'])).v, ['g'], 'the room has heard of neither any more');
   });
   await withServer({ idleRoomMs: 600000 }, async (port, server) => {
     const empty = (): Promise<void> => until('the room to be empty', () => server.rooms()[0].connections === 0);
@@ -2635,4 +2684,278 @@ test('a room that is founded again forgets nothing it has let go of', async () =
     assert.equal(b.hello.from, 0);
     assert.equal((await says(a.c, b.c, ['f'], 0)).rev, 0, 'and that is revision 0 again');
   });
+});
+
+// --- The name of a room ---------------------------------------------------------
+
+test('hello tells the name of the room, and a join names it in the letters of a key or is a bad message', async () => {
+  await withServer({}, async (port, server) => {
+    const a = await joined(port, { v: ['v1'] });
+    assert.equal(typeof a.hello.ep, 'string', `hello carries the name of the room: ${JSON.stringify(a.hello)}`);
+    assert.match(a.hello.ep, EPOCH, 'the name is made of what a join may send back');
+    const b = await joined(port, { v: ['v1'] });
+    assert.equal(b.hello.ep, a.hello.ep, 'the second to come is told the same name');
+    const other = await joined(port, { v: ['v1'] }, '/other');
+    assert.match(other.hello.ep, EPOCH);
+    assert.notEqual(other.hello.ep, a.hello.ep, 'another room has another name');
+
+    for (const ep of ['', 'e'.repeat(65), 'a b', 'a:b', 'ş', 'a.b', 'a#b', 'a/b', 7, null, true, ['a'], { ep: 'a' }]) {
+      await turnedAway(port, { v: ['v1'], since: 0, ep }, 1008, 'bad-message').catch((error) => {
+        throw new Error(`ep ${JSON.stringify(ep)}: ${error.message}`);
+      });
+      await turnedAway(port, { v: ['v1'], ep }, 1008, 'bad-message', '/nowhere').catch((error) => {
+        throw new Error(`ep ${JSON.stringify(ep)} in a room that does not exist: ${error.message}`);
+      });
+    }
+    assert.equal(server.rooms().some((room) => room.key === '/nowhere'), false, 'a join that is refused makes no room');
+    // A name that is well made and not the room's is no fault: it is only not this room.
+    for (const ep of ['a', 'Az09_-', 'e'.repeat(64)]) {
+      const { answer } = await knock(port, { v: ['v1'], since: 0, ep });
+      assert.equal(answer.t, 'hello', `ep ${ep}: ${JSON.stringify(answer)}`);
+      assert.equal(answer.ep, a.hello.ep, 'hello tells the name the room has, not the one that was sent');
+    }
+  });
+});
+
+test('a `since` without the name of the room, or with another name, is not looked at', async () => {
+  await withServer({}, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const ep = a.hello.ep;
+    await operations(a.c, 0, 3);
+    a.c.send({ t: 'saved', v: ['s3'], rev: 3 });
+    await a.c.settled();
+    const elsewhere = await joined(port, { v: ['v0'] }, '/elsewhere');
+    await operations(elsewhere.c, 0, 3);
+    assert.notEqual(elsewhere.hello.ep, ep);
+    const wrong: [string, object][] = [
+      ['no name', {}],
+      ['a name nobody has', { ep: 'not-this-room' }],
+      ['the name of another room', { ep: elsewhere.hello.ep }],
+      ['the name in other letters', { ep: ep.toUpperCase() === ep ? ep.toLowerCase() : ep.toUpperCase() }],
+    ];
+    for (const [name, extra] of wrong) {
+      // A file the room was not founded on: with nothing to go by, it is to be loaded again.
+      for (const [v, since] of [[['s3'], 3], [[], 2], [['unknown'], 0], [['s3'], 99]] as [string[], number][]) {
+        const { answer } = await knock(port, { v, since, ...extra, ro: true });
+        assert.deepEqual(
+          answer,
+          { t: 'reset', rev: 3, v: ['s3'] },
+          `${name}, v ${JSON.stringify(v)}, since ${since}: the join was to be turned back`,
+        );
+      }
+      // The file the room was founded on gets in as it would without `since`: from the beginning.
+      const { c, answer } = await knock(port, { v: ['v0', 's3'], since: 3, ...extra, ro: true });
+      assert.deepEqual(
+        { t: answer.t, ep: answer.ep, from: answer.from, rev: answer.rev, v: answer.v },
+        { t: 'hello', ep, from: 0, rev: 3, v: ['v0'] },
+        `${name}: the foundation is joined from 0, whatever since says`,
+      );
+      for (const rev of [1, 2, 3]) assert.equal((await c.json()).rev, rev, `${name}: every operation is played to it`);
+      await c.settled();
+    }
+    // The control: the same joins with the name of the room.
+    const right = await knock(port, { v: ['s3'], since: 3, ep, ro: true });
+    assert.deepEqual(
+      { t: right.answer.t, from: right.answer.from, v: right.answer.v },
+      { t: 'hello', from: 3, v: ['s3'] },
+      'with the name, since decides',
+    );
+    await right.c.settled();
+    const founder = await knock(port, { v: ['v0', 's3'], since: 3, ep, ro: true });
+    assert.deepEqual({ from: founder.answer.from, v: founder.answer.v }, { from: 3, v: ['v0', 's3'] });
+    await founder.c.settled();
+    const beyond = await knock(port, { v: ['s3'], since: 4, ep, ro: true });
+    assert.deepEqual(beyond.answer, { t: 'reset', rev: 3, v: ['s3'] }, 'the name does not make a revision the room has not reached');
+  });
+});
+
+test('a room that is founded again has another name; a room that is kept keeps its name', async () => {
+  await withServer({ idleRoomMs: 600000 }, async (port, server) => {
+    const empty = (): Promise<void> => until('the room to be empty', () => server.rooms()[0].connections === 0);
+    const first = await joined(port, { v: ['f'] });
+    const beside = await joined(port, { v: ['f'] });
+    assert.equal(beside.hello.ep, first.hello.ep);
+    first.c.end();
+    beside.c.end();
+    await empty();
+    // Nothing was written: with the name it had, the room is still the room it was.
+    const same = await joined(port, { v: ['other'], since: 0, ep: first.hello.ep });
+    assert.deepEqual(
+      { ep: same.hello.ep, from: same.hello.from, v: same.hello.v },
+      { ep: first.hello.ep, from: 0, v: [] },
+      'a join that names the room does not found it again',
+    );
+    same.c.end();
+    await empty();
+    // Another file, and no name: it is founded again.
+    const second = await joined(port, { v: ['g'] });
+    assert.match(second.hello.ep, EPOCH);
+    assert.notEqual(second.hello.ep, first.hello.ep, 'the room that is founded again is another room');
+    assert.deepEqual({ from: second.hello.from, rev: second.hello.rev, v: second.hello.v }, { from: 0, rev: 0, v: ['g'] });
+    const old = await knock(port, { v: ['f'], since: 0, ep: first.hello.ep, ro: true });
+    assert.deepEqual(old.answer, { t: 'reset', rev: 0, v: ['g'] }, 'revision 0 of the room before it is not revision 0 of this one');
+    // The same file, with nothing written since, finds the room it was: whoever was in it can come back to it.
+    second.c.end();
+    await empty();
+    const third = await joined(port, { v: ['g'] });
+    assert.equal(third.hello.ep, second.hello.ep, 'a room that is started again on the file it was founded on keeps its name');
+    assert.notEqual(third.hello.ep, first.hello.ep, 'which is not the name of the room before it');
+
+    // Once something was written, the room keeps its name with nobody in it, for as long as it is kept.
+    await operations(third.c, 0, 3);
+    third.c.end();
+    await empty();
+    const back = await joined(port, { v: ['saved-at-3'], since: 3, ep: third.hello.ep });
+    assert.deepEqual({ ep: back.hello.ep, from: back.hello.from, rev: back.hello.rev }, { ep: third.hello.ep, from: 3, rev: 3 });
+    back.c.end();
+    await empty();
+    const again = await joined(port, { v: ['g'] });
+    assert.deepEqual({ ep: again.hello.ep, from: again.hello.from, rev: again.hello.rev }, { ep: third.hello.ep, from: 0, rev: 3 });
+  });
+  await withServer({ idleRoomMs: 60 }, async (port, server) => {
+    const a = await joined(port, { v: ['v0'] });
+    const old = a.hello.ep;
+    await operations(a.c, 0, 3);
+    a.c.end();
+    await until('the room to be forgotten', () => server.rooms().length === 0);
+    // The room is let go of. A client of it comes back with what it knew: revision 3 of a room that is no more.
+    const back = await knock(port, { v: ['saved-at-3'], since: 3, ep: old, key: 'back' });
+    assert.equal(back.answer.t, 'hello', `whoever comes first founds the room: ${JSON.stringify(back.answer)}`);
+    assert.notEqual(back.answer.ep, old, 'the room is a new one');
+    assert.match(back.answer.ep, EPOCH);
+    assert.deepEqual(
+      { from: back.answer.from, rev: back.answer.rev, v: back.answer.v },
+      { from: 0, rev: 0, v: ['saved-at-3'] },
+      'it is not caught up from revision 3 of the room that was let go of',
+    );
+    await operations(back.c, 0, 4);
+    // Now the new room has a revision 3 of its own, and the old name still does not open it.
+    for (const v of [['v0'], ['unknown'], []]) {
+      const second = await knock(port, { v, since: 3, ep: old, ro: true });
+      assert.deepEqual(second.answer, { t: 'reset', rev: 4, v: ['saved-at-3'] }, `v ${JSON.stringify(v)}: the old name opened the new room`);
+    }
+    const mine = await knock(port, { v: ['saved-at-3'], since: 3, ep: old, ro: true });
+    assert.deepEqual(
+      { t: mine.answer.t, from: mine.answer.from },
+      { t: 'hello', from: 0 },
+      'the file the new room was founded on is joined from 0, not from the 3 of the old room',
+    );
+    for (const rev of [1, 2, 3, 4]) assert.equal((await mine.c.json()).rev, rev);
+  });
+});
+
+test('what a writer said of a version lets nobody in: a forged save is not joined from', async () => {
+  await withServer({}, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const ep = a.hello.ep;
+    await operations(a.c, 0, 3);
+    const liar = await joined(port, { v: ['v0'] });
+    for (const rev of [1, 2, 3]) assert.equal((await liar.c.json()).rev, rev);
+    assert.equal((await a.c.json()).t, 'peer');
+
+    // The liar may write and has seen revision 1: the table takes its word that X holds revision 1.
+    liar.c.send({ t: 'saved', v: ['X'], rev: 1 });
+    assert.deepEqual(await a.c.json(), { t: 'saved', from: liar.hello.you, v: ['X'], rev: 1 });
+    // The one who really saved X says where: the table contradicts, and the revision is not passed on.
+    a.c.send({ t: 'saved', v: ['X'], rev: 3 });
+    assert.deepEqual(await liar.c.json(), { t: 'saved', from: a.hello.you, v: ['X'] }, 'the honest save is passed on without its revision');
+
+    // Whoever loads X now has the file of revision 3. From 1 it would apply the operations 2 and 3 twice.
+    const blind = await knock(port, { v: ['X'], key: 'blind' });
+    assert.deepEqual(blind.answer, { t: 'reset', rev: 3, v: ['X'] }, 'a join with X alone is never caught up from where the liar put it');
+    assert.deepEqual(await a.c.json(), { t: 'sync' });
+    assert.deepEqual(await liar.c.json(), { t: 'sync' });
+
+    // The file carries where it was saved; its client says so, and is believed for this room.
+    const honest = await knock(port, { v: ['X'], since: 3, ep, key: 'honest' });
+    assert.deepEqual(
+      { t: honest.answer.t, ep: honest.answer.ep, from: honest.answer.from, rev: honest.answer.rev, v: honest.answer.v },
+      { t: 'hello', ep, from: 3, rev: 3, v: ['X'] },
+      'with the revision and the name of the room it gets in where its file is',
+    );
+    await honest.c.settled().catch(() => {
+      throw new Error('an operation was played to a file that holds it already');
+    });
+    assert.equal(honest.c.seen.filter((text) => text.includes('"t":"op"')).length, 0, 'no operation was played to it');
+    assert.equal((await a.c.json()).t, 'peer');
+    // And it writes on from there.
+    honest.c.send({ t: 'op', base: 3, id: 'honest:next', ops: [1] });
+    assert.equal((await a.c.json()).rev, 4);
+  });
+});
+
+test('a room has only so many saves a minute written down, whoever says them', async () => {
+  let time = 7000;
+  await withServer({ now: () => time, savedPerMinute: 0, roomSavedPerMinute: 3 }, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const b = await joined(port, { v: ['v0'] });
+    const ep = a.hello.ep;
+    assert.equal((await a.c.json()).t, 'peer');
+    await operations(a.c, 0, 1);
+    assert.equal((await b.c.json()).rev, 1);
+    assert.equal((await says(a.c, b.c, ['s1'], 1)).rev, 1);
+    assert.equal((await says(a.c, b.c, ['s2'], 1)).rev, 1);
+    assert.equal((await says(b.c, a.c, ['t1'], 1)).rev, 1, 'the third save of the room, the first of its connection');
+    // What only repeats the table costs nothing; what is refused for another reason neither.
+    assert.equal((await says(a.c, b.c, ['s1', 't1'], 1)).rev, 1);
+    assert.equal('rev' in (await says(a.c, b.c, ['s1'], 0)), false);
+    const fourth = await says(a.c, b.c, ['s4'], 1);
+    assert.equal('rev' in fourth, false, `the fourth save of the minute was written down: ${JSON.stringify(fourth)}`);
+    assert.equal('rev' in (await says(b.c, a.c, ['t2'], 1)), false, 'the limit is of the room, whoever says it');
+    // One who comes new has a full bucket of its own, and the room is as full as it was.
+    const c = await joined(port, { v: ['v0'] });
+    assert.equal((await next(c.c)).rev, 1);
+    assert.equal('rev' in (await says(c.c, a.c, ['u1'], 1)), false, 'a new connection does not write for the room either');
+    assert.deepEqual(await next(b.c), { t: 'saved', from: c.hello.you, v: ['u1'] }, 'everyone else hears it the same');
+    assert.equal(a.c.closed, false, 'the connection is not closed');
+    assert.deepEqual((await comesBack(port, ep, 1, ['s2', 's4', 't1', 't2', 'u1'])).v, ['s2', 't1'], 'what came over the limit is not in the table');
+    time += 19000;
+    assert.equal('rev' in (await says(a.c, b.c, ['s5'], 1)), false, 'nineteen seconds are not a save');
+    time += 2000;
+    assert.equal((await says(b.c, a.c, ['t3'], 1)).rev, 1, 'twenty-one seconds are');
+    assert.equal('rev' in (await says(a.c, b.c, ['s6'], 1)), false, 'and only one');
+    // What was not written for the rate was not spoiled: it can be said again.
+    time += 20000;
+    assert.equal((await says(a.c, b.c, ['s4'], 1)).rev, 1);
+    assert.deepEqual((await comesBack(port, ep, 1, ['s4', 's5', 't3'])).v, ['s4', 't3']);
+    // The bucket holds no more than a minute of saves.
+    time += 600000;
+    for (const version of ['w1', 'w2', 'w3']) assert.equal((await says(a.c, b.c, [version], 1)).rev, 1);
+    assert.equal('rev' in (await says(a.c, b.c, ['w4'], 1)), false, 'ten minutes are three saves, not thirty');
+  });
+  // A save that the connection may not write takes nothing from the room, and the other way round.
+  await withServer({ now: () => time, savedPerMinute: 1, roomSavedPerMinute: 2 }, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const b = await joined(port, { v: ['v0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    assert.equal((await says(a.c, b.c, ['s1'], 0)).rev, 0);
+    assert.equal('rev' in (await says(a.c, b.c, ['s2'], 0)), false, 'the connection has one save a minute');
+    assert.equal('rev' in (await says(a.c, b.c, ['s3'], 0)), false);
+    assert.equal((await says(b.c, a.c, ['t1'], 0)).rev, 0, 'what the connection could not write was not taken from the room');
+    const c = await joined(port, { v: ['v0'] });
+    const d = await joined(port, { v: ['v0'] });
+    assert.equal('rev' in (await says(c.c, a.c, ['u1'], 0)), false, 'the room is full');
+    assert.equal('rev' in (await says(c.c, a.c, ['u2'], 0)), false);
+    time += 30000;
+    assert.equal((await says(c.c, a.c, ['u3'], 0)).rev, 0, 'what the room could not write was not taken from the connection');
+    assert.equal('rev' in (await says(d.c, a.c, ['x1'], 0)), false, 'half a minute is one save of the room');
+  });
+  await withServer({ now: () => time, savedPerMinute: 0 }, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const b = await joined(port, { v: ['v0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    for (let i = 1; i <= 30; i++) assert.equal((await says(a.c, b.c, [`s${i}`], 0)).rev, 0, `save ${i} of the default thirty`);
+    assert.equal('rev' in (await says(a.c, b.c, ['s31'], 0)), false, 'the default is thirty a minute');
+    // The limit is of the room: another room writes.
+    const other = await joined(port, { v: ['v0'] }, '/other');
+    const beside = await joined(port, { v: ['v0'] }, '/other');
+    assert.equal((await says(other.c, beside.c, ['s31'], 0)).rev, 0);
+  });
+  await withServer({ now: () => time, savedPerMinute: 0, roomSavedPerMinute: 0 }, async (port) => {
+    const a = await joined(port, { v: ['v0'] });
+    const b = await joined(port, { v: ['v0'] });
+    assert.equal((await a.c.json()).t, 'peer');
+    for (let i = 1; i <= 40; i++) assert.equal((await says(a.c, b.c, [`s${i}`], 0)).rev, 0, `save ${i}: 0 is no limit`);
+  });
+  assert.throws(() => createCollabServer({ roomSavedPerMinute: -1 }), TypeError, 'a rate that is negative is refused');
 });

@@ -35,12 +35,19 @@
 // it lives. It holds sixteen versions; the oldest save makes room, the versions
 // of the foundation and those of the last save that was written never do. A
 // version that left the table (it was full, or the log moved past its
-// revision) is remembered, and is never written again at any revision: whoever
-// joins with it gets `reset`. A room remembers `maxEvictedVersions` of them;
-// from then on it writes no new version at all. A `saved` whose revision the
-// table contradicts, that names a version that left, that comes after the room
-// stopped writing or faster than `savedPerMinute` for its connection, is passed
-// on WITHOUT its `rev`, and writes nothing.
+// revision) is remembered, and is never written again at any revision: the room
+// has not heard of it any more, whoever names it. A room remembers
+// `maxEvictedVersions` of them; from then on it writes no new version at all. A
+// `saved` whose revision the table contradicts, that names a version that left,
+// that comes after the room stopped writing, or faster than `savedPerMinute`
+// for its connection or than `roomSavedPerMinute` for the room (all its
+// connections together), is passed on WITHOUT its `rev`, and writes nothing.
+//
+// What the table is for. It is what those who may write have SAID, so nobody
+// gets into the room on its word (see the rules of `join`). It decides the
+// `rev` of the `saved` messages that are passed on, it tells a client that
+// comes back by rule a. which of its versions the room has heard of (the `v`
+// of `hello`), and its newest versions are named in `reset`.
 //
 // A connection is in one room at most, and joins it once. A `join` may carry a
 // `key`: a SECRET of the client, that the relay puts in no message, in no line
@@ -55,14 +62,27 @@
 // formats to the file, and a connection adds `formatsPerMinute` of them (the
 // length of `f`); over it the operation is refused with `nack`, reason `rate`.
 //
+// A room has a name of its own, `ep`, made up when it is founded and told in
+// every `hello`: a room that is founded again (the relay was restarted, the
+// room was let go of after `idleRoomMs`, or everybody left it before anything
+// was written and somebody came with no claim on it) is another room, whose
+// revisions are counted anew. A room in which something was written keeps its
+// name for as long as it is kept. A `join` may say the name back (`ep`, in the
+// letters of a `key`: one to sixty-four of A-Z, a-z, 0-9, `_` and `-`).
+//
 // The four rules of `join`, tried in this order:
-//   a. `since` is given and floor <= since <= rev: the connection is caught up
-//      from `since` (it has seen everything up to there).
-//   b. one of its versions `v` is in the table and was saved at a revision that
-//      is still in the log: it is caught up from that revision (the newest
-//      match).
-//   c. the room is fresh (rev 0, nobody else in it): its versions are written
-//      down as revision 0 and it starts from there.
+//   a. `since` is given with the `ep` of this room and floor <= since <= rev:
+//      the connection is caught up from `since`. That is a client coming back,
+//      or one whose file was saved in this room and says so itself. A `since`
+//      without `ep`, or with another one, is not looked at: the join goes on
+//      to the rules below as if it had named none. The `v` of its `hello` are
+//      those of its versions the room has heard of (foundation or table).
+//   b. the room is fresh (rev 0, nobody else in it): it is founded, with a new
+//      `ep`; the versions `v` are written down as revision 0 and it starts there.
+//   c. one of its versions `v` is one the room was founded on, and the log
+//      still starts at 0: it is caught up from 0. (The table of versions that
+//      `saved` fills is not used for this: what it says is what somebody said.
+//      It tells who joins by rule a. whether the room has heard of its file.)
 //   d. otherwise it gets `reset` with the newest versions the room knows. It
 //      stays connected but is in no room until it has loaded that file and
 //      joined the same room again, for which it has `joinTimeoutMs`. If it may
@@ -143,6 +163,8 @@ const DEFAULTS = {
   syncPerMinute: 2,
   /** 0: no limit. */
   savedPerMinute: 6,
+  /** 0: no limit. */
+  roomSavedPerMinute: 30,
   /** 0: no limit. */
   formatsPerMinute: 2000,
   /** 0: no save is ever written down. */
@@ -360,6 +382,7 @@ export function createCollabServer(options = {}) {
   const presenceBurst = Math.max(1, Math.ceil(opt.presencePerSecond));
   const syncBurst = Math.max(1, Math.ceil(opt.syncPerMinute));
   const savedBurst = Math.max(1, Math.ceil(opt.savedPerMinute));
+  const roomSavedBurst = Math.max(1, Math.ceil(opt.roomSavedPerMinute));
   const formatsBurst = Math.max(1, Math.ceil(opt.formatsPerMinute));
   const now = opt.now;
 
@@ -996,6 +1019,8 @@ export function createCollabServer(options = {}) {
     if (!versions) return false;
     const since = message.since;
     if (since !== undefined && !isCount(since)) return false;
+    const ep = message.ep;
+    if (ep !== undefined && (typeof ep !== 'string' || !USER_KEY.test(ep))) return false;
     if (message.ro !== undefined && typeof message.ro !== 'boolean') return false;
     const name = message.room;
     // A `#` in the name would let two pairs of path and name make one key.
@@ -1022,7 +1047,7 @@ export function createCollabServer(options = {}) {
     conn.greeted = true;
     clearTimeout(conn.joinTimer);
     conn.joinTimer = null;
-    const join = { key, versions, since, user, ro: message.ro === true, pv, userKey };
+    const join = { key, versions, since, ep, user, ro: message.ro === true, pv, userKey };
     if (!opt.authorize) return enter(conn, join, true);
 
     let verdict;
@@ -1092,6 +1117,8 @@ export function createCollabServer(options = {}) {
     // in: a join that is refused leaves nothing behind.
     const room = known || {
       key: join.key,
+      /** The name of the room as it was founded: a new one every time, so that "revision 3" of the room before it means nothing here. */
+      ep: randomBytes(9).toString('base64url'),
       pv: join.pv,
       rev: 0,
       floor: 0,
@@ -1107,40 +1134,44 @@ export function createCollabServer(options = {}) {
       conns: new Set(),
       idleTimer: null,
       syncTokens: { tokens: syncBurst, at: now() },
+      /** The saves of everyone in it that may still be written down. */
+      savedTokens: { tokens: roomSavedBurst, at: now() },
     };
 
     const fresh = room.rev === 0 && room.conns.size === 0;
     const { since, versions } = join;
     let from = -1;
     let matched = [];
-    // In a fresh room `since: 0` and no `since` mean the same start, and the
-    // versions have to be written down either way, or nobody else could join.
-    if (since !== undefined && since >= room.floor && since <= room.rev && !(fresh && since === 0)) {
+    // `since` counts only for this room as it was founded (`ep`): a room that
+    // was founded again counts its revisions again.
+    if (since !== undefined && join.ep === room.ep && since >= room.floor && since <= room.rev) {
       from = since;
-      matched = versions.filter((version) => room.versions.has(version));
-    } else {
+      matched = versions.filter((version) => room.versions.has(version) || room.founding.has(version));
+    } else if (fresh) {
+      // Nothing was written here yet: the room is founded (again), under a new
+      // name. What it knew until now leaves the table like any other version.
+      // On the file it was founded on before, with nothing written since, it is
+      // the room it was: whoever was in it comes back to it.
+      if (known && !versions.some((version) => room.founding.has(version))) room.ep = randomBytes(9).toString('base64url');
+      for (const version of [...room.versions.keys(), ...room.founding]) {
+        if (!versions.includes(version)) forget(room, version);
+      }
+      room.versions.clear();
+      room.lastSaved = new Set();
+      room.founding = new Set(versions);
       for (const version of versions) {
-        const rev = room.versions.get(version);
-        if (rev !== undefined && rev >= room.floor && rev > from) from = rev;
+        room.versions.set(version, 0);
+        room.evicted.delete(version);
       }
-      if (from >= 0) {
-        matched = versions.filter((version) => room.versions.get(version) === from);
-      } else if (fresh) {
-        // Nothing was written here yet: the room is founded again. What it
-        // knew until now leaves the table like any other version.
-        for (const version of [...room.versions.keys(), ...room.founding]) {
-          if (!versions.includes(version)) forget(room, version);
-        }
-        room.versions.clear();
-        room.lastSaved = new Set();
-        room.founding = new Set(versions);
-        for (const version of versions) {
-          room.versions.set(version, 0);
-          room.evicted.delete(version);
-        }
-        from = 0;
-        matched = versions;
-      }
+      from = 0;
+      matched = versions;
+    } else if (room.floor === 0 && versions.some((version) => room.founding.has(version))) {
+      // Otherwise only with the file the room was founded on. What a version
+      // was said to hold later is no ground to start from (anybody who may write
+      // can say it); a file that was saved in the room names its revision itself,
+      // and its client joins with `since` and `ep`.
+      from = 0;
+      matched = versions.filter((version) => room.founding.has(version));
     }
     if (from < 0) {
       // Only a room that exists turns a join away like this.
@@ -1185,7 +1216,7 @@ export function createCollabServer(options = {}) {
     // The log goes out in one piece; its bytes are not held against the client
     // until the socket has been empty once.
     conn.socket.cork();
-    send(conn, { t: 'hello', pv: room.pv, rev: room.rev, from, you: conn.id, ro: conn.ro, v: matched, peers });
+    send(conn, { t: 'hello', pv: room.pv, ep: room.ep, rev: room.rev, from, you: conn.id, ro: conn.ro, v: matched, peers });
     for (let index = from - room.floor; index < room.log.length && !conn.dead; index++) {
       conn.allowance += room.log[index].bytes;
       write(conn, room.log[index].frame);
@@ -1255,6 +1286,19 @@ export function createCollabServer(options = {}) {
     return true;
   }
 
+  /**
+   * A connection has only so many saves a minute written down, and so has the
+   * room, whoever says them: as many connections as one likes do not fill the
+   * table faster. A save that one of the two refuses takes nothing from the other.
+   */
+  function maySave(conn, room) {
+    const ofRoom = opt.roomSavedPerMinute > 0;
+    if (ofRoom && !takeToken(room.savedTokens, opt.roomSavedPerMinute / 60, roomSavedBurst)) return false;
+    if (!(opt.savedPerMinute > 0) || takeToken(conn.savedTokens, opt.savedPerMinute / 60, savedBurst)) return true;
+    if (ofRoom) room.savedTokens.tokens += 1;
+    return false;
+  }
+
   function onSaved(conn, message) {
     const versions = versionList(message.v, 1);
     if (!versions) return false;
@@ -1273,11 +1317,7 @@ export function createCollabServer(options = {}) {
       if (!unknown) {
         // It says what the table says: there is nothing to write.
         out.rev = rev;
-      } else if (
-        !sealed(room) &&
-        // A connection has only so many saves a minute written down.
-        (!(opt.savedPerMinute > 0) || takeToken(conn.savedTokens, opt.savedPerMinute / 60, savedBurst))
-      ) {
+      } else if (!sealed(room) && maySave(conn, room)) {
         room.lastSaved = new Set(versions);
         for (const version of versions) setVersion(room, version, rev);
         out.rev = rev;

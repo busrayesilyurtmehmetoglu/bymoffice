@@ -5958,6 +5958,18 @@ export class WorkbookView {
    * in which something was changed. Less than hasPendingInput(): a drag, a composition by itself
    * and a dialog nothing was changed in hold no text. Only asks.
    */
+  /**
+   * Gives up the cell that is being typed in and answers what was typed: for a workbook that is about
+   * to be replaced (the file is loaded again), where the text can be applied to nothing and is said
+   * back instead. Undefined when no cell is being typed in.
+   */
+  takeTypedText(): string | undefined {
+    if (this.destroyed || !this.edit) return undefined;
+    const text = this.editText;
+    this.cancelEditing();
+    return text === '' ? undefined : text;
+  }
+
   hasUnappliedText(): boolean {
     if (this.destroyed) return false;
     return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || (this.rulesDialog !== undefined && this.rulesDialog.changed());

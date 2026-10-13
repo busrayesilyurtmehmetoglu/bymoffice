@@ -20,6 +20,7 @@ import type { SheetPdfExportOptions, WorkbookView, WorkbookViewOptions } from '.
 import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
 import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
+import { readCollabStamp, writeSharedFile, type CollabStamp } from '../formats/xlsx/collab-stamp';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabTransport, type CollabUser } from '../collab/index';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
@@ -1121,6 +1122,7 @@ export function createBridge(host: BridgeHost): Bridge {
     }
     // `collab`: the address of a relay, or an object with it and who this participant is.
     let collab: { url: string; room?: string; token?: string; user?: CollabUser } | undefined;
+    let stamp: CollabStamp | undefined;
     const collabField = message.collab;
     if (typeof collabField === 'string') collab = { url: collabField };
     else if (typeof collabField === 'object' && collabField !== null && !Array.isArray(collabField)) {
@@ -1301,6 +1303,8 @@ export function createBridge(host: BridgeHost): Bridge {
         doc = await (file.document as NonNullable<OfficeFile['document']>)();
       } else {
         workbook = await file.workbook();
+        // What the file says of the room it was saved in, for a workbook that is to be edited together.
+        if (collab && file.package) stamp = await readCollabStamp(file.package);
         if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
       }
     } catch (error) {
@@ -1504,7 +1508,7 @@ export function createBridge(host: BridgeHost): Bridge {
     const list = sheetList(workbook);
     sheetsSent = JSON.stringify(list);
     loaded(view.activeSheet, list, false);
-    if (collab) joinCollab(shown, view, book, collab, file.format !== 'xlsx' || convertedFrom !== undefined ? undefined : bytes, locked || readOnly === true);
+    if (collab) joinCollab(shown, view, book, collab, file.format !== 'xlsx' || convertedFrom !== undefined ? undefined : bytes, locked || readOnly === true, stamp);
   };
 
   /**
@@ -1513,7 +1517,7 @@ export function createBridge(host: BridgeHost): Bridge {
    * the list of the others changes. `bytes`: the file as it was loaded, undefined for one that
    * cannot be edited together (not an xlsx, or converted to be one here).
    */
-  const joinCollab = (current: Shown, view: WorkbookView, book: Workbook, plan: { url: string; room?: string; token?: string; user?: CollabUser }, bytes: Uint8Array | undefined, readOnly: boolean): void => {
+  const joinCollab = (current: Shown, view: WorkbookView, book: Workbook, plan: { url: string; room?: string; token?: string; user?: CollabUser }, bytes: Uint8Array | undefined, readOnly: boolean, stamp?: CollabStamp): void => {
     if (!bytes) {
       send({ type: 'collabState', state: 'closed', reason: 'unsupported', rev: 0, pending: 0, peers: [] });
       return;
@@ -1552,6 +1556,8 @@ export function createBridge(host: BridgeHost): Bridge {
       {
         transport,
         versions: [contentVersion(bytes)],
+        // What the file says of the room and the step it was saved at: it joins there, whatever anybody says of it.
+        stamp,
         user: plan.user,
         room: plan.room,
         token: plan.token,
@@ -1786,20 +1792,11 @@ export function createBridge(host: BridgeHost): Bridge {
    */
   const sharedBytes = async (current: Shown): Promise<Uint8Array> => {
     const session = current.collab;
-    if (!session || session.state === 'closed') return current.file.save();
-    if (session.state === 'online') await session.whenSettled(3000);
-    const rev = session.savableRev;
-    session.pause();
-    let bytes: Uint8Array;
-    let touched = false;
-    try {
-      bytes = await current.file.save();
-    } finally {
-      touched = session.resume();
-    }
+    if (!session) return current.file.save();
+    const done = await writeSharedFile(session, current.file.package, () => current.file.save());
     // Told to the others only once the application says it has stored the file (see userSaver()).
-    current.written = { bytes, rev: touched ? undefined : rev };
-    return bytes;
+    if (session.state !== 'closed') current.written = done;
+    return done.bytes;
   };
 
   /** The file that is shown as bytes, with what is being typed in it. */

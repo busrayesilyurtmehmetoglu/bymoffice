@@ -333,6 +333,7 @@ export interface UiStrings {
     undoWait: string;
     slow: string;
     updating: string;
+    typedKept(text: string): string;
     copySheet: string;
     tooLarge: string;
     unsupported: string;
@@ -879,6 +880,7 @@ export const STRINGS_EN: UiStrings = {
     undoWait: 'Undo has to wait until your last changes have arrived, and they have not yet: nothing was undone. Try again.',
     slow: 'A change has been on its way for a long time; the connection is made anew.',
     updating: 'The file was changed elsewhere and is loaded again; it cannot be edited until that is done.',
+    typedKept: (text) => `The file is loaded again, and what you were typing was not applied. You typed: ${text}`,
     dialogClosed: 'Someone else changed the sheet or its rules: the dialog was closed without applying anything.',
     document: 'Editing together is not available for documents yet.',
   },
@@ -1443,6 +1445,7 @@ export const STRINGS_TR: UiStrings = {
     undoWait: 'Geri alma, son değişiklikleriniz yerine ulaşana dek bekler; henüz ulaşmadı: hiçbir şey geri alınmadı. Yeniden deneyin.',
     slow: 'Bir değişiklik uzun süredir yolda; bağlantı yeniden kuruluyor.',
     updating: 'Dosya başka yerde değişti ve yeniden yükleniyor; bitene dek düzenlenemez.',
+    typedKept: (text) => `Dosya yeniden yükleniyor; yazmakta olduğunuz uygulanmadı. Yazdığınız: ${text}`,
     dialogClosed: 'Başkası sayfayı ya da kurallarını değiştirdi: kutu hiçbir şey uygulanmadan kapatıldı.',
     document: 'Birlikte düzenleme belgelerde henüz yok.',
   },

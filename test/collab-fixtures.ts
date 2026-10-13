@@ -5,6 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { buildXlsx } from '../src/formats/xlsx/build';
+import { readCollabStamp, writeCollabStamp } from '../src/formats/xlsx/collab-stamp';
 import { writeXlsx } from '../src/formats/xlsx/write';
 import { open, type OfficeFile, type Sheet, type Workbook } from '../src/index';
 import { contentVersion } from '../src/collab/protocol';
@@ -111,7 +112,7 @@ export interface Member {
 /**
  * A participant: reads `bytes` and joins.
  */
-export async function join(net: Net, name: string, bytes: Uint8Array, options: Partial<SessionOptions> = {}, reload?: () => Promise<Uint8Array>): Promise<Member> {
+export async function join(net: Net, name: string, bytes: Uint8Array, options: Partial<SessionOptions> = {}, reload?: () => Promise<Uint8Array>, unsaved?: () => boolean): Promise<Member> {
   const file = await open(bytes);
   const wb = await file.workbook();
   const transport = net.server.connect();
@@ -121,13 +122,14 @@ export async function join(net: Net, name: string, bytes: Uint8Array, options: P
       workbook: () => member.wb,
       changed: (change) => member.changes.push(change),
       notice: (notice) => member.notices.push(notice),
+      unsaved,
       reload: reload
         ? () => {
             const load = (async () => {
               const next = await reload();
               member.file = await open(next);
               member.wb = await member.file.workbook();
-              return [contentVersion(next)];
+              return { versions: [contentVersion(next)], stamp: await readCollabStamp(member.file.package!) };
             })();
             member.loading = load.then(
               () => new Promise<void>((resolve) => setImmediate(resolve)),
@@ -137,12 +139,14 @@ export async function join(net: Net, name: string, bytes: Uint8Array, options: P
           }
         : undefined,
     },
-    { transport, versions: [contentVersion(bytes)], user: { name }, timer: () => () => undefined, ...options },
+    { transport, versions: [contentVersion(bytes)], stamp: await readCollabStamp(file.package!), user: { name }, timer: () => () => undefined, ...options },
   );
   return member;
 }
 
 export async function saveOf(member: Member): Promise<Uint8Array> {
+  // As mount() saves a workbook that is edited together: the room and the step go into the file.
+  await writeCollabStamp(member.file.package!, member.session.stampNow);
   await writeXlsx(member.file.package!, member.wb);
   return member.file.package!.save();
 }

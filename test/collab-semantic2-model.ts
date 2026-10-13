@@ -123,7 +123,7 @@ export async function run(cfg: Config): Promise<Result> {
   const order: string[] = [];
   const obs = server.connect();
   obs.onMessage((text) => { const m = JSON.parse(text); if (m.t === 'op') order.push(m.id); });
-  obs.onState!((st) => { if (st === 'open') obs.send(JSON.stringify({ t: 'join', pv: 1, key: 'obs', v: [contentVersion(bytes)] })); });
+  obs.onState!((st) => { if (st === 'open') obs.send(JSON.stringify({ t: 'join', pv: 2, key: 'obs', v: [contentVersion(bytes)] })); });
   while (stepNet());
   interface M { name: string; wb: Workbook; session: CollabSession; t: any; notices: { code: string; count?: number }[]; cut: boolean; key: string }
   const members: M[] = [];

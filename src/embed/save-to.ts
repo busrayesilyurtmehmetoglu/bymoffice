@@ -527,6 +527,18 @@ export interface SaveHost {
   pending?(): boolean;
   /** Whether the view is only read now: auto-save sends nothing from such a view. */
   readOnly?(): boolean;
+  /**
+   * Whether this side is the one to save by itself now. For a file that is edited together: one
+   * participant saves for all, and the others hold still (rearm() looks again when that changes).
+   * Without it auto-save is this side's alone to do.
+   */
+  autoAllowed?(): boolean;
+  /**
+   * A save met a conflict: resolves true when the file turned out to have been saved meanwhile by
+   * someone it is edited together with, and that was found to be so (adopt() was called with what the
+   * target names the file by now). The save is then sent once more, with that name as its condition.
+   */
+  conflictWait?(): Promise<boolean>;
   /** Auto-save as it starts out; SaveController.setAutoSave() changes it. */
   autoSave?: AutoSaveSettings;
   info(): SaveInfo;
@@ -1005,6 +1017,12 @@ export class SaveController implements SaveCommand {
     }
   }
 
+  /** Looks again whether auto-save has something to send: for a host whose autoAllowed() answers otherwise now. */
+  rearm(): void {
+    if (this.destroyed || this.autoTimer !== undefined) return;
+    this.arm();
+  }
+
   private disarm(): void {
     const off = this.autoTimer;
     this.autoTimer = undefined;
@@ -1062,6 +1080,12 @@ export class SaveController implements SaveCommand {
     }
     // The host was asked, and may have saved, changed or destroyed from inside its answers: looked at again.
     if (!able) return;
+    // Someone else saves for everybody: nothing is sent from here until that changes.
+    try {
+      if (host.autoAllowed !== undefined && !host.autoAllowed()) return;
+    } catch {
+      return;
+    }
     if (!this.autoFree()) return this.arm();
     if (!this.guarded()) {
       // Nothing to guard the save with: it could go over what someone else saved, and nobody would be
@@ -1228,6 +1252,17 @@ export class SaveController implements SaveCommand {
           this.etag = this.hinted;
           this.hinted = undefined;
           return this.start(overwrite, auto, tries + 1);
+        }
+        if (host.conflictWait) {
+          // The word of that save may be a moment behind the conflict it made.
+          let moved = false;
+          try {
+            moved = await host.conflictWait();
+          } catch {
+            moved = false;
+          }
+          if (this.destroyed) return false;
+          if (moved && this.etag !== sentWith) return this.start(overwrite, auto, tries + 1);
         }
       }
       if (error instanceof SaveError) {

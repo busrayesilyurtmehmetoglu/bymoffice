@@ -158,7 +158,7 @@ test('a shift taken back, and a position read through a shift', () => {
 
 test('messages: what is one and what is none', () => {
   const none = (text: string, read: (text: string) => unknown, what: string): void => assert.throws(() => read(text), { name: 'WireError' }, what);
-  const hello = { t: 'hello', rev: 3, from: 1, you: 'c1', ro: false, v: [], peers: [] };
+  const hello = { t: 'hello', rev: 3, from: 1, ep: 'room1', you: 'c1', ro: false, v: [], peers: [] };
   assert.equal((parseServerMessage(JSON.stringify(hello)) as { rev: number }).rev, 3, 'a hello');
   none(JSON.stringify({ ...hello, from: 4 }), parseServerMessage, 'a log that starts behind where the room is');
   none(JSON.stringify({ ...hello, rev: -1 }), parseServerMessage, 'a negative step');
@@ -211,4 +211,59 @@ test('the edges of the rules', () => {
     assert.equal(transformStep([{ w: op }], [{ w: op }], true).recs, undefined, `the undoing of "${op.t}" gives way to someone who did the same since`);
     assert.equal(transformStep([{ w: op }], [{ w: op }], false).recs?.length, 1, `a step of "${op.t}" does not`);
   }
+});
+
+test('what is not known to come out right is dropped, either way round: a sort and rows, merged cells and rows, merged cells and a cell', () => {
+  const sorted: Rec = { w: { t: 'sort', s: 0, g: [1, 0, 3, 5], o: [2, 0, 1] }, wide: true };
+  const merged: Rec = { w: { t: 'merges', s: 0, add: [[2, 0, 3, 1]], del: [] } };
+  const carried = (shift: Shift): Carry[] => [{ sh: shift }];
+  // A sort beside rows or columns of its sheet, whichever of the two waits: dropped, and so is what was made after it.
+  for (const [name, step, beside] of [
+    ['rows that wait beside a sort', [ins(2, 1)], carried(sort(1, [2, 0, 1]))],
+    ['rows that go beside a sort of some columns', [del(2, 1)], carried(sort(1, [2, 0, 1], false, 0, 1))],
+    ['columns that wait beside a sort', [ins(1, 1, 'col')], carried(sort(1, [2, 0, 1]))],
+    ['a sort that waits beside rows', [sorted], carried(rows(true, 2, 1))],
+    ['a sort that waits beside columns', [sorted], carried(cols(false, 1, 1))],
+  ] as [string, Rec[], Carry[]][]) {
+    const done = transformStep(step, beside);
+    assert.deepEqual([done.recs, done.poison, done.noop], [undefined, true, false], `${name}: dropped, with what follows it`);
+  }
+  // On another sheet they have nothing to do with each other.
+  assert.equal(transformStep([ins(2, 1)], [{ sh: { ...sort(1, [2, 0, 1]), s: 1 } as Shift }]).recs !== undefined, true, 'a sort of another sheet moves nothing here');
+  // Merged cells beside rows of their sheet: the merge is dropped; rows that wait beside a merge take what follows with them.
+  const mergeBesideRows = transformStep([merged], carried(rows(true, 3, 1)));
+  assert.deepEqual([mergeBesideRows.recs, mergeBesideRows.poison === true], [undefined, false], 'a merge that waits beside rows is dropped alone');
+  const rowsBesideMerge = transformStep([ins(3, 1)], [{ w: merged.w }]);
+  assert.deepEqual([rowsBesideMerge.recs, rowsBesideMerge.poison], [undefined, true], 'rows that wait beside a merge are dropped with what follows');
+  assert.equal(transformStep([merged], carried(rows(true, 3, 1, 1))).recs !== undefined, true, 'rows of another sheet leave a merge alone');
+  // Merged cells and a cell that someone else wrote inside them.
+  assert.equal(transformStep([merged], [{ w: cell(3, 1) }]).recs, undefined, 'a merge over a cell someone else wrote meanwhile is dropped');
+  assert.equal(transformStep([merged], [{ w: cell(9, 4) }]).recs !== undefined, true, 'a cell elsewhere leaves it alone');
+  // A sheet that is moved, beside anything that names a sheet by its place.
+  const moved = transformStep([{ w: cell(1, 1) }], [{ sh: { k: 'sMove', from: 0, to: 1 } }]);
+  assert.deepEqual([moved.recs, moved.poison], [undefined, true], 'a cell beside a sheet that was moved is dropped with what follows');
+});
+
+test('an undoing gives way whole, a deletion grows by nothing, and what was said is said', () => {
+  // Rows that someone else put in inside a run that is to go: the run goes around them, in two parts, and is no longer.
+  const around = transformStep([del(2, 4)], [{ sh: rows(true, 4, 3) }]);
+  assert.deepEqual((around.recs || []).map((rec) => at(rec.w)), [[7, 2], [2, 2]], 'four rows go, in two runs, and the three that came stay');
+  assert.equal((around.recs || []).reduce((sum, rec) => sum + (rec.w as { n: number }).n, 0), 4, 'no more rows than were to go');
+  // The undoing of rows beside rows of someone else on the sheet: not done at all.
+  assert.equal(transformStep([del(2, 1)], [{ sh: rows(true, 9, 1) }], true).recs, undefined, 'rows are not taken back after someone else put rows into the sheet');
+  assert.equal(transformStep([del(2, 1)], [{ sh: rows(true, 9, 1) }], false).recs !== undefined, true, 'a deletion that is no undoing is');
+  // A formula that read what someone else took away is written as the error it became, and that is said.
+  const broken = transformStep([{ w: cell(1, 5, 'B4+1') }], [{ sh: rows(false, 3, 1) }]);
+  assert.deepEqual([broken.partial, JSON.stringify(broken.recs).indexOf('#REF!') >= 0], [true, true], 'the formula is an error now, and it is said');
+  assert.equal(transformStep([{ w: cell(1, 5, 'B9+1') }], [{ sh: rows(false, 3, 1) }]).partial, false, 'one that reads a row that only moved says nothing');
+  // Rows that were to go, some of which someone else took first and then brought back: they stay, and it is said.
+  const first = transformStep([del(2, 3)], [{ sh: rows(false, 3, 1) }]);
+  assert.deepEqual([(first.recs || []).map((rec) => at(rec.w)), first.partial], [[[2, 2]], false], 'the row that is gone already is not deleted again, and nothing is said yet');
+  const second = transformStep(first.recs as Rec[], [{ sh: rows(true, 3, 1) }]);
+  assert.equal(second.partial, true, 'when it comes back, it is said that not everything that was to go is gone');
+  // Rows put in where a run went stand behind the rows that come back there, as they stood behind the run.
+  const folded = transformStep([ins(4, 1)], [{ sh: rows(false, 2, 2) }]);
+  assert.deepEqual((folded.recs || []).map((rec) => at(rec.w)), [[2, 1]], 'at the place of the run');
+  const unfolded = transformStep(folded.recs as Rec[], [{ sh: rows(true, 2, 2) }]);
+  assert.deepEqual((unfolded.recs || []).map((rec) => at(rec.w)), [[4, 1]], 'and behind the run again when it comes back');
 });

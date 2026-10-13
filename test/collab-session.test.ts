@@ -609,9 +609,9 @@ async function alone(options: { reload?: () => Promise<string[]>; pausable?: boo
     { transport: transport as never, versions: ['h:1:x'], timer: () => () => undefined, onReadOnly: () => readOnly++ },
   );
   const tell = (message: unknown): void => listener(JSON.stringify(message));
-  const hello = (from: number, rev: number, more: object = {}): void => tell({ t: 'hello', rev, from, you: 'me', ro: false, v: [], peers: [], ...more });
+  const hello = (from: number, rev: number, more: object = {}): void => tell({ t: 'hello', rev, from, ep: 'room1', you: 'me', ro: false, v: [], peers: [], ...more });
   const step = (rev: number, more: object = {}): void => tell({ t: 'op', rev, id: `q:${rev}`, from: 'q', ops: [{ t: 'cells', s: 0, c: [[40 + rev, 0, { v: { k: 'number', v: rev } }]] }], ...more });
-  return { wb, session, sent, notices, tell, hello, step, reloads: () => reloads, readOnly: () => readOnly };
+  return { wb, session, sent, notices, tell, hello, step, transport: transport as { suspend(): void; resume(): void }, reloads: () => reloads, readOnly: () => readOnly };
 }
 
 test('a step is this participant\'s own only when it says what this participant sent', async () => {
@@ -670,16 +670,34 @@ test('steps that arrive out of turn make the session ask again from where it is,
   assert.deepEqual([s.reloads(), s.session.state, s.notices], [0, 'detached', ['detached']], 'the workbook holds three steps nobody is known to have saved: it is detached, not loaded over');
 });
 
-test('a relay of another version of the contract, and one that takes no names from here, end the session', async () => {
+test('a relay of another version of the contract ends the session; a room that says no name, or another room than the one this side was in, is not trusted', async () => {
   const s = await alone();
-  assert.deepEqual([s.sent[0].pv, typeof s.sent[0].key], [1, 'string'], '"join" names the version and what the steps will be named with');
+  assert.deepEqual([s.sent[0].pv, typeof s.sent[0].key, (s.sent[0] as { since?: number }).since], [2, 'string', undefined], '"join" names the version; a first join names no step');
   s.tell({ t: 'error', code: 'version' });
   assert.deepEqual([s.session.state, s.notices], ['closed', ['refused']], 'refused');
-  const other = await alone();
+  // A relay that names no room is none of this contract.
+  const bare = await alone();
+  bare.tell({ t: 'hello', rev: 0, from: 0, you: 'me', ro: false, v: [], peers: [] });
+  assert.equal(bare.session.state, 'closed', 'a "hello" without the name of the room is no message');
+  // Without the word of a file there is only the start of a room to join at.
+  const late = await alone();
+  late.hello(2, 5);
+  assert.equal(late.session.state, 'closed', 'a relay that lets a file in at a later step on nobody\'s word is not followed');
+  // Coming back, the join names the room and the step; another room in answer is another room.
+  const other = await alone({ pausable: true });
   other.hello(0, 0);
   other.session.submit(setCellInput(other.wb, 0, 30, 0, 'x'));
-  other.tell({ t: 'nack', id: (other.sent[1] as { id: string }).id, rev: 0, reason: 'id' });
-  assert.equal(other.session.state, 'closed', 'a relay that will never place a step of this participant is left');
+  const sentOp = other.sent.filter((message) => message.t === 'op')[0] as unknown as { id: string; ops: unknown[] };
+  other.tell({ t: 'op', rev: 1, id: sentOp.id, from: 'me', ops: sentOp.ops });
+  other.transport.suspend();
+  other.transport.resume();
+  const joins = other.sent.filter((message) => message.t === 'join');
+  assert.equal(joins.length, 2, `it joins again: ${other.sent.map((message) => message.t).join()}`);
+  const again = joins[1] as { t: string; since?: number; ep?: string };
+  assert.deepEqual([again.t, again.since, again.ep], ['join', 1, 'room1'], 'the join after a lost connection names the room this side was in, and its step');
+  other.hello(1, 1, { ep: 'room2' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual([other.session.state, other.notices], ['detached', ['detached']], 'a room of another name is not the room the step was of: the workbook, with a step nobody saved, is kept apart');
 });
 
 test('what the others say of where they are is passed on a few times a second, however often they say it', async () => {
@@ -881,34 +899,34 @@ test('the relay of the page: a key that joins again takes the place of its conne
     });
     return { got, send: (message) => raw.send(JSON.stringify(message)) };
   };
-  const writer = connect({ t: 'join', pv: 1, v: ['v1'], key: 'secret-of-a' });
-  const reader = connect({ t: 'join', pv: 1, v: ['v1'], key: 'secret-of-b', ro: true });
+  const writer = connect({ t: 'join', pv: 2, v: ['v1'], key: 'secret-of-a' });
+  const reader = connect({ t: 'join', pv: 2, v: ['v1'], key: 'secret-of-b', ro: true });
   drain();
   assert.deepEqual([writer.got[0].t, reader.got[0].t], ['hello', 'hello'], 'both are in');
   assert.equal(JSON.stringify(writer.got.concat(reader.got)).indexOf('secret-of-'), -1, 'the key of a participant is told to nobody');
   // The same key again: the old connection is told that it was replaced, and the new one is in.
-  const again = connect({ t: 'join', pv: 1, v: ['v1'], key: 'secret-of-a' });
+  const again = connect({ t: 'join', pv: 2, v: ['v1'], key: 'secret-of-a' });
   drain();
   assert.equal(again.got[0].t, 'hello', 'the key joins again');
   assert.deepEqual(writer.got.filter((message) => message.t === 'error').map((message) => message.code), ['replaced'], 'and the connection it had is told so');
   // Another version of the contract is no participant.
-  const old = connect({ t: 'join', pv: 2, v: ['v1'], key: 'c' });
+  const old = connect({ t: 'join', pv: 3, v: ['v1'], key: 'c' });
   drain();
   assert.equal(old.got[0].t, 'error', 'a contract the relay does not speak');
   // Who cannot join: those who write are asked to save, those who only read are not; and a reader who cannot join asks nobody.
   const asked = (who: { got: Got[] }): number => who.got.filter((message) => message.t === 'sync').length;
-  connect({ t: 'join', pv: 1, v: ['other'], key: 'd', ro: true });
+  connect({ t: 'join', pv: 2, v: ['other'], key: 'd', ro: true });
   drain();
   assert.deepEqual([asked(again), asked(reader)], [0, 0], 'someone who only reads makes nobody save');
-  connect({ t: 'join', pv: 1, v: ['other'], key: 'e' });
+  connect({ t: 'join', pv: 2, v: ['other'], key: 'e' });
   drain();
   assert.deepEqual([asked(again), asked(reader)], [1, 0], 'someone who writes does; who only reads is not asked');
-  connect({ t: 'join', pv: 1, v: ['other'], key: 'f' });
-  connect({ t: 'join', pv: 1, v: ['other'], key: 'g' });
+  connect({ t: 'join', pv: 2, v: ['other'], key: 'f' });
+  connect({ t: 'join', pv: 2, v: ['other'], key: 'g' });
   drain();
   assert.equal(asked(again), 2, 'twice a minute and no more');
   clock += 61000;
-  connect({ t: 'join', pv: 1, v: ['other'], key: 'h' });
+  connect({ t: 'join', pv: 2, v: ['other'], key: 'h' });
   drain();
   assert.equal(asked(again), 3, 'and again a minute later');
   // "saved": of a step the room does not have, the step is not passed on; nor may a version move to another step.
@@ -923,10 +941,19 @@ test('the relay of the page: a key that joins again takes the place of its conne
   again.send({ t: 'saved', v: ['v1'], rev: 1 });
   drain();
   assert.deepEqual(told().slice(1).map((message) => message.rev), [1, undefined, undefined], 'a version stays at the step it was first saved at, also the one the room started with');
-  const late = connect({ t: 'join', pv: 1, v: ['v3'], key: 'i' });
-  const first = connect({ t: 'join', pv: 1, v: ['v1'], key: 'j' });
+  // Who joins: with the file the room was started with from the start; with a later one only on the word of the
+  // file itself (the room and the step that were written into it), never on what was said of it.
+  const ep = (again.got[0] as { ep?: string }).ep;
+  assert.equal(typeof ep, 'string', 'the room says what it is called');
+  const said = connect({ t: 'join', pv: 2, v: ['v3'], key: 'i' });
+  const stamped = connect({ t: 'join', pv: 2, v: ['v3'], key: 'k', since: 1, ep });
+  const stranger = connect({ t: 'join', pv: 2, v: ['v3'], key: 'l', since: 1, ep: 'another-room' });
+  const bare = connect({ t: 'join', pv: 2, v: ['v3'], key: 'm', since: 1 });
+  const first = connect({ t: 'join', pv: 2, v: ['v1'], key: 'j' });
   drain();
-  assert.deepEqual([late.got[0].t, late.got[0].rev, late.got[0].from], ['hello', 1, 1], 'who has the saved file starts behind its step');
+  assert.equal(said.got[0].t, 'reset', 'what was said of a file is no ground to join on');
+  assert.deepEqual([stamped.got[0].t, stamped.got[0].rev, stamped.got[0].from, stamped.got[0].v], ['hello', 1, 1, ['v3']], 'who has the saved file starts behind the step it names, and hears that the room knows the file');
+  assert.deepEqual([stranger.got[0].t, bare.got[0].t], ['reset', 'reset'], 'a step of another room, or of none, is the step of nothing');
   assert.deepEqual([first.got[0].t, first.got[0].from], ['hello', 0], 'who has the first file gets every step');
 });
 
@@ -980,4 +1007,58 @@ test('a file that is loaded again takes the place of what waited: nothing of the
   assert.equal(sent.some((text) => text.indexOf('never sent') >= 0), false, 'and the step of the workbook that went was sent to nobody');
   assert.deepEqual(b.notices.map((notice) => notice.code), ['reloaded'], 'which is said');
   assertSame([a, b], 'after the load');
+});
+
+test('a relay that writes a step out anew (other order of the names, same step) hands this participant its own step', async () => {
+  const s = await alone();
+  s.hello(0, 0);
+  s.session.submit(setCellInput(s.wb, 0, 30, 0, '=A1+1'));
+  const sent = s.sent.filter((message) => message.t === 'op')[0] as unknown as { id: string; ops: unknown[] };
+  // Every object with its names the other way round, as a relay that parses and writes again may send it.
+  const turned = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(turned);
+    if (value === null || typeof value !== 'object') return value;
+    const out: { [name: string]: unknown } = {};
+    for (const name of Object.keys(value as object).reverse()) out[name] = turned((value as { [name: string]: unknown })[name]);
+    return out;
+  };
+  assert.notEqual(JSON.stringify(turned(sent.ops)), JSON.stringify(sent.ops), 'the step is written differently (or the test tests nothing)');
+  s.tell({ t: 'op', rev: 1, id: sent.id, from: 'me', ops: turned(sent.ops) });
+  assert.deepEqual([s.session.pending, s.session.rev, s.session.state, s.notices], [0, 1, 'online', []], 'it is the step this side sent: placed, and nothing waits');
+  // Another step under that name is someone else's.
+  s.session.submit(setCellInput(s.wb, 0, 31, 0, 'mine'));
+  const next = s.sent.filter((message) => message.t === 'op')[1] as unknown as { id: string };
+  s.tell({ t: 'op', rev: 2, id: next.id, from: 'q', ops: [{ t: 'cells', s: 0, c: [[32, 0, { v: { k: 'string', v: 'theirs' } }]] }] });
+  assert.equal(s.session.pending, 1, 'a step that says something else is not this side\'s step, whatever it is called');
+});
+
+test('undo waits for what is on its way, is told when it does not get its turn, and a step that was not placed is undone like any other once the session is on its own', async () => {
+  const s = await alone({ pausable: true });
+  s.hello(0, 0);
+  s.session.submit(setCellInput(s.wb, 0, 30, 0, 'first'));
+  assert.equal(s.session.undo(), undefined, 'a step that is on its way is not undone yet');
+  assert.equal(value(s.wb, 0, 30, 0), 'first', 'and the cell is as it was typed');
+  // Something else is typed before the undo had its turn: it does not get it, which is said.
+  s.session.submit(setCellInput(s.wb, 0, 31, 0, 'second'));
+  assert.deepEqual(s.notices, ['undo-wait'], 'the undo that waited is given up, and that is said');
+  // While a file is loaded again nothing is taken.
+  const loading = await alone({ reload: () => new Promise<string[]>(() => undefined) });
+  loading.hello(0, 0);
+  loading.session.reload();
+  assert.throws(() => loading.session.submit(setCellInput(loading.wb, 0, 30, 0, 'x')), /loaded again/, 'a change made while the file is loaded again is refused');
+  assert.equal(loading.session.undo(), undefined, 'and so is an undo');
+  // Out of the room with two steps that were never placed: they are steps of the workbook, to be undone one by one.
+  const sentOp = s.sent.filter((message) => message.t === 'op')[0] as unknown as { id: string };
+  s.tell({ t: 'nack', id: sentOp.id, rev: 0 });
+  s.transport.suspend();
+  s.transport.resume();
+  s.hello(0, 0, { ep: 'another-room' });
+  assert.equal(s.session.state, 'detached', 'another room: the workbook is kept apart with what waited');
+  assert.equal(s.session.canUndo, true, 'what waited can be undone');
+  assert.ok(s.session.undo(), 'the last step is undone at once');
+  assert.deepEqual([value(s.wb, 0, 31, 0), value(s.wb, 0, 30, 0)], [undefined, 'first'], 'the second step is taken back, the first is there');
+  assert.ok(s.session.undo(), 'and the one before it');
+  assert.equal(value(s.wb, 0, 30, 0), undefined, 'the first step is taken back as well');
+  assert.ok(s.session.redo(), 'what was undone is made again');
+  assert.equal(value(s.wb, 0, 30, 0), 'first', 'the first step is back');
 });

@@ -111,6 +111,14 @@ export interface Rec {
   nm?: string;
   /** A sort that took every used column of its sheet along (see Shift). */
   wide?: boolean;
+  /**
+   * For rows or columns that are put in at a place where a run was taken away by someone else: how far
+   * into that run they were put in. When rows come back at that place (the deletion was undone), they are
+   * put in as far behind the first of them.
+   */
+  fold?: number;
+  /** For rows or columns that are taken away: someone else took some of them away first. When rows come back there, not all that was to go is gone. */
+  cut?: boolean;
 }
 
 /** A message or an operation that is not what the contract says: whoever sent it is not trusted further. */

@@ -31,7 +31,8 @@ import type { PdfExportOptions } from './pdf/export';
 import type { SheetPdfExportOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
 import { askOverwrite } from './ui/save-confirm';
-import { createSaveSync } from './collab/save-sync';
+import { createSaveSync, type SaveSync } from './collab/save-sync';
+import { readCollabStamp, writeSharedFile } from './formats/xlsx/collab-stamp';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
 import {
   SaveController,
@@ -1358,6 +1359,9 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         bytesAsIs: () => saveAsIs(),
         pending: () => pendingInput(),
         readOnly: () => readOnlyNow(),
+        // Edited together: one participant saves for all, and a conflict with a save of someone in the room is none.
+        autoAllowed: () => (saveSync ? saveSync.autoAllowed() : true),
+        conflictWait: () => (saveSync ? saveSync.conflictWait() : Promise.resolve(false)),
         autoSave,
         info,
         strings: () => resolveUiStrings(options.locale),
@@ -1389,6 +1393,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     : undefined;
   /** The session, while the workbook is edited together; and the file that was written last, with the step it holds. */
   let session: CollabSession | undefined;
+  let saveSync: SaveSync | undefined;
   let written: { bytes: Uint8Array; rev: number | undefined } | undefined;
   /** Tells the others of a save that succeeded, when the bytes are the ones that were written last. */
   const sayShared = (bytes: Uint8Array, tag?: string): void => {
@@ -1405,20 +1410,11 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
    */
   const sharedBytes = async (take: () => Promise<Uint8Array>): Promise<Uint8Array> => {
     const shared = session;
-    if (!shared || shared.state === 'closed') return take();
-    if (shared.state === 'online') await shared.whenSettled(3000);
-    const rev = shared.savableRev;
-    shared.pause();
-    let bytes: Uint8Array;
-    let touched = false;
-    try {
-      bytes = await take();
-    } finally {
-      touched = shared.resume();
-    }
-    // A file into which something was typed while it was written is the file of no one step.
-    written = { bytes, rev: touched ? undefined : rev };
-    return bytes;
+    if (!shared) return take();
+    const done = await writeSharedFile(shared, file.package, take);
+    // A closed session tells nobody of its saves.
+    if (shared.state !== 'closed') written = done;
+    return done.bytes;
   };
   /** What ties the controller to the page: the question before leaving, the hidden page, the view that turns read-only. */
   let bound: { unsaved(): boolean; release(): void } | undefined;
@@ -1583,11 +1579,11 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   const sheetOptions: SpreadsheetEditorOptions = {
     ...options,
     onChange: (change) => {
-      // What someone else changed is there to be saved, but is theirs to save by itself.
+      // What someone else changed is there to be saved: by the one participant who saves for all.
       if (change.remote && controller) {
         touched = true;
-        // Saved by itself by one participant only (the one who leads), so that the others do not save over each other.
-        controller.changed(!(session !== undefined && session.leads && controller.autoSave !== undefined));
+        if (saveSync) saveSync.remoteChanged();
+        else controller.changed(true);
       } else changed();
       if (options.onChange) options.onChange(change);
     },
@@ -1662,20 +1658,24 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       if (session) mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending });
     };
     /** The file is loaded again from its address and shown in place (the room is at a version this side does not have). */
-    const reload = async (): Promise<string[]> => {
+    const reload = async (): Promise<{ versions: string[]; stamp?: { ep: string; rev: number } }> => {
       if (typeof options.file !== 'string') throw new Error('The file has no address to load it from again');
       // Until the file is there nothing is typed into the workbook that is about to go.
       const editable = !view.readOnly;
+      // What is being typed can be applied to nothing (the workbook goes): it is said back when the file is there.
+      const typed = editable ? view.takeTypedText() : undefined;
       if (editable) editor.setReadOnly(true);
       view.showNotice(resolveUiStrings(options.locale).collab.updating, 'info');
       try {
-        return await loadAgain();
+        const loaded = await loadAgain();
+        if (typed !== undefined) view.showNotice(resolveUiStrings(options.locale).collab.typedKept(typed.length > 500 ? `${typed.slice(0, 500)}…` : typed), 'error');
+        return loaded;
       } catch (error) {
         if (editable) mounted.editor.setReadOnly(false);
         throw error;
       }
     };
-    const loadAgain = async (): Promise<string[]> => {
+    const loadAgain = async (): Promise<{ versions: string[]; stamp?: { ep: string; rev: number } }> => {
       const address = options.file as string;
       const response = await fetch(address, { cache: 'no-store' });
       if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
@@ -1709,7 +1709,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       if (controller) controller.adopt(tag === null ? undefined : tag, true);
       touched = false;
       show();
-      return fileVersions(named, bytes);
+      return { versions: fileVersions(named, bytes), stamp: file.package ? await readCollabStamp(file.package) : undefined };
     };
     const handle: MountedCollab = {
       get state() {
@@ -1735,7 +1735,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         if (session) session.leave();
       },
     };
-    const saveSync = controller
+    saveSync = controller
       ? createSaveSync({
           controller,
           session: () => session,
@@ -1756,16 +1756,19 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       {
         transport: plan.transport(),
         versions: fileVersions(readETag, readBytes),
+        stamp: file.package ? await readCollabStamp(file.package) : undefined,
         user: plan.options.user,
         room: plan.options.room,
         token: plan.options.token,
         readOnly: view.readOnly,
         onState: (state) => {
+          if (saveSync) saveSync.roomChanged();
           show();
           if (plan.options.onState) plan.options.onState(state);
           if (handle.onState) handle.onState(state);
         },
         onPeers: (peers) => {
+          if (saveSync) saveSync.roomChanged();
           view.collabPeersChanged(peers);
           show();
           if (plan.options.onPeers) plan.options.onPeers(peers);

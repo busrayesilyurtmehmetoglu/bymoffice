@@ -21,7 +21,7 @@ export async function run(seed: number, withDel: boolean, trace = false) {
   const r = rng(seed); let next = 1; const init: (string | null)[][] = []; for (let i = 0; i < 8; i++) init.push([`R${next++}`, null, null, null]);
   const bytes = await buildXlsx(bookOf(init)); const lanes = new Map<string, (() => void)[]>(); const server = new MemoryServer({ deliver: (fn, lane) => { let q = lanes.get(lane); if (!q) lanes.set(lane, (q = [])); q.push(fn); } });
   const log: string[] = []; const stepNet = () => { const busy = [...lanes.entries()].filter((q) => q[1].length); if (!busy.length) return false; const pick = busy[Math.floor(r() * busy.length)]; if (trace) log.push(`   deliver ${pick[0]}`); pick[1].shift()!(); return true; };
-  const order: string[] = []; const obs = server.connect(); obs.onMessage((t) => { const q = JSON.parse(t); if (q.t === 'op') order.push(q.id); }); obs.onState!((s) => { if (s === 'open') obs.send(JSON.stringify({ t: 'join', pv: 1, key: 'obs', v: [contentVersion(bytes)] })); }); while (stepNet());
+  const order: string[] = []; const obs = server.connect(); obs.onMessage((t) => { const q = JSON.parse(t); if (q.t === 'op') order.push(q.id); }); obs.onState!((s) => { if (s === 'open') obs.send(JSON.stringify({ t: 'join', pv: 2, key: 'obs', v: [contentVersion(bytes)] })); }); while (stepNet());
   const ms: any[] = []; for (let i = 0; i < 2 + (seed % 2); i++) { const wb = await (await open(bytes)).workbook(); const m: any = { name: 'm' + i, wb, notices: [] }; m.session = new CollabSession({ workbook: () => m.wb, changed: () => undefined, notice: (n) => m.notices.push(n) }, { transport: server.connect(), versions: [contentVersion(bytes)], timer: () => () => undefined }); m.key = m.session.tag; ms.push(m); }
   while (stepNet());
   const its = new Map<string, It>(); let tok = 1; log.length = 0;
@@ -56,8 +56,6 @@ for (const withDeletes of [false, true]) {
   test(`undo beside the steps of others, ${withDeletes ? 'with' : 'without'} rows that are deleted (${SEEDS} runs)`, async () => {
     const bad: string[] = [];
     for (let seed = 1; seed <= SEEDS && bad.length < 3; seed++) {
-      // Seed 155 with deletions is the one known case that is not right yet (see the test below).
-      if (withDeletes && seed === 155) continue;
       const result = await run(seed, withDeletes);
       if (result.V.length > 0) bad.push(`seed ${seed}: ${result.V.slice(0, 2).join(' | ').slice(0, 300)}`);
     }
@@ -65,9 +63,7 @@ for (const withDeletes of [false, true]) {
   });
 }
 
-// Known and not right: two participants put rows in at one place, and after an undo the rows of one stand on
-// the other side of the rows of the other than the replay says. Nothing is lost and everybody has the same sheet.
-test('undo: rows that two participants put in at one place keep their order after an undo', { todo: true }, async () => {
+test('undo: rows that were put in at one place keep their order after an undo (once seed 155)', async () => {
   const result = await run(155, true);
   assert.deepEqual(result.V, [], 'seed 155');
 });

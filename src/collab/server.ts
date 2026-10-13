@@ -53,6 +53,10 @@ interface Connection {
 }
 
 interface Room {
+  /** The name of the room as it was started: another one every time it is started anew. */
+  ep: string;
+  /** What the file the room was started with is known by. */
+  founding: Set<string>;
   key: string;
   rev: number;
   floor: number;
@@ -83,6 +87,12 @@ export interface MemoryTransport extends CollabTransport {
   /** Cuts the connection, as a network that went away would; resume() connects again. */
   suspend(): void;
   resume(): void;
+}
+
+let epochs = 0;
+/** A name for a room that is started: no two rooms of a page, or of two pages, are likely to share one. */
+function epochName(): string {
+  return `${Date.now().toString(36)}${Math.floor(Math.random() * 0x7fffffff).toString(36)}${(++epochs).toString(36)}`;
 }
 
 export class MemoryServer {
@@ -152,7 +162,7 @@ export class MemoryServer {
       }
       let room = this.roomsByKey.get(key);
       const made = !room;
-      if (!room) room = { key, rev: 0, floor: 0, log: [], bytes: 0, versions: new Map(), members: new Set(), pv: undefined, latest: [], gone: new Set(), syncs: [] };
+      if (!room) room = { key, ep: epochName(), founding: new Set(), rev: 0, floor: 0, log: [], bytes: 0, versions: new Map(), members: new Set(), pv: undefined, latest: [], gone: new Set(), syncs: [] };
       const pv = message.pv === undefined ? 1 : message.pv;
       if (room.pv !== undefined && room.pv !== pv) {
         this.say(connection, { t: 'error', code: 'version' });
@@ -174,21 +184,28 @@ export class MemoryServer {
       const fresh = room.rev === 0 && room.members.size === 0;
       let from: number | undefined;
       let named: string[] = [];
-      if (message.since !== undefined && message.since >= room.floor && message.since <= room.rev && !(fresh && message.since === 0)) {
+      // A step is taken on the word of who joins only for this room as it was started: a room that was started anew
+      // counts its steps anew, and "step 3" of the one before it says nothing about it.
+      if (message.since !== undefined && message.ep === room.ep && message.since >= room.floor && message.since <= room.rev) {
         from = message.since;
         named = message.v.filter((version) => room!.versions.has(version));
-      } else {
+      } else if (fresh) {
+        // Started (anew) with the file of who comes first. With the file it was started with before, and nothing
+        // done since, it is the room it was: whoever was in it comes back to it.
+        if (!message.v.some((version) => room!.founding.has(version))) room.ep = epochName();
+        room.versions.clear();
+        room.founding.clear();
         for (const version of message.v) {
-          const rev = room.versions.get(version);
-          if (rev !== undefined && rev >= room.floor && (from === undefined || rev > from)) from = rev;
+          room.versions.set(version, 0);
+          room.founding.add(version);
         }
-        if (from !== undefined) named = message.v.filter((version) => room!.versions.get(version) === from);
-        else if (fresh) {
-          room.versions.clear();
-          for (const version of message.v) room.versions.set(version, 0);
-          from = 0;
-          named = message.v.slice();
-        }
+        from = 0;
+        named = message.v.slice();
+      } else if (room.floor === 0 && message.v.some((version) => room!.founding.has(version))) {
+        // Otherwise only with the file the room was started with. What a file was said to hold later is no ground to
+        // start from: anybody may have said it. A file that was saved in the room says its step itself (see `since`).
+        from = 0;
+        named = message.v.filter((version) => room!.founding.has(version));
       }
       if (from === undefined) {
         // The versions of the latest step any is known for.
@@ -229,7 +246,7 @@ export class MemoryServer {
       });
       room.members.add(connection);
       connection.room = room;
-      this.say(connection, { t: 'hello', rev: room.rev, from, you: connection.id, ro: connection.ro, pv, v: Array.from(new Set(named)), peers });
+      this.say(connection, { t: 'hello', rev: room.rev, from, ep: room.ep, you: connection.id, ro: connection.ro, pv, v: Array.from(new Set(named)), peers });
       for (const entry of room.log) if (entry.rev > from) this.say(connection, { t: 'op', rev: entry.rev, id: entry.id, from: entry.from, ops: entry.ops });
       return;
     }

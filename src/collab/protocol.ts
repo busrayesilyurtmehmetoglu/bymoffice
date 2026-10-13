@@ -28,14 +28,14 @@ export interface PeerMessage {
 }
 
 export type ClientMessage =
-  | { t: 'join'; v: string[]; since?: number; user?: CollabUser; token?: string; ro?: boolean; room?: string; pv?: number; key?: string }
+  | { t: 'join'; v: string[]; since?: number; ep?: string; user?: CollabUser; token?: string; ro?: boolean; room?: string; pv?: number; key?: string }
   | { t: 'op'; base: number; id: string; ops: unknown[] }
   | { t: 'presence'; data: unknown }
   | { t: 'saved'; v: string[]; rev?: number }
   | { t: 'ping' };
 
 export type ServerMessage =
-  | { t: 'hello'; rev: number; from: number; you: string; ro: boolean; pv?: number; v: string[]; peers: PeerMessage[] }
+  | { t: 'hello'; rev: number; from: number; ep: string; you: string; ro: boolean; pv?: number; v: string[]; peers: PeerMessage[] }
   | { t: 'op'; rev: number; id: string; from: string; ops: unknown[] }
   | { t: 'nack'; id: string; rev: number; reason?: string }
   | { t: 'reset'; rev: number; v: string[] }
@@ -103,7 +103,8 @@ export function parseServerMessage(textOf: string): ServerMessage {
     case 'hello': {
       if (!isRev(m.rev) || !isRev(m.from) || m.from > m.rev) return fail('hello');
       if (!Array.isArray(m.peers) || m.peers.length > MAX_PEERS) return fail('hello');
-      return { t: 'hello', rev: m.rev, from: m.from, you: text(m.you, 100, 'hello'), ro: m.ro === true, v: m.v === undefined ? [] : versions(m.v, 0), peers: m.peers.map(peer) };
+      if (typeof m.ep !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(m.ep)) return fail('hello');
+      return { t: 'hello', rev: m.rev, from: m.from, ep: m.ep, you: text(m.you, 100, 'hello'), ro: m.ro === true, v: m.v === undefined ? [] : versions(m.v, 0), peers: m.peers.map(peer) };
     }
     case 'op':
       if (!isRev(m.rev) || !Array.isArray(m.ops)) return fail('op');
@@ -147,6 +148,10 @@ export function parseClientMessage(textOf: string): ClientMessage {
       if (m.since !== undefined) {
         if (!isRev(m.since)) return fail('join');
         out.since = m.since;
+      }
+      if (m.ep !== undefined) {
+        if (typeof m.ep !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(m.ep)) return fail('join');
+        out.ep = m.ep;
       }
       if (m.user !== undefined) out.user = cleanUser(m.user);
       if (m.token !== undefined) out.token = text(m.token, 4096, 'join');

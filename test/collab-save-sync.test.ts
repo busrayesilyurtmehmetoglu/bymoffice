@@ -67,6 +67,15 @@ test('a save that the server confirms is taken: its ETag, and a clean workbook w
   await r.sync.saved({ versions: ['e:"v2b"'], rev: 3 });
   assert.deepEqual([r.controller.currentETag, r.controller.dirty], ['"v2b"', true], 'the ETag is taken, the changes made here stay to be saved');
   assert.equal(await r.controller.saveNow(), true, 'and are saved');
+  // On the word of the one participant who saves for all they are: this side leaves its saving to that one.
+  r.controller.changed();
+  r.server.etag = '"v2c"';
+  await r.sync.saved({ versions: ['e:"v2c"'], rev: 3, byLeader: true });
+  assert.deepEqual([r.controller.currentETag, r.controller.dirty], ['"v2c"', false], 'what the saver of the room wrote holds them');
+  r.controller.changed();
+  r.server.etag = '"v2d"';
+  await r.sync.saved({ versions: ['e:"v2d"'], rev: 2, byLeader: true });
+  assert.equal(r.controller.dirty, true, 'but not a file of an earlier step, whoever wrote it');
   r.controller.changed(true);
   r.server.etag = '"v3"';
   await r.sync.saved({ versions: ['e:"v3"'], rev: 2 });
@@ -165,4 +174,144 @@ test('when the room asks for a save, the one who leads saves, as a save nobody a
   r.controller.changed(true);
   assert.equal(await r.sync.sync(), false, 'a conflict is not written over');
   assert.equal(r.asked.length, 0, 'and nobody is asked about a save nobody asked for');
+});
+
+/**
+ * Two participants of one room, each with the real controller and the real glue of mount(), on one
+ * file on a server that takes a save only when it is conditional on what the file is known by.
+ */
+function room() {
+  const server = { etag: '"v1"', n: 1, puts: [] as { by: string; match: string | undefined; status: number }[] };
+  let clock = 1000;
+  const sides = ['a', 'b'].map((name, index) => {
+    const session = { state: 'online' as SyncSession['state'], rev: 0, pending: 0, leads: index === 0 };
+    let timers: { run: () => void; at: number }[] = [];
+    const errors: string[] = [];
+    const serve = (async (_url: unknown, init?: RequestInit) => {
+      const method = (init && init.method) || 'GET';
+      const headers = ((init && init.headers) || {}) as { [name: string]: string };
+      const reply = (status: number, etag?: string) => ({ status, ok: status >= 200 && status < 300, headers: { get: (key: string) => (key.toLowerCase() === 'etag' && etag !== undefined ? etag : null) }, body: { cancel: async () => undefined } }) as unknown as Response;
+      if (method === 'HEAD') return reply(200, server.etag);
+      if (method !== 'PUT') return reply(200, server.etag);
+      // The answer takes a moment: two saves that were sent at once are both on their way before either is answered.
+      await Promise.resolve();
+      const ok = headers['If-Match'] === server.etag;
+      if (ok) server.etag = `"v${++server.n}"`;
+      server.puts.push({ by: name, match: headers['If-Match'], status: ok ? 204 : 412 });
+      return ok ? reply(204, server.etag) : reply(412);
+    }) as typeof fetch;
+    const target: SaveTarget = { kind: 'request', url: 'https://app.example.com/files/7', method: 'PUT', headers: [], credentials: 'same-origin', sameAsFile: true, timeoutMs: SAVE_TIMEOUT_MS, allowConverted: true, onConflict: 'ask' };
+    const asked: string[] = [];
+    // eslint-disable-next-line prefer-const
+    let sync: ReturnType<typeof createSaveSync>;
+    const host: SaveHost = {
+      target,
+      writable: () => true,
+      commit: () => true,
+      bytes: async () => new Uint8Array([1]),
+      info: () => ({ format: 'xlsx' }),
+      strings: () => STRINGS_EN,
+      askOverwrite: () => void asked.push('asked'),
+      onError: (error) => void errors.push(error.code),
+      etag: '"v1"',
+      fetch: serve,
+      autoSave: { delayMs: 1000, maxWaitMs: 5000 },
+      now: () => clock,
+      timer: (run, ms) => {
+        const entry = { run, at: clock + ms };
+        timers.push(entry);
+        return () => {
+          timers = timers.filter((other) => other !== entry);
+        };
+      },
+      // As mount() ties them: one participant saves for all, and a conflict with a save of the room is none.
+      autoAllowed: () => sync.autoAllowed(),
+      conflictWait: () => sync.conflictWait(),
+      // Tells the other participant, as the session does.
+      onSaved: () => {
+        const tag = controller.currentETag as string;
+        for (const other of sides) if (other.name !== name) void other.sync.saved({ versions: [`e:${tag}`], rev: session.rev, byLeader: session.leads });
+      },
+    };
+    const controller: SaveController = new SaveController(host);
+    sync = createSaveSync({ controller, session: () => session, target: { url: target.url, credentials: 'same-origin' }, strong: strongETag, readOnly: () => false, fetch: serve, timer: host.timer });
+    const fire = (): boolean => {
+      const due = timers.filter((entry) => entry.at <= clock);
+      timers = timers.filter((entry) => entry.at > clock);
+      for (const entry of due) entry.run();
+      return due.length > 0;
+    };
+    return { name, session, controller, sync, errors, asked, fire };
+  });
+  /** Time passes, and everything that is due happens. */
+  const pass = async (ms: number): Promise<void> => {
+    clock += ms;
+    for (let round = 0; round < 20; round++) {
+      let any = false;
+      for (const side of sides) if (side.fire()) any = true;
+      await settle();
+      if (!any) break;
+    }
+  };
+  /** One participant changes something: a change of its own there, one of someone else for the other. */
+  const edit = (who: number): void => {
+    for (const side of sides) side.session.rev++;
+    sides[who].controller.changed();
+    sides[1 - who].sync.remoteChanged();
+  };
+  return { server, sides, pass, edit };
+}
+
+test('auto-save on both sides of a room: one participant saves, once, and nobody is told of a conflict', async () => {
+  const r = room();
+  const [a, b] = r.sides;
+  // The one who does not save for all changes something.
+  r.edit(1);
+  await r.pass(1500);
+  assert.deepEqual(r.server.puts.map((put) => [put.by, put.status]), [['a', 204]], 'one save, by the one who saves for all');
+  assert.deepEqual([a.errors, b.errors, a.asked, b.asked], [[], [], [], []], 'nobody is told of a conflict or asked');
+  assert.deepEqual([a.controller.dirty, a.controller.currentETag], [false, r.server.etag], 'the saver has nothing left to save');
+  assert.equal(b.controller.currentETag, r.server.etag, 'the other knows the file by its new name');
+  assert.equal(b.controller.dirty, false, 'and has nothing left to save either: what it changed is in the file the saver wrote');
+  // Then the saver changes something, then the other again: still one save each time.
+  r.edit(0);
+  await r.pass(1500);
+  r.edit(1);
+  await r.pass(1500);
+  assert.deepEqual(r.server.puts.map((put) => [put.by, put.status]), [['a', 204], ['a', 204], ['a', 204]], 'one save for every change');
+  assert.deepEqual([a.errors, b.errors], [[], []], 'and still no conflict');
+  // The other saves by hand at the moment the saver saves by itself: one of the two is refused, and neither is told so.
+  r.edit(1);
+  r.server.puts.length = 0;
+  const byHand = b.controller.saveNow();
+  await r.pass(1500);
+  assert.equal(await byHand, true, 'the save by hand went through');
+  assert.equal(r.server.puts.some((put) => put.status === 412), true, 'one save met the other (or the test does not test what it says)');
+  assert.deepEqual([a.errors, b.errors, a.asked, b.asked], [[], [], [], []], 'a conflict with a save of the room is no conflict');
+  assert.equal(a.controller.state.autoPaused === true, false, 'and auto-save goes on');
+});
+
+test('auto-save in a room: when the one who saves for all leaves, the next one does', async () => {
+  const r = room();
+  const [a, b] = r.sides;
+  r.edit(1);
+  // The saver is gone before it saved.
+  a.session.state = 'closed';
+  a.controller.destroy();
+  b.session.leads = true;
+  b.sync.roomChanged();
+  await r.pass(1500);
+  assert.deepEqual(r.server.puts.filter((put) => put.by === 'b').map((put) => put.status), [204], 'the one who is left saves what it changed');
+  assert.equal(b.controller.dirty, false, 'and has nothing left to save');
+  // Offline, nobody knows who saves: nothing is sent.
+  b.session.state = 'offline';
+  b.session.leads = false;
+  b.controller.changed();
+  await r.pass(6000);
+  assert.equal(r.server.puts.filter((put) => put.by === 'b').length, 1, 'nothing is saved by itself while the room cannot be reached');
+  b.session.state = 'online';
+  b.session.leads = true;
+  b.sync.roomChanged();
+  await r.pass(6000);
+  assert.equal(r.server.puts.filter((put) => put.by === 'b').length, 2, 'and it is, once the room is back');
 });

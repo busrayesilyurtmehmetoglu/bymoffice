@@ -51,7 +51,10 @@ export interface CollabServerOptions {
   maxLogEntries?: number;
   /** Default 32 MiB. */
   maxLogBytes?: number;
-  /** How long an empty room is kept. Default 5 minutes. */
+  /**
+   * How long an empty room is kept. Default 5 minutes. A room that was let go of and is joined again is another
+   * room: it has a new name (`hello.ep`), and a `since` that names the old one is not looked at.
+   */
   idleRoomMs?: number;
   /**
    * How long a connection may take to send its `join`, and after a `reset` to join again. Default 10 seconds;
@@ -84,6 +87,12 @@ export interface CollabServerOptions {
    * over it a `saved` is passed on without its `rev`. Default 6; 0 is no limit.
    */
   savedPerMinute?: number;
+  /**
+   * Saves a minute of a whole room, whoever says them, that are written to the table of versions (a bucket of
+   * as many tokens, beside that of every connection); over it a `saved` is passed on without its `rev`.
+   * Default 30; 0 is no limit.
+   */
+  roomSavedPerMinute?: number;
   /**
    * Formats a minute one connection may add: the length of `f` of an operation that opens with
    * `{ "t": "st", "f": [...] }` (a bucket of as many tokens); over it the operation is refused with `nack`,

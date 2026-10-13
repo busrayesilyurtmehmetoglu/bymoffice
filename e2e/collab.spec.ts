@@ -31,6 +31,7 @@ interface Spec {
   color?: string;
   readOnly?: boolean;
   saveTo?: boolean;
+  autoSave?: boolean;
 }
 
 function mount(page: Page, spec: Spec): Promise<string> {
@@ -61,6 +62,7 @@ function mount(page: Page, spec: Spec): Promise<string> {
     };
     if (given.readOnly) options.readOnly = true;
     if (given.saveTo) options.saveTo = true;
+    if (given.autoSave) options.autoSave = { delayMs: 300, maxWaitMs: 2000 };
     try {
       w.__mounted = await api.mount(document.getElementById('editor'), options);
       return 'ok';
@@ -99,7 +101,7 @@ function pixelsOf(page: Page, colour: string): Promise<number> {
 }
 
 /** Two pages on one file and one room; the first one holds the room unless the relay of the server does. */
-async function pair(context: BrowserContext, page: Page, request: APIRequestContext, options: { socket?: boolean; saveTo?: boolean; second?: Partial<Spec> } = {}): Promise<{ a: Page; b: Page; url: string; room: string }> {
+async function pair(context: BrowserContext, page: Page, request: APIRequestContext, options: { socket?: boolean; saveTo?: boolean; autoSave?: boolean; second?: Partial<Spec> } = {}): Promise<{ a: Page; b: Page; url: string; room: string }> {
   const room = unique();
   const url = `/e2e/saved/${room}.xlsx`;
   await seed(request, url, await createBlank('xlsx', { sheetName: 'Data' }));
@@ -112,8 +114,8 @@ async function pair(context: BrowserContext, page: Page, request: APIRequestCont
   (b as any).__problems = problems;
   await page.goto(PAGE);
   await b.goto(PAGE);
-  expect(await mount(page, { file: url, room, via: options.socket ? 'socket' : 'host', name: 'Ada', color: RED, saveTo: options.saveTo })).toBe('ok');
-  expect(await mount(b, { file: url, room, via: options.socket ? 'socket' : 'tab', name: 'Ben', color: BLUE, saveTo: options.saveTo, ...options.second })).toBe('ok');
+  expect(await mount(page, { file: url, room, via: options.socket ? 'socket' : 'host', name: 'Ada', color: RED, saveTo: options.saveTo, autoSave: options.autoSave })).toBe('ok');
+  expect(await mount(b, { file: url, room, via: options.socket ? 'socket' : 'tab', name: 'Ben', color: BLUE, saveTo: options.saveTo, autoSave: options.autoSave, ...options.second })).toBe('ok');
   await online(page);
   await online(b);
   await expect.poll(() => peers(page), { message: 'the first page sees the second' }).toBe(1);
@@ -456,5 +458,50 @@ test('while the file is loaded again nothing can be typed into the workbook that
   await online(b);
   await type(b, 3, 0, 'typed afterwards');
   await expect.poll(() => cell(a, 3, 0), { message: 'what is typed afterwards reaches the others' }).toBe('typed afterwards');
+  clean(b);
+});
+
+test('auto-save on both pages of a room: one page saves, nobody is told of a conflict, and the stored file holds what was typed', async ({ page, context, request }) => {
+  const { a, b, url } = await pair(context, page, request, { saveTo: true, autoSave: true });
+  const puts: string[] = [];
+  for (const [name, each] of [['a', a], ['b', b]] as [string, Page][]) {
+    each.on('response', (response) => {
+      if (response.request().method() === 'PUT' && response.url().endsWith(url)) puts.push(`${name} ${response.status()}`);
+    });
+  }
+  const stored = async (): Promise<string> => {
+    const answer = await request.get(url);
+    const book = await (await open(new Uint8Array(await answer.body()))).workbook();
+    return JSON.stringify(Array.from(book.sheets[0].rows.entries()).map(([row, value]) => [row, value.cells.map((cell) => (cell ? cell.value : null))]));
+  };
+  // Typed on one page, then on the other: saved each time, by one page.
+  for (const [who, text, row] of [[b, 'typed by the second', 2], [a, 'typed by the first', 3], [b, 'typed by the second again', 4]] as [Page, string, number][]) {
+    const before = puts.length;
+    await type(who, row, 0, text);
+    await expect.poll(stored, { message: `"${text}" is in the stored file` }).toContain(text);
+    await expect.poll(() => Promise.all([a, b].map((each) => each.evaluate(() => (window as any).__mounted.hasUnsavedChanges))), { message: 'both pages have nothing left to save' }).toEqual([false, false]);
+    expect(puts.slice(before).filter((put) => put.endsWith(' 412')), 'no save met another').toEqual([]);
+    expect(new Set(puts.slice(before).map((put) => put[0])).size, `one page saved: ${puts.slice(before).join()}`).toBe(1);
+  }
+  expect(new Set(puts.map((put) => put[0])).size, `the same page every time: ${puts.join()}`).toBe(1);
+  for (const each of [a, b]) {
+    expect(await each.evaluate(() => (window as any).__errors), 'no error of a save').toEqual([]);
+    expect((await notices(each)).filter((notice) => notice.startsWith('error')), 'nothing is said of a conflict').toEqual([]);
+  }
+  clean(b);
+});
+
+test('what is being typed when the file is loaded again is said back, not lost without a word', async ({ page, context, request }) => {
+  const { b } = await pair(context, page, request, { saveTo: true });
+  await b.evaluate(() => {
+    const view = (window as any).__mounted.view;
+    view.select({ top: 5, left: 0, bottom: 5, right: 0 });
+    view.startEditing('half a sentence');
+  });
+  expect(await b.evaluate(() => (window as any).__mounted.view.hasUnappliedText()), 'a cell is being typed in').toBe(true);
+  await b.evaluate(() => (window as any).__mounted.collab.reload());
+  await expect.poll(() => notices(b), { message: 'the text is said back' }).toContainEqual(expect.stringMatching(/what you were typing was not applied\. You typed: half a sentence/));
+  await online(b);
+  expect(await cell(b, 5, 0), 'and it is in no cell').toBe(null);
   clean(b);
 });

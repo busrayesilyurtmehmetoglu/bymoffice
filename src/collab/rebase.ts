@@ -28,6 +28,8 @@ export interface Mapped {
   conflict?: true;
   /** Part of it went with a place that is gone. */
   partial?: true;
+  /** Rows or columns that are put in stand behind this many of those the shift put in at the same place (and not before them all, as they do otherwise). */
+  behind?: number;
 }
 
 function mapSheet(s: number, shift: Shift): number | undefined {
@@ -97,6 +99,12 @@ function mapPatchFormula(patch: WireCellPatch, same: boolean, shift: Shift): Wir
   if (patch === 0 || !patch.v || !patch.v.f) return patch;
   const text = mapFormula(patch.v.f.x, same, shift);
   return text === patch.v.f.x ? patch : { ...patch, v: { ...patch.v, f: { ...patch.v.f, x: text } } };
+}
+
+/** How often a formula that is written names something that is gone. */
+function brokenRefs(patch: WireCellPatch): number {
+  if (patch === 0 || !patch.v || !patch.v.f) return 0;
+  return patch.v.f.x.split('#REF!').length - 1;
 }
 
 /** Whether a shift changes what formulas say. */
@@ -189,6 +197,8 @@ export function mapRec(rec: Rec, shift: Shift, first = false): Mapped {
           else col = at;
         } else if (perm && row >= perm.top && row <= perm.bottom && col >= perm.left && col <= perm.right) row = perm.top + perm.target[row - perm.top];
         const patch = movesFormulas(shift) ? mapPatchFormula(entry[2], onSheet, shift) : entry[2];
+        // A formula that read what someone else took away meanwhile is written as the error it has become: said.
+        if (patch !== entry[2] && brokenRefs(patch) > brokenRefs(entry[2])) partial = true;
         cells.push(row === entry[0] && col === entry[1] && patch === entry[2] ? entry : [row, col, patch]);
       }
       if (cells.length === 0) return { conflict: true };
@@ -327,14 +337,36 @@ export function mapRec(rec: Rec, shift: Shift, first = false): Mapped {
         return recs.length === 1 ? { rec: recs[0] } : { recs };
       }
       if (!onSheet || shift.k !== 'rc' || shift.axis !== op.x) return moved(s === op.s ? op : { ...op, s }, nm);
-      if (op.t === 'ins') return moved({ ...op, s, at: mapInsertion(op.at, shift, first) }, nm);
+      if (op.t === 'ins') {
+        if (!shift.ins && op.at > shift.at && op.at <= shift.at + shift.n) {
+          // Into a run that is gone, or right behind its last row: at the place of the run, and how far in is remembered.
+          return { rec: { w: { ...op, s, at: shift.at }, nm, fold: op.at - shift.at } };
+        }
+        if (shift.ins && rec.fold !== undefined && shift.at === op.at && !first) {
+          // Rows came (back) where the run went: as far behind the first of them as it was behind the first of the run.
+          const behind = Math.min(rec.fold, shift.n);
+          return { rec: { w: { ...op, s, at: op.at + behind }, nm }, behind };
+        }
+        const done = moved({ ...op, s, at: mapInsertion(op.at, shift, first) }, nm);
+        if (rec.fold !== undefined && done.rec) done.rec = { ...done.rec, fold: rec.fold };
+        return done;
+      }
+      // Rows of the run that someone else took away first, and that come back now (their deletion was undone): they
+      // were to go and stay. Which is said.
+      const back = rec.cut === true && shift.ins && shift.at >= op.at && shift.at <= op.at + op.n && !first;
       if (shift.ins && shift.at > op.at && shift.at < op.at + op.n && !first) {
         // Rows that someone else put in between the rows that are to go were never seen by whoever deletes: they
         // stay, and the rows on either side of them go - the lower ones first, which moves nothing above them.
-        return { recs: [{ w: { ...op, s, at: shift.at + shift.n, n: op.at + op.n - shift.at }, nm }, { w: { ...op, s, n: shift.at - op.at }, nm }] };
+        const split: Mapped = { recs: [{ w: { ...op, s, at: shift.at + shift.n, n: op.at + op.n - shift.at }, nm }, { w: { ...op, s, n: shift.at - op.at }, nm }] };
+        if (back) split.partial = true;
+        return split;
       }
       const band = mapBand(op.at, op.n, shift);
-      return band ? moved({ ...op, s, at: band[0], n: band[1] }, nm) : { noop: true };
+      if (!band) return { noop: true };
+      const out = moved({ ...op, s, at: band[0], n: band[1] }, nm);
+      if (back) out.partial = true;
+      else if (out.rec && (rec.cut === true || band[1] < op.n)) out.rec = { ...out.rec, cut: true };
+      return out;
     }
     case 'sheet-':
       return moved(s === op.s ? op : { ...op, s }, shift.k === 'sName' && shift.s === op.s ? shift.name : rec.nm);
@@ -644,8 +676,15 @@ export function transformStep(recs: readonly Rec[], carry: readonly Carry[], und
       }
       // The carried item is read through the operation as it was beside it.
       if (mine) {
-        const w = item.w ? mapRec({ w: item.w }, mine, true).rec : undefined;
-        const shifts = item.sh ? mapShift(item.sh, mine) : [];
+        // Put in behind (some of) what the item put in: the item is read through it where it stands now, and is
+        // two insertions when it stands between them.
+        const through = result.behind !== undefined && result.rec ? shiftOf(result.rec.w, result.rec.nm, result.rec.wide) || mine : mine;
+        const w = item.w ? mapRec({ w: item.w }, through, true).rec : undefined;
+        let shifts = item.sh ? mapShift(item.sh, through) : [];
+        if (result.behind !== undefined && item.sh && item.sh.k === 'rc' && through.k === 'rc') {
+          const k = result.behind;
+          shifts = k >= item.sh.n ? [item.sh] : [{ ...item.sh, n: k }, { ...item.sh, at: item.sh.at + k + through.n, n: item.sh.n - k }];
+        }
         if (shifts.length === 0 && w) behind.push({ w: w.w });
         shifts.forEach((sh, i) => behind.push(i === 0 && w ? { sh, w: w.w } : { sh }));
       } else behind.push(item);

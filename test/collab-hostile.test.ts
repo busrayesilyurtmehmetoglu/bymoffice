@@ -18,7 +18,7 @@ function intruder(net: Net, bytes: Uint8Array, key = 'evil'): { send(message: un
   const got: { t: string; rev?: number; id?: string }[] = [];
   raw.onMessage((text) => got.push(JSON.parse(text)));
   raw.onState!((state) => {
-    if (state === 'open') raw.send(JSON.stringify({ t: 'join', v: [contentVersion(bytes)], key, pv: 1 }));
+    if (state === 'open') raw.send(JSON.stringify({ t: 'join', v: [contentVersion(bytes)], key, pv: 2 }));
   });
   return { send: (message) => raw.send(JSON.stringify(message)), got };
 }
@@ -141,7 +141,7 @@ const NASTY = ['"><x y="', ']]>', '&amp;<&>', "it's", ' lead and trail ', '<!--'
 
 function python(): boolean {
   try {
-    execFileSync('python3', ['-c', 'import xml.etree.ElementTree'], { stdio: 'ignore' });
+    execFileSync('python3', ['-c', 'import xml.etree.ElementTree'], { stdio: 'ignore', timeout: 60000 });
     return true;
   } catch {
     return false;
@@ -193,7 +193,7 @@ test('whatever steps arrive, the file that is saved is well formed and opens', a
       const zip = ZipArchive.read(saved);
       const parts: { [name: string]: string } = {};
       for (const name of zip.names()) if (/\.(xml|rels|vml)$/.test(name)) parts[name] = Buffer.from(await zip.read(name)).toString('base64');
-      const out = execFileSync('python3', ['-c', 'import sys,json,base64\nimport xml.etree.ElementTree as E\nbad=[]\nfor k,v in json.load(sys.stdin).items():\n  try:\n    E.fromstring(base64.b64decode(v))\n  except Exception as e:\n    bad.append(k+": "+str(e))\nprint(json.dumps(bad))'], { input: JSON.stringify(parts), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      const out = execFileSync('python3', ['-c', 'import sys,json,base64\nimport xml.etree.ElementTree as E\nbad=[]\nfor k,v in json.load(sys.stdin).items():\n  try:\n    E.fromstring(base64.b64decode(v))\n  except Exception as e:\n    bad.append(k+": "+str(e))\nprint(json.dumps(bad))'], { input: JSON.stringify(parts), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60000 });
       assert.deepEqual(JSON.parse(out), [], `run ${run}: every part is well formed, namespaces and all`);
     }
   }
@@ -213,5 +213,5 @@ test('more of what is no step: lengths, depths and places', async () => {
   ];
   for (const [what, step] of bad.slice(0, 5)) assert.throws(() => decodeStep(step, wb.styles), { name: 'WireError' }, `refused: ${what}`);
   const { parseServerMessage } = await import('../src/collab/protocol');
-  assert.throws(() => parseServerMessage(JSON.stringify({ t: 'hello', rev: 0, from: 0, you: 'c', ro: false, v: [], peers: Array.from({ length: 1025 }, (_x, i) => ({ id: `p${i}`, user: {}, ro: false })) })), { name: 'WireError' }, 'refused: a hello with more peers than a room has');
+  assert.throws(() => parseServerMessage(JSON.stringify({ t: 'hello', rev: 0, from: 0, ep: 'e', you: 'c', ro: false, v: [], peers: Array.from({ length: 1025 }, (_x, i) => ({ id: `p${i}`, user: {}, ro: false })) })), { name: 'WireError' }, 'refused: a hello with more peers than a room has');
 });

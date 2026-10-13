@@ -16,14 +16,14 @@ Aşama 4a yalnız **tabloları** kapsar. Belgeler (docx) birlikte düzenlenmez.
 
 ## Dört kural (aktarıcı)
 
-1. **Oda** bir `rev` (0'dan başlar), bir `floor` (günlükteki en eski adımdan önceki sürüm) ve bir günlük tutar.
+1. **Oda** bir `rev` (0'dan başlar), bir `floor` (günlükteki en eski adımdan önceki sürüm), bir günlük ve bir **dönem adı** (`ep`) tutar. Dönem adı oda **kurulurken** aktarıcının ürettiği rastgele bir dizgedir (`[A-Za-z0-9_-]{1,64}`, gizli değildir) ve her `hello`'da verilir. Oda unutulup yeniden kurulursa (aktarıcı yeniden başladı, boş oda silindi, sayfa içi aktarıcının sayfası yenilendi) ya da boş ve `rev 0` iken **başka bir dosyayla** yeniden kurulursa dönem adı değişir: yeni oda adımlarını baştan sayar ve eskisinin "3. adımı" onda hiçbir şey demek değildir.
 2. **`op`:** `base === rev` ise kabul: `rev++`, günlüğe yaz, odadaki **herkese (gönderen dahil)** yayınla. Değilse yalnız gönderene `nack`.
-3. **`join`:** katılana `hello` ve bildiği sürümden sonraki günlük gönderilir; günlük o sürümü kapsamıyorsa `reset` (istemci dosyayı yeniden yükleyip yeniden katılır).
+3. **`join`:** katılana `hello` ve durduğu adımdan sonraki günlük gönderilir. Durduğu adım iki yoldan bilinir: (i) `since` + **bu odanın** `ep`'i (odaya geri dönen istemci, ya da dosyasının içinde o odanın damgası olan istemci — aşağıda "Dosyadaki damga"); (ii) odanın **kurulduğu** dosyayla gelen, 0'dan. Başka her durumda `reset` (istemci dosyayı yeniden yükleyip yeniden katılır). `ep`'siz ya da başka `ep`'li `since` **yok sayılır**.
 4. **Hafif iletiler** (`presence`, `saved`) günlüğe girmez, sıra numarası almaz, öbürlerine aktarılır.
 
 Ek kurallar (aktarıcı):
 
-5. **Sürüm (`pv`):** `join` protokol sürümünü taşır (şimdi `1`). Odanın sürümü ilk katılanla sabitlenir; başka sürümle gelen `error version` alır. (Yeni bir sürümün tanıdığı işlem türü eskilerde atlanırdı; aynı odada iki sürüm ıraksama demektir.)
+5. **Sürüm (`pv`):** `join` protokol sürümünü taşır (şimdi **`2`**; `1`: dönem adı ve damga yoktu, `since` tek başına kabul ediliyordu — sessiz ıraksamaya yol açtığı için `1` konuşan istemci `2` odasına alınmaz). Odanın sürümü ilk katılanla sabitlenir; başka sürümle gelen `error version` alır. (Yeni bir sürümün tanıdığı işlem türü eskilerde atlanırdı; aynı odada iki sürüm ıraksama demektir.)
 6. **Gizli anahtar (`key`):** `join` bir `key` taşır (1–64 karakter, `[A-Za-z0-9_-]`). Anahtar katılımcı ile aktarıcı arasında **sırdır**: hiçbir iletide, günlükte ya da oda listesinde yer almaz. Aynı odaya aynı anahtarla gelen bağlantı o katılımcının kendisidir (kopup dönen): eski bağlantı `error replaced` alır ve kapanır, yenisi yerine geçer. `op.id` herhangi bir dizgedir (1–100 karakter) ve anahtarla ilgisi yoktur; istemci adımlarını anahtardan türetilmeyen, herkesin gördüğü ayrı bir önekle adlandırır ve kendi adımını yalnız adından değil **içeriğinden** de tanır (aynı adla gelen başka içerik başkasının adımıdır). İçerik karşılaştırması anahtar sırasından bağımsızdır; yine de aktarıcı `ops`'u **aldığı metinle** aktarmalıdır (örnek sunucu öyle yapar). Gönderilen adım 30 sn içinde ne onay ne ret alırsa istemci bunu söyler ve yeniden bağlanır.
 7. **Bağlantı başına tek oda:** katılmış bağlantıdan ikinci `join` → `bad-message`. `reset` almış bağlantı yalnız aynı odaya yeniden katılabilir. Sırası bozuk adım gören istemci yeni bağlantı kurup `since` ile katılır (dosya yeniden yüklenmez).
 8. **Sürüm eşlemesi değişmez:** bir sürüm dizgesinin hangi adımı tuttuğu bir kez yazılır (ilk yazan kazanır; odanın kuruluş sürümleri 0'a kilitlidir). `saved` yalnız yazma yetkili üyeden kabul edilir ve `rev` yalnız gönderenin gerçekten gördüğü aralıkta (`katıldığı adım ≤ rev ≤ odanın adımı`). Tablo sınırlıdır (16 sürüm); **kuruluş sürümleri ve son kaydedilen sürüm asla atılmaz**, atılan bir sürüm **bir daha yazılamaz** (atılanlar ayrıca tutulur: en çok 4.096; dolunca oda yeni sürüm yazmaz). Var olan ya da atılmış bir sürüme başka adım söyleyen `saved`, `rev`'i olmadan aktarılır. Yeni sürüm yazan `saved` bağlantı başına hız sınırlıdır (örnek sunucu: dakikada 6).
@@ -40,7 +40,7 @@ Her ileti tek bir JSON nesnesidir (WebSocket'te bir metin çerçevesi). En büy�
 
 | İleti | Alanlar |
 |---|---|
-| `join` | `{ "t":"join", "pv":1, "key":dizge, "v":[dizge…], "since"?:tamsayı, "user"?:{ "name"?:dizge, "color"?:"#RRGGBB" }, "token"?:dizge, "ro"?:true, "room"?:dizge }` |
+| `join` | `{ "t":"join", "pv":2, "key":dizge, "v":[dizge…], "since"?:tamsayı, "ep"?:dizge, "user"?:{ "name"?:dizge, "color"?:"#RRGGBB" }, "token"?:dizge, "ro"?:true, "room"?:dizge }` |
 | `op` | `{ "t":"op", "base":tamsayı, "id":dizge, "ops":[…] }` |
 | `presence` | `{ "t":"presence", "data":{ "s":sayfa, "a":[satır,sütun], "r":[üst,sol,alt,sağ] } \| null }` |
 | `saved` | `{ "t":"saved", "v":[dizge…], "rev"?:tamsayı }` |
@@ -54,9 +54,9 @@ Her ileti tek bir JSON nesnesidir (WebSocket'te bir metin çerçevesi). En büy�
 
 | İleti | Alanlar |
 |---|---|
-| `hello` | `{ "t":"hello", "pv":1, "rev":tamsayı, "from":tamsayı, "you":dizge, "ro":mantıksal, "v":[dizge…], "peers":[{ "id", "user":{name?,color?}, "ro", "presence"? }…] }` |
+| `hello` | `{ "t":"hello", "pv":2, "ep":dizge, "rev":tamsayı, "from":tamsayı, "you":dizge, "ro":mantıksal, "v":[dizge…], "peers":[{ "id", "user":{name?,color?}, "ro", "presence"? }…] }` |
 | `op` | `{ "t":"op", "rev":tamsayı, "id":dizge, "from":dizge, "ops":[…] }` |
-| `nack` | `{ "t":"nack", "id":dizge, "rev":tamsayı, "reason"?:"read-only"\|"id"\|"rate" }` |
+| `nack` | `{ "t":"nack", "id":dizge, "rev":tamsayı, "reason"?:"read-only"\|"rate" }` |
 | `sync` | `{ "t":"sync" }` — biri katılamıyor: kaydedebilen kaydetsin |
 | `reset` | `{ "t":"reset", "rev":tamsayı, "v":[dizge…] }` |
 | `presence` | `{ "t":"presence", "from":dizge, "data":… }` |
@@ -69,12 +69,20 @@ Her ileti tek bir JSON nesnesidir (WebSocket'te bir metin çerçevesi). En büy�
 
 ### `join` nasıl yanıtlanır (sırayla)
 
-a. `since` verilmiş ve `floor ≤ since ≤ rev` → `hello` (`from: since`) + sonraki adımlar. (Taze odada `since: 0` bu kurala girmez; aşağıdakilere bakılır.)
-b. `v`'den biri odanın sürüm tablosunda ve o sürümün adımı `r ≥ floor` → `hello` (`from: r`) + sonraki adımlar (birden çok eşleşmede en büyük `r`).
-c. Oda **taze** (`rev === 0` ve başka katılmış bağlantı yok) → tablo temizlenir, `v`'nin her dizgesi 0 olarak yazılır → `hello` (`from: 0`).
+a. `since` verilmiş, `ep` **bu odanın dönem adı** ve `floor ≤ since ≤ rev` → `hello` (`from: since`) + sonraki adımlar. `hello.v`, katılanın `v`'sinden odanın **duyduğu** (kuruluş ya da `saved` tablosundaki) dizgeleri taşır.
+b. Oda **taze** (`rev === 0` ve başka katılmış bağlantı yok) → oda (yeniden) kurulur: tablo temizlenir, `v`'nin her dizgesi **kuruluş sürümü** olarak 0'a yazılır → `hello` (`from: 0`). `v`'den biri odanın önceki kuruluş sürümüyse dönem adı **korunur** (hiçbir şey yazılmamış aynı oda: içindekiler geri dönebilir); değilse yeni dönem adı üretilir.
+c. `v`'den biri odanın **kuruluş sürümü** ve `floor === 0` → `hello` (`from: 0`) + bütün adımlar.
 d. Hiçbiri → `reset`. Bağlantı açık kalır ama odada sayılmaz; istemci dosyasını yeniden yükleyip aynı bağlantıdan yeniden `join` gönderir.
 
-`saved { v, rev }` gelince (`floor ≤ rev ≤ oda rev'i`) `v`'nin her dizgesi tabloya o `rev` ile yazılır (en çok 16 dizge; en eskisi atılır).
+`saved { v, rev }` gelince (`floor ≤ rev ≤ oda rev'i`) `v`'nin her dizgesi tabloya o `rev` ile yazılır (en çok 16 dizge; en eskisi atılır). **Tablo kimseyi içeri almaz** (sürüm 1'de alıyordu): bir dizgenin hangi adımı tuttuğu yalnız birinin SÖZÜDÜR — aynı kitabı tutan herkes aynı baytları yazacağı için yazma yetkili biri dürüst kaydın özetini önceden hesaplayıp yanlış adıma yazdırabilir. Tablo şunlara yarar: aktarılan `saved` iletisinin `rev`'i, `reset.v`, ve (a) ile katılana "oda bu dosyayı duydu" demek (`hello.v`).
+
+### Dosyadaki damga
+
+Birlikte düzenlenen kitap kaydedilirken motor dosyanın **içine** odanın dönem adını ve dosyanın tuttuğu adımı yazar: `docProps/custom.xml` içinde tek bir özel belge özelliği, `BymOfficeCollab` = `"<ep>:<rev>"` (parça yoksa ilişkisi ve içerik türüyle birlikte oluşturulur; dosyanın öbür özel özelliklerine dokunulmaz; `collab` olmadan açılan kitapta **hiç yazılmaz**). Dosya hiçbir adımın dosyası değilse (bekleyen adım vardı, ya da yazılırken bir şey değiştirildi — motor iki kez yeniden dener) ya da oturum odadan ayrıysa (`detached`, `closed`) damga **silinir**.
+
+Dosyayı açan istemci damgayı okur ve `join`'e `since: <rev>`, `ep: <ep>` koyar. `hello` geldiğinde: dönem adı damgadakiyle aynıysa `from` damgadaki adım olmalı **ve** `hello.v` boş olmamalıdır (oda bu baytları duymuş olmalı: damgayı taşıdığı halde oda dışında — Excel'de, `collab`'sız — değiştirilmiş dosya başka bir dosyadır); tutmuyorsa istemci damgayı bırakıp damgasız katılır (kuruluş dosyası değilse `reset` → `sync` → odanın kaydedicisi kaydeder → yeniden yükleme). Dönem adı başkaysa yalnız `from: 0` kabul edilir. Odaya **geri dönen** istemci (`since` = onaylanmış adımı, `ep` = içinde olduğu oda) `hello.ep` başka çıkarsa kendi adımına güvenmez: kaydedilmemiş işi yoksa dosyayı yeniden yükler, varsa `detached` olur (iş atılmaz).
+
+Damga, **dosyanın durduğu yere yazabilen** biri tarafından sahtelenebilir; o kişi dosyanın kendisini de değiştirebilir. Aktarıcıdaki bir katılımcının sözüyle sahtelenemez. Damgayı yazıp okuyan modül: `src/formats/xlsx/collab-stamp.ts` (`readCollabStamp`, `writeCollabStamp`, `writeSharedFile`). Kendi kaydeden uygulama (`collab.saved(bytes, etag)`, köprüde `save`) `mounted.save()`'in verdiği baytları saklarsa damga içindedir.
 
 ### Oda anahtarı, yetki
 
@@ -148,7 +156,7 @@ Bu tablo **yakınsamayı etkilemez** (o, aktarıcının sırasından gelir); yal
 
 ## Geri al / yinele
 
-Yalnız katılımcının **kendi** adımları geri alınır. Geri alma, o adımı geri çeviren **yeni bir adımdır** (herkese gider). Geri alma yığını **onaylanmış** sıraya göre tutulur: bir adım aktarıcı onaylayınca yığına girer; katılımcının bekleyen adımı varken istenen geri alma, bekleyenler yerleşene dek **bekler** (3 sn'de yerleşmezse "şimdi geri alınamıyor" denir, `undo-wait`) ve sonra uygulanır. Geri alma **bütündür ya da hiç yoktur**: başkası aynı hücreyi/notu/sayfa adını sonradan değiştirdiyse, ya da geri alınacak satır/sütun ekleme-silmesinin sayfasına başkası sonradan satır/sütun ekleyip sildiyse, ya da adımın kendisi yerleşirken başkasının satır/sütun adımının yanından geçtiyse o adım **geri alınamaz** ve söylenir (`undo-gone`). Bilinen eksik: iki katılımcının **aynı yere** eklediği satırlardan biri geri alınıp yeniden eklenirse sıraları başvuru modelinden farklı çıkabilir (içerik kaybolmaz, herkes aynı kitabı görür; `test/collab-undo2.test.ts`'te `todo`).
+Yalnız katılımcının **kendi** adımları geri alınır. Geri alma, o adımı geri çeviren **yeni bir adımdır** (herkese gider). Geri alma yığını **onaylanmış** sıraya göre tutulur ve **LIFO**'dur: bir adım aktarıcı onaylayınca yığına girer ve yığındaki kayıt katılımcının KENDİ sonraki adımlarından **geçirilmez** (o adımlar yığında üstündedir ve onlar geri alınmadan alttakine ulaşılmaz; kayıt yazıldığı kitap için geçerlidir). Yalnız BAŞKASININ adımları yığından geçirilir — her kayda, üstündeki kayıtların geri alınmış halinden okunarak. Geri alınamayan bir adım (sayfa silme gibi) satır/sütun/sayfa kaydırdıysa altındaki kayıtlar ondan bir kez, kalıcı geçirilir; geri alınamaz hale gelen (`undo-gone`) bir adım satır/sütun/sayfa kaydırdıysa altındaki kayıtlar da düşer (söylenir). Değişmez (`test/collab-alone.test.ts`): odada başkası yokken — ya da başkası yalnız başka bir sayfaya yazarken — her işlem/geri al/yinele dizisi `collab`'sız geçmişle aynı kitabı bırakır ve hiçbir şey söylenmez; tek istisna geri getirilemeyen sayfa (eklemesi geri alınan sayfa yinelenemez: `undo-none`). katılımcının bekleyen adımı varken istenen geri alma, bekleyenler yerleşene dek **bekler** (3 sn'de yerleşmezse "şimdi geri alınamıyor" denir, `undo-wait`) ve sonra uygulanır. Geri alma **bütündür ya da hiç yoktur**: başkası aynı hücreyi/notu/sayfa adını sonradan değiştirdiyse, ya da geri alınacak satır/sütun ekleme-silmesinin sayfasına başkası sonradan satır/sütun ekleyip sildiyse, ya da adımın kendisi yerleşirken başkasının satır/sütun adımının yanından geçtiyse o adım **geri alınamaz** ve söylenir (`undo-gone`). Bekleyen geri alma isteği, sırası gelmeden yeni bir değişiklik yapılırsa bırakılır ve söylenir (`undo-wait`). Başkasının sildiği bir aralığın içine ya da hemen arkasına yapılan bekleyen ekleme, o silme geri alınıp satırlar geri gelince aralıktaki eski yerine (aynı uzaklığa) konur.
 
 | Adım | Geri alınması |
 |---|---|
@@ -167,8 +175,8 @@ Değişmez: araya başkasının adımı girmeden yapılan "işlem → geri al", 
 - Kaydeden istemci, bekleyen adımı kalmayınca (en çok 3 sn bekler) dosyayı yazar; yazarken gelen iletiler bekletilir (dosya tek bir anın kitabıdır). Kayıt başarılı olunca `saved { v: ["e:<yeni ETag>", "h:…"], rev }` gönderir.
 - Öbürleri bu iddiayı **sunucuya sorar** (`saveTo` adresine `HEAD`; desteklenmiyorsa `If-None-Match` ile `GET` — gövde indirilmez): sunucunun güçlü ETag'i söylenenle aynıysa ETag benimsenir (sonraki kayıt 412 almaz) ve kitap "kaydedilmiş" sayılır — ama yalnız şu koşulların **hepsi** tutuyorsa: sunucunun şimdiki ETag'i söylenenle aynı, söylenen `rev` bu istemcinin onaylanmış `rev`'i, bekleyen adımı yok, söylenen ETag bu istemcinin zaten bildiği ETag değil (bildiği ETag'den sonra adım uygulandıysa o dosya onları tutmaz) ve **bu istemcinin kendi yaptığı, kendi kaydetmediği değişiklik yok** (kendi işinin dosyada olduğuna başkasının sözüyle inanılmaz; yanlış "kirli" bir kayıt daha demektir, yanlış "temiz" veri kaybı). Doğrulanamazsa hiçbir şey kaydedilmiş sayılmaz; söylenen ETag yalnız bir ipucudur: kendi kaydı 412 alırsa **koşullu olarak** (o ETag ile `If-Match`) bir kez yeniden denenir. Kaydeden, sonradan katılana son `saved`'ini yeniden söyler. İşlev olarak verilen `saveTo`'da ve köprüde doğrulama uygulamanındır.
 - Dosya yazılırken yerelde bir şey değiştirildiyse o kayıt hiçbir adımın dosyası değildir: `saved` `rev` olmadan gider.
-- Kendiliğinden kaydetme açıkken başkasının değişikliğini odada **tek** katılımcı kendiliğinden kaydeder (yazma yetkililerden kimliği en küçük olan); öbürleri `saved`'i doğrulayıp temizlenir.
-- İki istemci aynı anda kaydederse biri 412 alır; o arada öbürünün `saved` iletisi geldiyse kayıt yeni ETag ile kendiliğinden yeniden gönderilir; gelmediyse olağan çakışma sorusu açılır. Açık bir çakışma sorusunu `saved` **kapatmaz** (doğrulanmış olsa da): üzerine yazma kararı kullanıcınındır. Aktarıcı ya da oda değişince (yeniden yükleme, `detached`) son `saved` unutulur.
+- **Kendiliğinden kaydetmeyi odada TEK katılımcı yapar** (odanın kaydedicisi: yazma yetkililerden aktarıcının verdiği kimliği en küçük olan), herkesin değişikliği için. Öbürlerinin kendiliğinden kaydı durur (elle Kaydet herkeste çalışır); kaydedici ayrılırsa sıradaki devralır; aktarıcıya ulaşamayan katılımcı (kimin kaydedici olduğunu bilemez) kendiliğinden kaydetmez; odadan ayrı (`detached`, `closed`) kitap her kitap gibi kaydedilir. Katılımcının **kendi** değişiklikleri yalnız **kaydedicinin** doğrulanmış `saved`'iyle "kaydedilmiş" sayılır; başkasının sözüyle sayılmaz.
+- İki istemci aynı anda kaydederse biri 412 alır; öbürünün `saved` iletisi o arada geldiyse ya da **2,5 sn içinde gelip doğrulanırsa** (ETag sunucuda öyle) çakışma sayılmaz: kayıt yeni ETag'i koşul alarak bir kez yeniden gönderilir (doğrulanmayan söz bunu tetiklemez; hiçbir zaman koşulsuz yazılmaz); gelmediyse olağan çakışma sorusu açılır. Açık bir çakışma sorusunu `saved` **kapatmaz** (doğrulanmış olsa da): üzerine yazma kararı kullanıcınındır. Aktarıcı ya da oda değişince (yeniden yükleme, `detached`) son `saved` unutulur.
 - Başkasının değişikliği dosyayı "kaydedilmemiş" yapar ama **kendiliğinden kaydetmeyi başlatmaz**: değişikliği yapan kaydeder.
 - Çevrimdışıyken yapılan kayıt bildirilemez; bağlanınca adımlar gönderilir, öbürlerinin kaydı gerekirse çakışma yolundan geçer.
 
