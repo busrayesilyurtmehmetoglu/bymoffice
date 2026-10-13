@@ -303,10 +303,15 @@ interface Budget {
 
 const NO_NUMBERS = new ChartNumbers(0, undefined, []);
 
+/** True for a reference of a chart that follows the edits of its workbook (Chart.live) and names cells that are gone. */
+const gone = (chart: Chart, data: ChartData): boolean => chart.live === true && data.ref !== undefined && data.ref.indexOf('#REF!') >= 0;
+
 function numbersOf(chart: Chart, data: ChartData | undefined, options: ChartDataOptions, budget: Budget, zero = chart.blanks === 'zero'): Numbers {
   if (!data) return { values: NO_NUMBERS, live: false };
   const workbook = options.workbook;
-  const areas = workbook && data.ref !== undefined ? chartRefAreas(workbook, data.ref) : undefined;
+  // The cells a series showed were deleted since the file was read: it shows nothing, not what the file cached of them.
+  if (workbook && gone(chart, data)) return { values: NO_NUMBERS, live: true };
+  const areas = workbook && data.ref !== undefined ? chartRefAreas(workbook, data.ref, chart.live === true) : undefined;
   const gather = new NumberGatherer();
   if (areas && workbook) {
     const date1904 = workbook.date1904 === true;
@@ -379,8 +384,9 @@ function formatted(value: number, code: string, locale: FormatLocale | undefined
 function labelsOf(chart: Chart, data: ChartData | undefined, options: ChartDataOptions, budget: Budget, axis: ChartAxis | undefined): Labels | undefined {
   if (!data) return undefined;
   const workbook = options.workbook;
+  if (workbook && gone(chart, data)) return undefined;
   const code = categoryFormat(axis);
-  let areas = workbook && data.ref !== undefined ? chartRefAreas(workbook, data.ref) : undefined;
+  let areas = workbook && data.ref !== undefined ? chartRefAreas(workbook, data.ref, chart.live === true) : undefined;
   let outerAreas: ChartRefArea[] | undefined;
   if (areas && data.multiLevel) {
     // UNSURE: of a block of several levels the last column (or, for a block that lies, the last row) is the level next to the axis,
@@ -458,10 +464,10 @@ function labelsOf(chart: Chart, data: ChartData | undefined, options: ChartDataO
 }
 
 /** The text of the first cell a reference names; undefined when it cannot be followed. */
-function cellText(reference: string | undefined, options: ChartDataOptions): string | undefined {
+function cellText(reference: string | undefined, options: ChartDataOptions, live: boolean): string | undefined {
   const workbook = options.workbook;
   if (!workbook || reference === undefined) return undefined;
-  const areas = chartRefAreas(workbook, reference);
+  const areas = chartRefAreas(workbook, reference, live);
   if (!areas) return undefined;
   const { sheet, range } = areas[0];
   const row = sheet.rows.get(range.top);
@@ -508,7 +514,7 @@ export function chartValues(chart: Chart, options: ChartDataOptions = {}): Chart
     for (const item of group.series) {
       position++;
       const numbers = numbersOf(chart, item.values, options, budget);
-      let name = item.name ? cellText(item.name.ref, options) : undefined;
+      let name = item.name ? cellText(item.name.ref, options, chart.live === true) : undefined;
       if (name === undefined) name = item.name && item.name.text !== undefined ? item.name.text : options.seriesName ? options.seriesName(position) : `Series${position}`;
       const entry: ChartSeriesValues = { group: g, kind: group.kind, series: item, name, values: numbers.values, format: numbers.format, live: numbers.live };
       if (group.kind === 'scatter' || group.kind === 'bubble') {
@@ -559,7 +565,7 @@ export function chartValues(chart: Chart, options: ChartDataOptions = {}): Chart
     out.categoryNumber = (index) => (index >= 0 && index < count && index < known.count ? number(index) : null);
     if (known.format) out.categoryFormat = known.format;
   }
-  const title = chart.title ? cellText(chart.title.ref, options) : undefined;
+  const title = chart.title ? cellText(chart.title.ref, options, chart.live === true) : undefined;
   if (title !== undefined) out.title = title;
   return out;
 }

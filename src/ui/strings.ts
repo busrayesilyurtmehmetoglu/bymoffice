@@ -301,6 +301,79 @@ export interface UiStrings {
   sheetNamesClash(first: string, second: string): string;
   /** The dialogs that set rules: data validation and conditional formats. */
   rules: RuleStrings;
+  /** Charts: the menu that adds one, the dialog that changes one, and what is said about them. */
+  charts: ChartStrings;
+}
+
+/** What the commands and the dialog of charts say. */
+export interface ChartStrings {
+  /** The label of the toolbar button and the title of its menu. */
+  insert: string;
+  /** By the types the commands make: column, bar, line, area, pie, doughnut, scatter; and "stackedColumn". */
+  types: Record<string, string>;
+  /** Items of the menu of a chart; with an ellipsis where a dialog follows. */
+  edit: string;
+  remove: string;
+  dialogTitle: string;
+  type: string;
+  /** A chart of a type the dialog does not offer: what its list shows in the place of one. */
+  otherType: string;
+  grouping: string;
+  /** By standard, stacked, percentStacked. */
+  groupings: Record<string, string>;
+  title: string;
+  range: string;
+  seriesIn: string;
+  /** By auto, columns, rows. */
+  directions: Record<string, string>;
+  legend: string;
+  /** By r, l, t, b, tr, none. */
+  legends: Record<string, string>;
+  dataLabels: string;
+  axes: string;
+  categoryTitle: string;
+  valueTitle: string;
+  minimum: string;
+  maximum: string;
+  series: string;
+  categories: string;
+  seriesName(n: number): string;
+  seriesValues(n: number): string;
+  seriesColor(n: number): string;
+  ownColor(n: number): string;
+  moveUp(n: number): string;
+  moveDown(n: number): string;
+  removeSeries(n: number): string;
+  addSeries: string;
+  ok: string;
+  cancel: string;
+  /** Read out when a chart is selected (`name`: its title, or the name it has in the file), added, changed, moved and deleted. */
+  selected(name: string): string;
+  added: string;
+  changed: string;
+  moved: string;
+  removed: string;
+  /** What is wrong with what was typed. */
+  needRange: string;
+  badRange: string;
+  badNumber: string;
+  needValues: string;
+  /** Why the type of a chart of the file cannot be chosen, and why a chart cannot be changed at all. */
+  typeFixed: string;
+  notEditable: string;
+  noChart: string;
+  /** Why the series of a chart cannot be added, taken away or put in another order. */
+  seriesFixed: string;
+  groupingFixed: string;
+  noAxis: string;
+  tooManySeries(most: number): string;
+  tooManyCharts: string;
+  textTooLong(most: number): string;
+  badCharacter: string;
+  /** A sheet cannot be renamed or deleted: a chart names it in a reference that cannot be read. */
+  refUnread: string;
+  /** Said when copy, cut or paste is asked for while a chart is selected. */
+  noCopy: string;
 }
 
 /** What the dialogs of data validation say. Kinds and operators are named by the words the file uses for them. */
@@ -913,6 +986,62 @@ export const STRINGS_EN: UiStrings = {
     ruleDeleted: 'Conditional format deleted',
     rulesCleared: 'Conditional formats cleared',
   },
+  charts: {
+    insert: 'Insert chart',
+    types: { column: 'Column', stackedColumn: 'Stacked column', bar: 'Bar', line: 'Line', area: 'Area', pie: 'Pie', doughnut: 'Doughnut', scatter: 'Scatter' },
+    edit: 'Edit chart\u2026',
+    remove: 'Delete chart',
+    dialogTitle: 'Chart',
+    type: 'Type',
+    otherType: 'Another type',
+    grouping: 'Series',
+    groupings: { standard: 'Side by side', stacked: 'Stacked', percentStacked: 'Stacked to 100%' },
+    title: 'Title',
+    range: 'Data range',
+    seriesIn: 'Series in',
+    directions: { auto: 'Automatic', columns: 'Columns', rows: 'Rows' },
+    legend: 'Legend',
+    legends: { r: 'Right', l: 'Left', t: 'Top', b: 'Bottom', tr: 'Top right', none: 'None' },
+    dataLabels: 'Show the values as labels',
+    axes: 'Axes',
+    categoryTitle: 'Title of the category axis',
+    valueTitle: 'Title of the value axis',
+    minimum: 'Smallest value',
+    maximum: 'Largest value',
+    series: 'Series',
+    categories: 'Category labels',
+    seriesName: (n) => `Name of series ${n}`,
+    seriesValues: (n) => `Values of series ${n}`,
+    seriesColor: (n) => `Colour of series ${n}`,
+    ownColor: (n) => `Series ${n} has a colour of its own`,
+    moveUp: (n) => `Move series ${n} up`,
+    moveDown: (n) => `Move series ${n} down`,
+    removeSeries: (n) => `Remove series ${n}`,
+    addSeries: 'Add series',
+    ok: 'OK',
+    cancel: 'Cancel',
+    selected: (name) => (name === '' ? 'Chart selected' : `Chart selected: ${name}`),
+    added: 'Chart added',
+    changed: 'Chart changed',
+    moved: 'Chart moved',
+    removed: 'Chart deleted',
+    needRange: 'Enter the range of cells the chart shows',
+    badRange: 'This is not a range of cells',
+    badNumber: 'Enter a number, or leave the field empty',
+    needValues: 'A series needs a range of values',
+    typeFixed: 'The type of this chart cannot be changed: its file holds formatting another type cannot keep',
+    notEditable: 'This chart can be moved and deleted, not changed: its file holds what cannot be kept',
+    noChart: 'No chart is selected',
+    seriesFixed: 'The series of this chart cannot be added, removed or reordered: its type or its file does not allow it',
+    groupingFixed: 'The series of this type of chart cannot be stacked',
+    noAxis: 'This chart has no such axis',
+    tooManySeries: (most) => `A chart has at most ${most} series`,
+    tooManyCharts: 'No more charts can be added here',
+    textTooLong: (most) => `This text cannot be longer than ${most} characters`,
+    badCharacter: 'The text holds a character a file cannot hold',
+    refUnread: 'The sheet cannot be changed: a chart names it in a reference that cannot be read',
+    noCopy: 'A chart cannot be copied or pasted yet',
+  },
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -1370,6 +1499,62 @@ export const STRINGS_TR: UiStrings = {
     ruleChanged: 'Koşullu biçim değiştirildi',
     ruleDeleted: 'Koşullu biçim silindi',
     rulesCleared: 'Koşullu biçimler temizlendi',
+  },
+  charts: {
+    insert: 'Grafik ekle',
+    types: { column: 'Sütun', stackedColumn: 'Yığılmış sütun', bar: 'Çubuk', line: 'Çizgi', area: 'Alan', pie: 'Pasta', doughnut: 'Halka', scatter: 'Dağılım' },
+    edit: 'Grafiği düzenle\u2026',
+    remove: 'Grafiği sil',
+    dialogTitle: 'Grafik',
+    type: 'Tür',
+    otherType: 'Başka bir tür',
+    grouping: 'Seriler',
+    groupings: { standard: 'Yan yana', stacked: 'Yığılmış', percentStacked: '%100 yığılmış' },
+    title: 'Başlık',
+    range: 'Veri aralığı',
+    seriesIn: 'Seriler',
+    directions: { auto: 'Otomatik', columns: 'Sütunlarda', rows: 'Satırlarda' },
+    legend: 'Gösterge',
+    legends: { r: 'Sağda', l: 'Solda', t: 'Üstte', b: 'Altta', tr: 'Sağ üstte', none: 'Yok' },
+    dataLabels: 'Değerleri etiket olarak göster',
+    axes: 'Eksenler',
+    categoryTitle: 'Kategori ekseninin başlığı',
+    valueTitle: 'Değer ekseninin başlığı',
+    minimum: 'En küçük değer',
+    maximum: 'En büyük değer',
+    series: 'Seriler',
+    categories: 'Kategori etiketleri',
+    seriesName: (n) => `${n}. serinin adı`,
+    seriesValues: (n) => `${n}. serinin değerleri`,
+    seriesColor: (n) => `${n}. serinin rengi`,
+    ownColor: (n) => `${n}. serinin kendi rengi var`,
+    moveUp: (n) => `${n}. seriyi yukarı taşı`,
+    moveDown: (n) => `${n}. seriyi aşağı taşı`,
+    removeSeries: (n) => `${n}. seriyi kaldır`,
+    addSeries: 'Seri ekle',
+    ok: 'Tamam',
+    cancel: 'Vazgeç',
+    selected: (name) => (name === '' ? 'Grafik seçildi' : `Grafik seçildi: ${name}`),
+    added: 'Grafik eklendi',
+    changed: 'Grafik değiştirildi',
+    moved: 'Grafik taşındı',
+    removed: 'Grafik silindi',
+    needRange: 'Grafiğin göstereceği hücre aralığını girin',
+    badRange: 'Bu bir hücre aralığı değil',
+    badNumber: 'Bir sayı girin ya da alanı boş bırakın',
+    needValues: 'Bir serinin değer aralığı olmalı',
+    typeFixed: 'Bu grafiğin türü değiştirilemez: dosyası başka bir türün koruyamayacağı biçimlendirme taşıyor',
+    notEditable: 'Bu grafik taşınabilir ve silinebilir, değiştirilemez: dosyası korunamayacak içerik taşıyor',
+    noChart: 'Seçili grafik yok',
+    seriesFixed: 'Bu grafiğin serileri eklenemez, kaldırılamaz ya da yeniden sıralanamaz: türü ya da dosyası buna izin vermiyor',
+    groupingFixed: 'Bu grafik türünün serileri yığılamaz',
+    noAxis: 'Bu grafikte böyle bir eksen yok',
+    tooManySeries: (most) => `Bir grafikte en çok ${most} seri olabilir`,
+    tooManyCharts: 'Buraya daha fazla grafik eklenemez',
+    textTooLong: (most) => `Bu metin ${most} karakterden uzun olamaz`,
+    badCharacter: 'Metin, dosyaya yazılamayan bir karakter içeriyor',
+    refUnread: 'Sayfa değiştirilemiyor: bir grafik onu okunamayan bir başvuruda anıyor',
+    noCopy: 'Grafik henüz kopyalanıp yapıştırılamıyor',
   },
 };
 

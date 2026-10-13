@@ -26,6 +26,7 @@ export type IconName =
   | 'filter'
   | 'validation'
   | 'conditionalFormat'
+  | 'chart'
   | 'rowsColumns';
 
 type Shape = [tag: string, attrs: { [name: string]: string }];
@@ -73,6 +74,8 @@ const ICONS: { [name in IconName]: Shape[] } = {
   conditionalFormat: [path('M4 5h16v14H4z M4 9.7h16 M4 14.3h16'), path('M6.4 12h6.2', { 'stroke-width': '2.6' })],
   // A cell with a tick: what may be typed into it.
   validation: [path('M4 6h16v12H4z'), path('m8.5 12.2 2.4 2.4 4.6-5')],
+  // Three columns on a base line.
+  chart: [path('M4 20h16'), path('M6.5 20v-6h3v6 M10.5 20V7h3v13 M14.5 20v-9h3v9')],
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
 };
 

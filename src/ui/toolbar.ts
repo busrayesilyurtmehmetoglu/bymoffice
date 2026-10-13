@@ -164,6 +164,7 @@ export class Toolbar {
     this.addButton('filter', () => host.view.toggleFilter(), true);
     this.addMenuButton('conditionalFormat', 'menu', () => this.openConditional());
     this.addDialogButton('validation', () => void host.view.openValidationDialog());
+    this.addMenuButton('chart', 'menu', () => this.openCharts());
     this.addSeparator();
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
 
@@ -201,10 +202,17 @@ export class Toolbar {
     // Not during an edit either: the view would answer by dropping what was typed. Nor while a note
     // or the name of a sheet is typed in its field, whose own Ctrl+Z undoes within it.
     const typing = view.isEditing || view.isEditingComment || view.isRenaming;
+    // The button of charts is named in the words of the view, which may have changed its language.
+    const chart = this.buttons.chart;
+    const insert = view.chartStrings.insert;
+    if (chart && chart.getAttribute('aria-label') !== insert) {
+      chart.setAttribute('aria-label', insert);
+      chart.title = insert;
+    }
     this.setDisabled('undo', view.readOnly || typing || !view.history.canUndo);
     this.setDisabled('redo', view.readOnly || typing || !view.history.canRedo);
     this.updateSave(typing);
-    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'rowsColumns'];
+    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.sizeSelect.disabled = !editable;
     this.formatSelect.disabled = !editable;
@@ -356,11 +364,13 @@ export class Toolbar {
       filter: s.filter,
       validation: s.dataValidation,
       conditionalFormat: s.conditionalFormat,
+      // The words of charts are the view's (its menu and its dialog use the same): set once there is a view, see update().
+      chart: '',
       rowsColumns: s.rowsAndColumns,
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {
       const button = this.buttons[key];
-      if (!button) continue;
+      if (!button || labels[key] === '') continue;
       button.setAttribute('aria-label', labels[key]);
       button.title = labels[key];
     }
@@ -529,6 +539,29 @@ export class Toolbar {
       dialog(rules.manageRules, 'manage'),
     ];
     this.open('conditionalFormat', this.strings.conditionalFormat, items);
+  }
+
+  /** The types of chart that can be added for the selection, and the dialog of the chart that is selected. */
+  private openCharts(): void {
+    const view = this.host.view;
+    const charts = view.chartStrings;
+    const add = (label: string, type: 'column' | 'bar' | 'line' | 'area' | 'pie' | 'doughnut' | 'scatter', stacked = false): PopoverItem => ({
+      label,
+      action: () => this.host.run(() => void view.addChart(stacked ? { type, grouping: 'stacked' } : { type })),
+    });
+    const items: PopoverItem[] = [
+      add(charts.types.column, 'column'),
+      add(charts.types.stackedColumn, 'column', true),
+      add(charts.types.bar, 'bar'),
+      add(charts.types.line, 'line'),
+      add(charts.types.area, 'area'),
+      add(charts.types.pie, 'pie'),
+      add(charts.types.doughnut, 'doughnut'),
+      add(charts.types.scatter, 'scatter'),
+    ];
+    // A dialog takes the focus itself: its item is not followed by a command's way back to the grid.
+    if (view.selectedChart !== undefined) items.push({ label: charts.edit, action: () => void view.openChartDialog() });
+    this.open('chart', charts.insert, items);
   }
 
   private openRowsColumns(): void {

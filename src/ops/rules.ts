@@ -41,6 +41,7 @@ import {
   type KeptNode,
   type RuleKept,
   type Sheet,
+  type SheetDrawing,
   type SheetNameMap,
   type SheetSpaces,
   type StyleSheet,
@@ -559,6 +560,8 @@ export interface RuleLists {
   sheet: Sheet;
   validations?: { list: DataValidation[] | undefined };
   conditional?: { list: ConditionalFormat[] | undefined };
+  /** The drawings of the sheet, when the references of its charts changed (see charts.ts): they travel with the rules through undo and redo. */
+  drawings?: { list: SheetDrawing[] | undefined };
 }
 
 /** A list with some of its entries replaced (undefined: taken out); the list itself when no entry changed. */
@@ -725,6 +728,14 @@ export function swapRuleLists(changes: readonly RuleLists[] | undefined): RuleLi
       previous.conditional = { list: sheet.conditionalFormats };
       if (change.conditional.list && change.conditional.list.length > 0) sheet.conditionalFormats = change.conditional.list;
       else delete sheet.conditionalFormats;
+    }
+    if (change.drawings) {
+      previous.drawings = { list: sheet.drawings };
+      // What the sheet came with, noted once: while the list is that one, the writer leaves the parts alone.
+      if (!sheet.drawingsRead) sheet.drawingsRead = { list: sheet.drawings };
+      if (change.drawings.list && change.drawings.list.length > 0) sheet.drawings = change.drawings.list;
+      else delete sheet.drawings;
+      sheet.drawingsModified = true;
     }
     undo.push(previous);
   }

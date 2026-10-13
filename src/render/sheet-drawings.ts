@@ -125,6 +125,22 @@ export function adjustDrawingAnchor(anchor: DrawingAnchor, edits: readonly Sheet
   return to ? { ...anchor, from, to } : { ...anchor, from };
 }
 
+/**
+ * The structural edits that move a drawing: all of them for a drawing of the file, and for one
+ * that was added, moved or changed since only those made after it was (SheetDrawing.since).
+ */
+function drawingEdits(drawing: Pick<SheetDrawing, 'since'>, edits: readonly SheetStructuralEdit[] | undefined): readonly SheetStructuralEdit[] | undefined {
+  const since = drawing.since;
+  if (!edits || since === undefined || !(since > 0)) return edits;
+  // A count that is not one of this list (it can only come from outside) moves the drawing by nothing.
+  return since >= edits.length || Math.floor(since) !== since ? [] : edits.slice(since);
+}
+
+/** Where a drawing of the model is now: the one rule by which the view, the writer and the commands place it. */
+export function drawingAnchorNow(drawing: Pick<SheetDrawing, 'anchor' | 'since'>, edits: readonly SheetStructuralEdit[] | undefined): DrawingAnchor {
+  return adjustDrawingAnchor(drawing.anchor, drawingEdits(drawing, edits));
+}
+
 /** Where the cell of a comment ends up; undefined when it was deleted (the writer removes the comment then). */
 export function adjustCommentCell(row: number, col: number, edits: readonly SheetStructuralEdit[] | undefined): { row: number; col: number } | undefined {
   if (!edits) return { row, col };
@@ -341,6 +357,46 @@ interface TextLayout {
   height: number;
 }
 
+/** The side of the squares a selected drawing is sized by, in pixels. */
+export const HANDLE_SIZE = 8;
+/** The handles of a selected drawing: its corners and the middles of its sides. */
+export type DrawingHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+const HANDLES: DrawingHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+const SELECTION_COLOR = '#1A73E8';
+
+/** Where the middle of a handle of a box is. */
+function handlePoint(rect: Rect, handle: DrawingHandle): { x: number; y: number } {
+  const x = handle === 'nw' || handle === 'w' || handle === 'sw' ? rect.x : handle === 'n' || handle === 's' ? rect.x + rect.width / 2 : rect.x + rect.width;
+  const y = handle === 'nw' || handle === 'n' || handle === 'ne' ? rect.y : handle === 'w' || handle === 'e' ? rect.y + rect.height / 2 : rect.y + rect.height;
+  return { x, y };
+}
+
+/** The handle of a box that a point is on, within `reach` pixels of its middle; undefined when it is on none. */
+export function drawingHandleAt(rect: Rect, x: number, y: number, reach: number = HANDLE_SIZE): DrawingHandle | undefined {
+  for (const handle of HANDLES) {
+    const at = handlePoint(rect, handle);
+    if (Math.abs(x - at.x) <= reach && Math.abs(y - at.y) <= reach) return handle;
+  }
+  return undefined;
+}
+
+/**
+ * A box after one of its handles was dragged by (dx, dy), or the whole box (`handle` "move").
+ * It keeps at least `min` pixels each way, and the side that is not dragged stays where it is.
+ */
+export function resizedRect(rect: Rect, handle: DrawingHandle | 'move', dx: number, dy: number, min: number): Rect {
+  if (handle === 'move') return { x: Math.max(rect.x + dx, 0), y: Math.max(rect.y + dy, 0), width: rect.width, height: rect.height };
+  let left = rect.x;
+  let top = rect.y;
+  let right = rect.x + rect.width;
+  let bottom = rect.y + rect.height;
+  if (handle === 'nw' || handle === 'w' || handle === 'sw') left = Math.max(Math.min(left + dx, right - min), 0);
+  if (handle === 'ne' || handle === 'e' || handle === 'se') right = Math.max(right + dx, left + min);
+  if (handle === 'nw' || handle === 'n' || handle === 'ne') top = Math.max(Math.min(top + dy, bottom - min), 0);
+  if (handle === 'sw' || handle === 's' || handle === 'se') bottom = Math.max(bottom + dy, top + min);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
 /**
  * The drawings and comments of one sheet as they are shown. Made once per
  * sheet and asked every frame; what it works out is kept until the sheet's
@@ -370,6 +426,10 @@ export class SheetDrawings {
   private layouts = new WeakMap<DrawingText, TextLayout>();
   /** fontsVersion() the layouts were made under: they hold font strings and widths of that time. */
   private layoutFonts = fontsVersion();
+  /** The drawing that is shown as selected, by its place in Sheet.drawings: a frame with handles is drawn around it. */
+  selected: number | undefined;
+  /** Where the selected drawing would stand if the drag that is under way ended now (sheet pixels): drawn as a dashed frame. */
+  ghost: Rect | undefined;
 
   constructor(sheet: Sheet, options: SheetDrawingsOptions = {}) {
     this.sheet = sheet;
@@ -417,6 +477,28 @@ export class SheetDrawings {
     return found ? found.comment : undefined;
   }
 
+  /** The box of the drawing at a place of Sheet.drawings, in sheet pixels; undefined for one that is not shown. */
+  boxOf(metrics: SheetMetrics, index: number): Rect | undefined {
+    this.syncPlaces(metrics);
+    for (const item of this.placed) if (item.order === index) return { x: item.x, y: item.y, width: item.width, height: item.height };
+    return undefined;
+  }
+
+  /**
+   * The drawing under a point of the sheet (pixels from the corner of cell A1) that `wanted`
+   * accepts, the one on top first; -1 when there is none. Comment boxes are not drawings.
+   */
+  hit(metrics: SheetMetrics, x: number, y: number, wanted: (object: DrawingObject) => boolean = () => true): number {
+    this.syncPlaces(metrics);
+    const count = (this.sheet.drawings || []).length;
+    let found = -1;
+    for (const item of this.placed) {
+      if (item.order >= count || item.order < found) continue;
+      if (x >= item.x && x <= item.x + item.width && y >= item.y && y <= item.y + item.height && wanted(item.object)) found = item.order;
+    }
+    return found;
+  }
+
   /** The box of each object on the sheet, in pixels from the top-left corner of cell A1, bottom one first. */
   rects(metrics: SheetMetrics): (Rect & { object: DrawingObject })[] {
     this.syncPlaces(metrics);
@@ -439,7 +521,7 @@ export class SheetDrawings {
     const drawings = sheet.drawings || [];
     for (let i = 0; i < drawings.length; i++) {
       const drawing = drawings[i];
-      anchors.push(drawing && drawing.anchor ? adjustDrawingAnchor(drawing.anchor, edits) : { kind: 'absolute' });
+      anchors.push(drawing && drawing.anchor ? drawingAnchorNow(drawing, edits) : { kind: 'absolute' });
     }
     this.anchors = anchors;
     const placed: PlacedComment[] = [];
@@ -533,7 +615,8 @@ export class SheetDrawings {
     const { clip, originX, originY } = target;
     if (!(clip.width > 0 && clip.height > 0)) return;
     const items = this.visible(clip.x - originX, clip.y - originY, clip.x + clip.width - originX, clip.y + clip.height - originY);
-    if (items.length === 0) return;
+    const marked = this.selected !== undefined ? this.boxOf(target.metrics, this.selected) : undefined;
+    if (items.length === 0 && !marked) return;
     const dpr = target.devicePixelRatio > 0 && target.devicePixelRatio < Infinity ? target.devicePixelRatio : 1;
     // A font was registered or taken out: the broken lines hold the font strings and the widths from before.
     const fonts = fontsVersion();
@@ -556,8 +639,33 @@ export class SheetDrawings {
         frame.painter.invalidate();
       }
     }
+    if (marked) paintSelection(ctx, marked, this.ghost, originX, originY);
     ctx.restore();
   }
+}
+
+/** The frame and the handles of the selected drawing, and the dashed frame of where a drag would put it. */
+function paintSelection(ctx: CanvasRenderingContext2D, box: Rect, ghost: Rect | undefined, originX: number, originY: number): void {
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = SELECTION_COLOR;
+  ctx.setLineDash([]);
+  ctx.strokeRect(Math.round(originX + box.x) + 0.5, Math.round(originY + box.y) + 0.5, Math.round(box.width) - 1, Math.round(box.height) - 1);
+  const half = HANDLE_SIZE / 2;
+  for (const handle of HANDLES) {
+    const at = handlePoint(box, handle);
+    const x = Math.round(originX + at.x - half);
+    const y = Math.round(originY + at.y - half);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(x, y, HANDLE_SIZE, HANDLE_SIZE);
+    ctx.strokeRect(x + 0.5, y + 0.5, HANDLE_SIZE - 1, HANDLE_SIZE - 1);
+  }
+  if (ghost && ghost.width > 0 && ghost.height > 0) {
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(Math.round(originX + ghost.x) + 0.5, Math.round(originY + ghost.y) + 0.5, Math.round(ghost.width) - 1, Math.round(ghost.height) - 1);
+  }
+  ctx.restore();
 }
 
 // -------------------------------------------------------------------- painting

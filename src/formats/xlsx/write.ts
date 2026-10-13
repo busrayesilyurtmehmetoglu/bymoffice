@@ -54,7 +54,11 @@ import { cellDisplayText } from '../../format/cell-format';
 import type { OpcPackage } from '../../opc';
 import { localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
-import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../../render/sheet-drawings';
+import { adjustDrawingAnchor, commentCellNow, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
+import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, patchChartPart, type DrawingPartEdit } from './chart-write';
+import { drawingSource } from './drawings';
+import type { Chart } from '../../model/sheet/chart';
+import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { parseColor } from './styles';
@@ -3455,6 +3459,15 @@ function worksheetRank(s: string, start: number, local: string): number {
  * every other byte stays. Undefined when the part already says so.
  */
 function setLegacyDrawing(original: Uint8Array, id: string | null, sheetName: string): Uint8Array | undefined {
+  return setSheetDrawing(original, 'legacyDrawing', id, sheetName);
+}
+
+/**
+ * A sheet part with nothing changed but the element that names a drawing by a relationship
+ * (<drawing>, <legacyDrawing>): `id` is the id it has to state, null for a sheet that has none
+ * any more. The element is put where the schema has it. Undefined when the part already says so.
+ */
+function setSheetDrawing(original: Uint8Array, local: 'drawing' | 'legacyDrawing', id: string | null, sheetName: string): Uint8Array | undefined {
   const s = decodeSource(original);
   const root = rawElement(s);
   const rootLocal = localName(root.name);
@@ -3464,9 +3477,9 @@ function setLegacyDrawing(original: Uint8Array, id: string | null, sheetName: st
   const prefix = root.name.slice(0, root.name.length - rootLocal.length);
   const declared = new RegExp(`\\sxmlns:([A-Za-z_][\\w.-]*)\\s*=\\s*["'](?:${escapeRegExp(NS_REL)}|${escapeRegExp(NS_REL_STRICT)})["']`).exec(s.slice(root.start, root.openEnd));
   const attr = declared ? `${declared[1]}:id` : `xmlns:r="${NS_REL}" r:id`;
-  const text = id === null ? '' : `<${prefix}legacyDrawing ${attr}="${escapeAttr(id)}"/>`;
-  const rank = WORKSHEET_ORDER.indexOf('legacyDrawing');
-  const present = root.children.find((child) => child.local === 'legacyDrawing');
+  const text = id === null ? '' : `<${prefix}${local} ${attr}="${escapeAttr(id)}"/>`;
+  const rank = WORKSHEET_ORDER.indexOf(local);
+  const present = root.children.find((child) => child.local === local);
   if (present) {
     if (s.slice(present.start, present.end) === text) return undefined;
     return spliceExact(original, [{ start: present.start, end: present.end, text }]);
@@ -3810,6 +3823,13 @@ function editVml(source: Uint8Array, removed: Set<number>, added: AddedNote[], n
 /** The id of the relationship <legacyDrawing> of a sheet names; undefined for a sheet without the element. */
 function legacyDrawingId(sheetXml: string): string | undefined {
   const match = /<(?:[A-Za-z_][\w.-]*:)?legacyDrawing(?=[\s/>])[^>]*?\b[A-Za-z_][\w.-]*:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(sheetXml);
+  if (!match) return undefined;
+  return plainOf(match[1] !== undefined ? match[1] : match[2]);
+}
+
+/** The id of the relationship <drawing> of a sheet names; undefined for a sheet without the element. */
+function drawingId(sheetXml: string): string | undefined {
+  const match = /<(?:[A-Za-z_][\w.-]*:)?drawing(?=[\s/>])[^>]*?\b[A-Za-z_][\w.-]*:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(sheetXml);
   if (!match) return undefined;
   return plainOf(match[1] !== undefined ? match[1] : match[2]);
 }
@@ -4226,6 +4246,27 @@ interface SaveState {
    * needs one takes it out again; one that does writes it under the same name.
    */
   notes: Map<Sheet, NoteParts>;
+  /**
+   * Per sheet: the parts the last save made for its charts that the file does not have (chart
+   * parts, a drawing part, its relationships, the relationships of the sheet). A save that no
+   * longer needs one takes it out again; one that does writes it under the same name.
+   */
+  charts: Map<Sheet, string[]>;
+}
+
+/** What a save does around a sheet for its charts and the drawings that hold them. */
+interface ChartWrites {
+  /** Parts of the file with what they become; null takes the part out. */
+  parts: Map<string, Uint8Array | XmlDocument | null>;
+  /** Parts the file does not have. */
+  fresh: PartWrite[];
+  /** Relationships of the sheet to add, and the ids of those to drop. */
+  relate: { id: string; kind: string; part: string }[];
+  unrelate: Set<string>;
+  /** What <drawing> of the sheet has to say: the id of a relationship, null for a sheet without a drawing; undefined leaves the element as it is. */
+  element: string | null | undefined;
+  /** The names of the parts in `fresh`. */
+  names: string[];
 }
 
 /** Names of the parts made for the notes of a sheet; each is of a part the file does not have. */
@@ -4345,14 +4386,15 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   const sheetsModified = !!workbook.sheetsModified || workbook.sheets.some((sheet) => sheet.part === '');
   const notesModified = workbook.sheets.some((sheet) => sheet.commentsModified && sheet.kind !== 'chartsheet');
   const rulesModified = workbook.sheets.some((sheet) => (sheet.validationsModified || sheet.conditionalModified) && sheet.kind !== 'chartsheet');
-  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified) return;
+  const chartsModified = workbook.sheets.some((sheet) => sheet.drawingsModified && sheet.kind === 'worksheet');
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
-    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map(), notes: new Map() };
+    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map(), notes: new Map(), charts: new Map() };
     SAVES.set(workbook, saved);
   }
-  const { originals, moved, removed, added, notes: noted } = saved;
+  const { originals, moved, removed, added, notes: noted, charts: charted } = saved;
   // The first time a part is about to be rewritten, the package still holds it as the file had it.
   const originalOf = async (part: string): Promise<Uint8Array | undefined> => {
     const kept = originals.get(part);
@@ -4472,6 +4514,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       for (const name of removed.keys()) taken.add(name.toLowerCase());
       for (const name of added.values()) taken.add(name.toLowerCase());
       for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined) taken.add(name.toLowerCase());
+      for (const names of charted.values()) for (const name of names) taken.add(name.toLowerCase());
     }
     return taken;
   };
@@ -4520,6 +4563,37 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     };
   };
 
+  /**
+   * The ids of the relationships a part gets in this save, by the part: ONE allocator for each part,
+   * whoever adds relationships to it (the notes of a sheet, its charts, the charts of a drawing), so
+   * that no two of them come out with the same id. `rels` are the relationships the part has in the file.
+   */
+  const allocators = new Map<string, () => string>();
+  const relationIds = (part: string, rels: XmlElement[]): (() => string) => {
+    const key = part.toLowerCase();
+    let next = allocators.get(key);
+    if (next) return next;
+    const ids = new Set<string>();
+    let highestId = 0;
+    for (const rel of rels) {
+      const id = rel.attrs.get('Id') || '';
+      ids.add(id);
+      const match = /^rId(\d{1,9})$/.exec(id);
+      if (match && Number(match[1]) > highestId) highestId = Number(match[1]);
+    }
+    next = (): string => {
+      for (;;) {
+        const id = `rId${++highestId}`;
+        if (!ids.has(id)) {
+          ids.add(id);
+          return id;
+        }
+      }
+    };
+    allocators.set(key, next);
+    return next;
+  };
+
   const mainPrefix = prefixOf(book.root);
   const mainNamespace = book.root.attrs.get(mainPrefix === '' ? 'xmlns' : `xmlns:${mainPrefix.slice(0, -1)}`) || NS_MAIN;
   const notesNow = new Map<Sheet, NoteParts>();
@@ -4534,23 +4608,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const rels = sheetRels ? childrenNamed(parseXml(sheetRels).root, 'Relationship') : [];
     const out: NoteWrites = { parts: new Map(), fresh: [], relate: [], unrelate: new Set(), legacy: undefined, names: {} };
     const before = noted.get(sheet) || {};
-    const ids = new Set<string>();
-    let highestId = 0;
-    for (const rel of rels) {
-      const id = rel.attrs.get('Id') || '';
-      ids.add(id);
-      const match = /^rId(\d{1,9})$/.exec(id);
-      if (match && Number(match[1]) > highestId) highestId = Number(match[1]);
-    }
-    const newId = (): string => {
-      for (;;) {
-        const id = `rId${++highestId}`;
-        if (!ids.has(id)) {
-          ids.add(id);
-          return id;
-        }
-      }
-    };
+    const newId = relationIds(sheetPart, rels);
     const dir = main.slice(0, slash);
 
     // The comments: what the file has, moved along with the rows and columns, then brought in line with the model.
@@ -4630,7 +4688,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     return out;
   };
   /** The relationships of a sheet with what its notes ask for; undefined when they ask for nothing. */
-  const relateNotes = (doc: XmlDocument, sheetPart: string, notes: NoteWrites): boolean => {
+  const relateNotes = (doc: XmlDocument, sheetPart: string, notes: Pick<NoteWrites, 'relate' | 'unrelate'>): boolean => {
     let changed = false;
     if (notes.unrelate.size > 0) {
       const kept = doc.root.children.filter((node) => !(node.type === 'element' && localName(node.name) === 'Relationship' && notes.unrelate.has(node.attrs.get('Id') || '')));
@@ -4652,6 +4710,249 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     return changed;
   };
   const emptyRels = (): XmlDocument => parseXml('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>');
+
+  // --- charts --------------------------------------------------------------------------------
+  const chartsNow = new Map<Sheet, string[]>();
+  /** The relationships of parts of the file that this save drops (by the part they belong to), and the parts they led to. */
+  const droppedRels = new Map<string, Set<string>>();
+  const leavingParts: string[] = [];
+  /** The parts a part leads to in the file as it was opened, each with the id of the relationship; `skip` leaves relationships out. */
+  const leadsTo = async (source: string, skip?: (source: string, id: string) => boolean): Promise<string[]> => {
+    const bytes = await peek(relsPartOf(source));
+    const out: string[] = [];
+    if (!bytes) return out;
+    let doc: XmlDocument;
+    try {
+      doc = parseXml(bytes);
+    } catch (error) {
+      // Relationships that cannot be read lead nowhere: what they may point at stays.
+      return out;
+    }
+    for (const rel of childrenNamed(doc.root, 'Relationship')) {
+      if (!internal(rel) || (skip && skip(source, rel.attrs.get('Id') || ''))) continue;
+      const target = actualOf(resolveTarget(source, rel.attrs.get('Target') || ''));
+      if ((pkg.hasPart(target) || originals.get(target) || removed.has(target)) && !isRelsPart(target)) out.push(target);
+    }
+    return out;
+  };
+  const reachFrom = async (from: string[], skip?: (source: string, id: string) => boolean): Promise<Set<string>> => {
+    const seen = new Set<string>(from);
+    const queue = from.slice();
+    for (let i = 0; i < queue.length; i++) {
+      if (i >= MAX_RELATED_PARTS) throw new Error('Cannot write the workbook: its parts refer to each other without end');
+      for (const target of await leadsTo(queue[i], skip)) {
+        if (seen.has(target)) continue;
+        seen.add(target);
+        queue.push(target);
+      }
+    }
+    return seen;
+  };
+  /**
+   * What the drawings of a sheet whose charts were added, moved, changed or deleted ask of the
+   * parts around it; undefined when the parts of the file say what the model says. `sheetXml` and
+   * `sheetRels` are the sheet as the file has it (undefined for a sheet that is not in the file);
+   * `edits`, `fileName` and `others` are what the anchors and links of a drawing part follow anyway.
+   */
+  const chartsOf = async (
+    sheet: Sheet,
+    sheetPart: string,
+    sheetXml: string | undefined,
+    sheetRels: Uint8Array | undefined,
+    edits: SheetStructuralEdit[] | undefined,
+    fileName: string,
+    others: OtherSheets | undefined,
+  ): Promise<ChartWrites | undefined> => {
+    const now = sheet.drawings || [];
+    const read = sheetXml === undefined ? [] : sheet.drawingsRead ? sheet.drawingsRead.list || [] : now;
+    const out: ChartWrites = { parts: new Map(), fresh: [], relate: [], unrelate: new Set(), element: undefined, names: [] };
+    const rels = sheetRels ? childrenNamed(parseXml(sheetRels).root, 'Relationship') : [];
+    const newSheetId = relationIds(sheetPart, rels);
+    const dir = main.slice(0, slash);
+    // The names the last save gave the parts it made for this sheet are taken again, in the same order.
+    const reuse = (charted.get(sheet) || []).slice();
+    const freshName = (head: string, tail: string, alsoFree?: (name: string) => string): string => {
+      const pattern = new RegExp(`^${escapeRegExp(head)}\\d+${escapeRegExp(tail)}$`, 'i');
+      const at = reuse.findIndex((name) => pattern.test(name));
+      if (at >= 0) return reuse.splice(at, 1)[0];
+      for (;;) {
+        const candidate = freeName(head, tail);
+        // Relationships left behind under the name would become those of the new part.
+        if (!alsoFree || !takenNames().has(alsoFree(candidate).toLowerCase()) || reuse.some((name) => name.toLowerCase() === alsoFree(candidate).toLowerCase())) return candidate;
+      }
+    };
+    const cellsOf = (chart: Chart) => chartCellsOf(workbook, chart.live === true);
+    const anchorOf = (drawing: SheetDrawing): DrawingAnchor => drawingAnchorNow(drawing, sheet.structuralEdits);
+
+    // What became of each drawing the sheet was read with, and what is new.
+    const places = new Map<SheetDrawing, number>();
+    read.forEach((drawing, i) => places.set(drawing, i));
+    const became = new Map<SheetDrawing, SheetDrawing>();
+    const added: SheetDrawing[] = [];
+    for (const drawing of now) {
+      const from = drawing.from || drawing;
+      if (places.has(from)) became.set(from, drawing);
+      else if (drawing.object.type === 'chart' && drawing.object.part === undefined) added.push(drawing);
+      else if (sheetXml !== undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing of the model is neither in the file nor a chart that was added`);
+    }
+    const partEdits = new Map<string, DrawingPartEdit>();
+    const editOf = (part: string): DrawingPartEdit => {
+      let edit = partEdits.get(part);
+      if (!edit) {
+        edit = { moved: new Map(), removed: new Set(), added: [] };
+        partEdits.set(part, edit);
+      }
+      return edit;
+    };
+    for (const drawing of read) {
+      const next = became.get(drawing);
+      if (next === drawing) continue;
+      const source = drawingSource(drawing);
+      if (!source || source.part === undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing that was changed cannot be found in the file`);
+      const drawingPart = actualOf(source.part);
+      if (!next) {
+        editOf(drawingPart).removed.add(source.index);
+        continue;
+      }
+      const place = anchorOf(next);
+      if (JSON.stringify(place) !== JSON.stringify(adjustDrawingAnchor(drawing.anchor, sheet.structuralEdits))) editOf(drawingPart).moved.set(source.index, place);
+      const was = drawing.object;
+      const is = next.object;
+      if (is === was) continue;
+      if (was.type !== 'chart' || is.type !== 'chart' || was.part === undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing that is not a chart was changed`);
+      if (is.chart === was.chart) continue;
+      const chartPart = actualOf(was.part);
+      const original = await peek(chartPart);
+      if (!original) throw new Error(`Cannot write sheet "${sheet.name}": its chart part ${chartPart} is missing`);
+      let bytes: Uint8Array;
+      if (was.known === 'all') bytes = encoder.encode(chartSpaceXml(is.chart, cellsOf(is.chart)));
+      else if (was.known === 'refs' && is.origin) bytes = patchChartPart(original, is.origin, is.chart, cellsOf(is.chart), was.seriesFixed === true);
+      else throw new Error(`Cannot write sheet "${sheet.name}": the chart in ${chartPart} was changed, and its part holds what the model does not`);
+      out.parts.set(chartPart, bytes);
+    }
+
+    // The drawing part the sheet has, when it has one: new charts go into the first.
+    let home: { part: string; id: string } | undefined;
+    for (const rel of rels) {
+      if (!endsWith(typeOf(rel), '/drawing') || !internal(rel)) continue;
+      const part = actualOf(resolveTarget(sheetPart, rel.attrs.get('Target') || ''));
+      if (!(await peek(part))) continue;
+      if (!home) home = { part, id: rel.attrs.get('Id') || '' };
+    }
+    const chartFor = (drawing: SheetDrawing, drawingPart: string, relId: string): { anchor: DrawingAnchor; relId: string; name: string; description?: string; rel: XmlElement } => {
+      const object = drawing.object as Extract<DrawingObject, { type: 'chart' }>;
+      const part = freshName(`${dir}/charts/chart`, '.xml', relsPartOf);
+      out.fresh.push([part, encoder.encode(chartSpaceXml(object.chart, cellsOf(object.chart))), CHART_CONTENT_TYPE]);
+      out.names.push(part);
+      const rel = element('Relationship', [
+        ['Id', relId],
+        ['Type', `${relBase}/chart`],
+        ['Target', relativeTarget(drawingPart, part)],
+      ]);
+      return { anchor: anchorOf(drawing), relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Chart', description: object.description, rel };
+    };
+    if (added.length > 0 && home && !partEdits.has(home.part)) editOf(home.part);
+
+    for (const [drawingPart, edit] of partEdits) {
+      const original = await peek(drawingPart);
+      if (!original) throw new Error(`Cannot write sheet "${sheet.name}": its drawing part ${drawingPart} is missing`);
+      // One sheet's charts cannot change a part that another sheet shows as well.
+      for (const other of workbook.sheets) {
+        if (other === sheet || other.part === '') continue;
+        for (const otherRel of await pkg.relationships(other.part)) {
+          if (otherRel.part !== null && actualOf(otherRel.part) === drawingPart) throw new Error(`Cannot write sheet "${sheet.name}": ${drawingPart} is shared with sheet "${other.name}"`);
+        }
+      }
+      const partRelsName = relsPartOf(drawingPart);
+      const partRelsBytes = await peek(partRelsName);
+      const partRels = partRelsBytes ? parseXml(partRelsBytes) : emptyRels();
+      let relsChanged = !!partRelsBytes && (!!edits || !!others) && mayHoldPlaces(partRelsBytes) && adjustPlaceTargets(partRels.root, edits || [], fileName, others);
+      const relPrefix = prefixOf(partRels.root);
+      const partIds = new Set<string>();
+      for (const rel of childrenNamed(partRels.root, 'Relationship')) partIds.add(rel.attrs.get('Id') || '');
+      const newPartId = relationIds(drawingPart, childrenNamed(partRels.root, 'Relationship'));
+      if (home && drawingPart === home.part) {
+        for (const drawing of added) {
+          const id = newPartId();
+          partIds.add(id);
+          const made = chartFor(drawing, drawingPart, id);
+          made.rel.name = `${relPrefix}Relationship`;
+          partRels.root.children.push(made.rel);
+          relsChanged = true;
+          edit.added.push(made);
+        }
+      }
+      const staged = edits || others ? adjustDrawing(original, edits || [], fileName, others) : original;
+      const result = editDrawingPart(staged, edit);
+      // The relationships only the anchors that went used go, and with them the parts nothing else leads to.
+      const dropped = new Set(result.unrelated);
+      if (result.empty) for (const id of partIds) dropped.add(id);
+      const leaving: string[] = [];
+      if (dropped.size > 0) {
+        const keptRels: XmlNode[] = [];
+        for (const node of partRels.root.children) {
+          if (node.type === 'element' && localName(node.name) === 'Relationship' && dropped.has(node.attrs.get('Id') || '')) {
+            if (internal(node)) leaving.push(actualOf(resolveTarget(drawingPart, node.attrs.get('Target') || '')));
+            relsChanged = true;
+          } else keptRels.push(node);
+        }
+        partRels.root.children = keptRels;
+      }
+      // What nothing leads to any more once every sheet was looked at goes: worked out for the workbook, below.
+      if (dropped.size > 0) droppedRels.set(drawingPart, dropped);
+      for (const part of leaving) leavingParts.push(part);
+      if (result.empty) {
+        // Nothing is left to draw: the drawing part goes, and the sheet names none.
+        out.parts.set(drawingPart, null);
+        for (const rel of rels) {
+          if (!endsWith(typeOf(rel), '/drawing') || !internal(rel) || actualOf(resolveTarget(sheetPart, rel.attrs.get('Target') || '')) !== drawingPart) continue;
+          const id = rel.attrs.get('Id') || '';
+          out.unrelate.add(id);
+          const gone = droppedRels.get(sheetPart) || new Set<string>();
+          gone.add(id);
+          droppedRels.set(sheetPart, gone);
+          if (sheetXml !== undefined && drawingId(sheetXml) === id) out.element = null;
+        }
+        continue;
+      }
+      if (!sameBytes(result.bytes, original)) out.parts.set(drawingPart, result.bytes);
+      if (relsChanged) {
+        if (partRelsBytes) out.parts.set(partRelsName, partRels);
+        else {
+          out.fresh.push([partRelsName, partRels]);
+          out.names.push(partRelsName);
+        }
+      }
+    }
+
+    if (added.length > 0 && !home) {
+      // The first drawing of the sheet: a part for it, its relationships, and <drawing> in the sheet.
+      const drawingPart = freshName(`${dir}/drawings/drawing`, '.xml', relsPartOf);
+      const partRels = emptyRels();
+      const anchors: string[] = [];
+      const newPartId = relationIds(drawingPart, []);
+      added.forEach((drawing, i) => {
+        const made = chartFor(drawing, drawingPart, newPartId());
+        made.rel.name = `${prefixOf(partRels.root)}Relationship`;
+        partRels.root.children.push(made.rel);
+        anchors.push(chartAnchorXml(made.anchor, made.relId, i + 2, made.name, made.description, relBase === NS_REL_STRICT));
+      });
+      out.fresh.push([drawingPart, encoder.encode(drawingPartXml(anchors, relBase === NS_REL_STRICT)), DRAWING_CONTENT_TYPE]);
+      out.fresh.push([relsPartOf(drawingPart), partRels]);
+      out.names.push(drawingPart, relsPartOf(drawingPart));
+      const id = newSheetId();
+      out.relate.push({ id, kind: 'drawing', part: drawingPart });
+      out.element = id;
+    }
+    if (out.parts.size === 0 && out.fresh.length === 0 && out.relate.length === 0 && out.unrelate.size === 0) return undefined;
+    return out;
+  };
+  /** The sheets whose drawings are not the ones they were read with. */
+  const charting = new Set<Sheet>();
+  for (const sheet of workbook.sheets) {
+    if (sheet.kind !== 'worksheet' || !sheet.drawingsModified) continue;
+    if (sheet.part === '' ? !!sheet.drawings && sheet.drawings.length > 0 : !sheet.drawingsRead || sheet.drawingsRead.list !== sheet.drawings) charting.add(sheet);
+  }
 
 
   // The notes of the sheets of the file are looked at first: whether anything of them is
@@ -4699,7 +5000,7 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   // The formats those rules give: records the style sheet gets for as long as a rule asks for them.
   const dxfs = planDxfs(workbook);
 
-  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed || restated || fileNotes.size > 0 || tabbed.size > 0 || ruled.size > 0 || dxfs.added.length > 0;
+  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed || restated || fileNotes.size > 0 || tabbed.size > 0 || ruled.size > 0 || dxfs.added.length > 0 || charting.size > 0;
   const fileActive = fileActiveOf(book.root, file.length);
   const bookViews = childNamed(book.root, 'bookViews');
   const windows = bookViews ? childrenNamed(bookViews, 'workbookView').length : 0;
@@ -4793,10 +5094,17 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     const notes = fileNotes.get(sheet);
     const tab = tabbed.has(sheet);
     const rules = ruled.has(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !rules) continue;
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !rules && !charting.has(sheet)) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
+    // Charts that were added, moved, changed or deleted: the drawing and chart parts of the sheet follow the model.
+    let charts: ChartWrites | undefined;
+    if (charting.has(sheet)) {
+      const asFile = await peek(sheet.part);
+      const structural = sheet.modified && sheet.structuralEdits && sheet.structuralEdits.length > 0 ? sheet.structuralEdits : undefined;
+      if (asFile) charts = await chartsOf(sheet, sheet.part, decodeSource(asFile), await peek(sheetRelsPart), structural, fileName, others);
+    }
 
     // Tables name their columns after their header cells; the two have to agree. Their formulas
     // name sheets as the file does and follow what happened to those.
@@ -4837,6 +5145,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       else if (bytes && (foreign.length > 0 || rename || tabSelected !== undefined || legacyDrawing !== undefined || rules)) {
         next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf });
       }
+      // The drawing the sheet names, once it got its first chart or lost its last.
+      if (bytes && charts && charts.element !== undefined) next = setSheetDrawing(next || bytes, 'drawing', charts.element, sheet.name) || next;
       // The colour of the tab, in the part as it is by now.
       if (bytes && tab) next = next ? setTabColorIn(next, sheet.tabColor, sheet.name) || next : tabbed.get(sheet);
       if (bytes && next) {
@@ -4848,7 +5158,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     } else {
       const bytes = await originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
-      const written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
+      let written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
+      if (charts && charts.element !== undefined) written = setSheetDrawing(written, 'drawing', charts.element, sheet.name) || written;
       const next = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
       // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation.
       if (sameBytes(next, bytes)) asInFile.add(sheet);
@@ -4859,8 +5170,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     // After rows or columns moved: the pictures and comments of the sheet follow, and the
     // relationships of links that are gone are removed. After rows or columns moved in another
     // sheet, or sheets were renamed or deleted: the shapes that show a cell of such a sheet follow.
-    const sheetRelsBytes = edits || others || notes ? await peek(sheetRelsPart) : undefined;
-    if (sheetRelsBytes || notes) {
+    const sheetRelsBytes = edits || others || notes || charts ? await peek(sheetRelsPart) : undefined;
+    if (sheetRelsBytes || notes || charts) {
       const sheetRels = sheetRelsBytes ? parseXml(sheetRelsBytes) : emptyRels();
       const linkIds = new Set<string>();
       for (const link of sheet.hyperlinks) if (link.rId !== undefined) linkIds.add(link.rId);
@@ -4883,6 +5194,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
         const part = actualOf(resolveTarget(sheet.part, rel.attrs.get('Target') || ''));
         // Written below, moved along and with the notes of the model.
         if (notes && notes.parts.has(part)) continue;
+        // The same for a drawing part whose charts changed, and for its relationships.
+        if (charts && charts.parts.has(part)) continue;
         const original = await peek(part);
         if (!original) continue;
         if (edits) {
@@ -4933,6 +5246,27 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
         }
         notesNow.set(sheet, notes.names);
       }
+      if (charts) {
+        for (const [part, data] of charts.parts) {
+          const original = await originalOf(part);
+          if (data === null) wanted.add(part);
+          else if (original) {
+            writes.push([part, data]);
+            rewritten.push(part);
+          }
+        }
+        for (const [part, data, contentType] of charts.fresh) {
+          if (!originals.has(part)) originals.set(part, null);
+          writes.push([part, data, contentType]);
+        }
+        if (relateNotes(sheetRels, sheet.part, charts)) dropped = true;
+        if (!sheetRelsBytes && dropped && !(notes && notes.names.rels !== undefined)) {
+          // The file has no relationships for the sheet: the part made for them goes when it is no longer needed.
+          if (!originals.has(sheetRelsPart)) originals.set(sheetRelsPart, null);
+          charts.names.push(sheetRelsPart);
+        }
+        chartsNow.set(sheet, charts.names);
+      }
       if (dropped) {
         if (sheetRelsBytes) {
           keep(sheetRelsPart, sheetRelsBytes);
@@ -4976,19 +5310,30 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       `${around.properties}<dimension ref="A1"/><sheetViews>${around.view}</sheetViews>${around.format}<sheetData/>${around.protection}${around.page}</worksheet>`;
     // A link to another file belongs to the relationships of the sheet it was made in; only places in the workbook are written.
     const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
-    const bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf }) as Uint8Array;
+    // Its charts: all of them were added, and so are the parts that hold them.
+    const charts = charting.has(sheet) ? await chartsOf(sheet, part, undefined, undefined, undefined, sheet.name, undefined) : undefined;
+    let bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf }) as Uint8Array;
+    if (charts && charts.element) bytes = setSheetDrawing(bytes, 'drawing', charts.element, sheet.name) || bytes;
     if (!originals.has(part)) originals.set(part, null);
     writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
-    if (notes) {
+    if (notes || charts) {
       const sheetRels = emptyRels();
-      relateNotes(sheetRels, part, notes);
+      if (notes) relateNotes(sheetRels, part, notes);
+      if (charts) relateNotes(sheetRels, part, charts);
       const sheetRelsPart = relsPartOf(part);
-      for (const [name, data, contentType] of notes.fresh.concat([[sheetRelsPart, sheetRels]])) {
+      const fresh: PartWrite[] = (notes ? notes.fresh : []).concat(charts ? charts.fresh : []);
+      for (const [name, data, contentType] of fresh.concat([[sheetRelsPart, sheetRels]])) {
         if (!originals.has(name)) originals.set(name, null);
         writes.push([name, data, contentType]);
       }
-      notes.names.rels = sheetRelsPart;
-      notesNow.set(sheet, notes.names);
+      if (notes) {
+        notes.names.rels = sheetRelsPart;
+        notesNow.set(sheet, notes.names);
+      }
+      if (charts) {
+        if (!notes) charts.names.push(sheetRelsPart);
+        chartsNow.set(sheet, charts.names);
+      }
     }
     addedNow.set(sheet, part);
     relIds.set(sheet, relate('worksheet', part));
@@ -4998,7 +5343,10 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   // Parts made for notes that are no longer there (undone, deleted, or their sheet is gone).
   const noteParts = new Set<string>();
   for (const names of notesNow.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined) noteParts.add(name);
+  // The same for the parts made for charts; the relationships of a sheet may have been made for either.
+  for (const names of chartsNow.values()) for (const name of names) noteParts.add(name);
   for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined && !noteParts.has(name)) deletions.push(name);
+  for (const names of charted.values()) for (const name of names) if (!noteParts.has(name) && deletions.indexOf(name) < 0) deletions.push(name);
 
   // Sheets of the file that are gone: their parts, and what only they lead to, leave the package.
   if (gone.length > 0) {
@@ -5064,6 +5412,19 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
         if (original && !wanted.has(actual.get(part.toLowerCase()) || part)) writes.push([part, original]);
       }
       movedNow.set(sheet.part, []);
+    }
+  }
+
+  // Parts that charts which went led to (their own parts, styles and colours they share): one goes when nothing
+  // of the workbook leads to it once every relationship this save drops is gone - whichever sheets dropped them.
+  if (leavingParts.length > 0) {
+    const stays = await reachFrom(['/'], (source, id) => {
+      const gone = droppedRels.get(source);
+      return gone !== undefined && gone.has(id);
+    });
+    for (const part of await reachFrom(leavingParts)) {
+      if (stays.has(part) || isRelsPart(part) || part.toLowerCase() === '/[content_types].xml') continue;
+      wanted.add(part);
     }
   }
 
@@ -5167,4 +5528,6 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   for (const [sheet, part] of addedNow) added.set(sheet, part);
   noted.clear();
   for (const [sheet, names] of notesNow) noted.set(sheet, names);
+  charted.clear();
+  for (const [sheet, names] of chartsNow) charted.set(sheet, names);
 }

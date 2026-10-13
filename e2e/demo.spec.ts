@@ -203,6 +203,19 @@ test.describe('demo page', () => {
     await expect(page.locator('#status')).toHaveText('Biçim: xls (cfb)');
     await expect(page.locator('#preview-section')).toBeHidden();
   });
+  test('the sample workbook with charts lists its charts, and a chart that is added is listed with them', async ({ page }) => {
+    await page.locator('#sample-chart').click();
+    await expect(page.locator('#preview-section')).toBeVisible();
+    // Charts of another hand: everything but their type can be changed (the radar and the combination are of no type the commands make).
+    await expect(page.locator('#chart-state')).toContainText('Grafikler: column (türü dışında)');
+    const before = await page.evaluate(() => (window as any).__view.charts().length);
+    expect(before).toBeGreaterThan(3);
+    await page.evaluate(() => void (window as any).__view.addChart({ type: 'pie', range: { top: 0, left: 0, bottom: 5, right: 1 } }));
+    expect(await page.evaluate(() => (window as any).__view.charts().length)).toBe(before + 1);
+    await expect(page.locator('#chart-state')).toContainText('pie (her yönüyle)');
+    await expect(page.locator('#edit-state')).toContainText('1 değişiklik adımı');
+  });
+
   test('the sample document with charts opens with its charts drawn', async ({ page }) => {
     await page.locator('#sample-doc-chart').click();
     await expect(page.locator('#status')).toHaveText('Biçim: docx (ooxml)');

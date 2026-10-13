@@ -65,7 +65,7 @@
         </div>
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
-          <button id="sample-chart" title="Verisi, altı grafiği (sütun, çizgi, pasta; radar, ikincil eksenli ve veri etiketli birleşik, balon) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir.">Grafikli örnek xlsx üret ve aç</button>
+          <button id="sample-chart" title="Verisi, altı grafiği (sütun, çizgi, pasta; radar, ikincil eksenli ve veri etiketli birleşik, balon) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir. Grafikler taşınabilir, silinebilir, kutularından düzenlenebilir; araç çubuğundan yenileri eklenebilir.">Grafikli örnek xlsx üret ve aç</button>
           <button id="sample-doc-chart" title="İçinde üç grafik olan sentetik bir Word belgesi: satır içinde sütun grafiği, metnin sardığı pasta ve tablo hücresinde çizgi grafiği. Grafikler dosyadaki önbellek değerlerinden çizilir.">Grafikli örnek docx üret ve aç</button>
           <button id="blank-docx">Boş docx oluştur ve aç</button>
           <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
@@ -123,7 +123,10 @@
             <input type="text" id="sheet-author" value="Deneme Kullanıcısı" maxlength="255" />
           </label>
         </div>
-        <div class="row" style="margin: 0 0 10px"><span class="muted" id="edit-state"></span></div>
+        <div class="row" style="margin: 0 0 10px">
+          <span class="muted" id="edit-state"></span>
+          <span class="muted" id="chart-state" title="Araç çubuğundaki Grafik ekle düğmesi seçili aralıktan grafik ekler (Alt+F1: sütun grafiği). Grafiğe tıklayınca seçilir: sürükleyerek taşınır, tutamaçlarından boyutlandırılır, ok tuşlarıyla kaydırılır, Delete ile silinir; çift tık ya da sağ tık menüsü Grafiği düzenle kutusunu açar. view.charts() listesi burada özetlenir."></span>
+        </div>
         <div id="grid"></div>
         <p class="muted" id="cell-info" style="margin: 10px 0 0"></p>
         <p class="muted">
@@ -375,6 +378,15 @@
 
       function refreshTools() {
         $('edit-state').textContent = !view ? '' : $('readonly').checked ? 'Salt okunur.' : changes === 0 ? 'Değişiklik yok.' : `${changes} değişiklik adımı (geri al/yinele dahil).`;
+        // The charts of the shown sheet as view.charts() lists them: how many, and how far each can be changed.
+        let charts = [];
+        try {
+          charts = view ? view.charts() : [];
+        } catch (error) {
+          charts = [];
+        }
+        const kinds = { all: 'her yönüyle', parts: 'türü dışında', none: 'yalnız taşınır/silinir' };
+        $('chart-state').textContent = charts.length === 0 ? '' : `Grafikler: ${charts.map((chart) => `${chart.type || 'başka tür'} (${kinds[chart.editable]})`).join(', ')}.`;
       }
 
       function describeSheet(workbook, index) {
@@ -436,6 +448,7 @@
             onSelectionChange: (selection, index) => describeSelection(workbook, selection, index),
             onSheetChange: (index) => {
               note(index);
+              refreshTools();
               describeSelection(workbook, view.selection, index);
             },
           });

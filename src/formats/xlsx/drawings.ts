@@ -8,7 +8,7 @@
 // noted, the rest of the drawing is still shown.
 
 import type { OpcPackage, Relationship } from '../../opc';
-import type { Chart } from '../../model/sheet/chart';
+import { MAX_SHEET_CHARTS, type Chart } from '../../model/sheet/chart';
 import {
   MAX_COLS,
   MAX_ROWS,
@@ -23,6 +23,7 @@ import {
   type SheetDrawing,
 } from '../../model/sheet/types';
 import { localName, parseXml, type XmlElement } from '../../xml';
+import { chartKnown, type ChartPartFacts } from './chart-write';
 
 /** Anchors read from one drawing; a sheet with more shows the first ones. */
 export const MAX_SHEET_DRAWINGS = 20000;
@@ -35,7 +36,7 @@ const MAX_WRAPPER_DEPTH = 8;
 const MAX_SHAPE_PARAGRAPHS = 2000;
 const MAX_SHAPE_TEXT = 32767;
 /** Chart parts read for one drawing; further charts are shown as placeholders. */
-export const MAX_DRAWING_CHARTS = 1000;
+export const MAX_DRAWING_CHARTS = MAX_SHEET_CHARTS;
 /** EMU per pixel at 96 dpi. */
 export const EMU_PER_PIXEL = 9525;
 /** A sheet is at most this wide or tall, in EMU (16,384 columns of 255 characters and then some). */
@@ -50,6 +51,8 @@ export interface DrawingReadContext {
   hasPart?(part: string): boolean;
   /** The charts of the drawing that could be read, by the name of their part; a chart that is not among them is a placeholder. */
   charts?: Map<string, Chart>;
+  /** What is known of the parts of those charts beside their models (DrawingChart.known), by the same names. */
+  chartsKnown?: Map<string, ChartPartFacts>;
   warnings: string[];
 }
 
@@ -81,6 +84,8 @@ export interface ChartReading {
   known?: Map<string, Chart | null>;
   /** Why a chart part of `known` could not be read: said again for every drawing that names it. */
   failed?: Map<string, string>;
+  /** What is known of each chart part of `known` beside its model (DrawingChart.known), by the same names. */
+  written?: Map<string, ChartPartFacts>;
   /** The names of the parts of the package; made by the reader on first use. */
   names?: PartNames;
   /** The package `known`, `failed` and `names` belong to: they are made anew for another one. */
@@ -88,14 +93,15 @@ export interface ChartReading {
 }
 
 /** What `reading` knows of the parts of `pkg`; what it knew of another package is let go of. */
-function partsKnown(pkg: OpcPackage, reading: ChartReading): { names: PartNames; known: Map<string, Chart | null>; failed: Map<string, string> } {
-  if (reading.of !== pkg || !reading.names || !reading.known || !reading.failed) {
+function partsKnown(pkg: OpcPackage, reading: ChartReading): { names: PartNames; known: Map<string, Chart | null>; failed: Map<string, string>; written: Map<string, ChartPartFacts> } {
+  if (reading.of !== pkg || !reading.names || !reading.known || !reading.failed || !reading.written) {
     reading.of = pkg;
     reading.names = partNames(pkg);
     reading.known = new Map();
     reading.failed = new Map();
+    reading.written = new Map();
   }
-  return { names: reading.names, known: reading.known, failed: reading.failed };
+  return { names: reading.names, known: reading.known, failed: reading.failed, written: reading.written };
 }
 
 /** Gives the name the package has a part under; undefined for a part it does not have. */
@@ -580,7 +586,11 @@ function readObject(state: ReadState, el: XmlElement, depth: number, transformOu
     const id = reference ? prefixedAttr(reference, 'id') : undefined;
     const rel = id !== undefined ? state.relById.get(id) : undefined;
     const chart = rel && !rel.external && rel.part ? state.context.charts.get(rel.part) : undefined;
-    if (chart && rel && rel.part) return { ...base, type: 'chart', chart, part: rel.part };
+    if (chart && rel && rel.part) {
+      const facts = state.context.chartsKnown ? state.context.chartsKnown.get(rel.part) : undefined;
+      if (!facts) return { ...base, type: 'chart', chart, part: rel.part };
+      return facts.seriesFixed ? { ...base, type: 'chart', chart, part: rel.part, known: facts.known, seriesFixed: true } : { ...base, type: 'chart', chart, part: rel.part, known: facts.known };
+    }
   }
   return { ...base, type: 'placeholder', what };
 }
@@ -647,6 +657,19 @@ function anchorElements(parent: XmlElement, depth: number, out: XmlElement[]): v
   }
 }
 
+/** Where each drawing that was read stands in its file: see drawingSource(). */
+const SOURCES = new WeakMap<SheetDrawing, { part?: string; index: number }>();
+
+/**
+ * Where a drawing that this reader made stands in the file: its drawing part (as the package
+ * spells it) and which of the anchors of that part it is, counted as the reader takes them.
+ * What lets the writer find the anchor of a drawing that was moved or deleted. Undefined for a
+ * drawing no reader made.
+ */
+export function drawingSource(drawing: SheetDrawing): { part?: string; index: number } | undefined {
+  return SOURCES.get(drawing);
+}
+
 /**
  * The anchors of a drawing part with what they hold, bottom one first. Never
  * throws for what the part states: an anchor that cannot be read is left out
@@ -674,8 +697,10 @@ export function parseDrawing(root: XmlElement, context: DrawingReadContext): She
       // One object that cannot be read does not take the others with it.
       drawing = undefined;
     }
-    if (drawing) out.push(drawing);
-    else skipped++;
+    if (drawing) {
+      out.push(drawing);
+      SOURCES.set(drawing, { index: i });
+    } else skipped++;
   }
   if (skipped > 0) context.warnings.push(`Drawing: ${skipped} object(s) could not be read and are not shown`);
   return out;
@@ -697,10 +722,18 @@ export const MAX_WORKBOOK_CHART_BYTES = 64 * 1024 * 1024;
  * large, one beyond the limits of the sheet or the workbook) is said in `warnings`: its
  * frame shows a placeholder. Never throws.
  */
-async function readCharts(pkg: OpcPackage, rels: Relationship[], themeColors: string[], reading: ChartReading, sheetBudget: { left: number }, warnings: string[]): Promise<Map<string, Chart>> {
+async function readCharts(
+  pkg: OpcPackage,
+  rels: Relationship[],
+  themeColors: string[],
+  reading: ChartReading,
+  sheetBudget: { left: number },
+  warnings: string[],
+  kinds: Map<string, ChartPartFacts>,
+): Promise<Map<string, Chart>> {
   const charts = new Map<string, Chart>();
   const limit = reading.maxPartBytes !== undefined && reading.maxPartBytes >= 0 ? reading.maxPartBytes : MAX_CHART_PART_BYTES;
-  const { names, known, failed } = partsKnown(pkg, reading);
+  const { names, known, failed, written } = partsKnown(pkg, reading);
   if (!(typeof reading.bytes === 'number' && reading.bytes >= 0)) reading.bytes = MAX_WORKBOOK_CHART_BYTES;
   const warn = (text: string) => {
     if (warnings.length < MAX_CHART_WARNINGS) warnings.push(text);
@@ -713,8 +746,11 @@ async function readCharts(pkg: OpcPackage, rels: Relationship[], themeColors: st
     if (part === undefined) continue;
     const made = known.get(part);
     if (made !== undefined) {
-      if (made) charts.set(rel.part, made);
-      else if (failed.has(part)) warn(failed.get(part) as string);
+      if (made) {
+        charts.set(rel.part, made);
+        const kind = written.get(part);
+        if (kind) kinds.set(rel.part, kind);
+      } else if (failed.has(part)) warn(failed.get(part) as string);
       continue;
     }
     if (sheetBudget.left <= 0 || reading.charts <= 0) {
@@ -729,7 +765,22 @@ async function readCharts(pkg: OpcPackage, rels: Relationship[], themeColors: st
       if (bytes.length > limit) throw new Error('the part is too large');
       if (bytes.length > reading.bytes) throw new Error('the charts of the workbook hold too many bytes');
       reading.bytes -= bytes.length;
-      chart = reading.read(parseXml(bytes).root, themeColors, reading);
+      const root = parseXml(bytes).root;
+      chart = reading.read(root, themeColors, reading);
+      if (chart) {
+        // What the part holds beside the model decides how far the chart can be changed (DrawingChart.known).
+        let related = true;
+        try {
+          related = (await pkg.relationships(part)).length > 0;
+        } catch (error) {
+          // Relationships that cannot be read are relationships: the part is not written anew.
+        }
+        const kind = chartKnown(root, chart, related);
+        if (kind) {
+          written.set(part, kind);
+          kinds.set(rel.part, kind);
+        }
+      }
     } catch (error) {
       // A chart part that cannot be read (not XML, a DTD, too much of it) leaves its frame a placeholder.
       const text = `Chart could not be read: ${error instanceof Error ? error.message : String(error)}`;
@@ -780,8 +831,14 @@ export async function readSheetDrawings(
         charts.drawingBytes -= bytes.length;
       }
       const rels = await pkg.relationships(rel.part);
-      const found = charts ? await readCharts(pkg, rels, themeColors, charts, chartBudget, warnings) : undefined;
-      const read = parseDrawing(parseXml(bytes).root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), charts: found, warnings });
+      const kinds = new Map<string, ChartPartFacts>();
+      const found = charts ? await readCharts(pkg, rels, themeColors, charts, chartBudget, warnings, kinds) : undefined;
+      const read = parseDrawing(parseXml(bytes).root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), charts: found, chartsKnown: kinds, warnings });
+      // Where each anchor is in the file: what the writer finds it by.
+      for (const drawing of read) {
+        const source = SOURCES.get(drawing);
+        if (source) source.part = part;
+      }
       drawings = drawings.concat(read.slice(0, MAX_SHEET_DRAWINGS - drawings.length));
     } catch (error) {
       warnings.push(`Drawing could not be read: ${error instanceof Error ? error.message : String(error)}`);

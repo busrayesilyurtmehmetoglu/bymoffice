@@ -5,7 +5,7 @@
 
 import type { OpcPackage, Relationship } from '../../opc';
 import { MAX_WORKBOOK_CHARTS, MAX_WORKBOOK_CHART_POINTS } from '../../model/sheet/chart';
-import { createSheet, type DefinedName, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
+import { createSheet, type DefinedName, type DrawingChart, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
 import { childElements, localName, type XmlDocument, type XmlElement } from '../../xml';
 import { parseChart } from './chart';
 import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
@@ -61,7 +61,21 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   // While a workbook has any, rows and columns stay where they are in all of its sheets.
   const global: string[] = [];
   const allParts = pkg.partNames().map((part) => part.toLowerCase());
-  if (allParts.some((part) => part.startsWith('/xl/charts/'))) global.push('chart');
+  // A chart part is known by what it is: its content type, or the relationship of a drawing that leads to it
+  // (found while the sheets are read); the folder charts usually stand in says so as well.
+  const isChartType = (part: string): boolean => /drawingml\.chart\+xml$|chartex/i.test(pkg.contentTypeOf(part) || '');
+  let hasCharts = pkg.partNames().some((part) => part.toLowerCase().startsWith('/xl/charts/') || isChartType(part));
+  /** The parts that relationships of drawings name as charts, in lower case, with whether the relationship is of a chart that is read. */
+  const chartTargets = new Map<string, boolean>();
+  const noteCharts = (drawingRels: Relationship[]): void => {
+    for (const inner of drawingRels) {
+      const innerType = inner.type.slice(inner.type.lastIndexOf('/') + 1);
+      if ((innerType !== 'chart' && innerType !== 'chartEx') || inner.external || !inner.part) continue;
+      hasCharts = true;
+      const key = inner.part.toLowerCase();
+      chartTargets.set(key, innerType === 'chart' && chartTargets.get(key) !== false);
+    }
+  };
   if (allParts.some((part) => part.startsWith('/xl/pivottables/') || part.startsWith('/xl/pivotcache/'))) global.push('pivotTable');
 
   // The people of threaded comments are kept once for the workbook.
@@ -128,7 +142,9 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
         if (type !== 'hyperlink' && type !== 'printerSettings') anchored.add(type);
         // A drawing may hold charts, whose series refer to cells of this sheet from yet another part.
         if (type === 'drawing' && r.part && pkg.hasPart(r.part)) {
-          for (const inner of await pkg.relationships(r.part)) {
+          const drawingRels = await pkg.relationships(r.part);
+          noteCharts(drawingRels);
+          for (const inner of drawingRels) {
             const innerType = inner.type.slice(inner.type.lastIndexOf('/') + 1);
             if (innerType !== 'image' && innerType !== 'hyperlink') anchored.add(innerType);
           }
@@ -157,7 +173,9 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
       // those parts hold, the sheet is still listed: without a chart that can be read it shows a note.
       try {
         const warnings: string[] = [];
-        const drawings = await readSheetDrawings(pkg, await pkg.relationships(rel.part), styles.themeColors, mediaParts, warnings, chartReading);
+        const ownRels = await pkg.relationships(rel.part);
+        for (const r of ownRels) if (r.type.endsWith('/drawing') && !r.external && r.part && pkg.hasPart(r.part)) noteCharts(await pkg.relationships(r.part));
+        const drawings = await readSheetDrawings(pkg, ownRels, styles.themeColors, mediaParts, warnings, chartReading);
         if (drawings) sheet.drawings = drawings;
         // A chart that could not be read is said, as on a worksheet: the sheet then shows its note.
         if (warnings.length > 0) sheet.warnings = warnings;
@@ -188,6 +206,43 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     });
   }
 
+  // Whether the charts follow rows, columns and sheets that change: every chart part of the file has to
+  // be the chart of one drawing of a worksheet, and the model has to hold every reference of it.
+  const shown = new Map<string, DrawingChart[]>();
+  for (const sheet of sheets) {
+    if (sheet.kind !== 'worksheet') continue;
+    for (const drawing of sheet.drawings || []) {
+      const object = drawing.object;
+      if (object.type !== 'chart' || object.part === undefined) continue;
+      const key = object.part.toLowerCase();
+      const list = shown.get(key);
+      if (list) list.push(object);
+      else shown.set(key, [object]);
+    }
+  }
+  // A part two frames show cannot be changed for one of them.
+  for (const list of shown.values()) if (list.length > 1) for (const object of list) delete object.known;
+  let chartParts = 0;
+  let follow = true;
+  for (const part of pkg.partNames()) {
+    const type = pkg.contentTypeOf(part) || '';
+    const lower = part.toLowerCase();
+    const named = chartTargets.get(lower);
+    const isChart = /drawingml\.chart\+xml$/i.test(type) || named === true;
+    // Charts of the newer kinds (chartex) and parts under the folder of charts that say nothing of what they are.
+    const unknown = /chartex/i.test(type) || named === false || (!isChart && lower.startsWith('/xl/charts/') && /\/chart[^/]*\.xml$/.test(lower));
+    if (!isChart && !unknown) continue;
+    chartParts++;
+    const list = shown.get(lower);
+    if (unknown || !list || list.length !== 1 || list[0].known === undefined) follow = false;
+  }
+  // While a workbook has charts, every sheet says so: rows, columns and names stay unless the charts follow.
+  if (hasCharts) {
+    for (const sheet of sheets) {
+      if (sheet.kind === 'chartsheet' || (sheet.anchored || []).indexOf('chart') >= 0) continue;
+      sheet.anchored = (sheet.anchored || []).concat(['chart']).sort();
+    }
+  }
   const properties = child(root, 'workbookPr');
   const views = child(root, 'bookViews');
   const view = views && child(views, 'workbookView');
@@ -201,6 +256,7 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     date1904: isTrue(properties?.attrs.get('date1904')),
     activeSheet: activeTab < sheets.length ? activeTab : 0,
   };
+  if (chartParts > 0 && follow) workbook.chartsFollow = true;
   if (mediaParts.size > 0) {
     // Read from the package when a picture is first shown, and only what a drawing of this workbook shows.
     workbook.media = {

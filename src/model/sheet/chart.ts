@@ -14,6 +14,8 @@ import { foldSheetName, MAX_COLS, MAX_ROWS, sheetNameMap, type CellRange, type S
 export const MAX_CHART_SERIES = 255;
 /** Points of one series that are read from the cache or from cells; further ones are left out. */
 export const MAX_CHART_POINTS = 100000;
+/** Charts read from one sheet; further ones are shown as placeholders. No more are added to a sheet either: a file that is written can be read. */
+export const MAX_SHEET_CHARTS = 1000;
 /** Charts read from one workbook, all sheets together; further ones are shown as placeholders. */
 export const MAX_WORKBOOK_CHARTS = 2000;
 /** Cached values (<c:pt>) read from the charts of one workbook, all together; a chart that would go beyond is shown as a placeholder. */
@@ -382,6 +384,13 @@ export interface ChartLegend {
 }
 
 export interface Chart {
+  /**
+   * The references of the chart (of its series, their names and the titles) name sheets as they
+   * are called now and cells where they are now: set on a chart that was added or changed since
+   * the file was read, and kept so by every edit of rows, columns and sheets (see charts.ts of
+   * the operations). Without it they are as the file has them.
+   */
+  live?: boolean;
   /** The chart types of the plot area, in the order of the file. Never empty. */
   groups: ChartGroup[];
   axes: ChartAxis[];
@@ -446,7 +455,7 @@ function splitAreas(text: string): string[] | undefined {
   return pieces;
 }
 
-function areaOf(workbook: Workbook, piece: string, names: ReturnType<typeof sheetNameMap>): ChartRefArea | undefined {
+function areaOf(workbook: Workbook, piece: string, names: ReturnType<typeof sheetNameMap> | undefined): ChartRefArea | undefined {
   const text = piece.trim();
   let name: string;
   let rest: string;
@@ -516,20 +525,24 @@ function areaOf(workbook: Workbook, piece: string, names: ReturnType<typeof shee
  * Undefined for whatever cannot be followed to worksheets of this workbook: a
  * reference without a sheet, into another workbook, to a deleted sheet, a
  * defined name, "#REF!", a formula. The values the file cached are drawn then.
+ * `live`: the reference names sheets as they are called now (Chart.live), not as the file does.
  * Never throws.
  */
-export function chartRefAreas(workbook: Workbook, reference: string | undefined): ChartRefArea[] | undefined {
+export function chartRefAreas(workbook: Workbook, reference: string | undefined, live = false): ChartRefArea[] | undefined {
   if (typeof reference !== 'string' || reference.length === 0 || reference.length > 8192) return undefined;
   let text = reference.trim();
   if (text.charCodeAt(0) === 61) text = text.slice(1).trim();
   if (text.charCodeAt(0) === 40 && text.charCodeAt(text.length - 1) === 41) text = text.slice(1, text.length - 1);
   const pieces = splitAreas(text);
   if (!pieces) return undefined;
-  let names: ReturnType<typeof sheetNameMap>;
-  try {
-    names = sheetNameMap(workbook);
-  } catch (error) {
-    return undefined;
+  // A reference of a chart that was changed since the file was read names sheets as they are called now.
+  let names: ReturnType<typeof sheetNameMap> | undefined;
+  if (!live) {
+    try {
+      names = sheetNameMap(workbook);
+    } catch (error) {
+      return undefined;
+    }
   }
   const areas: ChartRefArea[] = [];
   for (const piece of pieces) {
@@ -538,4 +551,170 @@ export function chartRefAreas(workbook: Workbook, reference: string | undefined)
     areas.push(area);
   }
   return areas.length > 0 ? areas : undefined;
+}
+
+// ------------------------------------------------------------------ every reference
+
+/** The data sources of a series, with what each is. */
+function seriesSources(series: ChartSeries): ChartData[] {
+  const out: ChartData[] = [];
+  if (series.categories) out.push(series.categories);
+  if (series.values) out.push(series.values);
+  if (series.bubbleSizes) out.push(series.bubbleSizes);
+  for (const bars of series.errorBars || []) {
+    if (bars && bars.plus) out.push(bars.plus);
+    if (bars && bars.minus) out.push(bars.minus);
+  }
+  return out;
+}
+
+/** Every reference a chart of the model holds: of its titles, of the names of its series and of their data. */
+export function chartRefs(chart: Chart): string[] {
+  const out: string[] = [];
+  if (chart.title && chart.title.ref !== undefined) out.push(chart.title.ref);
+  for (const axis of chart.axes || []) if (axis && axis.title && axis.title.ref !== undefined) out.push(axis.title.ref);
+  for (const group of chart.groups || []) {
+    for (const series of group.series || []) {
+      if (series.name && series.name.ref !== undefined) out.push(series.name.ref);
+      for (const data of seriesSources(series)) if (data.ref !== undefined) out.push(data.ref);
+    }
+  }
+  return out;
+}
+
+/**
+ * A chart with every reference it holds put through `change`; the chart itself when none came
+ * out different. Nothing of the chart that was handed in is altered.
+ */
+export function mapChartRefs(chart: Chart, change: (reference: string) => string): Chart {
+  let changed = false;
+  const title = (item: ChartTitle | undefined): ChartTitle | undefined => {
+    if (!item || item.ref === undefined) return item;
+    const ref = change(item.ref);
+    if (ref === item.ref) return item;
+    changed = true;
+    return { ...item, ref };
+  };
+  const data = (item: ChartData | undefined): ChartData | undefined => {
+    if (!item || item.ref === undefined) return item;
+    const ref = change(item.ref);
+    if (ref === item.ref) return item;
+    changed = true;
+    return { ...item, ref };
+  };
+  const next: Chart = { ...chart };
+  next.title = title(chart.title);
+  if (next.title === undefined) delete next.title;
+  next.axes = (chart.axes || []).map((axis) => {
+    const moved = title(axis.title);
+    return moved === axis.title ? axis : { ...axis, title: moved };
+  });
+  next.groups = chart.groups.map((group) => {
+    let touched = false;
+    const series = group.series.map((item) => {
+      const before = changed;
+      changed = false;
+      const out: ChartSeries = { ...item };
+      if (item.name && item.name.ref !== undefined) {
+        const ref = change(item.name.ref);
+        if (ref !== item.name.ref) {
+          out.name = { ...item.name, ref };
+          changed = true;
+        }
+      }
+      for (const key of ['categories', 'values', 'bubbleSizes'] as const) {
+        const moved = data(item[key]);
+        if (moved !== item[key]) out[key] = moved;
+      }
+      if (item.errorBars) {
+        const bars = item.errorBars.map((bar) => {
+          const plus = data(bar.plus);
+          const minus = data(bar.minus);
+          return plus === bar.plus && minus === bar.minus ? bar : { ...bar, plus, minus };
+        });
+        if (bars.some((bar, i) => bar !== (item.errorBars as ChartErrorBars[])[i])) out.errorBars = bars;
+      }
+      const mine = changed;
+      changed = before || mine;
+      if (mine) touched = true;
+      return mine ? out : item;
+    });
+    return touched ? { ...group, series } : group;
+  });
+  return changed ? next : chart;
+}
+
+// ------------------------------------------------------------------ what can be written
+
+/** The chart types a part is written for from the model: the ones the commands make. A series is added to a chart of the file only in these. */
+const WRITTEN_KINDS: { [kind: string]: true } = { bar: true, line: true, area: true, pie: true, doughnut: true, scatter: true };
+
+/** Whether series of a chart type can be written from the model. */
+export function chartKindWritten(kind: ChartKind): boolean {
+  return Object.prototype.hasOwnProperty.call(WRITTEN_KINDS, kind);
+}
+
+/** Whether a chart can be written from its model alone: every chart type of it is one the commands make, in its plain form. */
+export function chartWritable(chart: Chart): boolean {
+  return !!chart && Array.isArray(chart.groups) && chart.groups.length > 0 && chart.groups.every((group) => chartKindWritten(group.kind) && !group.threeD && !group.ofPie);
+}
+
+/** The chart types whose series are grouped (side by side, stacked, stacked to a hundred per cent). */
+export function chartKindGrouped(kind: ChartKind): boolean {
+  return kind === 'bar' || kind === 'line' || kind === 'area';
+}
+
+/**
+ * Why the part of a chart of the file cannot be changed from the chart it was read as (`before`)
+ * to `now`, as a message; undefined when it can. `places` says, for each chart type of `now`,
+ * which series of the same chart type of `before` each series is (-1: added since); `fixed`
+ * that the part holds content bound to the order of its series (DrawingChart.seriesFixed).
+ * The one rule both the commands and the writer go by: what this refuses is no operation, and
+ * what it lets pass the writer writes.
+ */
+export function chartPartProblem(before: Chart, now: Chart, places: readonly (readonly number[])[], fixed: boolean): string | undefined {
+  if (now.groups.length !== before.groups.length) return 'Cannot change the type of this chart: its part holds formatting that another type cannot keep';
+  for (let g = 0; g < now.groups.length; g++) {
+    const was = before.groups[g];
+    const is = now.groups[g];
+    if (was.kind !== is.kind || (was.barDir || 'col') !== (is.barDir || 'col')) return 'Cannot change the type of this chart: its part holds formatting that another type cannot keep';
+    if (was.grouping !== is.grouping && !chartKindGrouped(is.kind)) return 'Cannot change how the series of this chart are grouped';
+    const list = places[g] || [];
+    if (list.length !== is.series.length) return 'Cannot change the series of this chart';
+    const same = list.length === was.series.length && list.every((place, i) => place === i);
+    if (same) continue;
+    const seen = new Set<number>();
+    for (const place of list) {
+      if (place < 0) {
+        if (!chartKindWritten(is.kind)) return 'Cannot add a series to a chart of this type';
+        continue;
+      }
+      if (seen.has(place) || !was.series[place]) return 'Cannot change the series of this chart';
+      seen.add(place);
+    }
+    // Open, high, low and close are the series in that order: with another number or order it is another chart.
+    if (is.kind === 'stock') return 'Cannot add, remove or reorder the series of a stock chart';
+    if (fixed) return 'Cannot add, remove or reorder the series of this chart: its part holds content bound to their order';
+    if (is.series.length === 0) return 'A chart has at least one series';
+  }
+  return undefined;
+}
+
+/**
+ * The entries of a legend that are left out (ChartLegend.deleted) after the series of the chart
+ * changed: `places` lists, for each series now in the order of the legend, the place it had
+ * before (-1: added since). The entry of a series follows it; that of a series that is gone goes.
+ */
+export function remapLegendEntries(deleted: readonly number[] | undefined, places: readonly number[]): number[] | undefined {
+  if (!deleted || deleted.length === 0) return undefined;
+  const now = new Map<number, number>();
+  places.forEach((place, i) => {
+    if (place >= 0) now.set(place, i);
+  });
+  const out: number[] = [];
+  for (const index of deleted) {
+    const moved = now.get(index);
+    if (moved !== undefined) out.push(moved);
+  }
+  return out.length > 0 ? out : undefined;
 }

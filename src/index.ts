@@ -112,6 +112,30 @@ export {
 } from './ops/sheets';
 export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
 export {
+  CHART_PART_CHANGES,
+  CHART_TYPES,
+  DEFAULT_CHART_HEIGHT,
+  DEFAULT_CHART_WIDTH,
+  addChart,
+  anchorOfRect,
+  chartProblem,
+  chartRangeRef,
+  moveChart,
+  removeChart,
+  seriesOfRange,
+  sheetCharts,
+  updateChart,
+  type ChartGrouping,
+  type ChartInfo,
+  type ChartLegendPlace,
+  type ChartPatch,
+  type ChartSeriesEdit,
+  type ChartSeriesSpec,
+  type ChartSpec,
+  type ChartType,
+  type RangeSeries,
+} from './ops/charts';
+export {
   CONDITIONAL_TYPES,
   ICON_SET_NAMES,
   MAX_SHEET_CONDITIONAL_RULES,
@@ -166,7 +190,7 @@ export { parseTsv, toTsv } from './edit/clipboard';
 export { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, quoteSheetName, renameSheetsInFormula, shiftFormula, type StructuralEdit } from './calc/refs';
 export { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, renderGridPrint, type GridBand, type GridFilter, type GridPrintScene, type GridScene, type GridSelection, type GridTheme } from './render/grid';
 export type { GridCommentSource, GridDrawingSource } from './render/grid';
-export { SheetDrawings, adjustCommentCell, adjustDrawingAnchor, commentCellNow, commentEdits, anchorRect, type DrawingTarget, type PlacedComment, type SheetDrawingLabels, type SheetDrawingsOptions } from './render/sheet-drawings';
+export { SheetDrawings, adjustCommentCell, adjustDrawingAnchor, commentCellNow, commentEdits, drawingAnchorNow, anchorRect, type DrawingTarget, type PlacedComment, type SheetDrawingLabels, type SheetDrawingsOptions } from './render/sheet-drawings';
 export type { DecodedImage } from './render/images';
 export { cellText, formatGeneral } from './render/cell-text';
 export { cellDisplayText, formatCell, isoToSerial } from './format/cell-format';

@@ -8,6 +8,7 @@
 
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
+import { chartsFollow, chartsMoved, chartsRenamed } from './charts';
 import { liveRulesMoved, liveRulesRenamed, swapRuleLists, type RuleLists } from './rules';
 import {
   FILTER_NAME,
@@ -34,6 +35,7 @@ import {
   type Row,
   type Sheet,
   type SheetComment,
+  type SheetDrawing,
   type SheetNameMap,
   type SheetNeighbours,
   type SheetState,
@@ -156,6 +158,16 @@ export type Op =
       type: 'setConditionalFormats';
       sheet: number;
       formats: ConditionalFormat[] | undefined;
+    }
+  | {
+      /**
+       * Replaces the drawings of a sheet (undefined: none). The list is held by reference and
+       * never altered, so that the inverse puts the very list back. What the list may hold is
+       * the business of the commands (see charts.ts).
+       */
+      type: 'setDrawings';
+      sheet: number;
+      drawings: SheetDrawing[] | undefined;
     }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
@@ -518,7 +530,9 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   }
   // Content placed by cell position but stored in other parts has to move with the cells. The writer
   // moves pictures and comments; for anything else the edit is refused rather than leave it behind.
-  const stuck = (sheet.anchored || []).filter((part) => !MOVABLE_PARTS.has(part));
+  // Charts follow when the model holds every reference of every chart of the workbook (see charts.ts).
+  const follow = chartsFollow(workbook);
+  const stuck = (sheet.anchored || []).filter((part) => !MOVABLE_PARTS.has(part) && !(part === 'chart' && follow));
   if (stuck.length > 0) throw new RangeError(`Cannot ${kind} ${axis}s in a sheet with ${stuck.join(', ')}: not supported yet`);
   checkArrayFormulas(sheet, edit);
 
@@ -630,7 +644,8 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   if (dropped) syncFilterName(workbook, index);
   // Rules added or changed since the file was read are kept where their cells are; those of the file are
   // left as the file has them, and are read through the edit from now on.
-  const rules = swapRuleLists(liveRulesMoved(workbook, sheet, refEdit));
+  // So are the references of charts: wherever one names cells that moved, it is written anew.
+  const rules = swapRuleLists(liveRulesMoved(workbook, sheet, refEdit).concat(chartsMoved(workbook, refEdit)));
 
   return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), weight };
 }
@@ -991,7 +1006,7 @@ function nameHolder(workbook: Workbook): string | undefined {
   for (const sheet of workbook.sheets) {
     const anchored = sheet.anchored;
     if (!anchored) continue;
-    for (const kind of NAME_HOLDERS) if (anchored.indexOf(kind) >= 0) return kind;
+    for (const kind of NAME_HOLDERS) if (anchored.indexOf(kind) >= 0 && !(kind === 'chart' && chartsFollow(workbook))) return kind;
     for (const kind of CONTROL_KINDS) if (anchored.indexOf(kind) >= 0) return 'form controls';
   }
   return undefined;
@@ -1159,13 +1174,16 @@ function renameSheetOp(workbook: Workbook, index: number, name: string): Op {
   if (problem) throw new RangeError(problem);
   const sheet = workbook.sheets[index];
   const old = foldSheetName(sheet.name);
-  const changes = sheetNameChanges(workbook, (written) => (foldSheetName(written) === old ? name : undefined), 'rename');
+  const renames: SheetNameMap = (written) => (foldSheetName(written) === old ? name : undefined);
+  const changes = sheetNameChanges(workbook, renames, 'rename');
+  // Worked out before anything is changed: a chart whose reference cannot be read refuses the rename.
+  const charts = chartsRenamed(workbook, renames);
 
   const undo = sheetsSnapshot(workbook);
   undo.renamed = { sheet, name: sheet.name, nameInFile: sheet.nameInFile };
   applySheetNameChanges(changes, undo);
   // Rules of the file name sheets as the file does (see nameInFile below); those changed since name them as they are called.
-  const rules = swapRuleLists(liveRulesRenamed(workbook, (written) => (foldSheetName(written) === old ? name : undefined)));
+  const rules = swapRuleLists(liveRulesRenamed(workbook, renames).concat(charts));
   if (rules.length > 0) undo.rules = rules;
   workbook.definedNames = changes.definedNames;
   // What is kept the way the file has it goes on naming the sheet as the file does.
@@ -1195,10 +1213,12 @@ function deleteSheetOp(workbook: Workbook, index: number): Op {
     },
   };
   const changes = sheetNameChanges(workbook, map, 'delete', sheet);
+  // The charts of the other sheets that show cells of this one show "#REF!" from now on.
+  const charts = chartsRenamed(workbook, map, sheet);
 
   const undo = sheetsSnapshot(workbook);
   applySheetNameChanges(changes, undo);
-  const rules = swapRuleLists(liveRulesRenamed(workbook, map, sheet));
+  const rules = swapRuleLists(liveRulesRenamed(workbook, map, sheet).concat(charts));
   if (rules.length > 0) undo.rules = rules;
   // The names of the sheet go with it; those of the sheets after it follow their sheets.
   const names: DefinedName[] = [];
@@ -1500,6 +1520,18 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       sheet.commentsModified = true;
       return { type: 'setComments', sheet: op.sheet, comments: previous };
     }
+    case 'setDrawings': {
+      const sheet = sheetAt(workbook, op.sheet);
+      if (op.drawings !== undefined && !Array.isArray(op.drawings)) throw new RangeError('The drawings of a sheet are a list');
+      const previous = sheet.drawings;
+      // What the sheet came with, noted once: while the list is that one, the writer leaves the parts alone.
+      if (!sheet.drawingsRead) sheet.drawingsRead = { list: previous };
+      if (op.drawings && op.drawings.length > 0) sheet.drawings = op.drawings;
+      else delete sheet.drawings;
+      // Not `modified`: no cell changed, so the sheet part stays as it is and nothing has to be calculated again.
+      sheet.drawingsModified = true;
+      return { type: 'setDrawings', sheet: op.sheet, drawings: previous };
+    }
     case 'setDataValidations': {
       const sheet = sheetAt(workbook, op.sheet);
       if (op.validations !== undefined && !Array.isArray(op.validations)) throw new RangeError('The data validations of a sheet are a list');
@@ -1595,6 +1627,7 @@ function weightOf(ops: Op[]): number {
     else if (op.type === 'setAutoFilter') weight += ((op.show ? op.show.length : 0) + (op.hide ? op.hide.length : 0)) / 16;
     // The list of comments a step replaced is kept, not the comments themselves.
     else if (op.type === 'setComments') weight += (op.comments ? op.comments.length : 0) / 16;
+    else if (op.type === 'setDrawings') weight += (op.drawings ? op.drawings.length : 0) / 16;
     else if (op.type === 'setDataValidations') weight += (op.validations ? op.validations.length : 0) / 16;
     else if (op.type === 'setConditionalFormats') weight += (op.formats ? op.formats.length : 0) / 16;
   }

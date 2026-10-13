@@ -905,8 +905,41 @@ export interface DrawingPlaceholder extends DrawingObjectBase {
 export interface DrawingChart extends DrawingObjectBase {
   type: 'chart';
   chart: Chart;
-  /** The chart part, e.g. "/xl/charts/chart1.xml". It is never written from the model. */
+  /**
+   * The chart part, e.g. "/xl/charts/chart1.xml"; missing for a chart that is in no file (one
+   * added since the workbook was read: the writer gives it a part). A part that was not changed
+   * is written back as it is; see ChartOrigin for one that was.
+   */
   part?: string;
+  /**
+   * Set by the reader, for a chart of a file, by what its part holds beside the model:
+   * "all" when the part is exactly what the writer makes of the model (the engine wrote it): such a
+   * chart can be changed in every way, and is written anew from the model;
+   * "refs" when every formula of the part is in the model (the references of the series, of their
+   * names and of the titles): rows and columns inserted or deleted and sheets renamed can be followed,
+   * and what the model holds of it can be changed in the part while everything else of the part stays.
+   * Missing for a chart of which neither is known: it is shown, moved and deleted, not changed.
+   */
+  known?: 'all' | 'refs';
+  /**
+   * Set by the reader beside `known: 'refs'` when the part holds content that is bound to the
+   * number and order of its series and that the model does not hold (a legend entry of a trend
+   * line, the formats of a pivot chart): the series are changed, not added, removed or reordered.
+   */
+  seriesFixed?: boolean;
+  /** Set once a chart of the file was changed: what it was read as. */
+  origin?: ChartOrigin;
+}
+
+/**
+ * What a chart of the file that was changed came from: the chart as it was read, and, for each
+ * chart type (group) of the chart as it is now, the series it has by their places in the same
+ * group of the chart as read (-1 for a series added since). The writer changes the part by the
+ * differences between the two, and leaves the rest of it alone.
+ */
+export interface ChartOrigin {
+  chart: Chart;
+  series: number[][];
 }
 
 export type DrawingObject = DrawingPicture | DrawingShape | DrawingGroup | DrawingPlaceholder | DrawingChart;
@@ -918,6 +951,15 @@ export type DrawingObject = DrawingPicture | DrawingShape | DrawingGroup | Drawi
 export interface SheetDrawing {
   anchor: DrawingAnchor;
   object: DrawingObject;
+  /**
+   * Set on a drawing that was added, moved or changed since the sheet was read: how many of the
+   * sheet's structuralEdits had been made by then. `anchor` is where the drawing was at that
+   * time, and only the edits from this index on move it. A drawing of the file has none: it is
+   * where the file has it, and every structural edit moves it. See drawingAnchorNow().
+   */
+  since?: number;
+  /** Set on a drawing of the file that was moved or changed: the drawing as the sheet was read with it, by which the writer knows its anchor in the file. */
+  from?: SheetDrawing;
 }
 
 /** A comment (note) on a cell. A view for reading, like SheetDrawing. */
@@ -1232,6 +1274,14 @@ export interface Sheet {
    */
   drawings?: SheetDrawing[];
   /**
+   * Charts were added, moved, changed or deleted ("setDrawings"), or a chart follows rows,
+   * columns or sheets that changed; the writer brings the drawing and chart parts of the sheet in
+   * line with the model. Set on its own, without `modified`: no cell changed.
+   */
+  drawingsModified?: boolean;
+  /** The list the sheet had before its drawings were first changed. Set with `drawingsModified`. */
+  drawingsRead?: { list: SheetDrawing[] | undefined };
+  /**
    * Comments as the file has them; structuralEdits are applied where they are shown. Notes
    * added by editing stand where they were put (SheetComment.since says after how many of the
    * structural edits), so that the same rule places both: see commentCellNow(). The list is
@@ -1289,6 +1339,14 @@ export interface Workbook {
   activeSheet: number;
   /** The pictures of the workbook's drawings, by DrawingPicture.media. */
   media?: WorkbookMedia;
+  /**
+   * Set by the reader of a file with chart parts when every one of them is shown as a chart of a
+   * worksheet whose references the model holds (DrawingChart.known): the charts then follow rows
+   * and columns that are inserted or deleted and sheets that are renamed or deleted (see
+   * charts.ts). Without it a workbook with charts (Sheet.anchored names "chart") keeps its rows,
+   * columns and sheet names as they are.
+   */
+  chartsFollow?: boolean;
   /**
    * Set once a sheet was inserted, deleted, renamed, moved, copied, hidden, shown or given
    * another tab colour after the workbook was read (and never cleared, not by undo either): the

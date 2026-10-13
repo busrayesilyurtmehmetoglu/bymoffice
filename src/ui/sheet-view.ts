@@ -11,7 +11,7 @@ import { FocusRetry, pressOf } from './focus-retry';
 import { colX, createLayout, hitTest, maxScroll, rangeRect, rowY, scrollAreaSize, scrollToReveal, type GridLayout } from '../layout/grid-geometry';
 import { DEFAULT_DIGIT_WIDTH, createSheetMetrics, type AxisMetrics, type SheetMetrics } from '../layout/sheet-metrics';
 import type { Chart } from '../model/sheet/chart';
-import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type DrawingAnchor, type Sheet, type SheetComment, type SheetDrawing, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
 import { resolveUiStrings, type UiStrings } from './strings';
@@ -109,7 +109,21 @@ import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
 import { ChartRenderer, type ChartRendererOptions } from '../render/chart';
-import { SheetDrawings } from '../render/sheet-drawings';
+import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
+import {
+  MIN_CHART_SIZE,
+  addChart as addChartOps,
+  anchorOfRect,
+  moveChart as moveChartOps,
+  removeChart as removeChartOps,
+  sheetCharts,
+  updateChart as updateChartOps,
+  type ChartInfo,
+  type ChartPatch,
+  type ChartSpec,
+} from '../ops/charts';
+import { ChartDialog, chartFields } from './chart-dialog';
+import type { Rect } from '../layout/grid-geometry';
 import { onFontsChanged } from '../render/fonts';
 import { onEmbeddedFontNotice } from '../render/embedded-fonts';
 import { cssFont } from '../render/text';
@@ -843,9 +857,15 @@ export class WorkbookView {
    * Works out and draws the charts of the sheet that is shown, on a worksheet and on a chart sheet alike; made when
    * a chart is first drawn. What it keeps is given up when another sheet is shown, and is limited at any time.
    */
-  private charts: ChartRenderer | undefined;
+  private chartPainter: ChartRenderer | undefined;
   /** Counts the redraws that were asked for from outside: charts read their cells anew then (see render()). */
   private chartEpoch = 0;
+  /** The chart that is selected: the sheet it is on and its place in the drawings of that sheet. */
+  private chartPick: { sheet: Sheet; index: number } | undefined;
+  /** The selected chart is being moved, or sized by one of its handles: where the pointer came down (sheet pixels), the box it had and the box it would get. */
+  private chartDrag: { pointerId: number; sheet: Sheet; drawing: SheetDrawing; index: number; handle: DrawingHandle | 'move'; x: number; y: number; originX: number; originY: number; start: Rect; now: Rect; moved: boolean; touch: boolean } | undefined;
+  /** When the selected chart was last tapped: a second tap opens its dialog. */
+  private lastChartTap = 0;
   /** The name the canvas has for assistive technology while it shows the chart of a chart sheet; '' while it has none. */
   private canvasLabel = '';
   /** Decoded pictures of the workbook; made when a sheet with a picture is first drawn. */
@@ -1144,7 +1164,7 @@ export class WorkbookView {
     this.sheetIndex = index;
     this.shown = this.workbook.sheets[index];
     // What was worked out for the charts of the sheet that is left is not kept while they are out of sight.
-    if (this.charts) this.charts.clear();
+    if (this.chartPainter) this.chartPainter.clear();
     this.showSheet();
     this.schedule();
     this.noteActiveSheet();
@@ -1266,6 +1286,7 @@ export class WorkbookView {
 
   destroy(): void {
     if (this.destroyed) return;
+    this.endChartDrag(false, 0);
     this.destroyed = true;
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.unwatchFonts) this.unwatchFonts();
@@ -1344,8 +1365,8 @@ export class WorkbookView {
     if (this.images) this.images.destroy();
     this.images = undefined;
     this.drawings.clear();
-    if (this.charts) this.charts.clear();
-    this.charts = undefined;
+    if (this.chartPainter) this.chartPainter.clear();
+    this.chartPainter = undefined;
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);
     // Give the backing store back right away; some browsers keep it until collection otherwise.
@@ -1828,7 +1849,7 @@ export class WorkbookView {
     }
     this.sheetIndex = index;
     this.shown = sheets[index];
-    if (this.charts) this.charts.clear();
+    if (this.chartPainter) this.chartPainter.clear();
     if (kind === 'rename') {
       // The same tabs under other names: a press that is under way on one of them still finds it.
       const tabs = this.tabs.children;
@@ -2971,6 +2992,12 @@ export class WorkbookView {
     }
     const conditional = this.conditionalOf(state.sheet);
     const floating = this.drawingsOf(state.sheet);
+    // The chart that is selected, while it is there: a step undone or a sheet changed may have taken it away.
+    const picked = this.pickedChart();
+    if (floating) {
+      floating.selected = picked;
+      floating.ghost = picked !== undefined && this.chartDrag && this.chartDrag.moved ? this.chartDrag.now : undefined;
+    }
     // A picture asked for in this frame is never dropped to make room for another.
     if (this.images) this.images.pass++;
     renderGrid(context, {
@@ -2999,6 +3026,387 @@ export class WorkbookView {
     this.placeNote();
   }
 
+  // ------------------------------------------------------------------ charts
+
+  /** The words of the menu and the dialog of charts, in the language of the view: for a shell that offers their commands. */
+  get chartStrings(): UiStrings['charts'] {
+    return this.strings.charts;
+  }
+
+  /** The charts of the shown sheet, the one on top last; `id` is what the methods below name a chart by. */
+  charts(): ChartInfo[] {
+    if (this.destroyed) return [];
+    return sheetCharts(this.workbook, this.sheetIndex);
+  }
+
+  /** The id of the chart that is selected; undefined when none is. */
+  get selectedChart(): number | undefined {
+    return this.destroyed ? undefined : this.pickedChart();
+  }
+
+  /** Selects a chart of the shown sheet (a frame with handles is drawn around it), or none. Throws RangeError for an id that names no chart. */
+  selectChart(id: number | undefined): void {
+    if (this.destroyed) return;
+    if (id !== undefined && !this.isChartAt(id)) throw new RangeError(`No chart at index ${id}`);
+    // A view that changes nothing selects no chart: there is nothing to do with one.
+    if (this.locked && id !== undefined) return;
+    this.setChartPick(id);
+  }
+
+  /**
+   * Adds a chart to the shown sheet and selects it; returns its id. Without a range and without
+   * series the chart shows the selection (the block of cells around the active cell when one
+   * cell is selected). Throws RangeError for a chart that cannot be made; does nothing (and
+   * returns -1) in a read-only view.
+   */
+  addChart(spec: Partial<ChartSpec> & Pick<ChartSpec, 'type'>): number {
+    if (!this.beginRules()) return -1;
+    const state = this.state();
+    const made: ChartSpec = { ...spec };
+    if (made.range === undefined && made.series === undefined) {
+      const range = state.range;
+      made.range = range.top === range.bottom && range.left === range.right ? currentRegion(state.sheet, range.top, range.left) : { ...range };
+    }
+    if (!this.applyOps(addChartOps(this.workbook, this.sheetIndex, made))) return -1;
+    const id = (state.sheet.drawings || []).length - 1;
+    this.setChartPick(id, false);
+    this.live.textContent = this.strings.charts.added;
+    return id;
+  }
+
+  /** Changes a chart of the shown sheet: see ChartPatch. Throws RangeError for what cannot be done. */
+  updateChart(id: number, patch: ChartPatch): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(updateChartOps(this.workbook, this.sheetIndex, id, patch))) this.live.textContent = this.strings.charts.changed;
+  }
+
+  /** Moves or sizes a chart of the shown sheet: `anchor` is where it stands from now on (an anchor, or the cells it covers). */
+  moveChart(id: number, anchor: DrawingAnchor | CellRange): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(moveChartOps(this.workbook, this.sheetIndex, id, anchor))) this.live.textContent = this.strings.charts.moved;
+  }
+
+  /** Deletes a chart of the shown sheet. */
+  removeChart(id: number): void {
+    if (!this.beginRules()) return;
+    const picked = this.pickedChart();
+    if (!this.applyOps(removeChartOps(this.workbook, this.sheetIndex, id))) return;
+    // The charts behind it moved up by one place.
+    if (picked !== undefined) this.setChartPick(picked === id ? undefined : picked > id ? picked - 1 : picked, false);
+    this.live.textContent = this.strings.charts.removed;
+  }
+
+  /**
+   * Opens the dialog of a chart of the shown sheet (the selected one without an argument) over
+   * the view. Returns false when there is no dialog: a read-only view, no such chart, a chart
+   * that can only be moved and deleted (said in the live region and to onNotice), something
+   * typed that cannot be applied.
+   */
+  openChartDialog(id?: number): boolean {
+    if (!this.beginDialog()) return false;
+    const index = id === undefined ? this.pickedChart() : id;
+    const strings = this.strings.charts;
+    const info = index === undefined ? undefined : this.charts().find((chart) => chart.id === index);
+    if (!info) {
+      this.notify(strings.noChart, 'error');
+      return false;
+    }
+    if (info.editable === 'none') {
+      this.notify(strings.notEditable, 'error');
+      return false;
+    }
+    const sheet = this.state().sheet;
+    const dialog = new ChartDialog({
+      parent: this.options.focusScope || this.root,
+      strings,
+      locale: this.locale,
+      fields: chartFields(info, this.locale, sheet.name),
+      editable: info.editable,
+      canAddSeries: info.canAddSeries,
+      canReorderSeries: info.canReorderSeries,
+      coarse: coarsePointer(),
+      pointer: this.dialogPointer,
+      onApply: (patch) => {
+        this.dialogHome(sheet);
+        // The dialog belongs to the sheet it was opened on.
+        if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
+        if (this.applyFromDialog(updateChartOps(this.workbook, this.sheetIndex, info.id, patch))) this.live.textContent = strings.changed;
+      },
+      // What a field cannot be read as is said in the words of the dialog already.
+      explain: (error) => (error instanceof FieldError ? error.message : this.localizeError(error)),
+      onClose: () => {
+        this.dialogClosed(sheet);
+        // Back to the cells, unless the view is going away.
+        if (!this.destroyed) this.focusInput(true);
+      },
+    });
+    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => dialog.dialog.close(), changed: () => dialog.dialog.changed, say: (message) => dialog.dialog.showError(message) };
+    return true;
+  }
+
+  private isChartAt(index: number): boolean {
+    const drawings = this.state().sheet.drawings;
+    const drawing = drawings && Math.floor(index) === index ? drawings[index] : undefined;
+    return !!drawing && !!drawing.object && drawing.object.type === 'chart' && this.state().sheet.kind === 'worksheet';
+  }
+
+  /** The place of the selected chart in the drawings of the shown sheet; undefined when no chart of it is selected (any more). */
+  private pickedChart(): number | undefined {
+    const pick = this.chartPick;
+    if (!pick) return undefined;
+    if (pick.sheet !== this.state().sheet || !this.isChartAt(pick.index)) {
+      this.chartPick = undefined;
+      return undefined;
+    }
+    return pick.index;
+  }
+
+  private setChartPick(index: number | undefined, say = true): void {
+    const before = this.pickedChart();
+    this.chartPick = index === undefined ? undefined : { sheet: this.state().sheet, index };
+    if (index === before) return;
+    this.schedule();
+    if (index === undefined || !say) return;
+    const info = this.charts().find((chart) => chart.id === index);
+    this.live.textContent = this.strings.charts.selected(info && info.title ? info.title.replace(/\s+/g, ' ').slice(0, 100) : '');
+  }
+
+  /** A point of the canvas as a point of the sheet, in pixels from the corner of cell A1; undefined over the headers. */
+  private sheetPoint(x: number, y: number): { x: number; y: number } | undefined {
+    const layout = this.layout();
+    const left = x - layout.metrics.headerWidth;
+    const top = y - layout.metrics.headerHeight;
+    if (left < 0 || top < 0) return undefined;
+    return { x: left < layout.frozenWidth ? left : left + layout.scrollX, y: top < layout.frozenHeight ? top : top + layout.scrollY };
+  }
+
+  /** The chart under a point of the canvas, by its place in the drawings of the sheet; -1 when there is none. */
+  private chartUnder(x: number, y: number): number {
+    const state = this.state();
+    const layer = this.drawingsOf(state.sheet);
+    const at = this.sheetPoint(x, y);
+    return layer && at ? layer.hit(state.metrics, at.x, at.y, (object) => object.type === 'chart') : -1;
+  }
+
+  /** What a pointer at a point of the canvas would take of the selected chart: one of its handles, or the chart itself ("move"). */
+  private chartGrab(x: number, y: number, coarse: boolean): DrawingHandle | 'move' | undefined {
+    const index = this.pickedChart();
+    const state = this.state();
+    const layer = index === undefined ? undefined : this.drawingsOf(state.sheet);
+    const box = layer && index !== undefined ? layer.boxOf(state.metrics, index) : undefined;
+    const at = this.sheetPoint(x, y);
+    if (!box || !at) return undefined;
+    const handle = drawingHandleAt(box, at.x, at.y, coarse ? HANDLE_SIZE * 2 : HANDLE_SIZE - 2);
+    if (handle) return handle;
+    return at.x >= box.x && at.x <= box.x + box.width && at.y >= box.y && at.y <= box.y + box.height ? 'move' : undefined;
+  }
+
+  /** The cursor over a chart: what a press there would do. */
+  private chartCursor(x: number, y: number): string {
+    if (this.locked || this.typingFormula() || this.state().sheet.kind !== 'worksheet') return '';
+    const grab = this.chartGrab(x, y, false);
+    if (grab === 'move') return 'move';
+    if (grab === 'n' || grab === 's') return 'ns-resize';
+    if (grab === 'e' || grab === 'w') return 'ew-resize';
+    if (grab === 'nw' || grab === 'se') return 'nwse-resize';
+    if (grab === 'ne' || grab === 'sw') return 'nesw-resize';
+    return this.chartUnder(x, y) >= 0 ? 'move' : '';
+  }
+
+  /** A press of the mouse: on a handle of the selected chart, on a chart, or beside the chart that was selected. True when the press was the chart's. */
+  private pressChart(pointerId: number, point: { x: number; y: number }): boolean {
+    if (this.locked || this.state().sheet.kind !== 'worksheet') return false;
+    const picked = this.pickedChart();
+    const grab = this.chartGrab(point.x, point.y, false);
+    if (picked !== undefined && grab && grab !== 'move') {
+      this.beginChartDrag(pointerId, picked, grab, point, false);
+      return true;
+    }
+    const index = this.chartUnder(point.x, point.y);
+    if (index < 0) {
+      if (picked !== undefined) this.setChartPick(undefined);
+      return false;
+    }
+    this.setChartPick(index);
+    this.beginChartDrag(pointerId, index, 'move', point, false);
+    return true;
+  }
+
+  /** A tap: on a chart it selects the chart; beside the chart that was selected it lets go of it. True when the tap was a chart's. */
+  private tapChart(x: number, y: number): boolean {
+    if (this.locked || this.state().sheet.kind !== 'worksheet') return false;
+    const index = this.chartUnder(x, y);
+    if (index < 0) {
+      if (this.pickedChart() !== undefined) this.setChartPick(undefined);
+      return false;
+    }
+    this.setChartPick(index);
+    return true;
+  }
+
+  private beginChartDrag(pointerId: number, index: number, handle: DrawingHandle | 'move', point: { x: number; y: number }, touch: boolean): void {
+    const state = this.state();
+    const layer = this.drawingsOf(state.sheet);
+    const box = layer ? layer.boxOf(state.metrics, index) : undefined;
+    const at = this.sheetPoint(Math.max(point.x, state.metrics.headerWidth), Math.max(point.y, state.metrics.headerHeight));
+    if (!box || !at) return;
+    const drawing = (state.sheet.drawings || [])[index];
+    if (!drawing) return;
+    this.endDrag();
+    this.chartDrag = { pointerId, sheet: state.sheet, drawing, index, handle, x: at.x, y: at.y, originX: point.x, originY: point.y, start: box, now: box, moved: false, touch };
+    this.capturePointer(pointerId);
+    // A drag whose end the page never hears of (the window lost the focus) is over.
+    window.addEventListener('blur', this.onChartDragLost);
+  }
+
+  private moveChartDrag(point: { x: number; y: number }): void {
+    const drag = this.chartDrag;
+    if (!drag) return;
+    const state = this.state();
+    if (!drag.moved) {
+      const slop = drag.touch ? TAP_SLOP : DRAG_SLOP;
+      if (Math.abs(point.x - drag.originX) <= slop && Math.abs(point.y - drag.originY) <= slop) return;
+      drag.moved = true;
+    }
+    this.readScroll();
+    const at = this.sheetPoint(Math.max(point.x, state.metrics.headerWidth), Math.max(point.y, state.metrics.headerHeight));
+    if (!at) return;
+    drag.now = resizedRect(drag.start, drag.handle, at.x - drag.x, at.y - drag.y, MIN_CHART_SIZE);
+    this.schedule();
+  }
+
+  /**
+   * Copy, cut and paste while a chart is selected: the chart is what they would be about, and a
+   * chart is not copied yet. The cells are not touched (the selection of cells is not what the
+   * user is looking at); that nothing happened is said.
+   */
+  private chartClipboard(event: ClipboardEvent): boolean {
+    if (this.pickedChart() === undefined) return false;
+    event.preventDefault();
+    this.clipboardHandled = true;
+    this.notify(this.strings.charts.noCopy, 'info');
+    return true;
+  }
+
+  private onChartDragLost = (): void => {
+    this.endChartDrag(false, 0);
+  };
+
+  /** Ends the drag of a chart: with `apply` the chart stands where it was dragged to; a press that did not move is a click (a tap). */
+  private endChartDrag(apply: boolean, time: number): void {
+    const drag = this.chartDrag;
+    if (!drag) return;
+    this.chartDrag = undefined;
+    window.removeEventListener('blur', this.onChartDragLost);
+    window.removeEventListener('mousemove', this.onPointerMove);
+    window.removeEventListener('mouseup', this.onPointerUp);
+    if (this.pointerEvents) {
+      try {
+        this.canvas.releasePointerCapture(drag.pointerId);
+      } catch {
+        // Already released.
+      }
+    }
+    this.schedule();
+    if (!apply || this.destroyed || this.locked) return;
+    // The chart that was taken hold of: another one may stand at its place by now (a step undone, another sheet shown).
+    const state = this.state();
+    if (state.sheet !== drag.sheet || (state.sheet.drawings || [])[drag.index] !== drag.drawing) return;
+    if (!drag.moved) {
+      // A second tap on the selected chart opens its dialog, as a double click does.
+      if (drag.touch) {
+        const second = time - this.lastChartTap < DOUBLE_TAP_MS;
+        this.lastChartTap = second ? 0 : time;
+        if (second) this.attempt(() => void this.openChartDialog(drag.index));
+      }
+      return;
+    }
+    const metrics = this.state().metrics;
+    this.attempt(() => this.moveChart(drag.index, anchorOfRect(metrics, drag.now.x, drag.now.y, drag.now.width, drag.now.height)));
+  }
+
+  /** The menu of a chart: opened by the press that asks for a menu on it. */
+  private openChartMenu(x: number, y: number): boolean {
+    if (this.locked || this.state().sheet.kind !== 'worksheet' || this.editAway() || this.typingFormula()) return false;
+    const index = this.chartUnder(x, y);
+    if (index < 0) return false;
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    this.setChartPick(index);
+    const strings = this.strings.charts;
+    const info = this.charts().find((chart) => chart.id === index);
+    const fixed = !info || info.editable === 'none';
+    const items: MenuItem[] = [
+      { label: strings.edit, disabled: fixed, title: fixed ? strings.notEditable : undefined, explain: fixed ? () => this.notify(strings.notEditable, 'error') : undefined, action: () => this.attempt(() => void this.openChartDialog(index)) },
+      { label: strings.remove, action: () => this.attempt(() => this.removeChart(index)) },
+    ];
+    this.showMenu(items, x, y);
+    return true;
+  }
+
+  /**
+   * The keys of charts. With a chart selected: the arrows move it (by ten pixels, by one with
+   * Shift; with Alt they size it), Delete deletes it, Enter opens its dialog and Escape lets go of
+   * it. Ctrl+Alt+5 selects the first chart of the sheet, then the next one with every press, and
+   * none after the last. Without a chart selected Alt+F1 adds one of the selection. Tab is never
+   * taken: it leaves the grid as it always does. Returns whether the key was taken.
+   */
+  private chartKey(event: KeyboardEvent): boolean {
+    const state = this.state();
+    // No chart is selected in a read-only view, and none of these keys is taken there.
+    if (state.sheet.kind !== 'worksheet' || this.locked) return false;
+    const ctrl = event.ctrlKey || event.metaKey;
+    const picked = this.pickedChart();
+    const ids = (): number[] => this.charts().map((chart) => chart.id);
+    if (event.altKey && event.ctrlKey && event.code === 'Digit5') {
+      // The first chart, then the next one with every press; after the last one none is selected.
+      const all = ids();
+      if (all.length === 0) return false;
+      const at = picked === undefined ? -1 : all.indexOf(picked);
+      this.setChartPick(at + 1 < all.length ? all[at + 1] : undefined);
+      return true;
+    }
+    if (picked === undefined) {
+      if (event.key === 'F1' && event.altKey && !ctrl && !event.shiftKey && !this.locked) {
+        this.attempt(() => void this.addChart({ type: 'column' }));
+        return true;
+      }
+      return false;
+    }
+    const layer = this.drawingsOf(state.sheet);
+    const box = layer ? layer.boxOf(state.metrics, picked) : undefined;
+    switch (event.key) {
+      case 'Escape':
+        this.setChartPick(undefined);
+        return true;
+      case 'Delete':
+      case 'Backspace':
+        if (!this.locked) this.attempt(() => this.removeChart(picked));
+        return true;
+      case 'Enter':
+        if (ctrl || event.altKey) return false;
+        this.attempt(() => void this.openChartDialog(picked));
+        return true;
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight': {
+        if (ctrl) return false;
+        if (this.locked || !box) return true;
+        const step = event.shiftKey ? 1 : 10;
+        const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
+        const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0;
+        const next = resizedRect(box, event.altKey ? 'se' : 'move', dx, dy, MIN_CHART_SIZE);
+        this.attempt(() => this.moveChart(picked, anchorOfRect(state.metrics, next.x, next.y, next.width, next.height)));
+        return true;
+      }
+      default:
+        // Undo, redo, save and the like work as ever; anything that is typed is typed into the cells.
+        if (!ctrl && !event.altKey && event.key.length === 1) this.setChartPick(undefined);
+        return false;
+    }
+  }
+
   // -------------------------------------------------- drawings and comments
 
   /** What floats above the cells of a sheet; undefined for a sheet without drawings and comments, which then costs nothing to draw. */
@@ -3024,8 +3432,8 @@ export class WorkbookView {
 
   /** The one renderer of the charts this view shows: the layers of all sheets and the chart sheets share what it keeps. */
   private chartRenderer(): ChartRenderer {
-    if (!this.charts) this.charts = new ChartRenderer(this.chartSource());
-    return this.charts;
+    if (!this.chartPainter) this.chartPainter = new ChartRenderer(this.chartSource());
+    return this.chartPainter;
   }
 
   /**
@@ -3035,11 +3443,11 @@ export class WorkbookView {
    */
   getChartState(): { charts: number; weight: number; values: number; layouts: number; texts: string[] } {
     const texts: string[] = [];
-    if (this.destroyed || !this.charts) return { charts: 0, weight: 0, values: 0, layouts: 0, texts };
-    for (const layout of this.charts.layouts()) {
+    if (this.destroyed || !this.chartPainter) return { charts: 0, weight: 0, values: 0, layouts: 0, texts };
+    for (const layout of this.chartPainter.layouts()) {
       for (const item of layout.items) if (item.kind === 'text' && texts.length < 500) texts.push(item.text);
     }
-    return { ...this.charts.state(), texts };
+    return { ...this.chartPainter.state(), texts };
   }
 
   /** The chart a chart sheet shows: the first one of its drawing. Undefined for any other sheet, and for a chart that is not drawn. */
@@ -4616,6 +5024,13 @@ export class WorkbookView {
       event.stopPropagation();
       return;
     }
+    if (event.key === 'Escape' && this.chartDrag) {
+      // The same for a chart that is being dragged.
+      this.endChartDrag(false, 0);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     // Ctrl+P, while a cell is edited too: the browser would print the host page with a part of the grid in it.
     if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === 'p' || event.key === 'P')) {
       event.preventDefault();
@@ -4628,6 +5043,12 @@ export class WorkbookView {
     }
     // 229: the key went to an input method, also where isComposing is not reported.
     if (event.isComposing || event.keyCode === 229) return;
+    // A chart that is selected takes the keys that move, size, change and delete it.
+    if (this.chartKey(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (event.key === 'Escape' && this.commentShown && !this.hoverComment) {
       // Puts the comment of the active cell away; it comes back when the cell is entered again.
       const shown = this.commentShown;
@@ -4993,6 +5414,22 @@ export class WorkbookView {
     if (/^The rule needs|^A list needs a value|^A custom rule needs a value/.test(message)) return rules.needValue(rules.value);
     if ((match = /^The items of a list written into the rule cannot be longer than (\d+) characters together$/.exec(message))) return rules.listTooLong(Number(match[1]));
     if ((match = /^The (.+) of a rule cannot be longer than (\d+) characters$/.exec(message))) return rules.textTooLong(/title/.test(match[1]) ? rules.title : rules.message, Number(match[2]));
+    const charts = strings.charts;
+    if (/is not a range of cells of this workbook$|^The range of a chart is a range of cells/.test(message)) return charts.badRange;
+    if (message === 'A series needs a range of values' || message === 'A chart has at least one series') return charts.needValues;
+    if (message === 'The range holds no values for a chart' || message === 'A chart needs a range of cells, or series' || message === 'The series of this chart are not one block of cells') return charts.needRange;
+    if (/^Cannot change the type of this chart/.test(message)) return charts.typeFixed;
+    if (/^Cannot change this chart:/.test(message)) return charts.notEditable;
+    if (/^The (smallest and the largest|largest) value of an axis/.test(message)) return charts.badNumber;
+    if (/^Cannot (add a series to a chart of this type|add, remove or reorder the series of|change the series of)/.test(message)) return charts.seriesFixed;
+    if (message === 'Cannot change how the series of this chart are grouped') return charts.groupingFixed;
+    if (message === 'This chart has no such axis') return charts.noAxis;
+    if ((match = /^A chart has at most (\d+) series$/.exec(message))) return charts.tooManySeries(Number(match[1]));
+    if (/^A (sheet|workbook) has at most \d+ charts$|^The sheet has too many drawings$/.test(message)) return charts.tooManyCharts;
+    if ((match = /^The (title|title of an axis|name of a series) cannot be longer than (\d+) characters$/.exec(message))) return charts.textTooLong(Number(match[2]));
+    if (/holds a character a file cannot hold$/.test(message)) return charts.badCharacter;
+    if (message === 'Cannot change the sheet: a reference of a chart cannot be read') return charts.refUnread;
+    if (/^No chart at index/.test(message)) return charts.noChart;
     return sheetErrorText(message, strings) || strings.actionFailed;
   }
 
@@ -5183,7 +5620,7 @@ export class WorkbookView {
    */
   hasPendingInput(): boolean {
     if (this.destroyed) return false;
-    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || this.rulesDialog !== undefined || this.composing || this.drag !== undefined;
+    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || this.rulesDialog !== undefined || this.composing || this.drag !== undefined || this.chartDrag !== undefined;
   }
 
   /**
@@ -5238,6 +5675,9 @@ export class WorkbookView {
     if (this.destroyed || next === this.locked) return;
     if (next) {
       this.endTabDrag();
+      // Nothing is dragged and no chart is selected in a view that changes nothing.
+      this.endChartDrag(false, 0);
+      this.chartPick = undefined;
       this.commitEditing();
       this.finishRename(true, true);
       this.finishNote(true, true);
@@ -5478,6 +5918,8 @@ export class WorkbookView {
    */
   private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }): boolean {
     if (ops.length === 0) return false;
+    // A chart that is being dragged is let go where it was: the change may be about it.
+    this.endChartDrag(false, 0);
     // A dialog of rules that is open shows the workbook as it was when it was opened (the range it is for, the place
     // of its rule): a change from outside it closes it when nothing was changed in it, and is refused otherwise.
     if (this.rulesDialog && !this.applyingRules && !this.settleDialog()) return false;
@@ -5492,7 +5934,7 @@ export class WorkbookView {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
       // A note or a rule changes no size and no position.
-      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats') structural = true;
+      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
       if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }
@@ -5529,6 +5971,8 @@ export class WorkbookView {
     if (this.rulesDialog) return false;
     // A tab that is being dragged is let go where it was: the step may change the list it was dragged in.
     this.endTabDrag();
+    // The same for a chart: the step may put another one in its place.
+    this.endChartDrag(false, 0);
     if (this.edit) {
       this.cancelEditing();
       return true;
@@ -6196,6 +6640,7 @@ export class WorkbookView {
     // While a cell is edited the clipboard works on the editor's text, as in any text field.
     const data = event.clipboardData;
     if (this.destroyed || this.edit || !data) return;
+    if (this.chartClipboard(event)) return;
     event.preventDefault();
     this.clipboardHandled = true;
     this.attempt(() => {
@@ -6207,6 +6652,7 @@ export class WorkbookView {
 
   private onPaste = (event: ClipboardEvent): void => {
     if (this.destroyed || this.edit) return;
+    if (this.chartClipboard(event)) return;
     event.preventDefault();
     const data = event.clipboardData;
     if (!data) return;
@@ -6546,6 +6992,8 @@ export class WorkbookView {
     const y = (touch.clientY - rect.top) * (rect.height > 0 ? this.height / rect.height : 1);
     // Keeps the browser from scrolling with a finger that is resizing (none does while a formula is typed).
     if (!this.typingFormula() && this.resizeAt(x, y, RESIZE_REACH_TOUCH) && event.cancelable) event.preventDefault();
+    // The same for a finger on the chart that is selected: it moves or sizes the chart.
+    else if (!this.locked && !this.typingFormula() && this.chartGrab(x, y, true) && event.cancelable) event.preventDefault();
   };
 
   private onContextMenu = (event: MouseEvent): void => {
@@ -6556,7 +7004,10 @@ export class WorkbookView {
       event.preventDefault();
       return;
     }
-    if (this.openHeaderMenu(point.x, point.y)) {
+    const onChart = this.openChartMenu(point.x, point.y);
+    // The menu of a cell is about the cells: the chart that was selected is let go of.
+    if (!onChart && this.pickedChart() !== undefined) this.setChartPick(undefined, false);
+    if (onChart || this.openHeaderMenu(point.x, point.y)) {
       event.preventDefault();
       // On a touch screen this is the long press; lifting the finger must not count as a tap.
       if (this.touch) this.touch.consumed = true;
@@ -6569,7 +7020,7 @@ export class WorkbookView {
     if (this.destroyed || !touch || touch.moved || touch.consumed || this.menu) return;
     this.readScroll();
     if (touch.domX !== this.domX || touch.domY !== this.domY) return;
-    if (this.openHeaderMenu(touch.x, touch.y)) touch.consumed = true;
+    if (this.openChartMenu(touch.x, touch.y) || this.openHeaderMenu(touch.x, touch.y)) touch.consumed = true;
   };
 
   private clearLongPress(): void {
@@ -6586,6 +7037,13 @@ export class WorkbookView {
     if (this.destroyed) return;
     const point = this.canvasPoint(event);
     const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
+    const chart = resize || this.locked || this.typingFormula() ? -1 : this.chartUnder(point.x, point.y);
+    if (chart >= 0) {
+      // A second click on a chart opens its dialog.
+      this.setChartPick(chart);
+      this.attempt(() => void this.openChartDialog(chart));
+      return;
+    }
     if (resize) {
       // Not while a formula is typed, as a drag of the border.
       if (!this.typingFormula()) this.autoFit(resize);
@@ -6690,6 +7148,12 @@ export class WorkbookView {
       this.touchInput = true;
       // No resizing while a formula is typed: the finger on a border is one that taps or scrolls.
       const resize = this.typingFormula() ? undefined : this.resizeAt(point.x, point.y, RESIZE_REACH_TOUCH);
+      // A finger on the chart that is selected moves it, or sizes it by a handle; lifted where it came down it is a tap.
+      const grab = resize || this.locked || this.typingFormula() ? undefined : this.chartGrab(point.x, point.y, true);
+      if (grab && this.chartPick && this.commitForPress()) {
+        this.beginChartDrag(pointerId, this.chartPick.index, grab, point, true);
+        return;
+      }
       this.touch = { pointerId, x: point.x, y: point.y, domX: this.domX, domY: this.domY, moved: false, consumed: false, resize };
       this.longPressTimer = window.setTimeout(this.onLongPress, LONG_PRESS_MS);
       return;
@@ -6732,6 +7196,8 @@ export class WorkbookView {
       this.beginResize(pointerId, point, resize);
       return;
     }
+    // A press on a chart selects it and starts to move it; on a handle of the selected chart it sizes it.
+    if (this.pressChart(pointerId, point)) return;
     if (this.pressCellButton(point.x, point.y, false)) return;
     const mode = this.press(point.x, point.y, event.shiftKey);
     this.drag = { pointerId, mode, x: point.x, y: point.y, originX: point.x, originY: point.y, moved: false };
@@ -6760,6 +7226,10 @@ export class WorkbookView {
     const pointer = event as PointerEvent;
     const pointerId = pointer.pointerId === undefined ? 0 : pointer.pointerId;
     const point = this.canvasPoint(event);
+    if (this.chartDrag && this.chartDrag.pointerId === pointerId) {
+      this.moveChartDrag(point);
+      return;
+    }
     const touch = this.touch;
     if (touch && touch.pointerId === pointerId) {
       const resize = this.typingFormula() ? undefined : touch.resize;
@@ -6793,7 +7263,7 @@ export class WorkbookView {
       // Hovering: the cursor says where a press would resize.
       if (pointer.pointerType !== 'touch') {
         const over = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
-        const cursor = over ? (over.axis === 'col' ? 'col-resize' : 'row-resize') : '';
+        const cursor = over ? (over.axis === 'col' ? 'col-resize' : 'row-resize') : this.chartCursor(point.x, point.y);
         if (this.canvas.style.cursor !== cursor) this.canvas.style.cursor = cursor;
         this.hoverAt(point.x, point.y);
       }
@@ -6818,6 +7288,10 @@ export class WorkbookView {
   private onPointerUp = (event: MouseEvent): void => {
     const pointer = event as PointerEvent;
     const pointerId = pointer.pointerId === undefined ? 0 : pointer.pointerId;
+    if (this.chartDrag && this.chartDrag.pointerId === pointerId) {
+      this.endChartDrag(true, event.timeStamp);
+      return;
+    }
     const touch = this.touch;
     if (touch && touch.pointerId === pointerId) {
       this.endTouch();
@@ -6837,6 +7311,11 @@ export class WorkbookView {
       }
       if (!this.commitForPress()) return;
       this.focusInput(true, event);
+      // A tap on a chart selects it; a tap beside the chart that was selected lets go of it.
+      if (this.tapChart(point.x, point.y)) {
+        this.lastTap = undefined;
+        return;
+      }
       if (this.pressCellButton(point.x, point.y, true)) {
         this.lastTap = undefined;
         return;
@@ -6878,9 +7357,12 @@ export class WorkbookView {
     const pointerId = (event as PointerEvent).pointerId;
     if (this.touch && this.touch.pointerId === pointerId) this.endTouch();
     if (this.drag && this.drag.pointerId === pointerId) this.endDrag();
+    if (this.chartDrag && this.chartDrag.pointerId === pointerId) this.endChartDrag(false, 0);
   };
 
   private endDrag(): void {
+    // Whatever ends a drag of cells ends one of a chart as well: nothing is moved.
+    if (this.chartDrag) this.endChartDrag(false, 0);
     const drag = this.drag;
     this.drag = undefined;
     this.hideGuide();

@@ -61,7 +61,8 @@ import {
 } from '../../model/sheet/types';
 import { KEPT_MAIN, MAX_KEPT_DEPTH, unpackKept, type KeptAttr, type KeptNode, type RuleKept } from '../../model/sheet/types';
 import { keptFor, keptNow, ruleHolder } from '../../ops/rules';
-import { adjustCommentCell, adjustDrawingAnchor, commentEdits } from '../../render/sheet-drawings';
+import { adjustCommentCell, adjustDrawingAnchor, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
+import { CHART_CONTENT_TYPE, chartCellsOf, chartSpaceXml, chartWritable } from './chart-write';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
 import { ZipArchive } from '../../zip';
 import {
@@ -1318,6 +1319,9 @@ interface DrawingContext {
   notes: Notes;
   /** Ids of the objects of one drawing part, which have to differ. */
   nextId: number;
+  /** The chart parts of the new package, in the order they are numbered (xl/charts/chart1.xml, ...): a chart that is written adds its part. */
+  charts: string[];
+  workbook: Workbook;
 }
 
 const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/;
@@ -1399,9 +1403,21 @@ function objectXml(context: DrawingContext, object: DrawingObject, box: Box, dep
     return '';
   }
   if (object.type === 'chart') {
-    // A chart is drawn from its part and never written from the model (no reader of a format without parts makes one).
-    context.notes.add('Drawing: a chart is not written from the model and is left out');
-    return '';
+    // A chart of the kinds the commands make is written from its model, with the cells it shows cached as they are;
+    // what its part held beside the model (formatting, extensions) is not in a file that is built anew.
+    if (!chartWritable(object.chart)) {
+      context.notes.add('Drawing: a chart of a type that is not written from the model is left out');
+      return '';
+    }
+    if (object.part !== undefined && object.known !== 'all') context.notes.add('Drawing: a chart is written from the model; formatting its part held beside it is not kept');
+    context.charts.push(chartSpaceXml(object.chart, chartCellsOf(context.workbook, object.chart.live === true)));
+    const rel = context.rels.add(`${NS_REL}/chart`, `../charts/chart${context.charts.length}.xml`);
+    const frameId = ++context.nextId;
+    return (
+      `<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${frameId}" name="${escapeAttr(object.name !== undefined && object.name !== '' ? object.name : `Chart ${context.charts.length}`)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>` +
+      '<xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>' +
+      `<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="${rel}"/></a:graphicData></a:graphic></xdr:graphicFrame>`
+    );
   }
   const id = ++context.nextId;
   if (object.type === 'picture') {
@@ -1483,7 +1499,7 @@ function drawingXml(sheet: Sheet, metrics: SheetMetrics, context: DrawingContext
   let anchors = '';
   for (const drawing of sheet.drawings || []) {
     // The model keeps anchors as the file has them; rows and columns moved since move them here.
-    const anchor = anchorXml(adjustDrawingAnchor(drawing.anchor, sheet.structuralEdits), metrics);
+    const anchor = anchorXml(drawingAnchorNow(drawing, sheet.structuralEdits), metrics);
     if (!anchor) {
       context.notes.add('Drawing: an object whose anchor names no cell of the sheet is left out');
       continue;
@@ -1677,6 +1693,8 @@ interface SheetParts {
 }
 
 interface SheetNumbers {
+  /** The chart parts written so far, all sheets together: see DrawingContext.charts. */
+  charts: string[];
   drawing: number;
   comments: number;
   vmlBlocks: { next: number };
@@ -1852,7 +1870,7 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   }
 
   if (sheet.drawings && sheet.drawings.length > 0) {
-    const context: DrawingContext = { rels: new Rels(), media, embeds: new Map(), notes, nextId: 1 };
+    const context: DrawingContext = { rels: new Rels(), media, embeds: new Map(), notes, nextId: 1, charts: numbers.charts, workbook };
     const xml = drawingXml(sheet, metricsOf(), context);
     if (xml !== '') {
       out.drawing = { xml, rels: context.rels };
@@ -1965,7 +1983,7 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
 
   // From here to the end nothing is awaited: the count is this build's alone.
   replacedCharacters = 0;
-  const numbers: SheetNumbers = { drawing: 0, comments: 0, vmlBlocks: { next: 1 } };
+  const numbers: SheetNumbers = { charts: [], drawing: 0, comments: 0, vmlBlocks: { next: 1 } };
   // The formats conditional rules state themselves become records of the style sheet.
   const dxfs = planDxfs(workbook);
   const written: { name: string; parts: SheetParts; drawing: number; comments: number }[] = [];
@@ -2047,6 +2065,10 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
     }
   }
   for (const [name, data] of mediaData) files.push([name, data]);
+  numbers.charts.forEach((xml, i) => {
+    files.push([`xl/charts/chart${i + 1}.xml`, xml]);
+    overrides.push([`xl/charts/chart${i + 1}.xml`, CHART_CONTENT_TYPE]);
+  });
 
   if (workbook.styles.themeColors.length > 0) {
     files.push(['xl/theme/theme1.xml', themeXml(workbook.styles, notes)]);
