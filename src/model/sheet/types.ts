@@ -960,6 +960,12 @@ export interface SheetDrawing {
   since?: number;
   /** Set on a drawing of the file that was moved or changed: the drawing as the sheet was read with it, by which the writer knows its anchor in the file. */
   from?: SheetDrawing;
+  /**
+   * Set by a reader on a drawing that shares a wrapper of alternatives (mc:AlternateContent) with
+   * another drawing of the file: it is moved and changed like any other, and it is not deleted
+   * (the wrapper cannot go with one of the drawings it holds).
+   */
+  wrapped?: boolean;
 }
 
 /** A comment (note) on a cell. A view for reading, like SheetDrawing. */
@@ -1279,6 +1285,13 @@ export interface Sheet {
    * line with the model. Set on its own, without `modified`: no cell changed.
    */
   drawingsModified?: boolean;
+  /**
+   * Set by a reader on a sheet whose drawing part takes no change: why ("its drawing is shared
+   * with another sheet", "its drawing is nested too deeply", "its drawing cannot be read"). No
+   * chart is added to such a sheet, moved or deleted on it; a chart of it whose own part can be
+   * changed (DrawingChart.known) still is. Drawings and charts are shown all the same.
+   */
+  drawingsFixed?: string;
   /** The list the sheet had before its drawings were first changed. Set with `drawingsModified`. */
   drawingsRead?: { list: SheetDrawing[] | undefined };
   /**

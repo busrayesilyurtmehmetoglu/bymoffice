@@ -446,6 +446,94 @@ test.describe('charts are edited', () => {
     expect(await cells()).not.toBe(before);
   });
 
+  test('with a chart selected nothing is typed into the cells and no key formats, clears or edits them; Escape gives the keys back to the cells', async ({ page }) => {
+    await mount(page, await book());
+    await addPlain(page);
+    await view(page, '(view.select(api.parseRange("A1:B4")), view.selectChart(0), view.focus())');
+    const cells = () => view(page, 'JSON.stringify([0, 1, 2, 3].map((row) => [0, 1].map((col) => { const cell = api.getCell(view.workbook.sheets[0], row, col); return cell ? [cell.value, cell.style] : null; })))');
+    const before = await cells();
+    const untouched = async (what: string) => {
+      expect(await cells(), `${what}: no cell changed`).toBe(before);
+      expect(await view(page, 'view.isEditing'), `${what}: no cell is edited`).toBe(false);
+      expect(await view(page, 'view.selectedChart'), `${what}: the chart stays selected`).toBe(0);
+      expect((await charts(page)).length, `${what}: the chart is there`).toBe(1);
+      expect(await view(page, 'JSON.stringify(view.selection.range)'), `${what}: the cells that are selected`).toBe(JSON.stringify({ top: 0, left: 0, bottom: 3, right: 1 }));
+    };
+    // Typing: the key is taken and nothing comes of it.
+    expect(await key(page, { key: 'x' })).toBe(true);
+    await untouched('a letter');
+    await page.keyboard.type('hello');
+    await untouched('typing');
+    expect(await page.evaluate(() => (document.querySelector('#host .bym-input') as HTMLTextAreaElement).value), 'nothing of what was typed is left in the input').not.toContain('hello');
+    for (const [what, init] of [
+      ['F2', { key: 'F2' }],
+      ['Shift+F2', { key: 'F2', shiftKey: true }],
+      ['Ctrl+B', { key: 'b', ctrlKey: true }],
+      ['Ctrl+I', { key: 'i', ctrlKey: true }],
+      ['Ctrl+U', { key: 'u', ctrlKey: true }],
+      ['Cmd+B', { key: 'b', metaKey: true }],
+      ['Ctrl+A', { key: 'a', ctrlKey: true }],
+      ['Ctrl+Delete', { key: 'Delete', ctrlKey: true }],
+      ['Alt+Backspace', { key: 'Backspace', altKey: true }],
+      ['Home', { key: 'Home' }],
+      ['Ctrl+ArrowDown', { key: 'ArrowDown', ctrlKey: true }],
+      ['PageDown', { key: 'PageDown' }],
+    ] as [string, KeyboardEventInit][]) {
+      expect(await key(page, init), `${what} is taken`).toBe(true);
+      await untouched(what);
+    }
+    // Ctrl with + and - is the zoom of the browser: not taken, and the rows that are selected under the chart stay.
+    await view(page, '(view.select({ top: 1, left: 0, bottom: 1, right: 16383 }), view.selectChart(0))');
+    expect(await key(page, { key: '-', ctrlKey: true })).toBe(false);
+    expect(await key(page, { key: '+', ctrlKey: true })).toBe(false);
+    expect(await cells(), 'no row went and none came').toBe(before);
+    await view(page, '(view.select(api.parseRange("A1:B4")), view.selectChart(0))');
+    // Shift+Delete is "cut" on Windows: it is left to the browser, and the chart is not deleted by it.
+    expect(await key(page, { key: 'Delete', shiftKey: true })).toBe(false);
+    await untouched('Shift+Delete');
+    // An input method: its keys are not the view's to take, and what it composes goes nowhere.
+    await page.evaluate(() => {
+      const input = document.querySelector('#host .bym-input') as HTMLTextAreaElement;
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Process', keyCode: 229, bubbles: true, cancelable: true } as KeyboardEventInit));
+      input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+      input.value = 'か';
+      input.dispatchEvent(new InputEvent('input', { inputType: 'insertCompositionText', data: 'か', isComposing: true, bubbles: true }));
+      input.dispatchEvent(new CompositionEvent('compositionend', { data: 'か', bubbles: true }));
+      input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: 'か', bubbles: true }));
+    });
+    await untouched('an input method');
+    expect(await page.evaluate(() => (document.querySelector('#host .bym-input') as HTMLTextAreaElement).value)).not.toContain('か');
+    // Undo is still the workbook's.
+    await view(page, 'view.moveChart(0, { top: 6, left: 0, bottom: 18, right: 3 })');
+    expect(await key(page, { key: 'z', ctrlKey: true })).toBe(true);
+    expect((await charts(page))[0].anchor.from.row).toBe(5);
+    // Escape lets go of the chart: from then on what is typed is typed into the active cell.
+    await view(page, 'view.selectChart(0)');
+    expect(await key(page, { key: 'Escape' })).toBe(true);
+    expect(await view(page, 'view.selectedChart')).toBe(undefined);
+    await page.keyboard.type('q');
+    expect(await view(page, 'view.isEditing')).toBe(true);
+    await page.keyboard.press('Escape');
+    // Plain Delete deletes the chart, and only it.
+    await view(page, 'view.selectChart(0)');
+    expect(await key(page, { key: 'Delete' })).toBe(true);
+    expect((await charts(page)).length).toBe(0);
+    expect(await cells()).toBe(before);
+  });
+
+  test('a long press on a cell opens the menu of the cells and lets go of the chart that was selected', async ({ page }) => {
+    await mount(page, await book());
+    await addPlain(page);
+    await view(page, 'view.selectChart(0)');
+    const box = await canvasBox(page);
+    // Cell B2, above the chart.
+    const x = box.x + HEADER_WIDTH + COLUMN_WIDTH * 1.5;
+    const y = box.y + HEADER_HEIGHT + ROW_HEIGHT * 1.5;
+    await touchEvent(page, 'pointerdown', x, y);
+    await expect(page.locator('#host .bym-menu')).toBeVisible();
+    expect(await view(page, 'view.selectedChart'), 'the menu is about the cells').toBe(undefined);
+  });
+
   test('a read-only view selects no chart by key or by call, and its arrow keys move the cells', async ({ page }) => {
     await mount(page, await book());
     await addPlain(page);

@@ -4735,13 +4735,14 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     }
     return out;
   };
-  const reachFrom = async (from: string[], skip?: (source: string, id: string) => boolean): Promise<Set<string>> => {
+  /** Every part that can be reached from `from`, without the relationships `skip` leaves out and without passing through a part of `blocked`. */
+  const reachFrom = async (from: string[], skip?: (source: string, id: string) => boolean, blocked?: Set<string>): Promise<Set<string>> => {
     const seen = new Set<string>(from);
     const queue = from.slice();
     for (let i = 0; i < queue.length; i++) {
       if (i >= MAX_RELATED_PARTS) throw new Error('Cannot write the workbook: its parts refer to each other without end');
       for (const target of await leadsTo(queue[i], skip)) {
-        if (seen.has(target)) continue;
+        if (seen.has(target) || (blocked && blocked.has(target))) continue;
         seen.add(target);
         queue.push(target);
       }
@@ -5348,59 +5349,30 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
   for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined && !noteParts.has(name)) deletions.push(name);
   for (const names of charted.values()) for (const name of names) if (!noteParts.has(name) && deletions.indexOf(name) < 0) deletions.push(name);
 
-  // Sheets of the file that are gone: their parts, and what only they lead to, leave the package.
-  if (gone.length > 0) {
-    const actual = new Map<string, string>();
-    for (const name of removed.keys()) actual.set(name.toLowerCase(), name);
-    for (const name of pkg.partNames()) actual.set(name.toLowerCase(), name);
-    /** The parts a part leads to in the file as it was opened. */
-    const targetsOf = async (source: string): Promise<string[]> => {
-      const bytes = await peek(relsPartOf(source));
-      const out: string[] = [];
-      if (!bytes) return out;
-      let doc: XmlDocument;
-      try {
-        doc = parseXml(bytes);
-      } catch (error) {
-        // Relationships that cannot be read lead nowhere: what they may point at stays.
-        return out;
-      }
-      for (const rel of childrenNamed(doc.root, 'Relationship')) {
-        if (!internal(rel)) continue;
-        const target = actual.get(resolveTarget(source, rel.attrs.get('Target') || '').toLowerCase());
-        // A relationships part is not content: it goes with the part it belongs to and with nothing else.
-        if (target !== undefined && !isRelsPart(target)) out.push(target);
-      }
-      return out;
-    };
-    /** Every part that can be reached from `from` without passing through a part of `blocked`. */
-    const reach = async (from: string[], blocked: Set<string>): Promise<Set<string>> => {
-      const seen = new Set<string>(from);
-      const queue = from.slice();
-      for (let i = 0; i < queue.length; i++) {
-        if (i >= MAX_RELATED_PARTS) throw new Error('Cannot write the workbook: its parts refer to each other without end');
-        for (const target of await targetsOf(queue[i])) {
-          if (seen.has(target) || blocked.has(target)) continue;
-          seen.add(target);
-          queue.push(target);
-        }
-      }
-      return seen;
-    };
+  // Parts that leave the package with what this save takes out: the sheets of the file that are gone, and
+  // the parts that charts which went led to (their own parts, styles and colours they share). One analysis
+  // for both, made once everything that goes is known: a part leaves when nothing of the workbook leads
+  // to it any more - not through a sheet that is gone, and not by a relationship this save drops,
+  // whichever sheet dropped it. What anything that stays still leads to stays.
+  if (gone.length > 0 || leavingParts.length > 0) {
     const roots: string[] = [];
     for (const sheet of gone) {
-      const name = actual.get(sheet.part.toLowerCase());
-      if (name !== undefined) roots.push(name);
+      const name = actualOf(sheet.part);
+      if (pkg.hasPart(name) || removed.has(name)) roots.push(name);
     }
-    const doomed = await reach(roots, new Set());
+    const dropped = (source: string, id: string): boolean => {
+      const ids = droppedRels.get(source);
+      return ids !== undefined && ids.has(id);
+    };
+    const doomed = await reachFrom(roots.concat(leavingParts));
     // What the rest of the package shows as well (a picture two drawings share) stays.
-    const kept = await reach(['/'], new Set(roots));
-    // Whatever the relationships of the deleted sheet claim, the package keeps what it stands on:
+    const kept = await reachFrom(['/'], dropped, new Set(roots));
+    // Whatever the relationships of a deleted sheet claim, the package keeps what it stands on:
     // the workbook part and the parts of the sheets that stay.
-    kept.add(actual.get(main.toLowerCase()) || main);
+    kept.add(actualOf(main));
     for (const sheet of file) {
       if (sheet.part === '' || !present.has(sheet.part)) continue;
-      kept.add(actual.get(sheet.part.toLowerCase()) || sheet.part);
+      kept.add(actualOf(sheet.part));
     }
     for (const part of doomed) if (!kept.has(part) && !isRelsPart(part) && part.toLowerCase() !== '/[content_types].xml') wanted.add(part);
     for (const sheet of gone) {
@@ -5409,22 +5381,9 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       // What an earlier save wrote differently around the sheet and stays in the package goes back to what the file had.
       for (const part of moved.get(sheet.part) || []) {
         const original = originals.get(part);
-        if (original && !wanted.has(actual.get(part.toLowerCase()) || part)) writes.push([part, original]);
+        if (original && !wanted.has(actualOf(part))) writes.push([part, original]);
       }
       movedNow.set(sheet.part, []);
-    }
-  }
-
-  // Parts that charts which went led to (their own parts, styles and colours they share): one goes when nothing
-  // of the workbook leads to it once every relationship this save drops is gone - whichever sheets dropped them.
-  if (leavingParts.length > 0) {
-    const stays = await reachFrom(['/'], (source, id) => {
-      const gone = droppedRels.get(source);
-      return gone !== undefined && gone.has(id);
-    });
-    for (const part of await reachFrom(leavingParts)) {
-      if (stays.has(part) || isRelsPart(part) || part.toLowerCase() === '/[content_types].xml') continue;
-      wanted.add(part);
     }
   }
 

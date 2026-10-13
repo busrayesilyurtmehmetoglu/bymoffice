@@ -141,7 +141,10 @@ export async function packageProblems(bytes: Uint8Array): Promise<string[]> {
     if (!isRels && !overrides.has(name) && !defaults.has(extension)) problems.push(`${name}: no content type`);
     if (/\.(xml|rels|vml)$/.test(name)) {
       try {
-        const root = parseXml(await zip.read(name)).root;
+        const raw = await zip.read(name);
+        const line = encodingProblem(raw);
+        if (line) problems.push(`${name}: ${line}`);
+        const root = parseXml(raw).root;
         const ids = new Set<string>();
         const rels = relsOf(name);
         if (!isRels && held.has(rels)) for (const rel of elementsOf(parseXml(await zip.read(rels)).root)) ids.add(rel.attrs.get('Id') || '');
@@ -152,6 +155,29 @@ export async function packageProblems(bytes: Uint8Array): Promise<string[]> {
     }
   }
   return problems;
+}
+
+/**
+ * What is wrong with the bytes of an XML part for the encoding it declares; undefined when a
+ * parser that honours the declaration reads the text that was meant. A part in UTF-16 is known
+ * by its byte order mark; every other part has to be UTF-8, and one that declares anything else
+ * may hold no byte beyond ASCII (such a byte is two letters, or none, to the parser).
+ */
+export function encodingProblem(bytes: Uint8Array): string | undefined {
+  if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) return undefined;
+  let head = '';
+  for (let i = 0; i < Math.min(bytes.length, 200); i++) head += String.fromCharCode(bytes[i]);
+  const declared = /^(?:\u00ef\u00bb\u00bf)?<\?xml[^?]*?\sencoding\s*=\s*["']([^"']*)["']/.exec(head);
+  if (declared && !/^utf-?8$/i.test(declared[1])) {
+    for (let i = 0; i < bytes.length; i++) if (bytes[i] >= 0x80) return `declares the encoding ${declared[1]} and holds bytes that are not ASCII`;
+    return undefined;
+  }
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch (error) {
+    return 'is not UTF-8';
+  }
+  return undefined;
 }
 
 const RELATIONSHIPS = /^http:\/\/(schemas\.openxmlformats\.org\/officeDocument\/2006|purl\.oclc\.org\/ooxml\/officeDocument)\/relationships$/;

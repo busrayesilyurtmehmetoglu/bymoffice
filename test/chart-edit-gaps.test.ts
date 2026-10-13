@@ -112,6 +112,9 @@ test('chart writer: a drawing part two sheets show is not changed for one of the
   const zip = ZipArchive.read(bytes);
   zip.set('xl/worksheets/_rels/sheet2.xml.rels', encoder.encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>'));
   const doc = await load(await zip.write());
+  // The command says so beforehand (see the second review); the writer still holds, for a model that was not read from the file.
+  assert.throws(() => moveChart(doc.wb, 0, 0, { top: 20, left: 0, bottom: 30, right: 4 }), /its drawing is shared with another sheet/);
+  delete doc.wb.sheets[0].drawingsFixed;
   doc.history.apply(moveChart(doc.wb, 0, 0, { top: 20, left: 0, bottom: 30, right: 4 }), undefined, undefined);
   await assert.rejects(save(doc), /is shared with sheet "Other"/);
 });

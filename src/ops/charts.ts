@@ -25,6 +25,7 @@
 // is a place of the sheet as it was then (SheetDrawing.since), like a note.
 
 import { adjustFormula, formulaNamesSheetsUnread, quoteSheetName, renameSheetsInFormula, type StructuralEdit } from '../calc/refs';
+import { scatterAxes } from '../layout/chart';
 import { createSheetMetrics, type SheetMetrics } from '../layout/sheet-metrics';
 import { chartKindGrouped, chartKindWritten, chartPartProblem, chartRefAreas, chartWritable, mapChartRefs, MAX_CHART_SERIES, MAX_SHEET_CHARTS, MAX_WORKBOOK_CHARTS, remapLegendEntries, type Chart, type ChartAxis, type ChartData, type ChartDataLabels, type ChartGroup, type ChartLegend, type ChartLine, type ChartSeries, type ChartShape } from '../model/sheet/chart';
 import {
@@ -502,8 +503,10 @@ function axesNamed(chart: Chart): { category?: ChartAxis; value?: ChartAxis } {
   const group = chart.groups[0];
   const own = (chart.axes || []).filter((axis) => !group || group.axisIds.indexOf(axis.id) >= 0);
   if (group && group.kind === 'scatter') {
-    const horizontal = own.find((axis) => axis.position === 'b' || axis.position === 't');
-    return { category: horizontal, value: own.find((axis) => axis !== horizontal) };
+    // The two axes are told apart the way they are drawn: by where they say they lie, and where
+    // both say the same (a file that states "l" for each) the first the chart type names is the horizontal one.
+    const pair = scatterAxes(chart, group);
+    return { category: pair.x, value: pair.y };
   }
   return { category: own.find((axis) => axis.kind === 'cat'), value: own.find((axis) => axis.kind === 'val') };
 }
@@ -569,12 +572,28 @@ function defaultAnchor(sheet: Sheet, range: CellRange | undefined): DrawingAncho
 
 // ------------------------------------------------------------------ commands
 
-/** Why the charts of a sheet cannot be changed at all; undefined when they can. */
+/** Why no chart can be added to a sheet, moved or deleted on it; undefined when that can be done. */
 export function chartsProblem(workbook: Workbook, sheetIndex: number): string | undefined {
   const sheet = workbook.sheets[sheetIndex];
   if (!sheet) return `No sheet at index ${sheetIndex}`;
   if (sheet.kind !== 'worksheet') return `Cannot change the charts of a ${sheet.kind}`;
-  return undefined;
+  return placesProblem(sheet);
+}
+
+/**
+ * Why no chart of a sheet is added, moved or deleted: the drawing part of the file takes no
+ * change (Sheet.drawingsFixed). A chart of such a sheet is still changed in its own part.
+ */
+function placesProblem(sheet: Sheet): string | undefined {
+  return sheet.drawingsFixed !== undefined && sheet.part !== '' ? `Cannot change the charts of this sheet: ${sheet.drawingsFixed}` : undefined;
+}
+
+/** The sheet of a command that changes where charts are, or which there are. Throws when its drawing takes no change. */
+function placedSheetOf(workbook: Workbook, sheetIndex: number): Sheet {
+  const sheet = sheetOf(workbook, sheetIndex);
+  const problem = placesProblem(sheet);
+  if (problem) throw new RangeError(problem);
+  return sheet;
 }
 
 function setDrawings(sheetIndex: number, list: SheetDrawing[]): Op[] {
@@ -588,7 +607,7 @@ function setDrawings(sheetIndex: number, list: SheetDrawing[]): Op[] {
  * cells of the workbook, an unknown type, too many drawings).
  */
 export function addChart(workbook: Workbook, sheetIndex: number, spec: ChartSpec): Op[] {
-  const sheet = sheetOf(workbook, sheetIndex);
+  const sheet = placedSheetOf(workbook, sheetIndex);
   if (!spec || typeof spec !== 'object') throw new RangeError('A chart needs a type and a range of cells');
   const type = checkType(spec.type);
   const grouping = checkGrouping(spec.grouping);
@@ -617,10 +636,15 @@ export function addChart(workbook: Workbook, sheetIndex: number, spec: ChartSpec
   return setDrawings(sheetIndex, drawings.concat([added]));
 }
 
-/** Deletes a chart. Throws RangeError when `id` names none. */
+/**
+ * Deletes a chart. Throws RangeError when `id` names none, and for a chart of the file that
+ * shares a wrapper of alternatives with another drawing (SheetDrawing.wrapped).
+ */
 export function removeChart(workbook: Workbook, sheetIndex: number, id: number): Op[] {
-  const sheet = sheetOf(workbook, sheetIndex);
-  chartAt(sheet, id);
+  const sheet = placedSheetOf(workbook, sheetIndex);
+  const { drawing } = chartAt(sheet, id);
+  const inFile = fileDrawing(drawing);
+  if (inFile && inFile.wrapped) throw new RangeError('Cannot delete this chart: it shares its place in the drawing with another object');
   const next = (sheet.drawings as SheetDrawing[]).slice();
   next.splice(id, 1);
   return setDrawings(sheetIndex, next);
@@ -646,7 +670,7 @@ function changed(sheet: Sheet, drawing: SheetDrawing, change: Partial<Pick<Sheet
  * covers). Returns no operation when the chart is there already.
  */
 export function moveChart(workbook: Workbook, sheetIndex: number, id: number, anchor: DrawingAnchor | CellRange): Op[] {
-  const sheet = sheetOf(workbook, sheetIndex);
+  const sheet = placedSheetOf(workbook, sheetIndex);
   const { drawing } = chartAt(sheet, id);
   const wanted = checkedAnchor(anchor);
   if (JSON.stringify(wanted) === JSON.stringify(drawingAnchorNow(drawing, sheet.structuralEdits))) return [];
@@ -661,9 +685,9 @@ export function moveChart(workbook: Workbook, sheetIndex: number, id: number, an
  * thrown away: what this lets pass, updateChart() takes and the writer writes.
  */
 export function chartProblem(workbook: Workbook, sheetIndex: number, id: number, patch?: ChartPatch): string | undefined {
-  const problem = chartsProblem(workbook, sheetIndex);
-  if (problem) return problem;
   const sheet = workbook.sheets[sheetIndex];
+  if (!sheet) return `No sheet at index ${sheetIndex}`;
+  if (sheet.kind !== 'worksheet') return `Cannot change the charts of a ${sheet.kind}`;
   const drawing = sheet.drawings ? sheet.drawings[id] : undefined;
   if (!drawing || !drawing.object || drawing.object.type !== 'chart') return `No chart at index ${id}`;
   const object = drawing.object;
@@ -995,8 +1019,11 @@ export function updateChart(workbook: Workbook, sheetIndex: number, id: number, 
     if (!same) {
       chart = { ...chart, groups: [{ ...group, series: list }] };
       places = [from];
-      // The entries of the legend that are left out are numbered by the series: each follows its own.
-      if (chart.legend && chart.legend.deleted) {
+      // The entries of the legend that are left out are numbered by the series: each follows its own,
+      // when the series are others or stand in another order. (Entries behind the series are those of
+      // trend lines; a part that has any keeps its series as they are, and the entries with them.)
+      const reordered = from.length !== group.series.length || from.some((was, i) => was !== i);
+      if (reordered && chart.legend && chart.legend.deleted) {
         const legend = { ...chart.legend };
         const deleted = remapLegendEntries(legend.deleted, edits.map((edit) => (edit.from !== undefined ? edit.from : -1)));
         if (deleted) legend.deleted = deleted;

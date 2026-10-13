@@ -3350,6 +3350,12 @@ export class WorkbookView {
    * it. Ctrl+Alt+5 selects the first chart of the sheet, then the next one with every press, and
    * none after the last. Without a chart selected Alt+F1 adds one of the selection. Tab is never
    * taken: it leaves the grid as it always does. Returns whether the key was taken.
+   *
+   * While a chart is selected the keys are not the cells': what is typed is typed nowhere, F2
+   * edits no cell, and the keys that format, clear, select or walk the cells do nothing (they are
+   * taken all the same, so that the browser does nothing of its own with them). The selection of
+   * cells is not what the user is looking at. Escape gives the keys back to the cells. Undo, redo,
+   * save, print, the clipboard and the keys that show another sheet work as ever.
    */
   private chartKey(event: KeyboardEvent): boolean {
     const state = this.state();
@@ -3381,7 +3387,10 @@ export class WorkbookView {
         return true;
       case 'Delete':
       case 'Backspace':
-        if (!this.locked) this.attempt(() => this.removeChart(picked));
+        // Shift+Delete is "cut" on Windows: left alone, as it is with cells selected, it arrives as a cut
+        // event or does nothing. With another modifier the key would clear the cells: nothing is done.
+        if (event.shiftKey) return false;
+        if (!ctrl && !event.altKey && !this.locked) this.attempt(() => this.removeChart(picked));
         return true;
       case 'Enter':
         if (ctrl || event.altKey) return false;
@@ -3391,7 +3400,8 @@ export class WorkbookView {
       case 'ArrowDown':
       case 'ArrowLeft':
       case 'ArrowRight': {
-        if (ctrl) return false;
+        // With Ctrl the cells would be walked to the edge of their data.
+        if (ctrl) return true;
         if (this.locked || !box) return true;
         const step = event.shiftKey ? 1 : 10;
         const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
@@ -3400,10 +3410,24 @@ export class WorkbookView {
         this.attempt(() => this.moveChart(picked, anchorOfRect(state.metrics, next.x, next.y, next.width, next.height)));
         return true;
       }
-      default:
-        // Undo, redo, save and the like work as ever; anything that is typed is typed into the cells.
-        if (!ctrl && !event.altKey && event.key.length === 1) this.setChartPick(undefined);
-        return false;
+      case 'F2':
+        // Neither the cell nor its note is edited.
+        return true;
+      case 'Home':
+      case 'End':
+        return true;
+      case 'PageUp':
+      case 'PageDown':
+        // With Ctrl or Alt they show another sheet; alone they would walk the cells.
+        return !ctrl && !event.altKey;
+      default: {
+        if (event.key.length !== 1) return false;
+        // Something that is typed.
+        if (!ctrl && !event.altKey) return true;
+        // The keys that format the cells and select all of them. Every other combination is left alone:
+        // undo, redo, save, and what the browser does with a key (Ctrl with + and - is its zoom: see structuralKey()).
+        return ctrl && !event.altKey && 'biuaBIUA'.indexOf(event.key) >= 0;
+      }
     }
   }
 
@@ -5307,6 +5331,8 @@ export class WorkbookView {
     const state = this.state();
     if (state.sheet.kind !== 'worksheet') return;
     this.closeMenu();
+    // Asked for by the application or by a press on the cell: the chart that was selected is let go of.
+    if (this.pickedChart() !== undefined) this.setChartPick(undefined, false);
     this.beginEdit();
     const edit = this.edit as Edit | undefined;
     if (!edit) return;
@@ -5420,6 +5446,8 @@ export class WorkbookView {
     if (message === 'The range holds no values for a chart' || message === 'A chart needs a range of cells, or series' || message === 'The series of this chart are not one block of cells') return charts.needRange;
     if (/^Cannot change the type of this chart/.test(message)) return charts.typeFixed;
     if (/^Cannot change this chart:/.test(message)) return charts.notEditable;
+    if (/^Cannot change the charts of this sheet:/.test(message)) return charts.placesFixed;
+    if (/^Cannot delete this chart: it shares/.test(message)) return charts.wrapped;
     if (/^The (smallest and the largest|largest) value of an axis/.test(message)) return charts.badNumber;
     if (/^Cannot (add a series to a chart of this type|add, remove or reorder the series of|change the series of)/.test(message)) return charts.seriesFixed;
     if (message === 'Cannot change how the series of this chart are grouped') return charts.groupingFixed;
@@ -5818,7 +5846,9 @@ export class WorkbookView {
 
   /** Ctrl with plus or minus on whole rows or columns. Returns false when the selection is neither. */
   private structuralKey(kind: 'insert' | 'delete'): boolean {
-    if (this.locked) return false;
+    // With a chart selected the key is not about the rows and columns that are selected under it; it is
+    // not taken either, so that it stays the zoom of the browser.
+    if (this.locked || this.pickedChart() !== undefined) return false;
     const range = this.state().range;
     const rows = fullWidth(range) && !fullHeight(range);
     const cols = fullHeight(range) && !fullWidth(range);
@@ -6223,6 +6253,12 @@ export class WorkbookView {
 
   private onInput = (event: Event): void => {
     if (this.destroyed) return;
+    if (!this.edit && this.pickedChart() !== undefined) {
+      // A chart is selected: what an input method or a key the view did not see put into the input goes
+      // nowhere. While the method composes the input is left alone; what it leaves is taken out after.
+      if ((event as InputEvent).isComposing !== true && !this.composing) this.syncInput();
+      return;
+    }
     if (!this.edit) {
       // Typed over the idle text: that starts an edit which already holds what was typed. Only input that
       // adds something does; a deletion of the idle text (a key combination the view does not know) does not.
@@ -6246,6 +6282,8 @@ export class WorkbookView {
 
   private onCompositionStart = (): void => {
     if (this.destroyed || this.edit || this.locked || this.state().sheet.kind !== 'worksheet') return;
+    // With a chart selected no cell is edited (see chartKey()).
+    if (this.pickedChart() !== undefined) return;
     // An input method composes in place; the editor has to be there from its first key.
     this.selectIdleText();
     this.beginEdit(this.input.value, true);
@@ -6255,7 +6293,10 @@ export class WorkbookView {
   /** An input method began or ended composing, in the editor or in a field of the shell: no pointing meanwhile. */
   private onComposition = (event: Event): void => {
     this.composing = event.type === 'compositionstart';
-    if (!this.destroyed) this.syncSheetLock();
+    if (this.destroyed) return;
+    this.syncSheetLock();
+    // What was composed while a chart was selected is not kept in the input.
+    if (!this.composing && !this.edit && event.target === this.input && this.pickedChart() !== undefined) this.syncInput();
   };
 
   /** A press inside the editor places the caret: from here on the arrow keys move it. */
@@ -7020,7 +7061,10 @@ export class WorkbookView {
     if (this.destroyed || !touch || touch.moved || touch.consumed || this.menu) return;
     this.readScroll();
     if (touch.domX !== this.domX || touch.domY !== this.domY) return;
-    if (this.openChartMenu(touch.x, touch.y) || this.openHeaderMenu(touch.x, touch.y)) touch.consumed = true;
+    const onChart = this.openChartMenu(touch.x, touch.y);
+    // As with a right click: the menu of a cell is about the cells, and the chart that was selected is let go of.
+    if (!onChart && this.pickedChart() !== undefined) this.setChartPick(undefined, false);
+    if (onChart || this.openHeaderMenu(touch.x, touch.y)) touch.consumed = true;
   };
 
   private clearLongPress(): void {

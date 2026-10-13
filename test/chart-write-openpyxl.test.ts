@@ -10,6 +10,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { ZipArchive } from '../src/index';
 import { addChart, updateChart, CHART_TYPES, type ChartType } from '../src/ops/charts';
 import { FOREIGN, chartsOf, load, packageProblems, salesBook, save } from './chart-edit-fixtures';
 import { chartFrameOf } from './chart-fixtures';
@@ -192,15 +193,22 @@ import json, sys, re, zipfile, warnings
 import xml.etree.ElementTree as ET
 import openpyxl
 warnings.simplefilter('ignore')
-problems = []; spaces = {}
+problems = []; spaces = {}; titles = {}
 z = zipfile.ZipFile(sys.argv[1])
 for name in z.namelist():
     if not re.search(r'\.(xml|rels|vml)$', name): continue
+    raw = z.read(name)
+    # The parser honours the encoding a part declares: one that is not UTF-8 may hold nothing but ASCII.
+    said = re.match(rb'^(?:\xef\xbb\xbf)?<\?xml[^?]*?encoding\s*=\s*["\']([^"\']*)', raw)
+    if said and said.group(1).lower() not in (b'utf-8', b'utf8', b'utf-16') and any(b >= 0x80 for b in raw):
+        problems.append('%s: declares %s and holds bytes that are not ASCII' % (name, said.group(1).decode('ascii', 'replace')))
     try:
-        root = ET.fromstring(z.read(name))
+        root = ET.fromstring(raw)
     except ET.ParseError as e:
         problems.append('%s: %s' % (name, e)); continue
     if '/charts/chart' in name:
+        for title in root.findall('./{*}chart/{*}title'):
+            titles[name] = ''.join(t.text or '' for t in title.iter() if t.tag.endswith('}t'))
         spaces[name] = sorted(set(el.tag[1:].split('}')[0] for el in root.iter() if el.tag[0] == '{' and re.search(r'drawingml/(2006/)?chart$', el.tag[1:].split('}')[0])))
 wb = openpyxl.load_workbook(sys.argv[1])
 def ref(source):
@@ -209,7 +217,7 @@ def ref(source):
         if held is not None: return held.f
     return None
 charts = [[{'tag': c.tagname, 'series': [[s.tx.strRef.f if s.tx is not None and s.tx.strRef is not None else (s.tx.v if s.tx is not None else None), ref(getattr(s, 'cat', None)) or ref(getattr(s, 'xVal', None)), ref(getattr(s, 'val', None)) or ref(getattr(s, 'yVal', None))] for s in c.series]} for c in ws._charts] for ws in wb.worksheets]
-print(json.dumps({'problems': problems, 'spaces': spaces, 'charts': charts}))
+print(json.dumps({'problems': problems, 'spaces': spaces, 'charts': charts, 'titles': titles}))
 `;
 
 test('chart write: charts openpyxl wrote are changed in their parts and by rows that are inserted, and openpyxl opens the result', async (t) => {
@@ -228,8 +236,23 @@ test('chart write: charts openpyxl wrote are changed in their parts and by rows 
     const read = (file: string) => {
       const run = spawnSync('python3', ['-c', READ, file], { encoding: 'utf8' });
       assert.equal(run.status, 0, `openpyxl opens ${file}: ${run.stderr.slice(-1500)}`);
-      return JSON.parse(run.stdout) as { problems: string[]; spaces: Record<string, string[]>; charts: { tag: string; series: (string | null)[][] }[][] };
+      return JSON.parse(run.stdout) as { problems: string[]; spaces: Record<string, string[]>; charts: { tag: string; series: (string | null)[][] }[][]; titles: Record<string, string> };
     };
+    // A part that declares another encoding than UTF-8: what is written is read, by a parser that honours
+    // the declaration, as what was meant.
+    for (const encoding of ['ISO-8859-1', 'us-ascii']) {
+      const zip = ZipArchive.read(bytes);
+      const name = zip.names().filter((entry) => /charts\/chart\d+\.xml$/.test(entry)).sort()[0];
+      const xml = new TextDecoder().decode(await zip.read(name)).replace(/^<\?xml[^?]*\?>\s*/, '');
+      zip.set(name, new TextEncoder().encode(`<?xml version="1.0" encoding="${encoding}"?>\n${xml}`));
+      const other = await load(await zip.write());
+      other.history.apply(updateChart(other.wb, 0, 0, { title: 'Şırnak ₺ İki' }), undefined, undefined);
+      const file = join(folder, 'encoded.xlsx');
+      writeFileSync(file, await save(other));
+      const found = read(file);
+      assert.deepEqual(found.problems, [], `${encoding}: every part is well-formed in the encoding it declares`);
+      assert.equal(found.titles[name], 'Şırnak ₺ İki', `${encoding}: the title is read as it was typed`);
+    }
     const doc = await load(bytes);
     assert.deepEqual(chartsOf(doc.wb.sheets[0]).map((chart) => chart.known), ['refs', 'refs'], 'the charts of openpyxl are changed in their parts');
     assert.equal(doc.wb.chartsFollow, true);

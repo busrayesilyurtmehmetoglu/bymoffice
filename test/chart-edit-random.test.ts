@@ -16,7 +16,7 @@ import type { Op } from '../src/ops/ops';
 import { drawingAnchorNow } from '../src/render/sheet-drawings';
 import { FOREIGN, bare, chartsOf, load, packageProblems, reopen, salesBook, same, save, type Loaded } from './chart-edit-fixtures';
 import { catAx, chartFrameOf, chartXml, group, numRef, ser, strRef, valAx } from './chart-fixtures';
-import { twoCell } from './sheet-drawing-fixtures';
+import { sp, twoCell } from './sheet-drawing-fixtures';
 
 /** How many runs per starting file; more when asked for (CHART_SEEDS=200). */
 const SEEDS = Math.max(1, Math.min(Number(process.env.CHART_SEEDS) || 12, 5000));
@@ -223,7 +223,24 @@ async function startingFiles(): Promise<{ name: string; bytes: Uint8Array }[]> {
     plot: group('barChart', '<c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/>', one(0, 'B') + one(1, 'C') + one(2, 'B'), '<c:gapWidth val="150"/>') + catAx() + valAx(),
     tail: '<c:legend><c:legendPos val="r"/><c:legendEntry><c:idx val="2"/><c:delete val="1"/></c:legendEntry><c:legendEntry><c:idx val="0"/><c:txPr><a:bodyPr/><a:p><a:endParaRPr/></a:p></c:txPr></c:legendEntry><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/>',
   });
+  // Parts that are not changed in place, or not at all: what is asked of them is refused beforehand or written.
+  const deep = `<z:d xmlns:z="urn:z">${'<z:d>'.repeat(2100)}${'</z:d>'.repeat(2100)}</z:d>`;
+  const other = { name: 'Other', xml: '<sheetData/>' };
+  const deepChart = await salesBook({ drawing: frame, charts: [FOREIGN.replace('</c:chartSpace>', `<c:extLst><c:ext uri="{deep}">${deep}</c:ext></c:extLst></c:chartSpace>`)], sheets: [other] });
+  const deepShape = twoCell([0, 30], [2, 33], sp({ name: 'S' }).replace('<xdr:cNvPr id="3" name="S"/>', `<xdr:cNvPr id="3" name="S"><a:extLst><a:ext uri="{deep}">${deep}</a:ext></a:extLst></xdr:cNvPr>`));
+  assert.ok(deepShape.indexOf('urn:z') > 0, 'the deep shape is in its fixture');
+  const deepDrawing = await salesBook({ drawing: frame + deepShape, charts: [FOREIGN], sheets: [other] });
+  const latin = await salesBook({ drawing: frame, charts: [FOREIGN.replace(/^<\?xml[^?]*\?>/, '<?xml version="1.0" encoding="ISO-8859-1"?>')], sheets: [other] });
+  const wrapper = `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x" xmlns:x="urn:x">${frame}${twoCell([0, 30], [2, 33], sp({ name: 'Beside' }))}</mc:Choice><mc:Fallback/></mc:AlternateContent>`;
+  const wrapped = await salesBook({ drawing: wrapper, charts: [FOREIGN], sheets: [other] });
+  const both = ZipArchive.read(await salesBook({ drawing: frame, charts: [FOREIGN], sheets: [{ name: 'Other', xml: '<sheetData/><drawing r:id="rId9"/>' }] }));
+  both.set('xl/worksheets/_rels/sheet2.xml.rels', new TextEncoder().encode('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>'));
   return [
+    { name: 'a chart part nested deeply', bytes: deepChart },
+    { name: 'a drawing part nested deeply', bytes: deepDrawing },
+    { name: 'a chart part that declares Latin-1', bytes: latin },
+    { name: 'a chart that shares its wrapper', bytes: wrapped },
+    { name: 'a drawing two sheets show', bytes: await both.write() },
     { name: 'no charts', bytes: plain },
     { name: 'a chart of another application', bytes: foreign },
     { name: 'charts the engine wrote', bytes: own },

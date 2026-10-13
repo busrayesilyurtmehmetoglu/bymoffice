@@ -372,6 +372,10 @@ export interface ChartStrings {
   badCharacter: string;
   /** A sheet cannot be renamed or deleted: a chart names it in a reference that cannot be read. */
   refUnread: string;
+  /** No chart is added to the sheet, moved or deleted on it: its drawing in the file takes no change. */
+  placesFixed: string;
+  /** The chart shares a wrapper of the file with another object and is not deleted. */
+  wrapped: string;
   /** Said when copy, cut or paste is asked for while a chart is selected. */
   noCopy: string;
 }
@@ -1041,6 +1045,8 @@ export const STRINGS_EN: UiStrings = {
     textTooLong: (most) => `This text cannot be longer than ${most} characters`,
     badCharacter: 'The text holds a character a file cannot hold',
     refUnread: 'The sheet cannot be changed: a chart names it in a reference that cannot be read',
+    placesFixed: 'Charts cannot be added, moved or deleted on this sheet: its drawing in the file cannot be changed',
+    wrapped: 'This chart cannot be deleted: in the file it is bound to another object',
     noCopy: 'A chart cannot be copied or pasted yet',
   },
 };
@@ -1556,6 +1562,8 @@ export const STRINGS_TR: UiStrings = {
     textTooLong: (most) => `Bu metin ${most} karakterden uzun olamaz`,
     badCharacter: 'Metin, dosyaya yazılamayan bir karakter içeriyor',
     refUnread: 'Sayfa değiştirilemiyor: bir grafik onu okunamayan bir başvuruda anıyor',
+    placesFixed: 'Bu sayfada grafik eklenemez, taşınamaz ve silinemez: dosyadaki çizimi değiştirilemiyor',
+    wrapped: 'Bu grafik silinemez: dosyada başka bir nesneye bağlı',
     noCopy: 'Grafik henüz kopyalanıp yapıştırılamıyor',
   },
 };

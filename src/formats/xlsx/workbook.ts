@@ -9,7 +9,7 @@ import { createSheet, type DefinedName, type DrawingChart, type Sheet, type Shee
 import { childElements, localName, type XmlDocument, type XmlElement } from '../../xml';
 import { parseChart } from './chart';
 import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
-import { readSheetDrawings, type ChartReading } from './drawings';
+import { readSheetDrawings, type ChartReading, type DrawingPartFacts } from './drawings';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
 import { parseChartSheetSetup, parseWorksheet } from './worksheet';
@@ -98,6 +98,8 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   /** The sheet that shows each comments part and legacy drawing: a part two sheets show cannot be changed for one of them. */
   const noteParts = new Map<string, Sheet>();
   const sheetsElement = child(root, 'sheets');
+  /** The drawing parts each sheet shows: one that two sheets show is changed for neither. */
+  const drawingParts: { sheet: Sheet; parts: string[] }[] = [];
   for (const element of sheetsElement ? childElements(sheetsElement, 'sheet') : []) {
     const name = element.attrs.get('name') ?? '';
     const rel = relById.get(prefixedAttr(element, 'id') ?? '');
@@ -163,8 +165,11 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
       if (anchored.size > 0) sheet.anchored = [...anchored].sort();
       // What is shown of them; the parts themselves are written back as they are.
       const warnings: string[] = [];
-      const drawings = await readSheetDrawings(pkg, sheetRels, styles.themeColors, mediaParts, warnings, chartReading);
+      const facts: DrawingPartFacts = { parts: [] };
+      const drawings = await readSheetDrawings(pkg, sheetRels, styles.themeColors, mediaParts, warnings, chartReading, facts);
       if (drawings) sheet.drawings = drawings;
+      if (facts.fixed !== undefined) sheet.drawingsFixed = facts.fixed;
+      drawingParts.push({ sheet, parts: facts.parts });
       const comments = await readSheetComments(pkg, sheetRels, persons, warnings);
       if (comments) sheet.comments = comments;
       if (warnings.length > 0) sheet.warnings = warnings;
@@ -175,8 +180,10 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
         const warnings: string[] = [];
         const ownRels = await pkg.relationships(rel.part);
         for (const r of ownRels) if (r.type.endsWith('/drawing') && !r.external && r.part && pkg.hasPart(r.part)) noteCharts(await pkg.relationships(r.part));
-        const drawings = await readSheetDrawings(pkg, ownRels, styles.themeColors, mediaParts, warnings, chartReading);
+        const facts: DrawingPartFacts = { parts: [] };
+        const drawings = await readSheetDrawings(pkg, ownRels, styles.themeColors, mediaParts, warnings, chartReading, facts);
         if (drawings) sheet.drawings = drawings;
+        drawingParts.push({ sheet, parts: facts.parts });
         // A chart that could not be read is said, as on a worksheet: the sheet then shows its note.
         if (warnings.length > 0) sheet.warnings = warnings;
       } catch (error) {
@@ -204,6 +211,13 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
       localSheet: local !== undefined && /^\d{1,6}$/.test(local) ? Number(local) : undefined,
       hidden: isTrue(element.attrs.get('hidden')),
     });
+  }
+
+  // A drawing part that several sheets show: a change made for one of them would show on the others.
+  const showing = new Map<string, number>();
+  for (const item of drawingParts) for (const part of item.parts) showing.set(part.toLowerCase(), (showing.get(part.toLowerCase()) || 0) + 1);
+  for (const item of drawingParts) {
+    if (item.sheet.drawingsFixed === undefined && item.parts.some((part) => (showing.get(part.toLowerCase()) || 0) > 1)) item.sheet.drawingsFixed = 'its drawing is shared with another sheet';
   }
 
   // Whether the charts follow rows, columns and sheets that change: every chart part of the file has to

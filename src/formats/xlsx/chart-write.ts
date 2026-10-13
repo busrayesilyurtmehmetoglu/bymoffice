@@ -48,6 +48,24 @@ const EMU_PER_PIXEL = 9525;
 const COLOR = /^#[0-9A-Fa-f]{6}$/;
 /** Elements of one chart part that are looked at when it is compared or counted; a part with more is not known. */
 const MAX_PART_ELEMENTS = 2000000;
+/**
+ * How deep the elements of a part may be nested for the part to be changed in place. The
+ * functions that change a part walk it by calling themselves; a part nested deeper is read and
+ * shown, and what it holds is left as it is. What applications write is nested some twenty deep.
+ */
+export const MAX_PATCH_DEPTH = 128;
+
+/** Whether elements of a tree are nested deeper than `limit` (the root is at depth 0). Does not call itself. */
+export function nestedBeyond(root: XmlElement, limit: number): boolean {
+  let level: XmlElement[] = [root];
+  for (let depth = 0; level.length > 0; depth++) {
+    if (depth > limit) return true;
+    const next: XmlElement[] = [];
+    for (const el of level) for (const node of el.children) if (node.type === 'element') next.push(node);
+    level = next;
+  }
+  return false;
+}
 
 const TEXT_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\r': '&#13;' };
 const ATTR_ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '"': '&quot;', '\t': '&#9;', '\n': '&#10;', '\r': '&#13;' };
@@ -362,13 +380,37 @@ function boundToSeries(root: XmlElement, chart: Chart): boolean {
 }
 
 /**
+ * Whether a part holds a wrapper of alternatives (mc:AlternateContent) where the writer puts
+ * and looks for what it changes: in the chart, its plot area, a chart type, a series, an axis, a
+ * legend or a title. What stands inside such a wrapper is there twice, or not where it is looked
+ * for: a title would be put beside the one in the wrapper.
+ */
+function wrapped(root: XmlElement): boolean {
+  const holds = (el: XmlElement | undefined): boolean => !!el && el.children.some((node) => node.type === 'element' && localName(node.name) === 'AlternateContent');
+  const chartEl = child(root, 'chart');
+  const plot = child(chartEl, 'plotArea');
+  if (holds(chartEl) || holds(plot) || holds(child(chartEl, 'title')) || holds(child(chartEl, 'legend'))) return true;
+  for (const el of elements(plot)) {
+    const local = localName(el.name);
+    if (Object.prototype.hasOwnProperty.call(GROUP_NAMES, local)) {
+      if (holds(el) || elements(el, 'ser').some(holds)) return true;
+    } else if (Object.prototype.hasOwnProperty.call(AXIS_NAMES, local) && (holds(el) || holds(child(el, 'title')))) return true;
+  }
+  return false;
+}
+
+/**
  * What is known of a chart part beside its model: `known` "all" when the part is exactly what
  * chartSpaceXml() makes of the model (prefixes and namespaces included) and it has no
  * relationships; "refs" when every formula of the part is a reference of the model and the
- * series of the part are the series of the model. Undefined otherwise. Never throws.
+ * series of the part are the series of the model. Undefined otherwise: also for a part nested
+ * too deeply to be changed (MAX_PATCH_DEPTH) and one that wraps what is changed in alternatives.
+ * Never throws.
  */
 export function chartKnown(root: XmlElement, chart: Chart, related: boolean): ChartPartFacts | undefined {
   try {
+    if (nestedBeyond(root, MAX_PATCH_DEPTH)) return undefined;
+    if (wrapped(root)) return undefined;
     const found = formulas(root);
     const refs = chartRefs(chart);
     if (found.foreign || found.count !== refs.length) return undefined;
@@ -555,6 +597,7 @@ function openPart(bytes: Uint8Array, spaces: (root: XmlElement, scope: Map<strin
   const elements: XmlElement[] = [];
   const walk = (el: XmlElement, depth: number): void => {
     elements.push(el);
+    // Never met for a part the reader let be changed (see nestedBeyond()): what stops a stack that runs out.
     if (depth > 2000) throw new Error('Cannot write the part: its content is nested too deeply');
     for (const node of el.children) {
       if (node.type !== 'element') continue;
@@ -563,10 +606,13 @@ function openPart(bytes: Uint8Array, spaces: (root: XmlElement, scope: Map<strin
     }
   };
   walk(doc.root, 0);
-  // The text of the part, when it is UTF-8 (what every application writes): only then are its bytes kept.
+  // The text of the part, when it is UTF-8 and says nothing else (what every application writes): only
+  // then are its bytes kept. A part that declares another encoding is written out whole, as UTF-8
+  // with a declaration that says so: new text beside the old declaration would be read as something else.
+  const declared = doc.declaration ? /\sencoding\s*=\s*["']([^"']*)["']/.exec(doc.declaration) : null;
   let source: string | undefined;
   try {
-    source = bytes.length >= 2 && ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) ? undefined : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    source = (declared && !/^utf-?8$/i.test(declared[1])) || (bytes.length >= 2 && ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))) ? undefined : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch (error) {
     source = undefined;
   }
@@ -1246,7 +1292,7 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
     anchorsOf(root, 0, undefined, found);
     const relIds = (el: XmlElement, out: Set<string>, depth = 0): void => {
       for (const [name, value] of el.attrs) if (name.indexOf(':') > 0 && name.slice(0, 6) !== 'xmlns:' && /^(id|embed|link|pict|dm|lo|qs|cs)$/.test(localName(name))) out.add(value);
-      if (depth < 64) for (const node of el.children) if (node.type === 'element') relIds(node, out, depth + 1);
+      if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') relIds(node, out, depth + 1);
     };
     const gone = new Set<string>();
     for (const [index, anchor] of edit.moved) {
@@ -1267,6 +1313,9 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
     for (const index of edit.removed) {
       const item = found[index];
       if (!item) throw new Error('Cannot write the drawing: an anchor of the model is not in its part');
+      // The wrapper goes with its anchor, and with what stands in for the anchor in its other branches;
+      // an anchor that shares its wrapper with another one is not taken out (the reader says so: SheetDrawing.wrapped).
+      if (found.some((other, at) => other.top === item.top && other !== item && !edit.removed.has(at))) throw new Error('Cannot write the drawing: an anchor that goes shares its wrapper with one that stays');
       relIds(item.top, gone);
       removed.add(item.top);
     }
@@ -1278,7 +1327,7 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
           const id = Number(el.attrs.get('id'));
           if (id > top && id < 4294967295) top = id;
         }
-        if (depth < 64) for (const node of el.children) if (node.type === 'element') ids(node, depth + 1);
+        if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') ids(node, depth + 1);
       };
       ids(root, 0);
       const added: XmlNode[] = edit.added.map((item) => made(root, chartAnchorXml(item.anchor, item.relId, ++top, item.name, item.description, strict)));

@@ -23,7 +23,7 @@ import {
   type SheetDrawing,
 } from '../../model/sheet/types';
 import { localName, parseXml, type XmlElement } from '../../xml';
-import { chartKnown, type ChartPartFacts } from './chart-write';
+import { MAX_PATCH_DEPTH, chartKnown, nestedBeyond, type ChartPartFacts } from './chart-write';
 
 /** Anchors read from one drawing; a sheet with more shows the first ones. */
 export const MAX_SHEET_DRAWINGS = 20000;
@@ -636,22 +636,28 @@ function readAnchor(el: XmlElement): DrawingAnchor | undefined {
 
 const ANCHOR_NAMES: { [local: string]: true } = { twoCellAnchor: true, oneCellAnchor: true, absoluteAnchor: true };
 
-function anchorElements(parent: XmlElement, depth: number, out: XmlElement[]): void {
+/**
+ * The anchors of a drawing part in the order they are shown. With `tops`, the child of the root
+ * each stands in is noted beside it: the anchor itself, or the wrapper that holds it.
+ */
+function anchorElements(parent: XmlElement, depth: number, out: XmlElement[], tops?: XmlElement[], top?: XmlElement): void {
   for (const node of parent.children) {
     if (node.type !== 'element') continue;
     const local = localName(node.name);
-    if (Object.prototype.hasOwnProperty.call(ANCHOR_NAMES, local)) out.push(node);
-    else if (local === 'AlternateContent' && depth < MAX_WRAPPER_DEPTH) {
+    if (Object.prototype.hasOwnProperty.call(ANCHOR_NAMES, local)) {
+      out.push(node);
+      if (tops) tops.push(top || node);
+    } else if (local === 'AlternateContent' && depth < MAX_WRAPPER_DEPTH) {
       // The same object in a newer and an older form, each with its own anchor: one of them is shown.
       const before = out.length;
       for (const branch of node.children) {
         if (branch.type !== 'element' || localName(branch.name) !== 'Choice') continue;
-        anchorElements(branch, depth + 1, out);
+        anchorElements(branch, depth + 1, out, tops, top || node);
         if (out.length > before) break;
       }
       if (out.length === before) {
         const fallback = child(node, 'Fallback');
-        if (fallback) anchorElements(fallback, depth + 1, out);
+        if (fallback) anchorElements(fallback, depth + 1, out, tops, top || node);
       }
     }
   }
@@ -678,7 +684,11 @@ export function drawingSource(drawing: SheetDrawing): { part?: string; index: nu
 export function parseDrawing(root: XmlElement, context: DrawingReadContext): SheetDrawing[] {
   const state: ReadState = { context, relById: new Map(context.rels.map((rel) => [rel.id, rel])), objects: 0 };
   const anchors: XmlElement[] = [];
-  anchorElements(root, 0, anchors);
+  const tops: XmlElement[] = [];
+  anchorElements(root, 0, anchors, tops);
+  // How many anchors each wrapper holds: one that holds several cannot go with one of them.
+  const held = new Map<XmlElement, number>();
+  for (const top of tops) held.set(top, (held.get(top) || 0) + 1);
   const out: SheetDrawing[] = [];
   let skipped = 0;
   for (let i = 0; i < anchors.length; i++) {
@@ -692,7 +702,7 @@ export function parseDrawing(root: XmlElement, context: DrawingReadContext): She
       const content: XmlElement[] = [];
       objectElements(anchors[i], 0, content);
       const object = anchor && content.length > 0 ? readObject(state, content[0], 0) : undefined;
-      if (anchor && object) drawing = { anchor, object };
+      if (anchor && object) drawing = (held.get(tops[i]) || 0) > 1 ? { anchor, object, wrapped: true } : { anchor, object };
     } catch (error) {
       // One object that cannot be read does not take the others with it.
       drawing = undefined;
@@ -797,6 +807,14 @@ async function readCharts(
 /** Warnings about charts of one drawing that are listed one by one. */
 const MAX_CHART_WARNINGS = 20;
 
+/** What reading the drawings of a sheet says of their parts beside the drawings themselves. */
+export interface DrawingPartFacts {
+  /** The drawing parts of the sheet, as the package spells them. */
+  parts: string[];
+  /** Why the drawing parts take no change (see Sheet.drawingsFixed), when one of them does not. */
+  fixed?: string;
+}
+
 /**
  * The drawings of a sheet from the parts its relationships name; undefined
  * for a sheet without any. Parts of pictures that are shown are added to
@@ -810,6 +828,7 @@ export async function readSheetDrawings(
   media: Set<string>,
   warnings: string[],
   charts?: ChartReading,
+  facts?: DrawingPartFacts,
 ): Promise<SheetDrawing[] | undefined> {
   let drawings: SheetDrawing[] = [];
   const chartBudget = { left: MAX_DRAWING_CHARTS };
@@ -822,6 +841,7 @@ export async function readSheetDrawings(
     const part = names(rel.part);
     if (part === undefined || seen.has(part)) continue;
     seen.add(part);
+    if (facts) facts.parts.push(part);
     try {
       const bytes = await pkg.readPart(part);
       if (bytes.length > MAX_PART_BYTES) throw new Error('the part is too large');
@@ -833,7 +853,9 @@ export async function readSheetDrawings(
       const rels = await pkg.relationships(rel.part);
       const kinds = new Map<string, ChartPartFacts>();
       const found = charts ? await readCharts(pkg, rels, themeColors, charts, chartBudget, warnings, kinds) : undefined;
-      const read = parseDrawing(parseXml(bytes).root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), charts: found, chartsKnown: kinds, warnings });
+      const root = parseXml(bytes).root;
+      if (facts && facts.fixed === undefined && nestedBeyond(root, MAX_PATCH_DEPTH)) facts.fixed = 'its drawing is nested too deeply';
+      const read = parseDrawing(root, { rels, themeColors, hasPart: (part) => pkg.hasPart(part), charts: found, chartsKnown: kinds, warnings });
       // Where each anchor is in the file: what the writer finds it by.
       for (const drawing of read) {
         const source = SOURCES.get(drawing);
@@ -842,6 +864,8 @@ export async function readSheetDrawings(
       drawings = drawings.concat(read.slice(0, MAX_SHEET_DRAWINGS - drawings.length));
     } catch (error) {
       warnings.push(`Drawing could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      // What cannot be read cannot be changed either.
+      if (facts && facts.fixed === undefined) facts.fixed = 'its drawing cannot be read';
     }
   }
   if (drawings.length === 0) return undefined;
