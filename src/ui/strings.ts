@@ -120,7 +120,8 @@ export interface UiStrings {
   // Tracked changes.
   /**
    * What a tracked change is: `kind` is a kind of DocRevision ("insert", "delete", "moveFrom", "moveTo", "format",
-   * "paragraphFormat", "tableFormat", "sectionFormat", "other"); the author, the date and the text come from the file.
+   * "paragraphFormat", "tableFormat", "sectionFormat", "other", and "insertColumn" and "deleteColumn" for a column of
+   * a table); the author, the date and the text come from the file.
    */
   revisionDescription(kind: string, author: string | undefined, date: string | undefined, text: string): string;
   /** Said when a change is stepped to: its number, how many there are, what it is, and whether the step went round to the first or the last one. */
@@ -176,7 +177,6 @@ export interface UiStrings {
   /** The text of a comment is too long or is not there. */
   commentTextNeeded: string;
   /** Said after a copy was pasted as text alone because changes are tracked. */
-  pastedAsText: string;
   cannotCutObjects: string;
   cannotWriteClipboard: string;
   /** A copy made in an editor of the page does not fit where it is pasted. */
@@ -628,6 +628,8 @@ export const STRINGS_EN: UiStrings = {
     const what: { [kind: string]: string } = {
       insert: 'Inserted',
       delete: 'Deleted',
+      insertColumn: 'Column inserted',
+      deleteColumn: 'Column deleted',
       moveFrom: 'Moved from here',
       moveTo: 'Moved here',
       format: 'Formatting changed',
@@ -676,7 +678,6 @@ export const STRINGS_EN: UiStrings = {
   commentFixed: 'This comment cannot be changed here: its marks sit in a part of the document that is kept as it is',
   commentGone: 'The comment is no longer in the document',
   commentTextNeeded: 'A comment needs text, of at most 32,767 characters',
-  pastedAsText: 'Changes are tracked in this document: the copy was pasted as text, without its formatting and pictures',
   cannotCutObjects: 'The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place',
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
   cannotPasteHere: 'What was copied cannot be pasted here',
@@ -1146,6 +1147,8 @@ export const STRINGS_TR: UiStrings = {
     const what: { [kind: string]: string } = {
       insert: 'Eklendi',
       delete: 'Silindi',
+      insertColumn: 'Sütun eklendi',
+      deleteColumn: 'Sütun silindi',
       moveFrom: 'Buradan taşındı',
       moveTo: 'Buraya taşındı',
       format: 'Biçim değişti',
@@ -1194,7 +1197,6 @@ export const STRINGS_TR: UiStrings = {
   commentFixed: 'Bu yorum burada değiştirilemez: işaretleri belgenin olduğu gibi korunan bir bölümünde',
   commentGone: 'Yorum artık belgede yok',
   commentTextNeeded: 'Yorum için en çok 32.767 karakterlik bir metin gerekir',
-  pastedAsText: 'Bu belgede değişiklikler izleniyor: kopya biçimi ve görselleri olmadan, metin olarak yapıştırıldı',
   cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (dipnot, denklem, metin kutusu, içerik denetimi, izlenen değişiklik); yerinde bırakıldı',
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',
   cannotPasteHere: 'Kopyalanan içerik buraya yapıştırılamıyor',

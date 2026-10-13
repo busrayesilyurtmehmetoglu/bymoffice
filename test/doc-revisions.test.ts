@@ -455,7 +455,8 @@ test('revisions: a vertically merged cell that began in a row that goes begins i
 // ------------------------------------------------- what the model does not hold
 
 test('revisions: changes the model only keeps as XML are listed as "other", cannot be resolved one by one, and are skipped and counted by "all"', async () => {
-  const cellIns = `<w:tc><w:tcPr><w:cellIns w:id="1"${WHO('Ann')}/></w:tcPr>${p('cell')}</w:tc>`;
+  // (Inserted and deleted cells are in the model and can be resolved: test/doc-track-tables.test.ts.)
+  const cellIns = `<w:tc><w:tcPr><w:cellMerge w:id="1"${WHO('Ann')} w:vMerge="rest"/></w:tcPr>${p('cell')}</w:tc>`;
   const o = await open(p(ins(2, t('typed'), 'Bob')) + tbl(`<w:tr>${cellIns}</w:tr>`, [2000]) + p('end'));
   const list = revisionsOf(o.doc);
   assert.deepEqual(
@@ -471,14 +472,14 @@ test('revisions: changes the model only keeps as XML are listed as "other", cann
   assert.deepEqual([all.resolved, all.skipped], [1, 1]);
   run(o.history, all);
   assert.deepEqual(kinds(o.doc), ['other']);
-  assert.ok((await body(o)).indexOf('<w:cellIns w:id="1"') > 0);
+  assert.ok((await body(o)).indexOf('<w:cellMerge w:id="1"') > 0);
   // Nothing left that can be resolved: nothing to do, and it says so.
   const none = rejectAll(o.doc);
   assert.deepEqual([none.ops.length, none.resolved, none.skipped], [0, 0, 1]);
 });
 
 test('revisions: a rejected formatting change of a cell that also carries a change kept as XML is refused; accepting it is not', async () => {
-  const cell = `<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:cellIns w:id="1"${WHO('Ann')}/><w:tcPrChange w:id="2"${WHO('Bob')}><w:tcPr><w:tcW w:w="900" w:type="dxa"/></w:tcPr></w:tcPrChange></w:tcPr>${p('cell')}</w:tc>`;
+  const cell = `<w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/><w:cellMerge w:id="1"${WHO('Ann')} w:vMerge="rest"/><w:tcPrChange w:id="2"${WHO('Bob')}><w:tcPr><w:tcW w:w="900" w:type="dxa"/></w:tcPr></w:tcPrChange></w:tcPr>${p('cell')}</w:tc>`;
   const o = await open(tbl(`<w:tr>${cell}</w:tr>`, [2000]) + p('end'));
   const format = first(o.doc, 'tableFormat');
   assert.deepEqual([format.canAccept, format.canReject], [true, false]);
@@ -487,7 +488,7 @@ test('revisions: a rejected formatting change of a cell that also carries a chan
   assert.deepEqual([all.resolved, all.skipped], [0, 2]);
   run(o.history, acceptRevision(o.doc, format));
   const out = await body(o);
-  assert.ok(out.indexOf('tcPrChange') < 0 && out.indexOf('<w:cellIns w:id="1"') > 0 && out.indexOf('w:w="2000"') > 0, out);
+  assert.ok(out.indexOf('tcPrChange') < 0 && out.indexOf('<w:cellMerge w:id="1"') > 0 && out.indexOf('w:w="2000"') > 0, out);
 });
 
 test('revisions: a change that is gone from the document is refused', async () => {

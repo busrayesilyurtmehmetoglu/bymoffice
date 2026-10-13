@@ -121,7 +121,8 @@ import {
 } from './position';
 import { freeRelId, rowSpans, takenByDocument, type Taken } from './structure';
 import { cellsBetween, deleteSpan, joinedProps, neighbour, newMarkProps, parting, withoutSection } from './text';
-import { noteForeignIds, plainExtras, plainProps } from './track';
+import { TRACK_UNSUPPORTED, noteForeignIds, plainExtras, plainProps, withFreshChanges, withMarkRevision, withPlainMark, type Tracking } from './track';
+import { insertedBlocks, insertedFiller, insertedPieces } from './track-blocks';
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -1342,6 +1343,39 @@ function inside(pieces: Piece[], base: Wrapper | undefined): Piece[] {
   return pieces.map((piece) => ({ ...piece, wrap: rebase(piece.wrap, 0) }));
 }
 
+/**
+ * The wrappers a tracked paste goes into at the caret: those the caret is in
+ * without the tracked changes among them. What is pasted gets insertions of
+ * its own, innermost (an insertion holds runs and nothing else, and a paste
+ * may bring links and controls), so an insertion or a move of somebody else
+ * the caret stands in is cut in two there. Refused with TRACK_UNSUPPORTED
+ * when a content control inside such a change would be cut with it.
+ */
+function untrackedBase(base: Wrapper | undefined): Wrapper | undefined {
+  let control = false;
+  let steps = 0;
+  for (let w = base; w && steps < 4096; w = w.parent, steps++) {
+    if (w.kind === 'sdt' || w.kind === 'customXml') control = true;
+    else if (control && isChange(w)) return bad(TRACK_UNSUPPORTED);
+  }
+  const strip = (w: Wrapper | undefined, depth: number): Wrapper | undefined => {
+    if (!w || depth > 4096) return undefined;
+    const parent = strip(w.parent, depth + 1);
+    if (isChange(w)) return parent;
+    if (parent === w.parent) return w;
+    const out = { ...w } as Wrapper;
+    if (parent) out.parent = parent;
+    else delete out.parent;
+    return out;
+  };
+  return strip(base, 0);
+}
+
+const isChange = (w: Wrapper): boolean => w.kind === 'ins' || w.kind === 'del' || w.kind === 'moveFrom' || w.kind === 'moveTo';
+
+/** Properties for a paragraph a tracked paste ends where there was no end before: its mark says that it was inserted. */
+const endedBy = (track: Tracking, props: ParaProps): ParaProps => withMarkRevision(withFreshChanges(withPlainMark(withoutSection(props)), track), 'inserted', track.revision());
+
 const lengthOf = (pieces: Piece[]): number => {
   let length = 0;
   for (const piece of pieces) length += piece.len;
@@ -1469,6 +1503,13 @@ export function fragmentNeeds(doc: DocModel, fragment: DocFragment): string[] {
  * of blocks: an empty paragraph is added where it would. The caret is left
  * after what was put in.
  *
+ * Where changes are tracked everything that is put in is a tracked
+ * insertion: the content of the paragraphs (in insertions, innermost around
+ * their runs), the mark of every paragraph the paste makes, the rows of its
+ * tables. The mark that was there stays the mark of the last paragraph, so
+ * rejecting the paste joins the paragraph again as it was. A range is
+ * deleted as a tracked change first.
+ *
  * Throws RangeError for a place that cannot be edited; for tables that would
  * nest deeper than MAX_TABLE_DEPTH; for a fragment of a document of the other
  * kind (strict or transitional) or one that names WordprocessingML by another
@@ -1485,7 +1526,7 @@ export function insertFragment(doc: DocModel, at: DocPosition | DocRange, fragme
     const caret = samePosition(start, end) ? start : deleteSpan(draft, start, end);
     if (fragment.blocks.length === 0) return caret;
     return place(draft, caret, fragment, options);
-  }, options);
+  }, options, true);
 }
 
 function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options: InsertFragmentOptions | undefined): DocPosition {
@@ -1558,7 +1599,14 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
   const paragraph = at.paragraph;
   const pieces = flatten(paragraph);
   const index = caretIndex(pieces, caret);
-  const base = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+  const track = draft.track;
+  const between = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+  const base = track ? untrackedBase(between) : between;
+  /** The content of a paragraph of the fragment as it stands at the caret; a tracked insertion where changes are tracked. */
+  const incoming = (from: Paragraph): Piece[] => {
+    const made = inside(pastePieces(ctx, from), base);
+    return track ? insertedPieces(track, made) : made;
+  };
   let head = pieces.slice(0, index);
   let tail = pieces.slice(index);
   const blocks = fragment.blocks;
@@ -1585,7 +1633,7 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
   };
 
   if (blocks.length === 1 && openStart && openEnd) {
-    const added = inside(pastePieces(ctx, first as Paragraph), base);
+    const added = incoming(first as Paragraph);
     definitions();
     draft.setParagraph(story, caret.path, paragraphWith(paragraph, rebuild(head.concat(added, tail))));
     return { story, path: caret.path.slice(), offset: lengthOf(head) + lengthOf(added) };
@@ -1593,12 +1641,15 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
 
   const shows = (list: Piece[]): boolean => list.some((piece) => piece.len > 0 || isAtom(piece));
   const bound = <T extends Block>(block: T): T => (paragraph.wrap ? { ...block, wrap: paragraph.wrap } : block);
+  /** The first half of the paragraph at the caret, where the paste ends it: its mark is new. */
+  const cutHead = (): Paragraph => paragraphWith(paragraph, rebuild(head), track ? endedBy(track, paragraph.props) : newMarkProps(paragraph.props));
   const out: Block[] = [];
   let headUsed = false;
   let from = 0;
   let to = blocks.length;
   if (openStart) {
-    const made: Paragraph = { type: 'paragraph', props: adaptParaProps(ctx, (first as Paragraph).props), children: rebuild(head.concat(inside(pastePieces(ctx, first as Paragraph), base))) };
+    const firstProps = adaptParaProps(ctx, (first as Paragraph).props);
+    const made: Paragraph = { type: 'paragraph', props: track ? withMarkRevision(firstProps, 'inserted', track.revision()) : firstProps, children: rebuild(head.concat(incoming(first as Paragraph))) };
     if (paragraph.attrs && head.length) made.attrs = paragraph.attrs;
     // UNSURE: the text before the caret takes the paragraph formatting of the first paragraph pasted, whose end was
     // copied, as in Word; whether Word does so for every kind of paragraph formatting was not compared.
@@ -1616,18 +1667,19 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
   const middle: Block[] = [];
   for (let i = from; i < to; i++) {
     const made = pasteBlock(ctx, blocks[i], 0);
-    if (made) middle.push(bound(made));
+    if (made) middle.push(bound(track ? insertedBlocks(track, [made])[0] : made));
   }
   let target: Block | undefined;
   let offset = 0;
   let after = false;
   if (openEnd) {
-    if (!openStart && headUsed) out.push(paragraphWith(paragraph, rebuild(head), newMarkProps(paragraph.props)));
+    if (!openStart && headUsed) out.push(cutHead());
     for (const block of middle) out.push(block);
-    const inner = inside(pastePieces(ctx, last as Paragraph), base);
+    const inner = incoming(last as Paragraph);
     let props = paragraph.props;
     const left = fragment.joinedProps;
-    if (options && options.moved === true && openStart && fragment.endProps && left && (props === left || sameProps(props, left))) props = adaptParaProps(ctx, fragment.endProps);
+    // (Where changes are tracked the cut joined nothing, so there is no formatting to give back.)
+    if (!track && options && options.moved === true && openStart && fragment.endProps && left && (props === left || sameProps(props, left))) props = adaptParaProps(ctx, fragment.endProps);
     target = paragraphWith(paragraph, rebuild(inner.concat(tail)), props, !(headUsed && head.length > 0));
     offset = lengthOf(inner);
     out.push(target);
@@ -1640,7 +1692,7 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
       for (const block of middle) out.push(block);
       after = true;
     } else {
-      if (!openStart && headUsed) out.push(paragraphWith(paragraph, rebuild(head), newMarkProps(paragraph.props)));
+      if (!openStart && headUsed) out.push(cutHead());
       for (const block of middle) out.push(block);
       // The paragraph itself when nothing of it is before the caret: it keeps its place in the source of the story.
       target = head.length === 0 ? paragraph : paragraphWith(paragraph, rebuild(tail), paragraph.props, false);
@@ -1652,7 +1704,7 @@ function place(draft: Draft, caret: DocPosition, fragment: DocFragment, options:
   // A table never touches another one and never ends its list.
   const before = neighbour(at.blocks, at.index, -1);
   const behind = neighbour(at.blocks, at.index, 1);
-  const empty = (): Paragraph => bound({ type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] });
+  const empty = (): Paragraph => bound(track ? insertedFiller(track, undefined) : { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] });
   const placed: Block[] = [];
   let previous = before >= 0 ? at.blocks[before].type : '';
   for (const block of out) {

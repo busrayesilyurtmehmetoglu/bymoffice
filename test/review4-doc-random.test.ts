@@ -1,7 +1,8 @@
 // Editing with and without tracking, accepting, rejecting, undoing and redoing on random
 // documents (seeded): after every step the model is what a reader of the file written from it
 // has, the file is well formed with ids that are unique, and an edit that is not tracked makes
-// no tracked change of a paragraph mark or of formatting.
+// no tracked change of a paragraph mark or of formatting. Among the edits: tables, rows, columns
+// and links, which are tracked changes where changes are tracked.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -12,8 +13,14 @@ import {
   DocHistory,
   acceptRevision,
   deleteBackward,
+  deleteColumn,
   deleteForward,
   deleteRange,
+  deleteRow,
+  insertColumn,
+  insertHyperlink,
+  insertRow,
+  insertTable,
   insertText,
   listRevisions,
   rejectRevision,
@@ -111,7 +118,7 @@ function shapeOf(doc: DocModel): string {
     .replace(/,}/g, '}');
 }
 
-const REVISION = /<w:(ins|del|moveFrom|moveTo|rPrChange|pPrChange|numberingChange)\b([^>]*)>/g;
+const REVISION = /<w:(ins|del|moveFrom|moveTo|rPrChange|pPrChange|numberingChange|cellIns|cellDel|tblGridChange)\b([^>]*)>/g;
 
 async function check(o: Opened, label: string, uniqueIds: boolean): Promise<void> {
   await writeDocx(o.pkg, o.doc);
@@ -149,17 +156,18 @@ function marksAndRecords(doc: DocModel): number {
   return count;
 }
 
-async function walk(seed: number, duplicateIds: boolean, steps: number): Promise<{ done: number; resolved: number; undone: number }> {
+async function walk(seed: number, duplicateIds: boolean, steps: number): Promise<{ done: number; resolved: number; undone: number; tables: number }> {
   const o = await open(generateWrapped(seed, duplicateIds));
   const d = dice(seed * 31 + 7);
   const me = { author: 'Me', date: '2026-10-09T10:00:00Z' };
   let done = 0;
   let resolved = 0;
   let undone = 0;
+  let tables = 0;
   await check(o, `seed ${seed} start`, !duplicateIds);
   for (let step = 0; step < steps; step++) {
     const label = `seed ${seed}${duplicateIds ? ' (ids twice)' : ''} step ${step}`;
-    const kind = d.int(12);
+    const kind = d.int(16);
     if (kind === 0 && o.history.canUndo) {
       o.history.undo();
       undone++;
@@ -188,6 +196,17 @@ async function walk(seed: number, duplicateIds: boolean, steps: number): Promise
       else if (kind === 6) [name, edit] = ['deleteBackward', deleteBackward(o.doc, at, 'char', options)];
       else if (kind === 7) [name, edit] = ['deleteForward', deleteForward(o.doc, at, 'char', options)];
       else if (kind === 8) [name, edit] = ['lines', insertText(o.doc, at, 'x\ny', undefined, options)];
+      else if (kind === 12) [name, edit] = ['table', insertTable(o.doc, at, 1 + d.int(2), 1 + d.int(2), options)];
+      else if (kind === 13 || kind === 14) {
+        // In a cell of a table, when the document has one by now.
+        const cells = paths.filter((other) => other.length >= 4);
+        if (!cells.length) continue;
+        const cell = { story: 'body', path: d.pick(cells), offset: 0 };
+        const choice = d.int(2);
+        if (kind === 13) [name, edit] = choice ? ['insertRow', insertRow(o.doc, cell, d.pick(['above', 'below'] as const), options)] : ['deleteRow', deleteRow(o.doc, cell, options)];
+        else [name, edit] = choice ? ['insertColumn', insertColumn(o.doc, cell, d.pick(['left', 'right'] as const), options)] : ['deleteColumn', deleteColumn(o.doc, cell, options)];
+        tables++;
+      } else if (kind === 15) [name, edit] = ['link', insertHyperlink(o.doc, { anchor: at, focus: to }, '#here', options)];
       else {
         const list = listRevisions(o.doc).list.filter((revision) => revision.kind !== 'other');
         if (!list.length) continue;
@@ -220,7 +239,7 @@ async function walk(seed: number, duplicateIds: boolean, steps: number): Promise
   while (o.history.canUndo) o.history.undo();
   await writeDocx(o.pkg, o.doc);
   assert.deepEqual(await o.pkg.save(), o.bytes, `seed ${seed}: undo`);
-  return { done, resolved, undone };
+  return { done, resolved, undone, tables };
 }
 
 const SEEDS = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 217, 233, 377];
@@ -229,13 +248,16 @@ test('random review 4: the model is what the file reads as after every edit, res
   let done = 0;
   let resolved = 0;
   let undone = 0;
+  let tables = 0;
   for (const seed of SEEDS) {
     const result = await walk(seed, false, 70);
     done += result.done;
     resolved += result.resolved;
     undone += result.undone;
+    tables += result.tables;
   }
   assert.ok(done > SEEDS.length * 25 && resolved > SEEDS.length * 3 && undone > SEEDS.length * 2, `${done} edits, ${resolved} resolved, ${undone} undone`);
+  assert.ok(tables > SEEDS.length, `${tables} edits of rows and columns`);
 });
 
 test('random review 4: the same in files that come with ids twice', async () => {

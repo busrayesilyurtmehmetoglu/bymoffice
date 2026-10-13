@@ -11,7 +11,8 @@
 //     text as <w:delText> items; the mark of a paragraph that was joined to
 //     the next says `deleted`, and the two paragraphs stay two;
 //   - text (and tabs and line breaks) that sits directly in a tracked
-//     insertion of the same author is taken out for good, as Word does:
+//     insertion the same author made since the document was opened (see
+//     Tracking.made) is taken out for good, as Word does:
 //     nobody needs the history of a change to a change. Everything else in
 //     such an insertion (a note reference, a field, a picture, an equation,
 //     and text inside a simple field, a link, a content control or a smart
@@ -42,6 +43,9 @@
 //       - deleted text is not formatted at all.
 // Content in a `del` wrapper is not content any more: it takes no offsets
 // (see position.ts) and no command touches it again.
+//
+// Rows, cells and tables that are put in or taken out, and content that is
+// put in whole (a paste, a picture, a linked text): see track-blocks.ts.
 
 import { createContext, createReaderState } from '../../formats/docx/common';
 import { paraPropsElement, runPropsElement, wEl, type PropsContext } from '../../formats/docx/write-props';
@@ -179,6 +183,17 @@ export function trackingFor(doc: DocModel, options?: TrackOptions): Tracking | u
 }
 
 /**
+ * Says that the revisions with these ids are ones `author` made since the document was opened (see Tracking.made).
+ * Nothing a file brought is the editor's by itself; this is for a caller that knows better, and for tests of what
+ * happens to an own insertion that holds more than typing can put there.
+ */
+export function claimRevisions(doc: DocModel, author: string, ids: number[]): void {
+  let given = SESSION_IDS.get(doc);
+  if (!given) SESSION_IDS.set(doc, (given = new Map<number, string>()));
+  for (const id of ids) given.set(id, author);
+}
+
+/**
  * A new id for an element that is a part of the revision with the id `from` (an edit cut that in two). The part is
  * as much of this session as the revision was: whoever made the one made the other.
  */
@@ -188,6 +203,14 @@ function renewedId(doc: DocModel, from: number | undefined): number {
   const author = given && from !== undefined ? given.get(from) : undefined;
   if (given && author !== undefined) given.set(id, author);
   return id;
+}
+
+/**
+ * A revision like `info` for another element of the same change (the cell of a new row in a column that is a pending
+ * change): the same author and date under an id of its own, and as much of this session as the one it is like.
+ */
+export function revisionLike(doc: DocModel, info: RevisionInfo): RevisionInfo {
+  return { ...info, id: renewedId(doc, info.id) };
 }
 
 // ------------------------------------------------------------------------ ids
@@ -225,8 +248,13 @@ function idsOfBlocks(blocks: Block[], note: (id: number | undefined) => void, de
         if (row.props.inserted) note(row.props.inserted.id);
         if (row.props.deleted) note(row.props.deleted.id);
         if (row.extras) for (const extra of row.extras) idsOfElement(extra.el, note, 0);
-        for (const cell of row.cells) idsOfBlocks(cell.blocks, note, depth + 1);
+        for (const cell of row.cells) {
+          if (cell.props.inserted) note(cell.props.inserted.id);
+          if (cell.props.deleted) note(cell.props.deleted.id);
+          idsOfBlocks(cell.blocks, note, depth + 1);
+        }
       }
+      if (block.gridChange) note(block.gridChange.id);
     }
   }
 }
@@ -429,6 +457,17 @@ function refuseCopies(from: Wrapper | undefined, until: Wrapper): void {
 }
 
 /**
+ * Does text the editor types go on in an insertion: one they made since the document was opened. An insertion a file
+ * brought under the same name is not theirs to add to (see Tracking.made): what is typed beside it is an insertion of
+ * its own, which can be taken back for good. An editor without a name owns none, and goes on in any that carries the
+ * stand-in name, so that typing makes one insertion and not one for every key.
+ */
+function continues(tracking: Tracking, wrapper: RevisionWrapper): boolean {
+  if (wrapper.author !== tracking.author) return false;
+  return !tracking.named || tracking.made(wrapper);
+}
+
+/**
  * The wrapper text put before the piece at `index` goes into, given the one
  * it would take untracked (`base`, see wrapBetween): an insertion of this
  * author beside it is continued (it keeps its date), text inside the
@@ -446,7 +485,7 @@ export function insertionWrap(tracking: Tracking, pieces: Piece[], index: number
     }
   }
   if (around) {
-    if (around.kind === 'ins' && around.author === tracking.author) return { wrap: base as Wrapper, pieces };
+    if (around.kind === 'ins' && continues(tracking, around)) return { wrap: base as Wrapper, pieces };
     // Every wrapper between the text and the insertion that is cut is cut with it.
     refuseCopies(base, around);
     const mine = newWrapper('ins', tracking.revision(), around.parent);
@@ -467,7 +506,7 @@ export function insertionWrap(tracking: Tracking, pieces: Piece[], index: number
   }
   for (const near of [index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined]) {
     for (let w = near; w; w = w.parent) {
-      if (w.kind === 'ins' && w.author === tracking.author && w.parent === base) return { wrap: w, pieces };
+      if (w.kind === 'ins' && continues(tracking, w) && w.parent === base) return { wrap: w, pieces };
     }
   }
   return { wrap: newWrapper('ins', tracking.revision(), base), pieces };
@@ -552,7 +591,7 @@ function joinStruck(pieces: Piece[]): Piece[] {
  * The pieces with the content of [from, to) deleted as a tracked change:
  * what removePieces() would take is put into a deletion (and takes no
  * offsets any more), except for the text, tabs and line breaks this author
- * had inserted as a tracked change, which go - unless a link, a control or
+ * had inserted as a tracked change since the document was opened, which go - unless a link, a control or
  * the like around the insertion would be left with nothing: then all of the
  * author's text in it stays, deleted. `changed` is false when there was
  * nothing to delete.
@@ -571,7 +610,7 @@ export function strikePieces(tracking: Tracking, pieces: Piece[], from: number, 
     const piece = pieces[q];
     const item = piece.item;
     const wrap = piece.wrap;
-    if (!fields || !item || piece.code || fields[q] >= 0 || !wrap || wrap.kind !== 'ins' || wrap.author !== author) return false;
+    if (!fields || !item || piece.code || fields[q] >= 0 || !wrap || wrap.kind !== 'ins' || !tracking.made(wrap)) return false;
     return item.type === 'text' || item.type === 'tab' || (item.type === 'break' && item.kind === 'line');
   };
   const gone: boolean[] = [];
@@ -711,10 +750,10 @@ export function joinsWithoutLoss(first: ParaProps, second: ParaProps): boolean {
   return sameProps(a, b) && sameProps(withoutRevisionFlags(first.markProps), withoutRevisionFlags(second.markProps));
 }
 
-/** Was the mark of a paragraph inserted by this author as a tracked change: joining it to a paragraph formatted alike takes the mark out for good. */
+/** Was the mark of a paragraph inserted by this author as a tracked change since the document was opened: joining it to a paragraph formatted alike takes the mark out for good. */
 export function isOwnMark(props: ParaProps, tracking: Tracking): boolean {
   const mark = props.markProps;
-  return tracking.named && mark !== undefined && mark.inserted !== undefined && mark.inserted.author === tracking.author;
+  return mark !== undefined && tracking.made(mark.inserted);
 }
 
 /** A kept <w:pPrChange> or <w:rPrChange> with an id of its own. */

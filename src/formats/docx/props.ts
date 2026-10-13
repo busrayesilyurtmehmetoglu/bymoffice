@@ -11,6 +11,7 @@
 // both spellings is kept, as the model holds only one of the two values.
 
 import {
+  type AttrList,
   EMPTY_PARA_PROPS,
   EMPTY_RUN_PROPS,
   type Border,
@@ -258,6 +259,23 @@ function readCellMargins(ctx: PartContext, el: XmlElement, target: CellMargins):
 }
 
 /** Author, date and id of a tracked change element. */
+/**
+ * A mark of a revision in properties (<w:ins> in <w:rPr> or <w:trPr>, <w:cellIns>): who and when, and whatever
+ * other attributes it carries, which are part of the mark and go where it goes. Undefined for an element that holds
+ * anything: that is no mark the model can stand for, and it is kept whole.
+ */
+function readRevisionMark(ctx: PartContext, el: XmlElement): RevisionInfo | undefined {
+  if (hasContent(el)) return undefined;
+  const info = readRevision(ctx, el);
+  const known = info.id === undefined ? ['author', 'date'] : ['id', 'author', 'date'];
+  let rest: AttrList | undefined;
+  el.attrs.forEach((value, name) => {
+    if (known.indexOf(kindOf(ctx, name)) < 0) (rest || (rest = [])).push([name, value]);
+  });
+  if (rest) info.attrs = rest;
+  return info;
+}
+
 export function readRevision(ctx: PartContext, el: XmlElement): RevisionInfo {
   const info: RevisionInfo = {};
   const id = intAttr(ctx, el, 'id', -0x80000000, 0x7fffffff);
@@ -324,9 +342,10 @@ function parseRunProps(ctx: PartContext, el: XmlElement): RunProps {
     }
     const mark = REVISION_MARKS.get(kind);
     if (mark !== undefined) {
-      if (p[mark]) return UNKNOWN;
-      p[mark] = readRevision(ctx, child);
-      return LEAF;
+      const info = p[mark] ? undefined : readRevisionMark(ctx, child);
+      if (!info) return UNKNOWN;
+      p[mark] = info;
+      return DONE;
     }
     switch (kind) {
       case 'rStyle': {
@@ -954,9 +973,10 @@ export function readRowProps(ctx: PartContext, el: XmlElement | undefined): RowP
       case 'ins':
       case 'del': {
         const field = kind === 'ins' ? 'inserted' : 'deleted';
-        if (p[field]) return UNKNOWN;
-        p[field] = readRevision(ctx, child);
-        return LEAF;
+        const info = p[field] ? undefined : readRevisionMark(ctx, child);
+        if (!info) return UNKNOWN;
+        p[field] = info;
+        return DONE;
       }
       case 'trPrChange':
         if (p.change) return UNKNOWN;
@@ -1037,6 +1057,15 @@ export function readCellProps(ctx: PartContext, el: XmlElement | undefined): Cel
         if (value === undefined || p.cnfStyle !== undefined) return UNKNOWN;
         p.cnfStyle = value;
         return LEAF;
+      }
+      case 'cellIns':
+      case 'cellDel': {
+        const field = kind === 'cellIns' ? 'inserted' : 'deleted';
+        // The first one counts; a second is kept as it is.
+        const info = p[field] ? undefined : readRevisionMark(ctx, child);
+        if (!info) return UNKNOWN;
+        p[field] = info;
+        return DONE;
       }
       case 'tcPrChange':
         if (p.change) return UNKNOWN;

@@ -319,16 +319,11 @@ export class DocToolbar {
       'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'highlight', 'alignLeft', 'alignCenter', 'alignRight', 'alignJustify',
       'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak',
     ];
+    // Where changes are tracked all of these are offered too: each makes its change as a tracked one, and the few
+    // it cannot make so (a column through merged cells, a link over a picture) are refused when asked for, and said.
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
-    // Where changes are tracked, what cannot be made a tracked change yet is not offered: tables, pictures and
-    // links. The formatting of text and of paragraphs, lists and styles are tracked changes there.
-    const tracked = editable && view.trackingChanges;
-    if (tracked) {
-      const untracked: ButtonKey[] = ['insertTable', 'insertPicture', 'insertLink'];
-      for (let i = 0; i < untracked.length; i++) this.setDisabled(untracked[i], true);
-    }
     // Rows and columns are those of the table the caret is in.
-    this.setDisabled('rowsColumns', !editable || tracked || !view.inTable);
+    this.setDisabled('rowsColumns', !editable || !view.inTable);
     this.styleSelect.disabled = !editable;
     this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;

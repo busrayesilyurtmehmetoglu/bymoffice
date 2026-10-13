@@ -8,6 +8,7 @@ import { readDocx } from '../src/formats/docx/document';
 import { writeDocx } from '../src/formats/docx/write';
 import { type DocModel } from '../src/model/doc/types';
 import { DocHistory, deleteRange, insertText, type DocEditOptions, type DocRange } from '../src/ops/doc/index';
+import { claimRevisions } from '../src/ops/doc/track';
 import { OpcPackage } from '../src/opc';
 import { parseXml } from '../src/xml';
 import { NUMBERING, STYLES, docPicture, p, paragraphAt, pos, r, range, run, texts } from './doc-ops-fixtures';
@@ -29,6 +30,8 @@ async function open(body: string, extra: Partial<DocxSpec> = {}): Promise<Opened
   const bytes = await buildSpec({ body: body + SECT, styles: STYLES, settings: TRACK, ...extra });
   const pkg = await OpcPackage.open(bytes);
   const doc = await readDocx(pkg);
+  // The insertions of these tests are ones the editor made in this session: only such a one gives up what was typed into it.
+  claimRevisions(doc, 'Me', [7, 8, 20]);
   return { pkg, doc, history: new DocHistory<DocRange | undefined>(doc) };
 }
 

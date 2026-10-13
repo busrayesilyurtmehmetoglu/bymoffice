@@ -18,7 +18,6 @@ import {
   insertBlock,
   insertColumn,
   insertHyperlink,
-  insertImage,
   insertPageBreak,
   insertRow,
   insertTable,
@@ -33,6 +32,7 @@ import {
   type DocPosition,
   type DocRange,
 } from '../src/ops/doc/index';
+import { claimRevisions } from '../src/ops/doc/track';
 import { OpcPackage } from '../src/opc';
 import { parseXml } from '../src/xml';
 import { STYLES, checkInvariants, dice, docPicture, p, paragraphAt, paragraphPaths, pos, r, randomPosition, range, run, tbl, tc, texts, tr } from './doc-ops-fixtures';
@@ -471,26 +471,18 @@ test('save, open again: the model holds the same revisions', async () => {
 });
 
 test('what cannot be tracked is refused and changes nothing', async () => {
-  const o = await open(p('abcd') + tbl(tr(tc('x') + tc('y')) + tr(tc('z') + tc('w')), [1000, 1000]) + p('end'), {
-    numbering: '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="-"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>',
-  });
+  // (Formatting of text, of paragraphs and lists is tracked: test/doc-track-format.test.ts. Tables, rows, columns,
+  // pictures, links, blocks and ranges over tables are tracked too: test/doc-track-tables.test.ts, test/doc-track-content.test.ts.)
+  const field =
+    '<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> DATE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>today</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>';
+  const o = await open(p(r('ab') + field + r('cd')) + tbl(tr(tc('x', '<w:gridSpan w:val="2"/>')) + tr(tc('z') + tc('w')), [1000, 1000]) + p('end'));
   const before = docPicture(o.doc);
-  const span = range(pos(0, 1), pos(0, 3));
-  const cell: DocPosition = { story: 'body', path: [1, 0, 0, 0], offset: 0 };
-  // (Formatting of text, of paragraphs and lists is tracked: test/doc-track-format.test.ts.)
-  refused(() => insertTable(o.doc, pos(0, 1), 2, 2));
-  refused(() => insertRow(o.doc, cell, 'below'));
-  refused(() => deleteRow(o.doc, cell));
+  const cell: DocPosition = { story: 'body', path: [1, 1, 0, 0], offset: 0 };
+  // A column through a merged cell; a link over the text of a field; a block that is neither a paragraph nor a table.
   refused(() => insertColumn(o.doc, cell, 'right'));
   refused(() => deleteColumn(o.doc, cell));
-  refused(() => insertHyperlink(o.doc, span, 'https://example.org/'));
-  refused(() => insertImage(o.doc, pos(0, 1), { bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]), type: 'image/png', width: 9525, height: 9525 }));
-  refused(() => insertBlock(o.doc, pos(0, 1), { type: 'paragraph', props: {}, children: [] }));
-  // A range that takes cells of a table, or a table whole.
-  refused(() => deleteRange(o.doc, range(pos(0, 1), pos(2, 1)), ME));
-  refused(() => deleteRange(o.doc, range(pos(0, 1), { story: 'body', path: [1, 0, 0, 0], offset: 1 }), ME));
-  refused(() => deleteRange(o.doc, range({ story: 'body', path: [1, 0, 0, 0], offset: 0 }, { story: 'body', path: [1, 1, 1, 0], offset: 1 }), ME));
-  refused(() => insertText(o.doc, range(pos(0, 1), pos(2, 1)), 'x', undefined, ME));
+  refused(() => insertHyperlink(o.doc, range(pos(0, 1), pos(0, 6)), 'https://example.org/'));
+  refused(() => insertBlock(o.doc, pos(0, 1), { type: 'mark', mark: { type: 'bookmarkStart', id: '9', name: 'b' } }));
   assert.equal(docPicture(o.doc), before);
   assert.equal(o.doc.body.modified, undefined);
 });
@@ -535,10 +527,25 @@ test('random tracked edits: the file stays well formed and in schema order, and 
       const other = randomPosition(o.doc, d, story, paths);
       const who: DocEditOptions = { author: d.chance(0.7) ? 'Me' : 'Other', date: ME.date };
       let edit: DocEdit | undefined;
+      // A place in a cell of a table, for the rows and columns.
+      const cells = paragraphPaths(o.doc, 'body').filter((path) => path.length >= 4);
+      const cell: DocPosition = { story: 'body', path: d.pick(cells), offset: 0 };
       try {
-        switch (d.int(6)) {
+        switch (d.int(10)) {
           case 0:
             edit = insertText(o.doc, at, d.pick(['x', 'two words', 'a\nb', '\t', ' ']), undefined, who);
+            break;
+          case 6:
+            edit = insertTable(o.doc, at, 1 + d.int(2), 1 + d.int(2), who);
+            break;
+          case 7:
+            edit = d.chance(0.5) ? insertRow(o.doc, cell, d.pick(['above', 'below'] as const), who) : deleteRow(o.doc, cell, who);
+            break;
+          case 8:
+            edit = d.chance(0.5) ? insertColumn(o.doc, cell, d.pick(['left', 'right'] as const), who) : deleteColumn(o.doc, cell, who);
+            break;
+          case 9:
+            edit = insertHyperlink(o.doc, range(at, { ...at, offset: Math.min(at.offset + 2, texts(o.doc, story)[paths.findIndex((path) => path.join() === at.path.join())].length) }), 'https://example.org/', who);
             break;
           case 1:
             edit = deleteBackward(o.doc, at, d.chance(0.3) ? 'word' : 'char', who);
@@ -556,7 +563,7 @@ test('random tracked edits: the file stays well formed and in schema order, and 
             edit = insertText(o.doc, range(at, other), 'Z', undefined, who);
         }
       } catch (error) {
-        // A range over a table is refused; nothing else may be.
+        // What cannot be tracked (a column through cells that were merged meanwhile, a link over a field) is refused; nothing else may be.
         assert.ok(error instanceof RangeError && error.message === TRACK_UNSUPPORTED, String(error));
         continue;
       }
@@ -600,6 +607,8 @@ const OWN = (author: string, inner: string) => `<w:ins w:id="7" w:author="${auth
 
 test('of what the same author inserted only text goes for good: a note reference, a field, a picture and an equation stay, deleted', async () => {
   const o = await open(p(r('a') + OWN('Me', r('x') + '<w:r><w:footnoteReference w:id="2"/></w:r>' + FIELD + DRAWING + MATH + '<w:r><w:tab/><w:br/><w:br w:type="page"/><w:t>y</w:t></w:r>') + r('b')), { footnotes: NOTES });
+  // The insertion is one the editor made in this session: only such a one gives up what was typed into it.
+  claimRevisions(o.doc, 'Me', [7]);
   const original = await written(o);
   const picture = docPicture(o.doc);
   const length = texts(o.doc)[0].length;
@@ -653,6 +662,7 @@ test('an editor without a name owns no insertion: what "Author" inserted is dele
 test('text typed into a content control inside the insertion of somebody else is refused: the control would be written three times', async () => {
   const sdt = (inner: string) => `<w:sdt><w:sdtPr><w:id w:val="99"/><w:dataBinding w:xpath="/a"/></w:sdtPr><w:sdtContent>${inner}</w:sdtContent></w:sdt>`;
   const o = await open(p(OWN('You', sdt(r('abcd')))) + p(OWN('You', `<w:hyperlink w:anchor="here">${r('link')}</w:hyperlink>`)) + p(OWN('Me', sdt(r('mine')))) + p(sdt(OWN('You', r('inside')))));
+  claimRevisions(o.doc, 'Me', [7]);
   const before = docPicture(o.doc);
   refused(() => insertText(o.doc, pos(0, 2), 'X', undefined, ME));
   refused(() => insertText(o.doc, pos(0, 2), 'X\nY', undefined, ME));

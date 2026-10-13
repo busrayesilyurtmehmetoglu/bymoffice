@@ -129,6 +129,8 @@ export interface RevisionInfo {
   author?: string;
   /** ISO 8601 text as written. */
   date?: string;
+  /** Every other attribute the element of the revision carries (w16du:dateUtc, an id that is no number): part of it, written back with it. */
+  attrs?: AttrList;
 }
 
 /** Run properties that toggle between style levels instead of overriding (ECMA-376 Part 1, 17.7.3). */
@@ -461,6 +463,9 @@ export interface CellProps {
   fitText?: boolean;
   hideMark?: boolean;
   cnfStyle?: string;
+  /** The cell was put in, or taken out, with its column as a tracked change (<w:cellIns>, <w:cellDel>). */
+  inserted?: RevisionInfo;
+  deleted?: RevisionInfo;
   /** <w:tcPrChange> as read. */
   change?: XmlElement;
   extras?: ExtraXml[];
@@ -945,6 +950,11 @@ export interface Table extends BlockBase {
   props: TableProps;
   /** Grid column widths in twips. */
   grid: number[];
+  /**
+   * The grid as it was before a tracked change of the columns (<w:tblGridChange>, which names nobody: it has an id
+   * and nothing else). Only a record that holds plain columns, in a grid of plain columns, is read into this; any other stays in `extras` with its grid.
+   */
+  gridChange?: { id?: number; grid: number[] };
   rows: TableRow[];
   attrs?: AttrList;
   /** Children of <w:tbl>, or of a row-level wrapper in it, that are not rows or properties; <w:tblGrid> too when it has more than plain columns. */

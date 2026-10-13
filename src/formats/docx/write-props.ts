@@ -349,11 +349,14 @@ function marginsEl(ctx: PropsContext, local: string, margins: CellMargins): XmlE
 }
 
 function revisionEl(ctx: PropsContext, local: string, info: RevisionInfo): XmlElement {
-  return wEl(ctx, local, [
+  const el = wEl(ctx, local, [
     ['id', info.id],
     ['author', info.author],
     ['date', info.date],
   ]);
+  // What else the mark carried, under the names it was read with.
+  if (info.attrs) for (const [name, value] of info.attrs) if (!el.attrs.has(name)) el.attrs.set(name, value);
+  return el;
 }
 
 /** <w:cnfStyle>: the bit string in transitional documents, an attribute per set flag in strict ones (which have no w:val). */
@@ -700,6 +703,8 @@ function cellGens(ctx: PropsContext, p: CellProps): Gen[] {
   if (p.fitText !== undefined) add('tcFitText', onOffEl(ctx, 'tcFitText', p.fitText));
   if (p.vAlign !== undefined) add('vAlign', wEl(ctx, 'vAlign', [['val', p.vAlign]]));
   if (p.hideMark !== undefined) add('hideMark', onOffEl(ctx, 'hideMark', p.hideMark));
+  if (p.inserted) add('cellIns', revisionEl(ctx, 'cellIns', p.inserted));
+  if (p.deleted) add('cellDel', revisionEl(ctx, 'cellDel', p.deleted));
   if (p.change) add(localOf(p.change.name), p.change);
   return out;
 }

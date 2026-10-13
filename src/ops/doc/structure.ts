@@ -14,6 +14,7 @@ import {
   type Paragraph,
   type RowProps,
   type RunItem,
+  type RunProps,
   type Table,
   type TableCell,
   type TableProps,
@@ -26,12 +27,14 @@ import { patchRunProps } from './format';
 import {
   caretIndex,
   cleanText,
+  fieldPairs,
   flatten,
   groupFor,
   harvestBlocks,
   harvestRow,
   harvestTable,
   inheritedProps,
+  isRemovable,
   itemPiece,
   leftInlines,
   offsetOf,
@@ -45,7 +48,8 @@ import {
 } from './pieces';
 import { asRange, containerBlocks, inTextBox, orderRange, paragraphIn, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
 import { newMarkProps, placeBlock } from './text';
-import { plainProps } from './track';
+import { TRACK_UNSUPPORTED, insertionWrap, plainProps, revisionLike, strikePieces, type Tracking } from './track';
+import { insertedCell, insertedRow, insertedTable, isOwnCell, isOwnRow, struckCell, struckRow } from './track-blocks';
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -128,7 +132,14 @@ function cellStart(doc: DocModel, site: CellSite, row: number, cell: number): Do
 /**
  * Inserts a row above or below the row a position is in. The new row has the
  * cells of that row, empty, with their formatting; where the row is crossed
- * by vertically merged cells, the new cells continue the merge.
+ * by vertically merged cells, the new cells continue the merge. Where changes
+ * are tracked the row is a tracked insertion (see track-blocks.ts).
+ *
+ * Of the tracked changes of the row beside it the new row takes none, but
+ * one: a cell in a column that is a pending change (put in or taken out,
+ * <w:cellIns> or <w:cellDel>) is a cell of that column, and says so under an
+ * id of its own. A column is resolved whole, in every row; a row without the
+ * mark would keep a cell the others lose.
  */
 export function insertRow(doc: DocModel, position: DocPosition, where: 'above' | 'below', _options?: DocEditOptions): DocEdit {
   if (where !== 'above' && where !== 'below') bad('A row goes above or below');
@@ -149,21 +160,24 @@ export function insertRow(doc: DocModel, position: DocPosition, where: 'above' |
       }
       if (continues) props.vMerge = 'continue';
       else delete props.vMerge;
+      if (cell.props.inserted) props.inserted = revisionLike(doc, cell.props.inserted);
+      if (cell.props.deleted) props.deleted = revisionLike(doc, cell.props.deleted);
       return { props, blocks: [emptyLike(cell)] };
     });
     const props: RowProps = { ...plainProps(ref.props) };
     // Only the rows at the top of a table repeat on every page.
     if (where === 'below') delete props.header;
-    const row: TableRow = { props, cells };
+    let row: TableRow = { props, cells };
     if (ref.tableProps) row.tableProps = plainProps(ref.tableProps);
     const at = where === 'above' ? site.row : site.row + 1;
     const wrap = wrapBetween(at > 0 ? table.rows[at - 1].wrap : undefined, at < table.rows.length ? table.rows[at].wrap : undefined);
     if (wrap) row.wrap = wrap;
+    if (draft.track) row = insertedRow(draft.track, row);
     const rows = table.rows.slice();
     rows.splice(at, 0, row);
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows)]);
     return cellStart(doc, site, at, site.cell);
-  }, _options);
+  }, _options, true);
 }
 
 /** What removed rows or cells leave behind (see harvestBlocks): inlines for a paragraph that stays, and blocks without content. */
@@ -179,7 +193,7 @@ const leftoverOf = (harvest: Harvest): Leftover => ({ inlines: leftInlines(harve
  * the start of its first paragraph (`atEnd`: to the end of its last one), the
  * blocks before that paragraph. The cell itself when there is nothing.
  */
-function cellWith(cell: TableCell, left: Leftover, atEnd: boolean): TableCell {
+export function cellWith(cell: TableCell, left: Leftover, atEnd: boolean): TableCell {
   if (left.inlines.length === 0 && left.blocks.length === 0) return cell;
   const blocks = cell.blocks.slice();
   let index = -1;
@@ -237,6 +251,8 @@ function removeTable(draft: Draft, site: CellSite): DocPosition {
   }
   const out: Block[] = left.blocks.slice();
   if (needed) {
+    // (Where changes are tracked only a table the author put in since the document was opened comes here, and that
+    // one stands between the paragraphs it was put between: the list needs no other.)
     const filler: Paragraph = { type: 'paragraph', props: EMPTY_PARA_PROPS, children: left.inlines };
     if (site.table.wrap) filler.wrap = site.table.wrap;
     out.push(filler);
@@ -255,11 +271,28 @@ function removeTable(draft: Draft, site: CellSite): DocPosition {
  * afterwards. What the row held that is not content (marks of bookmarks and
  * comments, kept XML) moves to the start of the row after it, or to the end
  * of the row before it.
+ *
+ * Where changes are tracked the row stays, as a tracked deletion with
+ * everything in it deleted, and the table with it; only a row the same
+ * author inserted since the document was opened, with nothing of anybody
+ * else in it, goes for good.
  */
 export function deleteRow(doc: DocModel, position: DocPosition, _options?: DocEditOptions): DocEdit {
   return buildEdit(doc, (draft) => {
     const site = cellSite(doc, position);
     const table = site.table;
+    const track = draft.track;
+    if (track && !isOwnRow(track, table.rows[site.row])) {
+      const struck = struckRow(track, table.rows[site.row]);
+      if (struck !== table.rows[site.row]) {
+        const marked = table.rows.slice();
+        marked[site.row] = struck;
+        draft.replace(site.story, site.container, site.index, 1, [tableWith(table, marked)]);
+      }
+      // The caret leaves the row that is deleted, as it would leave one that is gone.
+      const to = site.row + 1 < table.rows.length ? site.row + 1 : site.row;
+      return cellStart(doc, site, to, Math.min(site.cell, table.rows[to].cells.length - 1));
+    }
     if (table.rows.length <= 1) return removeTable(draft, site);
     const rows = table.rows.slice();
     const gone = rows.splice(site.row, 1)[0];
@@ -284,7 +317,7 @@ export function deleteRow(doc: DocModel, position: DocPosition, _options?: DocEd
     draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows)]);
     const row = Math.min(site.row, rows.length - 1);
     return cellStart(doc, site, row, Math.min(site.cell, rows[row].cells.length - 1));
-  }, _options);
+  }, _options, true);
 }
 
 function widened(props: TableProps, by: number): TableProps {
@@ -302,6 +335,13 @@ function cellWidened(props: CellProps, by: number): CellProps {
  * the column beside it. Every row gets a cell at that place in the grid; a
  * cell that spans the place becomes one column wider instead, which is what
  * Word does with merged cells.
+ *
+ * Where changes are tracked every new cell is a tracked insertion
+ * (<w:cellIns>) and the table keeps the grid it had (<w:tblGridChange>). A
+ * column that would widen a merged cell, or change the columns a row leaves
+ * out, is refused there with TRACK_UNSUPPORTED: that is a change of the
+ * properties of a cell or a row, which rejecting the new cells would not
+ * take back.
  */
 export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' | 'right', _options?: DocEditOptions): DocEdit {
   if (side !== 'left' && side !== 'right') bad('A column goes left or right');
@@ -316,16 +356,19 @@ export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' 
     const refWidth = table.rows[site.row].cells[site.cell].props.width;
     let width = table.grid[beside];
     if (!(width > 0)) width = refWidth && refWidth.type === 'dxa' && refWidth.value > 0 ? Math.round(refWidth.value / (end - start)) : 1440;
+    const track = draft.track;
+    const untracked = (): never => bad(TRACK_UNSUPPORTED);
     const rows = table.rows.map((row): TableRow => {
       const before = row.props.gridBefore || 0;
-      if (place < before) return { ...row, props: { ...row.props, gridBefore: before + 1 } };
+      if (place < before) return track ? untracked() : { ...row, props: { ...row.props, gridBefore: before + 1 } };
       const spans = rowSpans(row);
       const fresh = (model: TableCell): TableCell => {
         const props: CellProps = { ...plainProps(model.props) };
         delete props.gridSpan;
         delete props.hMerge;
         if (props.width) props.width = { type: 'dxa', value: width };
-        return { props, blocks: [emptyLike(model)] };
+        const made: TableCell = { props, blocks: [emptyLike(model)] };
+        return track ? insertedCell(track, made) : made;
       };
       for (let c = 0; c < row.cells.length; c++) {
         const [from, to] = spans[c];
@@ -335,6 +378,7 @@ export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' 
           return { ...row, cells };
         }
         if (from < place && place < to) {
+          if (track) return untracked();
           const cells = row.cells.slice();
           cells[c] = { ...row.cells[c], props: { ...cellWidened(row.cells[c].props, width), gridSpan: to - from + 1 } };
           return { ...row, cells };
@@ -342,16 +386,73 @@ export function insertColumn(doc: DocModel, position: DocPosition, side: 'left' 
       }
       const rowEnd = spans.length ? spans[spans.length - 1][1] : before;
       if (place === rowEnd && row.cells.length) return { ...row, cells: row.cells.concat([fresh(row.cells[row.cells.length - 1])]) };
-      return { ...row, props: { ...row.props, gridAfter: (row.props.gridAfter || 0) + 1 } };
+      return track ? untracked() : { ...row, props: { ...row.props, gridAfter: (row.props.gridAfter || 0) + 1 } };
     });
     let grid = table.grid;
     if (place <= grid.length) {
       grid = grid.slice();
       grid.splice(place, 0, width);
-    }
-    draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows, grid, widened(table.props, width))]);
+    } else if (track) untracked();
+    const next = tableWith(table, rows, grid, widened(table.props, width));
+    // The grid as it was: kept once, for the first change of the columns (whoever made it). A grid the model keeps
+    // as it was read (it holds more than columns) is written from that, and gets no record of the model.
+    const keptGrid = (table.extras || []).some((extra) => extra.partial === true && extra.el.name.slice(extra.el.name.indexOf(':') + 1) === 'tblGrid');
+    if (track && !table.gridChange && !keptGrid) next.gridChange = { id: track.revision().id, grid: table.grid.slice() };
+    draft.replace(site.story, site.container, site.index, 1, [next]);
     return cellStart(doc, site, site.row, side === 'left' ? site.cell : site.cell + 1);
-  }, _options);
+  }, _options, true);
+}
+
+/** Is the record of the grid of a table one this author made since the document was opened. */
+const isOwnGrid = (track: Tracking, table: Table): boolean => table.gridChange !== undefined && track.made({ id: table.gridChange.id, author: track.author });
+
+const sameGrid = (a: number[], b: number[]): boolean => a.length === b.length && a.every((width, i) => width === b[i]);
+
+/**
+ * deleteColumn() where changes are tracked: the cells of the columns stay,
+ * as tracked deletions (<w:cellDel>) with everything in them deleted, and
+ * the grid with them. Refused with TRACK_UNSUPPORTED where a cell covers
+ * other columns too, or a row leaves some of the columns out, and where some
+ * of the cells are deleted already and others are not (a column is one
+ * change: it could not be resolved as one). Nothing happens to a column all
+ * of whose cells are deleted already. Returns false when all the cells are
+ * ones the author inserted in this session, which go for good.
+ */
+function strikeColumn(draft: Draft, track: Tracking, site: CellSite, start: number, end: number): boolean {
+  const table = site.table;
+  let own = true;
+  const hit: [number, number][] = [];
+  for (let r = 0; r < table.rows.length; r++) {
+    const row = table.rows[r];
+    const spans = rowSpans(row);
+    const before = row.props.gridBefore || 0;
+    const rowEnd = spans.length ? spans[spans.length - 1][1] : before;
+    if (start < before || end > rowEnd) bad(TRACK_UNSUPPORTED);
+    for (let c = 0; c < row.cells.length; c++) {
+      const [from, to] = spans[c];
+      if (to <= start || from >= end) continue;
+      if (from < start || to > end) bad(TRACK_UNSUPPORTED);
+      hit.push([r, c]);
+      if (!isOwnCell(track, row.cells[c])) own = false;
+    }
+  }
+  let struck = 0;
+  for (const [r, c] of hit) if (table.rows[r].cells[c].props.deleted) struck++;
+  if (struck === hit.length) return true;
+  if (struck > 0) bad(TRACK_UNSUPPORTED);
+  if (own) return false;
+  const rows = table.rows.slice();
+  let changed = false;
+  for (const [r, c] of hit) {
+    const cell = struckCell(track, rows[r].cells[c]);
+    if (cell === rows[r].cells[c]) continue;
+    const cells = rows[r].cells.slice();
+    cells[c] = cell;
+    rows[r] = { ...rows[r], cells };
+    changed = true;
+  }
+  if (changed) draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows)]);
+  return true;
 }
 
 /**
@@ -367,6 +468,12 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
     const site = cellSite(doc, position);
     const table = site.table;
     const [start, end] = rowSpans(table.rows[site.row])[site.cell];
+    const track = draft.track;
+    if (track && strikeColumn(draft, track, site, start, end)) {
+      // The caret leaves the column that is deleted: to the cell after it, else the one before it.
+      const cells = table.rows[site.row].cells.length;
+      return cellStart(doc, site, site.row, site.cell + 1 < cells ? site.cell + 1 : Math.max(0, site.cell - 1));
+    }
     const overlap = (from: number, to: number) => Math.max(0, Math.min(to, end) - Math.max(from, start));
     const widthOf = (from: number, to: number) => {
       let sum = 0;
@@ -429,10 +536,13 @@ export function deleteColumn(doc: DocModel, position: DocPosition, _options?: Do
     if (pending.pieces.length || pending.blocks.length) rows[rows.length - 1] = rowWith(rows[rows.length - 1], leftoverOf(pending), true);
     const grid = table.grid.slice();
     if (start < grid.length) grid.splice(start, end - start);
-    draft.replace(site.story, site.container, site.index, 1, [tableWith(table, rows, grid, widened(table.props, -widthOf(start, end)))]);
+    const next = tableWith(table, rows, grid, widened(table.props, -widthOf(start, end)));
+    // The author took back the columns they had put in: the grid is what their record says, and the record goes.
+    if (track && isOwnGrid(track, table) && sameGrid(grid, (table.gridChange as { grid: number[] }).grid)) delete next.gridChange;
+    draft.replace(site.story, site.container, site.index, 1, [next]);
     const row = caretRow >= 0 ? caretRow : Math.min(site.row, rows.length - 1);
     return cellStart(doc, site, row, Math.min(site.cell, rows[row].cells.length - 1));
-  }, _options);
+  }, _options, true);
 }
 
 const SINGLE: Border = Object.freeze({ style: 'single', size: 4, space: 0, color: Object.freeze({ auto: true }) });
@@ -464,7 +574,9 @@ function availableWidth(doc: DocModel, position: DocPosition): number {
  * Inserts a table of `rows` by `columns` empty cells of equal width at a
  * position (see insertBlock for where exactly). The table uses the table
  * style "TableGrid" when the document has it and single borders of its own
- * otherwise. The caret goes into the first cell.
+ * otherwise. The caret goes into the first cell. Where changes are tracked
+ * the table is a tracked insertion: every row of it says so, and so does the
+ * mark of every paragraph the command makes.
  */
 export function insertTable(doc: DocModel, position: DocPosition, rows: number, columns: number, _options?: DocEditOptions): DocEdit {
   if (!whole(rows, 1, MAX_NEW_CELLS) || !whole(columns, 1, MAX_COLUMNS) || rows * columns > MAX_NEW_CELLS) bad('The size of the table is not valid');
@@ -486,9 +598,10 @@ export function insertTable(doc: DocModel, position: DocPosition, rows: number, 
       for (let c = 0; c < columns; c++) cells.push({ props: cellProps, blocks: [{ type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] }] });
       list.push({ props: {}, cells });
     }
-    const index = placeBlock(draft, position, { type: 'table', props, grid, rows: list });
+    const table: Table = { type: 'table', props, grid, rows: list };
+    const index = placeBlock(draft, position, draft.track ? insertedTable(draft.track, table) : table);
     return { story: position.story, path: position.path.slice(0, -1).concat([index, 0, 0, 0]), offset: 0 };
-  }, _options);
+  }, _options, true);
 }
 
 // ------------------------------------------------------------------ hyperlinks
@@ -508,6 +621,27 @@ export function freeRelId(relationships: Map<string, unknown>): string {
 
 const isRevision = (w: Wrapper) => w.kind === 'ins' || w.kind === 'del' || w.kind === 'moveFrom' || w.kind === 'moveTo';
 
+/** Items a tracked link takes a second copy of: text and what is typed like it. */
+const LINKABLE = new Set<string>(['text', 'tab', 'break', 'noBreakHyphen', 'softHyphen', 'symbol']);
+
+/** Is content the result of a simple field, or inside a content control: what a second copy of its text beside it would write twice, or cut. */
+function inFieldOrControl(wrap: Wrapper | undefined): boolean {
+  let steps = 0;
+  for (let w = wrap; w && steps < 4096; w = w.parent, steps++) if (w.kind === 'simpleField' || w.kind === 'sdt' || w.kind === 'customXml') return true;
+  return false;
+}
+
+/** Would taking content out of the tracked changes around it cut a content control in two (it sits inside one of them). */
+function cutsControl(wrap: Wrapper | undefined): boolean {
+  let control = false;
+  let steps = 0;
+  for (let w = wrap; w && steps < 4096; w = w.parent, steps++) {
+    if (w.kind === 'sdt' || w.kind === 'customXml') control = true;
+    else if (control && isRevision(w)) return true;
+  }
+  return false;
+}
+
 /**
  * Makes the text of a range a hyperlink to `target`: an address ("https://…",
  * "mailto:…", "tel:…"), or "#name" for a bookmark of the document. The range
@@ -519,6 +653,18 @@ const isRevision = (w: Wrapper) => w.kind === 'ins' || w.kind === 'del' || w.kin
  * https, mailto, tel, or a bookmark): a script or a file address throws
  * RangeError, so that no document leaves the editor with one. The target is
  * stored as that function reads it, without the space around it.
+ *
+ * Where changes are tracked: the element of a link carries no revision, so a
+ * link over text that is there is that text deleted and the same text
+ * inserted inside the link, which is how Word tracks it (UNSURE: seen in
+ * files, not compared with Word here). Rejecting the two gives the text back
+ * as it was; another address for a link is the same, with the deleted text
+ * left in the old link. Text the editor typed in this session leaves no
+ * deletion behind. A range that holds more than text (a picture, a note
+ * reference, an equation, text of a field, simple or complex), and one that
+ * holds text of a content control, is refused there with TRACK_UNSUPPORTED:
+ * a second copy of those would be a second picture, a second reference,
+ * half a field, a second field or control.
  */
 export function insertHyperlink(doc: DocModel, range: DocRange, address: string, _options?: DocEditOptions): DocEdit {
   let plain = typeof address === 'string' && address.length <= 2083;
@@ -547,16 +693,18 @@ export function insertHyperlink(doc: DocModel, range: DocRange, address: string,
     const pieces = flatten(paragraph);
     const caret = start.offset === end.offset && (start.before === true) === (end.before === true);
     const from = caret ? caretIndex(pieces, start) : startIndex(pieces, start);
-    let to: number;
-    if (caret) {
-      const props = inheritedProps(pieces, from, paragraph.props.markProps);
-      const wrap = wrapBetween(from > 0 ? pieces[from - 1].wrap : undefined, from < pieces.length ? pieces[from].wrap : undefined);
-      const added = textPieces(target.replace(/[\t\n\u000b]/g, ' '), props, wrap, {});
-      pieces.splice(from, 0, ...added);
-      to = from + added.length;
-    } else to = caretIndex(pieces, end);
     const styled = doc.styles.styles.get('Hyperlink');
     const useStyle = styled !== undefined && styled.type === 'character';
+    const restyled = (props: RunProps): RunProps => (useStyle ? patchRunProps(props, { style: 'Hyperlink' }) : patchRunProps(props, { color: '0563C1', underline: true }));
+    const shown = target.replace(/[\t\n\u000b]/g, ' ');
+    let to: number;
+    if (caret && !draft.track) {
+      const props = inheritedProps(pieces, from, paragraph.props.markProps);
+      const wrap = wrapBetween(from > 0 ? pieces[from - 1].wrap : undefined, from < pieces.length ? pieces[from].wrap : undefined);
+      const added = textPieces(shown, props, wrap, {});
+      pieces.splice(from, 0, ...added);
+      to = from + added.length;
+    } else to = caret ? from : caretIndex(pieces, end);
     // The link goes inside the wrappers the text is in, but around tracked changes (which may only hold runs), and
     // replaces a link that is there. Wrappers whose parent changes are copied, once each, so that pieces that
     // shared a wrapper still do.
@@ -586,6 +734,52 @@ export function insertHyperlink(doc: DocModel, range: DocRange, address: string,
       }
       return mine;
     };
+    const track = draft.track;
+    if (track) {
+      // The linked text is new text: each stretch of it in an insertion of its own, inside the link.
+      const insertions = new Map<Wrapper, Wrapper>();
+      const insertionIn = (outer: Wrapper | undefined): Wrapper => {
+        if (cutsControl(outer)) bad(TRACK_UNSUPPORTED);
+        const inLink = linkIn(strip(outer));
+        let mine = insertions.get(inLink);
+        if (!mine) insertions.set(inLink, (mine = { kind: 'ins', ...track.revision(), parent: inLink }));
+        return mine;
+      };
+      let added: Piece[] = [];
+      let list = pieces;
+      let at = from;
+      if (caret) {
+        const wrap = wrapBetween(from > 0 ? pieces[from - 1].wrap : undefined, from < pieces.length ? pieces[from].wrap : undefined);
+        added = textPieces(shown, restyled(inheritedProps(pieces, from, paragraph.props.markProps)), insertionIn(wrap), {});
+      } else {
+        const owner = fieldPairs(pieces).owner;
+        const styles = new Map<RunProps, RunProps>();
+        const groups = new Map<object, object>();
+        for (let q = from; q < to; q++) {
+          const piece = pieces[q];
+          // What is no content (a bookmark, deleted text) stays where it is, outside the link.
+          if (piece.frozen || !isRemovable(piece)) continue;
+          const item = piece.item;
+          if (!item || owner[q] >= 0 || !LINKABLE.has(item.type) || inFieldOrControl(piece.wrap)) return bad(TRACK_UNSUPPORTED);
+          let props = styles.get(piece.props);
+          if (!props) styles.set(piece.props, (props = restyled(piece.props)));
+          let group = groups.get(piece.group);
+          if (!group) groups.set(piece.group, (group = {}));
+          added.push({ item, props, wrap: insertionIn(piece.wrap), group, index: -1, code: false, len: piece.len });
+        }
+        const struck = strikePieces(track, pieces, from, to);
+        list = struck.pieces;
+        // The linked text follows what was deleted: before the piece that followed the range, wherever that is now.
+        at = to < pieces.length ? list.indexOf(pieces[to]) : list.length;
+        if (at < 0) at = list.length - (pieces.length - to - 1);
+      }
+      list = list.slice();
+      list.splice(at, 0, ...added);
+      const first = offsetOf(list, at);
+      const last = offsetOf(list, at + added.length);
+      draft.setParagraph(story, start.path, paragraphWith(paragraph, rebuild(list)));
+      return { anchor: { story, path: start.path.slice(), offset: first }, focus: { story, path: start.path.slice(), offset: last } };
+    }
     const revisions = new Map<Wrapper, Wrapper>();
     const linked = (w: Wrapper | undefined, base: Wrapper): Wrapper => {
       if (!w) return base;
@@ -598,16 +792,14 @@ export function insertHyperlink(doc: DocModel, range: DocRange, address: string,
       const piece = pieces[q];
       if (piece.frozen) continue;
       const next: Piece = { ...piece, wrap: linked(piece.wrap, linkIn(strip(piece.wrap))) };
-      if (piece.item && !piece.code && piece.item.type !== 'fieldChar') {
-        next.props = useStyle ? patchRunProps(piece.props, { style: 'Hyperlink' }) : patchRunProps(piece.props, { color: '0563C1', underline: true });
-      }
+      if (piece.item && !piece.code && piece.item.type !== 'fieldChar') next.props = restyled(piece.props);
       pieces[q] = next;
     }
     const first = offsetOf(pieces, from);
     const last = offsetOf(pieces, to);
     draft.setParagraph(story, start.path, paragraphWith(paragraph, rebuild(pieces)));
     return { anchor: { story, path: start.path.slice(), offset: first }, focus: { story, path: start.path.slice(), offset: last } };
-  }, _options);
+  }, _options, true);
 }
 
 // -------------------------------------------------------------------- pictures
@@ -771,6 +963,11 @@ export function takenByDocument(doc: DocModel): Taken {
  * Throws RangeError for a type other than png, jpeg, gif, bmp and webp, for
  * bytes that do not begin like a file of the type, and for a size that is
  * not a whole number of EMU between 1 and 91440000.
+ *
+ * Where changes are tracked the picture sits in a tracked insertion.
+ * Rejecting that takes the picture out of its paragraph; the entry of
+ * DocModel.media and the relationship stay, as they do when a picture is
+ * deleted (undoing needs them), and a writer writes a part nothing refers to.
  */
 export function insertImage(doc: DocModel, position: DocPosition, image: NewImage, options?: InsertImageOptions): DocEdit {
   if (!image || typeof image !== 'object') bad('A picture needs its bytes');
@@ -848,12 +1045,18 @@ export function insertImage(doc: DocModel, position: DocPosition, image: NewImag
     if (description !== undefined) item.description = description;
 
     const paragraph = at.paragraph;
-    const pieces = flatten(paragraph);
+    let pieces = flatten(paragraph);
     const index = caretIndex(pieces, position);
     const props = inheritedProps(pieces, index, paragraph.props.markProps);
-    const wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+    let wrap = wrapBetween(index > 0 ? pieces[index - 1].wrap : undefined, index < pieces.length ? pieces[index].wrap : undefined);
+    if (draft.track) {
+      // The picture is a tracked insertion, like text typed at the same place.
+      const placed = insertionWrap(draft.track, pieces, index, wrap);
+      pieces = placed.pieces.slice();
+      wrap = placed.wrap;
+    }
     pieces.splice(index, 0, itemPiece(item, props, wrap, groupFor(pieces, index, props, wrap)));
     draft.setParagraph(story, position.path, paragraphWith(paragraph, rebuild(pieces)));
     return { story, path: position.path.slice(), offset: offsetOf(pieces, index) };
-  }, options);
+  }, options, true);
 }

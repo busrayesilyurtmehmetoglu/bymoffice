@@ -34,13 +34,28 @@
 //     present ones.
 //   - inserted or deleted table row: the row stays or goes; the table goes
 //     with its last row.
+//   - inserted or deleted table column (<w:cellIns>, <w:cellDel> in a cell
+//     of every row, over the same grid columns, by one author at one date):
+//     ONE change, resolved with all its cells. The cells stay or go together,
+//     a row goes with its last cell, the grid columns of cells that go leave
+//     the grid (those columns, wherever they are) and a table of a fixed
+//     width becomes that much narrower. No row is ever left with another
+//     number of columns than the others. The record of the grid as it was
+//     (<w:tblGridChange>, which names nobody) is part of the first inserted
+//     column of its table and goes with it.
+//   - a record of the grid in a table without an inserted column: accepted,
+//     the record goes; rejected, the grid is the one the record holds when
+//     that has as many columns as the rows need, and the record goes either
+//     way.
 // Of content that goes, the marks of bookmarks, comments and permissions and
 // the references to comments stay where it was: the rule every deletion
 // follows. A note whose last reference goes leaves with it (see Draft).
 //
-// What the model only keeps as XML (inserted, deleted and merged cells, a
-// changed table grid, a changed list number, changes inside text boxes and
-// other kept elements) is listed as "other" and cannot be resolved; "all"
+// What the model only keeps as XML (merged cells, a record of the grid that
+// holds more than columns, a changed list number, changes inside text boxes
+// and other kept elements), and inserted or deleted cells that do not make a
+// whole column (some rows only, a merged cell among them, two authors or
+// dates), is listed as "other" and cannot be resolved; "all"
 // passes over it and says how many changes it passed over. Nothing is ever
 // resolved halfway: a change one part of which cannot be resolved (it would
 // leave half a field) is not touched at all.
@@ -76,9 +91,9 @@ import {
 } from '../../model/doc/types';
 import type { XmlElement } from '../../xml';
 import { buildEdit, type DocEdit, type Draft } from './draft';
-import { flatten, harvestRow, paragraphWith, rebuild, withoutWrapper, type Harvest } from './pieces';
+import { flatten, harvestBlocks, harvestRow, paragraphWith, rebuild, withoutWrapper, type Harvest, type Piece } from './pieces';
 import { collapsed, itemsLength, paragraphIn, paragraphLength, resolvePosition, storyOf, type DocPosition, type DocRange, type StoryHandle } from './position';
-import { rowSpans, rowWith, type Leftover } from './structure';
+import { cellWith, rowSpans, rowWith, type Leftover } from './structure';
 import { neighbour } from './text';
 import { forcesTracking, plainProps, revisionExtras } from './track';
 
@@ -98,10 +113,13 @@ export interface DocRevision {
   /** Its place in the list. */
   index: number;
   /**
-   * "insert" and "delete": text, paragraph marks and table rows; "moveFrom"
+   * "insert" and "delete": text, paragraph marks, table rows and table
+   * cells; "moveFrom"
    * and "moveTo": the two ends of a move; "format": character formatting (of
    * text or of a paragraph mark); "paragraphFormat"; "tableFormat": of a
-   * table, a row or a cell; "sectionFormat"; "other": a change the engine
+   * table, a row or a cell, and the grid of a table as it was before its
+   * columns changed (which names no author); "sectionFormat"; "other": a
+   * change the engine
    * only keeps and cannot resolve.
    */
   kind: RevisionKind;
@@ -118,6 +136,13 @@ export interface DocRevision {
   /** Paragraph marks and table rows it holds. */
   marks: number;
   rows: number;
+  /** 1 for a column of a table that was put in or taken out (a cell in every row, and for an inserted column the record of the grid); 0 otherwise. */
+  columns: number;
+  /**
+   * For a column: where each of its cells begins and ends, row by row. `start` and `end` are those of the cell in
+   * the first row: the cells of a column do not follow each other in the text, other cells stand between them.
+   */
+  cells?: { start: DocPosition; end: DocPosition }[];
   /** For "other": how many elements of tracked changes the kept XML holds; 1 otherwise. */
   count: number;
   /** The name of the move this is an end of, when the file names it: the other end is resolved with it. */
@@ -180,6 +205,17 @@ interface Entry {
   rev: DocRevision;
   parts: Part[];
   ids: Set<number>;
+}
+
+/** The cells of one kind (inserted, deleted) over the same grid columns of a table, by one author at one date. */
+interface ColumnGroup {
+  flag: 'inserted' | 'deleted';
+  /** The first grid column they cover. */
+  from: number;
+  rows: Set<number>;
+  /** There is one in every row: a column, which is one change. */
+  whole: boolean;
+  entry?: Entry;
 }
 
 interface Collected {
@@ -353,6 +389,8 @@ class Lister {
   private current: Entry | undefined;
   /** Nothing but changes stood between the current change and here. */
   private adjacent = false;
+  /** The column whose cell is being walked: what the cell holds of its author and date is part of it, whatever else stands in the cell. */
+  private column: Entry | undefined;
   private story = 'body';
   private readonly tables: Table[] = [];
   private readonly budget = { left: SCAN_BUDGET };
@@ -445,10 +483,15 @@ class Lister {
           if (inline.type === 'run' && inline.props.change) count++;
         }
       } else if (block.type === 'table') {
+        if (block.gridChange) count++;
         for (const row of block.rows) {
           if (row.props.inserted) count++;
           if (row.props.deleted) count++;
-          for (const cell of row.cells) count += this.countInBlocks(cell.blocks, depth + 1);
+          for (const cell of row.cells) {
+            if (cell.props.inserted) count++;
+            if (cell.props.deleted) count++;
+            count += this.countInBlocks(cell.blocks, depth + 1);
+          }
         }
       } else if (block.type === 'unknown') count += countChanges(block.xml, this.budget);
     }
@@ -466,21 +509,23 @@ class Lister {
   private part(kind: RevisionKind, info: RevisionInfo, host: object, slot: Slot, start: DocPosition, end: DocPosition, text: string, rejectable: boolean, move?: string): Entry | undefined {
     if (this.stopped) return undefined;
     const part: Part = { host, slot, tables: this.tables.slice(), rejectable };
+    const fits = (to: Entry | undefined): boolean =>
+      to !== undefined && to.rev.kind === kind && to.rev.author === info.author && to.rev.move === move && (to.rev.date === info.date || (info.id !== undefined && to.ids.has(info.id)));
     let entry = this.current;
-    const same =
-      entry !== undefined &&
-      this.adjacent &&
-      entry.rev.kind === kind &&
-      entry.rev.author === info.author &&
-      entry.rev.move === move &&
-      (entry.rev.date === info.date || (info.id !== undefined && entry.ids.has(info.id)));
+    let same = this.adjacent && fits(entry);
+    // In a cell of a column that is a change, the column comes first.
+    if (fits(this.column)) {
+      entry = this.column;
+      same = true;
+    }
     if (same && entry) {
       entry.parts.push(part);
-      entry.rev.end = end;
+      // (A column is where its cells are, see DocRevision.cells: what a cell holds does not move its end.)
+      if (entry.rev.columns === 0) entry.rev.end = end;
       if (!rejectable) entry.rev.canReject = false;
     } else {
       if (!this.canStart()) return undefined;
-      const rev: DocRevision = { index: this.entries.length, kind, story: this.story, start, end, text: '', marks: 0, rows: 0, count: 1, canAccept: !this.locked, canReject: !this.locked && rejectable };
+      const rev: DocRevision = { index: this.entries.length, kind, story: this.story, start, end, text: '', marks: 0, rows: 0, columns: 0, count: 1, canAccept: !this.locked, canReject: !this.locked && rejectable };
       if (info.author !== undefined) rev.author = info.author;
       if (info.date !== undefined) rev.date = info.date;
       if (move !== undefined) rev.move = move;
@@ -507,7 +552,7 @@ class Lister {
     this.current = undefined;
     if (count <= 0 || this.stopped || !this.canStart()) return;
     this.entries.push({
-      rev: { index: this.entries.length, kind: 'other', story: at.story, start: at, end: at, text: '', marks: 0, rows: 0, count, canAccept: false, canReject: false },
+      rev: { index: this.entries.length, kind: 'other', story: at.story, start: at, end: at, text: '', marks: 0, rows: 0, columns: 0, count, canAccept: false, canReject: false },
       parts: [],
       ids: new Set<number>(),
     });
@@ -615,7 +660,7 @@ class Lister {
         const shows = kind === 'delete' || kind === 'moveFrom' ? true : !hidden;
         const text = shows ? inlinePreview(inline) : '';
         if (entry) {
-          entry.rev.end = after;
+          if (entry.rev.columns === 0) entry.rev.end = after;
           this.addText(entry, text);
           continue;
         }
@@ -665,6 +710,51 @@ class Lister {
     }
   }
 
+  /**
+   * The columns of a table that were put in or taken out. The cells that say so (<w:cellIns>, <w:cellDel>) are one
+   * change when there is one of them in every row, over the same grid columns, by one author at one date: a column
+   * is resolved whole or not at all, so that no row is ever left with another number of columns than the others.
+   * Cells that do not make such a column (some rows only, a merged cell among them, two authors) are in `loose`:
+   * they are kept and listed, never resolved. `owner` is the inserted column the record of the grid goes with: the
+   * first of them.
+   */
+  private columnsOf(table: Table): { of: Map<TableCell, { inserted?: ColumnGroup; deleted?: ColumnGroup }>; owner: ColumnGroup | undefined } {
+    const of = new Map<TableCell, { inserted?: ColumnGroup; deleted?: ColumnGroup }>();
+    let owner: ColumnGroup | undefined;
+    let any = false;
+    for (const row of table.rows) for (const cell of row.cells) if (cell.props.inserted || cell.props.deleted) any = true;
+    if (!any) return { of, owner };
+    // A row or a cell that is written back whole cannot lose or keep a cell with the others.
+    let frozen = false;
+    for (const row of table.rows) {
+      if (row.wrap && inAlternate(row.wrap)) frozen = true;
+      for (const cell of row.cells) if (cell.wrap && inAlternate(cell.wrap)) frozen = true;
+    }
+    for (const flag of ['inserted', 'deleted'] as const) {
+      const groups = new Map<string, ColumnGroup>();
+      for (let r = 0; r < table.rows.length; r++) {
+        const row = table.rows[r];
+        const spans = rowSpans(row);
+        for (let c = 0; c < row.cells.length; c++) {
+          const info = row.cells[c].props[flag];
+          if (!info) continue;
+          const key = [spans[c][0], spans[c][1], info.author === undefined ? '' : 'a' + info.author, info.date === undefined ? '' : 'd' + info.date].join('\u0001');
+          let group = groups.get(key);
+          if (!group) groups.set(key, (group = { flag, from: spans[c][0], rows: new Set<number>(), whole: false }));
+          group.rows.add(r);
+          let entry = of.get(row.cells[c]);
+          if (!entry) of.set(row.cells[c], (entry = {}));
+          entry[flag] = group;
+        }
+      }
+      groups.forEach((group) => {
+        group.whole = !frozen && group.rows.size === table.rows.length;
+        if (flag === 'inserted' && group.whole && (!owner || group.from < owner.from)) owner = group;
+      });
+    }
+    return { of, owner };
+  }
+
   private table(table: Table, siblings: Block[], base: number[], index: number, depth: number): void {
     const story = this.story;
     const path = base.concat([index]);
@@ -673,6 +763,13 @@ class Lister {
     // The table is among the tables a resolver goes into for its own formatting too.
     this.tables.push(table);
     if (table.props.change) this.part('tableFormat', infoOf(table.props.change), table, 'tableFormat', start, start, '', true);
+    const columns = this.columnsOf(table);
+    // The grid as it was goes with the column that was put in; without one it is a change of the table nobody signs.
+    if (table.gridChange && !columns.owner) {
+      this.adjacent = false;
+      this.part('tableFormat', table.gridChange.id === undefined ? {} : { id: table.gridChange.id }, table, 'grid', start, start, '', true);
+      this.adjacent = false;
+    }
     this.scanExtras(table.props.extras, start);
     this.scanExtras(table.extras, start);
     for (let r = 0; r < table.rows.length && !this.stopped; r++) {
@@ -719,12 +816,50 @@ class Lister {
         }
         const head2 = paragraphIn(cell.blocks, cellPath, 0, 1);
         const cellStart: DocPosition = head2 ? { story, path: head2, offset: 0 } : from;
+        // A cell that was put in or taken out with its column: part of the change its column is.
+        let column: Entry | undefined;
+        const groups = columns.of.get(cell);
+        for (const flag of ['inserted', 'deleted'] as const) {
+          const info = cell.props[flag];
+          const group = groups && groups[flag];
+          if (!info || !group) continue;
+          if (!group.whole) {
+            // Not a whole column: kept, and counted.
+            this.other(1, cellStart);
+            continue;
+          }
+          let cellEnd = cellStart;
+          const tail2 = paragraphIn(cell.blocks, cellPath, cell.blocks.length - 1, -1);
+          if (tail2) {
+            const last2 = paragraphAtPath(cell.blocks, tail2.slice(cellPath.length));
+            cellEnd = { story, path: tail2, offset: last2 ? paragraphLength(last2) : 0 };
+          }
+          const part: Part = { host: cell, slot: 'cell:' + flag, tables: this.tables.slice(), rejectable: true };
+          if (!group.entry) {
+            if (!this.canStart()) break;
+            const rev: DocRevision = { index: this.entries.length, kind: FLAG_KIND[flag], story, start: cellStart, end: cellEnd, text: '', marks: 0, rows: 0, columns: 1, cells: [], count: 1, canAccept: !this.locked, canReject: !this.locked };
+            if (info.author !== undefined) rev.author = info.author;
+            if (info.date !== undefined) rev.date = info.date;
+            group.entry = { rev, parts: [], ids: new Set<number>() };
+            this.entries.push(group.entry);
+            // The record of the grid is resolved with the column it was made for.
+            if (group === columns.owner && table.gridChange) group.entry.parts.push({ host: table, slot: 'grid', tables: this.tables.slice(), rejectable: true });
+          }
+          group.entry.parts.push(part);
+          (group.entry.rev.cells as { start: DocPosition; end: DocPosition }[]).push({ start: cellStart, end: cellEnd });
+          if (info.id !== undefined) group.entry.ids.add(info.id);
+          column = group.entry;
+        }
+        if (this.stopped) break;
         if (cell.props.change) {
           const markup = (cell.props.extras || []).some((extra) => CELL_MARKUP.has(localName(extra.el.name)));
           this.part('tableFormat', infoOf(cell.props.change), cell, 'cellFormat', cellStart, cellStart, '', !markup);
         }
         this.scanExtras(cell.props.extras, cellStart);
+        // What the cell holds of the same author and date (the marks of its paragraphs, its deleted text) is the column too.
+        this.column = column;
         this.blocks(cell.blocks, cellPath, depth + 1);
+        this.column = undefined;
       }
     }
     this.tables.pop();
@@ -866,6 +1001,11 @@ interface ResolvedParagraph {
 class Resolver {
   /** Parts that cannot be resolved as asked: the changes they belong to are left alone. */
   readonly refused = new Map<object, Set<Slot>>();
+  /**
+   * Paragraph marks that have to go but have to wait: what becomes of their paragraph depends on a change beside it
+   * that is not decided about yet. They stay changes, to be resolved once that one is.
+   */
+  readonly deferred = new Map<object, Set<Slot>>();
   /** Section breaks that went with the marks of their paragraphs. */
   sectionsRemoved = 0;
   private readonly touched = new Set<Table>();
@@ -875,6 +1015,8 @@ class Resolver {
   constructor(
     private readonly decisions: Map<object, Map<Slot, Verdict>>,
     tables: Iterable<Table>,
+    /** The one verdict of all the decisions. */
+    private readonly verdict: Verdict,
   ) {
     for (const table of tables) this.touched.add(table);
   }
@@ -924,7 +1066,17 @@ class Resolver {
               if (decided && row.props[flag] !== undefined && removes(FLAG_KIND[flag], decided)) rowGone = { host: row, slot: 'row:' + flag };
             }
           }
-          for (const cell of row.cells) this.checkFields(cell.blocks, stack, rowGone, depth + 1);
+          for (const cell of row.cells) {
+            let cellGone = rowGone;
+            const cellSlots = cellGone ? undefined : this.decisions.get(cell);
+            if (cellSlots) {
+              for (const flag of ['inserted', 'deleted'] as const) {
+                const decided = cellSlots.get('cell:' + flag);
+                if (decided && cell.props[flag] !== undefined && removes(FLAG_KIND[flag], decided)) cellGone = { host: cell, slot: 'cell:' + flag };
+              }
+            }
+            this.checkFields(cell.blocks, stack, cellGone, depth + 1);
+          }
         }
         continue;
       }
@@ -963,6 +1115,22 @@ class Resolver {
       this.reader = createContext(createReaderState(), host.part, host.rootAttrs, host.relationships);
     }
     return this.reader;
+  }
+
+  /**
+   * The decisions that take the mark of a paragraph are left for later (see list()): the mark stays the change it
+   * is, and everything else that was decided is done.
+   */
+  private deferMarks(paragraph: Paragraph): void {
+    const slots = this.decisions.get(paragraph);
+    const mark = paragraph.props.markProps;
+    if (!slots || !mark) return;
+    let set = this.deferred.get(paragraph);
+    if (!set) this.deferred.set(paragraph, (set = new Set<Slot>()));
+    for (const flag of MARK_FLAGS) {
+      const decided = slots.get('mark:' + flag);
+      if (decided && mark[flag] !== undefined && removes(FLAG_KIND[flag], decided)) set.add('mark:' + flag);
+    }
   }
 
   private refuse(host: object, slot: Slot): void {
@@ -1048,6 +1216,12 @@ class Resolver {
     const out: RowProps = { ...plainProps(readRowProps(ctx, childOf(ctx, change, 'trPr'))) };
     if (props.inserted !== undefined) out.inserted = props.inserted;
     if (props.deleted !== undefined) out.deleted = props.deleted;
+    // The grid columns the row leaves out are its place in the table, which other changes made what it is (a column
+    // put in or taken out since the record was made): no formatting, and not what the record brings back.
+    for (const key of ['gridBefore', 'gridAfter'] as const) {
+      if (props[key] !== undefined) out[key] = props[key];
+      else delete out[key];
+    }
     return out;
   }
 
@@ -1056,7 +1230,16 @@ class Resolver {
     if (!change) return props;
     if (verdict === 'accept') return without(props, 'change', {});
     const ctx = this.ctx();
-    return plainProps(readCellProps(ctx, childOf(ctx, change, 'tcPr')));
+    const out: CellProps = { ...plainProps(readCellProps(ctx, childOf(ctx, change, 'tcPr'))) };
+    // What says that the cell itself is a change is no formatting: it stays.
+    if (props.inserted !== undefined) out.inserted = props.inserted;
+    if (props.deleted !== undefined) out.deleted = props.deleted;
+    // Nor are the grid columns and the rows the cell covers: its place in the table, as it is now.
+    for (const key of ['gridSpan', 'vMerge', 'hMerge'] as const) {
+      if (props[key] !== undefined) (out as Record<string, unknown>)[key] = props[key];
+      else delete out[key];
+    }
+    return out;
   }
 
   // ----------------------------------------------------------- paragraphs
@@ -1065,7 +1248,8 @@ class Resolver {
     const slots = this.decisions.get(paragraph);
     if (!slots) return { paragraph, join: false };
     const refused = this.refused.get(paragraph);
-    const verdict = (slot: Slot): Verdict | undefined => (refused && refused.has(slot) ? undefined : slots.get(slot));
+    const waiting = this.deferred.get(paragraph);
+    const verdict = (slot: Slot): Verdict | undefined => ((refused && refused.has(slot)) || (waiting && waiting.has(slot)) ? undefined : slots.get(slot));
 
     // The properties: the formatting changes, and what the mark says of itself.
     let props = paragraph.props;
@@ -1231,15 +1415,23 @@ class Resolver {
 
   // --------------------------------------------------------------- tables
 
-  /** What stays of a row that goes: the marks of bookmarks, comments and permissions, without what wrapped them. */
-  private leftOf(row: TableRow): Leftover | undefined {
+  /** What stays of a row, or of a cell, that goes: the marks of bookmarks, comments and permissions, without what wrapped them. */
+  private leftOf(row: TableRow | undefined, cell?: TableCell): Leftover | undefined {
     const harvest: Harvest = { pieces: [], blocks: [] };
     try {
-      harvestRow(row, harvest);
+      if (row) harvestRow(row, harvest);
+      else if (cell) {
+        if (cell.wrap && inAlternate(cell.wrap)) return undefined;
+        harvestBlocks(cell.blocks, harvest);
+      }
     } catch (error) {
       if (error instanceof RangeError) return undefined;
       throw error;
     }
+    return this.survivors(harvest);
+  }
+
+  private survivors(harvest: { pieces: Piece[]; blocks: Block[] }): Leftover {
     const inlines: Inline[] = [];
     for (const piece of harvest.pieces) {
       if (piece.inline) {
@@ -1272,9 +1464,17 @@ class Resolver {
     const own = this.decisions.get(table);
     const format = own ? own.get('tableFormat') : undefined;
     if (format) props = this.tableProps(props, format);
+    const gridVerdict = own && table.gridChange ? own.get('grid') : undefined;
 
     const rows: TableRow[] = [];
-    let changed = props !== table.props;
+    /** For each row that stays: the grid columns of the cells it lost. */
+    const lost: Set<number>[] = [];
+    let anyLost = false;
+    /** The cells that go, with the decision that takes each: refused together when they are not a whole column. */
+    const taken: { cell: TableCell; slot: string }[] = [];
+    /** A column that was put in was decided about: the record of the grid goes with it, and brings no grid back. */
+    let columnDecided = false;
+    let changed = props !== table.props || gridVerdict !== undefined;
     /** Grid columns in which a vertically merged cell began in a row that went. */
     const heads = new Set<number>();
     let pending: Leftover = { inlines: [], blocks: [] };
@@ -1300,6 +1500,7 @@ class Resolver {
           // Content that is written back whole cannot be taken apart: the row stays as it is.
           for (const flag of ['inserted', 'deleted'] as const) if (slots && slots.has('row:' + flag)) this.refuse(row, 'row:' + flag);
           rows.push(row);
+          lost.push(new Set<number>());
           continue;
         }
         add(pending, leftover);
@@ -1320,12 +1521,36 @@ class Resolver {
 
       let cells: TableCell[] | undefined;
       const spans = heads.size ? rowSpans(row) : undefined;
+      /** The cells of the row that go (with their column), and what each leaves behind. */
+      let gone: Map<number, Leftover> | undefined;
       for (let c = 0; c < row.cells.length; c++) {
         const cell = row.cells[c];
         let cellProps = cell.props;
         const cellSlots = this.decisions.get(cell);
+        const cellRefused = this.refused.get(cell);
         const cellFormat = cellSlots ? cellSlots.get('cellFormat') : undefined;
         if (cellFormat) cellProps = this.cellProps(cellProps, cellFormat);
+        let cellGoes = false;
+        for (const flag of ['inserted', 'deleted'] as const) {
+          const decided = cellSlots && !(cellRefused && cellRefused.has('cell:' + flag)) ? cellSlots.get('cell:' + flag) : undefined;
+          if (!decided || cellProps[flag] === undefined) continue;
+          if (flag === 'inserted') columnDecided = true;
+          if (removes(FLAG_KIND[flag], decided)) {
+            cellGoes = true;
+            taken.push({ cell, slot: 'cell:' + flag });
+          }
+          cellProps = without(cellProps, flag, {});
+        }
+        if (cellGoes) {
+          const leftover = this.leftOf(undefined, cell);
+          if (leftover) {
+            (gone || (gone = new Map<number, Leftover>())).set(c, leftover);
+            continue;
+          }
+          // Content that is written back whole cannot be taken apart: the cell stays as it is.
+          for (const flag of ['inserted', 'deleted'] as const) if (cellSlots && cellSlots.has('cell:' + flag)) this.refuse(cell, 'cell:' + flag);
+          continue;
+        }
         if (spans && heads.has(spans[c][0]) && cellProps.vMerge === 'continue') cellProps = { ...cellProps, vMerge: 'restart' };
         const blocks = this.list(cell.blocks, depth + 1);
         if (cellProps === cell.props && blocks === cell.blocks) continue;
@@ -1333,6 +1558,34 @@ class Resolver {
         cells[c] = { ...cell, props: cellProps, blocks };
       }
       heads.clear();
+      const columns = new Set<number>();
+      if (gone) {
+        const all = rowSpans(row);
+        const kept: TableCell[] = [];
+        const source = cells || row.cells;
+        /** What cells that went left behind, for the next cell that stays. */
+        let carry: Leftover = { inlines: [], blocks: [] };
+        for (let c = 0; c < source.length; c++) {
+          const leftover = gone.get(c);
+          if (leftover) {
+            add(carry, leftover);
+            for (let g = all[c][0]; g < all[c][1]; g++) columns.add(g);
+            continue;
+          }
+          kept.push(carry.inlines.length || carry.blocks.length ? cellWith(source[c], carry, false) : source[c]);
+          carry = { inlines: [], blocks: [] };
+        }
+        if (kept.length === 0) {
+          // A row goes with its last cell.
+          add(pending, carry);
+          changed = true;
+          continue;
+        }
+        if (carry.inlines.length || carry.blocks.length) kept[kept.length - 1] = cellWith(kept[kept.length - 1], carry, true);
+        cells = kept;
+        anyLost = true;
+      }
+      lost.push(columns);
       let next = row;
       if (cells || rowProps !== row.props || tableProps !== row.tableProps) {
         next = { ...row, props: rowProps, cells: cells || row.cells };
@@ -1352,7 +1605,36 @@ class Resolver {
       return undefined;
     }
     if (pending.inlines.length || pending.blocks.length) rows[rows.length - 1] = rowWith(rows[rows.length - 1], pending, true);
-    const out: Table = { ...table, props, rows };
+    let grid = table.grid;
+    if (anyLost) {
+      // The cells that go are whole columns (see Lister.columnsOf): every row that stays lost the same grid columns.
+      // Those columns leave the grid, and a table of a fixed width is that much narrower.
+      const columns: number[] = [];
+      lost[0].forEach((column) => columns.push(column));
+      let whole = true;
+      for (const other of lost) if (other.size !== columns.length || !columns.every((column) => other.has(column))) whole = false;
+      if (!whole) {
+        // Never a table whose rows cover different columns: decisions that would leave one are not taken at all.
+        for (const one of taken) this.refuse(one.cell, one.slot);
+        return table;
+      }
+      columns.sort((x, y) => y - x);
+      grid = grid.slice();
+      let width = 0;
+      for (const column of columns) {
+        if (column >= grid.length) continue;
+        width += grid[column] || 0;
+        grid.splice(column, 1);
+      }
+      if (width > 0 && props.width && props.width.type === 'dxa') props = { ...props, width: { ...props.width, value: Math.max(0, props.width.value - width) } };
+    }
+    const out: Table = { ...table, props, grid, rows };
+    if (gridVerdict && table.gridChange) {
+      // The record alone, rejected: the grid is what it holds, when that fits the rows. With the column it was made
+      // for, the column leaving the grid is what brings the grid back, whatever order columns are resolved in.
+      if (gridVerdict === 'reject' && !columnDecided && !anyLost && table.gridChange.grid.length === grid.length) out.grid = table.gridChange.grid.slice();
+      delete out.gridChange;
+    }
     delete out.srcStart;
     delete out.srcEnd;
     return out;
@@ -1360,7 +1642,27 @@ class Resolver {
 
   // ---------------------------------------------------------------- lists
 
-  /** A list of blocks as the decisions leave it; the list itself when nothing in it changes. */
+  /** Does a paragraph hold nothing but content the verdict would take, were it given to the changes that content is in. */
+  private empties(paragraph: Paragraph): boolean {
+    for (const inline of paragraph.children) {
+      if (SURVIVORS.has(inline.type)) return false;
+      if (inline.type === 'run' && inline.content.some((item) => item.type === 'commentReference')) return false;
+      let goes = false;
+      let steps = 0;
+      for (let w = inline.wrap; w && steps < MAX_CHAIN && !goes; w = w.parent, steps++) goes = isRevision(w) && !inAlternate(w) && removes(WRAPPER_KIND[w.kind], this.verdict);
+      if (!goes) return false;
+    }
+    return true;
+  }
+
+  /**
+   * A list of blocks as the decisions leave it; the list itself when nothing in it changes.
+   *
+   * Where a paragraph mark goes and what happens to its paragraph depends on a neighbour that is itself a change
+   * of the same kind not decided about yet (a table all of which would go, a paragraph whose mark would), the
+   * mark waits (see `deferred`): it stays a change, and the rest of what was decided is done. So resolving
+   * changes one by one, in any order, leaves what resolving them together leaves.
+   */
   list(blocks: Block[], depth = 0): Block[] {
     if (depth > MAX_DEPTH) return blocks;
     const out: Block[] = [];
@@ -1371,12 +1673,64 @@ class Resolver {
       for (let i = out.length - 1, tries = 0; i >= 0 && tries < 64; i--, tries++) if (out[i].type === 'paragraph' || out[i].type === 'table') return out[i];
       return undefined;
     };
+    const isFrozen = (block: Block): boolean => block.wrap !== undefined && (block.wrap.kind === 'alternate' || inAlternate(block.wrap));
+    /** Has `other` a mark that the verdict which takes the mark of `paragraph` would take too. */
+    const waits = (other: Paragraph, paragraph: Paragraph): boolean => {
+      const slots = this.decisions.get(paragraph);
+      const mark = paragraph.props.markProps;
+      const pending = other.props.markProps;
+      if (!slots || !mark || !pending) return false;
+      for (const flag of MARK_FLAGS) {
+        const decided = slots.get('mark:' + flag);
+        if (!decided || mark[flag] === undefined || !removes(FLAG_KIND[flag], decided)) continue;
+        for (const one of MARK_FLAGS) if (pending[one] !== undefined && removes(FLAG_KIND[one], decided)) return true;
+      }
+      return false;
+    };
+    /**
+     * Would the verdict that takes the mark of a paragraph take all of the table too, were it given to the changes of
+     * the table: every row is one it takes (inserted, for a rejection; deleted, for an acceptance), or a row all of
+     * whose cells are (the columns of the table).
+     */
+    const goesWith = (table: Table, paragraph: Paragraph): boolean => {
+      const slots = this.decisions.get(paragraph);
+      const mark = paragraph.props.markProps;
+      if (!slots || !mark || table.rows.length === 0) return false;
+      for (const flag of ['inserted', 'deleted'] as const) {
+        const decided = slots.get('mark:' + flag);
+        if (!decided || mark[flag] === undefined || !removes(FLAG_KIND[flag], decided)) continue;
+        const taken = (props: { inserted?: RevisionInfo; deleted?: RevisionInfo }): boolean =>
+          (props.inserted !== undefined && removes('insert', decided)) || (props.deleted !== undefined && removes('delete', decided));
+        if (table.rows.every((row) => taken(row.props) || (row.cells.length > 0 && row.cells.every((cell) => taken(cell.props))))) return true;
+      }
+      return false;
+    };
+    /** What the tables of the list come to, each resolved once: a paragraph whose mark goes looks ahead past a table that goes. */
+    const tables = new Map<number, { table: Table | undefined; left: Leftover }>();
+    const tableAt = (index: number): { table: Table | undefined; left: Leftover } => {
+      let known = tables.get(index);
+      if (!known) {
+        const left: Leftover = { inlines: [], blocks: [] };
+        known = { table: this.table(blocks[index] as Table, depth, left), left };
+        tables.set(index, known);
+      }
+      return known;
+    };
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i];
       const frozen = block.wrap !== undefined && (block.wrap.kind === 'alternate' || inAlternate(block.wrap));
       if (block.type === 'paragraph' && !frozen) {
         const resolved = this.paragraph(block);
         let paragraph = resolved.paragraph;
+        // (As things were, should the mark of this paragraph turn out to have to wait.)
+        const held = open;
+        const sections = this.sectionsRemoved;
+        const wait = (): void => {
+          this.deferMarks(block);
+          open = held;
+          this.sectionsRemoved = sections;
+          i--;
+        };
         if (open) {
           const head = flatten(open.paragraph);
           const tail = flatten(paragraph);
@@ -1390,8 +1744,24 @@ class Resolver {
         const loose = open ? open.loose : [];
         open = undefined;
         if (resolved.join) {
-          const after = neighbour(blocks, i, 1);
+          // A table that goes whole (its rows were inserted with the paragraph, or deleted with it) is not in the way.
+          let after = neighbour(blocks, i, 1);
+          for (let tries = 0; after >= 0 && tries < 4096; tries++) {
+            const ahead = blocks[after];
+            if (ahead.type !== 'table' || isFrozen(ahead)) break;
+            const came = tableAt(after);
+            if (came.table !== undefined || came.left.inlines.length) break;
+            after = neighbour(blocks, after, 1);
+          }
           const next = after >= 0 ? blocks[after] : undefined;
+          // A table that would go whole with the same verdict, and is not decided about yet, stands between the mark
+          // and the paragraph it has to join. Alone, the mark would stay as a plain mark and the two paragraphs two for
+          // good, whatever happens to the table later: the mark waits for the table (or goes with it, in "all").
+          // (Not for a table that goes now and leaves marks behind: those get a paragraph of their own in its place.)
+          if (next && next.type === 'table' && !isFrozen(next) && tableAt(after).table !== undefined && goesWith(next, block)) {
+            wait();
+            continue;
+          }
           if (next && next.type === 'paragraph' && !(next.wrap !== undefined && (next.wrap.kind === 'alternate' || inAlternate(next.wrap)))) {
             // The section break this paragraph carries goes with its mark; it is counted when the join is made.
             open = { paragraph, loose, sections: paragraph.props.section !== undefined ? 1 : 0 };
@@ -1402,7 +1772,23 @@ class Resolver {
           const before = lastContent();
           const tableBefore = before !== undefined && before.type === 'table';
           const tableAfter = next !== undefined && next.type === 'table';
+          // And the table before it may be one that would go with the same verdict, and is not decided about yet: a
+          // paragraph that has to stay only because of that table (a table does not end a list) waits for it. So
+          // does one before which stands a paragraph whose own mark would go the same way: once that goes, the two
+          // are one paragraph, and whether that one stays is decided then. (Whether the paragraph is empty by then
+          // depends on changes in it that may be pending too: it waits either way.)
+          if (before !== undefined && ((before.type === 'table' && goesWith(before, block)) || (before.type === 'paragraph' && waits(before, block)))) {
+            wait();
+            continue;
+          }
           const droppable = next !== undefined ? !(tableAfter && tableBefore) : before !== undefined && !tableBefore;
+          // A paragraph that would go were it empty, and holds nothing but what the same verdict would take (changes
+          // not decided about yet), waits for those: it goes with the last of them, as it does when all are resolved
+          // together.
+          if (droppable && paragraph.children.length > 0 && this.empties(paragraph)) {
+            wait();
+            continue;
+          }
           if (paragraph.children.length === 0 && droppable) {
             if (paragraph.props.section !== undefined) this.sectionsRemoved++;
             changed = true;
@@ -1416,8 +1802,7 @@ class Resolver {
         continue;
       }
       if (block.type === 'table' && !frozen) {
-        const left: Leftover = { inlines: [], blocks: [] };
-        const table = this.table(block, depth, left);
+        const { table, left } = tableAt(i);
         if (table === block) {
           out.push(block);
           continue;
@@ -1425,6 +1810,11 @@ class Resolver {
         changed = true;
         if (table) {
           out.push(table);
+          continue;
+        }
+        if (open) {
+          // The paragraph before it is being joined to the one after it: the table leaves nothing but its marks.
+          for (const kept of left.blocks) open.loose.push(kept);
           continue;
         }
         // The table is gone. A paragraph takes its place where the list would otherwise be empty, end with a table or
@@ -1489,7 +1879,7 @@ function plan(doc: DocModel, found: Collected, wanted: Entry[], verdict: Verdict
       for (const part of found.ranges.get(name) || []) decide(part);
     });
     const everywhere = moves.size > 0;
-    const resolver = new Resolver(decisions, tables);
+    const resolver = new Resolver(decisions, tables, verdict);
     const out: Plan = { stories: [], chosen, sectionsRemoved: 0 };
     const ids: string[] = ['body'];
     doc.headers.forEach((_story, id) => ids.push('header:' + id));
@@ -1517,6 +1907,10 @@ function plan(doc: DocModel, found: Collected, wanted: Entry[], verdict: Verdict
       out.section = resolver.sectionProps(doc.body.section, verdict);
     }
     out.sectionsRemoved = resolver.sectionsRemoved;
+    // A change that is nothing but marks that wait was not resolved: it is not said to be.
+    if (resolver.deferred.size) {
+      out.chosen = chosen.filter((entry) => !entry.parts.every((part) => (resolver.deferred.get(part.host) || new Set<Slot>()).has(part.slot)));
+    }
     if (resolver.refused.size === 0) return out;
     const refusedMoves = new Set<string>();
     const hit = (entry: Entry): boolean => entry.parts.some((part) => (resolver.refused.get(part.host) || new Set<Slot>()).has(part.slot));
@@ -1767,12 +2161,20 @@ export function revisionsTouching(list: DocRevision[], range: DocRange): number[
   for (let i = 0; i < list.length; i++) {
     const revision = list[i];
     if (revision.story !== start.story) continue;
-    const from = placeOrder(revision.start, end);
-    const to = placeOrder(revision.end, start);
+    // A column is where its cells are: one stretch for each row.
+    const stretches = revision.cells && revision.cells.length ? revision.cells : [revision];
+    let inside = false;
+    let beside = false;
+    for (const stretch of stretches) {
+      const from = placeOrder(stretch.start, end);
+      const to = placeOrder(stretch.end, start);
+      if (from < 0 && to > 0) inside = true;
+      if (from <= 0 && to >= 0) beside = true;
+    }
     if (caret) {
-      if (from < 0 && to > 0) return [i];
-      if (from <= 0 && to >= 0 && border < 0) border = i;
-    } else if (from < 0 && to > 0) out.push(i);
+      if (inside) return [i];
+      if (beside && border < 0) border = i;
+    } else if (inside) out.push(i);
   }
   return caret && border >= 0 ? [border] : out;
 }

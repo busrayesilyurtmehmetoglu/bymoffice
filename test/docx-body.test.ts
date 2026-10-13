@@ -626,7 +626,9 @@ test('docx: what the reader does not understand is kept in place', async () => {
   assert.deepEqual(table.extras!.map((extra) => [extra.el.name, extra.partial]), [['w:tblGrid', true]]);
   assert.deepEqual(table.rows[0].props.extras!.map((extra) => extra.el.name), ['w:divId']);
   assert.deepEqual(table.rows[0].extras!.map((extra) => [extra.index, extra.el.name]), [[2, 'w:mystery']]);
-  assert.deepEqual(table.rows[0].cells[0].props.extras!.map((extra) => extra.el.name), ['w:cellIns', 'w:gridSpan']);
+  // A cell that was inserted with its column says so in the model; the span that is no span is kept.
+  assert.deepEqual(table.rows[0].cells[0].props.inserted, { id: 3, author: 'A' });
+  assert.deepEqual(table.rows[0].cells[0].props.extras!.map((extra) => extra.el.name), ['w:gridSpan']);
 
   // The tally of what was kept names each of them.
   assert.equal(doc.unknown.get('rPr/w14:ligatures'), 1);

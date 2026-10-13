@@ -5,6 +5,7 @@
 import { paragraphText, EMPTY_PARA_PROPS, type Block, type CellProps, type DocModel, type ParaProps, type Paragraph, type RunItem, type RunProps, type Table, type TableCell, type TableRow, type Wrapper } from '../../model/doc/types';
 import { buildEdit, tableContextOf, type DocEdit, type DocEditOptions, type Draft } from './draft';
 import { TRACK_UNSUPPORTED, afterCut, insertionLike, insertionWrap, isDeletedMark, isOwnMark, joinsWithoutLoss, plainProps, strikePieces, withFreshChanges, withMarkFlagsOf, withMarkRevision, withMarkRevisionsOf, withPlainMark, type Tracking } from './track';
+import { insertedFiller, insertedParagraph, insertedTable, struckBlocks, struckTable } from './track-blocks';
 import { inList, patchRunProps, withoutNumbering, type RunFormatPatch } from './format';
 import {
   atomFollows,
@@ -443,13 +444,19 @@ function nextParagraphProps(blocks: Block[], index: number, last: number): ParaP
  * tracked deletions, and so do its paragraphs: the mark of each paragraph
  * the range runs past says that it was deleted. What the author of the
  * change had put directly into a tracked insertion goes for good, text and,
- * between paragraphs formatted alike, paragraph marks. A range that takes cells of a table, or a table, is refused:
- * deleting those is a change of the table that is not tracked yet.
+ * between paragraphs formatted alike, paragraph marks.
+ *
+ * Tables follow the rules of deleteSpan(): a table the range covers whole
+ * stays with all its rows deleted (<w:del> in their properties) and what
+ * they hold deleted; of a table the range only reaches into, the cells it
+ * takes keep their place and what they hold is deleted. Nothing of a table
+ * ever goes for good here, whoever made it.
  */
 function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocPosition): DocPosition {
   const doc = draft.doc;
   const story = start.story;
   const a = resolvePosition(doc, start);
+  const b = resolvePosition(doc, end);
   const { depth, level } = parting(start, end);
   if (depth === start.path.length && depth === end.path.length) {
     const pieces = flatten(a.paragraph);
@@ -460,12 +467,28 @@ function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocP
     if (struck.changed) draft.setParagraph(story, start.path, paragraphWith(a.paragraph, rebuild(struck.pieces)));
     return { story, path: start.path.slice(), offset };
   }
-  if (depth % 3 !== 0 || start.path.length !== level + 1 || end.path.length !== level + 1) bad(TRACK_UNSUPPORTED);
   const container = start.path.slice(0, level);
   const blocks = containerBlocks(doc, story, container);
   const first = start.path[level];
   const last = end.path[level];
-  for (let i = first + 1; i < last; i++) if (blocks[i].type === 'table') bad(TRACK_UNSUPPORTED);
+  /** The start of the cell a range begins in: where the caret is left when the table stays. */
+  const inCell = (): DocPosition => {
+    const cell = start.path.slice(0, level + 3);
+    const path = paragraphIn(containerBlocks(doc, story, cell), cell, 0, 1);
+    return path ? { story, path, offset: 0 } : { story, path: start.path.slice(), offset: 0 };
+  };
+  if (depth % 3 !== 0) {
+    // Two cells of one table: what the cells between them hold is deleted.
+    const table = blocks[first] as Table;
+    const struck = tableStruck(track, table, cellsBetween(table, start.path[level + 1], start.path[level + 2], end.path[level + 1], end.path[level + 2]));
+    if (struck !== table) draft.replace(story, container, first, 1, [struck]);
+    return inCell();
+  }
+  const startTable = start.path.length === level + 1 ? undefined : (blocks[first] as Table);
+  const endTable = end.path.length === level + 1 ? undefined : (blocks[last] as Table);
+  // A table the range covers from its very first position, or to its very last, is deleted as a whole.
+  const startGoes = startTable !== undefined && start.offset === 0 && samePath(paragraphIn(blocks, container, first, 1), start.path);
+  const endGoes = endTable !== undefined && end.offset === b.length && samePath(paragraphIn(blocks, container, last, -1), end.path);
 
   const out: Block[] = [];
   /** Blocks without content that follow a paragraph whose mark went for good: they follow the paragraph it joined. */
@@ -476,6 +499,19 @@ function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocP
   let any = false;
   for (let i = first; i <= last; i++) {
     const block = blocks[i];
+    if (block.type === 'table') {
+      let struck: Table;
+      if (i === first && startTable && !startGoes) {
+        const [r1, c1] = [start.path[level + 1], start.path[level + 2]];
+        struck = tableStruck(track, block, (r, c) => r > r1 || (r === r1 && c >= c1));
+      } else if (i === last && endTable && !endGoes) {
+        const [r2, c2] = [end.path[level + 1], end.path[level + 2]];
+        struck = tableStruck(track, block, (r, c) => r < r2 || (r === r2 && c <= c2));
+      } else struck = struckTable(track, block);
+      if (struck !== block) any = true;
+      out.push(struck);
+      continue;
+    }
     if (block.type !== 'paragraph') {
       (open ? loose : out).push(block);
       continue;
@@ -496,7 +532,8 @@ function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocP
       content = open.pieces.concat(afterCut(open.pieces, content, track));
       changed = true;
     }
-    if (i < last && isOwnMark(block.props, track) && joinsWithoutLoss(block.props, nextParagraphProps(blocks, i, last))) {
+    const following = neighbour(blocks, i, 1);
+    if (i < last && following >= 0 && following <= last && blocks[following].type === 'paragraph' && isOwnMark(block.props, track) && joinsWithoutLoss(block.props, nextParagraphProps(blocks, i, last))) {
       // The mark was a tracked insertion of this author, between two paragraphs formatted alike: it goes, and the
       // next paragraph continues this one. Between paragraphs that differ it is deleted like any other mark, so
       // that the second keeps its formatting.
@@ -520,7 +557,33 @@ function strikeSpan(draft: Draft, track: Tracking, start: DocPosition, end: DocP
     open = undefined;
   }
   if (any) draft.replace(story, container, first, last - first + 1, out);
+  if (startTable) return startGoes ? { story, path: start.path.slice(), offset: 0 } : inCell();
   return { story, path: start.path.slice(), offset: caretOffset };
+}
+
+/** A copy of a table with what the cells `takes` picks hold deleted as a tracked change; the table itself when nothing changes. */
+function tableStruck(track: Tracking, table: Table, takes: (row: number, cell: number) => boolean): Table {
+  let rows: TableRow[] | undefined;
+  for (let r = 0; r < table.rows.length; r++) {
+    const row = table.rows[r];
+    let cells: TableCell[] | undefined;
+    for (let c = 0; c < row.cells.length; c++) {
+      if (!takes(r, c)) continue;
+      // The cell stays, and so does the mark of its last paragraph.
+      const blocks = struckBlocks(track, row.cells[c].blocks, false);
+      if (blocks === row.cells[c].blocks) continue;
+      if (!cells) cells = row.cells.slice();
+      cells[c] = { ...row.cells[c], blocks };
+    }
+    if (!cells) continue;
+    if (!rows) rows = table.rows.slice();
+    rows[r] = { ...row, cells };
+  }
+  if (!rows) return table;
+  const out: Table = { ...table, rows };
+  delete out.srcStart;
+  delete out.srcEnd;
+  return out;
 }
 
 /**
@@ -976,12 +1039,19 @@ export function placeBlock(draft: Draft, position: DocPosition, block: Block): n
   }
   const container = position.path.slice(0, -1);
   let index = at.index;
+  const track = draft.track;
   if (position.offset > 0 && position.offset < at.length) {
     const pieces = flatten(at.paragraph);
     const cut = caretIndex(pieces, position);
+    const head = pieces.slice(0, cut);
+    // Where changes are tracked the mark that is new (the one of the first half) says that it was inserted.
     draft.replace(position.story, container, index, 1, [
-      paragraphWith(at.paragraph, rebuild(pieces.slice(0, cut)), newMarkProps(at.paragraph.props)),
-      paragraphWith(at.paragraph, rebuild(pieces.slice(cut)), at.paragraph.props, false),
+      paragraphWith(
+        at.paragraph,
+        rebuild(head),
+        track ? withMarkRevision(withFreshChanges(withPlainMark(withoutSection(at.paragraph.props)), track), 'inserted', track.revision()) : newMarkProps(at.paragraph.props),
+      ),
+      paragraphWith(at.paragraph, rebuild(track ? afterCut(head, pieces.slice(cut), track) : pieces.slice(cut)), at.paragraph.props, false),
     ]);
     index++;
   } else if (position.offset > 0) index++;
@@ -993,7 +1063,10 @@ export function placeBlock(draft: Draft, position: DocPosition, block: Block): n
   const out: Block[] = [placed];
   let offset = 0;
   if (placed.type === 'table') {
-    const empty = (): Paragraph => (placed.wrap ? { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [], wrap: placed.wrap } : { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] });
+    const empty = (): Paragraph => {
+      if (track) return insertedFiller(track, placed.wrap);
+      return placed.wrap ? { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [], wrap: placed.wrap } : { type: 'paragraph', props: EMPTY_PARA_PROPS, children: [] };
+    };
     const before = neighbour(blocks, index, -1);
     const after = neighbour(blocks, index - 1, 1);
     if (before >= 0 && blocks[before].type === 'table') {
@@ -1006,14 +1079,23 @@ export function placeBlock(draft: Draft, position: DocPosition, block: Block): n
   return index + offset;
 }
 
-/** Inserts a block (a paragraph, a table) at a position; see placeBlock. The caret goes to the start of the block, or of what follows it when it holds no paragraph. */
+/**
+ * Inserts a block (a paragraph, a table) at a position; see placeBlock. The caret goes to the start of the block, or
+ * of what follows it when it holds no paragraph. Where changes are tracked the block is a tracked insertion: the
+ * content and the mark of a paragraph, the rows of a table; a block of another kind is refused there.
+ */
 export function insertBlock(doc: DocModel, position: DocPosition, block: Block, options?: DocEditOptions): DocEdit {
   const build = (draft: Draft) => {
-    const index = placeBlock(draft, position, block);
+    let made = block;
+    if (draft.track && block) {
+      if (block.type === 'paragraph') made = insertedParagraph(draft.track, block, true);
+      else if (block.type === 'table') made = insertedTable(draft.track, block);
+      else bad(TRACK_UNSUPPORTED);
+    }
+    const index = placeBlock(draft, position, made);
     const container = position.path.slice(0, -1);
     const path = paragraphIn(containerBlocks(doc, position.story, container), container, index, 1);
     return path ? { story: position.story, path, offset: 0 } : position;
   };
-  // A block put in whole is not made a tracked insertion yet: refused where changes are tracked.
-  return buildEdit(doc, build, options);
+  return buildEdit(doc, build, options, true);
 }

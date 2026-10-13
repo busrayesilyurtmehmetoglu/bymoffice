@@ -1009,6 +1009,36 @@ function readRows(ctx: PartContext, el: XmlElement, table: Table, index: number,
   table.extras = pushExtra(ctx, table.extras, index, el, 'tbl', false, wrap);
 }
 
+/** <w:tblGridChange w:id=""><w:tblGrid><w:gridCol/>...</w:tblGrid></w:tblGridChange>, when it holds nothing else. */
+function readGridChange(ctx: PartContext, el: XmlElement): { id?: number; grid: number[] } | undefined {
+  if (hasLooseContent(el)) return undefined;
+  ctx.hits = 0;
+  const id = intAttr(ctx, el, 'id', 0, 0x7fffffff);
+  if (ctx.hits !== el.attrs.size) return undefined;
+  let inner: XmlElement | undefined;
+  for (const node of el.children) {
+    if (node.type !== 'element') continue;
+    if (inner || kindOf(ctx, node.name) !== 'tblGrid') return undefined;
+    inner = node;
+  }
+  // The schema asks for the grid: a record without one says nothing that could be brought back.
+  if (!inner || inner.attrs.size || hasLooseContent(inner)) return undefined;
+  const grid: number[] = [];
+  for (const col of inner.children) {
+    if (col.type !== 'element') continue;
+    if (kindOf(ctx, col.name) !== 'gridCol' || col.children.length) return undefined;
+    ctx.hits = 0;
+    const text = attr(ctx, col, 'w');
+    const width = text === undefined ? undefined : parseMeasure(text, 20, 0, MAX_TWIPS);
+    if (width === undefined || ctx.hits !== col.attrs.size) return undefined;
+    grid.push(width);
+  }
+  if (grid.length > 1000) return undefined;
+  const out: { id?: number; grid: number[] } = { grid };
+  if (id !== undefined) out.id = id;
+  return out;
+}
+
 function readTable(ctx: PartContext, el: XmlElement, wrap: Wrapper | undefined, depth: number): Table {
   const table: Table = { type: 'table', props: {}, grid: [], rows: [] };
   const inner = nested(depth);
@@ -1026,15 +1056,31 @@ function readTable(ctx: PartContext, el: XmlElement, wrap: Wrapper | undefined, 
     else if (kind === 'tblGrid' && !gridSeen) {
       gridSeen = true;
       let plain = node.attrs.size === 0 && !hasLooseContent(node);
+      let change: XmlElement | undefined;
       for (const col of node.children) {
         if (col.type !== 'element') continue;
+        // The grid as it was before a tracked change, when it is the last child and holds plain columns.
+        if (!change && kindOf(ctx, col.name) === 'tblGridChange') {
+          const was = readGridChange(ctx, col);
+          if (was) {
+            change = col;
+            table.gridChange = was;
+            continue;
+          }
+        }
+        // Something follows the record: the grid is not what the schema says.
+        if (change) plain = false;
         ctx.hits = 0;
         const text = kindOf(ctx, col.name) === 'gridCol' ? attr(ctx, col, 'w') : undefined;
         const width = text === undefined ? undefined : parseMeasure(text, 20, 0, MAX_TWIPS);
         if (kindOf(ctx, col.name) === 'gridCol') table.grid.push(width === undefined ? 0 : width);
         if (width === undefined || ctx.hits !== col.attrs.size || col.children.length) plain = false;
       }
-      if (!plain) table.extras = pushExtra(ctx, table.extras, index, node, 'tbl', true);
+      if (!plain) {
+        // Kept as it was read, record and all: the record is not in the model too, or it would be two changes.
+        delete table.gridChange;
+        table.extras = pushExtra(ctx, table.extras, index, node, 'tbl', true);
+      }
     } else readRows(ctx, node, table, index, undefined, inner);
   }
   table.rows = fitted(table.rows);

@@ -3070,7 +3070,9 @@ export class DocumentView {
   describeRevision(revision: DocRevision): string {
     const date = revision.date;
     const shown = date !== undefined && /^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(date) ? `${date.slice(0, 10)} ${date.slice(11, 16)}` : date;
-    return this.strings.revisionDescription(revision.kind, revision.author, shown, revision.text);
+    // A column of a table that was put in or taken out is said as that.
+    const kind = revision.columns > 0 && (revision.kind === 'insert' || revision.kind === 'delete') ? revision.kind + 'Column' : revision.kind;
+    return this.strings.revisionDescription(kind, revision.author, shown, revision.text);
   }
 
   /** Places in the list of the changes the selection touches. */
@@ -5086,21 +5088,11 @@ export class DocumentView {
    * Pastes a copy made on this page as one step of the history: with its
    * pictures, links, fields and tables when it holds them, else its text with
    * the formatting it had. A copy whose pictures are still being read from
-   * the document it came from is pasted once they are there.
+   * the document it came from is pasted once they are there. Where changes
+   * are tracked what is pasted is a tracked insertion, all of it.
    */
   private pasteCopy(copy: StoredCopy, waited: boolean): void {
-    if (this.trackingChanges) {
-      // Formatting, pictures and tables are not made tracked insertions yet: the text of the copy is, and the user is told.
-      if (!this.editable || !this.range()) return;
-      if (copy.text === '') {
-        // A copy without text (a picture alone): nothing of it can be pasted as a tracked insertion, and that is said.
-        this.notify(this.strings.cannotTrackChange, 'info');
-        return;
-      }
-      this.pasteText(copy.text);
-      this.notify(this.strings.pastedAsText, 'info');
-      return;
-    }
+    // Where changes are tracked the copy goes in whole all the same, as a tracked insertion (see insertFragment).
     const asked = this.range();
     const fragment = copy.slice.fragment;
     if (!fragment) {
@@ -5159,7 +5151,9 @@ export class DocumentView {
     } catch (error) {
       // A copy that does not fit here (another kind of document, tables too deep) is not an error of the program.
       if (!(error instanceof RangeError)) throw error;
-      this.notify(this.strings.cannotPasteHere, 'info');
+      // What cannot be pasted as a tracked change is said as that.
+      if (error.message === ops.TRACK_UNSUPPORTED) this.refuse(error);
+      else this.notify(this.strings.cannotPasteHere, 'info');
       return;
     }
     this.history.seal();

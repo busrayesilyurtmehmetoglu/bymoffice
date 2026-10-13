@@ -29,6 +29,7 @@ import {
   type DocEditOptions,
   type DocRange,
 } from '../src/ops/doc/index';
+import { claimRevisions } from '../src/ops/doc/track';
 import { OpcPackage } from '../src/opc';
 import { parseXml } from '../src/xml';
 import { NUMBERING, STYLES, picture, p, paragraphAt, pos, r, range, run, tbl, tc, texts, tr } from './doc-ops-fixtures';
@@ -254,7 +255,7 @@ const REVISED_ROW =
   tc('b') +
   '</w:tr>';
 
-test('review 4 (A4): a row put beside a row with tracked changes carries none of them', async () => {
+test('review 4 (A4): a row put beside a row with tracked changes carries none of them, but the mark of a pending column', async () => {
   for (const where of ['above', 'below'] as const) {
     const o = await open(p('before') + tbl(REVISED_ROW, [2000, 2000]) + p('after'));
     const before = revisionsOf(o.doc);
@@ -269,7 +270,11 @@ test('review 4 (A4): a row put beside a row with tracked changes carries none of
     assert.equal(row.props.change, undefined);
     assert.equal(row.tableProps?.change, undefined);
     assert.equal(row.cells[0].props.change, undefined);
-    assert.ok(!(row.cells[0].props.extras || []).some((extra) => /cellIns/.test(extra.el.name)));
+    // But one: the cell beside it belongs to a column that is a pending change, and so does the new cell (a column
+    // is resolved in every row). It says so under an id of its own.
+    const mark = row.cells[0].props.inserted;
+    assert.ok(mark && mark.author === 'Ann' && mark.id !== 23, JSON.stringify(mark));
+    assert.equal(row.cells[1].props.inserted, undefined);
     const para = row.cells[0].blocks[0];
     assert.ok(para.type === 'paragraph');
     assert.equal(para.props.align, 'right');
@@ -279,7 +284,7 @@ test('review 4 (A4): a row put beside a row with tracked changes carries none of
     assert.equal(after.length, before.length, `${where}: ${JSON.stringify(after.map((revision) => revision.kind))}`);
     const xml = await body(o);
     assertUniqueIds(xml);
-    assert.deepEqual(idsIn(xml).sort(), idsBefore.sort(), where);
+    assert.deepEqual(idsIn(xml).filter((id) => id !== String((mark as { id: number }).id)).sort(), idsBefore.sort(), where);
     parseXml(await written(o));
     o.history.undo();
     await writeDocx(o.pkg, o.doc);
@@ -310,11 +315,21 @@ test('review 4 (A4): a column put beside cells with tracked changes carries none
   }
 });
 
-test('review 4 (A4): with tracking on, rows, columns and tables are still refused', async () => {
+test('review 4 (A4): with tracking on, a row, a column and a table beside a revised row are tracked insertions that take none of its changes', async () => {
   const o = await open(p('before') + tbl(REVISED_ROW, [2000, 2000]) + p('after'));
-  assert.throws(() => insertRow(o.doc, pos([1, 0, 0, 0], 0), 'below', TRACKED), RangeError);
-  assert.throws(() => insertColumn(o.doc, pos([1, 0, 0, 0], 0), 'right', TRACKED), RangeError);
-  assert.throws(() => insertTable(o.doc, pos(0, 2), 1, 1, TRACKED), RangeError);
+  const original = await body(o);
+  const idsBefore = idsIn(original);
+  run(o.history, insertRow(o.doc, pos([1, 0, 0, 0], 0), 'below', TRACKED));
+  run(o.history, insertColumn(o.doc, pos([1, 0, 0, 0], 0), 'right', TRACKED));
+  run(o.history, insertTable(o.doc, pos(0, 2), 1, 1, TRACKED));
+  const xml = await body(o);
+  assertUniqueIds(xml);
+  // Every change the file brought is still there, once; what was added is the editor's.
+  const now = idsIn(xml);
+  for (const id of idsBefore) assert.equal(now.filter((other) => other === id).length, 1, `id ${id}\n${xml}`);
+  assert.ok(now.length > idsBefore.length, xml);
+  // (One more of Ann's: the cell of the new row in the column she put in carries the mark of that column.)
+  assert.equal(count(xml, 'w:author="Ann"'), count(original, 'w:author="Ann"') + 1, xml);
 });
 
 // ------------------------------------------------------------------------- A5
@@ -390,6 +405,7 @@ test('review 4 (A7): what is left of an own insertion that is all a control hold
 test('review 4 (A7): where the control keeps something else, all of the own text goes for good, however its runs are cut', async () => {
   for (const inner of [r('abcd'), r('ab') + r('cd', '<w:b/>')]) {
     const o = await open(p(r('x') + CONTROL(r('k') + OWN(inner)) + r('y')), { settings: '<w:trackRevisions/>' });
+    claimRevisions(o.doc, 'Me', [7]);
     run(o.history, deleteRange(o.doc, range(pos(0, 2), pos(0, 6)), ME));
     assert.deepEqual(texts(o.doc), ['xky']);
     const xml = await body(o);
@@ -412,6 +428,7 @@ test('review 4 (A7): a link inside a control, each of them left empty or not', a
 
 test('review 4 (A7): Backspace key by key takes own text out of a control for good until the last character, which stays deleted', async () => {
   const o = await open(p(r('x') + CONTROL(OWN(r('abc'))) + r('y')), { settings: '<w:trackRevisions/>' });
+  claimRevisions(o.doc, 'Me', [7]);
   for (let offset = 4; offset > 1; offset--) run(o.history, deleteBackward(o.doc, pos(0, offset), 'char', ME));
   assert.deepEqual(texts(o.doc), ['xy']);
   const xml = await body(o);

@@ -1175,18 +1175,17 @@ function writeParagraph(ctx: BodyContext, paragraph: Paragraph, out: string[], d
 
 // --------------------------------------------------------------------- tables
 
-function gridElement(ctx: BodyContext, grid: number[]): XmlElement {
-  return wEl(
-    ctx,
-    'tblGrid',
-    undefined,
-    grid.map((width) => wEl(ctx, 'gridCol', [['w', width]])),
-  );
+function gridElement(ctx: BodyContext, grid: number[], change?: { id?: number; grid: number[] }): XmlElement {
+  const children = grid.map((width) => wEl(ctx, 'gridCol', [['w', width]]));
+  // The record of the grid as it was is the last child (CT_TblGrid).
+  if (change) children.push(wEl(ctx, 'tblGridChange', [['id', change.id]], [gridElement(ctx, change.grid)]));
+  return wEl(ctx, 'tblGrid', undefined, children);
 }
 
 function gridText(ctx: BodyContext, table: Table, kept: ExtraXml | undefined): string {
+  // (A grid that is kept as read keeps its record in what is kept: the model has none then.)
+  if (!kept) return treeText(ctx, gridElement(ctx, table.grid, table.gridChange));
   const wanted = gridElement(ctx, table.grid);
-  if (!kept) return treeText(ctx, wanted);
   // The grid as it was read (with its change record, say) while it still says what the model says.
   const again = rereadBlock(ctx, synthetic(ctx, 'tbl', [kept.el]));
   const understood = again && again.type === 'table' ? gridElement(ctx, again.grid) : undefined;

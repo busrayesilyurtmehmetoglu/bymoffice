@@ -18,14 +18,9 @@ import {
   deleteColumn,
   deleteForward,
   deleteRange,
-  deleteRow,
   indentList,
   insertBlock,
   insertColumn,
-  insertHyperlink,
-  insertImage,
-  insertRow,
-  insertTable,
   insertText,
   listRevisions,
   rejectAll,
@@ -738,19 +733,15 @@ test('a caret in an empty paragraph: a property turned on and off again leaves n
 
 // --------------------------------------------------------------- still refused
 
-test('tables, pictures, links and blocks are still refused where changes are tracked, and change nothing', async () => {
-  const o = await open(p('abcd') + tbl(tr(tc('x') + tc('y')) + tr(tc('z') + tc('w')), [1000, 1000]) + p('end'));
+test('what still cannot be tracked is refused, and changes nothing', async () => {
+  // (Tables, rows, columns, pictures, links and blocks are tracked: test/doc-track-tables.test.ts, test/doc-track-content.test.ts.)
+  const o = await open(p('abcd') + tbl(tr(tc('x', '<w:gridSpan w:val="2"/>')) + tr(tc('z') + tc('w')), [1000, 1000]) + p('end'));
   const before = docPicture(o.doc);
-  const span = range(pos(0, 1), pos(0, 3));
-  const cell: DocPosition = { story: 'body', path: [1, 0, 0, 0], offset: 0 };
-  refused(() => insertTable(o.doc, pos(0, 1), 2, 2));
-  refused(() => insertRow(o.doc, cell, 'below'));
-  refused(() => deleteRow(o.doc, cell));
+  const cell: DocPosition = { story: 'body', path: [1, 1, 0, 0], offset: 0 };
+  // A column through a merged cell changes that cell; a block that is neither a paragraph nor a table has no mark to say it was inserted.
   refused(() => insertColumn(o.doc, cell, 'right'));
   refused(() => deleteColumn(o.doc, cell));
-  refused(() => insertHyperlink(o.doc, span, 'https://example.org/'));
-  refused(() => insertImage(o.doc, pos(0, 1), { bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]), type: 'image/png', width: 9525, height: 9525 }));
-  refused(() => insertBlock(o.doc, pos(0, 1), { type: 'paragraph', props: {}, children: [] }));
+  refused(() => insertBlock(o.doc, pos(0, 1), { type: 'mark', mark: { type: 'bookmarkStart', id: '9', name: 'b' } }));
   assert.equal(docPicture(o.doc), before);
   assert.equal(o.doc.body.modified, undefined);
   // Formatting inside a cell is tracked like anywhere else.
@@ -758,7 +749,7 @@ test('tables, pictures, links and blocks are still refused where changes are tra
   run(o.history, setParaFormat(o.doc, cell, { align: 'center' }, ME));
   assert.deepEqual(listed(o.doc), [
     ['paragraphFormat', 'Me', ''],
-    ['format', 'Me', 'x'],
+    ['format', 'Me', 'z'],
   ]);
   checkWritten(await written(o));
 });

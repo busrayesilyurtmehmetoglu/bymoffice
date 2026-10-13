@@ -55,8 +55,11 @@ interface Made {
   revisions: number;
 }
 
-/** `listed`: now and then a paragraph is an item of a list whose number was changed, which the model only keeps (as XML in its properties). */
-export function generate(seed: number, listed = false): Made {
+/**
+ * `listed`: now and then a paragraph is an item of a list whose number was changed, which the model only keeps (as XML
+ * in its properties). `cells`: now and then a column of a table was inserted or deleted (a cell in every row).
+ */
+export function generate(seed: number, listed = false, cells = false): Made {
   const d: Dice = dice(seed);
   let id = 100;
   let serial = 0;
@@ -66,7 +69,7 @@ export function generate(seed: number, listed = false): Made {
   const run = (text: string, rPr = ''): string => `<w:r>${rPr ? `<w:rPr>${rPr}</w:rPr>` : ''}<w:t xml:space="preserve">${text}</w:t></w:r>`;
   const gone = (text: string): string => `<w:r><w:delText xml:space="preserve">${text}</w:delText></w:r>`;
 
-  type Piece = { text: string; state: State } | { mark: State } | { row: State; open: boolean };
+  type Piece = { text: string; state: State } | { mark: State } | { row: State; open: boolean } | { cell: State; open: boolean };
   const notes: { id: number; state: State; pieces: Piece[]; xml: string }[] = [];
 
   /** The content of one paragraph and what the generator knows of it. */
@@ -156,6 +159,21 @@ export function generate(seed: number, listed = false): Made {
   const table = (pieces: Piece[]): string => {
     let rows = '';
     const count = 1 + d.int(3);
+    // A column that is a change is one in every row: the same author and date, an id for each cell.
+    const columns: { state: State; who: () => string }[] = [];
+    for (let c = 0; c < 2; c++) {
+      let state: State = {};
+      let who = (): string => '';
+      // (The first column stays: a table whose last column goes leaves a paragraph for the bookmarks it held, which the count of the text does not know.)
+      if (cells && c === 1 && d.chance(0.6)) {
+        const author = d.pick(AUTHORS);
+        const date = d.pick(DATES);
+        revisions++;
+        state = d.chance(0.5) ? { ins: author } : { del: author };
+        who = () => `<w:tcPr><w:${state.ins ? 'cellIns' : 'cellDel'} w:id="${id++}" w:author="${author}" w:date="${date}"/></w:tcPr>`;
+      }
+      columns.push({ state, who });
+    }
     for (let r = 0; r < count; r++) {
       let state: State = {};
       let trPr = '';
@@ -166,15 +184,19 @@ export function generate(seed: number, listed = false): Made {
         trPr = `<w:trPr><w:${state.ins ? 'ins' : 'del'}${who(author)}/></w:trPr>`;
       }
       pieces.push({ row: state, open: true });
-      let cells = '';
+      let made = '';
       for (let c = 0; c < 2; c++) {
         let blocks = '';
+        const cellState = columns[c].state;
+        const tcPr = columns[c].who();
+        pieces.push({ cell: cellState, open: true });
         const paragraphs = 1 + d.int(2);
         for (let k = 0; k < paragraphs; k++) blocks += paragraph(pieces, k === paragraphs - 1, false);
-        cells += `<w:tc>${blocks}</w:tc>`;
+        pieces.push({ cell: cellState, open: false });
+        made += `<w:tc>${tcPr}${blocks}</w:tc>`;
       }
       pieces.push({ row: state, open: false });
-      rows += `<w:tr>${trPr}${cells}</w:tr>`;
+      rows += `<w:tr>${trPr}${made}</w:tr>`;
     }
     return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>${rows}</w:tbl>`;
   };
@@ -200,10 +222,13 @@ export function generate(seed: number, listed = false): Made {
 
   const textOf = (pieces: Piece[], accepts: Verdicts): string => {
     let out = '';
-    let hidden = false;
+    let rowHidden = false;
+    let cellHidden = false;
     for (const piece of pieces) {
-      if ('row' in piece) hidden = piece.open && !stays(piece.row, accepts);
-      else if (hidden) continue;
+      // A row goes with everything in it, and so does a cell.
+      if ('row' in piece) rowHidden = piece.open && !stays(piece.row, accepts);
+      else if ('cell' in piece) cellHidden = piece.open && !stays(piece.cell, accepts);
+      else if (rowHidden || cellHidden) continue;
       else if ('mark' in piece) out += stays(piece.mark, accepts) ? '\n' : '';
       else if (stays(piece.state, accepts)) out += piece.text;
     }
@@ -284,8 +309,9 @@ const SEEDS = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
 
 test('random revisions: "accept all" and "reject all" leave the text a plain count says, and no change', async () => {
   let total = 0;
-  for (const seed of SEEDS) {
-    const made = generate(seed);
+  for (const seed of SEEDS.concat(SEEDS.map((value) => -value))) {
+    // The second half of the seeds: with cells that were inserted or deleted with their column.
+    const made = generate(Math.abs(seed), false, seed < 0);
     total += made.revisions;
     for (const accept of [true, false]) {
       const o = await open(made.spec);
@@ -298,7 +324,7 @@ test('random revisions: "accept all" and "reject all" leave the text a plain cou
       assert.deepEqual(sorted(storyTexts(o.doc)), sorted(made.expected(() => accept)), label);
       assert.deepEqual(revisionsOf(o.doc), [], label);
       const xml = await checkWritten(o, label);
-      assert.ok(!/<w:(ins|del|moveFrom|moveTo|rPrChange|delText|delInstrText)\b/.test(xml), label);
+      assert.ok(!/<w:(ins|del|moveFrom|moveTo|rPrChange|delText|delInstrText|cellIns|cellDel)\b/.test(xml), label);
       // The file opens again to the same text.
       const again = await readDocx(await OpcPackage.open(await o.pkg.save()));
       assert.deepEqual(sorted(storyTexts(again)), sorted(made.expected(() => accept)), label);
@@ -312,8 +338,9 @@ test('random revisions: "accept all" and "reject all" leave the text a plain cou
 });
 
 test('random revisions: one by one in a random order gives what "all" gives for the same verdicts', async () => {
-  for (const seed of SEEDS) {
-    const made = generate(seed);
+  for (const seed of SEEDS.concat(SEEDS.map((value) => -value))) {
+    // The second half of the seeds: with columns that were inserted or deleted (each of them one change).
+    const made = generate(Math.abs(seed), false, seed < 0);
     const d = dice(seed * 7 + 1);
     // Two authors are accepted, two rejected.
     const accepted = new Set<string>([AUTHORS[d.int(2)], AUTHORS[2 + d.int(2)]]);
@@ -348,7 +375,8 @@ test('random revisions: one by one in a random order gives what "all" gives for 
 test('random revisions: editing with tracking on, mixed with accepting and rejecting', async () => {
   for (const seed of SEEDS.slice(0, 8)) {
     // With changed list numbers: every paragraph break in such an item makes a second paragraph with the record.
-    const made = generate(seed, true);
+    // And with cells that were inserted or deleted with their column.
+    const made = generate(seed, true, true);
     const o = await open({ ...made.spec, settings: '<w:trackRevisions/>' });
     const d = dice(seed * 13 + 5);
     const me = { author: 'Me', date: '2026-10-08T10:00:00Z' };

@@ -7,7 +7,7 @@ import { expect, test } from './helpers';
 // Formatting in a document that tracks its changes: bold, alignment, lists
 // and styles are tracked changes like typing is (the saved file records what
 // the formatting was), they are listed, rejected and accepted like the
-// others; what cannot be tracked yet (tables) is still refused, and said.
+// others. (Tables are tracked changes as well: e2e/doc-track-tables.spec.ts.)
 
 const STYLES =
   DOC_STYLES +
@@ -138,15 +138,17 @@ test.describe('tracked changes of formatting', () => {
     expect(accepted).toContain('<w:p><w:pPr><w:jc w:val="center"/></w:pPr>');
   });
 
-  test('a table is still refused where changes are tracked, with a notice that says why', async ({ page }) => {
+  test('a table is a tracked change too where changes are tracked, and the toolbar offers it', async ({ page }) => {
+    // (What it is in the file, and accepting and rejecting it: e2e/doc-track-tables.spec.ts.)
     await mountEdit(page, await sample(p('First paragraph.') + p('Second one.')));
-    const before = await savedXml(page);
     await select(page, [0], 3);
-    for (const command of ['insertTable', 'insertPicture', 'insertLink', 'rowsColumns']) await expect(button(page, command)).toBeDisabled();
-    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(false);
-    expect(await notices(page)).toEqual([{ message: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed', kind: 'info' }]);
-    expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
-    expect(await savedXml(page)).toBe(before);
+    for (const command of ['insertTable', 'insertPicture', 'insertLink']) await expect(button(page, command)).toBeEnabled();
+    // Rows and columns are those of a table: the caret is in none.
+    await expect(button(page, 'rowsColumns')).toBeDisabled();
+    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(true);
+    expect(await notices(page)).toEqual([]);
+    expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(true);
+    expect((await savedXml(page)).split('<w:trPr><w:ins ').length).toBe(3);
   });
 
   test('saved and opened again, the changes of formatting are still there, and rejecting all of them gives the formatting back', async ({ page }) => {

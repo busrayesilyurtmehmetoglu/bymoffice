@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test';
-import { p, r } from '../test/doc-layout-fixtures';
+import { p, r, tbl, tc, tr } from '../test/doc-layout-fixtures';
 import { docx, DOC_STYLES } from './fixtures/docx';
 import { ZipArchive } from '../src/zip';
 import { expect, test } from './helpers';
@@ -7,7 +7,8 @@ import { expect, test } from './helpers';
 // Documents that track their changes, and documents that are protected: what
 // is typed and deleted becomes a tracked change in the saved file and shows as
 // one on the page; what cannot be tracked is refused; a protected document
-// stays read-only.
+// stays read-only. (Tables, pictures, links and pasted content as tracked
+// changes: e2e/doc-track-tables.spec.ts.)
 
 interface MountOptions {
   readOnly?: boolean;
@@ -220,32 +221,34 @@ test.describe('tracked changes', () => {
     expect(xml.indexOf('<w:rPr><w:ins w:id="2" ')).toBeLessThan(xml.indexOf('<w:rPr><w:del w:id="1" '));
   });
 
-  test('a change that cannot be tracked is refused with a notice, and the toolbar does not offer what it cannot track', async ({ page }) => {
-    await mountEdit(page, await sample(p('First paragraph.') + p('Second one.')));
+  /** A table whose first row is one cell over both columns: a column through it cannot be tracked. */
+  const MERGED = tbl(tr(tc('wide', '<w:gridSpan w:val="2"/>')) + tr(tc('a2') + tc('b2')), [2000, 2000]);
+
+  test('a change that cannot be tracked is refused with a notice; the toolbar offers everything it can track', async ({ page }) => {
+    await mountEdit(page, await sample(p('First paragraph.') + MERGED + p('Second one.')));
     const before = await savedXml(page);
-    await select(page, [0], 0, 5);
-    // A table cannot be tracked yet. (Formatting can: e2e/doc-track-format.spec.ts.)
-    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(false);
+    await select(page, [1, 1, 0, 0], 0);
+    // A column through a merged cell cannot be tracked. (Tables, rows and other columns can: e2e/doc-track-tables.spec.ts.)
+    expect(await page.evaluate(() => (window as any).__view.insertColumn('right'))).toBe(false);
     await settled(page);
     expect(await notices(page)).toEqual([{ message: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed', kind: 'info' }]);
     expect(await page.evaluate(() => (window as any).__view.isModified)).toBe(false);
     expect(await savedXml(page)).toBe(before);
-    for (const command of ['insertTable', 'insertPicture', 'insertLink']) await expect(toolbarButton(page, command)).toBeDisabled();
-    for (const command of ['bold', 'alignCenter', 'bulletList']) await expect(toolbarButton(page, command)).toBeEnabled();
-    expect(await page.evaluate(() => (window as any).__view.insertTable(1, 1))).toBe(false);
+    for (const command of ['insertTable', 'insertPicture', 'insertLink', 'rowsColumns', 'bold', 'alignCenter', 'bulletList']) await expect(toolbarButton(page, command)).toBeEnabled();
+    expect(await page.evaluate(() => (window as any).__view.deleteColumn())).toBe(false);
     expect((await notices(page)).length).toBe(2);
-    expect(await paragraphs(page)).toEqual(['First paragraph.', 'Second one.']);
+    expect(await paragraphs(page)).toEqual(['First paragraph.', 'wide', 'a2', 'b2', 'Second one.']);
   });
 
   test('in Turkish the refusal is said in Turkish', async ({ page }) => {
-    await mountEdit(page, await sample(p('Birinci paragraf.')), { locale: 'tr' });
-    await select(page, [0], 0, 7);
-    expect(await page.evaluate(() => (window as any).__view.insertTable(2, 2))).toBe(false);
+    await mountEdit(page, await sample(p('Birinci paragraf.') + MERGED + p('Son.')), { locale: 'tr' });
+    await select(page, [1, 1, 0, 0], 0);
+    expect(await page.evaluate(() => (window as any).__view.insertColumn('right'))).toBe(false);
     await settled(page);
     expect((await notices(page))[0].message).toBe('Bu belgede değişiklikler izleniyor ve bu tür değişiklik henüz izlenemiyor; hiçbir şey değiştirilmedi');
   });
 
-  test('a copy is pasted as tracked text, and the user is told that its formatting stayed behind', async ({ page }) => {
+  test('a copy is pasted as a tracked insertion with the formatting it had, and nothing is said', async ({ page }) => {
     await mountEdit(page, await sample(p(r('Bold', '<w:b/>') + r(' and plain.')) + p('Second one.')));
     await select(page, [0], 0, 4);
     const clipboard = (kind: 'copy' | 'paste', give: { text?: string; html?: string } = {}) =>
@@ -277,7 +280,9 @@ test.describe('tracked changes', () => {
     await settled(page);
     expect(await paragraphs(page)).toEqual(['Bold and plain.', 'BoldSecond one.']);
     expect(await revisions(page)).toEqual([['ins', AUTHOR, DATE, 'Bold']]);
-    expect(await notices(page)).toEqual([{ message: 'Changes are tracked in this document: the copy was pasted as text, without its formatting and pictures', kind: 'info' }]);
+    expect(await notices(page)).toEqual([]);
+    // The insertion holds the text as it was copied: bold.
+    expect(await savedXml(page)).toContain(`<w:ins w:id="1" w:author="${AUTHOR_XML}" w:date="${DATE}"><w:r><w:rPr><w:b/></w:rPr><w:t>Bold</w:t></w:r></w:ins>`);
   });
 
   test('a cut puts the text on the clipboard and leaves it in the document as a tracked deletion', async ({ page }) => {
