@@ -113,15 +113,21 @@ import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, resizedRect, type DrawingH
 import {
   MIN_CHART_SIZE,
   addChart as addChartOps,
+  chartCopyProblem,
+  copyChart as copyChartOps,
+  cutChart as cutChartOps,
+  pasteChart as pasteChartOps,
   anchorOfRect,
   moveChart as moveChartOps,
   removeChart as removeChartOps,
   sheetCharts,
   updateChart as updateChartOps,
+  type ChartCopy,
   type ChartInfo,
   type ChartPatch,
   type ChartSpec,
 } from '../ops/charts';
+import { chartClip, chartPasteKind } from './chart-clip';
 import { ChartDialog, chartFields } from './chart-dialog';
 import type { Rect } from '../layout/grid-geometry';
 import { onFontsChanged } from '../render/fonts';
@@ -949,6 +955,13 @@ export class WorkbookView {
   private chartDrag: { pointerId: number; sheet: Sheet; drawing: SheetDrawing; index: number; handle: DrawingHandle | 'move'; x: number; y: number; originX: number; originY: number; start: Rect; now: Rect; moved: boolean; touch: boolean } | undefined;
   /** When the selected chart was last tapped: a second tap opens its dialog. */
   private lastChartTap = 0;
+  /**
+   * The chart that was last copied or cut, and the mark the clipboard got with it: a paste whose
+   * HTML carries the mark pastes this chart, any other pastes what it brings (see chartMarkup()).
+   */
+  private chartHeld: { copy: ChartCopy; mark: string } | undefined;
+  /** The chart the menu asked to be copied, for the copy event it then asks for: see chartClipboard(). */
+  private chartAsked: number | undefined;
   /** The name the canvas has for assistive technology while it shows the chart of a chart sheet; '' while it has none. */
   private canvasLabel = '';
   /** Decoded pictures of the workbook; made when a sheet with a picture is first drawn. */
@@ -3430,6 +3443,104 @@ export class WorkbookView {
     this.live.textContent = this.strings.charts.removed;
   }
 
+  /** The chart a command is about: the one that is named, or the selected one. Throws RangeError when there is none. */
+  private chartNamed(id: number | undefined): number {
+    const index = this.destroyed ? undefined : id === undefined ? this.pickedChart() : id;
+    if (index === undefined || !this.isChartAt(index)) throw new RangeError(`No chart at index ${index}`);
+    return index;
+  }
+
+  /**
+   * What the clipboard gets for a chart: a word in place of the chart (the chart itself is not put
+   * on the clipboard: it is pasted in this view only), and HTML that carries a mark by which a
+   * paste knows the chart that is held here. Nothing of the file is in either.
+   */
+  private chartMarkup(copy: ChartCopy): { text: string; html: string } {
+    const mark = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    this.chartHeld = { copy, mark };
+    return chartClip(this.strings.placeholder('chart'), mark);
+  }
+
+  /** Whether a chart that was copied or cut in this view is held for pasteChart(). */
+  get hasChartCopy(): boolean {
+    return !this.destroyed && this.chartHeld !== undefined;
+  }
+
+  /**
+   * Copies a chart of the shown sheet (the selected one without an argument): it is held for
+   * pasteChart(), and what belongs on the clipboard is returned (a word in place of the chart, and
+   * HTML with a mark; paste() knows the chart by that mark). Works in a read-only view. Throws
+   * RangeError for a chart that cannot be copied.
+   */
+  copyChart(id?: number): { text: string; html: string } {
+    const index = this.chartNamed(id);
+    const put = this.chartMarkup(copyChartOps(this.workbook, this.sheetIndex, index));
+    this.live.textContent = this.strings.charts.copied;
+    return put;
+  }
+
+  /** Copies a chart of the shown sheet and deletes it, as one undo step. A read-only view only copies. */
+  cutChart(id?: number): { text: string; html: string } {
+    const index = this.chartNamed(id);
+    if (this.destroyed || this.locked || !this.commitPending()) return this.copyChart(index);
+    if (this.collab) {
+      // Edited together, a chart that is gone cannot be pasted (see putChart()), nor brought back by undoing: it is copied, and stays.
+      const put = this.copyChart(index);
+      this.notifyLater(this.strings.collab.chartCut);
+      return put;
+    }
+    const picked = this.pickedChart();
+    const cut = cutChartOps(this.workbook, this.sheetIndex, index);
+    if (!this.applyOps(cut.ops)) return this.copyChart(index);
+    // The charts behind it moved up by one place.
+    if (picked !== undefined) this.setChartPick(picked === index ? undefined : picked > index ? picked - 1 : picked, false);
+    const put = this.chartMarkup(cut.copy);
+    this.live.textContent = this.strings.charts.cutOut;
+    return put;
+  }
+
+  /**
+   * Pastes the chart that was last copied or cut onto the shown sheet and selects it; returns
+   * its id, or -1 when nothing was pasted (no chart is held, a read-only view). With `at` its top
+   * left corner is the corner of that cell; without, it stands where the chart stood, moved right
+   * and down while a chart stands there. The copy shows the cells the chart shows, on whatever
+   * sheet it is pasted. Throws RangeError for a copy that is outdated (rows, columns or sheets
+   * changed since it was taken) and a sheet that takes no more charts.
+   */
+  pasteChart(at?: { row: number; col: number }): number {
+    const held = this.chartHeld;
+    if (!held || !this.beginRules()) return -1;
+    if (this.state().sheet.kind !== 'worksheet') return -1;
+    return this.putChart(held.copy, at, this.strings.charts.pasted);
+  }
+
+  /** Puts a copy of a chart of the shown sheet (the selected one without an argument) beside it and selects the copy; returns its id, or -1 in a read-only view. */
+  duplicateChart(id?: number): number {
+    const index = this.chartNamed(id);
+    if (!this.beginRules()) return -1;
+    return this.putChart(copyChartOps(this.workbook, this.sheetIndex, index), undefined, this.strings.charts.duplicated);
+  }
+
+  private putChart(copy: ChartCopy, at: { row: number; col: number } | undefined, said: string): number {
+    const pasted = pasteChartOps(this.workbook, this.sheetIndex, copy, at);
+    // Edited together, a paste travels as "a copy of that chart": a copy of a chart that was changed or deleted
+    // since cannot be said that way, and what is not said to the others is not done here either.
+    const first = pasted.ops[0];
+    if (this.collab && !(first && first.type === 'setDrawings' && first.by)) {
+      this.notify(this.strings.collab.chartCopyGone, 'info');
+      return -1;
+    }
+    if (!this.applyOps(pasted.ops)) return -1;
+    this.setChartPick(pasted.id, false);
+    this.live.textContent = said;
+    // What the copy does not have is said, not refused.
+    const notes: string[] = [];
+    if (pasted.dropped.length > 0) notes.push(this.strings.charts.copyLeftOut(pasted.dropped));
+    if (pasted.unbound > 0) notes.push(this.strings.charts.copyUnbound(pasted.unbound));
+    if (notes.length > 0) this.notifyLater(notes.join('; '));
+    return pasted.id;
+  }
+
   /**
    * Opens the dialog of a chart of the shown sheet (the selected one without an argument) over
    * the view. Returns false when there is no dialog: a read-only view, no such chart, a chart
@@ -3610,15 +3721,25 @@ export class WorkbookView {
   }
 
   /**
-   * Copy, cut and paste while a chart is selected: the chart is what they would be about, and a
-   * chart is not copied yet. The cells are not touched (the selection of cells is not what the
-   * user is looking at); that nothing happened is said.
+   * Copy and cut while a chart is selected (or asked for by the menu of a chart): the chart is
+   * what they are about, not the cells under it. The clipboard gets a word in place of the chart
+   * and the mark a paste knows it by. Returns whether the event was the chart's.
    */
-  private chartClipboard(event: ClipboardEvent): boolean {
-    if (this.pickedChart() === undefined) return false;
+  private chartClipboard(event: ClipboardEvent, cut: boolean): boolean {
+    const asked = this.chartAsked;
+    this.chartAsked = undefined;
+    const index = asked !== undefined && this.isChartAt(asked) ? asked : this.pickedChart();
+    if (index === undefined) return false;
     event.preventDefault();
     this.clipboardHandled = true;
-    this.notify(this.strings.charts.noCopy, 'info');
+    const data = event.clipboardData;
+    this.attempt(() => {
+      const put = cut ? this.cutChart(index) : this.copyChart(index);
+      if (data) {
+        data.setData('text/plain', put.text);
+        data.setData('text/html', put.html);
+      }
+    });
     return true;
   }
 
@@ -3661,29 +3782,45 @@ export class WorkbookView {
 
   /** The menu of a chart: opened by the press that asks for a menu on it. */
   private openChartMenu(x: number, y: number): boolean {
-    if (this.locked || this.state().sheet.kind !== 'worksheet' || this.editAway() || this.typingFormula()) return false;
+    if (this.state().sheet.kind !== 'worksheet' || this.editAway() || this.typingFormula()) return false;
     const index = this.chartUnder(x, y);
     if (index < 0) return false;
     this.closeMenu();
     if (!this.tryCommit()) return false;
-    this.setChartPick(index);
+    // A view that changes nothing selects no chart; it copies one all the same.
+    if (!this.locked) this.setChartPick(index);
     const strings = this.strings.charts;
     const info = this.charts().find((chart) => chart.id === index);
     const fixed = !info || info.editable === 'none';
-    const items: MenuItem[] = [
-      { label: strings.edit, disabled: fixed, title: fixed ? strings.notEditable : undefined, explain: fixed ? () => this.notify(strings.notEditable, 'error') : undefined, action: () => this.attempt(() => void this.openChartDialog(index)) },
-      { label: strings.remove, action: () => this.attempt(() => this.removeChart(index)) },
-    ];
+    const canCopy = typeof document.execCommand === 'function' || (navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function');
+    // What cannot be copied is shown all the same, and says why.
+    const problem = chartCopyProblem(this.workbook, this.sheetIndex, index);
+    const reason = problem === undefined ? undefined : this.localizeError(new RangeError(problem));
+    const explain = reason === undefined ? undefined : () => this.notify(reason, 'error');
+    const copy: MenuItem = { label: this.strings.copy, disabled: !canCopy || reason !== undefined, title: reason, explain, action: () => this.menuCopyChart(index, false) };
+    const items: MenuItem[] = this.locked
+      ? [copy]
+      : [
+          { label: strings.edit, disabled: fixed, title: fixed ? strings.notEditable : undefined, explain: fixed ? () => this.notify(strings.notEditable, 'error') : undefined, action: () => this.attempt(() => void this.openChartDialog(index)) },
+          { label: '', separator: true },
+          { label: this.strings.cut, disabled: !canCopy || reason !== undefined, title: reason, explain, action: () => this.menuCopyChart(index, true) },
+          copy,
+          { label: this.strings.paste, action: () => this.menuPaste() },
+          { label: strings.duplicate, disabled: reason !== undefined, title: reason, explain, action: () => this.attempt(() => void this.duplicateChart(index)) },
+          { label: '', separator: true },
+          { label: strings.remove, action: () => this.attempt(() => this.removeChart(index)) },
+        ];
     this.showMenu(items, x, y);
     return true;
   }
 
   /**
    * The keys of charts. With a chart selected: the arrows move it (by ten pixels, by one with
-   * Shift; with Alt they size it), Delete deletes it, Enter opens its dialog and Escape lets go of
-   * it. Ctrl+Alt+5 selects the first chart of the sheet, then the next one with every press, and
-   * none after the last. Without a chart selected Alt+F1 adds one of the selection. Tab is never
-   * taken: it leaves the grid as it always does. Returns whether the key was taken.
+   * Shift; with Alt they size it), Delete deletes it, Enter opens its dialog, Ctrl+D (Cmd+D) puts
+   * a copy beside it and Escape lets go of it. Ctrl+Alt+5 selects the first chart of the sheet,
+   * then the next one with every press, and none after the last. Without a chart selected Alt+F1
+   * adds one of the selection. Tab is never taken: it leaves the grid as it always does. Returns
+   * whether the key was taken.
    *
    * While a chart is selected the keys are not the cells': what is typed is typed nowhere, F2
    * edits no cell, and the keys that format, clear, select or walk the cells do nothing (they are
@@ -3758,6 +3895,10 @@ export class WorkbookView {
         if (event.key.length !== 1) return false;
         // Something that is typed.
         if (!ctrl && !event.altKey) return true;
+        if (ctrl && !event.altKey && !event.shiftKey && (event.key === 'd' || event.key === 'D')) {
+          this.attempt(() => void this.duplicateChart(picked));
+          return true;
+        }
         // The keys that format the cells and select all of them. Every other combination is left alone:
         // undo, redo, save, and what the browser does with a key (Ctrl with + and - is its zoom: see structuralKey()).
         return ctrl && !event.altKey && 'biuaBIUA'.indexOf(event.key) >= 0;
@@ -5783,6 +5924,9 @@ export class WorkbookView {
     if (/^Cannot change this chart:/.test(message)) return charts.notEditable;
     if (/^Cannot change the charts of this sheet:/.test(message)) return charts.placesFixed;
     if (/^Cannot delete this chart: it shares/.test(message)) return charts.wrapped;
+    if (/^Cannot copy this chart/.test(message)) return charts.notCopyable;
+    if (/^Cannot add the chart: the charts of the workbook would hold more/.test(message)) return charts.tooManyCharts;
+    if (/^Cannot paste the chart: rows, columns or sheets changed/.test(message)) return charts.copyOutdated;
     if (/^The (smallest and the largest|largest) value of an axis/.test(message)) return charts.badNumber;
     if (/^Cannot (add a series to a chart of this type|add, remove or reorder the series of|change the series of)/.test(message)) return charts.seriesFixed;
     if (message === 'Cannot change how the series of this chart are grouped') return charts.groupingFixed;
@@ -6112,6 +6256,8 @@ export class WorkbookView {
     const copied = { ...plain, html: plain.html.replace('<table>', `<table data-bym-copy="${this.copyId}">`) };
     this.copied = copied;
     this.copiedNames = this.workbook.sheets.map((sheet) => foldSheetName(sheet.name));
+    // The cells are what was copied last: no chart is held for a paste any more.
+    this.chartHeld = undefined;
     return copied;
   }
 
@@ -6132,9 +6278,34 @@ export class WorkbookView {
    * copy() of this view produced, the copied cells themselves are pasted, with
    * their formats and with formulas moved along. Without it, or with any other
    * HTML, the text is read field by field as if typed.
+   *
+   * HTML that carries the mark of the chart this view holds (copyChart(), cutChart()) pastes
+   * that chart. A chart is known by that mark alone: text is text, whatever it says. HTML that
+   * carries the mark of another copy of a chart (of another view, or of this page before it was
+   * loaded again) pastes nothing, and says so. Once HTML arrives that is not about the chart that
+   * is held, the clipboard has moved on, and the chart is held no longer; a call without `html`
+   * says nothing about the clipboard and leaves it held.
    */
   paste(text: string, html?: string): void {
     if (this.destroyed || this.locked) return;
+    const picked = this.pickedChart();
+    const kind = chartPasteKind(html, this.chartHeld ? this.chartHeld.mark : undefined);
+    if (kind === 'chart') {
+      // With a chart selected the copy goes beside the chart it was taken from; with cells selected, to the active cell.
+      this.pasteChart(picked === undefined ? { ...this.state().active } : undefined);
+      return;
+    }
+    if (html !== undefined) this.chartHeld = undefined;
+    if (kind === 'stale') {
+      // The word that stands for the chart on the clipboard is not text to put into a cell.
+      this.notify(this.strings.charts.copyGone, 'info');
+      return;
+    }
+    if (picked !== undefined) {
+      // Cells are not pasted under a chart that is selected: the selection of cells is not what the user is looking at.
+      this.notify(this.strings.charts.noCellPaste, 'info');
+      return;
+    }
     this.commitEditing();
     const value = String(text);
     const own = html !== undefined && this.copied !== undefined && this.copyId !== '' && String(html).indexOf(`data-bym-copy="${this.copyId}"`) >= 0;
@@ -7267,7 +7438,7 @@ export class WorkbookView {
     // While a cell is edited the clipboard works on the editor's text, as in any text field.
     const data = event.clipboardData;
     if (this.destroyed || this.edit || !data) return;
-    if (this.chartClipboard(event)) return;
+    if (this.chartClipboard(event, cut)) return;
     event.preventDefault();
     this.clipboardHandled = true;
     this.attempt(() => {
@@ -7279,12 +7450,12 @@ export class WorkbookView {
 
   private onPaste = (event: ClipboardEvent): void => {
     if (this.destroyed || this.edit) return;
-    if (this.chartClipboard(event)) return;
     event.preventDefault();
     const data = event.clipboardData;
     if (!data) return;
     const text = data.getData('text/plain');
-    const html = data.getData('text/html');
+    // What the clipboard holds is all here: no HTML is HTML that is about nothing.
+    const html = data.getData('text/html') || '';
     this.attempt(() => this.paste(text, html));
   };
 
@@ -7435,6 +7606,30 @@ export class WorkbookView {
     });
   }
 
+  /** Copy or cut of a chart from its menu: as menuCopy(), with the chart named for the event that is asked for. */
+  private menuCopyChart(index: number, cut: boolean): void {
+    this.focusInput(true);
+    this.selectIdleText();
+    this.clipboardHandled = false;
+    this.chartAsked = index;
+    try {
+      document.execCommand(cut ? 'cut' : 'copy');
+    } catch {
+      // Not available; the fallback below takes over.
+    }
+    this.chartAsked = undefined;
+    if (this.clipboardHandled) return;
+    this.attempt(() => {
+      const put = cut ? this.cutChart(index) : this.copyChart(index);
+      const clipboard = navigator.clipboard;
+      if (clipboard && typeof clipboard.writeText === 'function') {
+        clipboard.writeText(put.text).then(undefined, () => {
+          if (!this.destroyed) this.notify(this.strings.actionFailed, 'error');
+        });
+      } else this.notify(this.strings.actionFailed, 'error');
+    });
+  }
+
   /**
    * Paste from the menu: only the asynchronous clipboard can be read without a paste event.
    * Where it hands out the kinds of content it holds (read()), the HTML is taken with the text,
@@ -7453,6 +7648,7 @@ export class WorkbookView {
     const paste = (text: string, html?: string) => {
       if (!this.destroyed) this.attempt(() => this.paste(text, html));
     };
+    // Text alone: whether it stands for a chart cannot be told, and text is never taken for one.
     const asText = () => {
       if (typeof clipboard.readText !== 'function') unavailable();
       else clipboard.readText().then((text) => paste(text), unavailable);
@@ -7469,7 +7665,7 @@ export class WorkbookView {
         .then((items) => {
           const item = items[0];
           if (!item) return paste('');
-          return Promise.all([textOf(item, 'text/plain'), textOf(item, 'text/html')]).then(([text, html]) => paste(text === undefined ? '' : text, html));
+          return Promise.all([textOf(item, 'text/plain'), textOf(item, 'text/html')]).then(([text, html]) => paste(text === undefined ? '' : text, html === undefined ? '' : html));
         })
         .then(undefined, (error: unknown) => {
           // Refused is refused: asking a second time would show the browser's question twice.

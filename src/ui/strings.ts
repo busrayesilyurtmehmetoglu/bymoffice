@@ -347,6 +347,10 @@ export interface UiStrings {
     fork: { title: string; question: string; load: string; save: string; download: string; downloaded: string };
     noStamp: string;
     copySheet: string;
+    /** A chart is not cut while the workbook is edited together: it was copied, and stays where it is. */
+    chartCut: string;
+    /** The chart that was copied was changed or deleted since: edited together, it is not pasted. */
+    chartCopyGone: string;
     tooLarge: string;
     unsupported: string;
     sheetDeleted(name: string): string;
@@ -449,8 +453,25 @@ export interface ChartStrings {
   placesFixed: string;
   /** The chart shares a wrapper of the file with another object and is not deleted. */
   wrapped: string;
-  /** Said when copy, cut or paste is asked for while a chart is selected. */
-  noCopy: string;
+  /** The item of the menu of a chart that puts a copy beside it. (Cut, copy and paste are named as they are for cells.) */
+  duplicate: string;
+  /** Read out when a chart was copied, cut, pasted and duplicated. */
+  copied: string;
+  cutOut: string;
+  pasted: string;
+  duplicated: string;
+  /** Why a chart is not copied: its file holds references that are not known, and a copy could not be kept on the cells it shows. */
+  notCopyable: string;
+  /** The chart that was copied is not pasted: rows, columns or sheets changed since. */
+  copyOutdated: string;
+  /** What a copy was made without: `what` names the elements of the file ("userShapes", "externalData"). */
+  copyLeftOut(what: readonly string[]): string;
+  /** References of a copy on another sheet that still name no sheet. */
+  copyUnbound(count: number): string;
+  /** Said when cells are pasted while a chart is selected: nothing is pasted. */
+  noCellPaste: string;
+  /** The clipboard holds a chart that was copied in another view (or before this page was loaded again): nothing is pasted. */
+  copyGone: string;
 }
 
 /** What the dialogs of data validation say. Kinds and operators are named by the words the file uses for them. */
@@ -890,6 +911,8 @@ export const STRINGS_EN: UiStrings = {
     detached: 'The file was changed elsewhere, or the room was started anew, while this workbook holds changes that are in no file. Nothing was thrown away: your changes are here, and nobody else sees them. Save the file to go on together.',
     waiting: 'The room cannot be joined yet: someone who is in it has to save the file first. Trying again…',
     copySheet: 'A sheet cannot be copied while the workbook is edited together.',
+    chartCut: 'A chart cannot be cut while the workbook is edited together: it was copied. Paste it, then delete the chart.',
+    chartCopyGone: 'The chart was changed or deleted since it was copied; while the workbook is edited together it cannot be pasted. Copy the chart again.',
     tooLarge: 'This change is too large to be shared in one step.',
     unsupported: 'This cannot be done while the workbook is edited together.',
     sheetDeleted: (name) => `Sheet ${name} was deleted. This cannot be undone while the workbook is edited together.`,
@@ -1184,7 +1207,17 @@ export const STRINGS_EN: UiStrings = {
     refUnread: 'The sheet cannot be changed: a chart names it in a reference that cannot be read',
     placesFixed: 'Charts cannot be added, moved or deleted on this sheet: its drawing in the file cannot be changed',
     wrapped: 'This chart cannot be deleted: in the file it is bound to another object',
-    noCopy: 'A chart cannot be copied or pasted yet',
+    duplicate: 'Duplicate',
+    copied: 'Chart copied',
+    cutOut: 'Chart cut',
+    pasted: 'Chart pasted',
+    duplicated: 'Chart duplicated',
+    notCopyable: 'This chart cannot be copied: what its file holds cannot be kept in a copy',
+    copyOutdated: 'The chart cannot be pasted: rows, columns or sheets changed since it was copied. Copy it again.',
+    copyLeftOut: (what) => `The copy was made without ${what.map((name) => (name === 'userShapes' ? 'the shapes drawn over the chart' : name === 'externalData' ? 'the data kept outside the workbook' : name)).join(' and ')}`,
+    copyUnbound: (count) => (count === 1 ? 'One reference of the copy still names no sheet' : `${count} references of the copy still name no sheet`),
+    noCellPaste: 'A chart is selected: select a cell to paste cells',
+    copyGone: 'The chart on the clipboard was copied elsewhere and cannot be pasted here: copy the chart again',
   },
 };
 
@@ -1471,6 +1504,8 @@ export const STRINGS_TR: UiStrings = {
     detached: 'Dosya başka yerde değişti ya da oda yeniden başladı; bu kitapta ise hiçbir dosyada olmayan değişiklikler var. Hiçbir şey atılmadı: değişiklikleriniz burada ve başkası görmüyor. Birlikte devam etmek için dosyayı kaydedin.',
     waiting: 'Odaya şu an katılınamıyor: odadakilerden birinin önce dosyayı kaydetmesi gerekiyor. Yeniden deneniyor…',
     copySheet: 'Kitap birlikte düzenlenirken sayfa kopyalanamaz.',
+    chartCut: 'Kitap birlikte düzenlenirken grafik kesilemez: kopyalandı. Yapıştırın, sonra grafiği silin.',
+    chartCopyGone: 'Grafik kopyalandıktan sonra değişti ya da silindi; kitap birlikte düzenlenirken yapıştırılamaz. Grafiği yeniden kopyalayın.',
     tooLarge: 'Bu değişiklik tek adımda paylaşılamayacak kadar büyük.',
     unsupported: 'Bu, kitap birlikte düzenlenirken yapılamaz.',
     sheetDeleted: (name) => `${name} sayfası silindi. Kitap birlikte düzenlenirken bu geri alınamaz.`,
@@ -1765,7 +1800,17 @@ export const STRINGS_TR: UiStrings = {
     refUnread: 'Sayfa değiştirilemiyor: bir grafik onu okunamayan bir başvuruda anıyor',
     placesFixed: 'Bu sayfada grafik eklenemez, taşınamaz ve silinemez: dosyadaki çizimi değiştirilemiyor',
     wrapped: 'Bu grafik silinemez: dosyada başka bir nesneye bağlı',
-    noCopy: 'Grafik henüz kopyalanıp yapıştırılamıyor',
+    duplicate: 'Çoğalt',
+    copied: 'Grafik kopyalandı',
+    cutOut: 'Grafik kesildi',
+    pasted: 'Grafik yapıştırıldı',
+    duplicated: 'Grafik çoğaltıldı',
+    notCopyable: 'Bu grafik kopyalanamaz: dosyasındaki içerik kopyada korunamıyor',
+    copyOutdated: 'Grafik yapıştırılamıyor: kopyalandıktan sonra satırlar, sütunlar ya da sayfalar değişti. Yeniden kopyalayın.',
+    copyLeftOut: (what) => `Kopya şunlar olmadan yapıldı: ${what.map((name) => (name === 'userShapes' ? 'grafiğin üzerine çizilmiş şekiller' : name === 'externalData' ? 'kitabın dışında tutulan veri' : name)).join(', ')}`,
+    copyUnbound: (count) => `Kopyanın ${count} başvurusu hâlâ sayfa adı taşımıyor`,
+    noCellPaste: 'Bir grafik seçili: hücre yapıştırmak için bir hücre seçin',
+    copyGone: 'Panodaki grafik başka bir yerde kopyalanmış, buraya yapıştırılamıyor: grafiği yeniden kopyalayın',
   },
 };
 

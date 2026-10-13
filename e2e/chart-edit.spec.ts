@@ -409,25 +409,49 @@ test.describe('charts are edited', () => {
     expect(await view(page, 'view.selectedChart')).toBeUndefined();
   });
 
-  test('with a chart selected, copy, cut and paste leave the cells alone and say that a chart is not copied; Tab leaves the grid', async ({ page }) => {
+  test('with a chart selected, copy, cut and paste are about the chart and leave the cells alone; Tab leaves the grid', async ({ page }) => {
     await mount(page, await book());
     await addPlain(page);
     await view(page, '(view.select(api.parseRange("A1:B4")), view.selectChart(0))');
-    const fire = (type: string) =>
-      page.evaluate((type) => {
-        const data = new DataTransfer();
-        data.setData('text/plain', 'pasted');
-        const event = new ClipboardEvent(type, { clipboardData: data, bubbles: true, cancelable: true });
-        document.querySelector('#host .bym-input')!.dispatchEvent(event);
-        return event.defaultPrevented;
-      }, type);
+    const fire = (type: string, text = 'pasted') =>
+      page.evaluate(
+        ([type, text]) => {
+          const data = new DataTransfer();
+          data.setData('text/plain', text);
+          let event: Event | undefined;
+          try {
+            event = new ClipboardEvent(type, { clipboardData: data, bubbles: true, cancelable: true });
+          } catch {
+            event = undefined;
+          }
+          // Some browsers give a scripted clipboard event a clipboard of their own instead of the one passed in.
+          if (!event || (event as ClipboardEvent).clipboardData !== data) {
+            event = new Event(type, { bubbles: true, cancelable: true });
+            Object.defineProperty(event, 'clipboardData', { value: data });
+          }
+          document.querySelector('#host .bym-input')!.dispatchEvent(event);
+          return event.defaultPrevented;
+        },
+        [type, text] as [string, string],
+      );
     const cells = () => view(page, 'JSON.stringify([0, 1, 2, 3].map((row) => [api.getCell(view.workbook.sheets[0], row, 0)?.value, api.getCell(view.workbook.sheets[0], row, 1)?.value]))');
+    const notice = () => page.evaluate(() => (window as any).__events.filter((event: any) => event.type === 'notice').slice(-1)[0]?.message);
     const before = await cells();
-    for (const type of ['cut', 'copy', 'paste']) {
-      expect(await fire(type), `${type} is taken`).toBe(true);
-      expect(await cells(), `${type} changes no cell`).toBe(before);
-      expect(await page.evaluate(() => (window as any).__events.filter((event: any) => event.type === 'notice').slice(-1)[0]?.message), type).toBe('A chart cannot be copied or pasted yet');
-    }
+    // Text that is pasted while a chart is selected goes nowhere, and that is said.
+    expect(await fire('paste'), 'paste is taken').toBe(true);
+    expect(await cells(), 'paste changes no cell').toBe(before);
+    expect(await notice()).toBe('A chart is selected: select a cell to paste cells');
+    // Copy is about the chart: the cells under it are not copied, and nothing changes.
+    expect(await fire('copy'), 'copy is taken').toBe(true);
+    expect(await cells(), 'copy changes no cell').toBe(before);
+    expect(await view(page, 'view.hasChartCopy')).toBe(true);
+    expect((await charts(page)).length).toBe(1);
+    // Cut takes the chart, not the cells; undone, the chart is back.
+    expect(await fire('cut'), 'cut is taken').toBe(true);
+    expect(await cells(), 'cut changes no cell').toBe(before);
+    expect((await charts(page)).length).toBe(0);
+    await view(page, 'view.undo()');
+    await view(page, 'view.selectChart(0)');
     expect((await charts(page)).length).toBe(1);
     // Tab is not the chart's: the focus goes on as it does from the cells.
     expect(await key(page, { key: 'Tab' })).toBe(false);

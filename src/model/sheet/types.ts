@@ -927,8 +927,51 @@ export interface DrawingChart extends DrawingObjectBase {
    * line, the formats of a pivot chart): the series are changed, not added, removed or reordered.
    */
   seriesFixed?: boolean;
-  /** Set once a chart of the file was changed: what it was read as. */
+  /** Set once a chart of the file was changed: what it was read as. On a copy (`source`): what the part it is made from was read as. */
   origin?: ChartOrigin;
+  /**
+   * Set by the reader: the macro the frame of the chart is assigned in the file (the `macro` of its
+   * <xdr:graphicFrame>), when it has one. It is never run; the frame keeps it, and a copy of the
+   * chart is made without it (and says so).
+   */
+  macro?: string;
+  /**
+   * Set on a chart that was pasted as a copy of a chart of the file: the chart part of that
+   * chart, e.g. "/xl/charts/chart1.xml". The writer makes the frame of the copy (its anchor in
+   * the drawing) from the frame that part has in the file, so that what a frame says beside its
+   * name and its place (whether it is published, locked, printed, hidden, its title) goes with
+   * the copy. Without it, and when the file has no such frame, the frame is a plain one.
+   */
+  frame?: string;
+  /**
+   * Set by the reader on a chart of a file without `known` whose part would be "refs" but for
+   * children of its root that lead out of the part: shapes drawn over the chart ("userShapes") and
+   * data kept outside the workbook ("externalData"). The names of those. A copy of the chart is
+   * made without them, and says so (see copyChart() of the operations); the chart itself is
+   * moved and deleted like any other of which nothing is known.
+   */
+  loose?: string[];
+  /**
+   * Set on a chart that is in no file and was pasted as a copy of a chart of the file whose part
+   * holds more than its model: where the writer takes the part of the copy from. Such a chart has
+   * no `part`; it has `known: 'refs'`, `seriesFixed` as the chart it was copied from and always an
+   * `origin`, and is changed the way a chart of the file with those is.
+   */
+  source?: ChartSource;
+}
+
+/**
+ * The part a copy of a chart of the file is made from, as the file has it: its bytes with what
+ * differs between `origin` and the chart changed in them, and with every part it leads to (styles,
+ * colours, pictures of fills) copied beside it. The part is read when the workbook is written;
+ * the file the workbook was read from still holds it then, whatever became of the chart it was
+ * copied from.
+ */
+export interface ChartSource {
+  /** The chart part of the file, e.g. "/xl/charts/chart1.xml". */
+  part: string;
+  /** Children of the root of the part that are left out of the copy, with the relationships only they use (DrawingChart.loose). */
+  drops?: string[];
 }
 
 /**

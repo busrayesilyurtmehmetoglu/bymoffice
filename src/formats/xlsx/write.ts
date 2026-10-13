@@ -52,10 +52,10 @@ import {
 } from '../../model/sheet/types';
 import { cellDisplayText } from '../../format/cell-format';
 import type { OpcPackage } from '../../opc';
-import { localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
+import { decodeXmlBytes, localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { adjustDrawingAnchor, commentCellNow, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
-import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, patchChartPart, type DrawingPartEdit } from './chart-write';
+import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, stripChartPart, type DrawingPartEdit } from './chart-write';
 import { drawingSource } from './drawings';
 import type { Chart } from '../../model/sheet/chart';
 import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
@@ -181,10 +181,7 @@ export function escapeXstring(text: string): string {
 
 /** The part as text, the way XmlScanner sees it: byte order mark removed, line endings as "\n". */
 function decodeSource(bytes: Uint8Array): string {
-  let s: string;
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) s = new TextDecoder('utf-16le').decode(bytes);
-  else if (bytes[0] === 0xfe && bytes[1] === 0xff) s = new TextDecoder('utf-16be').decode(bytes);
-  else s = new TextDecoder('utf-8').decode(bytes);
+  let s = decodeXmlBytes(bytes);
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
   if (s.indexOf('\r') >= 0) s = s.replace(/\r\n?/g, '\n');
   return s;
@@ -3656,11 +3653,8 @@ function editComments(source: Uint8Array, plan: NotePlan, added: AddedNote[], sc
 /** A part as text with nothing brought in line: every line break as it is, a byte order mark kept. */
 function decodeExact(bytes: Uint8Array): string {
   if ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff)) return decodeSource(bytes);
-  try {
-    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-  } catch (error) {
-    return new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes);
-  }
+  // A part in a single-byte encoding is read as what it declares; any other as UTF-8, whatever it holds.
+  return decodeXmlBytes(bytes, true);
 }
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -4300,6 +4294,25 @@ const MAX_RELATED_PARTS = 1000000;
 
 type PartWrite = [part: string, data: Uint8Array | XmlDocument, contentType?: string];
 
+/** Parts one copy of a chart of the file is made of at most (its own part, styles, colours, pictures), and the bytes they hold together: what lies beyond is named by the copy, not copied. */
+const MAX_COPIED_PARTS = 64;
+const MAX_COPIED_BYTES = 64 * 1024 * 1024;
+
+/**
+ * One part of a copy of a chart of the file (DrawingChart.source): the part of the file it is
+ * made from, what it holds, and its relationships. A relationship to a part that is copied along
+ * names it by its place in the list (`to`); one that is written with another target says which
+ * (`target`); any other is written as it is.
+ */
+interface CopiedPart {
+  from: string;
+  bytes: Uint8Array;
+  contentType: string | undefined;
+  links: { rel: XmlElement; to?: number; target?: string }[];
+  /** The relationships of the part as the file has them, where they cannot be read: written as they are. */
+  rels?: Uint8Array;
+}
+
 /**
  * Brings the names of a table's columns in line with its header cells, the
  * way the application does: a column is named by the text of its header; an
@@ -4750,6 +4763,122 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     return seen;
   };
   /**
+   * What a copy of a chart of the file is written as (DrawingChart.source): the part it was copied
+   * from as the file has it, without what a copy leaves out and with what was changed in the copy,
+   * and every part that part leads to, each copied so that the copy shares nothing with the chart
+   * it was made of (a part that goes with one of them does not take the other's along). A
+   * relationship that leads out of the file is kept as it is; so is one to a part the workbook
+   * stands on (a sheet), which is named and not copied. What lies beyond what a copy takes
+   * (MAX_COPIED_PARTS, MAX_COPIED_BYTES) is named as well, and kept in the package for as long as
+   * the copy names it (`copyShared`). Relationships that cannot be read are written as they are.
+   * Throws for a chart part that is not there any more.
+   */
+  /**
+   * Where the frame of each chart part of the file stands: the drawing part and the relationship
+   * of that part which leads to the chart. Worked out once, from the sheets the file has (those
+   * that are gone by now as well: the file as it was opened still holds their parts).
+   */
+  let framed: Map<string, { part: string; id: string }> | undefined;
+  const frameOf = async (chartPart: string): Promise<string | undefined> => {
+    if (!framed) {
+      framed = new Map();
+      const relsIn = async (source: string): Promise<XmlElement[]> => {
+        const bytes = await peek(relsPartOf(source));
+        if (!bytes) return [];
+        try {
+          return childrenNamed(parseXml(bytes).root, 'Relationship');
+        } catch (error) {
+          return [];
+        }
+      };
+      const seen = new Set<string>();
+      for (const fileSheet of file) {
+        if (fileSheet.part === '') continue;
+        const sheetPart = actualOf(fileSheet.part);
+        for (const rel of await relsIn(sheetPart)) {
+          if (!endsWith(typeOf(rel), '/drawing') || !internal(rel)) continue;
+          const drawingPart = actualOf(resolveTarget(sheetPart, rel.attrs.get('Target') || ''));
+          if (seen.has(drawingPart)) continue;
+          seen.add(drawingPart);
+          for (const inner of await relsIn(drawingPart)) {
+            if (!internal(inner)) continue;
+            const target = actualOf(resolveTarget(drawingPart, inner.attrs.get('Target') || '')).toLowerCase();
+            if (!framed.has(target)) framed.set(target, { part: drawingPart, id: inner.attrs.get('Id') || '' });
+          }
+        }
+      }
+    }
+    const at = framed.get(actualOf(chartPart).toLowerCase());
+    const bytes = at ? await peek(at.part) : undefined;
+    return at && bytes ? framedAnchorXml(bytes, at.id) : undefined;
+  };
+  const copyShared = new Set<string>();
+  const copiedParts = async (sheet: Sheet, object: Extract<DrawingObject, { type: 'chart' }>): Promise<CopiedPart[]> => {
+    const source = object.source as NonNullable<typeof object.source>;
+    const first = actualOf(source.part);
+    const refuse = (why: string): never => {
+      throw new Error(`Cannot write sheet "${sheet.name}": the chart part ${first} a chart was copied from ${why}`);
+    };
+    const original = await peek(first);
+    if (!original) return refuse('is missing');
+    const stripped = source.drops && source.drops.length > 0 ? stripChartPart(original, source.drops) : { bytes: original, unrelated: [] };
+    const origin = object.origin || { chart: object.chart, series: object.chart.groups.map((group) => group.series.map((_series, i) => i)) };
+    const typeNow = (part: string): string | undefined => (pkg.hasPart(part) ? pkg.contentTypeOf(part) : removed.get(part));
+    const parts: CopiedPart[] = [
+      { from: first, bytes: patchChartPart(stripped.bytes, origin, object.chart, chartCellsOf(workbook, object.chart.live === true), object.seriesFixed === true), contentType: typeNow(first) || CHART_CONTENT_TYPE, links: [] },
+    ];
+    const places = new Map<string, number>([[first.toLowerCase(), 0]]);
+    // What the workbook stands on is never copied for a chart, whatever relationships claim.
+    const own = new Set<string>([actualOf(main).toLowerCase(), '/[content_types].xml']);
+    for (const other of workbook.sheets) if (other.part !== '') own.add(actualOf(other.part).toLowerCase());
+    let weight = parts[0].bytes.length;
+    for (let i = 0; i < parts.length; i++) {
+      const item = parts[i];
+      const relsBytes = await peek(relsPartOf(item.from));
+      if (!relsBytes) continue;
+      let doc: XmlDocument;
+      try {
+        doc = parseXml(relsBytes);
+      } catch (error) {
+        // What the chart leads to is as little known for the copy as it is for the chart.
+        item.rels = relsBytes;
+        continue;
+      }
+      for (const rel of childrenNamed(doc.root, 'Relationship')) {
+        if (i === 0 && stripped.unrelated.indexOf(rel.attrs.get('Id') || '') >= 0) continue;
+        if (!internal(rel)) {
+          item.links.push({ rel });
+          continue;
+        }
+        const target = actualOf(resolveTarget(item.from, rel.attrs.get('Target') || ''));
+        // A relationship that leads to relationships leads to those of the chart, not to any of the copy: it is left out (the commands say so).
+        if (isRelsPart(target)) continue;
+        const lower = target.toLowerCase();
+        const known = places.get(lower);
+        if (known !== undefined) {
+          item.links.push({ rel, to: known });
+          continue;
+        }
+        const bytes = own.has(lower) ? undefined : await peek(target);
+        // A part of the workbook itself, and one the file does not have: named as the chart names it.
+        if (!bytes) {
+          item.links.push({ rel, target });
+          continue;
+        }
+        if (parts.length >= MAX_COPIED_PARTS || weight + bytes.length > MAX_COPIED_BYTES) {
+          copyShared.add(target);
+          item.links.push({ rel, target });
+          continue;
+        }
+        weight += bytes.length;
+        places.set(lower, parts.length);
+        item.links.push({ rel, to: parts.length });
+        parts.push({ from: target, bytes, contentType: typeNow(target), links: [] });
+      }
+    }
+    return parts;
+  };
+  /**
    * What the drawings of a sheet whose charts were added, moved, changed or deleted ask of the
    * parts around it; undefined when the parts of the file say what the model says. `sheetXml` and
    * `sheetRels` are the sheet as the file has it (undefined for a sheet that is not in the file);
@@ -4840,17 +4969,55 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       if (!(await peek(part))) continue;
       if (!home) home = { part, id: rel.attrs.get('Id') || '' };
     }
-    const chartFor = (drawing: SheetDrawing, drawingPart: string, relId: string): { anchor: DrawingAnchor; relId: string; name: string; description?: string; rel: XmlElement } => {
+    // Copies of charts of the file: what each is made of is read before anything is given a name.
+    const copies = new Map<SheetDrawing, CopiedPart[]>();
+    const frames = new Map<SheetDrawing, string>();
+    for (const drawing of added) {
+      const object = drawing.object as Extract<DrawingObject, { type: 'chart' }>;
+      if (object.source) copies.set(drawing, await copiedParts(sheet, object));
+      const frame = object.frame !== undefined ? await frameOf(object.frame) : undefined;
+      if (frame !== undefined) frames.set(drawing, frame);
+    }
+    const chartFor = (drawing: SheetDrawing, drawingPart: string, relId: string): { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string; rel: XmlElement } => {
       const object = drawing.object as Extract<DrawingObject, { type: 'chart' }>;
       const part = freshName(`${dir}/charts/chart`, '.xml', relsPartOf);
-      out.fresh.push([part, encoder.encode(chartSpaceXml(object.chart, cellsOf(object.chart))), CHART_CONTENT_TYPE]);
-      out.names.push(part);
+      const copied = copies.get(drawing);
+      if (copied) {
+        // The part of the chart first, then what it leads to, each under a free name of the kind its own name is of.
+        const names = copied.map((item, i) => {
+          if (i === 0) return part;
+          const match = /^(.*?)\d*(\.[^./]*)?$/.exec(item.from) as RegExpExecArray;
+          return freshName(match[1], match[2] || '', relsPartOf);
+        });
+        copied.forEach((item, i) => {
+          out.fresh.push([names[i], item.bytes, item.contentType]);
+          out.names.push(names[i]);
+          if (item.rels) {
+            out.fresh.push([relsPartOf(names[i]), item.rels]);
+            out.names.push(relsPartOf(names[i]));
+            return;
+          }
+          if (item.links.length === 0) return;
+          const partRels = emptyRels();
+          for (const link of item.links) {
+            const rel = element(`${prefixOf(partRels.root)}Relationship`, [...link.rel.attrs]);
+            if (link.to !== undefined) rel.attrs.set('Target', relativeTarget(names[i], names[link.to]));
+            else if (link.target !== undefined) rel.attrs.set('Target', link.target);
+            partRels.root.children.push(rel);
+          }
+          out.fresh.push([relsPartOf(names[i]), partRels]);
+          out.names.push(relsPartOf(names[i]));
+        });
+      } else {
+        out.fresh.push([part, encoder.encode(chartSpaceXml(object.chart, cellsOf(object.chart))), CHART_CONTENT_TYPE]);
+        out.names.push(part);
+      }
       const rel = element('Relationship', [
         ['Id', relId],
         ['Type', `${relBase}/chart`],
         ['Target', relativeTarget(drawingPart, part)],
       ]);
-      return { anchor: anchorOf(drawing), relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Chart', description: object.description, rel };
+      return { anchor: anchorOf(drawing), relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Chart', description: object.description, from: frames.get(drawing), rel };
     };
     if (added.length > 0 && home && !partEdits.has(home.part)) editOf(home.part);
 
@@ -4932,13 +5099,17 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
       const partRels = emptyRels();
       const anchors: string[] = [];
       const newPartId = relationIds(drawingPart, []);
+      const framed: DrawingPartEdit['added'] = [];
       added.forEach((drawing, i) => {
         const made = chartFor(drawing, drawingPart, newPartId());
         made.rel.name = `${prefixOf(partRels.root)}Relationship`;
         partRels.root.children.push(made.rel);
         anchors.push(chartAnchorXml(made.anchor, made.relId, i + 2, made.name, made.description, relBase === NS_REL_STRICT));
+        framed.push(made);
       });
-      out.fresh.push([drawingPart, encoder.encode(drawingPartXml(anchors, relBase === NS_REL_STRICT)), DRAWING_CONTENT_TYPE]);
+      // With the frame of a chart of the file among them, the anchors are put into the empty part the way they are put into one of the file.
+      const plain = encoder.encode(drawingPartXml(framed.some((item) => item.from !== undefined) ? [] : anchors, relBase === NS_REL_STRICT));
+      out.fresh.push([drawingPart, framed.some((item) => item.from !== undefined) ? editDrawingPart(plain, { moved: new Map(), removed: new Set(), added: framed }).bytes : plain, DRAWING_CONTENT_TYPE]);
       out.fresh.push([relsPartOf(drawingPart), partRels]);
       out.names.push(drawingPart, relsPartOf(drawingPart));
       const id = newSheetId();
@@ -5370,6 +5541,8 @@ export async function writeXlsx(pkg: OpcPackage, workbook: Workbook): Promise<vo
     // Whatever the relationships of a deleted sheet claim, the package keeps what it stands on:
     // the workbook part and the parts of the sheets that stay.
     kept.add(actualOf(main));
+    // What a copy of a chart names without copying it stays, with what it leads to.
+    if (copyShared.size > 0) for (const part of await reachFrom([...copyShared])) kept.add(part);
     for (const sheet of file) {
       if (sheet.part === '' || !present.has(sheet.part)) continue;
       kept.add(actualOf(sheet.part));

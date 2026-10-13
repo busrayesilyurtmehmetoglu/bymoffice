@@ -333,10 +333,25 @@ function sameTree(a: XmlElement, b: XmlElement, budget: { left: number }): boole
   return true;
 }
 
-/** The elements that hold a formula (<c:f>, and <c15:f>, <cx:f> of extensions), and whether the part has what no model holds a reference for. */
-function formulas(root: XmlElement): { count: number; foreign: boolean } {
-  const out = { count: 0, foreign: false };
-  const stack: XmlElement[] = [root];
+/** The children of the root of a chart part that lead out of it and that a copy of the chart can do without: see DrawingChart.loose. */
+const LOOSE_NAMES: { [local: string]: true } = { userShapes: true, externalData: true };
+
+/**
+ * The elements that hold a formula (<c:f>, and <c15:f>, <cx:f> of extensions), whether the part
+ * has what no model holds a reference for, and which children of its root lead out of it
+ * (LOOSE_NAMES: those are not looked into).
+ */
+function formulas(root: XmlElement): { count: number; foreign: boolean; loose: string[] } {
+  const out = { count: 0, foreign: false, loose: [] as string[] };
+  const stack: XmlElement[] = [];
+  for (const node of root.children) {
+    if (node.type !== 'element') continue;
+    const local = localName(node.name);
+    // Shapes drawn over the chart (which may show cells) and data kept outside the workbook are not ranges the model follows.
+    if (Object.prototype.hasOwnProperty.call(LOOSE_NAMES, local)) {
+      if (out.loose.indexOf(local) < 0) out.loose.push(local);
+    } else stack.push(node);
+  }
   let seen = 0;
   while (stack.length > 0) {
     const el = stack.pop() as XmlElement;
@@ -346,17 +361,18 @@ function formulas(root: XmlElement): { count: number; foreign: boolean } {
     }
     const local = localName(el.name);
     if (local === 'f' || local === 'sqref' || local === 'formulaRef') out.count++;
-    // The source of a pivot chart, data kept outside the workbook and shapes drawn over the chart (which may show cells) are not ranges the model follows.
+    // The source of a pivot chart is not a range the model follows; neither is what leads out of the part from anywhere but its root.
     if (local === 'pivotSource' || local === 'externalData' || local === 'userShapes') out.foreign = true;
     for (const node of el.children) if (node.type === 'element') stack.push(node);
   }
   return out;
 }
 
-/** What the reader notes of a chart part beside its model: see DrawingChart.known and DrawingChart.seriesFixed. */
+/** What the reader notes of a chart part beside its model: see DrawingChart.known, DrawingChart.seriesFixed and DrawingChart.loose. */
 export interface ChartPartFacts {
-  known: 'all' | 'refs';
+  known?: 'all' | 'refs';
   seriesFixed?: boolean;
+  loose?: string[];
 }
 
 /** Whether a part holds content bound to the number and order of its series that no model holds. */
@@ -409,22 +425,42 @@ function wrapped(root: XmlElement): boolean {
  */
 export function chartKnown(root: XmlElement, chart: Chart, related: boolean): ChartPartFacts | undefined {
   try {
-    if (nestedBeyond(root, MAX_PATCH_DEPTH)) return undefined;
-    if (wrapped(root)) return undefined;
     const found = formulas(root);
-    const refs = chartRefs(chart);
-    if (found.foreign || found.count !== refs.length) return undefined;
-    // A reference that cannot be read to its end cannot follow a sheet that is renamed.
-    if (refs.some((ref) => formulaNamesSheetsUnread(ref))) return undefined;
-    // Amounts of error bars stated point by point are references the writer does not change in a part.
-    if (chart.groups.some((group) => group.series.some((series) => (series.errorBars || []).some((bars) => (bars.plus && bars.plus.ref !== undefined) || (bars.minus && bars.minus.ref !== undefined))))) return undefined;
-    const sets = seriesElements(root);
-    if (!sets || sets.length !== chart.groups.length || sets.some((set, i) => set.length !== chart.groups[i].series.length)) return undefined;
+    if (found.loose.length > 0 || !refsKnown(root, chart, found)) return undefined;
     if (!related && chartWritable(chart) && root.attrs.get('xmlns:c') === NS_C && root.attrs.get('xmlns:a') === NS_A) {
       const made = parseXml(chartSpaceXml(chart)).root;
       if (sameTree(made, root, { left: MAX_PART_ELEMENTS })) return { known: 'all' };
     }
     return boundToSeries(root, chart) ? { known: 'refs', seriesFixed: true } : { known: 'refs' };
+  } catch (error) {
+    return undefined;
+  }
+}
+
+/** Whether every formula of a part is a reference of the model, the series of the part are those of the model, and the part can be changed in place. */
+function refsKnown(root: XmlElement, chart: Chart, found: { count: number; foreign: boolean }): boolean {
+  if (nestedBeyond(root, MAX_PATCH_DEPTH)) return false;
+  if (wrapped(root)) return false;
+  const refs = chartRefs(chart);
+  if (found.foreign || found.count !== refs.length) return false;
+  // A reference that cannot be read to its end cannot follow a sheet that is renamed.
+  if (refs.some((ref) => formulaNamesSheetsUnread(ref))) return false;
+  // Amounts of error bars stated point by point are references the writer does not change in a part.
+  if (chart.groups.some((group) => group.series.some((series) => (series.errorBars || []).some((bars) => (bars.plus && bars.plus.ref !== undefined) || (bars.minus && bars.minus.ref !== undefined))))) return false;
+  const sets = seriesElements(root);
+  return !!sets && sets.length === chart.groups.length && !sets.some((set, i) => set.length !== chart.groups[i].series.length);
+}
+
+/**
+ * For a part of which chartKnown() knows nothing: whether it would be "refs" without the children
+ * of its root that lead out of it (DrawingChart.loose), and which those are. Undefined for a part
+ * that has none of them, and for one that is not known for another reason. Never throws.
+ */
+export function chartLoose(root: XmlElement, chart: Chart): ChartPartFacts | undefined {
+  try {
+    const found = formulas(root);
+    if (found.loose.length === 0 || !refsKnown(root, chart, found)) return undefined;
+    return boundToSeries(root, chart) ? { loose: found.loose, seriesFixed: true } : { loose: found.loose };
   } catch (error) {
     return undefined;
   }
@@ -1037,6 +1073,39 @@ function patchName(series: XmlElement, before: ChartSeries['name'], now: ChartSe
   insert(series, made(series, nameXml(now, cells)), SERIES_ORDER);
 }
 
+/** The ids of relationships an element and what stands in it name (r:id, r:embed, r:link, ...), added to `out`. */
+function relationIdsOf(el: XmlElement, out: Set<string>, depth = 0): void {
+  for (const [name, value] of el.attrs) if (name.indexOf(':') > 0 && name.slice(0, 6) !== 'xmlns:' && /^(id|embed|link|pict|dm|lo|qs|cs)$/.test(localName(name))) out.add(value);
+  if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') relationIdsOf(node, out, depth + 1);
+}
+
+/**
+ * A chart part without the children of its root named in `drops` (DrawingChart.loose): for a
+ * copy of the chart, which cannot take along what those lead to. Every other byte of the part
+ * stays. Also says which relationships only what went named (`unrelated`). The same bytes when
+ * the part has none of them.
+ */
+export function stripChartPart(bytes: Uint8Array, drops: readonly string[]): { bytes: Uint8Array; unrelated: string[] } {
+  const before = part;
+  try {
+    const { doc, context } = openPart(bytes, chartSpaces);
+    const root = doc.root;
+    const gone = new Set<string>();
+    const kept: XmlNode[] = [];
+    for (const node of root.children) {
+      if (node.type === 'element' && drops.indexOf(localName(node.name)) >= 0) relationIdsOf(node, gone);
+      else kept.push(node);
+    }
+    if (kept.length === root.children.length) return { bytes, unrelated: [] };
+    root.children = kept;
+    const stay = new Set<string>();
+    relationIdsOf(root, stay);
+    return { bytes: closePart(doc, context), unrelated: [...gone].filter((id) => !stay.has(id)) };
+  } finally {
+    part = before;
+  }
+}
+
 /**
  * The part of a chart of the file after the chart was changed: `origin` is the chart as the part
  * was read, `chart` the chart as it is now. What differs between the two is changed in the part,
@@ -1272,8 +1341,141 @@ export interface DrawingPartEdit {
   moved: Map<number, DrawingAnchor>;
   /** Anchors that go. */
   removed: Set<number>;
-  /** Charts that are added: where each stands, the id of its relationship, its name. */
-  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string }[];
+  /**
+   * Charts that are added: where each stands, the id of its relationship, its name. With `from`
+   * (the anchor of the chart it is a copy of: see framedAnchorXml()) the anchor is made from
+   * that one, and keeps everything of it but its place, its id, its name, its relationship and
+   * the macro it is assigned.
+   */
+  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string }[];
+}
+
+/** The <c:chart r:id> of a frame: the element that names the chart part, and the name of the attribute that does. */
+function chartReference(anchor: XmlElement): { el: XmlElement; attr: string } | undefined {
+  const stack: { el: XmlElement; depth: number; inData: boolean }[] = [{ el: anchor, depth: 0, inData: false }];
+  while (stack.length > 0) {
+    const { el, depth, inData } = stack.pop() as { el: XmlElement; depth: number; inData: boolean };
+    const local = localName(el.name);
+    if (inData && local === 'chart') {
+      for (const name of el.attrs.keys()) if (name.indexOf(':') > 0 && name.slice(0, 6) !== 'xmlns:' && localName(name) === 'id') return { el, attr: name };
+    }
+    if (depth < 16) for (const node of el.children) if (node.type === 'element') stack.push({ el: node, depth: depth + 1, inData: local === 'graphicData' });
+  }
+  return undefined;
+}
+
+/**
+ * The anchor of a drawing part whose frame shows the chart of the relationship `relId`, as XML
+ * that stands on its own (every namespace its names use is declared on it): what the frame of a
+ * copy of that chart is made from. An anchor inside a wrapper of alternatives is given without
+ * the wrapper. Undefined when the part has no such anchor, or cannot be read.
+ */
+export function framedAnchorXml(bytes: Uint8Array, relId: string): string | undefined {
+  let root: XmlElement;
+  try {
+    root = parseXml(bytes).root;
+  } catch (error) {
+    return undefined;
+  }
+  if (nestedBeyond(root, MAX_PATCH_DEPTH)) return undefined;
+  const declared = (el: XmlElement, scope: Map<string, string>): Map<string, string> => {
+    let own = scope;
+    for (const [name, value] of el.attrs) {
+      if (name !== 'xmlns' && name.slice(0, 6) !== 'xmlns:') continue;
+      if (own === scope) own = new Map(scope);
+      own.set(name === 'xmlns' ? '' : name.slice(6), value);
+    }
+    return own;
+  };
+  let found: { el: XmlElement; scope: Map<string, string> } | undefined;
+  const walk = (parent: XmlElement, scope: Map<string, string>, depth: number): void => {
+    for (const node of parent.children) {
+      if (found || node.type !== 'element') continue;
+      const local = localName(node.name);
+      if (Object.prototype.hasOwnProperty.call(ANCHOR_NAMES, local)) {
+        const reference = chartReference(node);
+        if (reference && reference.el.attrs.get(reference.attr) === relId) found = { el: node, scope };
+      } else if ((local === 'AlternateContent' || local === 'Choice' || local === 'Fallback') && depth < 16) walk(node, declared(node, scope), depth + 1);
+    }
+  };
+  walk(root, declared(root, new Map()), 0);
+  if (!found) return undefined;
+  // The prefixes its names use, and the default namespace when a name has no prefix.
+  const used = new Set<string>();
+  const names = (el: XmlElement, depth: number): void => {
+    used.add(prefixOf(el.name));
+    for (const name of el.attrs.keys()) if (name.indexOf(':') > 0 && name.slice(0, 6) !== 'xmlns:') used.add(prefixOf(name));
+    if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') names(node, depth + 1);
+  };
+  names(found.el, 0);
+  const attrs = new Map<string, string>();
+  for (const prefix of used) {
+    const key = prefix === '' ? 'xmlns' : `xmlns:${prefix}`;
+    const space = found.scope.get(prefix);
+    if (space !== undefined && prefix !== 'xml' && !found.el.attrs.has(key)) attrs.set(key, space);
+  }
+  for (const [name, value] of found.el.attrs) attrs.set(name, value);
+  return serializeXml({ declaration: null, leading: [], root: { type: 'element', name: found.el.name, attrs, children: found.el.children }, trailing: [] });
+}
+
+/**
+ * The anchor of a chart that is a copy, made from the anchor of the chart it was copied from
+ * (`item.from`): the place, the id of the shape, its name and the relationship of the chart are
+ * the copy's; the macro the frame was assigned is not carried (a copy is not bound to a macro
+ * behind the back of whoever made it); what else of the frame names a relationship of the
+ * drawing it came from (a link) is left out, since the copy may stand in another drawing.
+ * Everything else stays. Undefined when the anchor is not one of a chart.
+ */
+function copiedAnchor(root: XmlElement, item: DrawingPartEdit['added'][number], shapeId: number): XmlElement | undefined {
+  const context = part as PartContext;
+  let el: XmlElement;
+  try {
+    el = parseXml(item.from as string).root;
+  } catch (error) {
+    return undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(ANCHOR_NAMES, localName(el.name)) || nestedBeyond(el, MAX_PATCH_DEPTH)) return undefined;
+  const reference = chartReference(el);
+  if (!reference) return undefined;
+  const link = (node: XmlElement, parent: XmlElement, depth: number): void => {
+    context.parents.set(node, parent);
+    if (depth <= MAX_PATCH_DEPTH) for (const child_ of node.children) if (child_.type === 'element') link(child_, node, depth + 1);
+  };
+  link(el, root, 0);
+  reference.el.attrs.set(reference.attr, item.relId);
+  // Whatever else names a relationship named one of the drawing the frame came from.
+  const prune = (node: XmlElement, depth: number): void => {
+    node.children = node.children.filter((kid) => {
+      if (kid.type !== 'element' || kid === reference.el) return true;
+      for (const name of kid.attrs.keys()) if (name.indexOf(':') > 0 && name.slice(0, 6) !== 'xmlns:' && /^(id|embed|link|pict|dm|lo|qs|cs)$/.test(localName(name))) return false;
+      return true;
+    });
+    if (depth <= MAX_PATCH_DEPTH) for (const kid of node.children) if (kid.type === 'element') prune(kid, depth + 1);
+  };
+  prune(el, 0);
+  const frame = child(el, 'graphicFrame');
+  if (frame && frame.attrs.has('macro')) frame.attrs.set('macro', '');
+  const props = child(child(frame, 'nvGraphicFramePr'), 'cNvPr');
+  if (props) {
+    props.attrs.set('id', String(shapeId));
+    props.attrs.set('name', item.name);
+  }
+  // Where it stands, in the prefix the anchor has; whether it moves and sizes with the cells is the copy's as well.
+  const place = placeXml(item.anchor);
+  const holder = made(el, `<xdr:w>${place.inner}</xdr:w>`);
+  const kept = el.children.filter((node) => !(node.type === 'element' && /^(from|to|pos|ext)$/.test(localName(node.name))));
+  const placed = elements(holder);
+  for (const node of placed) context.parents.set(node, el);
+  el.children = (placed as XmlNode[]).concat(kept);
+  el.name = el.name.slice(0, el.name.length - localName(el.name).length) + place.name;
+  el.attrs.delete('editAs');
+  if (place.name === 'twoCellAnchor' && item.anchor.editAs && item.anchor.editAs !== 'twoCell') {
+    // Before what the anchor declares, where applications write it.
+    const attrs = new Map<string, string>([['editAs', item.anchor.editAs]]);
+    for (const [name, value] of el.attrs) attrs.set(name, value);
+    el.attrs = attrs;
+  }
+  return el;
 }
 
 /**
@@ -1290,10 +1492,7 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
     const strict = context.spaces.xdr === STRICT_XDR;
     const found: FoundAnchor[] = [];
     anchorsOf(root, 0, undefined, found);
-    const relIds = (el: XmlElement, out: Set<string>, depth = 0): void => {
-      for (const [name, value] of el.attrs) if (name.indexOf(':') > 0 && name.slice(0, 6) !== 'xmlns:' && /^(id|embed|link|pict|dm|lo|qs|cs)$/.test(localName(name))) out.add(value);
-      if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') relIds(node, out, depth + 1);
-    };
+    const relIds = relationIdsOf;
     const gone = new Set<string>();
     for (const [index, anchor] of edit.moved) {
       const item = found[index];
@@ -1330,7 +1529,10 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
         if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') ids(node, depth + 1);
       };
       ids(root, 0);
-      const added: XmlNode[] = edit.added.map((item) => made(root, chartAnchorXml(item.anchor, item.relId, ++top, item.name, item.description, strict)));
+      const added: XmlNode[] = edit.added.map((item) => {
+        const id = ++top;
+        return (item.from !== undefined ? copiedAnchor(root, item, id) : undefined) || made(root, chartAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict));
+      });
       root.children = root.children.concat(added);
     }
     const stay = new Set<string>();

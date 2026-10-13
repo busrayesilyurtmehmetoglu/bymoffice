@@ -20,17 +20,22 @@
 //   is. A change the part cannot take without losing what the model does not
 //   hold (another chart type) is refused.
 // - A chart of which neither is known is moved and deleted, not changed.
+// - A chart that is copied (copyChart(), pasteChart(), duplicateChart(), cutChart()) is a new
+//   chart of the model. A copy of a chart whose part holds more than its model is made from that
+//   part when the workbook is written (DrawingChart.source), and is changed the way the chart it
+//   was copied from is.
 //
 // A drawing that was added, moved or changed stands where it was put, which
 // is a place of the sheet as it was then (SheetDrawing.since), like a note.
 
-import { adjustFormula, formulaNamesSheetsUnread, quoteSheetName, renameSheetsInFormula, type StructuralEdit } from '../calc/refs';
+import { adjustFormula, formulaNamesSheetsUnread, formulaReferences, quoteSheetName, renameSheetsInFormula, type StructuralEdit } from '../calc/refs';
 import { scatterAxes } from '../layout/chart';
 import { createSheetMetrics, type SheetMetrics } from '../layout/sheet-metrics';
-import { chartKindGrouped, chartKindWritten, chartPartProblem, chartRefAreas, chartWritable, mapChartRefs, MAX_CHART_SERIES, MAX_SHEET_CHARTS, MAX_WORKBOOK_CHARTS, remapLegendEntries, type Chart, type ChartAxis, type ChartData, type ChartDataLabels, type ChartGroup, type ChartLegend, type ChartLine, type ChartSeries, type ChartShape } from '../model/sheet/chart';
+import { chartKindGrouped, chartKindWritten, chartPartCost, chartPartProblem, chartRefAreas, chartRefs, chartWritable, mapChartRefs, MAX_CHART_PART_BYTES, MAX_CHART_POINTS, MAX_CHART_SERIES, MAX_SHEET_CHARTS, MAX_WORKBOOK_CHART_BYTES, MAX_WORKBOOK_CHART_POINTS, MAX_WORKBOOK_CHARTS, remapLegendEntries, type Chart, type ChartAxis, type ChartData, type ChartDataLabels, type ChartGroup, type ChartLegend, type ChartLine, type ChartSeries, type ChartShape } from '../model/sheet/chart';
 import {
   MAX_COLS,
   MAX_ROWS,
+  sheetNameMap,
   type Cell,
   type CellRange,
   type ChartOrigin,
@@ -38,11 +43,13 @@ import {
   type DrawingChart,
   type DrawingMarker,
   type Sheet,
+  foldSheetName,
   type SheetDrawing,
   type SheetNameMap,
+  type SheetStructuralEdit,
   type Workbook,
 } from '../model/sheet/types';
-import { drawingAnchorNow } from '../render/sheet-drawings';
+import { anchorRect, drawingAnchorNow } from '../render/sheet-drawings';
 import { withCommand, type Op } from './ops';
 import type { RuleLists } from './rules';
 
@@ -177,6 +184,9 @@ function sheetOf(workbook: Workbook, sheetIndex: number): Sheet {
   if (sheet.kind !== 'worksheet') throw new RangeError(`Cannot change the charts of a ${sheet.kind}`);
   return sheet;
 }
+
+/** Whether a chart has a part that holds more than its model may: a chart of the file, and a copy that is made from the part of one (DrawingChart.source). */
+const partBound = (object: DrawingChart): boolean => object.part !== undefined || object.source !== undefined;
 
 /** What every command says of a chart a reader marked as only shown (Chart.shownOnly): it is neither changed, moved nor deleted. */
 const SHOWN_ONLY = 'Cannot change this chart: it was read from an xls file and is only shown';
@@ -605,6 +615,93 @@ function setDrawings(sheetIndex: number, list: SheetDrawing[]): Op[] {
   return [{ type: 'setDrawings', sheet: sheetIndex, drawings: list.length > 0 ? list : undefined }];
 }
 
+/** Throws RangeError when a sheet has no room for one more chart. */
+function checkRoom(workbook: Workbook, sheet: Sheet): void {
+  if ((sheet.drawings || []).length >= MAX_SHEET_DRAWINGS) throw new RangeError('The sheet has too many drawings');
+  // No more charts than are read back from a file: what is written can be opened again.
+  const chartsOn = (other: Sheet): number => (other.drawings || []).reduce((count, drawing) => (drawing && drawing.object && drawing.object.type === 'chart' ? count + 1 : count), 0);
+  if (chartsOn(sheet) >= MAX_SHEET_CHARTS) throw new RangeError(`A sheet has at most ${MAX_SHEET_CHARTS} charts`);
+  if (workbook.sheets.reduce((count, other) => count + chartsOn(other), 0) >= MAX_WORKBOOK_CHARTS) throw new RangeError(`A workbook has at most ${MAX_WORKBOOK_CHARTS} charts`);
+}
+
+/** Cells that are looked at when the charts of a workbook are weighed; beyond them a chart weighs what its model caches. */
+const MAX_WEIGHED_CELLS = 2000000;
+
+/**
+ * What a chart will weigh in the file that is written, as the budgets of a reader count it: the
+ * bytes of its part and the values its part caches. A chart of the file that was not changed
+ * weighs what its part was read as. Any other is written with the cells as they are: its values
+ * are counted from the cells, and its bytes are what its part had (the part a copy is made
+ * from, the part that is changed) and what the values and the series take - an estimate that
+ * errs on the side of too much.
+ */
+function chartWeight(workbook: Workbook, object: DrawingChart, budget: { cells: number }): { bytes: number; points: number } {
+  const read = chartPartCost(object.origin ? object.origin.chart : object.chart);
+  if (object.part !== undefined && !object.origin && read) return read;
+  const chart = object.chart;
+  let points = 0;
+  let series = 0;
+  const count = (ref: string | undefined, cached: number): void => {
+    const areas = ref !== undefined && budget.cells > 0 ? chartRefAreas(workbook, ref, chart.live === true) : undefined;
+    if (!areas) {
+      points += cached;
+      return;
+    }
+    let seen = 0;
+    let held = 0;
+    for (const { sheet, range } of areas) {
+      const bottom = Math.min(range.bottom, sheet.rowCount - 1);
+      for (let row = range.top; row <= bottom && seen < MAX_CHART_POINTS; row++) {
+        const cells = sheet.rows.get(row);
+        seen += range.right - range.left + 1;
+        if (!cells) continue;
+        for (let col = range.left; col <= range.right && col < cells.cells.length; col++) if (!isEmpty(cells.cells[col])) held++;
+      }
+    }
+    budget.cells -= seen;
+    points += Math.min(held, MAX_CHART_POINTS);
+  };
+  for (const group of chart.groups) {
+    for (const item of group.series) {
+      series++;
+      if (item.name && item.name.ref !== undefined) points++;
+      for (const data of [item.categories, item.values, item.bubbleSizes]) if (data) count(data.ref, data.cache ? data.cache.index.length : 0);
+    }
+  }
+  return { bytes: (read ? read.bytes : 2048) + 64 * points + 512 * series, points: Math.max(points, read ? read.points : 0) };
+}
+
+/**
+ * Throws RangeError when the charts of a workbook, with `adding`, would hold more than a
+ * reader takes of one workbook (MAX_WORKBOOK_CHART_BYTES, MAX_WORKBOOK_CHART_POINTS,
+ * MAX_CHART_PART_BYTES for one part): a chart beyond that would be a placeholder when the file
+ * is opened again.
+ */
+function checkBudget(workbook: Workbook, adding: DrawingChart): void {
+  const budget = { cells: MAX_WEIGHED_CELLS };
+  const added = chartWeight(workbook, adding, budget);
+  let bytes = added.bytes;
+  let points = added.points;
+  for (const sheet of workbook.sheets) {
+    for (const drawing of sheet.drawings || []) {
+      if (!drawing || !drawing.object || drawing.object.type !== 'chart') continue;
+      const weight = chartWeight(workbook, drawing.object, budget);
+      bytes += weight.bytes;
+      points += weight.points;
+    }
+  }
+  if (added.bytes > MAX_CHART_PART_BYTES || bytes > MAX_WORKBOOK_CHART_BYTES || points > MAX_WORKBOOK_CHART_POINTS) {
+    throw new RangeError('Cannot add the chart: the charts of the workbook would hold more than is read back from a file');
+  }
+}
+
+/** The name a chart that is added to a sheet gets: "Chart" and one more than the charts the sheet has. */
+function nextName(sheet: Sheet): string {
+  let number = 1;
+  for (const drawing of sheet.drawings || []) if (drawing && drawing.object && drawing.object.type === 'chart') number++;
+  return `Chart ${number}`;
+}
+
 /**
  * Adds a chart to a sheet, above its other drawings. Returns the operations; the chart is the
  * last entry of Sheet.drawings once they are applied.
@@ -622,11 +719,7 @@ function addChartPlain(workbook: Workbook, sheetIndex: number, spec: ChartSpec):
   const grouping = checkGrouping(spec.grouping);
   const legend = checkLegend(spec.legend);
   const drawings = sheet.drawings || [];
-  if (drawings.length >= MAX_SHEET_DRAWINGS) throw new RangeError('The sheet has too many drawings');
-  // No more charts than are read back from a file: what is written can be opened again.
-  const chartsOn = (other: Sheet): number => (other.drawings || []).reduce((count, drawing) => (drawing && drawing.object && drawing.object.type === 'chart' ? count + 1 : count), 0);
-  if (chartsOn(sheet) >= MAX_SHEET_CHARTS) throw new RangeError(`A sheet has at most ${MAX_SHEET_CHARTS} charts`);
-  if (workbook.sheets.reduce((count, other) => count + chartsOn(other), 0) >= MAX_WORKBOOK_CHARTS) throw new RangeError(`A workbook has at most ${MAX_WORKBOOK_CHARTS} charts`);
+  checkRoom(workbook, sheet);
   const group = groupOf(type, grouping);
   const specs = Array.isArray(spec.series) ? spec.series : spec.range !== undefined ? seriesOfRange(workbook, sheetIndex, spec.range, spec.seriesIn, type).series : undefined;
   if (!specs || specs.length === 0) throw new RangeError('A chart needs a range of cells, or series');
@@ -639,9 +732,9 @@ function addChartPlain(workbook: Workbook, sheetIndex: number, spec: ChartSpec):
   if (legend !== 'none') chart.legend = { position: legend };
   if (workbook.date1904) chart.date1904 = true;
   const anchor = spec.anchor !== undefined ? checkedAnchor(spec.anchor) : defaultAnchor(sheet, isRange(spec.range) ? spec.range : undefined);
-  let number = 1;
-  for (const drawing of drawings) if (drawing && drawing.object && drawing.object.type === 'chart') number++;
-  const added: SheetDrawing = { anchor, object: { type: 'chart', chart, name: `Chart ${number}` }, since: sheet.structuralEdits ? sheet.structuralEdits.length : 0 };
+  const made: DrawingChart = { type: 'chart', chart, name: nextName(sheet) };
+  checkBudget(workbook, made);
+  const added: SheetDrawing = { anchor, object: made, since: sheet.structuralEdits ? sheet.structuralEdits.length : 0 };
   return setDrawings(sheetIndex, drawings.concat([added]));
 }
 
@@ -885,7 +978,7 @@ function updateChartPlain(workbook: Workbook, sheetIndex: number, id: number, pa
   const problem = chartProblem(workbook, sheetIndex, id);
   if (problem) throw new RangeError(problem);
   const before = object.chart;
-  const whole = object.part === undefined || object.known === 'all';
+  const whole = !partBound(object) || object.known === 'all';
   if (!whole && patch.type !== undefined && checkType(patch.type) !== typeOf(before)) throw new RangeError('Cannot change the type of this chart: its part holds formatting that another type cannot keep');
   if (!whole && (patch.series !== undefined || patch.range !== undefined || patch.seriesIn !== undefined) && before.groups.length !== 1) throw new RangeError('Cannot change the series of a chart of several types');
   let chart: Chart = before;
@@ -1057,9 +1150,9 @@ function updateChartPlain(workbook: Workbook, sheetIndex: number, id: number, pa
 
   if (chart === before) return [];
   if (!chart.live) chart = { ...chart, live: true };
-  if (object.part !== undefined && !whole) chart = settled(chart, originOf(object).chart);
+  if (!whole) chart = settled(chart, originOf(object).chart);
   const next: DrawingChart = { ...object, chart };
-  if (object.part !== undefined && !whole) {
+  if (!whole) {
     const origin = originOf(object);
     next.origin = { chart: origin.chart, series: places.map((group, g) => group.map((place) => (place < 0 ? -1 : origin.series[g] !== undefined && origin.series[g][place] !== undefined ? origin.series[g][place] : -1))) };
     // What the writer could not write into the part is no operation: the same rule says so here.
@@ -1138,7 +1231,7 @@ export function sheetCharts(workbook: Workbook, sheetIndex: number): ChartInfo[]
       axisTitles: {},
       axisBounds: {},
       dataLabels: labelsShown(chart),
-      editable: sheet.kind !== 'worksheet' ? 'none' : object.part === undefined || object.known === 'all' ? 'all' : object.known === 'refs' ? 'parts' : 'none',
+      editable: sheet.kind !== 'worksheet' ? 'none' : !partBound(object) || object.known === 'all' ? 'all' : object.known === 'refs' ? 'parts' : 'none',
       ofFile: object.part !== undefined,
       canAddSeries: false,
       canReorderSeries: false,
@@ -1166,6 +1259,317 @@ export function sheetCharts(workbook: Workbook, sheetIndex: number): ChartInfo[]
   return out;
 }
 
+// ------------------------------------------------------------------ copies
+
+/** How far a copy is put from a chart that stands where it would stand: so many pixels to the right and down. */
+export const CHART_COPY_OFFSET = 24;
+
+/**
+ * A chart taken off a sheet to be put down again: what copyChart() and cutChart() give and
+ * pasteChart() takes. It belongs to the workbook it was taken from and is not to be altered.
+ * Its references name sheets and cells as they were when it was taken: once rows, columns or
+ * sheets changed since, it is put down nowhere (chartCopyOutdated()).
+ */
+export interface ChartCopy {
+  readonly workbook: Workbook;
+  /** The sheet it was taken from. */
+  readonly sheet: Sheet;
+  /** The drawing it was taken from, as the sheet had it then: while the sheet still has that very drawing, the copy is the chart as it is. */
+  readonly drawing: SheetDrawing;
+  /** The chart as it is put down (its name aside). */
+  readonly object: DrawingChart;
+  /** Where it stood, in pixels from the corner of cell A1, and how large it was. */
+  readonly rect: { x: number; y: number; width: number; height: number };
+  readonly editAs?: DrawingAnchor['editAs'];
+  /**
+   * What of the chart no copy takes along: elements of its part that are left out ("userShapes",
+   * "externalData"), the macro its frame is assigned ("macro"), relationships of its part that
+   * lead to relationships ("relationships").
+   */
+  readonly dropped: readonly string[];
+  /**
+   * The sheets the copy stands on as they were: their names and the rows and columns that had
+   * been inserted and deleted. These are the sheets its references name (and the sheet it was
+   * taken from, for references that name none); with `strict`, every sheet of the workbook.
+   */
+  readonly state: readonly { sheet: Sheet; name: string; edits: readonly SheetStructuralEdit[] }[];
+  /** A reference of the copy cannot be followed to cells (a sheet that is gone, another workbook): any row or column that moves anywhere outdates the copy. */
+  readonly strict?: boolean;
+}
+
+/** What pasteChart() and duplicateChart() give. */
+export interface PastedChart {
+  /** The operations that add the chart: one undo step. */
+  ops: Op[];
+  /** The id the chart has on its sheet once they are applied. */
+  id: number;
+  /** What of the chart that was copied the new chart does not have (ChartCopy.dropped). Nothing else of it is lost. */
+  dropped: string[];
+  /**
+   * References of the chart that name no sheet and are not cells (a name defined for the sheet
+   * the chart came from): on another sheet they could not be bound to the sheet they were written
+   * on, and stay as they are.
+   */
+  unbound: number;
+}
+
+/**
+ * Why a chart cannot be copied (or cut, or duplicated), as a message; undefined when it can. A
+ * chart of the file whose part holds references the model does not (a pivot chart, formulas of
+ * extensions) is not copied: on another sheet its copy could not be kept on the cells the chart
+ * shows, and it would follow no rows, columns or sheets.
+ */
+export function chartCopyProblem(workbook: Workbook, sheetIndex: number, id: number): string | undefined {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet) return `No sheet at index ${sheetIndex}`;
+  if (sheet.kind !== 'worksheet') return `Cannot copy the chart of a ${sheet.kind}`;
+  const drawing = sheet.drawings && Math.floor(id) === id ? sheet.drawings[id] : undefined;
+  if (!drawing || !drawing.object || drawing.object.type !== 'chart') return `No chart at index ${id}`;
+  const object = drawing.object;
+  // A chart of an xls file is shown from what was read of it; nothing writes one.
+  if (object.chart && object.chart.shownOnly === true) return 'Cannot copy this chart: it was read from an xls file and is only shown';
+  if (object.part !== undefined && object.known === undefined && !(object.loose && object.loose.length > 0)) return 'Cannot copy this chart: its part holds references the model does not, so a copy could not be kept on the cells it shows';
+  if (!partBound(object) && !chartWritable(object.chart)) return 'Cannot copy this chart: its type is not one that is written from the model';
+  return undefined;
+}
+
+/**
+ * Takes a copy of a chart; nothing of the workbook is changed. The copy shows the cells the
+ * chart shows. A chart of the file whose part holds more than its model (formatting, extensions,
+ * styles, colours, pictures of fills) is copied with all of that: the part of the copy is made
+ * from the bytes of that part when the workbook is written. What no copy takes along is named in
+ * `dropped`. Throws RangeError for a chart that cannot be copied: chartCopyProblem() says why.
+ */
+export function copyChart(workbook: Workbook, sheetIndex: number, id: number): ChartCopy {
+  const problem = chartCopyProblem(workbook, sheetIndex, id);
+  if (problem) throw new RangeError(problem);
+  const sheet = workbook.sheets[sheetIndex];
+  const { drawing, object } = chartAt(sheet, id);
+  // The references as the sheets are called now: a copy is a chart that was added.
+  let chart = object.chart;
+  if (!chart.live) {
+    const names = sheetNameMap(workbook);
+    if (names) chart = mapChartRefs(chart, (ref) => (ref.indexOf('!') < 0 || formulaNamesSheetsUnread(ref) ? ref : renameSheetsInFormula(ref, names)));
+    chart = { ...chart, live: true };
+  }
+  const made: DrawingChart = { type: 'chart', chart };
+  if (object.description !== undefined) made.description = object.description;
+  if (object.hidden) made.hidden = true;
+  // The frame of a chart of the file is what the frame of its copy is made from.
+  if (object.part !== undefined) made.frame = object.part;
+  else if (object.frame !== undefined) made.frame = object.frame;
+  const dropped: string[] = [];
+  if (partBound(object) && object.known !== 'all') {
+    made.known = 'refs';
+    if (object.seriesFixed) made.seriesFixed = true;
+    made.origin = originOf(object);
+    if (object.source) made.source = object.source.drops ? { part: object.source.part, drops: object.source.drops.slice() } : { part: object.source.part };
+    else {
+      made.source = { part: object.part as string };
+      if (object.loose && object.loose.length > 0) {
+        made.source.drops = object.loose.slice();
+        for (const name of object.loose) dropped.push(name);
+      }
+    }
+  }
+  if (object.part !== undefined) {
+    const cost = chartPartCost(originOf(object).chart);
+    if (cost && cost.stray) dropped.push('relationships');
+    if (object.macro !== undefined && object.macro !== '') dropped.push('macro');
+  }
+  // The sheets the copy stands on: those its references name.
+  const named = new Set<Sheet>();
+  let strict = false;
+  for (const ref of chartRefs(chart)) {
+    if (ref.indexOf('!') < 0) {
+      // Cells of the sheet the chart is on; a name is no cells, and moves with no row.
+      if (formulaReferences(ref).length > 0) named.add(sheet);
+      continue;
+    }
+    const areas = chartRefAreas(workbook, ref, true);
+    if (!areas) strict = true;
+    else for (const area of areas) named.add(area.sheet);
+  }
+  const anchor = drawingAnchorNow(drawing, sheet.structuralEdits);
+  const box = anchorRect(anchor, createSheetMetrics(sheet));
+  const copy: ChartCopy = {
+    workbook,
+    sheet,
+    drawing,
+    object: made,
+    rect: { x: box.x, y: box.y, width: box.width, height: box.height },
+    dropped,
+    state: workbook.sheets.filter((other) => strict || named.has(other)).map((other) => ({ sheet: other, name: other.name, edits: (other.structuralEdits || []).slice() })),
+  };
+  const more: { editAs?: DrawingAnchor['editAs']; strict?: boolean } = {};
+  if (anchor.kind === 'twoCell' && anchor.editAs !== undefined) more.editAs = anchor.editAs;
+  if (strict) more.strict = true;
+  return { ...copy, ...more };
+}
+
+/**
+ * Whether a copy can no longer be put down: it is of another workbook, or a sheet its
+ * references name is gone or has another name, or rows or columns were inserted or deleted on
+ * such a sheet since the copy was taken so that its references would name other cells than the
+ * chart it was taken from shows now. Sheets the chart does not name are nothing to it; neither
+ * are rows and columns that leave its references as they are (below its cells, or put in and
+ * taken out again), nor steps that were undone.
+ */
+export function chartCopyOutdated(workbook: Workbook, copy: ChartCopy): boolean {
+  if (!copy || copy.workbook !== workbook || !Array.isArray(copy.state)) return true;
+  const sameEdit = (a: SheetStructuralEdit, b: SheetStructuralEdit): boolean => a === b || (a.kind === b.kind && a.axis === b.axis && a.at === b.at && a.count === b.count);
+  const since: StructuralEdit[] = [];
+  for (const was of copy.state) {
+    if (workbook.sheets.indexOf(was.sheet) < 0 || was.sheet.name !== was.name) return true;
+    const now = was.sheet.structuralEdits || [];
+    // What was done when the copy was taken has to be what was done first: anything else is another sheet.
+    if (now.length < was.edits.length) return true;
+    for (let i = 0; i < was.edits.length; i++) if (!sameEdit(now[i], was.edits[i])) return true;
+    if (now.length > was.edits.length && copy.strict) return true;
+    for (let i = was.edits.length; i < now.length; i++) since.push({ kind: now[i].kind, axis: now[i].axis, at: now[i].at, count: now[i].count, sheetName: was.name });
+  }
+  if (since.length === 0) return false;
+  // What the chart it was taken from says now: each reference moved the way the charts of the workbook are moved.
+  for (const ref of chartRefs(copy.object.chart)) {
+    let text = ref;
+    for (const edit of since) text = adjustFormula(text, copy.sheet.name, edit);
+    if (text !== ref) return true;
+  }
+  return false;
+}
+
+/**
+ * A reference with the sheet it was written on named in every area that names none
+ * ("$A$1:$A$5" becomes "Sheet1!$A$1:$A$5"). `bound` is false for a reference that names no
+ * sheet and holds no cells to bind (a defined name): it is left as it is.
+ */
+function boundRef(ref: string, sheetName: string): { ref: string; bound: boolean } {
+  const found = formulaReferences(ref);
+  if (found.length === 0) return { ref, bound: ref.indexOf('!') >= 0 };
+  const prefix = `${quoteSheetName(sheetName)}!`;
+  let out = '';
+  let at = 0;
+  for (const item of found) {
+    if (item.bodyStart !== item.start) continue;
+    out += ref.slice(at, item.start) + prefix;
+    at = item.start;
+  }
+  return { ref: out + ref.slice(at), bound: true };
+}
+
+/**
+ * Puts a copy of a chart on a sheet, above its other drawings: on the sheet it was taken from
+ * or on another one of the same workbook. With `at` its top left corner is the corner of that
+ * cell; without, it stands where the chart stood, moved right and down (CHART_COPY_OFFSET) for as
+ * long as a chart stands there already. Its size is the size the chart had.
+ *
+ * The copy shows the cells the chart showed: on another sheet a reference that names no sheet
+ * gets the name of the sheet the chart was taken from. From then on it follows rows, columns and
+ * sheets like any chart that was added.
+ *
+ * Throws RangeError for a copy of another workbook, one that is outdated (chartCopyOutdated()),
+ * and a sheet that takes no more charts.
+ *
+ * While the chart the copy was taken from is still the drawing it was (it was neither changed,
+ * moved nor deleted since), the paste is "a copy of that chart" and its operation says so (the
+ * command "pasteChart": see pasteChartOf()): that is what travels when a workbook is edited
+ * together, where every participant makes the copy from the file they read themselves. A copy
+ * of a chart that is no longer what it was (a chart that was cut) is pasted from what is held,
+ * and its operation names no command.
+ */
+export function pasteChart(workbook: Workbook, sheetIndex: number, copy: ChartCopy, at?: { row: number; col: number }): PastedChart {
+  placedSheetOf(workbook, sheetIndex);
+  if (!copy || typeof copy !== 'object' || !copy.object || copy.object.type !== 'chart') throw new RangeError('What is pasted is not a chart that was copied');
+  if (copy.workbook !== workbook) throw new RangeError('A chart is pasted into the workbook it was copied from');
+  if (chartCopyOutdated(workbook, copy)) throw new RangeError('Cannot paste the chart: rows, columns or sheets changed since it was copied');
+  const home = workbook.sheets.indexOf(copy.sheet);
+  const from = home >= 0 && copy.drawing ? (copy.sheet.drawings || []).indexOf(copy.drawing) : -1;
+  if (from < 0) return pasteHeld(workbook, sheetIndex, copy, at);
+  // The chart as it is now: what it says is what the copy says (the copy is not outdated), and where it stands is where it stands now.
+  const pasted = pasteHeld(workbook, sheetIndex, copyChart(workbook, home, from), at);
+  withCommand(pasted.ops, 'pasteChart', [copy.sheet.name, from, at === undefined ? null : { row: at.row, col: at.col }]);
+  return pasted;
+}
+
+/**
+ * The operations of the command "pasteChart", as it travels: a copy of chart `id` of the sheet
+ * called `sheetName` is put on sheet `sheetIndex` (at a cell, or where pasteChart() puts it).
+ * The sheet is named, not counted: the name says which sheet is meant whatever sheets were put
+ * in or moved since. Throws RangeError for a sheet or a chart that is not there, and for
+ * whatever pasteChart() and copyChart() refuse.
+ */
+export function pasteChartOf(workbook: Workbook, sheetIndex: number, sheetName: string, id: number, at?: { row: number; col: number } | null): Op[] {
+  if (typeof sheetName !== 'string' || sheetName === '' || sheetName.length > 255) throw new RangeError('The chart that is copied is named by its sheet and its place');
+  if (typeof id !== 'number' || !(id >= 0) || Math.floor(id) !== id) throw new RangeError(`No chart at index ${String(id).slice(0, 40)}`);
+  if (at !== undefined && at !== null && (typeof at !== 'object' || Array.isArray(at))) throw new RangeError('The place of a chart is a cell of the sheet');
+  const wanted = foldSheetName(sheetName);
+  let home = -1;
+  workbook.sheets.forEach((sheet, index) => {
+    if (home < 0 && foldSheetName(sheet.name) === wanted) home = index;
+  });
+  if (home < 0) throw new RangeError(`No sheet called "${sheetName.slice(0, 80)}"`);
+  return pasteChart(workbook, sheetIndex, copyChart(workbook, home, id), at === null || at === undefined ? undefined : { row: at.row, col: at.col }).ops;
+}
+
+function pasteHeld(workbook: Workbook, sheetIndex: number, copy: ChartCopy, at: { row: number; col: number } | undefined): PastedChart {
+  const sheet = placedSheetOf(workbook, sheetIndex);
+  checkRoom(workbook, sheet);
+  let unbound = 0;
+  let chart = copy.object.chart;
+  if (sheet !== copy.sheet) {
+    chart = mapChartRefs(chart, (ref) => {
+      const made = boundRef(ref, copy.sheet.name);
+      if (!made.bound) unbound++;
+      return made.ref;
+    });
+  }
+  // A chart of its own, whatever else was made of the same copy.
+  if (chart === copy.object.chart) chart = { ...chart };
+  const metrics = createSheetMetrics(sheet);
+  let x = copy.rect.x;
+  let y = copy.rect.y;
+  if (at !== undefined) {
+    const whole = (n: unknown, limit: number) => typeof n === 'number' && n >= 0 && n < limit && Math.floor(n) === n;
+    if (!at || !whole(at.row, MAX_ROWS) || !whole(at.col, MAX_COLS)) throw new RangeError('The place of a chart is a cell of the sheet');
+    x = metrics.cols.offset(at.col);
+    y = metrics.rows.offset(at.row);
+  } else {
+    const taken: { x: number; y: number }[] = [];
+    for (const drawing of sheet.drawings || []) {
+      if (!drawing || !drawing.object || drawing.object.type !== 'chart') continue;
+      const box = anchorRect(drawingAnchorNow(drawing, sheet.structuralEdits), metrics);
+      taken.push({ x: box.x, y: box.y });
+    }
+    for (let n = 0; n < 64 && taken.some((box) => Math.abs(box.x - x) < 1 && Math.abs(box.y - y) < 1); n++) {
+      x += CHART_COPY_OFFSET;
+      y += CHART_COPY_OFFSET;
+    }
+  }
+  const anchor = anchorOfRect(metrics, x, y, copy.rect.width, copy.rect.height);
+  if (copy.editAs === 'oneCell' || copy.editAs === 'absolute') anchor.editAs = copy.editAs;
+  const object: DrawingChart = { ...copy.object, chart, name: nextName(sheet) };
+  if (copy.object.source) object.source = copy.object.source.drops ? { part: copy.object.source.part, drops: copy.object.source.drops.slice() } : { part: copy.object.source.part };
+  checkBudget(workbook, object);
+  const drawings = sheet.drawings || [];
+  const added: SheetDrawing = { anchor, object, since: sheet.structuralEdits ? sheet.structuralEdits.length : 0 };
+  return { ops: setDrawings(sheetIndex, drawings.concat([added])), id: drawings.length, dropped: copy.dropped.slice(), unbound };
+}
+
+/** Puts a copy of a chart beside it on its sheet: copyChart() and pasteChart() in one. */
+export function duplicateChart(workbook: Workbook, sheetIndex: number, id: number): PastedChart {
+  return pasteChart(workbook, sheetIndex, copyChart(workbook, sheetIndex, id));
+}
+
+/**
+ * Takes a copy of a chart and deletes the chart: the operations are one undo step, and the copy
+ * is pasted like any other. Throws RangeError for a chart that cannot be copied or cannot be
+ * deleted; nothing is taken then.
+ */
+export function cutChart(workbook: Workbook, sheetIndex: number, id: number): { copy: ChartCopy; ops: Op[] } {
+  const copy = copyChart(workbook, sheetIndex, id);
+  return { copy, ops: removeChart(workbook, sheetIndex, id) };
+}
+
 // ------------------------------------------------------------------ rows, columns and sheets
 
 /** Whether the charts of a workbook follow rows and columns that move and sheets that are renamed: see Workbook.chartsFollow. */
@@ -1188,7 +1592,7 @@ function mapCharts(workbook: Workbook, skip: Sheet | undefined, change: (chart: 
       if (chart === object.chart) return;
       const next: DrawingChart = { ...object, chart: chart.live ? chart : { ...chart, live: true } };
       // What the writer changes in the part of a chart of the file is the difference to what was read.
-      if (object.part !== undefined && object.known !== 'all') next.origin = originOf(object);
+      if (partBound(object) && object.known !== 'all') next.origin = originOf(object);
       if (!list) list = sheet.drawings ? sheet.drawings.slice() : [];
       // Its place is not touched: the anchor is as it was, and so is the count of edits it was put after.
       const moved: SheetDrawing = { ...drawing, object: next };

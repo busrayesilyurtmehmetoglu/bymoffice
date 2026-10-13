@@ -6,6 +6,8 @@
 // from the strings a consumer asks for: attributes are only validated while
 // scanning and are decoded on demand.
 
+import { decodeXmlBytes } from './xml';
+
 const NAMED_ENTITIES: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" };
 
 function decodeEntities(text: string): string {
@@ -23,11 +25,7 @@ function decodeEntities(text: string): string {
   });
 }
 
-function decodeBytes(bytes: Uint8Array): string {
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
-  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
-  return new TextDecoder('utf-8').decode(bytes);
-}
+const decodeBytes = (bytes: Uint8Array): string => decodeXmlBytes(bytes);
 
 const isSpace = (c: number) => c === 32 || c === 9 || c === 10 || c === 13;
 // space, '/', '>', '='

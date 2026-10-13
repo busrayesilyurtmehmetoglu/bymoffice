@@ -8,7 +8,7 @@
 // noted, the rest of the drawing is still shown.
 
 import type { OpcPackage, Relationship } from '../../opc';
-import { MAX_SHEET_CHARTS, type Chart } from '../../model/sheet/chart';
+import { MAX_CHART_PART_BYTES, MAX_SHEET_CHARTS, MAX_WORKBOOK_CHART_BYTES, noteChartPart, type Chart } from '../../model/sheet/chart';
 import {
   MAX_COLS,
   MAX_ROWS,
@@ -22,8 +22,8 @@ import {
   type DrawingTextRun,
   type SheetDrawing,
 } from '../../model/sheet/types';
-import { localName, parseXml, type XmlElement } from '../../xml';
-import { MAX_PATCH_DEPTH, chartKnown, nestedBeyond, type ChartPartFacts } from './chart-write';
+import { localName, parseXml, xmlEncodingRead, type XmlElement } from '../../xml';
+import { MAX_PATCH_DEPTH, chartKnown, chartLoose, nestedBeyond, type ChartPartFacts } from './chart-write';
 
 /** Anchors read from one drawing; a sheet with more shows the first ones. */
 export const MAX_SHEET_DRAWINGS = 20000;
@@ -575,6 +575,8 @@ function readObject(state: ReadState, el: XmlElement, depth: number, transformOu
   }
   // A graphic frame holds a chart, a diagram or something else that is not drawn here.
   if (kind === 'graphicFrame') readNames(child(el, 'nvGraphicFramePr'), base);
+  // The macro a frame is assigned: never run, kept where it is, and not carried to a copy of the chart.
+  const macro = kind === 'graphicFrame' ? el.attrs.get('macro') : undefined;
   const transform = readTransform(el, base);
   if (transformOut) transformOut.value = transform;
   const data = child(child(el, 'graphic'), 'graphicData');
@@ -588,8 +590,13 @@ function readObject(state: ReadState, el: XmlElement, depth: number, transformOu
     const chart = rel && !rel.external && rel.part ? state.context.charts.get(rel.part) : undefined;
     if (chart && rel && rel.part) {
       const facts = state.context.chartsKnown ? state.context.chartsKnown.get(rel.part) : undefined;
-      if (!facts) return { ...base, type: 'chart', chart, part: rel.part };
-      return facts.seriesFixed ? { ...base, type: 'chart', chart, part: rel.part, known: facts.known, seriesFixed: true } : { ...base, type: 'chart', chart, part: rel.part, known: facts.known };
+      if (!facts) return macro !== undefined && macro !== '' ? { ...base, type: 'chart', chart, part: rel.part, macro: macro.slice(0, 2000) } : { ...base, type: 'chart', chart, part: rel.part };
+      const made: DrawingObject = { ...base, type: 'chart', chart, part: rel.part };
+      if (macro !== undefined && macro !== '') made.macro = macro.slice(0, 2000);
+      if (facts.known !== undefined) made.known = facts.known;
+      if (facts.seriesFixed) made.seriesFixed = true;
+      if (facts.loose !== undefined) made.loose = facts.loose.slice();
+      return made;
     }
   }
   return { ...base, type: 'placeholder', what };
@@ -719,12 +726,9 @@ export function parseDrawing(root: XmlElement, context: DrawingReadContext): She
 /** Parts larger than this are not read; the sheet is shown without its drawing. */
 const MAX_PART_BYTES = 64 * 1024 * 1024;
 
-/** Chart parts larger than this are not read; the chart is shown as a placeholder. */
-export const MAX_CHART_PART_BYTES = 32 * 1024 * 1024;
 /** Bytes of drawing parts read for one workbook, all sheets together; a drawing beyond them is not shown. */
 export const MAX_WORKBOOK_DRAWING_BYTES = 256 * 1024 * 1024;
-/** Bytes of chart parts read for one workbook, all charts together; a chart beyond them is shown as a placeholder. */
-export const MAX_WORKBOOK_CHART_BYTES = 64 * 1024 * 1024;
+export { MAX_CHART_PART_BYTES, MAX_WORKBOOK_CHART_BYTES };
 
 /**
  * The charts a drawing part refers to, as far as `reading` reads them. A chart that could
@@ -776,16 +780,24 @@ async function readCharts(
       if (bytes.length > reading.bytes) throw new Error('the charts of the workbook hold too many bytes');
       reading.bytes -= bytes.length;
       const root = parseXml(bytes).root;
+      const pointsBefore = reading.points;
       chart = reading.read(root, themeColors, reading);
       if (chart) {
         // What the part holds beside the model decides how far the chart can be changed (DrawingChart.known).
         let related = true;
+        let stray = false;
         try {
-          related = (await pkg.relationships(part)).length > 0;
+          const partRels = await pkg.relationships(part);
+          related = partRels.length > 0;
+          stray = partRels.some((other) => !other.external && !!other.part && /(^|\/)_rels\/[^/]*\.rels$/i.test(other.part));
         } catch (error) {
           // Relationships that cannot be read are relationships: the part is not written anew.
         }
-        const kind = chartKnown(root, chart, related);
+        // What the budgets of the workbook were charged for it: a copy of the chart costs as much again.
+        const points = Math.max(0, pointsBefore - reading.points);
+        noteChartPart(chart, stray ? { bytes: bytes.length, points, stray: true } : { bytes: bytes.length, points });
+        // A part in an encoding that is not read (see xmlEncodingRead()) is shown; nothing is written from its text.
+        const kind = xmlEncodingRead(bytes) ? chartKnown(root, chart, related) || chartLoose(root, chart) : undefined;
         if (kind) {
           written.set(part, kind);
           kinds.set(rel.part, kind);

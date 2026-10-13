@@ -20,6 +20,10 @@ export const MAX_SHEET_CHARTS = 1000;
 export const MAX_WORKBOOK_CHARTS = 2000;
 /** Cached values (<c:pt>) read from the charts of one workbook, all together; a chart that would go beyond is shown as a placeholder. */
 export const MAX_WORKBOOK_CHART_POINTS = 4000000;
+/** Chart parts larger than this are not read; the chart is shown as a placeholder. */
+export const MAX_CHART_PART_BYTES = 32 * 1024 * 1024;
+/** Bytes of chart parts read for one workbook, all charts together; a chart beyond them is shown as a placeholder. */
+export const MAX_WORKBOOK_CHART_BYTES = 64 * 1024 * 1024;
 /** Areas of one reference ("(A1:A3,C1:C3)") that are followed. */
 export const MAX_CHART_AREAS = 64;
 /** Axes read from one chart. */
@@ -422,6 +426,32 @@ export interface Chart {
   palette: string[];
   /** What the chart has that is not drawn, or is drawn differently, one line each. */
   notes: string[];
+}
+
+// ------------------------------------------------------------------ what a part cost to read
+
+/**
+ * What a reader notes of the part a chart was read from: how many bytes it holds and how many
+ * cached values were read from it (what the budgets of a workbook count: MAX_WORKBOOK_CHART_BYTES,
+ * MAX_WORKBOOK_CHART_POINTS), and whether it has a relationship that leads to relationships
+ * (`stray`: a copy of the chart is made without it).
+ */
+export interface ChartPartCost {
+  bytes: number;
+  points: number;
+  stray?: boolean;
+}
+
+const COSTS = new WeakMap<Chart, ChartPartCost>();
+
+/** Notes what the part of a chart cost to read. By the chart as it was read: one that was changed since is another object. */
+export function noteChartPart(chart: Chart, cost: ChartPartCost): void {
+  COSTS.set(chart, cost);
+}
+
+/** What the part `chart` was read from cost; undefined for a chart no reader noted it of. */
+export function chartPartCost(chart: Chart | undefined): ChartPartCost | undefined {
+  return chart ? COSTS.get(chart) : undefined;
 }
 
 // ------------------------------------------------------------------ references

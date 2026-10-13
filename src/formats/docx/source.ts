@@ -12,7 +12,7 @@
 // gives up (`lost`) and the blocks read after that carry no source span; a
 // writer then rebuilds them from the model.
 
-import type { XmlComment, XmlPI } from '../../xml';
+import { decodeXmlBytes, type XmlComment, type XmlPI } from '../../xml';
 
 /**
  * Decodes a part exactly as XmlScanner does (byte order mark dropped, line
@@ -20,10 +20,7 @@ import type { XmlComment, XmlPI } from '../../xml';
  * the scanner reads. The scanner takes the string as it is.
  */
 export function decodePart(bytes: Uint8Array): string {
-  let text: string;
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) text = new TextDecoder('utf-16le').decode(bytes);
-  else if (bytes[0] === 0xfe && bytes[1] === 0xff) text = new TextDecoder('utf-16be').decode(bytes);
-  else text = new TextDecoder('utf-8').decode(bytes);
+  let text = decodeXmlBytes(bytes);
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   if (text.indexOf('\r') >= 0) text = text.replace(/\r\n?/g, '\n');
   return text;

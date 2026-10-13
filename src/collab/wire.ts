@@ -33,7 +33,7 @@ import {
   type StyleSheet,
   type Workbook,
 } from '../model/sheet/types';
-import { addChart, moveChart, removeChart, updateChart } from '../ops/charts';
+import { addChart, moveChart, pasteChartOf, removeChart, updateChart } from '../ops/charts';
 import { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, MAX_SHEET_NOTES, cellNow, notesBlocked } from '../ops/notes';
 import { MAX_CELL_FORMATS, applyOp, ensureNumberFormat, explicitFormula, sameFormat, sharedMasters, shiftAutoFilter, type CellChange, type Op, type RowProps, type SharedMasters } from '../ops/ops';
 import { addConditionalRule, clearConditionalRules, moveConditionalRule, removeConditionalRule, setValidation, updateConditionalRule } from '../ops/rules';
@@ -561,6 +561,8 @@ const COMMANDS: { [name: string]: { family: 'validation' | 'conditional' | 'char
   updateChart: { family: 'chart', run: (wb, s, a) => updateChart(wb, s, a[0] as never, a[1] as never) },
   moveChart: { family: 'chart', run: (wb, s, a) => moveChart(wb, s, a[0] as never, a[1] as never) },
   removeChart: { family: 'chart', run: (wb, s, a) => removeChart(wb, s, a[0] as never) },
+  // A copy of a chart (a paste, a duplicate): the chart is named by its sheet and its place, and each participant makes the copy from the file they read.
+  pasteChart: { family: 'chart', run: (wb, s, a) => pasteChartOf(wb, s, a[0] as never, a[1] as never, a[2] as never) },
 };
 
 /** What a command is about: its rules or its charts are one list, which two commands of a kind change one after the other. */

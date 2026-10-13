@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { clearRange, copyRange, pasteAt, setCellInput } from '../src/ops/commands';
-import { addChart, moveChart, removeChart, sheetCharts, updateChart } from '../src/ops/charts';
+import { addChart, copyChart, duplicateChart, moveChart, pasteChart, removeChart, sheetCharts, updateChart } from '../src/ops/charts';
 import { deleteColumns, deleteRows, setAutoFilter, setFilterColumn } from '../src/ops/filter';
 import { formatRange, mergeRange, setColumnWidth, setColumnsHidden, setRowHeight, setRowsHidden, unmergeRange } from '../src/ops/format';
 import { setComment } from '../src/ops/notes';
@@ -68,6 +68,8 @@ export function change(member: Pick<Member, 'wb' | 'name'>, random: () => number
     ['sort', 4, () => sortRange(wb, s, { top: 1, left: 0, bottom: int(random, 3, 9), right: 3 }, [{ col: int(random, 0, 3), descending: random() < 0.5 }])],
     ['chart+', 3, () => addChart(wb, s, { type: pick(random, ['column', 'line', 'pie'] as const), range: { top: 0, left: 0, bottom: 4, right: 2 }, title: `Chart ${int(random, 0, 9)}` })],
     ['chart-', 1, () => removeChart(wb, s, int(random, 0, Math.max(sheetCharts(wb, s).length - 1, 0)))],
+    ['chart copy', 2, () => duplicateChart(wb, s, (sheetCharts(wb, s)[0] || { id: 0 }).id).ops],
+    ['chart paste', 2, () => pasteChart(wb, int(random, 0, wb.sheets.length - 1), copyChart(wb, s, (sheetCharts(wb, s)[0] || { id: 0 }).id), random() < 0.5 ? { row, col } : undefined).ops],
     ['chart move', 1, () => moveChart(wb, s, (sheetCharts(wb, s)[0] || { id: 0 }).id, { top: row, left: col, bottom: row + 8, right: col + 5 })],
     ['chart change', 1, () => updateChart(wb, s, (sheetCharts(wb, s)[0] || { id: 0 }).id, { title: `Title ${int(random, 0, 9)}`, legend: pick(random, ['r', 'b', 'none'] as const) })],
   ];

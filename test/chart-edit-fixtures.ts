@@ -160,7 +160,8 @@ export async function packageProblems(bytes: Uint8Array): Promise<string[]> {
 /**
  * What is wrong with the bytes of an XML part for the encoding it declares; undefined when a
  * parser that honours the declaration reads the text that was meant. A part in UTF-16 is known
- * by its byte order mark; every other part has to be UTF-8, and one that declares anything else
+ * by its byte order mark; a part that declares Latin-1, Latin-5 or the Windows code page of
+ * either is read in it; every other part has to be UTF-8, and one that declares anything else
  * may hold no byte beyond ASCII (such a byte is two letters, or none, to the parser).
  */
 export function encodingProblem(bytes: Uint8Array): string | undefined {
@@ -169,6 +170,8 @@ export function encodingProblem(bytes: Uint8Array): string | undefined {
   for (let i = 0; i < Math.min(bytes.length, 200); i++) head += String.fromCharCode(bytes[i]);
   const declared = /^(?:\u00ef\u00bb\u00bf)?<\?xml[^?]*?\sencoding\s*=\s*["']([^"']*)["']/.exec(head);
   if (declared && !/^utf-?8$/i.test(declared[1])) {
+    // The single-byte encodings a reader of XML knows: every byte is a letter of them.
+    if (/^(iso-8859-1|iso-8859-9|windows-1252|windows-1254|latin1|latin5)$/i.test(declared[1])) return undefined;
     for (let i = 0; i < bytes.length; i++) if (bytes[i] >= 0x80) return `declares the encoding ${declared[1]} and holds bytes that are not ASCII`;
     return undefined;
   }

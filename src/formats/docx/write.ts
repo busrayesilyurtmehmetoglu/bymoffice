@@ -75,7 +75,7 @@ import {
   type Wrapper,
 } from '../../model/doc/types';
 import type { OpcPackage } from '../../opc';
-import { parseXml, serializeXml, type XmlDocument, type XmlElement } from '../../xml';
+import { decodeXmlBytes, parseXml, serializeXml, type XmlDocument, type XmlElement } from '../../xml';
 import { ZipArchive } from '../../zip';
 import { DEFAULT_AUTHOR, largestAnnotationId } from '../../ops/doc/track';
 import { resolveColor, resolveFont } from './resolve';
@@ -274,7 +274,7 @@ const DECLARED_ENCODING = /^(\uFEFF?<\?xml\b[^?>]*?\bencoding\s*=\s*)(["'])([^"'
 function splicedPart(original: Uint8Array, splices: { start: number; end: number; text: string }[]): Uint8Array {
   const little = original[0] === 0xff && original[1] === 0xfe;
   const big = original[0] === 0xfe && original[1] === 0xff;
-  const raw = new TextDecoder(little ? 'utf-16le' : big ? 'utf-16be' : 'utf-8', { ignoreBOM: true }).decode(original);
+  const raw = decodeXmlBytes(original, true);
   // Where each place of the normalized text is in the raw one.
   const sorted = splices.slice().sort((a, b) => a.start - b.start);
   let out = '';
@@ -298,8 +298,8 @@ function splicedPart(original: Uint8Array, splices: { start: number; end: number
     copied = end;
   }
   out += raw.slice(copied);
-  // The text is taken as UTF-8 and written as UTF-8: a declaration that names another encoding would make a
-  // reader that believes it refuse the part, or read other letters. Only the name of the encoding changes.
+  // The text is written as UTF-8 whatever single-byte encoding it was read in: a declaration that names another
+  // encoding would make a reader that believes it refuse the part, or read other letters. Only the name of the encoding changes.
   if (!little && !big) return new TextEncoder().encode(out.replace(DECLARED_ENCODING, (all: string, before: string, quote: string, name: string) => (/^utf-?8$/i.test(name) ? all : `${before}${quote}UTF-8${quote}`)));
   const bytes = new Uint8Array(out.length * 2);
   for (let i = 0; i < out.length; i++) {

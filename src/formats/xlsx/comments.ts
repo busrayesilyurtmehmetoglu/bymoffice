@@ -7,7 +7,7 @@
 
 import type { OpcPackage, Relationship } from '../../opc';
 import { MAX_COLS, MAX_ROWS, parseCellRef, type DrawingAnchor, type RichRun, type SheetComment } from '../../model/sheet/types';
-import { localName, parseXml, type XmlElement } from '../../xml';
+import { decodeXmlBytes, localName, parseXml, type XmlElement } from '../../xml';
 import { decodeXstring } from './shared-strings';
 import { parseFont } from './styles';
 
@@ -227,7 +227,7 @@ export function parseVmlNotes(bytes: Uint8Array): NoteBox[] {
     }
     return out;
   }
-  const text = new TextDecoder().decode(bytes);
+  const text = decodeXmlBytes(bytes);
   let i = 0;
   while (out.length < MAX_SHEET_COMMENTS) {
     const start = text.indexOf('<v:shape', i);
@@ -282,9 +282,7 @@ export function vmlRoot(text: string): { openEnd: number; closeStart: number } |
 
 /** A part as text, whatever of the three encodings of XML it is in. */
 function decodeAny(bytes: Uint8Array): string {
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder('utf-16le').decode(bytes);
-  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder('utf-16be').decode(bytes);
-  return new TextDecoder().decode(bytes);
+  return decodeXmlBytes(bytes);
 }
 
 /** Whether boxes of notes can be added to and taken out of a legacy drawing part. */

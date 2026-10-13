@@ -235,7 +235,13 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     }
   }
   // A part two frames show cannot be changed for one of them.
-  for (const list of shown.values()) if (list.length > 1) for (const object of list) delete object.known;
+  for (const list of shown.values()) {
+    if (list.length < 2) continue;
+    for (const object of list) {
+      delete object.known;
+      delete object.loose;
+    }
+  }
   let chartParts = 0;
   let follow = true;
   for (const part of pkg.partNames()) {

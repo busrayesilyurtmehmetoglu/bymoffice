@@ -1410,7 +1410,7 @@ function objectXml(context: DrawingContext, object: DrawingObject, box: Box, dep
       context.notes.add(object.chart && object.chart.shownOnly === true ? 'Drawing: a chart read from an xls file is only shown and is left out' : 'Drawing: a chart of a type that is not written from the model is left out');
       return '';
     }
-    if (object.part !== undefined && object.known !== 'all') context.notes.add('Drawing: a chart is written from the model; formatting its part held beside it is not kept');
+    if ((object.part !== undefined && object.known !== 'all') || object.source !== undefined) context.notes.add('Drawing: a chart is written from the model; formatting its part held beside it is not kept');
     context.charts.push(chartSpaceXml(object.chart, chartCellsOf(context.workbook, object.chart.live === true)));
     const rel = context.rels.add(`${NS_REL}/chart`, `../charts/chart${context.charts.length}.xml`);
     const frameId = ++context.nextId;

@@ -111,7 +111,7 @@ function brokenRefs(patch: WireCellPatch): number {
 const movesFormulas = (shift: Shift): boolean => shift.k === 'rc' || shift.k === 'sName' || shift.k === 'sDel';
 
 /** The commands that name a rule or a chart by its place in a list. */
-const BY_PLACE = ['updateConditionalRule', 'removeConditionalRule', 'moveConditionalRule', 'updateChart', 'moveChart', 'removeChart'];
+const BY_PLACE = ['updateConditionalRule', 'removeConditionalRule', 'moveConditionalRule', 'updateChart', 'moveChart', 'removeChart', 'pasteChart'];
 
 function mapModelRange(value: unknown, shift: RowCol): CellRange | undefined {
   const range = value as CellRange;
@@ -539,6 +539,9 @@ const key = (row: number, col: number): number => row * MAX_COLS + col;
  * gives way wherever someone else changed the same thing since.
  */
 function clash(op: WireOp, other: WireOp, undo: boolean): { drop: true } | { op: WireOp } | undefined {
+  // A chart that is copied is named by its place on a sheet that may be another one than the copy is put on:
+  // whatever was done to the charts of any sheet first may have made that place another chart's.
+  if (op.t === 'cmd' && op.name === 'pasteChart' && other.t === 'cmd' && commandFamily(other.name) === 'chart') return { drop: true };
   if (op.s !== other.s) return undefined;
   if (op.t === 'filter' && other.t === 'filter') return { drop: true };
   // Cells that are merged and something that is written into them, either way round: what a merge empties is what

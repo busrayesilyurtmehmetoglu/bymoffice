@@ -12,6 +12,7 @@ import { buildXlsx } from '../src/formats/xlsx/build';
 import { open } from '../src/index';
 import { chartValues, layoutChart } from '../src/layout/chart';
 import { chartCacheList, chartRefAreas, chartWritable, type Chart, type ChartAxis, type ChartGroup } from '../src/model/sheet/chart';
+import { chartCopyProblem, copyChart, cutChart, duplicateChart, pasteChartOf } from '../src/ops/charts';
 import type { DrawingChart, Sheet, Workbook } from '../src/model/sheet/types';
 import { ZipArchive } from '../src/zip';
 import { fakeMeasure } from './chart-fixtures';
@@ -555,4 +556,14 @@ test('xls chart: an xls file with a chart is saved as the bytes it was', async (
   const workbook = await file.workbook();
   assert.equal(workbook.sheets[0].drawings && workbook.sheets[0].drawings[0].object.type, 'chart');
   assert.deepEqual(await file.save(), bytes);
+});
+
+test('xls chart: a chart that is only shown is not copied, cut or duplicated', () => {
+  const workbook = embeddedBook({ series: [sales, costs], groups: [{ type: bar(0, 150, 0) }] });
+  assert.match(chartCopyProblem(workbook, 0, 0) || '', /^Cannot copy this chart: it was read from an xls file and is only shown$/);
+  assert.throws(() => copyChart(workbook, 0, 0), /read from an xls file and is only shown/);
+  assert.throws(() => cutChart(workbook, 0, 0), /read from an xls file and is only shown/);
+  assert.throws(() => duplicateChart(workbook, 0, 0), /read from an xls file and is only shown/);
+  assert.throws(() => pasteChartOf(workbook, 0, workbook.sheets[0].name, 0, null), /read from an xls file and is only shown/);
+  assert.equal((workbook.sheets[0].drawings || []).length, 1);
 });

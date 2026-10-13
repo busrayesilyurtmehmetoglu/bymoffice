@@ -134,19 +134,28 @@ export {
 } from './ops/sheets';
 export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
 export {
+  CHART_COPY_OFFSET,
   CHART_PART_CHANGES,
   CHART_TYPES,
   DEFAULT_CHART_HEIGHT,
   DEFAULT_CHART_WIDTH,
   addChart,
   anchorOfRect,
+  chartCopyOutdated,
+  chartCopyProblem,
   chartProblem,
   chartRangeRef,
+  copyChart,
+  cutChart,
+  duplicateChart,
   moveChart,
+  pasteChart,
+  pasteChartOf,
   removeChart,
   seriesOfRange,
   sheetCharts,
   updateChart,
+  type ChartCopy,
   type ChartGrouping,
   type ChartInfo,
   type ChartLegendPlace,
@@ -155,6 +164,7 @@ export {
   type ChartSeriesSpec,
   type ChartSpec,
   type ChartType,
+  type PastedChart,
   type RangeSeries,
 } from './ops/charts';
 export {
