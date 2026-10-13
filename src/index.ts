@@ -1658,7 +1658,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     workbook,
     view,
     editor,
-    save: () => save(),
+    save: (saveOptions?: SaveOptions) => save(saveOptions),
     print,
     exportPdf,
     saveNow,
