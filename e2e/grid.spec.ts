@@ -1685,6 +1685,9 @@ test.describe('keyboard: focus, extending and edge cases', () => {
   test('300,000 hidden rows in a row cost one key press and no time', async ({ page }) => {
     test.setTimeout(120_000);
     const HIDDEN = 300_000;
+    // A guard against walking the rows one by one in a way that grows with them, not a measure of speed: a key
+    // press takes a few milliseconds on an idle machine, and took 195 once while other work kept every core busy.
+    const LIMIT = 1000;
     const rows: string[] = [`<row r="1">${num('A1', 1)}</row>`];
     for (let r = 2; r <= HIDDEN + 1; r++) rows.push(`<row r="${r}" hidden="1"/>`);
     rows.push(`<row r="${HIDDEN + 2}">${num(`A${HIDDEN + 2}`, 2)}</row>`);
@@ -1701,16 +1704,16 @@ test.describe('keyboard: focus, extending and edge cases', () => {
         },
         [key, ctrlKey],
       );
-    expect(await press('ArrowDown'), 'ArrowDown over the hidden rows, in ms').toBeLessThan(100);
+    expect(await press('ArrowDown'), 'ArrowDown over the hidden rows, in ms').toBeLessThan(LIMIT);
     expect(await selection(page)).toEqual({ active: `A${HIDDEN + 2}`, range: `A${HIDDEN + 2}` });
     // The row after the hidden ones is drawn right under the first.
     expect((await cellGeometry(page, HIDDEN + 1, 0)).rect.y).toBe(HEADER_HEIGHT + ROW_HEIGHT);
-    expect(await press('ArrowDown')).toBeLessThan(100);
-    expect(await press('ArrowUp', true), 'Ctrl+ArrowUp, in ms').toBeLessThan(100);
+    expect(await press('ArrowDown')).toBeLessThan(LIMIT);
+    expect(await press('ArrowUp', true), 'Ctrl+ArrowUp, in ms').toBeLessThan(LIMIT);
     expect(await selection(page)).toEqual({ active: `A${HIDDEN + 2}`, range: `A${HIDDEN + 2}` });
-    expect(await press('ArrowUp')).toBeLessThan(100);
+    expect(await press('ArrowUp')).toBeLessThan(LIMIT);
     expect(await selection(page)).toEqual({ active: 'A1', range: 'A1' });
-    expect(await press('ArrowDown', true)).toBeLessThan(100);
+    expect(await press('ArrowDown', true)).toBeLessThan(LIMIT);
     expect(await selection(page)).toEqual({ active: `A${HIDDEN + 2}`, range: `A${HIDDEN + 2}` });
 
     const slowest = await page.evaluate(() => {
