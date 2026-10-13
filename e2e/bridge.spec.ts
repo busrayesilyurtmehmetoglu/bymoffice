@@ -723,7 +723,9 @@ for (const mode of ['channel', 'iframe'] as Mode[]) {
       const loaded = await bridge.waitFor('loaded', 3);
       expect(loaded).toMatchObject({ id: 'x1', format: 'xlsx', convertedFrom: 'xls' });
       expect(loaded.readOnly).toBeUndefined();
-      expect(loaded.warnings).toHaveLength(1);
+      // The chart sheet of this file is empty: one warning for what the new file leaves out, one for what could not be read.
+      expect(loaded.warnings).toHaveLength(2);
+      expect(loaded.warnings.join(' ')).toMatch(/chart sheet.*holds no Chart record/);
       await typeIntoGrid(page, bridge.editor, '7');
       await bridge.send({ type: 'save', id: 's2' });
       expect(await bridge.waitFor('saved', 3)).toEqual({ type: 'saved', id: 's2', data: expect.any(Number), format: 'xlsx', convertedFrom: 'xls' });

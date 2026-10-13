@@ -13,6 +13,7 @@ import { PdfFontSet } from '../src/pdf/font-set';
 import { FontError, applyLigatures, fontLigatures, readFont, type PdfFontFace } from '../src/pdf/sfnt';
 import { MAX_GLYPH_BYTES, glyphUsable, subsetTrueType } from '../src/pdf/subset';
 import { canvasMeasure, canvasPictures, drawPage } from '../src/pdf/vector';
+import { TextPainter, clearTextMeasureCache } from '../src/render/text';
 import { PdfError } from '../src/pdf/writer';
 import { checkPdf, hasPoppler, poppler, popplerTest, popplerWords } from './pdf-fixtures';
 import { TEST_GLYPHS, bonum, gsubTable, seeded, sfntFile, testFont, testFontTables, type TestGlyph } from './pdf-font-fixtures';
@@ -1065,4 +1066,131 @@ test('review: the pieces of a long run of spaced letters stand where the spacing
   assert.ok(texts.every((text) => text.spacing === 2), 'every piece is spaced');
   // 85 times "AB " of 30 px, and 255 letters each followed by 2 px.
   assert.ok(Math.abs(texts[1].x - (85 * 30 + 255 * 2)) < 0.01, `the second piece starts at ${texts[1].x}`);
+});
+
+// ---------------------------------------------------------------------------
+// What the first run in browsers found
+
+test('review: text a clip hides is not in the file: what cannot be seen on a drawn page cannot be found or copied from it', async () => {
+  const made = painted();
+  const ctx = made.ctx;
+  ctx.font = '20px T';
+  // A cell from 50 to 90 across and 20 to 60 down. "A" is 14 px wide, "B" 10.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(50, 20, 40, 40);
+  ctx.clip();
+  // Starts left of the cell: its first letter (30 to 44) is hidden, its second (44 to 54) shows in part.
+  ctx.fillText('ABAB', 30, 50);
+  // Runs out of the cell on the right: "A", "B" and "A" (62 to 100) show, the last of them in part; what starts at 100 does not.
+  ctx.fillText('ABABA', 62, 40);
+  // Above the cell altogether, and right of it altogether.
+  ctx.fillText('AB', 60, 10);
+  ctx.fillText('AB', 120, 50);
+  ctx.restore();
+  // Without the clip all of it is there; at the edge of the page what lies beyond the paper is not.
+  ctx.fillText('AB', 120, 50);
+  ctx.fillText('ABA', 181, 90);
+  assert.equal(made.unsupported(), undefined);
+  const page = await made.page();
+  assert.deepEqual(
+    page.texts.map((text) => [text.text, Math.round(text.x * 100) / 100]),
+    [
+      ['BAB', 44],
+      ['ABA', 62],
+      ['AB', 120],
+      ['AB', 181],
+    ],
+  );
+  assert.equal(page.text, 'BABABAABAB', 'nothing else is text of the page');
+});
+
+test('review: text that is hidden in the middle of a run leaves the rest where it was, and turned text is cut by the clip it runs through', async () => {
+  const made = painted();
+  const ctx = made.ctx;
+  ctx.font = '20px T';
+  // Two cells with a gap between them, as one clip: only the box around them is known, so nothing between is hidden.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, 200, 30);
+  ctx.clip();
+  // Reads downwards from (100, 5): "A" takes 14 px down the page, "B" 10. The clip ends 30 px down.
+  ctx.translate(100, 5);
+  ctx.rotate(Math.PI / 2);
+  ctx.fillText('ABAB', 0, 0);
+  ctx.restore();
+  const page = await made.page();
+  assert.deepEqual(page.texts.map((text) => text.text), ['ABA'], 'the letter that starts below the clip is not written');
+  // A clip inside a clip is the smaller of the two, and is given back with the state.
+  const nested = painted();
+  nested.ctx.font = '20px T';
+  nested.ctx.save();
+  nested.ctx.beginPath();
+  nested.ctx.rect(0, 0, 100, 100);
+  nested.ctx.clip();
+  nested.ctx.save();
+  nested.ctx.beginPath();
+  nested.ctx.rect(50, 0, 150, 100);
+  nested.ctx.clip();
+  nested.ctx.fillText('AAAAAAAAAA', 30, 50);
+  nested.ctx.restore();
+  nested.ctx.fillText('AAAAAAAAAA', 30, 80);
+  nested.ctx.restore();
+  const texts = (await nested.page()).texts;
+  assert.deepEqual(texts.map((text) => [text.glyphs.length, text.x]), [[4, 44], [5, 30]], 'between 50 and 100 inside both clips; up to 100 inside the outer one');
+  // A clip without a path hides everything.
+  const none = painted();
+  none.ctx.font = '20px T';
+  none.ctx.beginPath();
+  none.ctx.clip();
+  none.ctx.fillText('AB', 10, 50);
+  assert.equal((await none.page()).texts.length, 0);
+});
+
+popplerTest('review: Poppler finds on a drawn page only the text that shows', async () => {
+  const file = await buildPdf([{ width: 200, height: 100, vector: (await (async () => {
+    const canvas = createPdfCanvas({ width: 200, height: 100, pageWidth: 200, pageHeight: 100, fonts: new PdfFontSet([{ family: 'T', weight: 400, style: 'normal', bytes: TEST_FONT }], () => false), measure: { width: (_font, text) => Array.from(text).reduce((sum, char) => sum + (char === 'C' ? 8 : char === 'A' ? 14 : 10), 0) } });
+    canvas.context.font = '20px T';
+    canvas.context.save();
+    canvas.context.beginPath();
+    canvas.context.rect(50, 20, 40, 40);
+    canvas.context.clip();
+    // Four letters of 8 px before the cell (0 to 32), then "A" from 32 to 46, hidden, and "B" from 46 to 56.
+    canvas.context.fillText('CCCCAB', 0, 50);
+    canvas.context.restore();
+    return canvas.canvas.finish();
+  })()) }], { date: DATE });
+  const report = poppler(file);
+  assert.equal(report.complaints, '');
+  assert.equal(report.text[0].trim(), 'B', 'the letters the clip hides are not in the text of the file');
+});
+
+test('review: asking the browser what it draws leaves its canvases as they were and the widths the layout measured alone', () => {
+  // The widths the painters and the layout of a sheet keep: measured on a canvas of their own, twelve px a character.
+  clearTextMeasureCache();
+  const own = { font: '', fillStyle: '', measureText: (text: string) => ({ width: text.length * 12 }) };
+  const painter = new TextPainter(own as unknown as CanvasRenderingContext2D);
+  const joiner = String.fromCharCode(0x200c);
+  assert.equal(painter.measure('italic 12px "A"', 'ffi'), 36);
+  // The canvases the questions are asked on measure ten px a character.
+  const page = inkDocument();
+  const measurer = canvasMeasure(page.doc) as NonNullable<ReturnType<typeof canvasMeasure>>;
+  const plain = measurer.plain as NonNullable<typeof measurer.plain>;
+  assert.equal(measurer.width('italic 12px "A"', 'ffi'), 29);
+  assert.equal((plain('italic 12px "A"', 'ffi') as { width: number }).width, 30);
+  assert.equal((plain('italic 12px "A"', 'ff' + joiner + 'i') as { width: number }).width, 40);
+  (measurer.baseline as NonNullable<typeof measurer.baseline>)('italic 12px "A"', 'middle');
+  // Every canvas is as a painter expects to find one: kerning on, text on its alphabetic baseline.
+  assert.ok(page.contexts.length >= 2, 'a canvas to measure on and one to paint on');
+  for (const context of page.contexts) {
+    assert.equal(context.fontKerning, 'auto', 'kerning is on again');
+    assert.equal(context.textBaseline, 'alphabetic', 'the baseline is the alphabetic one again');
+  }
+  // None of what was asked is a width of the layout: what it measured is what it still has, and what it has not
+  // measured it measures itself.
+  own.measureText = (text: string) => ({ width: text.length * 99 });
+  assert.equal(painter.measure('italic 12px "A"', 'ffi'), 36, 'the width the layout measured before');
+  assert.equal(painter.measure('italic 12px "A"', 'ff' + joiner + 'i'), 4 * 99, 'a text only the question measured is not known to the layout');
+  assert.equal(painter.measure('italic 64px "A"', 'ffi'), 3 * 99, 'nor is the text at the size it was painted at');
+  clearTextMeasureCache();
 });

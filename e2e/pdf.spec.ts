@@ -821,8 +821,11 @@ interface InkBand {
  * The bands of rows of a picture that hold ink: a line of text is one (with
  * what is drawn in its rows: an underline, a shading), a border between two
  * lines another. The ink of a row is the darkness of its pixels summed, one
- * for a black pixel; a row counts when it holds a hundredth of what the
- * fullest row holds.
+ * for a black pixel; a row counts when it holds a twenty-fifth of what the
+ * fullest row holds - more than the lines that run down a table leave in a
+ * row. (Poppler paints a line thinner than a pixel a whole pixel wide and
+ * in its full colour, where the picture of the page has it faint: such a
+ * line must not decide where the bands are.)
  */
 function inkBands(picture: Raster): { bands: InkBand[]; total: number } {
   const rows = new Array<number>(picture.height).fill(0);
@@ -833,7 +836,7 @@ function inkBands(picture: Raster): { bands: InkBand[]; total: number } {
       if (dark > 0.02) rows[y] += dark;
     }
   }
-  const least = Math.max(1.5, Math.max(...rows) / 100);
+  const least = Math.max(3, Math.max(...rows) / 25);
   const bands: InkBand[] = [];
   let total = 0;
   for (let y = 0; y < rows.length; y++) {
@@ -852,11 +855,12 @@ function inkBands(picture: Raster): { bands: InkBand[]; total: number } {
 /**
  * Where two pictures of one page differ in what is on them, line by line:
  * the same bands of rows hold ink in both - as many, each starting and
- * ending within two pixels - and each band holds the same share of the ink
+ * ending within four pixels (the dots over letters are faint rows that
+ * count in one picture and not in the other) - and each band holds the same share of the ink
  * of its page within a quarter (two painters smooth the edges of letters
  * differently, and one may paint all text a little bolder: that changes
  * every line alike). A line of text that is missing or twice there, one that
- * lies more than two pixels higher or lower, one set in another size or cut
+ * lies more than four pixels higher or lower, one set in another size or cut
  * short is a difference. Tried on pages made in Node: a page against its own
  * picture has none; with a line of forty missing, six pixels lower, or cut
  * to half its words it has. A line moved sideways is not seen here: the
@@ -871,7 +875,7 @@ function inkDifferences(a: Raster, b: Raster): string[] {
   for (let i = 0; i < first.bands.length; i++) {
     const one = first.bands[i];
     const other = second.bands[i];
-    if (Math.abs(one.top - other.top) > 2 || Math.abs(one.bottom - other.bottom) > 2) out.push(`band ${i + 1}: rows ${one.top} to ${one.bottom} against ${other.top} to ${other.bottom}`);
+    if (Math.abs(one.top - other.top) > 4 || Math.abs(one.bottom - other.bottom) > 4) out.push(`band ${i + 1}: rows ${one.top} to ${one.bottom} against ${other.top} to ${other.bottom}`);
     const share = one.ink / first.total;
     const otherShare = other.ink / second.total;
     // A band of a row or two is a thin line: where it lies is compared, its ink is spread over its rows as the painter likes.
@@ -942,13 +946,13 @@ function linesOfWords(words: WordBox[]): WordBox[][] {
 
 /**
  * The words of the drawn page stand where the picture of the page has them:
- * the same words in the same lines, every line starting and ending within a
- * point and a half, at the same height. The invisible text of a picture
+ * the same words in the same lines, every line starting within a point and a
+ * half and ending where the picture ends it, at the same height. The invisible text of a picture
  * gives every character of a run the same width, so the edges of the words
  * inside a run of text are those of the run only at its two ends; they are
- * held to the run (no word leaves its line by more than the widest letter).
+ * held to the run loosely.
  */
-function expectSameWords(drawn: WordBox[], pictured: WordBox[], what: string): void {
+function expectSameWords(drawn: WordBox[], pictured: WordBox[], what: string, cut = 0): void {
   const first = linesOfWords(drawn);
   const second = linesOfWords(pictured);
   expect(first.map((line) => line.map((word) => word.text).join(' ')), `${what}: the lines of the drawn page`).toEqual(second.map((line) => line.map((word) => word.text).join(' ')));
@@ -957,9 +961,16 @@ function expectSameWords(drawn: WordBox[], pictured: WordBox[], what: string): v
     const b = second[i];
     const text = a.map((word) => word.text).join(' ');
     expect(Math.abs(a[0].xMin - b[0].xMin), `${what}: "${text}" starts at ${a[0].xMin}, in the picture at ${b[0].xMin}`).toBeLessThanOrEqual(1.5);
-    expect(Math.abs(a[a.length - 1].xMax - b[b.length - 1].xMax), `${what}: "${text}" ends at ${a[a.length - 1].xMax}, in the picture at ${b[b.length - 1].xMax}`).toBeLessThanOrEqual(1.5);
+    // Where a line ends: a space at the end of a run takes its share of the run in the invisible text (a
+    // character in sixty, say), and a letter a clip cuts through is whole in the drawn text where the invisible
+    // text ends at the clip (`cut`: how wide a letter may be).
+    const end = a[a.length - 1].xMax - b[b.length - 1].xMax;
+    expect(end >= -Math.max(1.5, (a[a.length - 1].xMax - a[0].xMin) / 60) && end <= Math.max(1.5, (a[a.length - 1].xMax - a[0].xMin) / 60) + cut, `${what}: "${text}" ends at ${a[a.length - 1].xMax}, in the picture at ${b[b.length - 1].xMax}`).toBe(true);
     expect(Math.abs((a[0].yMin + a[0].yMax) / 2 - (b[0].yMin + b[0].yMax) / 2), `${what}: the height of "${text}"`).toBeLessThanOrEqual(4);
-    for (let k = 0; k < a.length; k++) expect(Math.abs(a[k].xMin - b[k].xMin), `${what}: "${a[k].text}" in "${text}" starts at ${a[k].xMin}, in the picture at ${b[k].xMin}`).toBeLessThanOrEqual(14);
+    // Inside a run the invisible text of the picture gives every character the same width: a word may stand a
+    // sixteenth of its line away from where its letters are.
+    const slack = Math.max(14, (a[a.length - 1].xMax - a[0].xMin) / 16);
+    for (let k = 0; k < a.length; k++) expect(Math.abs(a[k].xMin - b[k].xMin), `${what}: "${a[k].text}" in "${text}" starts at ${a[k].xMin}, in the picture at ${b[k].xMin}`).toBeLessThanOrEqual(slack);
   }
 }
 
@@ -1039,9 +1050,12 @@ test.describe('pages written as text and drawings', () => {
     expect(vector.checked.pages.length).toBe(10);
     const sizes = { vector: vector.bytes.length, image: image.bytes.length };
     await info.attach('pdf-vector-sizes', { body: JSON.stringify(sizes), contentType: 'application/json' });
-    // The four faces of the font go in whole (about 200 KB together, compressed); the pages themselves are a few KB each.
-    expect(sizes.vector, `ten drawn pages have ${sizes.vector} bytes`).toBeLessThan(400 * 1024);
-    expect(sizes.vector * 3, `drawn ${sizes.vector} bytes, pictured ${sizes.image} bytes`).toBeLessThan(sizes.image);
+    // The four faces of the font go in whole (a font with CFF outlines is not cut down: about 210 KB together,
+    // compressed), whatever the number of pages; the pages themselves are about 2 KB each, where the picture of
+    // such a page is about 60 KB. Measured in Chromium: 228 KB drawn, 626 KB as pictures. With ten pages of a few
+    // lines the fonts are most of the file, so the drawn file is less than half of the other one, not a tenth.
+    expect(sizes.vector, `ten drawn pages have ${sizes.vector} bytes`).toBeLessThan(300 * 1024);
+    expect(sizes.vector * 2, `drawn ${sizes.vector} bytes, pictured ${sizes.image} bytes`).toBeLessThan(sizes.image);
   });
 
   test('a page in a font of the device stays a picture, and "vector" names it', async ({ page }) => {
@@ -1111,7 +1125,7 @@ test.describe('pages written as text and drawings', () => {
     const font = testFont();
     // The font stands in for the font of the cells wherever the device has it or not.
     await page.evaluate(([bytes, family]) => (window as any).BymOffice.fonts.registerFont({ family, source: new Uint8Array(bytes as number[]), as: ['Calibri'], prefer: true }), [Array.from(font), BOXES] as [number[], string]);
-    const data = `<sheetData><row r="1">${str('A1', 'Urun')}${str('B1', 'Tutar')}</row><row r="2">${str('A2', 'Cay')}${num('B2', 125)}</row><row r="3">${str('A3', 'Kahve')}${num('B3', 40)}</row></sheetData><printOptions gridLines="1"/>${A4_SETUP}`;
+    const data = `<sheetData><row r="1">${str('A1', 'Urun')}${str('B1', 'Tutar')}</row><row r="2">${str('A2', 'Cay')}${num('B2', 125)}</row><row r="3">${str('A3', 'Kahve')}${num('B3', 40)}</row><row r="4">${str('A4', 'ABCDEFGHIJKL')}${num('B4', 7)}</row></sheetData><printOptions gridLines="1"/>${A4_SETUP}`;
     await page.evaluate(([input, opts]) => (window as any).__mountView(input, opts), [Array.from(await buildXlsx({ sheets: [{ name: 'Data', xml: worksheetXml(data) }] })), { locale: 'en-US' }] as [number[], object]);
     await expect(page.locator('.bym-canvas')).toBeVisible();
     const out = await exportWithPages(page, { text: 'vector' });
@@ -1119,13 +1133,22 @@ test.describe('pages written as text and drawings', () => {
     expect(out.pages).toEqual([{ page: 1, mode: 'vector', reason: undefined }]);
     const pdf = read(out.data);
     expect(pdf.checked.pages[0].images.length).toBe(0);
-    expect(pdf.checked.pages[0].texts.map((run) => run.text).sort()).toEqual(['125', '40', 'Cay', 'Kahve', 'Tutar', 'Urun']);
+    const cells = pdf.checked.pages[0].texts.map((run) => run.text).sort();
+    // The long text of A4 is cut off by the cell beside it: only the letters that show are text of the page.
+    const cut = cells.filter((text) => text.charAt(0) === 'A')[0];
+    expect(cut.length >= 2 && cut.length < 12 && 'ABCDEFGHIJKL'.indexOf(cut) === 0, `what is written of the text that is cut off: "${cut}"`).toBe(true);
+    expect(pdf.checked.pages[0].text).not.toContain('L');
+    expect(cells.filter((text) => text !== cut)).toEqual(['125', '40', '7', 'Cay', 'Kahve', 'Tutar', 'Urun']);
     expect(pdf.checked.pages[0].shapes.some((shape) => shape.operator === 'S' || shape.operator === 'f'), 'the grid lines are drawings').toBe(true);
     const image = await exportWithPages(page, { text: 'image' });
     const pictured = read(image.data);
+    // The invisible text of the pictured page holds the same letters of it, and no others.
+    expect(pictured.checked.pages[0].text).toContain(cut);
+    expect(pictured.checked.pages[0].text).not.toContain('L');
     if (pdf.poppler) {
       expect(inkDifferences(popplerPage(pdf.bytes, 1, 100), popplerPage(pictured.bytes, 1, 100)), 'where the drawn sheet and its picture differ').toEqual([]);
-      expectSameWords(popplerWords(pdf.bytes).words, popplerWords(pictured.bytes).words, 'the sheet');
+      // "Tutar" does not fit its cell: its last letter shows in part, and is 11 points wide.
+      expectSameWords(popplerWords(pdf.bytes).words, popplerWords(pictured.bytes).words, 'the sheet', 11);
     }
     await page.evaluate((family) => (window as any).BymOffice.fonts.unregisterFont(family), BOXES);
   });

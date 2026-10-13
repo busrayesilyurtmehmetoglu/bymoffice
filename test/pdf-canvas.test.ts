@@ -649,7 +649,8 @@ test('pdf canvas: a glyph that stands for two characters is copied as the plaine
 });
 
 test('pdf canvas: text of a file cannot become syntax of the PDF', async () => {
-  const made = make();
+  // A page wide enough for all of it: what lies beyond the paper is not written.
+  const made = make({ pageWidth: 400 });
   made.ctx.font = '16px "TeX Gyre Bonum"';
   const hostile = ') Tj ET /X Do <</A 1>> (\\) % [x] BT';
   made.ctx.fillText(hostile, 5, 50);

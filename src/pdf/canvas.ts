@@ -125,6 +125,11 @@ const MAX_TEXT_UNITS = 100000;
 const MAX_DASHES = 64;
 
 type Matrix = [number, number, number, number, number, number];
+type Box = [number, number, number, number];
+
+/** How far above and below its baseline text counts as seen, in font sizes: what the invisible text of a pictured page is cut by (see clipRun). */
+const SEEN_ABOVE = 0.7;
+const SEEN_BELOW = 0.2;
 
 interface Paint {
   r: number;
@@ -150,6 +155,8 @@ interface State {
   align: string;
   baseline: string;
   spacing: number;
+  /** What can be seen through the clips so far, in points of the page (left, bottom, right, top); undefined: the page. */
+  clip: Box | undefined;
   /** What the content stream has in force, as it was written: empty when not known. */
   out: { fill: string; stroke: string; width: string; cap: string; join: string; miter: string; dash: string; ca: string; CA: string; font: string; tc: string };
 }
@@ -297,6 +304,8 @@ export class PdfCanvas {
   private marked = false;
   /** The current path, in points of the page, and where it stands. */
   private path: string[] = [];
+  /** The box around the points of the current path, in points of the page. */
+  private pathBox: Box | undefined;
   private point: [number, number] | undefined;
   private start: [number, number] | undefined;
   private readonly fonts: { face: PdfFontFace; glyphs: Map<number, string> }[] = [];
@@ -326,6 +335,7 @@ export class PdfCanvas {
       align: 'start',
       baseline: 'alphabetic',
       spacing: 0,
+      clip: undefined,
       out: { fill: '', stroke: '', width: '', cap: '', join: '', miter: '', dash: '', ca: '', CA: '', font: '', tc: '' },
     };
     if (!sound) this.refuse('the page has no size');
@@ -373,7 +383,7 @@ export class PdfCanvas {
   save(): void {
     if (this.stack.length >= MAX_SAVES) return this.refuse('the painter saves the state of the canvas too many times over');
     const state = this.state;
-    this.stack.push({ ...state, m: state.m.slice() as Matrix, dash: state.dash.slice(), out: { ...state.out } });
+    this.stack.push({ ...state, m: state.m.slice() as Matrix, dash: state.dash.slice(), clip: state.clip ? (state.clip.slice() as Box) : undefined, out: { ...state.out } });
     this.emit('q');
   }
 
@@ -606,9 +616,23 @@ export class PdfCanvas {
     this.path = [];
     this.point = undefined;
     this.start = undefined;
+    this.pathBox = undefined;
+  }
+
+  /** Takes a point of the path into the box around the path. */
+  private reach(point: [number, number]): void {
+    const box = this.pathBox;
+    if (!box) this.pathBox = [point[0], point[1], point[0], point[1]];
+    else {
+      if (point[0] < box[0]) box[0] = point[0];
+      if (point[1] < box[1]) box[1] = point[1];
+      if (point[0] > box[2]) box[2] = point[0];
+      if (point[1] > box[3]) box[3] = point[1];
+    }
   }
 
   private move(point: [number, number]): void {
+    this.reach(point);
     this.path.push(this.xy(point) + ' m');
     this.point = point;
     this.start = point;
@@ -616,11 +640,16 @@ export class PdfCanvas {
 
   private line(point: [number, number]): void {
     if (!this.point) return this.move(point);
+    this.reach(point);
     this.path.push(this.xy(point) + ' l');
     this.point = point;
   }
 
   private curve(first: [number, number], second: [number, number], end: [number, number]): void {
+    // A curve lies inside the box of its four points.
+    this.reach(first);
+    this.reach(second);
+    this.reach(end);
     this.path.push(this.xy(first) + ' ' + this.xy(second) + ' ' + this.xy(end) + ' c');
     this.point = end;
   }
@@ -833,6 +862,10 @@ export class PdfCanvas {
   clip(): void {
     const rule = this.rule(arguments, 'clip()');
     if (rule === undefined) return;
+    // What is seen from now on: what was seen before and lies in the box around the path.
+    const before = this.state.clip || [0, 0, this.options.pageWidth, this.options.pageHeight];
+    const box: Box = this.path.length === 0 || !this.pathBox ? [0, 0, 0, 0] : this.pathBox;
+    this.state.clip = [Math.max(before[0], box[0]), Math.max(before[1], box[1]), Math.min(before[2], box[2]), Math.min(before[3], box[3])];
     // Without a path nothing is left to draw into.
     this.emit((this.path.length === 0 ? '0 0 0 0 re' : this.path.join(' ')) + ' W' + rule + ' n');
   }
@@ -1125,10 +1158,9 @@ export class PdfCanvas {
     }
     const left = state.align === 'center' ? x - width / 2 : state.align === 'right' || state.align === 'end' ? x - width : x;
     if (!this.useFill()) return;
-    const named = this.fontName(face);
-    this.marked = true;
     const out = state.out;
     const m = state.m;
+    let named: { name: string; glyphs: Map<number, string> } | undefined;
     // The run in pieces of as many glyphs as are placed one by one, cut after a space where there is one: every
     // piece starts where the canvas has it, and so does every glyph in it.
     for (let first = 0; first < clusters.length; ) {
@@ -1151,47 +1183,88 @@ export class PdfCanvas {
       // Where the canvas has each glyph of the piece: the piece up to and with it, measured, ends where the glyph
       // ends, so the glyph starts its own advance before that. What that differs by from where the glyph before it
       // ends (kerning) is moved by in the text that is written.
-      let shown = '';
-      let hex = '';
-      let start = 0;
-      for (let i = first; i < end; i++) {
-        const cluster = clusters[i];
-        hex += hex4(cluster.glyph);
-        // A glyph that stands for several texts is copied as the plainest of them: see plainerText().
-        const known = named.glyphs.get(cluster.glyph);
-        named.glyphs.set(cluster.glyph, known === undefined ? cluster.text : plainerText(known, cluster.text));
-        if (i + 1 >= end) break;
+      const starts: number[] = [0];
+      for (let i = first; i + 1 < end; i++) {
         const reach = widthOf(from, clusters[i + 1].end);
         if (!finite(reach)) return this.refuse('text could not be measured');
         const next = reach - face.advance(clusters[i + 1].glyph) * unit;
-        const move = next - (start + face.advance(cluster.glyph) * unit);
-        if (Math.abs(move) > GLYPH_FIT_SHARE * size) return this.refuse('a text is not as wide as its glyphs are: the browser shapes it (ligatures, or another font)');
-        start = next;
-        // A move to the right is a negative number between two strings, in thousandths of the font size.
-        const moved = this.num((-move * 1000) / size, 2);
-        if (moved !== '0') {
-          shown += '<' + hex + '> ' + moved + ' ';
-          hex = '';
+        if (Math.abs(next - (starts[i - first] + face.advance(clusters[i].glyph) * unit)) > GLYPH_FIT_SHARE * size) return this.refuse('a text is not as wide as its glyphs are: the browser shapes it (ligatures, or another font)');
+        starts.push(next);
+      }
+      // Only what shows is written: a glyph the clip of the canvas hides altogether, or that lies beyond the paper,
+      // is no text of the page (it could be found and copied from the file though nobody sees it). The glyphs that
+      // show, and those that show in part, are written in the stretches they stand in.
+      for (let i = first; i < end; ) {
+        const placeOf = (index: number): number => left + origin + starts[index - first] + state.spacing * index;
+        if (!this.shows(placeOf(i), y + shift, face.advance(clusters[i].glyph) * unit, size)) {
+          i++;
+          continue;
         }
+        const begin = i;
+        let shown = '';
+        let hex = '';
+        for (; i < end && (i === begin || this.shows(placeOf(i), y + shift, face.advance(clusters[i].glyph) * unit, size)); i++) {
+          const cluster = clusters[i];
+          if (i > begin) {
+            // A move to the right is a negative number between two strings, in thousandths of the font size.
+            const move = starts[i - first] - (starts[i - 1 - first] + face.advance(clusters[i - 1].glyph) * unit);
+            const moved = this.num((-move * 1000) / size, 2);
+            if (moved !== '0') {
+              shown += '<' + hex + '> ' + moved + ' ';
+              hex = '';
+            }
+          }
+          hex += hex4(cluster.glyph);
+          if (!named) named = this.fontName(face);
+          // A glyph that stands for several texts is copied as the plainest of them: see plainerText().
+          const known = named.glyphs.get(cluster.glyph);
+          named.glyphs.set(cluster.glyph, known === undefined ? cluster.text : plainerText(known, cluster.text));
+        }
+        shown = shown === '' ? '<' + hex + '> Tj' : '[' + shown + '<' + hex + '>] TJ';
+        let line = 'BT';
+        const font = '/' + (named as { name: string }).name + ' ' + this.num(size, 3) + ' Tf';
+        if (out.font !== font) {
+          line += ' ' + font;
+          out.font = font;
+        }
+        const tc = this.num(state.spacing, 4);
+        if (out.tc !== tc && !(out.tc === '' && tc === '0')) {
+          line += ' ' + tc + ' Tc';
+          out.tc = tc;
+        }
+        // Text space has its y axis upwards; the canvas has it downwards.
+        const place = this.at(placeOf(begin), y + shift);
+        line += ' ' + this.num(m[0] * this.kx, 6) + ' ' + this.num(-m[1] * this.ky, 6) + ' ' + this.num(-m[2] * this.kx, 6) + ' ' + this.num(m[3] * this.ky, 6) + ' ' + this.xy(place) + ' Tm ' + shown + ' ET';
+        this.marked = true;
+        this.emit(line);
       }
-      shown = shown === '' ? '<' + hex + '> Tj' : '[' + shown + '<' + hex + '>] TJ';
-      let line = 'BT';
-      const font = '/' + named.name + ' ' + this.num(size, 3) + ' Tf';
-      if (out.font !== font) {
-        line += ' ' + font;
-        out.font = font;
-      }
-      const tc = this.num(state.spacing, 4);
-      if (out.tc !== tc && !(out.tc === '' && tc === '0')) {
-        line += ' ' + tc + ' Tc';
-        out.tc = tc;
-      }
-      // Text space has its y axis upwards; the canvas has it downwards.
-      const place = this.at(left + origin + state.spacing * first, y + shift);
-      line += ' ' + this.num(m[0] * this.kx, 6) + ' ' + this.num(-m[1] * this.ky, 6) + ' ' + this.num(-m[2] * this.kx, 6) + ' ' + this.num(m[3] * this.ky, 6) + ' ' + this.xy(place) + ' Tm ' + shown + ' ET';
-      this.emit(line);
       first = end;
     }
+  }
+
+  /**
+   * Whether a glyph shows: its place on its line (from `x`, `width` wide; from
+   * 0.7 of the font size above the baseline to 0.2 below it, as the text of a
+   * pictured page is cut) reaches into what the clip of the canvas and the
+   * paper leave to be seen. A clip that is no upright rectangle is the box
+   * around it: what lies in that box counts as seen.
+   */
+  private shows(x: number, y: number, width: number, size: number): boolean {
+    const corners = [this.at(x, y - size * SEEN_ABOVE), this.at(x + width, y - size * SEEN_ABOVE), this.at(x, y + size * SEEN_BELOW), this.at(x + width, y + size * SEEN_BELOW)];
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (let i = 0; i < 4; i++) {
+      x0 = Math.min(x0, corners[i][0]);
+      x1 = Math.max(x1, corners[i][0]);
+      y0 = Math.min(y0, corners[i][1]);
+      y1 = Math.max(y1, corners[i][1]);
+    }
+    const clip = this.state.clip || [0, 0, this.options.pageWidth, this.options.pageHeight];
+    // Touching what is seen is not being seen.
+    const hair = 1e-6;
+    return Math.min(x1, clip[2]) - Math.max(x0, clip[0]) > hair && Math.min(y1, clip[3]) - Math.max(y0, clip[1]) > hair;
   }
 
   // --------------------------------------------------------------- pictures

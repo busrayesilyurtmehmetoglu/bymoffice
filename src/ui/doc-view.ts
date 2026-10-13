@@ -1384,8 +1384,9 @@ export class DocumentView {
     const doc = this.container.ownerDocument || document;
     let plan: PrintPlan;
     for (let attempt = 0; ; attempt++) {
-      // The rest of the document is laid out by the view's own slices.
-      while (!this.done && !this.failed) {
+      // The rest of the document is laid out by the view's own slices. A font that has just arrived is waited for
+      // too: the pages are laid out anew with it in a moment, and until then they are those of the font before it.
+      while ((!this.done && !this.failed) || this.fontTimer !== undefined) {
         // A document beyond the limit is refused as soon as it is known to be, not after all of it was laid out.
         if (this.pages.length > MAX_PRINT_PAGES) break;
         await sleep(30);

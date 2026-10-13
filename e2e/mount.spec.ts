@@ -267,7 +267,11 @@ test.describe('BymOffice.mount', () => {
       [charted, plain],
     );
     expect(outcome).toEqual({
-      chart: ['xlsx', ['Sheet: the content of a chart sheet is not in the model; it is written as an empty worksheet']],
+      // The chart sheet of this file is empty: the reader says so too.
+      chart: ['xlsx', [
+        'Sheet: the content of a chart sheet is not in the model; it is written as an empty worksheet',
+        'Sheet "Chart1" was read with a warning: The chart of the sheet is not shown: it holds no Chart record',
+      ]],
       plain: ['xlsx', []],
       shape: ['docx', []],
       arrow: ['docx', ['1 shape(s) were written as rectangles: their geometry was not carried over']],
