@@ -77,12 +77,20 @@ export type DocOp =
   | { type: 'setComments'; items: Map<number, Comment> | null; modified?: Flag }
   /** Turns the "track changes" setting of the document (DocSettings.trackRevisions) on or off. */
   | { type: 'setTrackRevisions'; on: boolean }
+  /** Sets the distance between automatic tab stops (DocSettings.defaultTabStop), twips. */
+  | { type: 'setDefaultTabStop'; twips: number }
   /**
    * Adds, replaces or (null) removes entries of the font table, by font name. The table itself stays the object it is.
    * Of this the writer of a docx file takes the entries its font table does not name, together with another edit;
    * an entry replaced or removed stays in the file as it was.
    */
   | { type: 'setFonts'; fonts: [name: string, value: FontInfo | null][] };
+
+/** The least and the most distance between automatic tab stops, twips: 1 twip, and the widest page of Word (22 inches). */
+export const MIN_DEFAULT_TAB = 1;
+export const MAX_DEFAULT_TAB = 31680;
+/** The most a file can state (and a reader take): what an operation may put back. */
+const MAX_READ_DEFAULT_TAB = 1000000;
 
 const bad = (message: string): never => {
   throw new RangeError(message);
@@ -300,6 +308,14 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
       const before = doc.settings.trackRevisions === true;
       doc.settings.trackRevisions = op.on;
       return { type: 'setTrackRevisions', on: before };
+    }
+    case 'setDefaultTabStop': {
+      // Any distance a reader takes from a file: the inverse puts back what the file said, whatever it was. The
+      // command (setDefaultTabStop in format.ts) checks what is set anew.
+      if (!doc.settings || !(typeof op.twips === 'number' && op.twips >= 0 && op.twips <= MAX_READ_DEFAULT_TAB)) return bad('The default tab stop is not valid');
+      const before = doc.settings.defaultTabStop;
+      doc.settings.defaultTabStop = op.twips;
+      return { type: 'setDefaultTabStop', twips: before };
     }
     case 'setFonts': {
       const fonts = doc.fonts;

@@ -86,6 +86,12 @@ export type WireOp =
   | { t: 'move'; s: number; to: number }
   | { t: 'state'; s: number; state: SheetState }
   | { t: 'tab'; s: number; color: Color | 0 }
+  /**
+   * The frozen panes of a sheet: rows and columns, the first cell that scrolls and the first cell of the view (as
+   * SheetView has them). The first cell that scrolls is below and right of the frozen ones, or the step is no step;
+   * without it, it is the one right below and beside them (see paneOfWire()).
+   */
+  | { t: 'pane'; s: number; r: number; c: number; tl?: string; fv?: string }
   /** A command on the rules or the charts of a sheet, with what it was called with after the workbook and the sheet. */
   | { t: 'cmd'; s: number; name: string; a: unknown[] };
 

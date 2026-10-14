@@ -14,7 +14,7 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 - xlsx dosyasını sayfada **gösterir** (`BymOffice.mount()`): Canvas üzerinde yalnız görünen alan çizilir; kaydırma, hücre/aralık seçimi, klavye ile gezinme, dokunmatik kullanım, dondurulmuş bölmeler, sayfa sekmeleri.
 - Hücreleri **Excel sayı biçimleriyle** gösterir: tarih, saat, para, yüzde, bilimsel, kesir ve özel biçim kodları; Türkçe ve İngilizce yerel ayar (`1.234,50 ₺` / `15.03.2024` ↔ `1,234.50` / `3/15/2024`).
 - Hücreleri **düzenler ve dosyaya kaydeder**: yazarak giriş, geri al/yinele, kopyala/kes/yapıştır, satır ve sütun ekle-sil. Formül metinleri, birleştirilmiş hücreler ve adlandırılmış aralıklar ekleme-silmeyle birlikte kayar.
-- **Editör arayüzü** sunar: araç çubuğu (geri al/yinele, yazı boyutu, kalın/italik/altı çizili/üstü çizili, yazı ve dolgu rengi, kenarlık, hizalama, metni kaydır, birleştir, sayı biçimi, satır/sütun), formül çubuğu ve ad kutusu, durum çubuğu (toplam/ortalama/sayı), sağ tık menüsü, sürükleyerek sütun/satır boyutlandırma. Türkçe ve İngilizce.
+- **Editör arayüzü** sunar: araç çubuğu (geri al/yinele, yazı boyutu, kalın/italik/altı çizili/üstü çizili, yazı ve dolgu rengi, kenarlık, hizalama, metni kaydır, birleştir (yanındaki menüde birleştir ve ortala, birleştir, ayır), sayı biçimi, satır/sütun (bölmeleri dondurma dahil)), formül çubuğu ve ad kutusu, durum çubuğu (toplam/ortalama/sayı), sağ tık menüsü, sürükleyerek sütun/satır boyutlandırma. Türkçe ve İngilizce.
 - **Word belgelerini (docx) sayfa sayfa gösterir ve düzenler**: imleç ve seçim (fare, klavye, dokunmatik tutamaçlar), yazma ve silme, giriş yöntemleri (IME), geri al/yinele, kopyala/kes/yapıştır, biçimlendirme araç çubuğu (stil, font, boyut, kalın/italik/altı çizili, renk, hizalama, listeler, tablo, bağlantı, görsel); `save()` yalnız değişen blokları yeniden yazar.
 - **Word belgelerinde yorumları gösterir ve düzenler** (docx; doc ve RTF'te gösterir): yorumlu metin yazarının rengiyle vurgulanır (çözülmüş yorum soluk), sayfanın sağ kenar boşluğunda yorum işareti durur, işarete ya da metne basınca yorum balonu açılır (yazar, tarih, metin, yanıtlar). Düzenleyicide yorum **eklenir, düzenlenir, yanıtlanır, çözülür ve silinir** (araç çubuğu, balon, Ctrl/Cmd+Alt+M, `view` yöntemleri, köprü komutları); her biri tek geri alma adımıdır, izleme açıkken de izlenen değişiklik üretmez, ve `save()` ile `word/comments.xml` + `word/commentsExtended.xml`'e yazılır. `comments` korumalı belgede metin kilitlidir ama yorumlar serbesttir. Bkz. "Belge yorumları".
 - **Eski Word dosyalarını (doc, Word 97–2003) salt okunur açar ve gösterir**: metin, karakter ve paragraf biçimi, stiller, listeler, tablolar (birleşik ve iç içe hücreler), bölümler, üstbilgi/altbilgi, dipnotlar, alanlar, yer imleri, satır içi ve kayan resimler, metin kutuları, şekiller (dikdörtgen, yuvarlatılmış dikdörtgen, elips, düz çizgi; düz renk dolgu, çizgi rengi, kalınlığı ve kesikliği, çevirme ve döndürme — modelde `drawing.shape`). `file.document()` docx ile aynı `DocModel`'i verir; resimler pakette değil `model.media` içindedir (`BymOffice.documentPictures(model, file.package)` ikisini tek arayüzle sunar).
@@ -43,6 +43,8 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 
 | Özellik | Durum |
 |---|---|
+| Bölme ve birleştirmede: kaydırılmış konumdan dondurma (Excel'deki gibi görünen ilk satırdan), bölünmüş (dondurulmamış) bölme oluşturma ve gösterme; "Birleştir ve yay" (satır satır birleştirme); tablo (ListObject) içeren sayfada birleştirme | Yok. Dondurma A1'den sayar; bölünmüş bölme dosyada korunur; tablolu sayfada birleştirme reddedilir |
+| Sekme duraklarında: çubuk (`bar`) durağının dikey çizgisinin çizilmesi; cetvel üzerinde sürükleyerek durak koyma | Yok. Çubuk durağı dosyaya yazılır ve korunur, ekranda çizilmez; duraklar kutudan ve API'den girilir |
 | Belgeleri birlikte düzenlemede (`collab`, docx): değişiklik izleyen belge; görsel ekleme / boyutlama, yorumlar, izlenen değişikliği kabul / ret, zengin yapıştırma (görsel, alan, dipnot taşıyan kopya) | Oda kurulmaz (izleyen belge) ya da işlem yapılmaz; ikisi de söylenir. Ayrıntı: "Belgeleri birlikte düzenleme" |
 | Tabloları birlikte düzenlemede (`collab`, xlsx): sayfa kopyalama; hücre yapıştırmayla kural taşıma; **kesilmiş ya da kopyalandıktan sonra değişmiş grafiği yapıştırma** (grafik kesme yalnız kopyalar; değişmemiş grafiğin kopyası ve çoğaltma gider); sayfa silmenin, kural ve grafik komutlarının geri alınması; satır/sütun silmenin geri alınmasında notların, bağlantıların, kuralların geri gelmesi; aktarıcıda kalıcılık; köprü sayfasında başka kökendeki aktarıcı (sayfanın içerik güvenlik ilkesi `connect-src 'self'` der) | Yok. Yapılamayan işlem yapılmaz ve bildirilir; belgede `collab` verilirse bildirim gelir ve dosya tek başına düzenlenir |
 | Formüllerde: dinamik dizi taşması, `LET`/`LAMBDA`, tablo başvuruları (`Tablo[Sütun]`), başka dosyaya ve 3B (`Sayfa1:Sayfa3!A1`) başvurular, `;` ile argüman ayırma | Yok. Böyle bir formül içeren hücre dosyadaki son değerini korur ya da `#REF!`/`#NAME?` verir; formül metni kaydederken bozulmaz |
@@ -248,7 +250,8 @@ Izgaranın (`mounted.view`) üyeleri:
 | `readOnly`, `setReadOnly(readOnly)` | Salt okunur kipini görünümü yeniden kurmadan değiştirir; geri alma geçmişi korunur |
 | `insertRows(at, count)`, `deleteRows(at, count)`, `insertColumns(at, count)`, `deleteColumns(at, count)` | Satır ve sütun ekler ya da siler (0 tabanlı). Yapılamazsa `RangeError` fırlatır |
 | `format(patch)` | Seçime biçim uygular: `{ bold, italic, underline, strike, fontName, fontSize, color, fill, horizontal, vertical, wrapText, numFmt, border: { preset } }`; `null` ilgili özelliği kaldırır |
-| `merge()`, `unmerge()`, `selectionMerged` | Seçimi tek hücrede birleştirir (yalnız sol üst hücrenin içeriği kalır) ya da ayırır |
+| `merge(options?)`, `requestMerge(options?)`, `unmerge()`, `selectionMerged` | Seçimi tek hücrede birleştirir (yalnız sol üst hücrenin içeriği kalır; `{ center: true }` ortalar da) ya da ayırır. `merge()` sormadan birleştirir ve atılanları döndürür (`MergeReport`); `requestMerge()` değer atılacaksa önce sorar (araç çubuğunun yolu). Ayrıntı: "Hücre birleştirme" |
+| `frozenPanes`, `freezePanes(rows?, cols?)`, `unfreezePanes()` | Dondurulmuş satır/sütun sayısı; dondurma (bağımsız değişkensiz: etkin hücrenin üstü ve solu) ve çözme. Ayrıntı: "Bölmeleri dondurma" |
 | `selectionFormat` | Etkin hücrenin biçimi (araç çubuğu durumu için) |
 | `setColumnWidth(first, last, width)`, `setRowHeight(first, last, height)` | Genişlik (karakter) ve yükseklik (punto); `undefined` varsayılana döndürür, `0` gizler |
 | `editText`, `setEditText(text)`, `focus()` | Formül çubuğu gibi dış düzenleyiciler için |
@@ -621,7 +624,7 @@ Aynı seçenek, aynı aktarıcı: `mount(el, { file: '/files/7.docx', saveTo: tr
 |---|---|
 | Yazma, düz metin yapıştırma, silme (aralık, Backspace, Delete, paragraf birleştirme), Enter, seçimin üzerine yazma | **Doğru yere iner.** Aynı yere iki kişi yazarsa ikisinin metni de kalır (aktarıcının sonra sıraya koyduğu önde); silme yalnız yazarının gördüğü metni siler, araya başkasının yazdığı kalır; başkasının sildiği yere yazdığınız kalır. Hiç düşmez |
 | Karakter biçimi (kalın, italik, altı çizili, üstü çizili, renk, boyut, yazı tipi, vurgu, karakter stili) | Yazarının gördüğü metni kapsar; aynı metne iki biçimde sonra gelen kazanır. "Kapat" (ör. kalını kaldır), aralık artık tümüyle kalın değilse **düşer** ve söylenir |
-| Paragraf biçimi (hizalama, girinti, aralık, paragraf stili) | Paragrafına iner. İmlecin iki yanındaki metni başkası paragrafları birleştirerek sildiyse **düşer** ve söylenir |
+| Paragraf biçimi (hizalama, girinti, aralık, paragraf stili, sekme durakları) | Paragrafına iner. Sekme durağı değişikliği her katılımcıda o paragrafın stiline göre aynı biçimde hesaplanır; geri alma, paragrafı kendi sekme duraklarıyla yerine koyar. **Varsayılan sekme aralığı** (belge ayarı) odada **reddedilir** ve söylenir. İmlecin iki yanındaki metni başkası paragrafları birleştirerek sildiyse **düşer** ve söylenir |
 | Liste (madde / numara aç-kapat, düzey), sayfa sonu, bağlantı ekleme | Çalışır. Aynı blokta eşzamanlı başka bir değişiklikle karşılaşırsa sonra gelen **düşebilir** (söylenir) |
 | Tablo ekleme; satır / sütun ekleme-silme; hücre içine yazma | Çalışır. **Aynı tabloda** biri yapıyı değiştirirken öbürü o tabloda bir şey değiştirdiyse sonra gelen **düşer** (söylenir); başka paragraflardaki yazma etkilenmez |
 | Üstbilgi / altbilgi / dipnot içinde yazma | Gövdedeki kurallarla çalışır (her öykü kendi içinde) |
@@ -849,7 +852,7 @@ if (mounted.kind === 'document') {
 - Seçenekler: `zoom` (sayı, `'fit-width'`, `'fit-page'`), `toolbar` (sayfa göstergesi ve yakınlaştırma çubuğu), `readOnly`, `trackChanges`, `author`, `now` (bkz. "Belge koruması ve değişiklik izleme"), `onDocumentChange()` (belge her değiştiğinde, geri al ve yinele dahil), `onPageChange(page, count)`, `onLinkClick(target)` (`false` dönerse bağlantı açılmaz; yalnız http, https, mailto, tel hedefleri bağlantı olur), `locale`, `onNotice`, `onSave`.
 - `DocumentView`: `pageCount`, `currentPage`, `layoutDone`, `zoom`, `setZoom()`, `zoomIn()`, `zoomOut()`, `goToPage(n)`, `selectAll()`, `getSelectedText()`, `setLocale()`, `focus()`, `print(options?)`, `printing`, `destroy()`.
 - İzlenen değişiklikler: `revisions()`, `goToRevision()`, `acceptRevision()`, `rejectRevision()`, `acceptAllRevisions()`, `rejectAllRevisions()`, `setTrackChanges()` (bkz. "Belge koruması ve değişiklik izleme").
-- `DocumentView` düzenleme üyeleri: `readOnly`, `setReadOnly()`, `isModified`, `markSaved()`, `changeCount`, `canUndo`, `canRedo`, `undo()`, `redo()`, `getSelection()`, `setSelection(konum ya da aralık)`, `insertText()`, `format({ bold, italic, font, size, color… })`, `toggleFormat('bold')`, `formatParagraph({ align, style… })`, `toggleList('bullet' | 'number')`, `indent(±1)`, `insertTable(satır, sütun)`, `insertRow()`, `deleteRow()`, `insertColumn()`, `deleteColumn()`, `insertPageBreak()`, `insertLink(adres)`, `insertPicture(bytes)`, `selectionFormat`, `inTable`, `commitEditing()`. Konum `{ story: 'body', path: [blok dizini…], offset }` biçimindedir.
+- `DocumentView` düzenleme üyeleri: `readOnly`, `setReadOnly()`, `isModified`, `markSaved()`, `changeCount`, `canUndo`, `canRedo`, `undo()`, `redo()`, `getSelection()`, `setSelection(konum ya da aralık)`, `insertText()`, `format({ bold, italic, font, size, color… })`, `toggleFormat('bold')`, `formatParagraph({ align, style… })`, `toggleList('bullet' | 'number')`, `indent(±1)`, `insertTable(satır, sütun)`, `insertRow()`, `deleteRow()`, `insertColumn()`, `deleteColumn()`, `insertPageBreak()`, `insertLink(adres)`, `insertPicture(bytes)`, `selectionFormat`, `inTable`, `commitEditing()`, `tabStops`, `setTabStops(değişiklik)`, `defaultTabStop`, `setDefaultTabStop(twip)`, `openTabStopsDialog()` (bkz. "Sekme durakları"). Konum `{ story: 'body', path: [blok dizini…], offset }` biçimindedir.
 - **Pano:** kopyalanan seçim sistem panosuna düz metin ve (kaçışlanmış metinden üretilen) basit HTML olarak konur; dosyadan gelen hiçbir şey panoya işaretleme olarak yazılmaz, panodan gelen HTML hiç ayrıştırılmaz. Kopyanın kendisi (**zengin kopya**) sayfanın belleğinde tutulur ve HTML'deki bir işaretle eşlenir: yapıştırılan HTML bu işareti taşıyor **ve** düz metin o kopyanın metniyle aynıysa bellekteki kopya yapıştırılır, değilse panodaki düz metin. Böylece kopyala/kes → yapıştır **aynı düzenleyicide ve aynı sayfadaki başka bir BYM belge düzenleyicisinde** şunları taşır:
   - **Metin ve biçimi**, sekme, satır sonu, **sayfa sonu, sütun sonu**, yumuşak tire, bölünmez tire, simge (`w:sym`).
   - **Görseller** (satır içi ve kayan) ve metinsiz çizimler: çizimin saklanan XML'i yalnız görsellere ve dış adreslere başvuruyorsa. Aynı belgede var olan medya parçası ve ilişki yeniden kullanılır; başka belgede parça `DocModel.media`'ya boş bir adla (`/word/media/imageN.ext`) eklenir, öykünün parçasına ilişki eklenir, aynı görselin ikinci yapıştırması aynı parçayı kullanır. Her yapıştırılan çizim belgede benzersiz bir `wp:docPr id` alır.
@@ -873,6 +876,30 @@ if (mounted.kind === 'document') {
 - Sayfalar aşamalı dizilir: ilk sayfalar hemen görünür, kalanı arka planda; binlerce sayfalık belgede yalnız ekrandaki sayfaların tuvali tutulur.
 - **Fontlar ve sayfalama:** metin cihazdaki fontlarla ölçülür. Belgenin fontu cihazda yoksa ölçüleri uyumlu açık fontlar denenir (Calibri→Carlito, Cambria→Caladea, Arial→Liberation Sans, Times New Roman→Liberation Serif, Courier New→Liberation Mono), sonra genel aile. Bookman Old Style için yedek (TeX Gyre Bonum) paketle gelir ve kendiliğinden yüklenir; öbür fontları sayfanıza `@font-face` ile eklerseniz kendiliğinden kullanılır. Font farklıysa satır ve sayfa kırılmaları Word'dekinden farklı olabilir; Word'le yan yana karşılaştırma yapılmamıştır.
 - Alt düzey: `BymOffice.createCanvasMeasurer({ fonts: doc.fonts })` → `new BymOffice.DocLayout(doc, measurer)` → `layout.layout({ pages: 5 })` → `BymOffice.renderPage(ctx, layout.pages[0], { scale })`. Sayfanın öğeleri (`page.items`) `text`, `rect`, `line`, `image`, `shape` (şekil: `geometry`, `fill`, `stroke`, `rotation`) ve `mark` türündedir. Model düzenlendikten sonra `layout.edited({ milliseconds })` yalnız değişen sayfadan itibaren yeniden dizer; `undefined` dönerse ya da sonraki `layout()` çağrılarından sonra `layout.broken` `true` olursa yeni bir `DocLayout` kurulur.
+
+### Sekme durakları
+
+```js
+view.tabStops;                                   // imlecin paragrafının durakları: [{ pos: 1440, align: 'right', leader: 'dot' }] (twip)
+view.setTabStops({ set: [{ pos: 2880, align: 'center' }], clear: [1440] });   // seçimin paragrafları; tek adım
+view.setTabStops({ clearAll: true });            // bütün durakları kaldır (stilinkiler de)
+view.setTabStops(null);                          // paragrafın kendi durakları gider, stilinkiler geçerli olur
+view.setDefaultTabStop(567);                     // varsayılan sekme aralığı (twip; 567 ≈ 1 cm)
+view.openTabStopsDialog();                       // Paragraf → Sekmeler kutusu
+// Modelde:
+BymOffice.docOps.setParaFormat(doc, aralık, { tabs: { set: [/* … */] } });
+BymOffice.docOps.paragraphTabStops(doc, konum);
+BymOffice.docOps.setDefaultTabStop(doc, 720, aralık);
+```
+
+- **Hizalama:** `left`, `center`, `right`, `decimal`, `bar` (dikey çizgi; durak değildir), ayrıca dosyadan gelen `start`, `end`, `num`. **Dolgu:** `none`, `dot`, `hyphen`, `underscore`, `heavy`, `middleDot`. Konum −31.680..31.680 twip (±22 inç), paragraf başına en çok 64 **yazılan** girdi (stil duraklarını kaldıran `clear` girdileri dahil; aşan değişiklik reddedilir); geçersiz her alan `RangeError`.
+- **Stile göre hesaplanır:** değişiklik her paragraf için o paragrafın stilinin duraklarına göre çözülür: stilde olan ve aynen istenen durak yeniden yazılmaz, stilde olup istenmeyen durak `w:val="clear"` ile kaldırılır (Word'ün yazdığı gibi). `tabs` için **liste** verilirse paragrafın kendi durakları aynen o liste olur (`clear` girdileri dahil; birlikte düzenlemede paragrafın bütün olarak taşınması bunu kullanır).
+- **Kutu** (araç çubuğunda "Sekme durakları…" düğmesi): duraklar listesi (her birinin kaldırma düğmesi), konum (Türkçede cm, İngilizcede inç; virgül ya da nokta), hizalama, dolgu, "Ekle", "Tümünü temizle", varsayılan aralık; "Tamam" yalnız değişeni uygular, **tek geri alma adımı** olarak; varsayılan aralık yalnız alanı değiştirildiyse gönderilir (gösterilen değer yuvarlanmıştır); belge birlikte düzenlenirken bu alan devre dışıdır ve nedeni altında yazar (duraklar yine paylaşılır), Escape/"İptal" hiçbir şey yapmaz.
+- **İzleme açıkken** durak değişikliği öbür paragraf biçimleri gibi `w:pPrChange` ile izlenir; ret eski durakları geri getirir. **Varsayılan sekme aralığı** bir belge ayarıdır, Word onu izlemez: izleme açıkken **reddedilir** (`TRACK_UNSUPPORTED`).
+- **Kaydetme:** paragrafın `w:pPr/w:tabs`'ı yazılır; dosyadaki `w:tabs`'ın modelin tanımadığı öznitelik ve çocukları korunur, bütün duraklar kalkınca onlar da gider. Varsayılan aralık `settings.xml`'de yalnız `w:defaultTabStop` öğesi değiştirilerek (yoksa şemadaki yerine eklenerek, ayar parçası yoksa oluşturularak) yazılır; parçanın öbür baytları kalır. Geri al → kaydet dosyanın baytlarını verir. Python `zipfile` + `xml.etree` ile bağımsız okunur (birim testi).
+- **Dosyadaki değer:** `w:defaultTabStop` dosyada ne diyorsa (0, kesirli, 22 inçten büyük, birimli) modelde öyle kalır; düzen onu 1..31.680 twip aralığında kullanır. Yeni değer yalnız komutla (1..31.680 tam sayı) verilir; geri alma dosyadaki değeri aynen geri koyar ve kayıt özgün baytları verir. Dosyadaki bir durağın modelin tanımadığı öznitelikleri o durağın **konumuyla** eşlenir: durak kalkınca onlar da gider, başka durağa geçmez.
+- **Düzen:** sol, orta, sağ ve ondalık duraklar ve dolgular çizilir; varsayılan aralık değişince belge baştan dizilir. **Çubuk (`bar`) durağının dikey çizgisi henüz çizilmez** (durak olarak da sayılmaz, Word'deki gibi).
+- **Köprüde:** `setTabStops` ve `setDefaultTabStop` komutları (bkz. `docs/webview-koprusu.md`).
 
 ### Belge koruması ve değişiklik izleme
 
@@ -1452,6 +1479,45 @@ Her biri **tek geri alma adımıdır**, `workbook.sheetsModified`'ı kurar, `onC
 - **Kaydetme:** taşıma `workbook.xml`'de `<sheets>` sırasını, `activeTab`/`firstSheet`'i, `localSheetId`'leri ve `docProps/app.xml` başlık sırasını günceller; **parça adları ve `sheetId`'ler değişmez**, sayfa parçaları (seçili sekme işareti değişmedikçe) bayt bayt kalır. Gizleme/gösterme `<sheet state>`'i yazar; etkin sayfa gizlendiyse `activeTab` ve iki sayfanın `tabSelected` işareti de yazılır. **Birden çok penceresi olan dosyada** (`<workbookView>` > 1) gizlenen sayfayı gösteren her pencere etkin sayfaya (o da gizliyse ilk görünür sayfaya) çekilir, gizli sayfanın `tabSelected` işaretleri kalkar ve yalnız o pencerelerin görünümünde etkin sayfa seçili işaretlenir; öbür pencereler dokunulmadan kalır. `firstSheet` gizlenen bir sayfayı gösteriyorsa ilk görünür sayfaya çekilir. Rengi dosyadakiyle aynı olan (geri alınmış) sekme için sayfa parçası okunmaz bile. Sekme rengi yalnız o sayfa parçasındaki `<sheetPr><tabColor>`'ı değiştirir (yoksa `<sheetPr>` eklenir, kaldırılınca öğe çıkar; parçanın başka hiçbir baytı değişmez; `fullCalcOnLoad` yazılmaz); dosyadaki tema/indeks/ton renkli `tabColor` değiştirilmedikçe olduğu gibi kalır. Kopya, yeni sayfa gibi kendi parçasına (`sheetN.xml`), notları kendi yorum parçalarına, yerel adları `definedNames`'e yazılır; kaynak sayfanın parçaları bayt bayt kalır. Sıra değişince (taşıma, kopya) ekleme/silmede olduğu gibi `fullCalcOnLoad` yazılır ve `calcChain` çıkarılır. **Her biri için "kaydet → geri al → kaydet" açılan dosyayı bayt bayt geri verir.**
 - **Retler:** adları yalnız harf büyüklüğüyle ayrılan sayfaları olan kitapta bunlar da reddedilir. Grafik, pivot tablo ya da form denetimi içeren kitapta taşıma, gizleme ve renk **serbesttir** (sayfa adına dokunmazlar); kopyalama da serbesttir (yukarıdaki kayıplarla).
 
+### Bölmeleri dondurma
+
+```js
+view.freezePanes();          // etkin hücrenin üstündeki satırlar ve solundaki sütunlar
+view.freezePanes(1, 0);      // üst satır
+view.freezePanes(0, 1);      // ilk sütun
+view.unfreezePanes();        // = freezePanes(0, 0)
+view.frozenPanes;            // { rows, cols }
+// Modelde, görünüm olmadan:
+history.apply(BymOffice.freezePanes(workbook, 0, 2, 1));
+```
+
+- **Arayüz:** araç çubuğundaki "Satırlar ve sütunlar" menüsünün sonunda "Bölmeleri dondur" (etkin hücre A1 değilse), "Üst satırı dondur", "İlk sütunu dondur" ve bir şey dondurulmuşsa "Bölmeleri çöz".
+- Dondurulan satır ve sütunlar **sayfanın başından** sayılır (görünüm onları oradan gösterir): kaydırılmışken dondurmak, Excel'in aksine, kaydırılan konumdan değil A1'den dondurur ve dosyadaki "görünümün ilk hücresi" (`firstVisibleCell`) kalkar. Dondurmadan sonra kaydırılan alan dondurulan alanın hemen arkasından başlar.
+- **Tek geri alma adımı**, işlem `setPane` (kendi tersi). Bir **görünüm** değişikliğidir: hücre değişmez, sayfa "değişti" sayılmaz, **`fullCalcOnLoad` yazılmaz** ve hesap zinciri kalır.
+- **Kaydetme:** yalnız sayfa parçasının **ilk** `<sheetView>`'unun `<pane>` ve `<selection>` öğeleri yeniden yazılır (Excel'in yazdığı biçimde: `xSplit`, `ySplit`, `topLeftCell`, `activePane`, `state="frozen"`; etkin bölmenin seçimi eski etkin bölmenin seçimini her şeyiyle taşır, öbür bölmelere boş `<selection pane="…"/>`); görünümün öbür öznitelikleri ve çocukları (`pivotSelection`, `extLst`), öbür görünümler ve parçanın bütün öbür baytları (BOM ve CRLF dahil) kalır. Görünümü olmayan parçaya `<sheetViews>` eklenir. Bölmeler dosyadakine dönerse (geri al, çöz) parça bayt bayt dosyadaki gibi yazılır. openpyxl `freeze_panes` ile aynısını okur (birim testi).
+- **Bölünmüş (dondurulmamış) bölme** (`<pane>` `state` olmadan): gösterilmez, `view.split` ile bildirilir ve dosyada kalır; çözme onu değiştirmez, dondurma onun yerine dondurulmuş bölmeyi yazar (UNSURE: Excel bölünmüş bölmeyi dondururken bölme çizgisinin yerini kullanır; burada etkin hücre ya da verilen sayılar kullanılır).
+- **Grafik sayfasında** dondurma yoktur (`RangeError`). **Birlikte düzenlemede** (`collab`) bölmeler herkese gider (`pane` adımı: satır, sütun, kaydırılan alanın ilk hücresi ve görünümün ilk hücresi gider; kaydırılan alanın ilk hücresi dondurulan satırların altında ve sütunların sağında değilse adım reddedilir, verilmezse hemen alttaki/sağdaki hücredir; odada geri alma da dosyanın bölmesini aynen geri koyar; aynı sayfada aktarıcının sonra sıraladığı kazanır, başkasının sonradan değiştirdiği bölmeyi geri alma yapılmaz ve söylenir). Sekme rengi gibi: sayfa taşıma ile karşılaşan bekleyen dondurma düşer ve söylenir.
+- UNSURE (Excel'le doğrulanmadı): birden çok pencereli dosyada yalnız ilk görünüm değişir; etkin hücre dondurulan alandaysa seçimi yine etkin (sağ alt) bölmeye yazılır.
+
+### Hücre birleştirme
+
+```js
+view.merge();                      // sormadan; atılanları döndürür: { losses: [{ row, col, text }], count, notes }
+view.merge({ center: true });      // "Birleştir ve ortala"
+await view.requestMerge();         // değer atılacaksa önce sorar; birleştirildiyse true
+view.unmerge();                    // seçimin değdiği birleşimleri ayırır
+// Modelde:
+BymOffice.mergeReport(workbook, 0, range);    // atılacaklar (en çok 1.000 hücre listelenir, hepsi sayılır)
+BymOffice.mergeProblem(workbook, 0, range);   // neden birleştirilemez; birleştirilebiliyorsa undefined
+history.apply(BymOffice.mergeRange(workbook, 0, range, { center: true }));
+```
+
+- **Arayüz:** araç çubuğundaki birleştir düğmesi seçimi birleştirir (birleşik hücrede ayırır); yanındaki ok menüsü "Birleştir ve ortala", "Hücreleri birleştir", "Hücreleri ayır". **Sol üst dışındaki hücrelerde değer varsa önce sorulur** ("Birleştirme yalnız sol üst hücrenin değerini korur. Diğer N hücrenin değeri silinir.", `data-bym-confirm="merge-loss"`); "Birleştir" düğmesi soru geldikten 400 ms sonra yanıt verir, Escape ve "İptal" hiçbir şey yapmaz. Soru açıkken seçim, sayfa ya da hücreler değişirse yanıt birleştirmez.
+- Excel kuralı: **yalnız sol üst hücrenin değeri kalır**; öbür hücrelerin değeri ve formülü silinir, **biçimleri kalır**. Ortalamada (`center`) aralığın bütün hücreleri yatay ortalanır (boşaltılanlar da) — birleştirmeyle **aynı geri alma adımında**. Geri al bütün değerleri, formülleri ve biçimleri geri getirir; birleştir → geri al → kaydet dosyanın baytlarını verir.
+- **Formüller:** silinen hücreyi okuyan formüller yeniden hesaplanır (boş hücre). Silinen hücre paylaşılan formülün asıl hücresiyse gruptaki öbür hücreler formüllerini kendi metinleriyle tutar. **Koşullu biçim ve veri doğrulama kuralları** değişmez (Excel de korur). Sol üst dışındaki hücrelerdeki **notlar** silinmez, birleşik hücrenin altında kalır ve raporda sayılır (`notes`; UNSURE: Excel'in davranışı doğrulanmadı).
+- **Reddedilenler** (`RangeError`, arayüzde durum çubuğunda): tam satır/sütun; aralık **çok hücreli dizi formülüne** (ya da veri tablosuna) değiyorsa; birden çok satırlı aralıkta **süzgecin gizlediği** satır varsa; pivot tablonun alanına değiyorsa; sayfada **tablo** (ListObject) varsa (tabloların aralığı modelde yok; henüz desteklenmiyor); grafik sayfası. Başka bir birleşimle çakışan birleşim onun yerini alır (önceki davranış).
+- **Kaydetme:** `<mergeCells>` modelden yeniden yazılır; openpyxl `merged_cells` ile aynısını okur (birim testi). **Birlikte düzenlemede** birleştirme hücre ve birleşim adımları olarak gider (önceden de böyleydi): aynı aralığa eşzamanlı yazılan değer ile birleştirme karşılaşırsa sonra gelen düşer ve söylenir.
+
 ### Hücre notları
 
 Bir hücrenin notu (Excel 365'te "not", eski sürümlerde "açıklama"; dosyada `xl/commentsN.xml` + `xl/drawings/vmlDrawingN.vml`) görünümden ve programla eklenir, düzenlenir, silinir. Her değişiklik **tek geri alma adımıdır** ve `save()` ile dosyaya yazılır.
@@ -1780,7 +1846,7 @@ BymOffice.resolveColor(style.font.color, workbook.styles); // '#RRGGBB' ya da un
 | `rowCount`, `colCount` | Hücre içeren son satır/sütun + 1 |
 | `dimension` | Dosyanın bildirdiği kullanılan alan (eksik ya da yanlış olabilir) |
 | `defaultRowHeight`, `defaultColWidth` | Varsayılan ölçüler |
-| `view` | `frozenRows`, `frozenCols`, `topLeftCell` (kaydırılan alanın ilk hücresi), `firstVisibleCell` (görünümün sol üst hücresi; dondurulan alan buradan başlar), `showGridLines`, `zoomScale`, `rightToLeft`, `activeCell`, … |
+| `view` | `frozenRows`, `frozenCols`, `topLeftCell` (kaydırılan alanın ilk hücresi), `firstVisibleCell` (görünümün sol üst hücresi; dondurulan alan buradan başlar), `split` (dosyada dondurulmamış, bölünmüş bölme var; gösterilmez), `showGridLines`, `zoomScale`, `rightToLeft`, `activeCell`, … |
 | `tabColor` | Sekme rengi |
 | `pageSetup` | Sayfa yapısı (yazdırma ayarları); dosya hiçbir şey belirtmiyorsa `undefined`. Aşağıda |
 

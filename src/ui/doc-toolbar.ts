@@ -48,6 +48,7 @@ type ButtonKey =
   | 'numberedList'
   | 'decreaseIndent'
   | 'increaseIndent'
+  | 'tabStops'
   | 'insertTable'
   | 'rowsColumns'
   | 'insertPicture'
@@ -233,6 +234,8 @@ export class DocToolbar {
     this.addButton('numberedList', () => view().toggleList('number'), true);
     this.addButton('decreaseIndent', () => view().indent(-1));
     this.addButton('increaseIndent', () => view().indent(1));
+    // A dialog of the view: it takes the focus, and hands it back when it closes.
+    this.addMenuButton('tabStops', 'dialog', () => view().openTabStopsDialog());
     this.addSeparator();
     this.addMenuButton('insertTable', 'dialog', () => this.openTableGrid());
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
@@ -317,7 +320,7 @@ export class DocToolbar {
     }
     const others: ButtonKey[] = [
       'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'highlight', 'alignLeft', 'alignCenter', 'alignRight', 'alignJustify',
-      'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak',
+      'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'tabStops', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak',
     ];
     // Where changes are tracked all of these are offered too: each makes its change as a tracked one, and the few
     // it cannot make so (a column through merged cells, a link over a picture) are refused when asked for, and said.
@@ -564,6 +567,7 @@ export class DocToolbar {
       numberedList: s.numberedList,
       decreaseIndent: s.decreaseIndent,
       increaseIndent: s.increaseIndent,
+      tabStops: s.tabStops,
       insertTable: s.insertTable,
       rowsColumns: s.tableRowsColumns,
       insertPicture: s.insertPicture,

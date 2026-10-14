@@ -9,7 +9,7 @@
 // blocks were replaced" or "something in this story", and gives way to, or makes give way,
 // whatever else is about the same (see rebase.ts).
 
-import { EMPTY_PARA_PROPS, EMPTY_RUN_PROPS, paragraphText, type AttrList, type Block, type Comment, type DocColor, type DocModel, type DocRelationship, type ExtraXml, type Note, type StoryCollection, type Inline, type Language, type Paragraph, type ParaProps, type Run, type RunFonts, type RunItem, type RunProps } from '../../model/doc/types';
+import { EMPTY_PARA_PROPS, EMPTY_RUN_PROPS, paragraphText, type AttrList, type Block, type Comment, type DocColor, type DocModel, type DocRelationship, type ExtraXml, type Note, type StoryCollection, type Inline, type Language, type Paragraph, type ParaProps, type Run, type RunFonts, type RunItem, type RunProps, type TabStop } from '../../model/doc/types';
 import type { DocEdit } from '../../ops/doc/draft';
 import { indentList, patchParaProps, patchRunProps, rangeFormat, setParaFormat, setRunFormat, toggleList, toggleRunFormat, type ParaFormatPatch, type RunFormatPatch, type ToggleKey } from '../../ops/doc/format';
 import type { DocOp } from '../../ops/doc/ops';
@@ -296,6 +296,15 @@ function paraFormatOf(props: ParaProps): { p?: ParaFormatPatch; m?: PutRunFormat
       const mark = runFormatOf(value as RunProps);
       if (!mark) return undefined;
       out.m = mark;
+    } else if (key === 'tabs') {
+      // The stops the paragraph states, as a list: only when everybody reads them as they are.
+      const tabs = (value as TabStop[]).map((tab) => ({ ...tab }));
+      try {
+        patchParaProps(EMPTY_PARA_PROPS, { tabs });
+      } catch {
+        return undefined;
+      }
+      p.tabs = tabs;
     } else if (PARA_KEYS.indexOf(key) >= 0) p[key] = typeof value === 'object' && value !== null ? { ...(value as object) } : value;
     else return undefined;
   }
@@ -405,6 +414,9 @@ function readPutParagraph(value: unknown): PutParagraph {
     let copy: unknown;
     try {
       copy = plainCopy(from.p, 'paragraph');
+      // A paragraph that is put states its own stops as a list (see paraFormatOf()); a change of stops is no paragraph.
+      const tabs = (copy as { tabs?: unknown }).tabs;
+      if (tabs !== undefined && !Array.isArray(tabs)) return fail('paragraph');
       patchParaProps(EMPTY_PARA_PROPS, copy as ParaFormatPatch);
     } catch (error) {
       if (error instanceof RangeError || error instanceof WireError) return fail('paragraph');

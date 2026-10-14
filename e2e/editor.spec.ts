@@ -215,7 +215,7 @@ test.describe('layout', () => {
         viewport: document.documentElement.clientWidth,
       };
     });
-    expect(facts.buttons).toBe(23);
+    expect(facts.buttons).toBe(24);
     expect(facts.sizes).toEqual([facts.coarse ? '40x40' : '32x32']);
     expect(facts.scrolls).toBe(true);
     expect(facts.scrolled).toBe(true);
@@ -512,7 +512,17 @@ test.describe('toolbar', () => {
     };
     await select(page, 'A2');
     await press(button);
-    await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Insert row above', 'Insert row below', 'Insert column left', 'Insert column right', 'Delete row', 'Delete column']);
+    await expect(popover(page).locator('.bym-pop-item')).toHaveText([
+      'Insert row above',
+      'Insert row below',
+      'Insert column left',
+      'Insert column right',
+      'Delete row',
+      'Delete column',
+      'Freeze panes',
+      'Freeze top row',
+      'Freeze first column',
+    ]);
     await press(button);
 
     await choose('Insert row above');
@@ -545,11 +555,21 @@ test.describe('toolbar', () => {
     // The labels count what is selected; whole rows leave nothing to say about columns.
     await select(page, 'A1:B2');
     await press(button);
-    await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Insert 2 rows above', 'Insert 2 rows below', 'Insert 2 columns left', 'Insert 2 columns right', 'Delete 2 rows', 'Delete 2 columns']);
+    // The active cell is A1: there is nothing above it or left of it to freeze.
+    await expect(popover(page).locator('.bym-pop-item')).toHaveText([
+      'Insert 2 rows above',
+      'Insert 2 rows below',
+      'Insert 2 columns left',
+      'Insert 2 columns right',
+      'Delete 2 rows',
+      'Delete 2 columns',
+      'Freeze top row',
+      'Freeze first column',
+    ]);
     await press(button);
     await page.evaluate((right) => (window as any).__editor.view.select({ top: 1, left: 0, bottom: 1, right }), MAX_COLS - 1);
     await press(button);
-    await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Insert row above', 'Insert row below', 'Delete row']);
+    await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Insert row above', 'Insert row below', 'Delete row', 'Freeze panes', 'Freeze top row', 'Freeze first column']);
   });
 
   test('undo and redo are only enabled when there is a step, and take it', async ({ page, hasTouch }) => {
@@ -665,6 +685,8 @@ test.describe('keyboard and focus', () => {
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('sortAscending');
     // The number format list lies between these two buttons.
+    await page.keyboard.press('ArrowLeft');
+    expect(await focused()).toBe('mergeOptions');
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('merge');
     await page.keyboard.press('Home');
@@ -1047,7 +1069,7 @@ test.describe('read-only', () => {
   test('disables every editing control, locks the formula bar and says so', async ({ page }) => {
     await mount(page, await editorWorkbook(), { readOnly: true });
     const controls = page.locator('#host .bym-toolbar button, #host .bym-toolbar select');
-    await expect(controls).toHaveCount(25);
+    await expect(controls).toHaveCount(26);
     // Printing and making a PDF change nothing: their buttons are the controls that stay on.
     expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).map((control) => control.getAttribute('data-command')))).toEqual(['print', 'pdf']);
     await expect(page.locator('#host .bym-formula-input')).toHaveAttribute('readonly', '');
@@ -1160,7 +1182,7 @@ test.describe('language', () => {
     await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Tüm kenarlıklar', 'Dış kenarlıklar', 'Alt kenarlık', 'Üst kenarlık', 'Sol kenarlık', 'Sağ kenarlık', 'Kenarlık yok']);
     await press(command(page, 'borders'));
     await press(command(page, 'rowsColumns'));
-    await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Üste satır ekle', 'Alta satır ekle', 'Sola sütun ekle', 'Sağa sütun ekle', 'Satırı sil', 'Sütunu sil']);
+    await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Üste satır ekle', 'Alta satır ekle', 'Sola sütun ekle', 'Sağa sütun ekle', 'Satırı sil', 'Sütunu sil', 'Üst satırı dondur', 'İlk sütunu dondur']);
     await press(command(page, 'rowsColumns'));
     await press(command(page, 'textColor'));
     await expect(popover(page).locator('.bym-pop-item')).toHaveText(['Otomatik']);

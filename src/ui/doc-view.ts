@@ -24,8 +24,8 @@ import type { DocChange, DocCollabSession, DocPeer } from '../collab/doc/session
 import { tracing } from '../collab/doc/trace';
 import type { CollabNotice } from '../collab/room';
 import { CompositionHold, PeerCarets, movedSelection, peerFill, peerPlaces, placeNear, type PeerPlace } from './doc-collab';
-import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
-import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
+import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, TabStopsPatch, ToggleKey } from '../ops/doc/index';
+import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type TabStop, type Table } from '../model/doc/types';
 import { getLocale, type FormatLocale } from '../format/locale';
 import { renderPage } from '../render/doc';
 import type { ChartRendererState } from '../render/chart';
@@ -61,6 +61,8 @@ import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFile
 import { docPageRuns } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
 import { resolveUiStrings, type UiStrings } from './strings';
+import { TabStopsDialog } from './doc-tabs-dialog';
+import { editorRootIn } from './save-confirm';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
 export { declaredImagePixels, declaredImageSize, decodedImageSize, sniffImageType } from '../render/images';
@@ -755,6 +757,10 @@ export class DocumentView {
   private fontsDue = false;
   /** The entries the font table of the document had when it was last laid out from the start. */
   private fontEntries = -1;
+  /** The distance between automatic tab stops the layout was made with: the layout holds it, and is made again when it changes. */
+  private layoutTabStop = -1;
+  /** The dialog of tab stops, while it is open. */
+  private tabsDialog: TabStopsDialog | undefined;
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
@@ -1270,6 +1276,7 @@ export class DocumentView {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    if (this.tabsDialog) this.tabsDialog.close();
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
@@ -1908,6 +1915,7 @@ export class DocumentView {
     try {
       this.engine = new DocLayout(this.document, this.measurer, this.layoutOptions());
       this.fontEntries = this.document.fonts.size;
+      this.layoutTabStop = this.document.settings.defaultTabStop;
       this.pages = this.engine.pages;
       this.offsets = [0];
       this.done = false;
@@ -1940,7 +1948,9 @@ export class DocumentView {
       this.fontEntries = entries;
       // The charts too: their words are set in the fonts the table stands in for.
       if (fontsMoved) this.charts.clear();
-      progress = this.failed || fontsMoved ? undefined : this.engine.edited({ milliseconds: EDIT_LAYOUT_MS });
+      // The automatic tab stops are everywhere a paragraph has none of its own.
+      const tabMoved = this.layoutTabStop >= 0 && this.layoutTabStop !== this.document.settings.defaultTabStop;
+      progress = this.failed || fontsMoved || tabMoved ? undefined : this.engine.edited({ milliseconds: EDIT_LAYOUT_MS });
     } catch {
       progress = undefined;
     }
@@ -4480,6 +4490,103 @@ export class DocumentView {
   /** Paragraph formatting (alignment, style, spacing ...) for every paragraph the selection touches. */
   formatParagraph(patch: ParaFormatPatch): boolean {
     return this.perform((range) => ops.setParaFormat(this.document, range, patch), true);
+  }
+
+  /** The tab stops of the paragraph at the caret (those its style gives it and its own), in order; positions in twips. */
+  get tabStops(): TabStop[] {
+    const range = this.range() || this.startRange();
+    if (!range) return [];
+    try {
+      return ops.paragraphTabStops(this.document, range.focus);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Sets and clears tab stops of the paragraphs of the selection, as one undo step (see
+   * TabStopsPatch; null takes the paragraphs' own stops away, so that their style's apply).
+   * Where changes are tracked the change is a tracked one.
+   */
+  setTabStops(patch: TabStopsPatch | null): boolean {
+    this.caretForParagraphs();
+    return this.perform((range) => ops.setParaFormat(this.document, range, { tabs: patch }), true);
+  }
+
+  /** The distance between the automatic tab stops of the document, twips. */
+  get defaultTabStop(): number {
+    return this.document.settings.defaultTabStop;
+  }
+
+  /** Sets the distance between the automatic tab stops of the document, twips; one undo step. Refused where changes are tracked. */
+  setDefaultTabStop(twips: number): boolean {
+    this.caretForParagraphs();
+    return this.perform((range) => ops.setDefaultTabStop(this.document, twips, range), true);
+  }
+
+  /**
+   * Changes the tab stops of the paragraphs of the selection and the default tab stop as one undo step. Only one of
+   * them changing is that command alone (a change of stops travels in a room; the default does not).
+   */
+  private applyTabChanges(patch: TabStopsPatch | undefined, defaultTab: number | undefined): boolean {
+    if (!patch && defaultTab === undefined) return false;
+    if (defaultTab === undefined) return this.setTabStops(patch as TabStopsPatch);
+    if (!patch) return this.setDefaultTabStop(defaultTab);
+    this.caretForParagraphs();
+    return this.perform((range) => {
+      const stops = ops.setParaFormat(this.document, range, { tabs: patch });
+      const setting = ops.setDefaultTabStop(this.document, defaultTab, range);
+      // Neither depends on the other: both were made on the document as it is.
+      return { ...stops, ops: stops.ops.concat(setting.ops) };
+    }, true);
+  }
+
+  /** A caret at the start of the first paragraph of the body; undefined for a body without one. */
+  private startRange(): DocRange | undefined {
+    const blocks = this.document.body.blocks;
+    for (let i = 0; i < blocks.length && i < 10000; i++) {
+      if (blocks[i].type !== 'paragraph') continue;
+      const at: DocPosition = { story: 'body', path: [i], offset: 0 };
+      return { anchor: at, focus: { ...at, path: at.path.slice() } };
+    }
+    return undefined;
+  }
+
+  /**
+   * Commands about paragraphs and the settings of the document work where the caret is. Before the document was ever
+   * clicked into there is none: the caret goes to the start of the document, where Word has it when a file opens.
+   */
+  private caretForParagraphs(): void {
+    if (this.selection !== undefined || !this.editable || this.destroyed) return;
+    const start = this.startRange();
+    if (start) this.selection = { anchor: copyPosition(start.anchor), focus: copyPosition(start.focus) };
+  }
+
+  /** Opens the dialog of the tab stops of the paragraphs of the selection (Paragraph -> Tabs). */
+  openTabStopsDialog(): void {
+    if (!this.editable || this.destroyed) return;
+    this.typing.commit();
+    if (this.tabsDialog) this.tabsDialog.close();
+    const before = typeof document !== 'undefined' ? (document.activeElement as HTMLElement | null) : null;
+    this.tabsDialog = new TabStopsDialog({
+      root: editorRootIn(this.container, this.root),
+      strings: this.strings.tabs,
+      stops: this.tabStops,
+      defaultTab: this.defaultTabStop,
+      // In a room the default distance does not travel: the stops of the dialog do, and are not lost with it.
+      defaultFixed: this.collab !== undefined,
+      // One step, of what changed. What cannot be done is said by the view (a refusal); the dialog goes either way.
+      apply: (patch, defaultTab) => {
+        this.applyTabChanges(patch, defaultTab);
+        return true;
+      },
+      onClose: () => {
+        this.tabsDialog = undefined;
+        if (this.destroyed) return;
+        if (before && before.isConnected && typeof before.focus === 'function') before.focus({ preventScroll: true });
+        else this.focus();
+      },
+    });
   }
 
   /** Makes the paragraphs of the selection items of a list, or takes them out of it. */

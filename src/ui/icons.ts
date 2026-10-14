@@ -22,6 +22,7 @@ export type IconName =
   | 'alignRight'
   | 'wrapText'
   | 'merge'
+  | 'mergeOptions'
   | 'sortAscending'
   | 'sortDescending'
   | 'filter'
@@ -69,6 +70,8 @@ const ICONS: { [name in IconName]: Shape[] } = {
   alignRight: [path('M4 6h16 M10 10h10 M4 14h16 M10 18h10')],
   wrapText: [path('M4 6h16 M4 18h5 M4 12h13a3 3 0 0 1 0 6h-4'), path('m15 16-2 2 2 2')],
   merge: [path('M3 6h18v12H3z'), path('M6 12h4 M8 10l2 2-2 2 M18 12h-4 M16 10l-2 2 2 2')],
+  // The other ways of merging: a narrow arrow down beside the merge button.
+  mergeOptions: [path('m8 10 4 4 4-4')],
   // Bars that grow (or shrink) beside an arrow that points down.
   sortAscending: [path('M17 5v14 M14 16l3 3 3-3'), path('M4 7h4 M4 12h6 M4 17h8')],
   sortDescending: [path('M17 5v14 M14 16l3 3 3-3'), path('M4 7h8 M4 12h6 M4 17h4')],
@@ -90,6 +93,7 @@ export type DocIconName =
   | 'numberedList'
   | 'decreaseIndent'
   | 'increaseIndent'
+  | 'tabStops'
   | 'insertTable'
   | 'insertPicture'
   | 'insertLink'
@@ -108,6 +112,8 @@ const DOC_ICONS: { [name in DocIconName]: Shape[] } = {
   numberedList: [path('M10 6h10 M10 12h10 M10 18h10'), path('M4 5l1.5-1v4 M4 8h3', { 'stroke-width': '1.25' }), path('M4 14.5c0-1.5 2.8-1.5 2.8 0 0 1-2.8 2-2.8 3.5h3', { 'stroke-width': '1.25' })],
   decreaseIndent: [path('M4 5h16 M11 10h9 M11 14h9 M4 19h16'), path('m7.5 9.5-3 2.5 3 2.5')],
   increaseIndent: [path('M4 5h16 M11 10h9 M11 14h9 M4 19h16'), path('m4.5 9.5 3 2.5-3 2.5')],
+  // A ruler with the mark of a left tab stop on it.
+  tabStops: [path('M3 15h18 M6 15v-2 M10 15v-2 M14 15v-2 M18 15v-2'), path('M8 5v5h4', { 'stroke-width': '2.25' })],
   insertTable: [path('M4 5h16v14H4z M4 10h16 M4 14.5h16 M9.5 5v14 M14.5 5v14')],
   insertPicture: [path('M4 5h16v14H4z'), path('m4 16 4.5-4.5 4 4 2.5-2.5 5 5'), path('M15.5 9.5h.01', { 'stroke-width': '2.75' })],
   insertLink: [path('M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1'), path('M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1')],

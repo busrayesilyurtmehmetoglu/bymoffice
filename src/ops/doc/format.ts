@@ -16,8 +16,10 @@ import {
   type ParaSpacing,
   type Paragraph,
   type RunProps,
+  type TabStop,
 } from '../../model/doc/types';
 import { buildEdit, tableContextOf, type Draft, type DocEdit, type DocEditOptions } from './draft';
+import { MAX_DEFAULT_TAB, MIN_DEFAULT_TAB } from './ops';
 import { boundary, flatten, inheritedProps, markRunProps, paragraphWith, rebuild, sameInlines, sameProps, type Piece } from './pieces';
 import { asRange, containerBlocks, inTextBox, isCollapsed, orderRange, paragraphLength, paragraphsBetween, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
 import { inSessionInsertion, isOwnParagraph, trackedParaProps, trackedRunProps } from './track';
@@ -525,6 +527,8 @@ export function toggleRunFormat(doc: DocModel, range: DocRange, key: ToggleKey, 
 
 type Nullable<T> = { [K in keyof T]?: T[K] | null };
 
+const localOf = (name: string): string => name.slice(name.indexOf(':') + 1);
+
 /** A change of paragraph formatting; `null` removes a property so that the style decides again. */
 export interface ParaFormatPatch {
   /** "left", "center", "right", "both" (justified), "start", "end", "distribute", ... as in ST_Jc. */
@@ -542,10 +546,122 @@ export interface ParaFormatPatch {
   widowControl?: boolean | null;
   contextualSpacing?: boolean | null;
   outlineLevel?: number | null;
+  /**
+   * Tab stops set and cleared; null removes every tab stop the paragraph states itself (its style's apply again).
+   * A list states the paragraph's own stops exactly, "clear" entries included (how a paragraph travels whole).
+   */
+  tabs?: TabStopsPatch | TabStop[] | null;
 }
 
+/** A tab stop as a patch sets it. */
+export interface TabStopSpec {
+  /** Twips from the leading edge of the text (the indent does not count). */
+  pos: number;
+  /** "left", "center", "right", "decimal", "bar" (a vertical line, no stop), "start", "end" or "num". */
+  align: string;
+  /** What fills the space before the text at the stop: "none", "dot", "hyphen", "underscore", "heavy", "middleDot". */
+  leader?: string;
+}
+
+/**
+ * A change of the tab stops of paragraphs. What it does is worked out for each paragraph from
+ * the stops its style gives it, so that afterwards the paragraph has the stops asked for:
+ * `set` puts a stop at its position (in the place of any there), `clear` takes the stops at
+ * these positions away (a stop of the style is cleared by a "clear" entry, as Word writes it),
+ * `clearAll` takes every stop away first.
+ */
+export interface TabStopsPatch {
+  set?: TabStopSpec[];
+  clear?: number[];
+  clearAll?: boolean;
+}
+
+/** Tab stops of one paragraph, at most: Word takes 64. */
+export const MAX_TAB_STOPS = 64;
+
+const TAB_ALIGNS = new Set<string>(['left', 'center', 'right', 'decimal', 'bar', 'start', 'end', 'num']);
+const TAB_LEADERS = new Set<string>(['none', 'dot', 'hyphen', 'underscore', 'heavy', 'middleDot']);
+/** How far from the leading edge a tab stop can be, either way (ST_SignedTwipsMeasure as Word takes it). */
+const MAX_TAB_POS = 31680;
+
 const PARA_FLAGS = ['keepNext', 'keepLines', 'pageBreakBefore', 'widowControl', 'contextualSpacing'] as const;
-const PARA_PATCH_KEYS = new Set<string>(['align', 'indent', 'spacing', 'style', 'numbering', 'outlineLevel', ...PARA_FLAGS]);
+const PARA_PATCH_KEYS = new Set<string>(['align', 'indent', 'spacing', 'style', 'numbering', 'outlineLevel', 'tabs', ...PARA_FLAGS]);
+
+/** A tab stop of a patch, checked; "clear" only in a list of the stops a paragraph states. */
+function tabStopOf(value: unknown, clears = false): TabStop {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return bad('The tab stop is not valid');
+  const given = value as Record<string, unknown>;
+  for (const key of Object.keys(given)) if (key !== 'pos' && key !== 'align' && key !== 'leader') return bad('The tab stop is not valid');
+  if (!isWhole(given.pos, -MAX_TAB_POS, MAX_TAB_POS)) return bad('The position of the tab stop is not valid');
+  if (typeof given.align !== 'string' || !(TAB_ALIGNS.has(given.align) || (clears && given.align === 'clear'))) return bad('The alignment of the tab stop is not valid');
+  if (given.leader !== undefined && (typeof given.leader !== 'string' || !TAB_LEADERS.has(given.leader))) return bad('The leader of the tab stop is not valid');
+  const out: TabStop = { pos: given.pos, align: given.align };
+  if (given.leader !== undefined && given.leader !== 'none') out.leader = given.leader;
+  return out;
+}
+
+/** A change of tab stops, checked: what it sets, the positions it clears, whether it clears all. */
+function readTabsPatch(patch: unknown): { set: TabStop[]; clear: number[]; all: boolean } {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return bad('The change of tab stops is not valid');
+  const given = patch as Record<string, unknown>;
+  for (const key of Object.keys(given)) if (key !== 'set' && key !== 'clear' && key !== 'clearAll') return bad('The change of tab stops is not valid');
+  if (given.set !== undefined && (!Array.isArray(given.set) || given.set.length > MAX_TAB_STOPS)) return bad('The change of tab stops is not valid');
+  if (given.clear !== undefined && (!Array.isArray(given.clear) || given.clear.length > MAX_TAB_STOPS)) return bad('The change of tab stops is not valid');
+  if (given.clearAll !== undefined && typeof given.clearAll !== 'boolean') return bad('The change of tab stops is not valid');
+  const set = ((given.set as unknown[]) || []).map((tab) => tabStopOf(tab));
+  const clear = ((given.clear as unknown[]) || []).map((pos) => (isWhole(pos, -MAX_TAB_POS, MAX_TAB_POS) ? pos : bad('The position of the tab stop is not valid')));
+  return { set, clear, all: given.clearAll === true };
+}
+
+/**
+ * The tab stops a paragraph states itself to have the stops asked for, given those its style
+ * gives it (`inherited`, without "clear" entries): what differs from the style is stated, a stop
+ * of the style that is not wanted is cleared. Sorted by position; undefined when none is needed.
+ */
+function tabsFor(direct: TabStop[] | undefined, inherited: TabStop[], patch: { set: TabStop[]; clear: number[]; all: boolean }): TabStop[] | undefined {
+  // The stops the paragraph has now, by position.
+  const now = new Map<number, TabStop>();
+  for (const tab of inherited) now.set(tab.pos, tab);
+  for (const tab of direct || []) {
+    if (tab.align === 'clear') now.delete(tab.pos);
+    else now.set(tab.pos, tab);
+  }
+  if (patch.all) now.clear();
+  for (const pos of patch.clear) now.delete(pos);
+  for (const tab of patch.set) now.set(tab.pos, tab);
+  // What the style gives and is still wanted as it is needs no word; the rest is said.
+  const out: TabStop[] = [];
+  const style = new Map<number, TabStop>();
+  for (const tab of inherited) style.set(tab.pos, tab);
+  for (const [pos, tab] of now) {
+    const from = style.get(pos);
+    if (!from || from.align !== tab.align || (from.leader || 'none') !== (tab.leader || 'none')) out.push(tab);
+  }
+  for (const pos of style.keys()) if (!now.has(pos)) out.push({ pos, align: 'clear' });
+  out.sort((a, b) => a.pos - b.pos);
+  // What is written counts: the stops and the entries that clear stops of the style.
+  if (out.length > MAX_TAB_STOPS) return bad(`A paragraph has at most ${MAX_TAB_STOPS} tab stops`);
+  return out.length > 0 ? out : undefined;
+}
+
+/** The tab stops a paragraph's style (and the defaults of the document) give it, without those of the paragraph itself. */
+function inheritedTabs(doc: DocModel, props: ParaProps, where: TableContext | undefined): TabStop[] {
+  const bare: ParaProps = { ...props };
+  delete bare.tabs;
+  const resolved = resolveParaProps(doc, bare, where).tabs || [];
+  return resolved.filter((tab) => tab.align !== 'clear');
+}
+
+/** The tab stops of the paragraph at a position, as they apply (its style's and its own), in order. */
+export function paragraphTabStops(doc: DocModel, at: DocRange | DocPosition): TabStop[] {
+  const range = asRange(at);
+  const { story, list } = coveredParagraphs(doc, range);
+  const first = list[0];
+  if (!first) return [];
+  const paragraph = paragraphAt(doc, story, first.path);
+  const resolved = resolveParaProps(doc, paragraph.props, tableContextOf(doc, story, first.path)).tabs || [];
+  return resolved.filter((tab) => tab.align !== 'clear').map((tab) => ({ ...tab }));
+}
 
 /** ST_Jc. */
 const ALIGNMENTS = new Set<string>(['left', 'center', 'right', 'both', 'start', 'end', 'distribute', 'mediumKashida', 'highKashida', 'lowKashida', 'thaiDistribute', 'numTab']);
@@ -600,9 +716,34 @@ function spacingField(key: string, value: unknown): boolean {
  * a style has to be a paragraph style of the document and a list one of its
  * lists.
  */
-export function patchParaProps(props: ParaProps, patch: ParaFormatPatch, doc?: DocModel): ParaProps {
+export function patchParaProps(props: ParaProps, patch: ParaFormatPatch, doc?: DocModel, inherited?: TabStop[]): ParaProps {
   checkPatch(patch, PARA_PATCH_KEYS, 'paragraph');
   const out: ParaProps = { ...props };
+  if (patch.tabs !== undefined) {
+    let tabs: TabStop[] | undefined;
+    if (Array.isArray(patch.tabs)) {
+      // The stops as stated: one per position, in order.
+      if (patch.tabs.length > MAX_TAB_STOPS) bad(`A paragraph has at most ${MAX_TAB_STOPS} tab stops`);
+      const byPos = new Map<number, TabStop>();
+      for (const given of patch.tabs) {
+        const tab = tabStopOf(given, true);
+        if (byPos.has(tab.pos)) bad('Two tab stops are at one position');
+        byPos.set(tab.pos, tab);
+      }
+      tabs = Array.from(byPos.values()).sort((a, b) => a.pos - b.pos);
+      if (tabs.length === 0) tabs = undefined;
+    } else if (patch.tabs !== null) tabs = tabsFor(props.tabs, inherited || [], readTabsPatch(patch.tabs));
+    if (tabs) out.tabs = tabs;
+    else {
+      delete out.tabs;
+      // A <w:tabs> the model holds only in part would be written back as it was once no field stands for it: it goes with the stops.
+      if (out.extras && out.extras.some((extra) => extra.index >= 0 && localOf(extra.el.name) === 'tabs')) {
+        const extras = out.extras.filter((extra) => extra.index < 0 || localOf(extra.el.name) !== 'tabs');
+        if (extras.length > 0) out.extras = extras;
+        else delete out.extras;
+      }
+    }
+  }
   for (const key of PARA_FLAGS) {
     const value = patch[key];
     checkFlag(value, key);
@@ -679,12 +820,28 @@ export function setParaFormat(doc: DocModel, at: DocRange | DocPosition, patch: 
     doc,
     (draft) => {
       patchParaProps(EMPTY_PARA_PROPS, patch, doc);
-      mapParaProps(draft, range, (props) => patchParaProps(props, patch, doc));
+      // Tab stops are worked out against those each paragraph's style gives it.
+      mapParaProps(draft, range, (props, _paragraph, where) => patchParaProps(props, patch, doc, patch.tabs ? inheritedTabs(doc, props, where) : undefined));
       return range;
     },
     options,
     true,
   );
+}
+
+/**
+ * Sets the distance between the automatic tab stops of the document (the stops every paragraph
+ * has beyond its own), in twips. A setting of the document, not of text: where changes are
+ * tracked it is refused (RangeError(TRACK_UNSUPPORTED)), since Word keeps no trace of it. No
+ * operation when the distance is that already.
+ */
+export function setDefaultTabStop(doc: DocModel, twips: number, at?: DocRange | DocPosition, options?: DocEditOptions): DocEdit {
+  if (!(typeof twips === 'number' && twips >= MIN_DEFAULT_TAB && twips <= MAX_DEFAULT_TAB && Math.floor(twips) === twips)) bad('The default tab stop is not valid');
+  const range = at ? asRange(at) : { anchor: { story: 'body', path: [0], offset: 0 }, focus: { story: 'body', path: [0], offset: 0 } };
+  return buildEdit(doc, (draft) => {
+    if (doc.settings.defaultTabStop !== twips) draft.apply({ type: 'setDefaultTabStop', twips });
+    return range;
+  }, options);
 }
 
 /** Paragraph properties that take a paragraph out of its list: the numbering removed, or switched off when a style brings it. */

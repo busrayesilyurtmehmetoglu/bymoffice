@@ -1,6 +1,8 @@
 // The few words the views themselves say: labels for assistive technology, the
 // header menu, notes, the document view's bar. Content of files is never translated.
 
+import type { TabStopsStrings } from './doc-tabs-dialog';
+
 export interface UiStrings {
   spreadsheet: string;
   cellEditor: string;
@@ -29,6 +31,18 @@ export interface UiStrings {
   tooManyCells: string;
   tooManyRows(action: 'format' | 'resize' | 'change'): string;
   cannotMergeWhole: string;
+  cannotMergeArray(ref: string): string;
+  cannotMergeTable: string;
+  cannotMergePivot(name: string): string;
+  cannotMergeFiltered: string;
+  /** The question before a merge discards what `count` cells hold: its title, what it explains, and the answer that merges. */
+  mergeLossTitle: string;
+  mergeLossQuestion(count: number): string;
+  mergeConfirm: string;
+  /** Said for assistive technology after the panes were frozen ("" rows/columns) or unfrozen. */
+  panesFrozen(rows: number, cols: number): string;
+  /** The dialog of the tab stops of a document. */
+  tabs: TabStopsStrings;
   insertPushesOff(count: number, axis: string): string;
   arrayFormulaBlocks(kind: 'insert' | 'delete', axis: string, ref: string): string;
   /** `what` names the content in the way: comments, drawings, tables. */
@@ -690,6 +704,35 @@ export const STRINGS_EN: UiStrings = {
   tooManyCells: 'Too many cells to format at once',
   tooManyRows: (action) => `Too many rows to ${action} at once`,
   cannotMergeWhole: 'Whole rows or columns cannot be merged',
+  cannotMergeArray: (ref) => `Cells cannot be merged through the array formula in ${ref}`,
+  cannotMergeTable: 'Cells cannot be merged in a sheet with a table yet',
+  cannotMergePivot: (name) => `Cells of the pivot table "${name}" cannot be merged`,
+  cannotMergeFiltered: 'Cells cannot be merged across rows the filter hides',
+  mergeLossTitle: 'Merge cells',
+  mergeLossQuestion: (count) => `Merging keeps only the value of the upper-left cell. ${count === 1 ? 'The value of 1 other cell is' : `The values of ${count} other cells are`} discarded.`,
+  mergeConfirm: 'Merge',
+  panesFrozen: (rows, cols) => (rows === 0 && cols === 0 ? 'Panes unfrozen' : `Frozen: ${rows} ${rows === 1 ? 'row' : 'rows'}, ${cols} ${cols === 1 ? 'column' : 'columns'}`),
+  tabs: {
+    title: 'Tabs',
+    stops: 'Tab stops',
+    none: 'No tab stops: the default ones apply',
+    position: 'Position',
+    alignment: 'Alignment',
+    leader: 'Leader',
+    aligns: { left: 'Left', center: 'Centre', right: 'Right', decimal: 'Decimal', bar: 'Bar' },
+    leaders: { none: 'None', dot: 'Dots', hyphen: 'Dashes', underscore: 'Line', heavy: 'Heavy line', middleDot: 'Middle dots' },
+    set: 'Set',
+    clear: (stop) => `Clear the tab stop at ${stop}`,
+    clearAll: 'Clear all',
+    defaultStops: 'Default tab stops',
+    ok: 'OK',
+    cancel: 'Cancel',
+    unit: 'in',
+    decimal: '.',
+    badPosition: 'Type a position between -22 and 22 inches',
+    badDefault: 'Type a distance greater than 0 and at most 22 inches',
+    defaultShared: 'Not changed while the document is edited together',
+  },
   insertPushesOff: (count, axis) => `Cannot insert ${count} ${axis === 'row' ? 'row' : 'column'}(s): cells would be pushed off the sheet`,
   arrayFormulaBlocks: (kind, axis, ref) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'} through the array formula in ${ref}`,
   notSupportedWith: (kind, axis, what) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'} in a sheet with ${what}: not supported yet`,
@@ -1307,6 +1350,35 @@ export const STRINGS_TR: UiStrings = {
         ? 'Bir kerede boyutlandırılamayacak kadar çok satır seçili'
         : 'Bir kerede değiştirilemeyecek kadar çok satır seçili',
   cannotMergeWhole: 'Tam satırlar ya da sütunlar birleştirilemez',
+  cannotMergeArray: (ref) => `${ref} aralığındaki dizi formülünün içinden hücre birleştirilemez`,
+  cannotMergeTable: 'Tablo içeren bir sayfada hücre birleştirme henüz desteklenmiyor',
+  cannotMergePivot: (name) => `"${name}" özet tablosunun hücreleri birleştirilemez`,
+  cannotMergeFiltered: 'Süzgecin gizlediği satırların üzerinden hücre birleştirilemez',
+  mergeLossTitle: 'Hücreleri birleştir',
+  mergeLossQuestion: (count) => `Birleştirme yalnız sol üst hücrenin değerini korur. Diğer ${count} hücrenin değeri silinir.`,
+  mergeConfirm: 'Birleştir',
+  panesFrozen: (rows, cols) => (rows === 0 && cols === 0 ? 'Bölmelerin dondurulması kaldırıldı' : `Dondurulan: ${rows} satır, ${cols} sütun`),
+  tabs: {
+    title: 'Sekmeler',
+    stops: 'Sekme durakları',
+    none: 'Sekme durağı yok: varsayılanlar geçerli',
+    position: 'Konum',
+    alignment: 'Hizalama',
+    leader: 'Dolgu',
+    aligns: { left: 'Sol', center: 'Orta', right: 'Sağ', decimal: 'Ondalık', bar: 'Çubuk' },
+    leaders: { none: 'Yok', dot: 'Noktalar', hyphen: 'Tireler', underscore: 'Çizgi', heavy: 'Kalın çizgi', middleDot: 'Orta noktalar' },
+    set: 'Ekle',
+    clear: (stop) => `${stop} konumundaki sekme durağını kaldır`,
+    clearAll: 'Tümünü temizle',
+    defaultStops: 'Varsayılan sekme aralığı',
+    ok: 'Tamam',
+    cancel: 'İptal',
+    unit: 'cm',
+    decimal: ',',
+    badPosition: '-55,88 ile 55,88 cm arasında bir konum yazın',
+    badDefault: '0 ile 55,88 cm arasında bir aralık yazın',
+    defaultShared: 'Belge birlikte düzenlenirken değiştirilemez',
+  },
   insertPushesOff: (count, axis) => `${count} ${axis === 'row' ? 'satır' : 'sütun'} eklenemiyor: hücreler sayfanın dışına itilirdi`,
   arrayFormulaBlocks: (kind, axis, ref) =>
     `${ref} aralığındaki dizi formülünün içinden ${axis === 'row' ? 'satır' : 'sütun'} ${kind === 'insert' ? 'eklenemez' : 'silinemez'}`,

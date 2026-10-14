@@ -79,7 +79,7 @@ import { decodeXmlBytes, parseXml, serializeXml, type XmlDocument, type XmlEleme
 import { ZipArchive } from '../../zip';
 import { DEFAULT_AUTHOR, largestAnnotationId } from '../../ops/doc/track';
 import { resolveColor, resolveFont } from './resolve';
-import { WORD_NAMESPACES, parseOnOff } from './common';
+import { MAX_TWIPS, WORD_NAMESPACES, parseMeasure, parseOnOff } from './common';
 import {
   COMMENTS_EXTENDED_REL,
   COMMENTS_EXTENDED_TYPE,
@@ -311,6 +311,12 @@ function splicedPart(original: Uint8Array, splices: { start: number; end: number
   }
   return bytes;
 }
+
+/** What a document without a default tab stop of its own has: half an inch. */
+const DEFAULT_TAB_STOP = 720;
+
+/** The children of <w:settings> the schema puts between <w:trackRevisions> and <w:defaultTabStop>. */
+const BEFORE_DEFAULT_TAB_STOP = new Set<string>(['trackRevisions', 'doNotTrackMoves', 'doNotTrackFormatting', 'documentProtection', 'autoFormatOverride', 'styleLockTheme', 'styleLockQFSet']);
 
 /** The children of <w:settings> the schema puts before <w:trackRevisions>. */
 const BEFORE_TRACK_REVISIONS = new Set<string>([
@@ -675,58 +681,91 @@ function produceDocx(pkg: OpcPackage, doc: DocModel, options: WriteDocxOptions, 
     }
   }
 
-  // The one setting an edit changes: whether changes are tracked. The settings part is written when the model
-  // says otherwise than the file does, and then nothing in it changes but <w:trackRevisions>.
+  // The settings an edit changes: whether changes are tracked, and the distance between automatic tab stops. The
+  // settings part is written when the model says otherwise than the file does, and then nothing in it changes but
+  // the elements of those settings.
   let tracking: { part: string; data: Uint8Array; contentType?: string; relate: boolean } | undefined;
   {
     const wanted = doc.settings.trackRevisions === true;
+    const wantedTab = doc.settings.defaultTabStop;
     const rels = new RelsEdit(originalOf(relsPartOf(main)));
     const existing = rels.partOf(main, '/settings');
     const part = existing || dir + 'settings.xml';
     const original = originalOf(part);
     if (!original) {
-      if (wanted) {
+      if (wanted || wantedTab !== DEFAULT_TAB_STOP) {
         const attrs = generatedRootAttrs(doc.strict);
         const ctx = createBodyContext(part, attrs, new Map(), shared);
         let text = XML_DECLARATION + `<${ctx.w}settings`;
         for (const [name, value] of attrs) text += ` ${name}="${value}"`;
-        text += `><${ctx.w}trackRevisions/></${ctx.w}settings>`;
+        text += '>';
+        if (wanted) text += `<${ctx.w}trackRevisions/>`;
+        if (wantedTab !== DEFAULT_TAB_STOP) text += `<${ctx.w}defaultTabStop ${ctx.w}val="${wantedTab}"/>`;
+        text += `</${ctx.w}settings>`;
         tracking = { part, data: encodePart(text), contentType: CONTENT_TYPES.settings, relate: !existing };
       }
     } else {
       const source = decodePart(original);
       const scan = scanPart(source);
       const ctx = scan ? createBodyContext(part, scan.rootAttrs, new Map(), shared) : undefined;
-      // The setting as the reader reads it: the last element that states a value counts.
+      // The settings as the reader reads them: the last element that states a value counts.
       let stated = false;
+      let statedTab = DEFAULT_TAB_STOP;
       const marks: { start: number; end: number }[] = [];
+      const tabMarks: { start: number; end: number }[] = [];
       let place = scan ? scan.contentStart : 0;
+      let tabPlace = place;
+      const valOf = (attrs: [string, string][], w: string): string | undefined => {
+        let val: string | undefined;
+        for (const [name, value] of attrs) {
+          const colon = name.indexOf(':');
+          if ((colon < 0 || name.slice(0, colon + 1) === w) && name.slice(colon + 1) === 'val') val = value;
+        }
+        return val;
+      };
       if (scan && ctx) {
         for (const child of scan.children) {
           if (child.kind === 'trackRevisions') {
             marks.push(child);
-            let val: string | undefined;
-            for (const [name, value] of child.attrs) {
-              const colon = name.indexOf(':');
-              if ((colon < 0 || name.slice(0, colon + 1) === ctx.w) && name.slice(colon + 1) === 'val') val = value;
-            }
-            const value = parseOnOff(val);
+            const value = parseOnOff(valOf(child.attrs, ctx.w));
             if (value !== undefined) stated = value;
-          } else if (BEFORE_TRACK_REVISIONS.has(child.kind)) place = child.end;
+            tabPlace = child.end;
+          } else if (child.kind === 'defaultTabStop') {
+            tabMarks.push(child);
+            const val = valOf(child.attrs, ctx.w);
+            const value = val === undefined ? undefined : parseMeasure(val, 20, 0, MAX_TWIPS);
+            if (value !== undefined) statedTab = value;
+          } else {
+            if (BEFORE_TRACK_REVISIONS.has(child.kind)) place = child.end;
+            if (BEFORE_TRACK_REVISIONS.has(child.kind) || BEFORE_DEFAULT_TAB_STOP.has(child.kind)) tabPlace = child.end;
+          }
         }
       }
+      const changes = stated !== wanted || statedTab !== wantedTab;
       if (!scan || !ctx) {
         // What the file says cannot be told: it is left as it is.
         if (wanted && report) report.warnings.push(`${part} could not be followed; the tracking of changes was not written to it`);
-      } else if (stated !== wanted) {
-        const element = `<${ctx.w}trackRevisions/>`;
+        if (wantedTab !== DEFAULT_TAB_STOP && report) report.warnings.push(`${part} could not be followed; the default tab stop was not written to it`);
+      } else if (changes) {
         // Places in the text as the scanner read it; the bytes are changed at the same places of the text as it
         // was written, so that a byte order mark and the line ends of the file stay what they were.
         const splices: { start: number; end: number; text: string }[] = [];
-        if (scan.selfClosing) splices.push({ start: scan.contentStart - 2, end: scan.contentStart, text: `>${element}</${scan.rootName}>` });
-        else if (!marks.length) splices.push({ start: place, end: place, text: element });
-        // Every statement of the setting goes; the new one takes the place of the first.
-        else for (let i = 0; i < marks.length; i++) splices.push({ start: marks[i].start, end: marks[i].end, text: i === 0 && wanted ? element : '' });
+        const element = `<${ctx.w}trackRevisions/>`;
+        const tabElement = `<${ctx.w}defaultTabStop ${ctx.w}val="${wantedTab}"/>`;
+        if (scan.selfClosing) {
+          splices.push({ start: scan.contentStart - 2, end: scan.contentStart, text: `>${wanted ? element : ''}${statedTab !== wantedTab ? tabElement : ''}</${scan.rootName}>` });
+        } else {
+          if (stated !== wanted) {
+            if (!marks.length) splices.push({ start: place, end: place, text: element });
+            // Every statement of the setting goes; the new one takes the place of the first.
+            else for (let i = 0; i < marks.length; i++) splices.push({ start: marks[i].start, end: marks[i].end, text: i === 0 && wanted ? element : '' });
+          }
+          if (statedTab !== wantedTab) {
+            // Behind <w:trackRevisions> when that is put in at the same place.
+            if (!tabMarks.length) splices.push({ start: tabPlace, end: tabPlace, text: tabElement });
+            else for (let i = 0; i < tabMarks.length; i++) splices.push({ start: tabMarks[i].start, end: tabMarks[i].end, text: i === 0 ? tabElement : '' });
+          }
+        }
         tracking = { part, data: splicedPart(original, splices), relate: false };
       }
     }

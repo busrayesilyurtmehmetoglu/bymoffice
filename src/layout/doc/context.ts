@@ -286,7 +286,9 @@ export class LayoutContext {
     this.doc = doc;
     this.measurer = measurer;
     this.options = options;
-    const tab = twips(doc.settings.defaultTabStop);
+    // The setting as the file states it may be anything a reader takes (0, a fraction, more than a page): laid out within what Word takes.
+    const stated = doc.settings.defaultTabStop;
+    const tab = twips(typeof stated === 'number' && stated > 0 ? Math.min(stated, 31680) : 0);
     this.defaultTab = tab >= 1 ? tab : 48;
     const mode = Number(doc.settings.compatSettings.get('compatibilityMode'));
     this.compatMode = mode >= 11 && mode <= 99 ? mode : 12;

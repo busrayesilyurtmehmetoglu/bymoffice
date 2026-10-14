@@ -1,20 +1,25 @@
 // Editing of documents: positions, operations, commands and undo.
 
 export * from './position';
-export { applyDocOp, applyDocOps, type DocOp } from './ops';
+export { MAX_DEFAULT_TAB, MIN_DEFAULT_TAB, applyDocOp, applyDocOps, type DocOp } from './ops';
 export { DocHistory } from './history';
 export { buildEdit, Draft, type DocEdit, type DocEditOptions } from './draft';
 export { deleteBackward, deleteForward, deleteRange, expandRangeForTables, insertBlock, insertPageBreak, insertText, splitParagraph } from './text';
 export {
+  MAX_TAB_STOPS,
   indentList,
+  paragraphTabStops,
   patchParaProps,
   patchRunProps,
   rangeFormat,
+  setDefaultTabStop,
   setParaFormat,
   setRunFormat,
   toggleList,
   toggleRunFormat,
   type ParaFormatPatch,
+  type TabStopSpec,
+  type TabStopsPatch,
   type RangeFormat,
   type RunFormatPatch,
   type ToggleKey,

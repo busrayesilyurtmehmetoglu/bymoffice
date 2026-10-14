@@ -42,7 +42,7 @@ import type {
 } from '../../model/doc/types';
 import { TABLE_LOOK_BITS } from '../../model/doc/types';
 import type { XmlElement, XmlNode } from '../../xml';
-import { kindOf, serializeElement, type PartContext } from './common';
+import { MAX_TWIPS, kindOf, parseMeasure, serializeElement, type PartContext } from './common';
 import { readCellProps, readParaProps, readRowProps, readRunProps, readSectionProps, readTableProps } from './props';
 
 /** What the property writers need to know about the part they write into. */
@@ -878,14 +878,27 @@ export function mergeKept(kept: XmlElement, understood: XmlElement | undefined, 
   }
   for (const [name, value] of wanted.attrs) if (!kept.attrs.has(name)) attrs.set(name, value);
 
-  // Children pair up by name and order: the n-th <x> of each.
+  // Children pair up by name and order: the n-th <x> of each. The stops of a <w:tabs> pair up by their position
+  // instead, so that what the model does not hold of a stop stays with that stop (and goes with it).
+  const byPosition = localOf(kept.name) === 'tabs';
+  const keyOf = (el: XmlElement, n: number): string => {
+    if (byPosition && localOf(el.name) === 'tab') {
+      // As the reader takes it (attr() of common.ts): the attribute in the namespace of the element, then one without a prefix.
+      const colon = el.name.indexOf(':');
+      const prefix = colon >= 0 ? el.name.slice(0, colon + 1) : '';
+      const stated = el.attrs.has(prefix + 'pos') ? el.attrs.get(prefix + 'pos') : el.attrs.get('pos');
+      const pos = stated === undefined ? undefined : parseMeasure(stated, 20, -MAX_TWIPS, MAX_TWIPS);
+      if (pos !== undefined) return el.name + '\npos ' + pos;
+    }
+    return el.name + '\n' + n;
+  };
   const nth = (list: XmlElement[]) => {
     const seen = new Map<string, number>();
     const map = new Map<string, XmlElement>();
     for (const el of list) {
       const n = seen.get(el.name) || 0;
       seen.set(el.name, n + 1);
-      map.set(el.name + '\n' + n, el);
+      map.set(keyOf(el, n), el);
     }
     return map;
   };
@@ -902,7 +915,7 @@ export function mergeKept(kept: XmlElement, understood: XmlElement | undefined, 
     }
     const n = seen.get(node.name) || 0;
     seen.set(node.name, n + 1);
-    const key = node.name + '\n' + n;
+    const key = keyOf(node, n);
     const was = understoodChildren.get(key);
     const now = wantedChildren.get(key);
     if (now) {

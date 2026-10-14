@@ -159,7 +159,9 @@ export class Toolbar {
     this.addButton('alignRight', () => this.align('right'), true);
     this.addSeparator();
     this.addButton('wrapText', () => host.view.format({ wrapText: host.view.selectionFormat.alignment.wrapText !== true }), true);
-    this.addButton('merge', () => (host.view.selectionMerged ? host.view.unmerge() : host.view.merge()), true);
+    // Values the merge would discard are asked about first.
+    this.addButton('merge', () => (host.view.selectionMerged ? host.view.unmerge() : void host.view.requestMerge()), true);
+    this.addMenuButton('mergeOptions', 'menu', () => this.openMerge());
     this.addSeparator();
     this.formatSelect = this.addSelect('bym-tb-format');
     this.addSeparator();
@@ -216,7 +218,7 @@ export class Toolbar {
     this.setDisabled('undo', view.readOnly || typing || !view.canUndo);
     this.setDisabled('redo', view.readOnly || typing || !view.canRedo);
     this.updateSave(typing);
-    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
+    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.sizeSelect.disabled = !editable;
     this.formatSelect.disabled = !editable;
@@ -371,6 +373,7 @@ export class Toolbar {
       alignRight: s.alignRight,
       wrapText: s.wrapText,
       merge: s.mergeCells,
+      mergeOptions: s.mergeOptions,
       sortAscending: s.sortAscending,
       sortDescending: s.sortDescending,
       filter: s.filter,
@@ -576,6 +579,18 @@ export class Toolbar {
     this.open('chart', charts.insert, items);
   }
 
+  /** The ways of merging the selection, and of splitting it again. */
+  private openMerge(): void {
+    const s = this.strings;
+    const view = this.host.view;
+    const items: PopoverItem[] = [
+      { label: s.mergeAndCenter, action: () => this.host.run(() => void view.requestMerge({ center: true })) },
+      { label: s.mergeCells, action: () => this.host.run(() => void view.requestMerge()) },
+      { label: s.unmergeCells, action: () => this.host.run(() => view.unmerge()) },
+    ];
+    this.open('mergeOptions', s.mergeOptions, items);
+  }
+
   private openRowsColumns(): void {
     const s = this.strings;
     const view = this.host.view;
@@ -597,6 +612,13 @@ export class Toolbar {
     }
     if (withRows) add(s.deleteRows(rows), () => view.deleteRows(range.top, rows));
     if (withColumns) add(s.deleteColumns(columns), () => view.deleteColumns(range.left, columns));
+    // Frozen panes: at the active cell (when it is not the first one), the top row, the first column, and none.
+    const active = view.selection.active;
+    const frozen = view.frozenPanes;
+    if (active.row > 0 || active.col > 0) add(s.freezePanes, () => view.freezePanes());
+    add(s.freezeTopRow, () => view.freezePanes(1, 0));
+    add(s.freezeFirstColumn, () => view.freezePanes(0, 1));
+    if (frozen.rows > 0 || frozen.cols > 0) add(s.unfreezePanes, () => view.unfreezePanes());
     if (items.length > 0) this.open('rowsColumns', s.rowsAndColumns, items);
   }
 

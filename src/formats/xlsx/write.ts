@@ -66,6 +66,7 @@ import { pivotPartsToRead, pivotWrites } from './pivot-write';
 import { parseColor } from './styles';
 import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
 import { keptFor, keptNow, ownCellFormulaAt, ownCellSpelling, type CellSpelling } from '../../ops/rules';
+import { paneOf, samePane } from '../../ops/ops';
 
 const encoder = new TextEncoder();
 
@@ -3529,6 +3530,124 @@ function setTabColorIn(original: Uint8Array, color: Color | undefined, sheetName
   return spliceExact(original, [{ start: properties.start + element.openEnd, end: properties.start + element.openEnd, text }]);
 }
 
+/** Whether the panes of a sheet of the file are other ones than it came with ("setPane"). */
+function panesChanged(sheet: Sheet): boolean {
+  return !!sheet.paneModified && sheet.kind === 'worksheet' && sheet.part !== '' && !(sheet.paneRead && samePane(sheet.paneRead, paneOf(sheet)));
+}
+
+/** The panes of the selections of a view with panes frozen like this, the active one last (as Excel writes them). */
+function panesFor(rows: number, cols: number): string[] {
+  if (rows > 0 && cols > 0) return ['topRight', 'bottomLeft', 'bottomRight'];
+  if (rows > 0) return ['bottomLeft'];
+  if (cols > 0) return ['topRight'];
+  return ['topLeft'];
+}
+
+/** The start tag of an element with one attribute (without a prefix) set to a value, or removed. */
+function withStartAttr(tag: string, name: string, value: string | undefined): string {
+  const pattern = new RegExp(`\\s${name}\\s*=\\s*(?:"[^"]*"|'[^']*')`);
+  const present = pattern.exec(tag);
+  if (value === undefined) return present ? tag.slice(0, present.index) + tag.slice(present.index + present[0].length) : tag;
+  const text = ` ${name}="${escapeAttr(value)}"`;
+  if (present) return tag.slice(0, present.index) + text + tag.slice(present.index + present[0].length);
+  // Before the end of the tag: "/>" or ">".
+  const end = tag.charAt(tag.length - 2) === '/' ? tag.length - 2 : tag.length - 1;
+  return tag.slice(0, end) + text + tag.slice(end);
+}
+
+/**
+ * A sheet part with the panes of its first view as the model has them (SheetView.frozenRows,
+ * frozenCols, topLeftCell, firstVisibleCell): its <pane> is replaced (a split one too), and its
+ * <selection> elements are given to the panes the view has now - the one of the pane that was
+ * active goes to the pane that is active now, with everything it says, and every other pane gets
+ * an empty one. The other attributes and children of the view, and every other byte of the part,
+ * stay. A part without views gets one when the panes are frozen. Undefined when nothing changes.
+ */
+function setPaneIn(original: Uint8Array, sheet: Sheet): Uint8Array | undefined {
+  const s = decodeSource(original);
+  const root = rawElement(s);
+  const rootLocal = localName(root.name);
+  if (rootLocal !== 'worksheet' && rootLocal !== 'dialogsheet' && rootLocal !== 'macrosheet') {
+    throw new Error(`Cannot write sheet "${sheet.name}": its part has the root element <${root.name}>, not a worksheet`);
+  }
+  const prefix = root.name.slice(0, root.name.length - rootLocal.length);
+  const view = sheet.view;
+  const rows = view.frozenRows > 0 ? view.frozenRows : 0;
+  const cols = view.frozenCols > 0 ? view.frozenCols : 0;
+  const panes = panesFor(rows, cols);
+  const active = panes[panes.length - 1];
+  const paneXml = (p: string): string => {
+    if (rows === 0 && cols === 0) return '';
+    const topLeft = view.topLeftCell !== undefined && parseCellRef(view.topLeftCell) ? view.topLeftCell : cellName(rows, cols);
+    let out = `<${p}pane`;
+    if (cols > 0) out += ` xSplit="${cols}"`;
+    if (rows > 0) out += ` ySplit="${rows}"`;
+    return `${out} topLeftCell="${escapeAttr(topLeft)}" activePane="${active}" state="frozen"/>`;
+  };
+  const firstVisible = view.firstVisibleCell !== undefined && parseCellRef(view.firstVisibleCell) ? view.firstVisibleCell : undefined;
+  const views = root.children.find((child) => child.local === 'sheetViews');
+  if (!views) {
+    if (rows === 0 && cols === 0 && firstVisible === undefined) return undefined;
+    if (root.selfClosing) throw new Error(`Cannot write sheet "${sheet.name}": its part has no <sheetData>`);
+    const selections = panes.map((pane) => (pane === 'topLeft' ? '' : `<${prefix}selection pane="${pane}"/>`)).join('');
+    const inner = paneXml(prefix) + selections;
+    const open = `<${prefix}sheetView${firstVisible !== undefined ? ` topLeftCell="${escapeAttr(firstVisible)}"` : ''} workbookViewId="0"`;
+    const text = `<${prefix}sheetViews>${inner === '' ? `${open}/>` : `${open}>${inner}</${prefix}sheetView>`}</${prefix}sheetViews>`;
+    const rank = WORKSHEET_ORDER.indexOf('sheetViews');
+    const behind = root.children.find((child) => worksheetRank(s, child.start, child.local) > rank);
+    const at = behind ? behind.start : root.closeStart;
+    return spliceExact(original, [{ start: at, end: at, text }]);
+  }
+  const list = rawElement(s.slice(views.start, views.end));
+  const first = list.children.find((child) => child.local === 'sheetView');
+  if (!first) throw new Error(`Cannot write the panes of sheet "${sheet.name}": its <sheetViews> holds no <sheetView>`);
+  const base = views.start + first.start;
+  const raw = s.slice(base, views.start + first.end);
+  const element = rawElement(raw);
+  const p = element.name.slice(0, element.name.length - localName(element.name).length);
+  const splices: Splice[] = [];
+  // The first cell of the view, on its start tag.
+  const tag = raw.slice(element.start, element.openEnd);
+  const newTag = withStartAttr(tag, 'topLeftCell', firstVisible);
+  // The selections of the view, and which pane was the active one.
+  let wasActive = 'topLeft';
+  const selections: { pane: string; text: string }[] = [];
+  let placeAt = -1;
+  for (const child of element.children) {
+    if (child.local !== 'pane' && child.local !== 'selection') continue;
+    if (placeAt < 0) placeAt = child.start;
+    const text = raw.slice(child.start, child.end);
+    const attrs = parseXml(text).root.attrs;
+    if (child.local === 'pane') wasActive = attrs.get('activePane') || 'topLeft';
+    else selections.push({ pane: attrs.get('pane') || 'topLeft', text });
+    splices.push({ start: base + child.start, end: base + child.end, text: '' });
+  }
+  const main = selections.find((selection) => selection.pane === wasActive) || selections[0];
+  let inner = paneXml(p);
+  for (const pane of panes) {
+    if (pane === active && main) {
+      // The pane first, as Excel writes it; everything else of the selection as it was.
+      const end = startTagEnd(main.text, 0);
+      const bare = withStartAttr(main.text.slice(0, end), 'pane', undefined);
+      const name = /^<[^\s/>]+/.exec(bare)![0];
+      inner += name + (pane === 'topLeft' ? '' : ` pane="${pane}"`) + bare.slice(name.length) + main.text.slice(end);
+    }
+    else if (pane !== 'topLeft') inner += `<${p}selection pane="${pane}"/>`;
+  }
+  if (element.selfClosing) {
+    if (inner !== '') splices.push({ start: base + element.start, end: base + element.openEnd, text: `${newTag.slice(0, newTag.length - 2)}>${inner}</${element.name}>` });
+    else if (newTag !== tag) splices.push({ start: base + element.start, end: base + element.openEnd, text: newTag });
+  } else {
+    if (newTag !== tag) splices.push({ start: base + element.start, end: base + element.openEnd, text: newTag });
+    const at = placeAt >= 0 ? base + placeAt : base + element.openEnd;
+    // Before the removal of what was at that place: splices at one offset are applied in the order they were made.
+    if (inner !== '') splices.unshift({ start: at, end: at, text: inner });
+  }
+  // What takes the place of a pane and its selections may be what was there.
+  if (applySplices(s, splices) === s) return undefined;
+  return spliceExact(original, splices);
+}
+
 /** The comments read so far of a sheet, over all of its comment parts: what the reader took as the comments of the sheet. */
 interface CommentsScan {
   seen: Set<number>;
@@ -4422,8 +4541,9 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     (!!sheet.validationsModified && (!sheet.validationsRead || sheet.validationsRead.list !== sheet.dataValidations)) ||
     (!!sheet.conditionalModified && (!sheet.conditionalRead || sheet.conditionalRead.list !== sheet.conditionalFormats)) ||
     (!!sheet.drawingsModified && (!sheet.drawingsRead || sheet.drawingsRead.list !== sheet.drawings)) ||
-    (!!sheet.tabColorModified && !(sheet.tabColorRead && sameColor(sheet.tabColorRead.color, sheet.tabColor)));
-  const flagged = (sheet: Sheet): boolean => !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified);
+    (!!sheet.tabColorModified && !(sheet.tabColorRead && sameColor(sheet.tabColorRead.color, sheet.tabColor))) ||
+    panesChanged(sheet);
+  const flagged = (sheet: Sheet): boolean => !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified || sheet.paneModified);
   const sheetsModified = !!workbook.sheetsModified || sheets.some((sheet) => sheet.part === '');
   // The parts of refreshed pivot tables, and of those an earlier save wrote, are written from the bytes of the file.
   for (const part of pivotPartsToRead(workbook)) reads.bytes(part);
@@ -4540,7 +4660,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   const notesModified = workbook.sheets.some((sheet) => sheet.commentsModified && sheet.kind !== 'chartsheet');
   const rulesModified = workbook.sheets.some((sheet) => (sheet.validationsModified || sheet.conditionalModified) && sheet.kind !== 'chartsheet');
   const chartsModified = workbook.sheets.some((sheet) => sheet.drawingsModified && sheet.kind === 'worksheet');
-  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !workbook.pivotsModified) return;
+  // Panes set back to those of the file still bring back a part an earlier save wrote.
+  const panesModified = workbook.sheets.some((sheet) => !!sheet.paneModified);
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !panesModified && !workbook.pivotsModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
@@ -5303,6 +5425,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const coloured = bytes ? setTabColorIn(bytes, sheet.tabColor, sheet.name) : undefined;
     if (coloured) tabbed.set(sheet, coloured);
   }
+  // Frozen panes, the same way: panes that are those the sheet came with again cost nothing.
+  const paned = new Set<Sheet>();
+  for (const sheet of workbook.sheets) if (panesChanged(sheet)) paned.add(sheet);
 
   // Rules that were added, changed or deleted: a list that is the one the sheet came with again (undone) is no change.
   const ruled = new Set<Sheet>();
@@ -5314,7 +5439,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   // The formats those rules give: records the style sheet gets for as long as a rule asks for them.
   const dxfs = planDxfs(workbook);
 
-  const edited = modifiedSheets.length > 0 || stylesModified || reordered || renamed || restated || fileNotes.size > 0 || tabbed.size > 0 || ruled.size > 0 || dxfs.added.length > 0 || charting.size > 0;
+  const edited =
+    modifiedSheets.length > 0 || stylesModified || reordered || renamed || restated || fileNotes.size > 0 || tabbed.size > 0 || paned.size > 0 || ruled.size > 0 || dxfs.added.length > 0 || charting.size > 0;
   const fileActive = fileActiveOf(book.root, file.length);
   const bookViews = childNamed(book.root, 'bookViews');
   const windows = bookViews ? childrenNamed(bookViews, 'workbookView').length : 0;
@@ -5407,8 +5533,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     // Notes that were added, edited or deleted: the comment parts of the sheet follow the model.
     const notes = fileNotes.get(sheet);
     const tab = tabbed.has(sheet);
+    const pane = paned.has(sheet);
     const rules = ruled.has(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !rules && !charting.has(sheet)) continue;
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !rules && !charting.has(sheet)) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
@@ -5463,6 +5590,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       if (bytes && charts && charts.element !== undefined) next = setSheetDrawing(next || bytes, 'drawing', charts.element, sheet.name) || next;
       // The colour of the tab, in the part as it is by now.
       if (bytes && tab) next = next ? setTabColorIn(next, sheet.tabColor, sheet.name) || next : tabbed.get(sheet);
+      // The panes, in the part as it is by now.
+      if (bytes && pane) next = setPaneIn(next || bytes, sheet) || next;
       if (bytes && next) {
         // From here on the package no longer holds the part as the file had it.
         keep(sheet.part, bytes);
@@ -5474,9 +5603,11 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
       let written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
       if (charts && charts.element !== undefined) written = setSheetDrawing(written, 'drawing', charts.element, sheet.name) || written;
-      const next = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
-      // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation.
-      if (sameBytes(next, bytes)) asInFile.add(sheet);
+      const coloured = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
+      const next = (pane && setPaneIn(coloured, sheet)) || coloured;
+      // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation. Frozen
+      // panes are of the view only: a part that differs from the file by its panes alone asks for none either.
+      if (sameBytes(next, bytes) || (pane && sameBytes(coloured, bytes))) asInFile.add(sheet);
       writes.push([sheet.part, next]);
       rewritten.push(sheet.part);
     }

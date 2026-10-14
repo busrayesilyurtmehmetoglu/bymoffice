@@ -23,12 +23,18 @@ import { canPointAt, fieldSpanLive, formulaFieldTarget, isFormulaText, pointRefe
 import {
   formatAt,
   formatRange,
+  mergeProblem,
   mergeRange,
+  mergeReport,
   setColumnWidth as columnWidthOps,
   setRowHeight as rowHeightOps,
   unmergeRange,
+  type MergeOptions,
+  type MergeReport,
   type StylePatch,
 } from '../ops/format';
+import { freezePanes as freezePaneOps } from '../ops/panes';
+import { askOverwrite, editorRootIn } from './save-confirm';
 import { CalcEngine, type CalcEngineOptions } from '../calc/engine';
 import { ConditionalFormats } from '../format/conditional';
 import { DataValidations, MAX_LIST_ITEMS, ValidationError, tryOps } from '../format/validation';
@@ -933,6 +939,8 @@ export class WorkbookView {
   /** An input method is composing in the editor or in a field of the shell. */
   private composing = false;
   private menu: ContextMenu | undefined;
+  /** Takes away the question a merge that discards values asks (see requestMerge()), while it is open. */
+  private mergeQuestion: (() => void) | undefined;
   /** What dropped down from a cell: the menu of a filter button or the list of a data validation. */
   private panel: FilterMenu | ListMenu | undefined;
   /** What the grid draws for each filter; a filter is replaced, never changed, so one entry serves until then. */
@@ -1394,6 +1402,8 @@ export class WorkbookView {
     if (this.destroyed) return;
     this.endChartDrag(false, 0);
     this.destroyed = true;
+    if (this.mergeQuestion) this.mergeQuestion();
+    this.mergeQuestion = undefined;
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.unwatchFonts) this.unwatchFonts();
     this.unwatchFonts = undefined;
@@ -5975,6 +5985,10 @@ export class WorkbookView {
     if (message === 'Too many cells to format at once') return strings.tooManyCells;
     if ((match = /^Too many rows to (format|resize|change) at once$/.exec(message))) return strings.tooManyRows(match[1] as 'format' | 'resize' | 'change');
     if (message === 'Whole rows or columns cannot be merged') return strings.cannotMergeWhole;
+    if ((match = /^Cannot merge cells through the array formula in (.+)$/.exec(message))) return strings.cannotMergeArray(match[1]);
+    if (message === 'Cannot merge cells in a sheet with a table: not supported yet') return strings.cannotMergeTable;
+    if ((match = /^Cannot merge cells of the pivot table "(.*)"$/.exec(message))) return strings.cannotMergePivot(match[1]);
+    if (message === 'Cannot merge cells across rows the filter hides') return strings.cannotMergeFiltered;
     if ((match = /^Cannot insert (\d+) (row|col)\(s\): cells would be pushed off the sheet$/.exec(message))) return strings.insertPushesOff(Number(match[1]), match[2]);
     if ((match = /^Cannot (insert|delete) (row|col)s through the array formula in (.+)$/.exec(message))) {
       return strings.arrayFormulaBlocks(match[1] as 'insert' | 'delete', match[2], match[3]);
@@ -6095,18 +6109,113 @@ export class WorkbookView {
     this.applyOps(ops);
   }
 
-  /** Merges the selection into one cell, or splits the merges it touches. */
-  merge(): void {
-    if (this.destroyed || this.locked) return;
+  /**
+   * Merges the selection into one cell, as one undo step; with `center` it is centred across as
+   * well ("Merge and center"). As in Excel only the value of the top-left cell stays: what the
+   * others held goes, and is what this returns (see mergeReport()). Nothing is asked here - see
+   * requestMerge() for a merge that asks first. Undefined when nothing was merged (read-only, one
+   * cell). Throws RangeError for a range that cannot be merged (see mergeProblem()).
+   */
+  merge(options?: MergeOptions): MergeReport | undefined {
+    if (this.destroyed || this.locked) return undefined;
     this.commitEditing();
     const range = { ...this.state().range };
-    this.applyOps(mergeRange(this.workbook, this.sheetIndex, range), { active: { row: range.top, col: range.left }, range });
+    const report = mergeReport(this.workbook, this.sheetIndex, range);
+    const done = this.applyOps(mergeRange(this.workbook, this.sheetIndex, range, { center: !!(options && options.center) }), { active: { row: range.top, col: range.left }, range });
+    return done ? report : undefined;
   }
 
+  /**
+   * Merges the selection as merge() does, but asks the user first when values would be discarded
+   * (a question over the editor; "cancel" leaves everything as it was). For the toolbar and the
+   * menus. Resolves to whether the cells were merged.
+   */
+  requestMerge(options?: MergeOptions): Promise<boolean> {
+    if (this.destroyed || this.locked) return Promise.resolve(false);
+    this.commitEditing();
+    const range = { ...this.state().range };
+    const sheet = this.state().sheet;
+    // Refused before anything is asked: the question would be about a merge that cannot be made.
+    const problem = range.top === range.bottom && range.left === range.right ? undefined : mergeProblem(this.workbook, this.sheetIndex, range);
+    if (problem) throw new RangeError(problem);
+    const report = mergeReport(this.workbook, this.sheetIndex, range);
+    if (report.count === 0 || typeof document === 'undefined') return Promise.resolve(this.merge(options) !== undefined);
+    if (this.mergeQuestion) this.mergeQuestion();
+    const strings = this.strings;
+    // Nothing may have changed while the question was open: the epoch of the workbook moves with every change.
+    const epoch = this.printEpoch;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const settle = (merged: boolean): void => {
+        if (settled) return;
+        settled = true;
+        resolve(merged);
+      };
+      const close = askOverwrite({
+        root: editorRootIn(this.container, this.root),
+        kind: 'merge-loss',
+        strings: { saveConflictTitle: strings.mergeLossTitle, saveConflictQuestion: strings.mergeLossQuestion(report.count), saveOverwrite: strings.mergeConfirm, saveCancel: strings.saveCancel },
+        focusView: () => this.focus(),
+        answer: (yes) => {
+          this.mergeQuestion = undefined;
+          // What was asked about is what is merged: not after the selection, the sheet or the workbook changed meanwhile.
+          const now = this.state();
+          const same = now.sheet === sheet && now.range.top === range.top && now.range.left === range.left && now.range.bottom === range.bottom && now.range.right === range.right;
+          if (!yes || this.destroyed || !same || this.printEpoch !== epoch) return settle(false);
+          let merged = false;
+          this.attempt(() => {
+            merged = this.merge(options) !== undefined;
+          });
+          settle(merged);
+        },
+      });
+      // Taken away unanswered (another question, the view going): nothing is merged.
+      this.mergeQuestion = () => {
+        close();
+        settle(false);
+      };
+    });
+  }
+
+  /** Splits every merged range the selection touches, as one undo step. */
   unmerge(): void {
     if (this.destroyed || this.locked) return;
     this.commitEditing();
     this.applyOps(unmergeRange(this.workbook, this.sheetIndex, this.state().range));
+  }
+
+  /** The rows at the top and the columns at the left of the shown sheet that stay in place while it scrolls. */
+  get frozenPanes(): { rows: number; cols: number } {
+    const view = this.state().sheet.view;
+    return { rows: count(view.frozenRows), cols: count(view.frozenCols) };
+  }
+
+  /**
+   * Freezes the first `rows` rows and `cols` columns of the shown sheet (0 and 0 unfreezes) as
+   * one undo step. Without arguments: the rows above and the columns left of the active cell, as
+   * Excel's "Freeze panes" does. The frozen rows and columns are counted from the top and the
+   * left of the sheet, and the scrolling part starts right after them. No-op when read-only.
+   */
+  freezePanes(rows?: number, cols?: number): void {
+    if (this.destroyed || this.locked) return;
+    const state = this.state();
+    const r = rows === undefined && cols === undefined ? state.active.row : rows === undefined ? 0 : rows;
+    const c = rows === undefined && cols === undefined ? state.active.col : cols === undefined ? 0 : cols;
+    this.commitEditing();
+    if (!this.applyOps(freezePaneOps(this.workbook, this.sheetIndex, r, c))) return;
+    const now = this.state();
+    if (r > 0 || c > 0) {
+      // The part that scrolls starts where it starts.
+      if (r > 0) now.scrollY = 0;
+      if (c > 0) now.scrollX = 0;
+      this.commitScroll();
+      this.schedule();
+    }
+    this.live.textContent = this.strings.panesFrozen(r, c);
+  }
+
+  unfreezePanes(): void {
+    this.freezePanes(0, 0);
   }
 
   /** The format of the active cell (font, fill, border, alignment, numFmt), for a toolbar to reflect. */

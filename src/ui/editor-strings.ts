@@ -39,6 +39,15 @@ export interface EditorStrings {
   alignRight: string;
   wrapText: string;
   mergeCells: string;
+  /** The menu beside the merge button, and its entries. */
+  mergeOptions: string;
+  mergeAndCenter: string;
+  unmergeCells: string;
+  /** Entries of the menu of rows and columns: frozen panes. */
+  freezePanes: string;
+  freezeTopRow: string;
+  freezeFirstColumn: string;
+  unfreezePanes: string;
   numberFormat: string;
   formatGeneral: string;
   formatNumber: string;
@@ -85,6 +94,8 @@ export interface EditorStrings {
   numberedList: string;
   decreaseIndent: string;
   increaseIndent: string;
+  /** The button of the dialog of tab stops. */
+  tabStops: string;
   insertTable: string;
   /** A table size in the grid that inserts one: "3 x 2 table". */
   tableSize(rows: number, columns: number): string;
@@ -172,6 +183,13 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   alignRight: 'Align right',
   wrapText: 'Wrap text',
   mergeCells: 'Merge cells',
+  mergeOptions: 'Merge options',
+  mergeAndCenter: 'Merge and centre',
+  unmergeCells: 'Unmerge cells',
+  freezePanes: 'Freeze panes',
+  freezeTopRow: 'Freeze top row',
+  freezeFirstColumn: 'Freeze first column',
+  unfreezePanes: 'Unfreeze panes',
   numberFormat: 'Number format',
   formatGeneral: 'General',
   formatNumber: 'Number',
@@ -212,6 +230,7 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   numberedList: 'Numbered list',
   decreaseIndent: 'Decrease indent',
   increaseIndent: 'Increase indent',
+  tabStops: 'Tab stops…',
   insertTable: 'Insert table',
   tableSize: (rows, columns) => `${rows} x ${columns} table`,
   tableRowsColumns: 'Table rows and columns',
@@ -277,6 +296,13 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   alignRight: 'Sağa hizala',
   wrapText: 'Metni kaydır',
   mergeCells: 'Hücreleri birleştir',
+  mergeOptions: 'Birleştirme seçenekleri',
+  mergeAndCenter: 'Birleştir ve ortala',
+  unmergeCells: 'Hücreleri ayır',
+  freezePanes: 'Bölmeleri dondur',
+  freezeTopRow: 'Üst satırı dondur',
+  freezeFirstColumn: 'İlk sütunu dondur',
+  unfreezePanes: 'Bölmeleri çöz',
   numberFormat: 'Sayı biçimi',
   formatGeneral: 'Genel',
   formatNumber: 'Sayı',
@@ -317,6 +343,7 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   numberedList: 'Numaralı liste',
   decreaseIndent: 'Girintiyi azalt',
   increaseIndent: 'Girintiyi artır',
+  tabStops: 'Sekme durakları…',
   insertTable: 'Tablo ekle',
   tableSize: (rows, columns) => `${rows} x ${columns} tablo`,
   tableRowsColumns: 'Tablo satır ve sütunları',

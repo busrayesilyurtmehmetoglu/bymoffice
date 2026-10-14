@@ -2367,3 +2367,49 @@ test('bridge: a PDF beyond the limit of a message, and one that cannot be sent, 
   await settle();
   assert.deepEqual([f.sent[f.sent.length - 1].type, f.sent[f.sent.length - 1].id, f.sent[f.sent.length - 1].code], ['error', 'none', 'pdf-failed']);
 });
+
+// ------------------------------------------------------ the tab stops of a document
+
+test('bridge: setTabStops and setDefaultTabStop reach the document; the answer says what changed and what holds now', async () => {
+  const f = fake();
+  withEditableDocument(f);
+  const state = { stops: [] as unknown[], twips: 720, patches: [] as unknown[] };
+  for (const name of ['createDocumentView', 'createDocumentEditor'] as const) {
+    const inner = f.host[name] as NonNullable<BridgeHost['createDocumentView']>;
+    f.host[name] = ((container: HTMLElement, doc: never, options: never) => {
+      const view = inner(container, doc, options) as unknown as Record<string, unknown>;
+      view.setTabStops = (patch: unknown) => {
+        state.patches.push(patch);
+        state.stops = patch === null ? [] : [{ pos: 720, align: 'left' }];
+        return true;
+      };
+      view.setDefaultTabStop = (twips: number) => {
+        const changed = twips !== state.twips;
+        state.twips = twips;
+        return changed;
+      };
+      Object.defineProperty(view, 'tabStops', { get: () => state.stops });
+      Object.defineProperty(view, 'defaultTabStop', { get: () => state.twips });
+      return view as never;
+    }) as never;
+  }
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'setTabStops', id: 'n' });
+  assert.equal((f.sent[f.sent.length - 1] as { code?: string }).code, 'not-loaded');
+  await bridge.receive({ type: 'load', data: DATA });
+  await bridge.receive({ type: 'setTabStops', set: [{ pos: 720, align: 'left' }], clear: [1440], id: 't' });
+  assert.deepEqual(state.patches[0], { set: [{ pos: 720, align: 'left' }], clear: [1440] });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'done', id: 't', command: 'setTabStops', changed: true, tabStops: [{ pos: 720, align: 'left' }], defaultTabStop: 720 });
+  // Nothing to set or clear: the paragraphs' own stops go.
+  await bridge.receive({ type: 'setTabStops', id: 'u' });
+  assert.equal(state.patches[1], null);
+  await bridge.receive({ type: 'setDefaultTabStop', twips: 567, id: 'v' });
+  assert.deepEqual(f.sent[f.sent.length - 1], { type: 'done', id: 'v', command: 'setDefaultTabStop', changed: true, tabStops: [], defaultTabStop: 567 });
+  await bridge.receive({ type: 'setDefaultTabStop', twips: 567, id: 'w' });
+  assert.equal((f.sent[f.sent.length - 1] as { changed?: boolean }).changed, false);
+  for (const bad of [{ type: 'setDefaultTabStop' }, { type: 'setDefaultTabStop', twips: '1' }, { type: 'setTabStops', set: 'x' }, { type: 'setTabStops', clear: new Array(65).fill(1) }, { type: 'setTabStops', clearAll: 1 }]) {
+    await bridge.receive({ ...bad, id: 'b' });
+    assert.equal((f.sent[f.sent.length - 1] as { code?: string }).code, 'bad-message', JSON.stringify(bad).slice(0, 60));
+  }
+  bridge.destroy();
+});

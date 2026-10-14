@@ -8,6 +8,7 @@ import {
   MAX_COLS,
   MAX_ROWS,
   getCell,
+  parseRange,
   type Alignment,
   type Border,
   type BorderEdge,
@@ -23,7 +24,10 @@ import {
   type Underline,
   type Workbook,
 } from '../model/sheet/types';
+import { cellEditText } from '../edit/input';
 import { emptied, styleAt } from './commands';
+import { rowsHiddenByFilter } from './filter';
+import { cellNow } from './notes';
 import { MAX_CELL_FORMATS, ensureNumberFormat, sameFormat, type CellChange, type Op, type RowProps } from './ops';
 
 /** Which edges of a range get a border; "all" includes the lines between its cells. */
@@ -331,26 +335,142 @@ export function setRowsHidden(sheetIndex: number, first: number, last: number, h
 
 const intersects = (a: CellRange, b: CellRange) => a.top <= b.bottom && a.bottom >= b.top && a.left <= b.right && a.right >= b.left;
 
+/** How a range is merged. */
+export interface MergeOptions {
+  /** "Merge and center": the merged cell is centred across, as its cells are. */
+  center?: boolean;
+}
+
+/** A cell whose content a merge would discard: every cell of the range but its top-left one. */
+export interface MergeLoss {
+  row: number;
+  col: number;
+  /** What the cell holds as it would be typed: its formula ("=A1+1"), or its value. */
+  text: string;
+}
+
+/** What merging a range would do to what its cells hold. */
+export interface MergeReport {
+  /** Cells whose content goes, in order of rows; at most MAX_MERGE_LOSSES of them (see `count`). */
+  losses: MergeLoss[];
+  /** How many cells lose their content. */
+  count: number;
+  /** Notes on cells other than the top-left one: they stay, under the merged cell (where the cell is not shown). */
+  notes: number;
+}
+
+/** Most cells a merge report lists one by one. */
+export const MAX_MERGE_LOSSES = 1000;
+
+/** Most cells of a range that is merged and centred: each gets the alignment. */
+const MAX_CENTERED_CELLS = MAX_FORMAT_CELLS;
+
+/** Whether a cell holds something a merge would discard. */
+const holds = (cell: Cell): boolean => cell.kind !== 'blank' || cell.formula !== undefined;
+
+/** The array formulas (and tables of data) of a sheet that cover more than one cell, by the range they cover. */
+function arrayAreas(sheet: Sheet): { area: CellRange; ref: string }[] {
+  const out: { area: CellRange; ref: string }[] = [];
+  for (const row of sheet.rows.values()) {
+    row.cells.forEach((cell) => {
+      const formula = cell.formula;
+      if (!formula || (formula.type !== 'array' && formula.type !== 'dataTable') || formula.ref === undefined) return;
+      const area = parseRange(formula.ref);
+      if (!area || (area.top === area.bottom && area.left === area.right)) return;
+      out.push({ area, ref: formula.ref });
+    });
+  }
+  return out;
+}
+
 /**
- * Merges a range into one cell. As in Excel, only the content of its top-left
- * cell is kept; merges the range overlaps are replaced by it.
+ * Why a range cannot be merged; undefined when it can. Whole rows and columns are refused (as
+ * Excel does), and so are: a range that takes in part of an array formula or of a table of data
+ * (a merge would empty some of its cells), a range of more than one row with rows the filter
+ * hides (what is hidden would go unseen), a range that covers part of a pivot table, and any
+ * range of a sheet with tables (their ranges are not in the model: a merge in a table would make
+ * a file Excel repairs).
  */
-export function mergeRange(workbook: Workbook, sheetIndex: number, range: CellRange): Op[] {
+export function mergeProblem(workbook: Workbook, sheetIndex: number, range: CellRange): string | undefined {
   const sheet = workbook.sheets[sheetIndex];
-  if (range.top === range.bottom && range.left === range.right) return [];
-  if (fullHeight(range) || fullWidth(range)) throw new RangeError('Whole rows or columns cannot be merged');
+  if (!sheet) return `No sheet at index ${sheetIndex}`;
+  if (sheet.kind !== 'worksheet') return `Cannot merge cells of a ${sheet.kind}`;
+  if (!isRange(range)) return 'The range to merge is not valid';
+  if (fullHeight(range) || fullWidth(range)) return 'Whole rows or columns cannot be merged';
+  if ((sheet.anchored || []).indexOf('table') >= 0) return 'Cannot merge cells in a sheet with a table: not supported yet';
+  const pivots = workbook.pivots;
+  if (pivots) for (const table of pivots.tables) if (table.sheet === sheet && intersects(table.location.ref, range)) return `Cannot merge cells of the pivot table "${table.name}"`;
+  for (const { area, ref } of arrayAreas(sheet)) if (intersects(area, range)) return `Cannot merge cells through the array formula in ${ref}`;
+  if (range.bottom > range.top && rowsHiddenByFilter(sheet, range.top, range.bottom).length > 0) return 'Cannot merge cells across rows the filter hides';
+  return undefined;
+}
+
+const isRange = (range: CellRange): boolean => {
+  if (!range || typeof range !== 'object') return false;
+  const whole = (value: unknown, limit: number) => typeof value === 'number' && value >= 0 && value < limit && Math.floor(value) === value;
+  return whole(range.top, MAX_ROWS) && whole(range.bottom, MAX_ROWS) && whole(range.left, MAX_COLS) && whole(range.right, MAX_COLS) && range.top <= range.bottom && range.left <= range.right;
+};
+
+/** What merging a range would discard, for a question to the user before it is merged. */
+export function mergeReport(workbook: Workbook, sheetIndex: number, range: CellRange): MergeReport {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet) throw new RangeError(`No sheet at index ${sheetIndex}`);
+  const report: MergeReport = { losses: [], count: 0, notes: 0 };
+  if (!isRange(range)) return report;
+  const rows: number[] = [];
+  for (const rowIndex of sheet.rows.keys()) if (rowIndex >= range.top && rowIndex <= range.bottom) rows.push(rowIndex);
+  rows.sort((a, b) => a - b);
+  for (const rowIndex of rows) {
+    const row = sheet.rows.get(rowIndex)!;
+    row.cells.forEach((cell, col) => {
+      if (col < range.left || col > range.right || (rowIndex === range.top && col === range.left) || !holds(cell)) return;
+      report.count++;
+      if (report.losses.length < MAX_MERGE_LOSSES) report.losses.push({ row: rowIndex, col, text: cellEditText(cell, resolveCellStyle(workbook.styles, cell.style).numFmt) });
+    });
+  }
+  for (const comment of sheet.comments || []) {
+    const at = cellNow(sheet, comment);
+    if (at && at.row >= range.top && at.row <= range.bottom && at.col >= range.left && at.col <= range.right && !(at.row === range.top && at.col === range.left)) report.notes++;
+  }
+  return report;
+}
+
+/**
+ * Merges a range into one cell. As in Excel, only the content of its top-left cell is kept (see
+ * mergeReport() for what goes, and mergeProblem() for what is refused); every cell keeps its
+ * format. Merges the range overlaps are replaced by it. With `center` the cells of the range are
+ * centred across as well, in the same step.
+ */
+export function mergeRange(workbook: Workbook, sheetIndex: number, range: CellRange, options: MergeOptions = {}): Op[] {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet) throw new RangeError(`No sheet at index ${sheetIndex}`);
+  if (isRange(range) && range.top === range.bottom && range.left === range.right) return [];
+  const problem = mergeProblem(workbook, sheetIndex, range);
+  if (problem) throw new RangeError(problem);
   const ops: Op[] = [];
+  // The alignment, worked out on the cells as they are: the cells that are emptied keep the format it gives them.
+  const formatted = new Map<number, CellChange>();
+  if (options.center) {
+    if ((range.bottom - range.top + 1) * (range.right - range.left + 1) > MAX_CENTERED_CELLS) throw new RangeError('Too many cells to format at once');
+    for (const op of formatRange(workbook, sheetIndex, range, { horizontal: 'center' })) {
+      if (op.type !== 'setCells') throw new RangeError('Cannot centre the merged cells');
+      for (const change of op.cells) formatted.set(change.row * MAX_COLS + change.col, change);
+    }
+  }
   const cells: CellChange[] = [];
   for (const [rowIndex, row] of sheet.rows) {
     if (rowIndex < range.top || rowIndex > range.bottom) continue;
     row.cells.forEach((cell, col) => {
-      if (col < range.left || col > range.right || (rowIndex === range.top && col === range.left)) return;
-      if (cell.kind === 'blank' && !cell.formula) return;
-      cells.push({ row: rowIndex, col, cell: emptied(sheet, rowIndex, col, cell.style) });
+      if (col < range.left || col > range.right || (rowIndex === range.top && col === range.left) || !holds(cell)) return;
+      const key = rowIndex * MAX_COLS + col;
+      const restyled = formatted.get(key);
+      formatted.delete(key);
+      cells.push({ row: rowIndex, col, cell: emptied(sheet, rowIndex, col, restyled && restyled.cell ? restyled.cell.style : cell.style) });
     });
   }
+  for (const change of formatted.values()) cells.push(change);
   if (cells.length > 0) ops.push({ type: 'setCells', sheet: sheetIndex, cells });
-  ops.push({ type: 'setMerges', sheet: sheetIndex, merges: sheet.merges.filter((merge) => !intersects(merge, range)).concat([{ ...range }]) });
+  ops.push({ type: 'setMerges', sheet: sheetIndex, merges: sheet.merges.filter((merge) => !intersects(merge, range)).concat([{ top: range.top, left: range.left, bottom: range.bottom, right: range.right }]) });
   return ops;
 }
 

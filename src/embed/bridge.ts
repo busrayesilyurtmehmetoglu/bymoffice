@@ -108,6 +108,13 @@ export interface BridgeDocumentView {
   setTrackChanges?(on: boolean): unknown;
   /** Whether the changes made in the view are tracked. */
   readonly trackingChanges?: boolean;
+  /** Sets and clears tab stops of the paragraphs of the selection (see TabStopsPatch); whether anything changed. */
+  setTabStops?(patch: unknown): boolean;
+  /** The tab stops of the paragraph at the caret, positions in twips. */
+  readonly tabStops?: unknown[];
+  /** Sets the distance between the automatic tab stops of the document, twips; whether it changed. */
+  setDefaultTabStop?(twips: number): boolean;
+  readonly defaultTabStop?: number;
   /** The comments of the document, answers after the comment they answer: what the application is told. */
   comments?(): BridgeComment[];
   /** Changes whenever what comments() says of the comments changes: while it stays the same the list is not asked for again. */
@@ -1774,6 +1781,43 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
+   * Sets or clears tab stops of the paragraphs of the selection of the document that is shown, or
+   * the distance between its automatic tab stops, as one undo step. The answer says whether
+   * anything changed and what the stops are afterwards; what the view refuses (a change that
+   * cannot be tracked, a document that is edited together) it says to the user as well.
+   */
+  const tabDocument = (type: 'setTabStops' | 'setDefaultTabStop', message: Message, id: string | undefined) => {
+    let patch: unknown;
+    let twips: number | undefined;
+    if (type === 'setTabStops') {
+      const limited = (name: string): unknown[] | undefined => {
+        const value = message[name];
+        if (value === undefined || value === null) return undefined;
+        if (!Array.isArray(value) || value.length > 64) throw new BadMessage(`"${name}" must be a list of at most 64 entries`);
+        return value;
+      };
+      const set = limited('set');
+      const clear = limited('clear');
+      const clearAll = field<boolean>(message, 'clearAll', 'boolean', false);
+      // Nothing to set and nothing to clear: the paragraphs' own stops go.
+      patch = set === undefined && clear === undefined && clearAll === undefined ? null : { set, clear, clearAll };
+      if (patch) for (const key of ['set', 'clear', 'clearAll']) if ((patch as Record<string, unknown>)[key] === undefined) delete (patch as Record<string, unknown>)[key];
+    } else twips = field<number>(message, 'twips', 'number', true);
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const pages = shown.pages;
+    if (!pages) return fail('no-document', 'The open file is not a document', id);
+    if (shown.locked || shown.readOnly === true || shown.commentsOnly) return fail('read-only', 'The document is read-only', id);
+    let changed = false;
+    if (type === 'setTabStops') changed = pages.setTabStops ? pages.setTabStops(patch) === true : false;
+    else changed = pages.setDefaultTabStop ? pages.setDefaultTabStop(twips as number) === true : false;
+    if (id === undefined) return;
+    const out: Message = { type: 'done', id, command: type, changed };
+    if (pages.tabStops) out.tabStops = pages.tabStops.slice(0, 64);
+    if (typeof pages.defaultTabStop === 'number') out.defaultTabStop = pages.defaultTabStop;
+    send(out);
+  };
+
+  /**
    * Inserts, renames or deletes a sheet through the view, as one undo step. The list that
    * results is told by `sheets` (see tellSheets() in load()), whether or not the command
    * has an id; the answer says that the command was done, or why it was not.
@@ -2276,6 +2320,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
       if (type === 'refreshPivots') return refreshPivots(id);
+      if (type === 'setTabStops' || type === 'setDefaultTabStop') return tabDocument(type, fields, id);
       if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);

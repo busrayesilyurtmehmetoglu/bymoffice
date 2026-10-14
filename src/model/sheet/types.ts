@@ -785,6 +785,19 @@ export interface SheetView {
    */
   firstVisibleCell?: string;
   activeCell?: string;
+  /**
+   * Set by the reader when the first view has panes that are split but not frozen (a <pane>
+   * without state="frozen"). They are not shown; the file keeps them until panes are frozen.
+   */
+  split?: boolean;
+}
+
+/** The frozen panes of a sheet: what "setPane" sets (see SheetView for the fields). */
+export interface PaneState {
+  frozenRows: number;
+  frozenCols: number;
+  topLeftCell?: string;
+  firstVisibleCell?: string;
 }
 
 /** A corner of a drawing: a cell and how far into it, in EMU (914,400 per inch; 9,525 per pixel). */
@@ -1229,6 +1242,14 @@ export interface Sheet {
   tabColorModified?: boolean;
   /** The colour the tab had before it was first changed (none: `color` undefined). Set with `tabColorModified`. */
   tabColorRead?: { color: Color | undefined };
+  /**
+   * The frozen panes were changed ("setPane"); the writer brings <pane> and <selection> of the
+   * first view of the sheet part in line with the model. Set on its own, without `modified`:
+   * no cell changed, and nothing has to be calculated again.
+   */
+  paneModified?: boolean;
+  /** The panes the sheet had before they were first changed. Set with `paneModified`. */
+  paneRead?: PaneState;
   /**
    * How the sheet is protected (<sheetProtection>), and the ranges that are open in a
    * protected sheet (<protectedRanges>), as the file states them. Not applied and not changed

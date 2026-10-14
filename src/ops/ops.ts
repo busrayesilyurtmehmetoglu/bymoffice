@@ -37,6 +37,7 @@ import {
   type Row,
   type Sheet,
   type SheetComment,
+  type PaneState,
   type SheetDrawing,
   type SheetNameMap,
   type SheetNeighbours,
@@ -246,6 +247,16 @@ export type Op =
       sheet: number;
       copy: Sheet;
       names: DefinedName[];
+    }
+  | {
+      /**
+       * Sets the frozen panes of a sheet (SheetView.frozenRows, frozenCols, topLeftCell,
+       * firstVisibleCell); a field left out is removed. Its own inverse. A view-only change: the
+       * sheet is not `modified`.
+       */
+      type: 'setPane';
+      sheet: number;
+      pane: PaneState;
     }
   | {
       /** Sets the colour of the tab of a sheet; undefined removes it. Its own inverse. */
@@ -1356,6 +1367,49 @@ export function tabColorProblem(workbook: Workbook, index: number): string | und
   return sheetNameClash(workbook);
 }
 
+/** The panes a sheet has now, as "setPane" states them. */
+export function paneOf(sheet: Sheet): PaneState {
+  const view = sheet.view;
+  const out: PaneState = { frozenRows: view.frozenRows > 0 ? view.frozenRows : 0, frozenCols: view.frozenCols > 0 ? view.frozenCols : 0 };
+  if (view.topLeftCell !== undefined) out.topLeftCell = view.topLeftCell;
+  if (view.firstVisibleCell !== undefined) out.firstVisibleCell = view.firstVisibleCell;
+  return out;
+}
+
+export const samePane = (a: PaneState, b: PaneState): boolean =>
+  a.frozenRows === b.frozenRows && a.frozenCols === b.frozenCols && a.topLeftCell === b.topLeftCell && a.firstVisibleCell === b.firstVisibleCell;
+
+/** Why the panes of a sheet cannot be set to these; undefined when they can. Everything is checked: the operation may come from anyone. */
+export function paneProblem(workbook: Workbook, index: number, pane: PaneState): string | undefined {
+  const sheet = workbook.sheets[index];
+  if (!sheet) return `No sheet at index ${index}`;
+  if (sheet.kind !== 'worksheet') return `Cannot freeze the panes of a ${sheet.kind}`;
+  if (!pane || typeof pane !== 'object') return 'The panes are not valid';
+  const count = (value: unknown, limit: number) => typeof value === 'number' && value >= 0 && value < limit && Math.floor(value) === value;
+  if (!count(pane.frozenRows, MAX_ROWS) || !count(pane.frozenCols, MAX_COLS)) return 'The panes are not valid';
+  for (const ref of [pane.topLeftCell, pane.firstVisibleCell]) if (ref !== undefined && (typeof ref !== 'string' || ref.length > 10 || !parseCellRef(ref))) return 'The panes are not valid';
+  return undefined;
+}
+
+function setPaneOp(workbook: Workbook, index: number, pane: PaneState): Op {
+  const problem = paneProblem(workbook, index, pane);
+  if (problem) throw new RangeError(problem);
+  const sheet = sheetAt(workbook, index);
+  const previous = paneOf(sheet);
+  // What the sheet came with, noted once: the writer leaves the part alone while the panes are those.
+  if (!sheet.paneRead) sheet.paneRead = previous;
+  const view = sheet.view;
+  view.frozenRows = pane.frozenRows;
+  view.frozenCols = pane.frozenCols;
+  if (pane.topLeftCell !== undefined) view.topLeftCell = pane.topLeftCell;
+  else delete view.topLeftCell;
+  if (pane.firstVisibleCell !== undefined) view.firstVisibleCell = pane.firstVisibleCell;
+  else delete view.firstVisibleCell;
+  // Not `modified`: no cell changed, and nothing has to be calculated again.
+  sheet.paneModified = true;
+  return { type: 'setPane', sheet: index, pane: previous };
+}
+
 /** The defined names with the sheets they are local to looked up again after the list of sheets changed. */
 function rescopeNames(workbook: Workbook, before: Sheet[]): void {
   const after = workbook.sheets;
@@ -1648,6 +1702,8 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       workbook.sheetsModified = true;
       return { type: 'setTabColor', sheet: op.sheet, color: previous };
     }
+    case 'setPane':
+      return setPaneOp(workbook, op.sheet, op.pane);
     case 'restoreSheets':
       return restoreSheets(workbook, op.sheet, op.state, op.weight);
     case 'setPivot': {

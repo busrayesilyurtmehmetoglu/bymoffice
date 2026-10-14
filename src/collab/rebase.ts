@@ -374,6 +374,7 @@ export function mapRec(rec: Rec, shift: Shift, first = false): Mapped {
       return moved(s === op.s ? op : { ...op, s }, shift.k === 'sName' && shift.s === op.s ? shift.name : rec.nm);
     case 'state':
     case 'tab':
+    case 'pane':
       return moved(s === op.s ? op : { ...op, s });
     case 'move': {
       let to = op.to;
@@ -578,7 +579,7 @@ function clash(op: WireOp, other: WireOp, undo: boolean): { drop: true } | { op:
     if (notes.length === op.n.length) return undefined;
     return notes.length > 0 ? { op: { ...op, n: notes } } : { drop: true };
   }
-  if ((op.t === 'name' || op.t === 'tab' || op.t === 'state') && other.t === op.t) return { drop: true };
+  if ((op.t === 'name' || op.t === 'tab' || op.t === 'state' || op.t === 'pane') && other.t === op.t) return { drop: true };
   return undefined;
 }
 

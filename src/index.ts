@@ -237,7 +237,26 @@ export { formatValue, isDateFormat, serialToDate, type FormatOptions, type Forma
 export { WorkbookView, type HistoryMark, type WorkbookViewOptions } from './ui/sheet-view';
 export { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
 export { EDITOR_STRINGS_EN, EDITOR_STRINGS_TR, getEditorStrings, type EditorStrings } from './ui/editor-strings';
-export { ensureStyle, formatAt, formatRange, mergeRange, setColumnWidth, setColumnsHidden, setRowHeight, setRowsHidden, unmergeRange, type BorderPreset, type StylePatch } from './ops/format';
+export {
+  MAX_MERGE_LOSSES,
+  ensureStyle,
+  formatAt,
+  formatRange,
+  mergeProblem,
+  mergeRange,
+  mergeReport,
+  setColumnWidth,
+  setColumnsHidden,
+  setRowHeight,
+  setRowsHidden,
+  unmergeRange,
+  type BorderPreset,
+  type MergeLoss,
+  type MergeOptions,
+  type MergeReport,
+  type StylePatch,
+} from './ops/format';
+export { freezePanes, frozenPanes } from './ops/panes';
 export { STRINGS_EN, STRINGS_TR, getUiStrings, type UiStrings } from './ui/strings';
 export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 export { base64Decode, base64Encode, createBridge, installBridge, type Bridge, type BridgeDocumentView, type BridgeErrorCode, type BridgeHost, type BridgeState, type InstallBridgeOptions } from './embed/bridge';

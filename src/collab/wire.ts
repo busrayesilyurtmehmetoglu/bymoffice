@@ -10,8 +10,11 @@ import { adjustFormula, adjustRange, renameSheetsInFormula, type StructuralEdit 
 import {
   MAX_COLS,
   MAX_ROWS,
+  cellName,
   foldSheetName,
+  parseCellRef,
   parseRange,
+  type PaneState,
   type SheetNameMap,
   type Alignment,
   type AutoFilter,
@@ -93,6 +96,29 @@ export function xmlText(value: string): boolean {
 
 function str(value: unknown, max: number, what: string): string {
   if (typeof value !== 'string' || value.length > max || !xmlText(value)) return fail(what);
+  return value;
+}
+
+/** Whether a cell is one that scrolls with these rows and columns frozen (none frozen: no such cell is stated). */
+function scrollsAt(rows: number, cols: number, ref: string): boolean {
+  const at = parseCellRef(ref);
+  return !!at && (rows > 0 || cols > 0) && at.row >= rows && at.col >= cols;
+}
+
+/**
+ * The panes a "pane" step sets: the first cell that scrolls is the one it states, or the one right below and beside
+ * the frozen ones (as freezePanes() makes it).
+ */
+export function paneOfWire(op: { r: number; c: number; tl?: string; fv?: string }): PaneState {
+  const pane: PaneState = { frozenRows: op.r, frozenCols: op.c };
+  if (op.r > 0 || op.c > 0) pane.topLeftCell = op.tl !== undefined ? op.tl : cellName(op.r, op.c);
+  if (op.fv !== undefined) pane.firstVisibleCell = op.fv;
+  return pane;
+}
+
+/** The name of one cell ("B2"). */
+function cellRef(value: unknown, what: string): string {
+  if (typeof value !== 'string' || value.length > 10 || !parseCellRef(value)) return fail(what);
   return value;
 }
 
@@ -666,6 +692,17 @@ function readOp(value: unknown, style: (place: unknown) => number): WireOp {
       return { t: 'state', s, state: oneOf(from.state, ['visible', 'hidden', 'veryHidden'] as const, 'state') };
     case 'tab':
       return { t: 'tab', s, color: from.color === 0 ? 0 : readColor(from.color) };
+    case 'pane': {
+      const op: WireOp = { t: 'pane', s, r: int(from.r, 0, MAX_ROWS - 1, 'pane'), c: int(from.c, 0, MAX_COLS - 1, 'pane') };
+      // The first cell that scrolls is one of those that scroll: below and right of the frozen rows and columns.
+      if (has(from, 'tl')) {
+        const tl = cellRef(from.tl, 'pane');
+        if (!scrollsAt(op.r, op.c, tl)) fail('pane');
+        op.tl = tl;
+      }
+      if (has(from, 'fv')) op.fv = cellRef(from.fv, 'pane');
+      return op;
+    }
     case 'cmd': {
       const name = str(from.name, 64, 'command');
       if (!commandFamily(name)) fail('command');
@@ -960,6 +997,12 @@ export function encodeOp(workbook: Workbook, op: Op): Encoded {
       return { op: { t: 'state', s: op.sheet, state: op.state } };
     case 'setTabColor':
       return { op: { t: 'tab', s: op.sheet, color: op.color ? op.color : 0 } };
+    case 'setPane': {
+      const out: WireOp = { t: 'pane', s: op.sheet, r: op.pane.frozenRows, c: op.pane.frozenCols };
+      if (op.pane.topLeftCell !== undefined && scrollsAt(out.r, out.c, op.pane.topLeftCell)) out.tl = op.pane.topLeftCell;
+      if (op.pane.firstVisibleCell !== undefined) out.fv = op.pane.firstVisibleCell;
+      return { op: out };
+    }
     case 'copySheet':
       throw new CollabUnsupportedError('copySheet', 'A sheet cannot be copied while the workbook is edited together');
     case 'setPivot':
@@ -1399,6 +1442,17 @@ export function applyWire(workbook: Workbook, op: WireOp): Applied {
       const old = worksheet(workbook, op.s).state;
       const inverse = applyOp(workbook, { type: 'setSheetState', sheet: op.s, state: op.state });
       return { inverse: [inverse], undo: [{ w: { t: 'state', s: op.s, state: old } }], cells: [], layout: false, sheets: true };
+    }
+    case 'pane': {
+      const pane = paneOfWire(op);
+      const inverse = applyOp(workbook, { type: 'setPane', sheet: op.s, pane });
+      if (inverse.type !== 'setPane') throw new WireError('Invalid panes');
+      // The panes as they were, the file's first cell that scrolls with them (Excel writes where the pane was scrolled
+      // to): undone, the sheet is written as the file has it. One no participant would take is made of the rows and columns.
+      const back: WireOp = { t: 'pane', s: op.s, r: inverse.pane.frozenRows, c: inverse.pane.frozenCols };
+      if (inverse.pane.topLeftCell !== undefined && scrollsAt(back.r, back.c, inverse.pane.topLeftCell)) back.tl = inverse.pane.topLeftCell;
+      if (inverse.pane.firstVisibleCell !== undefined) back.fv = inverse.pane.firstVisibleCell;
+      return { inverse: [inverse], undo: [{ w: back }], cells: [], layout: true, sheets: false };
     }
     case 'tab': {
       const old = worksheet(workbook, op.s).tabColor;

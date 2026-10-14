@@ -188,7 +188,7 @@ function parseSheetView(sc: XmlScanner, view: SheetView): void {
         if (y !== undefined && y > 0) view.frozenRows = Math.min(Math.floor(y), MAX_ROWS - 1);
         const topLeft = sc.attr('topLeftCell');
         if (topLeft !== undefined && parseCellRef(topLeft)) view.topLeftCell = topLeft;
-      }
+      } else view.split = true;
     } else if (sc.local === 'selection') {
       const active = sc.attr('activeCell');
       if (active !== undefined && parseCellRef(active)) {
