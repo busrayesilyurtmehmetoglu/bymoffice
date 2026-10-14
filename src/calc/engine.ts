@@ -25,6 +25,7 @@
 // AGGREGATE) and what the defined names stand for. The formulas that use them are noted
 // when the graph is built, and rowsChanged() and namesChanged() name them as changed.
 
+import { touchModel } from '../model/edits';
 import { isoToSerial } from '../format/cell-format';
 import type { FormatLocale } from '../format/locale';
 import { MAX_COLS, MAX_ROWS, parseRange, type Cell, type CellFormula, type CellRange, type Row, type Sheet, type Workbook } from '../model/sheet/types';
@@ -1872,6 +1873,9 @@ export class CalcEngine {
     delete next.runs;
     delete next.si;
     this.own.add(next);
+    // A result that is written is a change of the workbook like any other: a file that is being written while
+    // results arrive (a calculation that runs in slices) would hold some of before and some of after.
+    touchModel(this.workbook);
     const model = sh.model;
     let target = model.rows.get(row);
     if (!target) {

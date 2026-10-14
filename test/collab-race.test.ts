@@ -200,32 +200,71 @@ test('a workbook that is changed while its file is written: the file is the work
   assert.deepEqual(independent(files), [], 'every file is whole to a reader that is not this engine: its styles, its sheets and its directory agree');
 });
 
-test('a document that is changed while its file is written is written again; one that never stops changing is not saved, and says so', async () => {
+test('a model that is changed while its file is written: written again once the changes pause, not into the next one; what never pauses is not saved, and says so', async () => {
   const { applyDocOp } = await import('../src/ops/doc/ops');
-  const { editsOf, SaveInterruptedError, MAX_WRITE_TRIES, writeSteady } = await import('../src/model/edits');
+  const { buildEdit } = await import('../src/ops/doc/draft');
+  const { editsOf, SaveInterruptedError, writeSteady } = await import('../src/model/edits');
   const file = await open(await createBlank('docx'));
   const doc = await file.document();
-  const before = editsOf(doc);
-  // An operation that changes nothing the file shows still counts as a change of the model: the writer starts over.
-  const same = { type: 'setTrackRevisions', on: false } as never;
+  const change = (): void => void applyDocOp(doc, { type: 'setTrackRevisions', on: false } as never);
+  // Time is the test's: a sleep is a step of its clock, and what happens meanwhile is scripted.
+  let clock = 0;
+  let during: (() => void)[] = [];
+  const sleeps: number[] = [];
+  const options = {
+    now: () => clock,
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+      clock += ms;
+      const next = during.shift();
+      if (next) next();
+    },
+  };
+  // Changed once while it was written, and twice more right after: the file is written again only after a moment without a change.
   let writes = 0;
-  const steady = await writeSteady(doc, async () => {
-    writes++;
-    if (writes === 1) applyDocOp(doc, same);
-    return writes;
-  });
-  assert.deepEqual([steady, editsOf(doc) > before], [2, true], 'written again after the change, and that file is answered');
-  let tries = 0;
-  await assert.rejects(
-    writeSteady(doc, async () => {
-      tries++;
-      applyDocOp(doc, same);
-    }),
-    SaveInterruptedError,
-    'a model that changes every time is not written half',
+  during = [change, change];
+  const steady = await writeSteady(doc, async () => (++writes === 1 ? (change(), writes) : writes), options);
+  assert.deepEqual([steady, writes, sleeps.length], [2, 2, 3], 'two writes, the second after the changes had paused (three waits: two met a change, the third met none)');
+  // What the writer throws while the model changes under it is no failure of the save: it is written again.
+  writes = 0;
+  const after = await writeSteady(
+    doc,
+    async () => {
+      if (++writes === 1) {
+        change();
+        throw new Error('tripped over half a change');
+      }
+      return 'whole';
+    },
+    options,
   );
-  assert.equal(tries, MAX_WRITE_TRIES, 'after so many tries');
-  assert.ok((await file.save()).length > 0, 'and the next save, in peace, is a file');
+  assert.deepEqual([after, writes], ['whole', 2], 'written again, and that file is answered');
+  await assert.rejects(writeSteady(doc, async () => Promise.reject(new Error('really broken')), options), /really broken/, 'what it throws in peace is thrown');
+  // A model that never pauses: given up after the time a save may wait, with an error of its own.
+  during = Array.from({ length: 1000 }, () => change);
+  const started = clock;
+  await assert.rejects(writeSteady(doc, async () => void change(), options), SaveInterruptedError, 'a model that changes all the time is not written half');
+  assert.ok(clock - started >= 10000 && clock - started < 11000, `after ten seconds of waiting (${clock - started} ms)`);
+  during = [];
+  // A command that is only tried on the document (and taken back at once) is no change of it.
+  const counted = editsOf(doc);
+  buildEdit(doc, (draft) => {
+    draft.apply({ type: 'setTrackRevisions', on: true } as never);
+    return { story: 'body', path: [0], offset: 0 } as never;
+  });
+  assert.equal(editsOf(doc), counted, 'the document counts as unchanged after a command was tried on it');
+  assert.ok((await file.save()).length > 0, 'and a save in peace is a file');
+  // A result the calculation writes is a change like any other.
+  const { CalcEngine } = await import('../src/calc/engine');
+  const { applyOp } = await import('../src/ops/ops');
+  const book = await (await open(await startFile())).workbook();
+  const engine = new CalcEngine(book);
+  const ops = setCellInput(book, 0, 1, 1, '55');
+  for (const op of ops) applyOp(book, op);
+  const before = editsOf(book);
+  const done = engine.recalculate([{ sheet: 0, row: 1, col: 1 }]);
+  assert.ok(done.some((part) => part.cells.length > 0), 'the calculation wrote results (or the test tests nothing)');
+  assert.ok(editsOf(book) > before, 'and each of them counts as a change of the workbook: a file that was being written is written again');
 });
 
 test('the turn of a package: a save from within it does not wait for it, and the stamp of a room is written within the turn of its file by itself', async () => {

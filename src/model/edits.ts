@@ -13,29 +13,71 @@ export function editsOf(model: object): number {
   return counts.get(model) || 0;
 }
 
+/**
+ * Sets the count back to what it was: for what applies changes and takes every one of them back
+ * in one go, without anything else running in between (a command that is tried on the model to see
+ * what it would do). The model is what it was, and a file that is being written from it is whole.
+ */
+export function restoreEdits(model: object, count: number): void {
+  counts.set(model, count);
+}
+
 /** A file could not be written because its model kept changing while it was written. Nothing was written half. */
 export class SaveInterruptedError extends Error {
   constructor() {
-    super('The file was changed again and again while it was written; it was not saved. Save again');
+    super('The file was being edited the whole time it was written; it was not saved. It is saved when the editing pauses');
     this.name = 'SaveInterruptedError';
   }
 }
 
-/** How often a file is written anew when its model changed while it was written. */
-export const MAX_WRITE_TRIES = 5;
+/** How long nothing may change before a file whose model changed while it was written is written again. */
+export const QUIET_MS = 150;
+/** How long a save waits in all for the editing to pause before it gives up. */
+export const MAX_STEADY_MS = 10000;
+
+export interface SteadyOptions {
+  quietMs?: number;
+  maxMs?: number;
+  sleep?(ms: number): Promise<void>;
+  now?(): number;
+}
 
 /**
  * Writes a file from a model: `write` is run, and its file is answered only when the model was
  * not changed while it ran - a file that was written while the model changed may hold some parts
- * of before the change and some of after it, and is the file of no moment. It is written again
- * then; when the model changes every time, SaveInterruptedError is thrown.
+ * of before the change and some of after it, and is the file of no moment. (So may what `write`
+ * throws: a writer that read half a change may trip over it.) It is written again then, once the
+ * changes have paused for a moment - not at once, into the next change. When they do not pause
+ * for as long as a save may wait, SaveInterruptedError is thrown.
  */
-export async function writeSteady<T>(model: object | undefined, write: () => Promise<T>): Promise<T> {
+export async function writeSteady<T>(model: object | undefined, write: () => Promise<T>, options: SteadyOptions = {}): Promise<T> {
   if (!model) return write();
-  for (let attempt = 0; attempt < MAX_WRITE_TRIES; attempt++) {
+  const quiet = options.quietMs === undefined ? QUIET_MS : options.quietMs;
+  const most = options.maxMs === undefined ? MAX_STEADY_MS : options.maxMs;
+  const sleep = options.sleep || ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = options.now || (() => Date.now());
+  const started = now();
+  for (;;) {
     const before = editsOf(model);
-    const out = await write();
-    if (editsOf(model) === before) return out;
+    let out: T | undefined;
+    let failed: unknown;
+    let threw = false;
+    try {
+      out = await write();
+    } catch (error) {
+      threw = true;
+      failed = error;
+    }
+    if (editsOf(model) === before) {
+      if (threw) throw failed;
+      return out as T;
+    }
+    // Changed while it was written: again, when nothing has changed for a moment.
+    for (;;) {
+      if (now() - started >= most) throw new SaveInterruptedError();
+      const seen = editsOf(model);
+      await sleep(quiet);
+      if (editsOf(model) === seen) break;
+    }
   }
-  throw new SaveInterruptedError();
 }

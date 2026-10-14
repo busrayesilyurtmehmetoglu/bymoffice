@@ -4,6 +4,7 @@
 // back and hands out the recorded operations; the caller applies them through
 // a DocHistory. A command that throws leaves the document as it was.
 
+import { editsOf, restoreEdits } from '../../model/edits';
 import type { Block, DocModel, Paragraph, RunItem, Story, Table, TableCell, TableRow, Wrapper } from '../../model/doc/types';
 import { applyDocOp, checkSplice, splicedBlocks, type DocOp } from './ops';
 import { READ_ONLY } from './pieces';
@@ -360,6 +361,9 @@ export function buildEdit(doc: DocModel, command: (draft: Draft) => DocRange | D
   const tracking = trackingFor(doc, options);
   if (tracking && !tracks) bad(TRACK_UNSUPPORTED);
   const draft = new Draft(doc, tracking);
+  // The command is tried on the document and taken back before anything else runs: the document is what it was,
+  // and is counted as unchanged (a file that is being written from it is not written again for a look at a command).
+  const counted = editsOf(doc);
   try {
     const result = command(draft);
     draft.finish();
@@ -367,5 +371,6 @@ export function buildEdit(doc: DocModel, command: (draft: Draft) => DocRange | D
     return { ops: draft.ops, selection: 'anchor' in result ? result : collapsed(result) };
   } finally {
     draft.rollback();
+    restoreEdits(doc, counted);
   }
 }

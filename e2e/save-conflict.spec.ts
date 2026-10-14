@@ -786,7 +786,7 @@ test.describe('the bridge page: saveResult with conflict asks before it overwrit
       await press(page.locator(CANCEL), hasTouch);
       await expect(confirm).toHaveCount(0);
       await expect(input).toBeFocused();
-      expect((await messages(page)).length, 'Cancel sends no message').toBe(before);
+      expect((await messages(page)).slice(before).map((message) => JSON.stringify(message).slice(0, 200)), 'Cancel sends no message').toEqual([]);
       expect((await messages(page)).filter((message) => message.type === 'saved').length).toBe(1);
 
       await page.keyboard.press('ControlOrMeta+s');

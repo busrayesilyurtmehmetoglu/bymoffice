@@ -488,6 +488,8 @@ export interface SaveStrings {
   saveConflict: string;
   /** A save nobody asked for that met the saves of others in a room again and again. */
   saveRoomBusy: string;
+  /** The file was being edited the whole time it was written. */
+  saveInterrupted: string;
   saveRedirected: string;
   saveConvertedNotAllowed(to: string): string;
   saveDenied: string;
@@ -1462,6 +1464,10 @@ export class SaveController implements SaveCommand {
         break;
       case 'refused':
         text = strings.saveFailed(detail);
+        break;
+      case 'write':
+        // Nothing went wrong: the file was being edited the whole time it was written.
+        text = (error.cause as { name?: string } | undefined) !== undefined && (error.cause as { name?: string }).name === 'SaveInterruptedError' ? strings.saveInterrupted : strings.saveFailed('');
         break;
       default:
         text = strings.saveFailed('');

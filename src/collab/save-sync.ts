@@ -142,7 +142,10 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
   /** What the server was last found to name the file by, and when: the same word again within a moment asks nothing. */
   let confirmed: { tag: string; at: number } | undefined;
   const storedAs = async (tag: string): Promise<boolean> => {
-    if (confirmed && confirmed.tag === tag && nowMs() - confirmed.at < CONFIRMED_FOR_MS) return true;
+    // What the server said a moment ago holds for the name this side still knows the file by. Once the file is known
+    // by another name (this side saved it, took another name, loaded it again), the same word again is a word like any
+    // other - late, said twice, or a lie - and the server is asked.
+    if (confirmed && confirmed.tag === tag && host.controller.currentETag === tag && nowMs() - confirmed.at < CONFIRMED_FOR_MS) return true;
     const found = await asks(tag);
     confirmed = found ? { tag, at: nowMs() } : undefined;
     return found;

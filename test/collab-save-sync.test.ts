@@ -173,6 +173,37 @@ test('a server that names a file by its content names it so again when the conte
   assert.equal(await refused, false, 'it is the user\'s');
 });
 
+test('a word of a save that comes again after this side saved (late, twice, or a lie) is asked of the server anew: it moves nothing and makes nothing clean', async () => {
+  const r = rig();
+  // Someone saves; the server confirms.
+  r.controller.changed(true);
+  r.server.etag = '"Y"';
+  await r.sync.saved({ versions: ['e:"Y"'], rev: 3 });
+  assert.deepEqual([r.controller.currentETag, r.controller.dirty], ['"Y"', false], 'taken');
+  // This side saves its own work: the file has another name. Then work of someone else arrives.
+  r.controller.changed();
+  assert.equal(await r.controller.saveNow(), true, 'saved');
+  const mine = r.controller.currentETag;
+  assert.notEqual(mine, '"Y"', 'the file has another name now');
+  r.controller.changed(true);
+  const heads = r.server.heads;
+  // The same word again, a moment later.
+  await r.sync.saved({ versions: ['e:"Y"'], rev: 3 });
+  assert.equal(r.server.heads, heads + 1, 'the server is asked again: what it said of that name was said of a file that is gone');
+  assert.deepEqual([r.controller.currentETag, r.controller.dirty], [mine, true], 'the name stays the one the server gave, and the work of the other is still to be saved');
+  r.asked.length = 0;
+  assert.equal(await r.controller.saveNow(), true, 'the next save is taken');
+  assert.deepEqual(r.asked, [], 'and nobody is asked about a conflict');
+  // While the file is still known by that name, the same word within a moment asks nothing.
+  r.controller.changed(true);
+  r.server.etag = '"Z"';
+  await r.sync.saved({ versions: ['e:"Z"'], rev: 3 });
+  const asked = r.server.heads;
+  r.controller.changed(true);
+  await r.sync.saved({ versions: ['e:"Z"'], rev: 3 });
+  assert.equal(r.server.heads, asked, 'no second question for the name the file is known by');
+});
+
 test('a server without HEAD is asked with a GET that fetches nothing', async () => {
   const r = rig({ head: false });
   r.controller.changed(true);

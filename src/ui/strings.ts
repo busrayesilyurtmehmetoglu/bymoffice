@@ -200,6 +200,7 @@ export interface UiStrings {
   saveConflict: string;
   /** A save nobody asked for met the saves of others in the room again and again. */
   saveRoomBusy: string;
+  saveInterrupted: string;
   /** The question a conflict leads to (see SaveToRequest.onConflict): its title, what it explains, and its two answers. */
   saveConflictTitle: string;
   saveConflictQuestion: string;
@@ -787,6 +788,7 @@ export const STRINGS_EN: UiStrings = {
   notConverted: (from) => `This ${from} file could not be converted to be edited; it is shown read-only`,
   saved: 'Saved',
   saveFailed: (detail) => (detail ? `The file could not be saved (${detail})` : 'The file could not be saved'),
+  saveInterrupted: 'Not saved yet: the file was being edited the whole time it was written. It is saved when the editing pauses.',
   saveRoomBusy: 'Not saved yet: several people are saving this file at once. Auto-save waits and tries again.',
   saveConflict: 'The file was not saved: the file on the server is not the one you opened (someone else changed it, or an earlier save of yours was written although its answer did not arrive)',
   saveConflictTitle: 'The file was changed on the server',
@@ -1385,6 +1387,7 @@ export const STRINGS_TR: UiStrings = {
   notConverted: (from) => `Bu ${from} dosyası düzenlenebilecek biçime çevrilemedi; salt okunur gösteriliyor`,
   saved: 'Kaydedildi',
   saveFailed: (detail) => (detail ? `Dosya kaydedilemedi (${detail})` : 'Dosya kaydedilemedi'),
+  saveInterrupted: 'Henüz kaydedilmedi: dosya yazılırken düzenleme hiç durmadı. Düzenleme durunca kaydedilecek.',
   saveRoomBusy: 'Henüz kaydedilmedi: bu dosyayı aynı anda birkaç kişi kaydediyor. Kendiliğinden kaydetme bekleyip yeniden deneyecek.',
   saveConflict: 'Dosya kaydedilmedi: sunucudaki dosya sizin açtığınızdan farklı (başkası değiştirmiş ya da önceki kaydınız yanıtı gelmeden yazılmış olabilir)',
   saveConflictTitle: 'Dosya sunucuda değişmiş',
