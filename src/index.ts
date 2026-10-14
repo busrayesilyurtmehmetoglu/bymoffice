@@ -135,6 +135,8 @@ export {
   type InsertSheetOptions,
 } from './ops/sheets';
 export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
+export { PivotRefreshError, compareText, listPivots, lookThroughPivots, pivotAt, refreshAllPivots, refreshPivot, refreshPivotProblem, type PivotInfo, type RefreshAll } from './ops/pivots';
+export type { PivotAggregate, PivotCache, PivotCacheField, PivotCacheState, PivotDataField, PivotField, PivotItem, PivotLine, PivotLocation, PivotPageField, PivotSource, PivotTable, PivotTableState, PivotValue, WorkbookPivots } from './model/sheet/pivot';
 export {
   CHART_COPY_OFFSET,
   CHART_PART_CHANGES,
@@ -1177,6 +1179,12 @@ export interface MountConversion {
   warnings: string[];
 }
 
+/** What MountedSpreadsheet.refreshPivots() did. */
+export interface PivotRefreshResult {
+  refreshed: number;
+  refused: { name: string; reason: string }[];
+}
+
 export interface MountedSpreadsheet {
   kind: 'spreadsheet';
   /** The file that is shown: the converted one when `conversion` is set. */
@@ -1214,6 +1222,14 @@ export interface MountedSpreadsheet {
    * is being typed is applied first. See WorkbookView.exportPdf().
    */
   exportPdf(options?: SheetPdfExportOptions): Promise<Uint8Array>;
+  /**
+   * Refreshes every pivot table of the workbook that can be, from its source, as one undo step
+   * (see WorkbookView.refreshAllPivots()). What is being typed is applied first. Resolves to how
+   * many tables were refreshed and, for each that was not, its name and why (in the language of
+   * the view). Nothing is refreshed in a read-only view; while the workbook is edited together a
+   * refresh is refused (it is not shared).
+   */
+  refreshPivots(): PivotRefreshResult;
   /**
    * Saves the file to MountOptions.saveTo, as the Save button does: what is
    * being typed is applied first. Resolves to true when it was saved, also
@@ -1760,6 +1776,17 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   converted();
   const print = (printOptions?: SheetPrintOptions) => view.print(printOptions);
   const exportPdf = (pdfOptions?: SheetPdfExportOptions) => view.exportPdf(pdfOptions);
+  const refreshPivots = (): PivotRefreshResult => {
+    let result: { refreshed: number[]; refused: { name: string; reason: string }[] };
+    try {
+      result = view.refreshAllPivots();
+    } catch (error) {
+      // Refused as a whole (edited together): every table says so.
+      const reason = view.localizeError(error);
+      return { refreshed: 0, refused: view.pivots().map((table) => ({ name: table.name, reason })) };
+    }
+    return { refreshed: result.refreshed.length, refused: result.refused.map((entry) => ({ name: entry.name, reason: entry.reason })) };
+  };
   const mounted: MountedSpreadsheet = {
     kind: 'spreadsheet',
     file,
@@ -1769,6 +1796,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     save: (saveOptions?: SaveOptions) => save(saveOptions),
     print,
     exportPdf,
+    refreshPivots,
     saveNow,
     get hasUnsavedChanges() {
       return unsaved();

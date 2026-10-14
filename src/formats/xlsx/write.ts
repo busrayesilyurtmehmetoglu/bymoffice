@@ -62,6 +62,7 @@ import type { Chart } from '../../model/sheet/chart';
 import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
+import { pivotPartsToRead, pivotWrites } from './pivot-write';
 import { parseColor } from './styles';
 import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
 import { keptFor, keptNow, ownCellFormulaAt, ownCellSpelling, type CellSpelling } from '../../ops/rules';
@@ -4424,6 +4425,8 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     (!!sheet.tabColorModified && !(sheet.tabColorRead && sameColor(sheet.tabColorRead.color, sheet.tabColor)));
   const flagged = (sheet: Sheet): boolean => !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified);
   const sheetsModified = !!workbook.sheetsModified || sheets.some((sheet) => sheet.part === '');
+  // The parts of refreshed pivot tables, and of those an earlier save wrote, are written from the bytes of the file.
+  for (const part of pivotPartsToRead(workbook)) reads.bytes(part);
   if (!workbook.styles.modified && !sheetsModified && !sheets.some(flagged)) return;
   const saved = SAVES.get(workbook);
   const want = (part: string): Uint8Array | undefined => {
@@ -4537,7 +4540,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   const notesModified = workbook.sheets.some((sheet) => sheet.commentsModified && sheet.kind !== 'chartsheet');
   const rulesModified = workbook.sheets.some((sheet) => (sheet.validationsModified || sheet.conditionalModified) && sheet.kind !== 'chartsheet');
   const chartsModified = workbook.sheets.some((sheet) => sheet.drawingsModified && sheet.kind === 'worksheet');
-  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified) return;
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !workbook.pivotsModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
@@ -5791,6 +5794,10 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   }
   movedNow.set(BOOK, bookParts);
 
+  // The parts of pivot tables that were refreshed, or go back to what the file had.
+  const pivots = pivotWrites(workbook, (part) => reads.bytes(part));
+  for (const [part, data] of pivots.writes) writes.push([part, data]);
+
   for (const [part, data, contentType] of restores) pkg.writePart(part, data, contentType);
   for (const [part, data, contentType] of writes) pkg.writePart(part, data, contentType);
   for (const [part] of removals) pkg.deletePart(part);
@@ -5805,4 +5812,5 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   for (const [sheet, names] of notesNow) noted.set(sheet, names);
   charted.clear();
   for (const [sheet, names] of chartsNow) charted.set(sheet, names);
+  pivots.done();
 }

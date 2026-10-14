@@ -74,6 +74,7 @@
         <div class="row">
           <button id="sample">Örnek xlsx üret ve aç</button>
           <button id="sample-chart" title="Verisi, altı grafiği (sütun, çizgi, pasta; radar, ikincil eksenli ve veri etiketli birleşik, balon) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir. Grafikler taşınabilir, silinebilir, kutularından düzenlenebilir, kopyalanıp yapıştırılabilir ve çoğaltılabilir (Ctrl/Cmd+C, X, V, D; sağ tık menüsü; başka sayfaya da); araç çubuğundan yenileri eklenebilir.">Grafikli örnek xlsx üret ve aç</button>
+          <button id="sample-pivot" title="Veri sayfası ve ondan yapılmış iki pivot tablosu (sıkıştırılmış düzende bölge × ürün; tablo düzeninde bölge ve ürün, iki değer) olan sentetik bir çalışma kitabı. Pivotlar eski haliyle açılır: tablonun bir hücresinde sağ tık → Pivot tabloyu yenile / Tüm pivot tabloları yenile. Veri sayfasında bir hücreyi değiştirip yeniden yenileyin; Ctrl/Cmd+Z yenilemeyi geri alır.">Pivotlu örnek xlsx üret ve aç</button>
           <button id="sample-doc-chart" title="İçinde üç grafik olan sentetik bir Word belgesi: satır içinde sütun grafiği, metnin sardığı pasta ve tablo hücresinde çizgi grafiği. Grafikler dosyadaki önbellek değerlerinden çizilir.">Grafikli örnek docx üret ve aç</button>
           <button id="blank-docx">Boş docx oluştur ve aç</button>
           <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
@@ -666,6 +667,91 @@
           utf8(`${head}<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows}</sheetData></worksheet>`),
         );
         await handle([{ name: 'ornek.xlsx', data: await zip.write() }]);
+      });
+
+      // A synthetic workbook with two pivot tables made from one cache over "Veri"!A1:D9: on "Pivot", one in compact form
+      // (regions in rows, products in columns, sum of sales) at A3 and one in tabular form (region and product in rows,
+      // sum of sales and count of units) at H3. Both stand as stand-ins that are out of date: a refresh builds them.
+      $('sample-pivot').addEventListener('click', async () => {
+        const utf8 = (text) => new TextEncoder().encode(text);
+        const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const PKG = 'http://schemas.openxmlformats.org/package/2006/relationships';
+        const MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml';
+        const data = [['Bölge', 'Ürün', 'Satış', 'Adet'], ['Doğu', 'Çay', 120, 4], ['Batı', 'Kahve', 200, 5], ['Doğu', 'Kahve', 90, 3], ['Kuzey', 'Çay', 75, 2], ['Batı', 'Çay', 60, 1], ['Kuzey', 'Kahve', 140, 6], ['Doğu', 'Çay', 30, 1], ['Batı', 'Kahve', 55, 2]];
+        const cell = (r, c, value) => {
+          const ref = 'ABCDEFGHIJKLMNOP'[c] + (r + 1);
+          return typeof value === 'number' ? `<c r="${ref}"><v>${value}</v></c>` : `<c r="${ref}" t="inlineStr"><is><t>${value}</t></is></c>`;
+        };
+        const sheet = (cells) => {
+          const byRow = new Map();
+          for (const [r, c, v] of cells) (byRow.get(r) || byRow.set(r, []).get(r)).push([c, v]);
+          const rows = [...byRow.keys()].sort((a, b) => a - b).map((r) => `<row r="${r + 1}">${byRow.get(r).sort((a, b) => a[0] - b[0]).map(([c, v]) => cell(r, c, v)).join('')}</row>`).join('');
+          return `${head}<worksheet xmlns="${MAIN}" xmlns:r="${REL}"><sheetData>${rows}</sheetData></worksheet>`;
+        };
+        const items = (field) => [...new Set(data.slice(1).map((row) => row[field]))];
+        const regions = items(0);
+        const products = items(1);
+        const shared = (list) => `<sharedItems count="${list.length}">${list.map((v) => `<s v="${v}"/>`).join('')}</sharedItems>`;
+        const cache =
+          `${head}<pivotCacheDefinition xmlns="${MAIN}" xmlns:r="${REL}" r:id="rId1" refreshedBy="Demo" refreshedDate="45000" createdVersion="8" refreshedVersion="8" minRefreshableVersion="3" recordCount="${data.length - 1}">` +
+          `<cacheSource type="worksheet"><worksheetSource ref="A1:D${data.length}" sheet="Veri"/></cacheSource><cacheFields count="4">` +
+          `<cacheField name="Bölge" numFmtId="0">${shared(regions)}</cacheField><cacheField name="Ürün" numFmtId="0">${shared(products)}</cacheField>` +
+          '<cacheField name="Satış" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" containsInteger="1" minValue="30" maxValue="200"/></cacheField>' +
+          '<cacheField name="Adet" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0" containsNumber="1" containsInteger="1" minValue="1" maxValue="6"/></cacheField></cacheFields></pivotCacheDefinition>';
+        const records =
+          `${head}<pivotCacheRecords xmlns="${MAIN}" xmlns:r="${REL}" count="${data.length - 1}">` +
+          data.slice(1).map((row) => `<r><x v="${regions.indexOf(row[0])}"/><x v="${products.indexOf(row[1])}"/><n v="${row[2]}"/><n v="${row[3]}"/></r>`).join('') +
+          '</pivotCacheRecords>';
+        const fieldItems = (list) => `<items count="${list.length + 1}">${list.map((_, x) => `<item x="${x}"/>`).join('')}<item t="default"/></items>`;
+        const table1 =
+          `${head}<pivotTableDefinition xmlns="${MAIN}" name="Bölgeler" cacheId="1" dataCaption="Değerler" updatedVersion="8" createdVersion="8" outline="1" outlineData="1">` +
+          '<location ref="A3:B5" firstHeaderRow="1" firstDataRow="2" firstDataCol="1"/><pivotFields count="4">' +
+          `<pivotField axis="axisRow" showAll="0">${fieldItems(regions)}</pivotField><pivotField axis="axisCol" showAll="0">${fieldItems(products)}</pivotField>` +
+          '<pivotField dataField="1" showAll="0"/><pivotField showAll="0"/></pivotFields>' +
+          '<rowFields count="1"><field x="0"/></rowFields><rowItems count="1"><i t="grand"><x/></i></rowItems><colFields count="1"><field x="1"/></colFields><colItems count="1"><i t="grand"><x/></i></colItems>' +
+          '<dataFields count="1"><dataField name="Toplam Satış" fld="2" baseField="0" baseItem="0"/></dataFields><pivotTableStyleInfo name="PivotStyleLight16" showRowHeaders="1" showColHeaders="1"/></pivotTableDefinition>';
+        const table2 =
+          `${head}<pivotTableDefinition xmlns="${MAIN}" name="Ürünler" cacheId="1" dataCaption="Değerler" updatedVersion="8" createdVersion="8" compact="0" compactData="0" outline="1" outlineData="1">` +
+          '<location ref="H3:K4" firstHeaderRow="0" firstDataRow="1" firstDataCol="2"/><pivotFields count="4">' +
+          `<pivotField axis="axisRow" compact="0" outline="0" showAll="0">${fieldItems(regions)}</pivotField><pivotField axis="axisRow" compact="0" outline="0" showAll="0">${fieldItems(products)}</pivotField>` +
+          '<pivotField dataField="1" compact="0" outline="0" showAll="0"/><pivotField dataField="1" compact="0" outline="0" showAll="0"/></pivotFields>' +
+          '<rowFields count="2"><field x="0"/><field x="1"/></rowFields><rowItems count="1"><i t="grand"><x/></i></rowItems><colFields count="1"><field x="-2"/></colFields>' +
+          '<colItems count="2"><i><x/></i><i i="1"><x v="1"/></i></colItems>' +
+          '<dataFields count="2"><dataField name="Toplam Satış" fld="2" baseField="0" baseItem="0"/><dataField name="Adet Sayısı" fld="3" subtotal="count" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>';
+        const dataCells = [];
+        data.forEach((row, r) => row.forEach((v, c) => dataCells.push([r, c, v])));
+        const pivotCells = [
+          [2, 0, 'Toplam Satış'], [2, 1, 'Sütun Etiketleri'], [3, 0, 'Satır Etiketleri'], [3, 1, 'Genel Toplam'], [4, 0, 'Genel Toplam'],
+          [2, 7, 'Bölge'], [2, 8, 'Ürün'], [2, 9, 'Toplam Satış'], [2, 10, 'Adet Sayısı'], [3, 7, 'Genel Toplam'],
+        ];
+        const zip = new BymOffice.ZipArchive();
+        zip.set(
+          '[Content_Types].xml',
+          utf8(
+            `${head}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>` +
+              `<Override PartName="/xl/workbook.xml" ContentType="${CT}.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="${CT}.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="${CT}.worksheet+xml"/>` +
+              `<Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" ContentType="${CT}.pivotCacheDefinition+xml"/><Override PartName="/xl/pivotCache/pivotCacheRecords1.xml" ContentType="${CT}.pivotCacheRecords+xml"/>` +
+              `<Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="${CT}.pivotTable+xml"/><Override PartName="/xl/pivotTables/pivotTable2.xml" ContentType="${CT}.pivotTable+xml"/></Types>`,
+          ),
+        );
+        zip.set('_rels/.rels', utf8(`${head}<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>`));
+        zip.set('xl/workbook.xml', utf8(`${head}<workbook xmlns="${MAIN}" xmlns:r="${REL}"><bookViews><workbookView activeTab="1"/></bookViews><sheets><sheet name="Veri" sheetId="1" r:id="rId1"/><sheet name="Pivot" sheetId="2" r:id="rId2"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId3"/></pivotCaches></workbook>`));
+        zip.set(
+          'xl/_rels/workbook.xml.rels',
+          utf8(`${head}<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${REL}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${REL}/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="${REL}/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/></Relationships>`),
+        );
+        zip.set('xl/worksheets/sheet1.xml', utf8(sheet(dataCells)));
+        zip.set('xl/worksheets/sheet2.xml', utf8(sheet(pivotCells)));
+        zip.set('xl/worksheets/_rels/sheet2.xml.rels', utf8(`${head}<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${REL}/pivotTable" Target="../pivotTables/pivotTable1.xml"/><Relationship Id="rId2" Type="${REL}/pivotTable" Target="../pivotTables/pivotTable2.xml"/></Relationships>`));
+        for (const n of [1, 2]) zip.set(`xl/pivotTables/_rels/pivotTable${n}.xml.rels`, utf8(`${head}<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${REL}/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>`));
+        zip.set('xl/pivotTables/pivotTable1.xml', utf8(table1));
+        zip.set('xl/pivotTables/pivotTable2.xml', utf8(table2));
+        zip.set('xl/pivotCache/pivotCacheDefinition1.xml', utf8(cache));
+        zip.set('xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels', utf8(`${head}<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${REL}/pivotCacheRecords" Target="pivotCacheRecords1.xml"/></Relationships>`));
+        zip.set('xl/pivotCache/pivotCacheRecords1.xml', utf8(records));
+        await handle([{ name: 'pivot-ornek.xlsx', data: await zip.write() }]);
       });
 
       // A synthetic workbook with charts: data in A1:C6, a column chart, a line chart and a pie below it, under those a

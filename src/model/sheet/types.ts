@@ -6,6 +6,7 @@
 
 import { parseXml, type XmlElement } from '../../xml';
 import type { Chart } from './chart';
+import type { WorkbookPivots } from './pivot';
 
 export const MAX_ROWS = 1048576;
 export const MAX_COLS = 16384;
@@ -1423,6 +1424,13 @@ export interface Workbook {
    * deleted in turn, its own neighbour takes its place here.
    */
   removedSheetNeighbours?: SheetNeighbours[];
+  /**
+   * The pivot tables of the workbook and their caches (see pivot.ts); missing for a workbook
+   * without any. What they show is in the cells of their sheets.
+   */
+  pivots?: WorkbookPivots;
+  /** Set once a pivot table was refreshed (and never cleared, not by undo either): the writer brings the parts of refreshed tables and caches in line with the model. */
+  pivotsModified?: boolean;
 }
 
 /** The sheets on either side of a deleted sheet; undefined where it was the first or the last. */

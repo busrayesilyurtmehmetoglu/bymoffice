@@ -7,6 +7,7 @@
 // operation keep the previous state for undo by reference, without copying it.
 
 import { touchModel } from '../model/edits';
+import type { PivotCacheState, PivotTableState } from '../model/sheet/pivot';
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
 import { chartsFollow, chartsMoved, chartsRenamed } from './charts';
@@ -251,6 +252,20 @@ export type Op =
       type: 'setTabColor';
       sheet: number;
       color: Color | undefined;
+    }
+  | {
+      /**
+       * Sets what a refresh made of a pivot cache (Workbook.pivots.caches[cache]) and of tables
+       * made from it (indexes into Workbook.pivots.tables); undefined puts one back to what the
+       * file has. The states are held by reference and never altered. The cells of the tables are
+       * not changed here: a refresh writes them with "setCells" (see pivots.ts). `sheet` is the
+       * sheet of the first table, for whoever reports which sheet a step changed.
+       */
+      type: 'setPivot';
+      sheet: number;
+      cache: number;
+      state: PivotCacheState | undefined;
+      tables: { table: number; state: PivotTableState | undefined }[];
     }
   | {
       /**
@@ -1635,6 +1650,28 @@ export function applyOp(workbook: Workbook, op: Op): Op {
     }
     case 'restoreSheets':
       return restoreSheets(workbook, op.sheet, op.state, op.weight);
+    case 'setPivot': {
+      const pivots = workbook.pivots;
+      const cache = pivots ? pivots.caches[op.cache] : undefined;
+      if (!pivots || !cache || !(op.cache >= 0) || Math.floor(op.cache) !== op.cache) throw new RangeError(`No pivot cache at index ${op.cache}`);
+      if (!Array.isArray(op.tables)) throw new RangeError('The tables of a pivot cache are a list');
+      // Everything is checked before anything is changed.
+      for (const entry of op.tables) {
+        const table = entry && typeof entry.table === 'number' ? pivots.tables[entry.table] : undefined;
+        if (!table || table.cache !== cache) throw new RangeError('A table of the operation is not made from its cache');
+      }
+      const tables = op.tables.map((entry) => ({ table: entry.table, state: pivots.tables[entry.table].now }));
+      const state = cache.now;
+      if (op.state) cache.now = op.state;
+      else delete cache.now;
+      for (const entry of op.tables) {
+        const table = pivots.tables[entry.table];
+        if (entry.state) table.now = entry.state;
+        else delete table.now;
+      }
+      workbook.pivotsModified = true;
+      return { type: 'setPivot', sheet: op.sheet, cache: op.cache, state, tables };
+    }
   }
 }
 
@@ -1656,6 +1693,8 @@ function weightOf(ops: Op[]): number {
     else if (op.type === 'setDrawings') weight += (op.drawings ? op.drawings.length : 0) / 16;
     else if (op.type === 'setDataValidations') weight += (op.validations ? op.validations.length : 0) / 16;
     else if (op.type === 'setConditionalFormats') weight += (op.formats ? op.formats.length : 0) / 16;
+    // The records of a cache a refresh replaced are kept for its undo.
+    else if (op.type === 'setPivot') weight += (op.state ? op.state.records.length : 0) / 16;
   }
   return weight;
 }

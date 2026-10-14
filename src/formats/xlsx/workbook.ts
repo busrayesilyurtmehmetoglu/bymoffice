@@ -6,8 +6,9 @@
 import type { OpcPackage, Relationship } from '../../opc';
 import { MAX_WORKBOOK_CHARTS, MAX_WORKBOOK_CHART_POINTS } from '../../model/sheet/chart';
 import { createSheet, type DefinedName, type DrawingChart, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
-import { childElements, localName, type XmlDocument, type XmlElement } from '../../xml';
+import { childElements, localName, serializeXml, type XmlDocument, type XmlElement } from '../../xml';
 import { parseChart } from './chart';
+import { pivotTableParts, readPivots } from './pivot';
 import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
 import { readSheetDrawings, type ChartReading, type DrawingPartFacts } from './drawings';
 import { parseSharedStrings } from './shared-strings';
@@ -100,6 +101,8 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   const sheetsElement = child(root, 'sheets');
   /** The drawing parts each sheet shows: one that two sheets show is changed for neither. */
   const drawingParts: { sheet: Sheet; parts: string[] }[] = [];
+  /** The pivot table parts each worksheet shows. */
+  const pivotParts: { sheet: Sheet; parts: string[] }[] = [];
   for (const element of sheetsElement ? childElements(sheetsElement, 'sheet') : []) {
     const name = element.attrs.get('name') ?? '';
     const rel = relById.get(prefixedAttr(element, 'id') ?? '');
@@ -121,6 +124,10 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     if (kind !== 'chartsheet') {
       parseWorksheet(await pkg.readPart(rel.part), sharedStrings, sheet);
       const sheetRels = await pkg.relationships(rel.part);
+      if (kind === 'worksheet') {
+        const tables = pivotTableParts(sheetRels);
+        if (tables.length > 0) pivotParts.push({ sheet, parts: tables });
+      }
       if (sheet.hyperlinks.some((link) => link.rId !== undefined)) {
         const targets = new Map(sheetRels.map((r) => [r.id, r.target]));
         for (const link of sheet.hyperlinks) {
@@ -277,6 +284,25 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     activeSheet: activeTab < sheets.length ? activeTab : 0,
   };
   if (chartParts > 0 && follow) workbook.chartsFollow = true;
+  if (pivotParts.length > 0) {
+    // The caches the workbook lists, by the part each is in: a table names its cache by that number.
+    const cacheIds = new Map<string, number>();
+    const cachesElement = child(root, 'pivotCaches');
+    for (const element of cachesElement ? childElements(cachesElement, 'pivotCache') : []) {
+      const target = relById.get(prefixedAttr(element, 'id') ?? '');
+      const id = element.attrs.get('cacheId') || '';
+      if (target && target.part && /^\d{1,10}$/.test(id) && !cacheIds.has(target.part.toLowerCase())) cacheIds.set(target.part.toLowerCase(), Number(id));
+    }
+    try {
+      // Slicers and timelines are listed in the extensions of the workbook part.
+      const extensions = child(root, 'extLst');
+      const slicers = !!extensions && /slicerCache|timelineCache/.test(serializeXml({ declaration: null, leading: [], root: extensions, trailing: [] }));
+      const pivots = await readPivots(pkg, pivotParts, cacheIds, workbook.date1904, main, slicers);
+      if (pivots) workbook.pivots = pivots;
+    } catch (error) {
+      // The tables stay as the file has them: shown, not refreshed.
+    }
+  }
   if (mediaParts.size > 0) {
     // Read from the package when a picture is first shown, and only what a drawing of this workbook shows.
     workbook.media = {

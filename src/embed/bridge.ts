@@ -46,7 +46,8 @@ export type BridgeErrorCode =
   | 'sheet-refused'
   | 'locale-refused'
   | 'no-document'
-  | 'comment-refused';
+  | 'comment-refused'
+  | 'pivot-refused';
 
 /**
  * What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed;
@@ -1732,6 +1733,35 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
+   * Refreshes every pivot table of the workbook that can be, as one undo step: the answer is "done" with how many
+   * were refreshed and, for each that was not, its name and why (in the language of the view).
+   */
+  const refreshPivots = (id: string | undefined) => {
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const view = shown.view;
+    if (!view) return fail('no-sheet', 'The open file is a document: it has no pivot tables', id);
+    if (shown.locked || view.readOnly === true) return fail('read-only', 'The file is read-only', id);
+    if (typeof view.refreshAllPivots !== 'function') return fail('pivot-refused', 'This view cannot refresh pivot tables', id);
+    const answer: Message = { type: 'done', id, command: 'refreshPivots' };
+    try {
+      // As in changeSheets(): what is being typed is applied first, and nothing is said to be done that was not.
+      if (!commitPendingOf(view)) return fail('pivot-refused', STILL_EDITING, id);
+      const result = view.refreshAllPivots();
+      answer.refreshed = result.refreshed.length;
+      answer.refused = result.refused.map((entry) => ({ name: entry.name, reason: entry.reason }));
+    } catch (error) {
+      let text: string;
+      try {
+        text = typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
+      } catch {
+        text = errorText(error);
+      }
+      return fail('pivot-refused', text, id);
+    }
+    if (id !== undefined) send(answer);
+  };
+
+  /**
    * Moves, hides or shows, copies a sheet or colours its tab through the view, as one undo
    * step. Like changeSheets(): the list that results is told by `sheets`, and the answer says
    * that the command was done, or why it was not.
@@ -2145,6 +2175,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
+      if (type === 'refreshPivots') return refreshPivots(id);
       if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);

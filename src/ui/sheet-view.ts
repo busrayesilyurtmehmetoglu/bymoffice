@@ -46,6 +46,7 @@ import {
 } from '../ops/filter';
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
 import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps } from '../ops/notes';
+import { listPivots, lookThroughPivots, pivotAt, refreshAllPivots as refreshAllPivotsOps, refreshPivot as refreshPivotOps, type PivotInfo } from '../ops/pivots';
 import { hasDefinedName } from '../ops/commands';
 import {
   CONDITIONAL_TYPES,
@@ -4627,6 +4628,94 @@ export class WorkbookView {
     return this.commitPending();
   }
 
+  // ------------------------------------------------------------ pivot tables
+
+  /** The pivot tables of the workbook, with the sheet each stands on and its cells now (see listPivots()). */
+  pivots(): PivotInfo[] {
+    return listPivots(this.workbook);
+  }
+
+  /**
+   * Refreshes a pivot table (`index` as pivots() lists it) from its source, with every table made
+   * from the same cache, as one undo step. What is being typed is applied first. Returns false in
+   * a read-only view, while what is typed cannot be applied, and when the table already shows what
+   * its source holds (nothing changed, nothing to undo). Throws RangeError with the reason when the
+   * table is not refreshed (see refreshPivot() of the operations): that is said in the words of
+   * the view by localizeError().
+   */
+  refreshPivot(index: number): boolean {
+    if (!this.beginRules()) return false;
+    // The source is read as the formulas have it once every calculation is done.
+    this.settleCalculation();
+    const ops = refreshPivotOps(this.workbook, index);
+    if (!this.applyOps(ops)) return false;
+    this.live.textContent = this.strings.pivots.refreshed(1);
+    return true;
+  }
+
+  /**
+   * Refreshes every pivot table that can be, as one undo step; the others stay as they are. Returns
+   * the tables that were refreshed and those that were not, each with the reason in the words of
+   * the view. Nothing is done in a read-only view, nor while what is typed cannot be applied
+   * (`refused` names every table then, with that reason).
+   */
+  refreshAllPivots(): { refreshed: number[]; refused: { index: number; name: string; reason: string }[] } {
+    const tables = listPivots(this.workbook);
+    if (!this.beginRules()) {
+      const reason = this.strings.actionFailed;
+      return { refreshed: [], refused: tables.map((table) => ({ index: table.index, name: table.name, reason })) };
+    }
+    this.settleCalculation();
+    // A source with formulas that come after a refresh which changed cells is refused there (its formulas are not
+    // calculated between two refreshes of one step): it is refreshed on its own, after this step was calculated.
+    const all = refreshAllPivotsOps(this.workbook);
+    const refused = all.refused.map((entry) => ({ index: entry.index, name: entry.name, reason: this.strings.pivots.refused(entry.reason) }));
+    if (all.ops.length > 0) this.applyOps(all.ops);
+    return { refreshed: all.refreshed, refused };
+  }
+
+  /** Finishes a calculation that is under way, so that what is read of the cells is what their formulas come to. */
+  private settleCalculation(): void {
+    if (this.engine && this.engine.incomplete) this.finishCalculation(this.engine);
+  }
+
+  /** The commands of pivot tables for the menu of a cell in one; nothing for a cell in none. */
+  private pivotItems(items: MenuItem[], row: number, col: number): void {
+    const index = pivotAt(this.workbook, this.sheetIndex, row, col);
+    if (index === undefined) return;
+    const strings = this.strings.pivots;
+    // The menu says what is known to be refused: once the package was looked through for what refers to the caches.
+    lookThroughPivots(this.workbook);
+    const known = listPivots(this.workbook)[index];
+    // What is known to be refused without reading the source is shown all the same, and says why.
+    // While the workbook is edited together a refresh is not shared: refused (see encodeOp()).
+    const reason = this.collab
+      ? this.strings.collab.unsupported
+      : known && known.refusal !== undefined
+        ? strings.refused(`Cannot refresh the pivot table "${known.name}": ${known.refusal}`)
+        : undefined;
+    const explain = reason === undefined ? undefined : () => this.notify(reason, 'error');
+    items.push({ label: '', separator: true });
+    items.push({ label: strings.refresh, disabled: reason !== undefined, title: reason, explain, action: () => this.attempt(() => this.menuRefreshPivot(index)) });
+    if (listPivots(this.workbook).length > 1) items.push({ label: strings.refreshAll, disabled: !!this.collab, title: this.collab ? reason : undefined, explain: this.collab ? explain : undefined, action: () => this.attempt(() => this.menuRefreshAll()) });
+  }
+
+  private menuRefreshPivot(index: number): void {
+    this.refreshPivot(index);
+  }
+
+  private menuRefreshAll(): void {
+    const result = this.refreshAllPivots();
+    if (result.refreshed.length > 0) this.notify(this.strings.pivots.refreshed(result.refreshed.length), result.refused.length > 0 ? 'error' : 'info');
+    // One reason is said for each cache that is not refreshed (its tables share it).
+    const said = new Set<string>();
+    for (const entry of result.refused) {
+      if (said.has(entry.reason)) continue;
+      said.add(entry.reason);
+      this.notify(entry.reason, 'error');
+    }
+  }
+
   /**
    * Opens a dialog of conditional formats over the view. `what` says which: "manage" the list
    * of rules (of the selection, or of the sheet); a number the dialog of that rule (see
@@ -5874,6 +5963,7 @@ export class WorkbookView {
     if (error instanceof ValidationError) return error.display;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
     let match: RegExpExecArray | null;
+    if (/^Cannot refresh the pivot table/.test(message)) return strings.pivots.refused(message);
     if (message === 'Too many cells to format at once') return strings.tooManyCells;
     if ((match = /^Too many rows to (format|resize|change) at once$/.exec(message))) return strings.tooManyRows(match[1] as 'format' | 'resize' | 'change');
     if (message === 'Whole rows or columns cannot be merged') return strings.cannotMergeWhole;
@@ -6482,7 +6572,7 @@ export class WorkbookView {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
       // A note or a rule changes no size and no position.
-      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings') structural = true;
+      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings' && op.type !== 'setPivot') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
       if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }
@@ -7547,6 +7637,7 @@ export class WorkbookView {
       if (rows > 0) items.push({ label: strings.deleteRows(rows), action: () => this.attempt(() => this.structural('delete', 'row', range.top, rows)) });
       if (cols > 0) items.push({ label: strings.deleteColumns(cols), action: () => this.attempt(() => this.structural('delete', 'col', range.left, cols)) });
       this.noteItems(items);
+      this.pivotItems(items, row, col);
       if (this.state().sheet.kind === 'worksheet') {
         items.push({ label: '', separator: true });
         items.push({ label: strings.rules.validationCommand, action: () => void this.openValidationDialog() });

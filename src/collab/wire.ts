@@ -962,6 +962,9 @@ export function encodeOp(workbook: Workbook, op: Op): Encoded {
       return { op: { t: 'tab', s: op.sheet, color: op.color ? op.color : 0 } };
     case 'copySheet':
       throw new CollabUnsupportedError('copySheet', 'A sheet cannot be copied while the workbook is edited together');
+    case 'setPivot':
+      // A refresh reads the source as this participant has it, and its cache is not sent: refused, before anything is changed.
+      throw new CollabUnsupportedError('other', 'A pivot table cannot be refreshed while the workbook is edited together');
     default:
       throw new CollabUnsupportedError('other', `The operation "${op.type}" cannot be shared`);
   }

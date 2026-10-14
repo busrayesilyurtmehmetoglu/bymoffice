@@ -381,6 +381,20 @@ export interface UiStrings {
   rules: RuleStrings;
   /** Charts: the menu that adds one, the dialog that changes one, and what is said about them. */
   charts: ChartStrings;
+  /** Pivot tables: the commands of the menu of a cell of one, and what is said about a refresh. */
+  pivots: PivotStrings;
+}
+
+/** What the commands of pivot tables say. */
+export interface PivotStrings {
+  refresh: string;
+  refreshAll: string;
+  /** Said after a refresh: how many tables were refreshed. */
+  refreshed(count: number): string;
+  /** Why a table was not refreshed, from the text of the engine ('Cannot refresh the pivot table "<name>": <reason>'). */
+  refused(message: string): string;
+  /** Said when the workbook has no pivot table to refresh. */
+  none: string;
 }
 
 /** What the commands and the dialog of charts say. */
@@ -1222,6 +1236,13 @@ export const STRINGS_EN: UiStrings = {
     noCellPaste: 'A chart is selected: select a cell to paste cells',
     copyGone: 'The chart on the clipboard was copied elsewhere and cannot be pasted here: copy the chart again',
   },
+  pivots: {
+    refresh: 'Refresh pivot table',
+    refreshAll: 'Refresh all pivot tables',
+    refreshed: (count) => (count === 1 ? 'Pivot table refreshed' : `${count} pivot tables refreshed`),
+    refused: (message) => message,
+    none: 'The workbook has no pivot table to refresh',
+  },
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -1817,7 +1838,112 @@ export const STRINGS_TR: UiStrings = {
     noCellPaste: 'Bir grafik seçili: hücre yapıştırmak için bir hücre seçin',
     copyGone: 'Panodaki grafik başka bir yerde kopyalanmış, buraya yapıştırılamıyor: grafiği yeniden kopyalayın',
   },
+  pivots: {
+    refresh: 'Pivot tabloyu yenile',
+    refreshAll: 'Tüm pivot tabloları yenile',
+    refreshed: (count) => (count === 1 ? 'Pivot tablo yenilendi' : `${count} pivot tablo yenilendi`),
+    refused: pivotRefusalTr,
+    none: 'Çalışma kitabında yenilenecek pivot tablo yok',
+  },
 };
+
+/** Why a pivot table cannot be refreshed, in Turkish: by the reason the engine gives (see src/ops/pivots.ts, src/formats/xlsx/pivot.ts). */
+const PIVOT_REASONS_TR: [RegExp, (m: RegExpExecArray) => string][] = [
+  [/^its data does not come from a range of the workbook/, () => 'verisi çalışma kitabındaki bir aralıktan gelmiyor (dış veri, OLAP, birleştirme ya da senaryo)'],
+  [/^its source is not stated$/, () => 'kaynağı belirtilmemiş'],
+  [/^its data comes from another workbook$/, () => 'verisi başka bir çalışma kitabından geliyor'],
+  [/^its data is a consolidation of several ranges$/, () => 'verisi birden çok aralığın birleştirilmesi'],
+  [/^its data comes from an OLAP source$/, () => 'verisi bir OLAP kaynağından geliyor'],
+  [/^it has a calculated field$/, () => 'hesaplanmış alanı var'],
+  [/^it groups items/, () => 'öğeleri gruplanmış (tarih ya da sayı aralıkları, elle birleştirilmiş öğeler)'],
+  [/^its fields cannot be read$/, () => 'alanları okunamıyor'],
+  [/^the workbook does not list its cache$/, () => 'çalışma kitabı önbelleğini listelemiyor'],
+  [/^its values stand in rows$/, () => 'değerleri satırlarda duruyor'],
+  [/^it shows no headers$/, () => 'başlıkları gösterilmiyor'],
+  [/^it has the classic layout$/, () => 'klasik düzende'],
+  [/^it merges the cells of its labels$/, () => 'etiket hücrelerini birleştiriyor'],
+  [/^a field is sorted in a way that is not known here$/, () => 'bir alanı burada bilinmeyen bir biçimde sıralanmış'],
+  [/^a field has subtotals by functions of their own$/, () => 'bir alanın kendi işlevleriyle ara toplamları var'],
+  [/^a field puts blank rows after its items$/, () => 'bir alan öğelerinden sonra boş satır bırakıyor'],
+  [/^a field is sorted by values$/, () => 'bir alan değerlere göre sıralanmış'],
+  [/^a field repeats the labels of its items$/, () => 'bir alan öğe etiketlerini yineliyor'],
+  [/^it has calculated items$/, () => 'hesaplanmış öğeleri var'],
+  [/^an item of a field is missing from its source$/, () => 'bir alanın bir öğesi kaynağında yok'],
+  [/^a value is summarized by a function that is not known here \("(.*)"\)$/, (m) => `bir değer burada bilinmeyen bir işlevle özetleniyor ("${m[1]}")`],
+  [/^a value is shown as a calculation/, () => 'bir değer hesaplama olarak gösteriliyor (oran, fark, değişen toplam …)'],
+  [/^it formats some of its items$/, () => 'bazı öğelerine biçim verilmiş'],
+  [/^a pivot chart is made from it$/, () => 'ondan bir pivot grafik yapılmış'],
+  [/^it filters by labels or by values$/, () => 'etikete ya da değere göre süzülüyor'],
+  [/^its fields are not those of its cache$/, () => 'alanları önbelleğinin alanlarıyla uyuşmuyor'],
+  [/^it names a cache the workbook does not have under that number$/, () => 'çalışma kitabında o numarayla bulunmayan bir önbelleği anıyor'],
+  [/^two sheets show the same table$/, () => 'iki sayfa aynı tabloyu gösteriyor'],
+  [/^its source "(.*)" is a table or a name that is not known here$/, (m) => `kaynağı "${m[1]}" burada bilinmeyen bir tablo ya da ad`],
+  [/^its source "(.*)" is not one range of cells$/, (m) => `kaynağı "${m[1]}" tek bir hücre aralığı değil`],
+  [/^the sheet of its source \("(.*)"\) is not in the workbook$/, (m) => `kaynağının sayfası ("${m[1]}") çalışma kitabında yok`],
+  [/^its source \("(.*)"\) is not a range of cells$/, (m) => `kaynağı ("${m[1]}") bir hücre aralığı değil`],
+  [/^its source has (\d+) columns and its cache (\d+) fields$/, (m) => `kaynağında ${m[1]} sütun, önbelleğinde ${m[2]} alan var`],
+  [/^its source has no rows below its header$/, () => 'kaynağında başlığın altında satır yok'],
+  [/^its source has more than (\d+) cells$/, (m) => `kaynağında ${m[1]} hücreden fazlası var`],
+  [/^the header of column (\S+) of its source is empty$/, (m) => `kaynağındaki ${m[1]} başlığı boş`],
+  [/^the header of (\S+) of its source is "(.*)", the field of the cache is "(.*)"$/, (m) => `kaynağındaki ${m[1]} başlığı "${m[2]}", önbellekteki alan "${m[3]}"`],
+  [/^it has no values$/, () => 'değer alanı yok'],
+  [/^its values have no place in its columns$/, () => 'değerlerinin sütunlarda yeri yok'],
+  [/^its values do not stand after the fields of its columns$/, () => 'değerleri sütun alanlarından sonra durmuyor'],
+  [/^its values stand in its columns although there is one of them$/, () => 'tek değeri olduğu hâlde değerler sütunlarda duruyor'],
+  [/^it has several values as well as fields in its columns$/, () => 'hem birden çok değeri hem sütun alanları var'],
+  [/^it has no fields in its rows$/, () => 'satırlarında alan yok'],
+  [/^it names a field it does not have$/, () => 'olmayan bir alanı anıyor'],
+  [/^its fields in rows are laid out in different forms$/, () => 'satır alanları farklı düzenlerde'],
+  [/^it has fields in its columns and is not in compact form$/, () => 'sütun alanları var ve sıkıştırılmış düzende değil'],
+  [/^the field "(.*)" lists no items$/, (m) => `"${m[1]}" alanı öğe listelemiyor`],
+  [/^the items of a field do not match its cache$/, () => 'bir alanın öğeleri önbelleğiyle uyuşmuyor'],
+  [/^the item the page shows for the field "(.*)" is not in its source any more$/, (m) => `sayfa alanı "${m[1]}" için gösterilen öğe artık kaynakta yok`],
+  [/^it would have more than (\d+) cells$/, (m) => `${m[1]} hücreden büyük olurdu`],
+  [/^it has more than (\d+) cells$/, (m) => `${m[1]} hücreden büyük`],
+  [/^it would reach past the end of the sheet$/, () => 'sayfanın sonunu aşardı'],
+  [/^it would grow over the pivot table "(.*)"$/, (m) => `"${m[1]}" pivot tablosunun üzerine taşardı`],
+  [/^it would grow over the merged cells (\S+)$/, (m) => `${m[1]} birleştirilmiş hücrelerinin üzerine taşardı`],
+  [/^it would grow over (\S+), which is not empty$/, (m) => `boş olmayan ${m[1]} hücresinin üzerine taşardı`],
+  [/^its cache is not known$/, () => 'önbelleği bilinmiyor'],
+  [/^every item of the field "(.*)" would be hidden$/, (m) => `"${m[1]}" alanının bütün öğeleri gizli kalırdı`],
+  [/^it cannot tell what refers to its cache$/, () => 'önbelleğini neyin andığı anlaşılamıyor (çalışma kitabı taranamayacak kadar büyük ya da okunamayan bir parçası var)'],
+  [/^its source has formulas, and another pivot table refreshed with it changed cells: refresh it on its own$/, () => 'kaynağında formül var ve onunla birlikte yenilenen başka bir pivot tablo hücreleri değiştirdi: bu tabloyu ayrıca yenileyin'],
+  [/^another part of the workbook refers to its cache \((.*)\)$/, (m) => `çalışma kitabının başka bir parçası önbelleğini anıyor (${m[1]})`],
+  [/^another part of the workbook refers to its records \((.*)\)$/, (m) => `çalışma kitabının başka bir parçası önbellek kayıtlarını anıyor (${m[1]})`],
+  [/^a slicer or a timeline reads the caches of the workbook$/, () => 'bir dilimleyici ya da zaman çizelgesi çalışma kitabının önbelleklerini okuyor'],
+  [/^a pivot chart is made from a table of its cache$/, () => 'önbelleğindeki bir tablodan pivot grafik yapılmış'],
+  [/^a pivot chart is made from a table that is not known here$/, () => 'burada bilinmeyen bir tablodan pivot grafik yapılmış'],
+  [/^the charts of the workbook are too large to look through for pivot charts$/, () => 'çalışma kitabının grafikleri pivot grafik aramak için fazla büyük'],
+  [/^a chart of the workbook cannot be read to tell whether it is a pivot chart$/, () => 'bir grafiğin pivot grafik olup olmadığı okunamıyor'],
+  [/^the workbook has too many parts to look through$/, () => 'çalışma kitabında taranamayacak kadar çok parça var'],
+  [/^relationships of the workbook cannot be read$/, () => 'çalışma kitabının ilişkileri okunamıyor'],
+  [/^it has a setting that is not known here \((.*)\)$/, (m) => `burada bilinmeyen bir ayarı var (${m[1]})`],
+  [/^it has a setting that is not applied here \((.*)\)$/, (m) => `burada uygulanmayan bir ayarı var (${m[1]})`],
+  [/^it has a part that is not known here \((.*)\)$/, (m) => `burada bilinmeyen bir öğesi var (${m[1]})`],
+  [/^a field has a part that is not known here \((.*)\)$/, (m) => `bir alanının burada bilinmeyen bir öğesi var (${m[1]})`],
+  [/^a value has a part that is not known here \((.*)\)$/, (m) => `bir değerinin burada bilinmeyen bir öğesi var (${m[1]})`],
+  [/^it has an extension that is not known here \((.*)\)$/, (m) => `burada bilinmeyen bir uzantısı var (${m[1]})`],
+  [/^a field has a caption of its own for its subtotals/, () => 'bir alanın ara toplamları için kendi başlığı var (subtotalCaption)'],
+  [/^an item of a field is collapsed/, () => 'bir alanın bir öğesi daraltılmış (ayrıntıları gizli)'],
+  [/^a field has an item of a kind that is not built here \("(.*)"\)$/, (m) => `bir alanda burada kurulmayan türde bir öğe var ("${m[1]}")`],
+  [/^it has more than (\d+) fields in its rows and columns$/, (m) => `satır ve sütunlarında ${m[1]} alandan fazlası var`],
+  [/^it sorts a field whose items are names of months or days/, () => 'öğeleri ay ya da gün adları olan bir alanı sıralıyor (Excel bunları takvim sırasıyla sıralar)'],
+  [/^it would take too long to add up/, () => 'toplanması çok uzun sürer (alanları ve değerleri için kayıt sayısı çok fazla)'],
+  [/^the labels of the field "(.*)" have a number format the style sheet has no style with$/, (m) => `"${m[1]}" alanının etiketlerinin sayı biçimi stil sayfasındaki hiçbir stilde yok`],
+  [/^its sheet is not in the workbook$/, () => 'sayfası çalışma kitabında yok'],
+  [/^it does not stand on a worksheet$/, () => 'bir çalışma sayfasında durmuyor'],
+];
+
+/** The reason a pivot table was not refreshed, in Turkish; the text of the engine where no translation fits. */
+function pivotRefusalTr(message: string): string {
+  const match = /^Cannot refresh the pivot table(?: "(.*?)")?: (.*)$/.exec(message);
+  if (!match) return message;
+  for (const [pattern, say] of PIVOT_REASONS_TR) {
+    const found = pattern.exec(match[2]);
+    if (found) return `${match[1] !== undefined ? `"${match[1]}" pivot tablosu` : 'Pivot tablo'} yenilenemiyor: ${say(found)}`;
+  }
+  return message;
+}
 
 /** Strings for a language tag such as "tr" or "en-US"; English for anything unknown. */
 export function getUiStrings(tag: string | undefined): UiStrings {

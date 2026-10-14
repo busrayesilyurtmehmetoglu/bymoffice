@@ -23,6 +23,7 @@ import {
   type SheetDrawing,
 } from '../../model/sheet/types';
 import { localName, parseXml, xmlEncodingRead, type XmlElement } from '../../xml';
+import { PIVOT_SCAN_LIMITS } from '../../model/sheet/pivot';
 import { MAX_PATCH_DEPTH, chartKnown, chartLoose, nestedBeyond, type ChartPartFacts } from './chart-write';
 
 /** Anchors read from one drawing; a sheet with more shows the first ones. */
@@ -783,6 +784,8 @@ async function readCharts(
       const pointsBefore = reading.points;
       chart = reading.read(root, themeColors, reading);
       if (chart) {
+        const source = pivotSourceIn(root);
+        if (source !== undefined) chart.pivotSource = source;
         // What the part holds beside the model decides how far the chart can be changed (DrawingChart.known).
         let related = true;
         let stray = false;
@@ -814,6 +817,28 @@ async function readCharts(
   }
   if (beyond > 0) warnings.push(`Charts beyond the limit of a sheet (${MAX_DRAWING_CHARTS}) or a workbook are not shown: ${beyond}`);
   return charts;
+}
+
+/** The table a pivot chart names (c:pivotSource/c:name, wherever it stands in the part); undefined for a chart that is none. */
+function pivotSourceIn(root: XmlElement): string | undefined {
+  const stack: XmlElement[] = [root];
+  let found: string | undefined;
+  const most = PIVOT_SCAN_LIMITS.chartNodes;
+  for (let seen = 0; stack.length > 0; seen++) {
+    // A part too large to be looked through to the end may be a pivot chart: of no table that is known (every cache is refused).
+    if (seen >= most) return '';
+    const el = stack.pop() as XmlElement;
+    if (localName(el.name) === 'pivotSource') {
+      const name = el.children.find((node): node is XmlElement => node.type === 'element' && localName(node.name) === 'name');
+      let text = '';
+      if (name) for (const node of name.children) if (node.type === 'text') text += node.value;
+      // Two sources that name different tables, or one that names none: '' (no table is known).
+      found = found === undefined ? text : found === text ? found : '';
+      continue;
+    }
+    for (const node of el.children) if (node.type === 'element') stack.push(node);
+  }
+  return found;
 }
 
 /** Warnings about charts of one drawing that are listed one by one. */

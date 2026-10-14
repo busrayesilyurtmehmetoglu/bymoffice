@@ -727,7 +727,7 @@ test.describe('printing from the editor', () => {
       (window as any).__view = mounted.view;
       return Object.keys(mounted).sort();
     }, Array.from(bytes));
-    expect(keys).toEqual(['destroy', 'editor', 'exportPdf', 'file', 'hasUnsavedChanges', 'kind', 'print', 'save', 'saveNow', 'setAutoSave', 'view', 'workbook']);
+    expect(keys).toEqual(['destroy', 'editor', 'exportPdf', 'file', 'hasUnsavedChanges', 'kind', 'print', 'refreshPivots', 'save', 'saveNow', 'setAutoSave', 'view', 'workbook']);
     await fakePrint(page, false);
     await page.evaluate(() => {
       const w = window as any;

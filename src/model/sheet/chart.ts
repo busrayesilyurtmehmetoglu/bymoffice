@@ -389,6 +389,12 @@ export interface ChartLegend {
 
 export interface Chart {
   /**
+   * Set by the reader of xlsx on a pivot chart (its part has a c:pivotSource): the name of the
+   * pivot table it is made from as the part writes it ("[Book1.xlsx]Sheet1!PivotTable1"), '' when
+   * it names none. Refreshing that table's cache is refused while the chart is there.
+   */
+  pivotSource?: string;
+  /**
    * The references of the chart (of its series, their names and the titles) name sheets as they
    * are called now and cells where they are now: set on a chart that was added or changed since
    * the file was read, and kept so by every edit of rows, columns and sheets (see charts.ts of
