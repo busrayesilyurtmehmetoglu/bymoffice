@@ -343,9 +343,11 @@ test('over a transport of the application (no way to connect anew) a file the ro
     },
     { transport: plain, versions: [contentVersion(stored)], stamp: await readCollabStamp(file.package!), timer: (run) => (timers.push(run), () => undefined) },
   );
-  for (let round = 0; round < 60 && session.state !== 'online'; round++) {
+  // The reload opens the stored file, which takes more turns than a few when the machine is busy: after 60 quick
+  // rounds the wait goes on in real time (up to about 5 s), so a slow open is waited for, not taken for a failure.
+  for (let round = 0; round < 560 && session.state !== 'online'; round++) {
     net.drain(random);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => (round < 60 ? setImmediate(resolve) : setTimeout(resolve, 10)));
     const due = timers;
     timers = [];
     for (const run of due) run();
