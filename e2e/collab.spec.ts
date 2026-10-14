@@ -573,7 +573,8 @@ test('who is in the file: the number, the list, who only reads, a guest, and nob
   await expect(rows.nth(2)).toContainText('viewing only');
   await expect(rows.nth(2)).toHaveAttribute('data-read-only', 'true');
   // The dot of a row is the colour the selection of that participant is drawn in.
-  expect(await rows.nth(1).locator('.bym-collab-person-color').evaluate((dot) => getComputedStyle(dot).backgroundColor)).toBe('rgb(26, 115, 232)');
+  // Polled: Firefox once read the style of the new row before it was applied ("").
+  await expect.poll(() => rows.nth(1).locator('.bym-collab-person-color').evaluate((dot) => getComputedStyle(dot).backgroundColor)).toBe('rgb(26, 115, 232)');
   // Everybody is called the same by everybody: the guest sees itself under the name the others see.
   const guest = await rows.nth(2).locator('.bym-collab-person-name').textContent();
   expect(await c.evaluate(() => (window as any).__mounted.collab.people[0]), 'the guest, to itself').toMatchObject({ name: guest, self: true, readOnly: true });

@@ -161,7 +161,7 @@ test('a radar chart, a bubble chart and a stock chart are charts of the model', 
   assert.deepEqual(stock.upDownBars, { gapWidth: 150, up: { fill: '#FFFFFF' }, down: { fill: '#000000' } });
 });
 
-test('a pie with a second plot is read as a pie that knows which points the second plot takes; a surface chart is still no chart', () => {
+test('a pie with a second plot is read as a pie that knows which points the second plot takes; a surface chart is a chart of its own kind', () => {
   const of = (inner: string) => must(chartXml({ plot: group('ofPieChart', '<c:ofPieType val="bar"/><c:varyColors val="1"/>', ser(0, { cat: CATS, val: numLit([1, 2, 3]) }), inner, false) }));
   const chart = of('<c:splitType val="pos"/><c:splitPos val="2"/>');
   assert.equal(chart.groups[0].kind, 'pie');
@@ -171,7 +171,7 @@ test('a pie with a second plot is read as a pie that knows which points the seco
   assert.deepEqual(of('<c:splitType val="percent"/><c:splitPos val="12.5"/>').groups[0].ofPie, { split: 'percent', position: 12.5 });
   assert.deepEqual(of('<c:splitType val="cust"/><c:custSplit><c:secondPiePt val="0"/><c:secondPiePt val="2"/><c:secondPiePt val="-1"/></c:custSplit>').groups[0].ofPie, { split: 'cust', points: [0, 2] });
   for (const name of ['surfaceChart', 'surface3DChart']) {
-    assert.equal(readChart(chartXml({ plot: group(name, '', ser(0, { val: numLit([1]) })) + catAx() + valAx() })), undefined, name);
+    assert.equal(readChart(chartXml({ plot: group(name, '', ser(0, { val: numLit([1]) })) + catAx() + valAx() }))?.groups[0].kind, 'surface', name);
   }
 });
 

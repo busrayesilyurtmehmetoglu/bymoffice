@@ -67,6 +67,8 @@ export type ChartPartReader = (root: XmlElement, themeColors: string[], budget?:
  */
 export interface ChartReading {
   read: ChartPartReader;
+  /** Reads the root element of a part of the newer chart types (chartex: parseChartEx()); without it such a chart is a placeholder. */
+  readEx?: ChartPartReader;
   /** Chart parts that may still be read; counted down. */
   charts: number;
   /** Cached values (<c:pt>) that may still be read; counted down by `read`. */
@@ -465,11 +467,26 @@ function shapeStyle(state: ReadState, shape: XmlElement, props: XmlElement | und
 const OBJECT_NAMES: { [local: string]: true } = { pic: true, sp: true, grpSp: true, cxnSp: true, graphicFrame: true, contentPart: true };
 
 /**
+ * The frame of a chart of the newer types (chartex) whose part was not read into a chart: what
+ * stands beside it as the fallback is shown in its place.
+ */
+function unreadChartEx(state: ReadState, el: XmlElement): boolean {
+  if (localName(el.name) !== 'graphicFrame') return false;
+  const data = child(child(el, 'graphic'), 'graphicData');
+  if (!/\/chartex$/.test((data && data.attrs.get('uri')) || '')) return false;
+  const reference = child(data, 'chart');
+  const id = reference ? prefixedAttr(reference, 'id') : undefined;
+  const rel = id !== undefined ? state.relById.get(id) : undefined;
+  return !(rel && !rel.external && rel.part && state.context.charts && state.context.charts.has(rel.part));
+}
+
+/**
  * The object an element stands for, looking through mc:AlternateContent: the
  * first choice that holds something known is taken, otherwise the fallback.
- * Never both, so nothing is shown twice.
+ * Never both, so nothing is shown twice. With `state`, a choice that holds a
+ * chart of the newer types that was not read is not taken.
  */
-function objectElements(parent: XmlElement, depth: number, out: XmlElement[]): void {
+function objectElements(parent: XmlElement, depth: number, out: XmlElement[], state?: ReadState): void {
   for (const node of parent.children) {
     if (node.type !== 'element') continue;
     const local = localName(node.name);
@@ -478,12 +495,13 @@ function objectElements(parent: XmlElement, depth: number, out: XmlElement[]): v
       const before = out.length;
       for (const branch of node.children) {
         if (branch.type !== 'element' || localName(branch.name) !== 'Choice') continue;
-        objectElements(branch, depth + 1, out);
+        objectElements(branch, depth + 1, out, state);
+        if (state && out.length > before && out.slice(before).some((found) => unreadChartEx(state, found))) out.length = before;
         if (out.length > before) break;
       }
       if (out.length === before) {
         const fallback = child(node, 'Fallback');
-        if (fallback) objectElements(fallback, depth + 1, out);
+        if (fallback) objectElements(fallback, depth + 1, out, state);
       }
     }
   }
@@ -548,7 +566,7 @@ function readObject(state: ReadState, el: XmlElement, depth: number, transformOu
     const group: DrawingObject = { ...base, type: 'group', children: [] };
     if (depth >= MAX_GROUP_DEPTH) return group;
     const members: XmlElement[] = [];
-    objectElements(el, 0, members);
+    objectElements(el, 0, members, state);
     const space =
       transform && transform.childWidth !== undefined && transform.childHeight !== undefined && transform.childX !== undefined && transform.childY !== undefined
         ? { x: transform.childX, y: transform.childY, width: transform.childWidth, height: transform.childHeight }
@@ -708,7 +726,7 @@ export function parseDrawing(root: XmlElement, context: DrawingReadContext): She
     try {
       const anchor = readAnchor(anchors[i]);
       const content: XmlElement[] = [];
-      objectElements(anchors[i], 0, content);
+      objectElements(anchors[i], 0, content, state);
       const object = anchor && content.length > 0 ? readObject(state, content[0], 0) : undefined;
       if (anchor && object) drawing = (held.get(tops[i]) || 0) > 1 ? { anchor, object, wrapped: true } : { anchor, object };
     } catch (error) {
@@ -755,7 +773,10 @@ async function readCharts(
   };
   let beyond = 0;
   for (const rel of rels) {
-    if (rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chart' || rel.external || !rel.part || charts.has(rel.part)) continue;
+    const type = rel.type.slice(rel.type.lastIndexOf('/') + 1);
+    if ((type !== 'chart' && type !== 'chartEx') || rel.external || !rel.part || charts.has(rel.part)) continue;
+    // A part of the newer chart types is read by its own reader, and is only shown.
+    const extended = type === 'chartEx';
     // The part as the package spells it: however a relationship spells it, it is read and counted once for the workbook.
     const part = names(rel.part);
     if (part === undefined) continue;
@@ -782,8 +803,9 @@ async function readCharts(
       reading.bytes -= bytes.length;
       const root = parseXml(bytes).root;
       const pointsBefore = reading.points;
-      chart = reading.read(root, themeColors, reading);
-      if (chart) {
+      chart = extended ? (reading.readEx ? reading.readEx(root, themeColors, reading) : undefined) : reading.read(root, themeColors, reading);
+      if (chart && extended) noteChartPart(chart, { bytes: bytes.length, points: Math.max(0, pointsBefore - reading.points) });
+      else if (chart) {
         const source = pivotSourceIn(root);
         if (source !== undefined) chart.pivotSource = source;
         // What the part holds beside the model decides how far the chart can be changed (DrawingChart.known).

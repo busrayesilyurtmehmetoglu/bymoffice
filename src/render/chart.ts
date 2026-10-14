@@ -9,7 +9,7 @@
 // fillText().
 
 import type { FormatLocale } from '../format/locale';
-import { chartLayoutWeight as layoutWeight, chartValues, layoutChart, type ChartFont, type ChartItem, type ChartLayout, type ChartValues } from '../layout/chart';
+import { chartLayoutWeight as layoutWeight, chartValues, layoutChart, type ChartFont, type ChartItem, type ChartLayout, type ChartValues, type ChartWord } from '../layout/chart';
 import type { Chart } from '../model/sheet/chart';
 import type { Font, Workbook } from '../model/sheet/types';
 import { fontsVersion } from './fonts';
@@ -286,6 +286,8 @@ export interface ChartRendererOptions {
   version?(): number;
   /** The name of a series that has none. */
   seriesName?(n: number): string;
+  /** The words a chart shows of its own (the legend of a waterfall), in the language of the view. */
+  chartWord?(word: ChartWord): string;
   /**
    * The value for `ctx.font` of a font of a chart, for measuring and for painting alike:
    * for a host that names its fonts another way than the grid does (a document, with the
@@ -320,6 +322,8 @@ export interface ChartRendererState {
   values: number;
   /** How often a chart was laid out. */
   layouts: number;
+  /** What the charts something is kept for have that is not drawn, or is drawn differently (Chart.notes), each once. */
+  notes: string[];
 }
 
 /**
@@ -352,7 +356,7 @@ export class ChartRenderer {
     // NaN never equals itself: without a version everything is worked out anew.
     if (!kept || kept.version !== version || kept.fonts !== fonts) {
       if (kept) this.weight -= kept.weight;
-      const values = chartValues(chart, { workbook: options.workbook, locale, seriesName: options.seriesName });
+      const values = chartValues(chart, { workbook: options.workbook, locale, seriesName: options.seriesName, chartWord: options.chartWord });
       this.valuesMade++;
       kept = { version, fonts, values, layouts: new Map(), weight: values.size + values.series.length * 8 };
       this.weight += kept.weight;
@@ -412,7 +416,11 @@ export class ChartRenderer {
 
   /** What the renderer holds and how often it worked something out. */
   state(): ChartRendererState {
-    return { charts: this.kept.size, weight: this.weight, values: this.valuesMade, layouts: this.layoutsMade };
+    const notes: string[] = [];
+    this.kept.forEach((_kept, chart) => {
+      for (const note of Array.isArray(chart.notes) ? chart.notes : []) if (notes.length < 200 && notes.indexOf(note) < 0) notes.push(note);
+    });
+    return { charts: this.kept.size, weight: this.weight, values: this.valuesMade, layouts: this.layoutsMade, notes };
   }
 
   /** The layouts that are kept, the one used last at the end: what was last drawn, for tests. */

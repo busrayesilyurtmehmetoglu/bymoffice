@@ -11,7 +11,7 @@
 // and on paper from what was kept.
 
 import type { FormatLocale } from '../format/locale';
-import type { ChartFont } from '../layout/chart';
+import type { ChartFont, ChartWord } from '../layout/chart';
 import type { LayoutFont } from '../layout/doc/types';
 import type { Chart } from '../model/sheet/chart';
 import { ChartRenderer, type ChartRendererState } from './chart';
@@ -26,6 +26,8 @@ export interface DocChartPainterOptions {
   locale?(): FormatLocale | undefined;
   /** The name of a series that has none. */
   seriesName?(n: number): string;
+  /** The words a chart shows of its own (the legend of a waterfall). */
+  chartWord?(word: ChartWord): string;
 }
 
 /** Paints the charts of the pages of one document; see RenderPageOptions.charts. */
@@ -41,6 +43,7 @@ export class DocChartPainter {
     this.renderer = new ChartRenderer({
       locale: options.locale,
       seriesName: options.seriesName,
+      chartWord: options.chartWord,
       // The cached values of a part never change: what was worked out is kept until the fonts change.
       version: () => 0,
       cssFont: (font: ChartFont): string => {

@@ -24,7 +24,8 @@ import type { OpcPackage, Relationship } from '../../opc';
 import { parseXml, type XmlComment, type XmlDocument, type XmlPI } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { linkFields, scanBlocks } from './body';
-import { readDocCharts, type DocChartLimits } from './charts';
+import { DocChartReader, MAX_DOC_CHARTS, type DocChartLimits } from './charts';
+import type { Chart } from '../../model/sheet/chart';
 import { linkComments, parseSidePart } from './comments';
 import { bounded, createContext, createReaderState, kindOf, pushExtra, pushMisc, quote, type PartContext, type ReaderState } from './common';
 import { partNames } from '../xlsx/drawings';
@@ -237,6 +238,30 @@ function fillComment(comment: Comment, ctx: PartContext, attrs: AttrList): void 
   if (rest.length) comment.attrs = rest;
 }
 
+/**
+ * The relationship ids the chart elements of a story name (<c:chart r:id>, <cx:chart r:id>, whatever
+ * the prefixes): which chart parts its frames show, found before the story is read. Elements are
+ * found by their names in the text of the part; an id that is no chart of a newer type is passed
+ * over by the caller. Empty for a part that cannot be read.
+ */
+async function chartIdsOf(pkg: OpcPackage, story: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  let text: string;
+  try {
+    text = new TextDecoder().decode(await pkg.readPart(story));
+  } catch (error) {
+    return out;
+  }
+  // `[^<>]` keeps every attempt within one tag: with `[^>]`, a part of many unclosed tags is read to its end from each.
+  const element = /<(?:[A-Za-z_][\w.-]*:)?chart\b([^<>]*)>/g;
+  const id = /(?:^|\s)(?:[A-Za-z_][\w.-]*:)?id\s*=\s*(?:"([^"]*)"|'([^']*)')/;
+  for (let match = element.exec(text); match && out.size < 100000; match = element.exec(text)) {
+    const found = id.exec(match[1]);
+    if (found) out.add(found[1] !== undefined ? found[1] : found[2]);
+  }
+  return out;
+}
+
 /** Limits of reading a document, for hosts that want tighter ones than the defaults. */
 export interface DocxReadOptions extends DocChartLimits {}
 
@@ -261,6 +286,35 @@ export async function readDocx(pkg: OpcPackage, options: DocxReadOptions = {}): 
     numberingTree ? numberingTree.ctx : createContext(state, '', [], NO_RELATIONSHIPS),
     numberingTree?.doc.root,
   );
+
+  // The charts of the newer types are read before the stories: a frame of one in alternate content is shown in
+  // place of its fallback only when its chart can be drawn.
+  const charts = new DocChartReader(pkg, themeColorList(theme), state.warnings, options);
+  // Only those a frame of a story shows (its <cx:chart r:id>, in the story or in a text box of it): a part no frame
+  // shows takes nothing of what the charts of the document may cost.
+  const extended = new Set<string>();
+  const stories = [main].concat(rels.filter((rel) => !rel.external && rel.part && /\/(header|footer|footnotes|endnotes|comments)$/.test(rel.type)).map((rel) => rel.part as string));
+  for (const story of stories.slice(0, 1000)) {
+    let named: typeof rels = [];
+    try {
+      named = story === main ? rels : await pkg.relationships(story);
+    } catch (error) {
+      // A story whose relationships cannot be read names no chart.
+    }
+    const ids = new Map<string, string>();
+    for (const rel of named) {
+      if (rel.external || !rel.part || rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chartEx') continue;
+      const part = partName(rel.part);
+      if (part !== undefined) ids.set(rel.id, part);
+    }
+    if (ids.size === 0) continue;
+    for (const id of await chartIdsOf(pkg, story)) {
+      const part = ids.get(id);
+      if (part !== undefined && extended.size < MAX_DOC_CHARTS) extended.add(part);
+    }
+  }
+  const drawnEx = extended.size > 0 ? await charts.readParts(extended, true) : new Map<string, Chart>();
+  state.chartExDrawn = new Set(drawnEx.keys());
 
   const body = await readBody(pkg, main, state);
 
@@ -314,9 +368,22 @@ export async function readDocx(pkg: OpcPackage, options: DocxReadOptions = {}): 
   }
   // The charts the frames of every story name, from the values their parts cached.
   if (state.chartParts.size > 0) {
-    const charts = await readDocCharts(pkg, state.chartParts, themeColorList(theme), state.warnings, options);
-    if (charts) model.charts = charts;
+    const older = Array.from(state.chartParts).filter((part) => !extended.has(part));
+    const read = older.length > 0 ? await charts.readParts(older) : new Map<string, Chart>();
+    // Of the charts of the newer types only those a frame shows; why one of those is not shown is said now.
+    charts.said(
+      Array.from(state.chartParts).filter((part) => extended.has(part)),
+      drawnEx,
+    );
+    // In the order the frames stand in the document.
+    const all = new Map<string, Chart>();
+    for (const part of state.chartParts) {
+      const chart = read.get(part) || drawnEx.get(part);
+      if (chart) all.set(part, chart);
+    }
+    if (all.size > 0) model.charts = all;
   }
+  charts.finish();
   model.strict = state.strict;
   return model;
 }

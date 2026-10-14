@@ -25,6 +25,7 @@ import { OpcPackage } from '../../opc';
 import { parseXml, type XmlElement } from '../../xml';
 import { readXls } from '../xls/workbook';
 import { ChartBudgetError, parseChart } from '../xlsx/chart';
+import { parseChartEx } from '../xlsx/chartex';
 import { chartCellsOf } from '../xlsx/chart-write';
 import { readXlsx } from '../xlsx/workbook';
 import { MAX_CHART_PART_BYTES, MAX_WORKBOOK_CHART_BYTES } from '../xlsx/drawings';
@@ -283,6 +284,135 @@ function fillFromBook(chart: Chart, book: Workbook, wants: Want[], budget: { poi
 }
 
 /**
+ * Reads the chart parts of one document, all within one set of limits: the parts of the newer
+ * chart types (chartex) before the stories are read (a Choice of alternate content is taken only
+ * for a chart that was read), the others after. Never throws: what goes wrong is added to
+ * `warnings`.
+ */
+export class DocChartReader {
+  private readonly maxCharts: number;
+  private readonly maxBytes: number;
+  private readonly budget: { points: number };
+  private bytesLeft: number;
+  private readonly books: Books;
+  private read = 0;
+  private beyond = 0;
+  private told = 0;
+  private unsaid = 0;
+  /** Why a part of the newer chart types was not read into a chart: said only for a frame that shows it. */
+  private readonly unread = new Map<string, string>();
+
+  constructor(
+    private readonly pkg: OpcPackage,
+    private readonly themeColors: string[],
+    private readonly warnings: string[],
+    limits: DocChartLimits = {},
+  ) {
+    this.maxCharts = limitOf(limits.maxCharts, MAX_DOC_CHARTS);
+    this.maxBytes = limitOf(limits.maxChartPartBytes, MAX_CHART_PART_BYTES);
+    this.budget = { points: limitOf(limits.maxChartPoints, MAX_DOC_CHART_POINTS) };
+    this.bytesLeft = limitOf(limits.maxChartBytes, MAX_DOC_CHART_BYTES);
+    this.books = {
+      pkg,
+      opened: new Map(),
+      left: limitOf(limits.maxChartBooks, MAX_DOC_CHART_BOOKS),
+      bytesLeft: limitOf(limits.maxChartBooksBytes, MAX_DOC_CHART_BOOKS_BYTES),
+      maxBytes: limitOf(limits.maxChartBookBytes, MAX_DOC_CHART_BOOK_BYTES),
+    };
+  }
+
+  private warn(text: string): void {
+    if (this.told < MAX_DOC_CHART_WARNINGS) {
+      this.warnings.push(text);
+      this.told++;
+    } else this.unsaid++;
+  }
+
+  /**
+   * Reads the chart parts (names of parts as the package spells them, each once, in the order
+   * their frames stand in the document) into models, by part name. `extended`: the parts are of
+   * the newer chart types; what keeps one from being a chart is kept back until a frame shows
+   * it (see said()).
+   */
+  async readParts(parts: Iterable<string>, extended = false): Promise<Map<string, Chart>> {
+    const { pkg, budget } = this;
+    const charts = new Map<string, Chart>();
+    const warn = extended ? (part: string, text: string) => void this.unread.set(part, text) : (_part: string, text: string) => this.warn(text);
+    for (const part of parts) {
+      if (this.read >= this.maxCharts) {
+        if (extended) this.unread.set(part, `Chart ${quote(part)} is not shown: the document holds more than ${this.maxCharts} charts`);
+        else this.beyond++;
+        continue;
+      }
+      this.read++;
+      try {
+        const bytes = await pkg.readPart(part);
+        if (bytes.length > this.maxBytes) throw new Error('the part is too large');
+        if (bytes.length > this.bytesLeft) {
+          warn(part, `Chart ${quote(part)} is not shown: the charts of the document hold too many bytes`);
+          continue;
+        }
+        this.bytesLeft -= bytes.length;
+        const root = parseXml(bytes).root;
+        const chart = extended ? parseChartEx(root, this.themeColors, budget) : parseChart(root, this.themeColors, budget);
+        if (!chart) {
+          warn(part, `Chart ${quote(part)} holds nothing that is drawn (no series, or a chart type that is not drawn); a placeholder is shown`);
+          continue;
+        }
+        if (!extended) {
+          const wants = wantsOf(chart, uncachedRefs(root));
+          if (wants.length > 0) {
+            // Only now, and only for this chart, the workbook beside the part is looked at.
+            let result: { read: Want[]; missing: Want[]; problem?: string };
+            try {
+              const book = await bookOf(this.books, part, root);
+              result = book instanceof BookError ? { read: [], missing: wants, problem: book.message } : fillFromBook(chart, book, wants, budget);
+            } catch (error) {
+              result = { read: [], missing: wants, problem: 'the embedded workbook of the chart could not be read' };
+            }
+            // What came from where: each part of the chart is named in the note that is true of it.
+            if (result.read.length > 0) chart.notes.push(BOOK_NOTE + kindsOf(result.read).join(', '));
+            if (result.missing.length > 0) chart.notes.push(`${EMPTY_NOTE}${kindsOf(result.missing).join(', ')} (${result.problem || 'the embedded workbook of the chart could not be read'})`);
+          }
+        } else if (chart.groups.some((group) => group.series.some((series) => empty(series.values) && series.values !== undefined && series.values.ref !== undefined))) {
+          // UNSURE: the workbook beside a part of a newer type is not opened; Word caches the values in the part.
+          chart.notes.push(`${EMPTY_NOTE}values of series (the embedded workbook of a chart of this type is not read)`);
+        }
+        // Values that name no cells and hold nothing have no workbook to be read from.
+        if (chart.groups.some((group) => group.series.some((series) => empty(series.values) && (!series.values || series.values.ref === undefined)))) {
+          chart.notes.push(`${EMPTY_NOTE}values of series (they name no cells)`);
+        }
+        charts.set(part, chart);
+      } catch (error) {
+        // A chart part that cannot be read (not XML, a DTD, too much of it) leaves its frame a placeholder.
+        if (error instanceof ChartBudgetError) warn(part, `Chart ${quote(part)} is not shown: the charts of the document hold too many cached values`);
+        else warn(part, `Chart ${quote(part)} could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return charts;
+  }
+
+  /** Says why the parts of the newer chart types that frames show (`parts`) were not read, those of them that were not. */
+  said(parts: Iterable<string>, read: Map<string, Chart>): void {
+    for (const part of parts) {
+      const why = this.unread.get(part);
+      if (why !== undefined && !read.has(part)) {
+        this.warn(why);
+        this.unread.delete(part);
+      }
+    }
+  }
+
+  /** Says what went beyond the limits; once, after the last parts were read. */
+  finish(): void {
+    if (this.unsaid > 0) this.warnings.push(`More charts that are not shown: ${this.unsaid}`);
+    if (this.beyond > 0) this.warnings.push(`Charts beyond the limit of a document (${this.maxCharts}) are not shown: ${this.beyond}`);
+    this.unsaid = 0;
+    this.beyond = 0;
+  }
+}
+
+/**
  * Reads the chart parts (names of parts as the package spells them, each
  * once, in the order their frames stand in the document) into models, by
  * part name.
@@ -290,74 +420,8 @@ function fillFromBook(chart: Chart, book: Workbook, wants: Want[], budget: { poi
  * chart. Never throws: what goes wrong is added to `warnings`.
  */
 export async function readDocCharts(pkg: OpcPackage, parts: Iterable<string>, themeColors: string[], warnings: string[], limits: DocChartLimits = {}): Promise<Map<string, Chart> | undefined> {
-  const maxCharts = limitOf(limits.maxCharts, MAX_DOC_CHARTS);
-  const maxBytes = limitOf(limits.maxChartPartBytes, MAX_CHART_PART_BYTES);
-  const budget = { points: limitOf(limits.maxChartPoints, MAX_DOC_CHART_POINTS) };
-  let bytesLeft = limitOf(limits.maxChartBytes, MAX_DOC_CHART_BYTES);
-  const books: Books = {
-    pkg,
-    opened: new Map(),
-    left: limitOf(limits.maxChartBooks, MAX_DOC_CHART_BOOKS),
-    bytesLeft: limitOf(limits.maxChartBooksBytes, MAX_DOC_CHART_BOOKS_BYTES),
-    maxBytes: limitOf(limits.maxChartBookBytes, MAX_DOC_CHART_BOOK_BYTES),
-  };
-  const charts = new Map<string, Chart>();
-  let read = 0;
-  let beyond = 0;
-  let said = 0;
-  let unsaid = 0;
-  const warn = (text: string) => {
-    if (said < MAX_DOC_CHART_WARNINGS) {
-      warnings.push(text);
-      said++;
-    } else unsaid++;
-  };
-  for (const part of parts) {
-    if (read >= maxCharts) {
-      beyond++;
-      continue;
-    }
-    read++;
-    try {
-      const bytes = await pkg.readPart(part);
-      if (bytes.length > maxBytes) throw new Error('the part is too large');
-      if (bytes.length > bytesLeft) {
-        warn(`Chart ${quote(part)} is not shown: the charts of the document hold too many bytes`);
-        continue;
-      }
-      bytesLeft -= bytes.length;
-      const root = parseXml(bytes).root;
-      const chart = parseChart(root, themeColors, budget);
-      if (!chart) {
-        warn(`Chart ${quote(part)} holds nothing that is drawn (no series, or a chart type that is not drawn); a placeholder is shown`);
-        continue;
-      }
-      const wants = wantsOf(chart, uncachedRefs(root));
-      if (wants.length > 0) {
-        // Only now, and only for this chart, the workbook beside the part is looked at.
-        let result: { read: Want[]; missing: Want[]; problem?: string };
-        try {
-          const book = await bookOf(books, part, root);
-          result = book instanceof BookError ? { read: [], missing: wants, problem: book.message } : fillFromBook(chart, book, wants, budget);
-        } catch (error) {
-          result = { read: [], missing: wants, problem: 'the embedded workbook of the chart could not be read' };
-        }
-        // What came from where: each part of the chart is named in the note that is true of it.
-        if (result.read.length > 0) chart.notes.push(BOOK_NOTE + kindsOf(result.read).join(', '));
-        if (result.missing.length > 0) chart.notes.push(`${EMPTY_NOTE}${kindsOf(result.missing).join(', ')} (${result.problem || 'the embedded workbook of the chart could not be read'})`);
-      }
-      // Values that name no cells and hold nothing have no workbook to be read from.
-      if (chart.groups.some((group) => group.series.some((series) => empty(series.values) && (!series.values || series.values.ref === undefined)))) {
-        chart.notes.push(`${EMPTY_NOTE}values of series (they name no cells)`);
-      }
-      charts.set(part, chart);
-    } catch (error) {
-      // A chart part that cannot be read (not XML, a DTD, too much of it) leaves its frame a placeholder.
-      if (error instanceof ChartBudgetError) warn(`Chart ${quote(part)} is not shown: the charts of the document hold too many cached values`);
-      else warn(`Chart ${quote(part)} could not be read: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  if (unsaid > 0) warnings.push(`More charts that are not shown: ${unsaid}`);
-  if (beyond > 0) warnings.push(`Charts beyond the limit of a document (${maxCharts}) are not shown: ${beyond}`);
+  const reader = new DocChartReader(pkg, themeColors, warnings, limits);
+  const charts = await reader.readParts(parts);
+  reader.finish();
   return charts.size > 0 ? charts : undefined;
 }

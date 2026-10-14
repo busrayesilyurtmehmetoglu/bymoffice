@@ -30,6 +30,9 @@ const NAMESPACES: [uri: string, prefix: string][] = [
   ['urn:schemas-microsoft-com:office:office', 'o'],
 ];
 
+/** A namespace of the newer chart parts: 2014/chartex, and the later ones that mark a version (2015/9/8/chartex, ...). */
+export const CHARTEX_SPACE = /^http:\/\/schemas\.microsoft\.com\/office\/drawing\/20\d\d(\/\d{1,2}){0,3}\/chartex$/;
+
 export const STRICT_W_NAMESPACE = 'http://purl.oclc.org/ooxml/wordprocessingml/main';
 /** Every namespace the reader takes for WordprocessingML. */
 export const WORD_NAMESPACES: readonly string[] = NAMESPACES.filter((entry) => entry[1] === 'w').map((entry) => entry[0]);
@@ -52,6 +55,12 @@ export interface ReaderState {
   partName?(part: string): string | undefined;
   /** Warnings about frames of charts said so far: see MAX_CHART_FRAME_WARNINGS. */
   chartWarnings: number;
+  /**
+   * The parts of the newer chart types (chartex) that were read into charts before the stories
+   * were, as the package spells them: a Choice of alternate content that holds a frame of such a
+   * chart is taken only when its chart is among them, else the Fallback is.
+   */
+  chartExDrawn?: Set<string>;
 }
 
 /** Warnings about frames of charts that lead nowhere, for one document; further ones are not said. */
@@ -96,7 +105,8 @@ export function createContext(
   const rPrefixes: string[] = [];
   for (const [name, value] of rootAttrs) {
     if (name !== 'xmlns' && !name.startsWith('xmlns:')) continue;
-    const known = NAMESPACES.find(([uri]) => uri === value);
+    // The namespaces of the newer chart parts (chartex) in all their versions: what a Choice of alternate content may require.
+    const known = NAMESPACES.find(([uri]) => uri === value) || (CHARTEX_SPACE.test(value) ? ['', 'cx'] : undefined);
     if (!known) continue;
     const prefix = name === 'xmlns' ? '' : name.slice(6);
     prefixes.set(prefix, known[1]);

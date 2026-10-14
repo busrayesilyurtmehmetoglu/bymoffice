@@ -3945,7 +3945,7 @@ export class WorkbookView {
 
   /** Where charts get their numbers from: the cells as they are now, read anew after every change and for every redraw asked for from outside. */
   private chartSource(): ChartRendererOptions {
-    return { workbook: this.workbook, locale: () => this.locale, version: () => this.printEpoch + this.chartEpoch, seriesName: (n) => this.strings.chartSeries(n) };
+    return { workbook: this.workbook, locale: () => this.locale, version: () => this.printEpoch + this.chartEpoch, seriesName: (n) => this.strings.chartSeries(n), chartWord: (word) => this.strings.chartWord(word) };
   }
 
   /** The one renderer of the charts this view shows: the layers of all sheets and the chart sheets share what it keeps. */
@@ -3959,9 +3959,9 @@ export class WorkbookView {
    * kept for and what it weighs (see CHART_KEEP_BUDGET), how often numbers were worked out and charts were laid
    * out since the view was made, and the texts of the charts as they were last laid out (at most 500).
    */
-  getChartState(): { charts: number; weight: number; values: number; layouts: number; texts: string[] } {
+  getChartState(): { charts: number; weight: number; values: number; layouts: number; texts: string[]; notes: string[] } {
     const texts: string[] = [];
-    if (this.destroyed || !this.chartPainter) return { charts: 0, weight: 0, values: 0, layouts: 0, texts };
+    if (this.destroyed || !this.chartPainter) return { charts: 0, weight: 0, values: 0, layouts: 0, texts, notes: [] };
     for (const layout of this.chartPainter.layouts()) {
       for (const item of layout.items) if (item.kind === 'text' && texts.length < 500) texts.push(item.text);
     }

@@ -96,7 +96,7 @@ test('every chart type that is drawn is read as its kind; the 3-D forms as their
 });
 
 test('a chart with a type that is not drawn is no chart of the model, whatever else it holds', () => {
-  for (const name of ['surfaceChart', 'surface3DChart', 'contourChart']) {
+  for (const name of ['contourChart', 'unknownChart']) {
     assert.equal(readChart(chartXml({ plot: group(name, '', simple()) + catAx() + valAx() })), undefined, name);
     assert.equal(readChart(chartXml({ plot: group('barChart', '<c:barDir val="col"/>', simple()) + group(name, '', simple(1)) + catAx() + valAx() })), undefined, `${name} beside a bar chart`);
   }
@@ -406,7 +406,7 @@ test('the frame of a chart in a drawing is a chart of the model, with the anchor
 });
 
 test('a chart that cannot be read is a placeholder; the other objects and the sheet are still there', async () => {
-  const radar = chartXml({ plot: group('surfaceChart', '', simple()) + catAx() + valAx() });
+  const radar = chartXml({ plot: group('contourChart', '', simple()) + catAx() + valAx() });
   const dtd = `<?xml version="1.0"?><!DOCTYPE c:chartSpace [<!ENTITY a "aaaa">]>${plain.slice(plain.indexOf('<c:chartSpace'))}`;
   const cut = plain.slice(0, plain.length - 40);
   const junk = new Uint8Array([0xff, 0xfe, 0x00, 0x01, 0x02]);
@@ -432,7 +432,7 @@ test('a chart sheet has the drawing that holds its chart; one whose chart is not
   assert.equal(sheets[1][0].object.type, 'chart');
   assert.equal(sheets[1][0].anchor.kind, 'absolute');
 
-  const radar = chartXml({ plot: group('surfaceChart', '', simple()) + catAx() + valAx() });
+  const radar = chartXml({ plot: group('contourChart', '', simple()) + catAx() + valAx() });
   const other = await drawingsOf(await chartWorkbook({ sheet: cells, chartSheet: radar }));
   assert.equal(other[1][0].object.type, 'placeholder');
 

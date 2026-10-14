@@ -164,7 +164,7 @@ const broken: [name: string, xml: string | Uint8Array, warning: RegExp][] = [
   ['not XML', '<c:chartSpace><c:chart>', /chart1\.xml.*could not be read/],
   ['a DTD', '<?xml version="1.0"?><!DOCTYPE c [<!ENTITY a "aaaa">]>' + columnsChart().replace(/^<\?xml[^>]*\?>/, ''), /chart1\.xml.*could not be read/],
   ['not text', new Uint8Array([0xff, 0xfe, 0x00, 0x01, 0x02, 0x80]), /chart1\.xml.*could not be read/],
-  ['a type that is not drawn', columnsChart({ type: 'surfaceChart' }), /chart1\.xml.*nothing that is drawn/],
+  ['a type that is not drawn', columnsChart({ type: 'contourChart' }), /chart1\.xml.*nothing that is drawn/],
   ['another root', '<?xml version="1.0"?><root/>', /chart1\.xml.*nothing that is drawn/],
 ];
 for (const [name, xml, warning] of broken) {

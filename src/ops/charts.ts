@@ -190,12 +190,15 @@ const partBound = (object: DrawingChart): boolean => object.part !== undefined |
 
 /** What every command says of a chart a reader marked as only shown (Chart.shownOnly): it is neither changed, moved nor deleted. */
 const SHOWN_ONLY = 'Cannot change this chart: it was read from an xls file and is only shown';
+/** The same, of a chart of a newer type (Chart.extended). */
+const SHOWN_ONLY_EXTENDED = 'Cannot change this chart: a chart of this type is only shown';
+const shownOnly = (chart: Chart | undefined): string => (chart && chart.extended === true ? SHOWN_ONLY_EXTENDED : SHOWN_ONLY);
 
 /** The chart of a sheet a command is about to change. Throws RangeError when `id` names none, and for a chart that is only shown. */
 function chartAt(sheet: Sheet, id: number): { drawing: SheetDrawing; object: DrawingChart } {
   const drawing = sheet.drawings && Math.floor(id) === id ? sheet.drawings[id] : undefined;
   if (!drawing || !drawing.object || drawing.object.type !== 'chart') throw new RangeError(`No chart at index ${id}`);
-  if (drawing.object.chart && drawing.object.chart.shownOnly === true) throw new RangeError(SHOWN_ONLY);
+  if (drawing.object.chart && drawing.object.chart.shownOnly === true) throw new RangeError(shownOnly(drawing.object.chart));
   return { drawing, object: drawing.object };
 }
 
@@ -801,7 +804,7 @@ export function chartProblem(workbook: Workbook, sheetIndex: number, id: number,
   const drawing = sheet.drawings ? sheet.drawings[id] : undefined;
   if (!drawing || !drawing.object || drawing.object.type !== 'chart') return `No chart at index ${id}`;
   const object = drawing.object;
-  if (object.chart && object.chart.shownOnly === true) return SHOWN_ONLY;
+  if (object.chart && object.chart.shownOnly === true) return shownOnly(object.chart);
   if (object.part !== undefined && object.known !== 'all' && object.known !== 'refs') return 'Cannot change this chart: its part holds references the model does not, so it is only moved and deleted';
   if (!patch) return undefined;
   try {
@@ -1327,7 +1330,7 @@ export function chartCopyProblem(workbook: Workbook, sheetIndex: number, id: num
   if (!drawing || !drawing.object || drawing.object.type !== 'chart') return `No chart at index ${id}`;
   const object = drawing.object;
   // A chart of an xls file is shown from what was read of it; nothing writes one.
-  if (object.chart && object.chart.shownOnly === true) return 'Cannot copy this chart: it was read from an xls file and is only shown';
+  if (object.chart && object.chart.shownOnly === true) return object.chart.extended === true ? 'Cannot copy this chart: a chart of this type is only shown' : 'Cannot copy this chart: it was read from an xls file and is only shown';
   if (object.part !== undefined && object.known === undefined && !(object.loose && object.loose.length > 0)) return 'Cannot copy this chart: its part holds references the model does not, so a copy could not be kept on the cells it shows';
   if (!partBound(object) && !chartWritable(object.chart)) return 'Cannot copy this chart: its type is not one that is written from the model';
   return undefined;

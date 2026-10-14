@@ -12,6 +12,7 @@ import { builtinFormatId, cellDisplayText, isoToSerial } from '../format/cell-fo
 import type { FormatLocale } from '../format/locale';
 import {
   chartCached,
+  chartKindExtended,
   chartRefAreas,
   MAX_CHART_POINTS,
   type Chart,
@@ -32,6 +33,7 @@ import {
 } from '../model/sheet/chart';
 import { resolveCellStyle } from '../model/sheet/color';
 import { clipLine, fitTrend, seriesSpread, smoothPath } from './chart-fit';
+import { extendedLegend, layoutExtended, type ExKit } from './chart-ex';
 import type { Cell, Sheet, Workbook } from '../model/sheet/types';
 
 /** Positions along the category axis that are drawn for one series; a series with more points is sampled down to it. */
@@ -69,7 +71,14 @@ export interface ChartDataOptions {
   locale?: FormatLocale;
   /** The name of a series that has none: `n` counts from 1. Default "Series1", "Series2", ... */
   seriesName?(n: number): string;
+  /** The words a chart shows of its own (the legend of a waterfall). Default English. */
+  chartWord?(word: ChartWord): string;
 }
+
+/** The words a chart shows of its own: the entries of the legend of a waterfall. */
+export type ChartWord = 'increase' | 'decrease' | 'total';
+
+const CHART_WORDS: { [word in ChartWord]: string } = { increase: 'Increase', decrease: 'Decrease', total: 'Total' };
 
 /**
  * The numbers of the points of a series. Only the points that hold a number are kept, so
@@ -229,6 +238,13 @@ export interface ChartValues {
   categoryFormat?: { code: string; builtinId?: number };
   /** The title, when the chart has one that is read from a cell. */
   title?: string;
+  /**
+   * The levels of the categories of a treemap or a sunburst: `name(level, index)` is the name the
+   * point `index` has at `level`, 0 being the leaves and `depth` - 1 the outermost level.
+   */
+  levels?: { depth: number; name(level: number, index: number): string };
+  /** A word the chart shows of its own, in the language of the view. */
+  word?(word: ChartWord): string;
   /** What is held for the chart: numbers of points and cells of labels, counted. What a keeper of many charts weighs them by. */
   size: number;
 }
@@ -474,6 +490,44 @@ function cellText(reference: string | undefined, options: ChartDataOptions, live
   return cellDisplayText(workbook, row ? row.cells[range.left] : undefined, options.locale);
 }
 
+/**
+ * The levels of the categories of a treemap or a sunburst: from the cells of the reference (its
+ * last column is the leaves, the columns before it the levels above; rows, when the reference
+ * says its levels are rows), or from the levels the file cached. Undefined for categories of one
+ * level, and for a reference whose cells cannot be followed and that cached nothing.
+ */
+function levelsOf(chart: Chart, data: ChartData | undefined, options: ChartDataOptions, budget: Budget): ChartValues['levels'] | undefined {
+  if (!data) return undefined;
+  const workbook = options.workbook;
+  const areas = workbook && data.ref !== undefined && !gone(chart, data) ? chartRefAreas(workbook, data.ref, chart.live === true) : undefined;
+  if (areas && workbook && areas.length === 1) {
+    const { sheet, range } = areas[0];
+    const byRow = data.byRow === true;
+    const depth = Math.min((byRow ? range.bottom - range.top : range.right - range.left) + 1, 8);
+    const levels: Map<number, Cell>[] = [];
+    for (let level = 0; level < depth; level++) {
+      const line = byRow ? { ...range, top: range.bottom - level, bottom: range.bottom - level } : { ...range, left: range.right - level, right: range.right - level };
+      const cells = new Map<number, Cell>();
+      budget.left -= eachCell([{ sheet, range: line }], chart.plotVisOnly, Math.max(Math.min(MAX_CHART_POINTS, budget.left), 0), (cell, position) => void cells.set(position, cell));
+      budget.held += cells.size;
+      levels.push(cells);
+    }
+    if (depth < 2) return undefined;
+    return { depth, name: (level, index) => (level >= 0 && level < depth ? clean(cellDisplayText(workbook, levels[level].get(index), options.locale)) : '') };
+  }
+  if (!data.multiLevel || !Array.isArray(data.levels) || data.levels.length === 0) return undefined;
+  const caches = [data.cache].concat(data.levels.slice(0, 7));
+  const depth = caches.length;
+  return {
+    depth,
+    name: (level, index) => {
+      if (!(level >= 0 && level < depth)) return '';
+      const value = chartCached({ kind: 'str', cache: caches[level], count: 0 }, index);
+      return typeof value === 'string' ? clean(value) : typeof value === 'number' ? String(value) : '';
+    },
+  };
+}
+
 /** Where the points of a scatter series stand: at the numbers of its x values, or at 1, 2, 3, ... when a point that has a y has no number for x. */
 function placesOf(xs: ChartNumbers | undefined, ys: ChartNumbers): ChartNumbers {
   if (!xs || xs.length === 0) return ChartNumbers.counting(ys.length);
@@ -536,9 +590,14 @@ export function chartValues(chart: Chart, options: ChartDataOptions = {}): Chart
     }
   }
   const known = labels;
+  const words = options.chartWord;
   const out: ChartValues = {
     series,
     count,
+    word: (word) => {
+      const said = words ? words(word) : undefined;
+      return typeof said === 'string' && said !== '' ? said : CHART_WORDS[word];
+    },
     label: (index) => {
       if (!(index >= 0 && index < count)) return '';
       if (!known) return String(index + 1);
@@ -567,6 +626,14 @@ export function chartValues(chart: Chart, options: ChartDataOptions = {}): Chart
   }
   const title = chart.title ? cellText(chart.title.ref, options, chart.live === true) : undefined;
   if (title !== undefined) out.title = title;
+  // The levels of the categories of a treemap or a sunburst: those of the first series that has any.
+  for (const entry of series) {
+    if ((entry.kind !== 'treemap' && entry.kind !== 'sunburst') || !entry.series.categories) continue;
+    const levels = levelsOf(chart, entry.series.categories, options, budget);
+    if (levels) out.levels = levels;
+    out.size = budget.held;
+    break;
+  }
   return out;
 }
 
@@ -993,7 +1060,9 @@ function lookOf(chart: Chart, group: ChartGroup, series: ChartSeries): SeriesLoo
   const color = chartAutoColor(chart, series.index);
   const shape = series.shape;
   const stated = shape ? shape.fill : undefined;
-  const filled = group.kind === 'bar' || group.kind === 'area' || group.kind === 'pie' || group.kind === 'doughnut' || group.kind === 'bubble' || (group.kind === 'radar' && group.radarStyle === 'filled');
+  // The newer chart types are shapes that are filled, as columns are.
+  const filled =
+    group.kind === 'bar' || group.kind === 'area' || group.kind === 'pie' || group.kind === 'doughnut' || group.kind === 'bubble' || (group.kind === 'radar' && group.radarStyle === 'filled') || chartKindExtended(group.kind);
   const line = shape ? shape.line : undefined;
   let stroke: string | undefined;
   let marker: SeriesLook['marker'];
@@ -1181,10 +1250,12 @@ function layoutWithin(chart: Chart, values: ChartValues, width: number, height: 
   const pad = detail === 'full' ? 8 : detail === 'compact' ? 4 : Math.min(2, w / 8, h / 8);
   const box: Box = { x: pad, y: pad, width: w - pad * 2, height: h - pad * 2 };
 
-  const pies = chart.groups.some((group) => group.kind === 'pie' || group.kind === 'doughnut');
+  // A chart of a newer type, or a surface, is drawn by its own rule: the first such chart type alone.
+  const special = specialGroup(chart);
+  const pies = special < 0 && chart.groups.some((group) => group.kind === 'pie' || group.kind === 'doughnut');
   // A pie or a radar beside other chart types is drawn alone: they share no axes with them.
-  const radar = !pies && chart.groups.some((group) => group.kind === 'radar');
-  const shown = values.series.filter((entry) => (pies ? entry.kind === 'pie' || entry.kind === 'doughnut' : radar ? entry.kind === 'radar' : true));
+  const radar = special < 0 && !pies && chart.groups.some((group) => group.kind === 'radar');
+  const shown = values.series.filter((entry) => (special >= 0 ? entry.group === special : pies ? entry.kind === 'pie' || entry.kind === 'doughnut' : radar ? entry.kind === 'radar' : true));
 
   if (detail === 'full') {
     placeTitle(context, box, shown);
@@ -1195,10 +1266,43 @@ function layoutWithin(chart: Chart, values: ChartValues, width: number, height: 
   let place = manualBox(chart.plotLayout, w, h, true);
   if (place && (place.width < 10 || place.height < 10)) place = undefined;
   const inner = place !== undefined && chart.plotLayout !== undefined && chart.plotLayout.target === 'inner';
-  if (pies) layoutPie(context, layout, place || box, shown);
+  if (special >= 0) layoutExtended(kitOf(context), layout, place || box, shown);
+  else if (pies) layoutPie(context, layout, place || box, shown);
   else if (radar) layoutRadar(context, layout, place || box, shown);
   else layoutAxes(context, layout, place && !inner ? place : box, shown, inner ? place : undefined);
   return layout;
+}
+
+/** The chart type drawn by a rule of its own (a newer type, a surface): the first one; -1 for a chart without any. */
+function specialGroup(chart: Chart): number {
+  for (let g = 0; g < chart.groups.length; g++) if (chartKindExtended(chart.groups[g].kind) || chart.groups[g].kind === 'surface') return g;
+  return -1;
+}
+
+/** What the layout of the newer chart types (chart-ex.ts) is lent of this one. */
+function kitOf(context: Context): ExKit {
+  const { chart, measure, options } = context;
+  return {
+    chart,
+    values: context.values,
+    measure,
+    options,
+    items: context.items,
+    detail: context.detail,
+    width: context.width,
+    height: context.height,
+    budget: context.budget,
+    font: (style, points, bold) => fontOf(style, chart.textStyle, points, bold),
+    color: (style) => colorOf(style, chart.textStyle),
+    clean,
+    fit: (text, font, room) => fit(text, font, room, measure),
+    tick: (value, format) => tickText(value, format, options),
+    line: lineColor,
+    auto: (index) => chartAutoColor(chart, index),
+    look: (group, series) => lookOf(chart, group, series),
+    scale: (low, high, axis, steps) => chartScale(low, high, { min: axis ? axis.min : undefined, max: axis ? axis.max : undefined, step: axis ? axis.majorUnit : undefined, maxSteps: steps }),
+    placer: () => new LabelPlacer(context, context.width, context.height),
+  };
 }
 
 function placeTitle(context: Context, box: Box, shown: ChartSeriesValues[]): void {
@@ -1246,6 +1350,7 @@ function legendEntries(context: Context, shown: ChartSeriesValues[], pies: boole
   const { chart, values } = context;
   const entries: LegendEntry[] = [];
   const first = shown[0];
+  if (first !== undefined && (chartKindExtended(first.kind) || first.kind === 'surface')) return extendedLegend(kitOf(context), shown);
   const perPoint = first !== undefined && (pies || (shown.length === 1 && first.kind === 'bar' && chart.groups[first.group].varyColors === true));
   if (perPoint) {
     // One entry per point: the slices of a pie, the columns of a series whose points differ in colour.
@@ -1378,6 +1483,8 @@ function placeLegend(context: Context, box: Box, shown: ChartSeriesValues[], pie
 // ----------------------------------------------------------------- data labels
 
 /** Where a data label belongs: the column, the point or the slice it is the label of. */
+export type ChartLabelAnchor = LabelAnchor;
+
 type LabelAnchor =
   /** `low`: the end of the bar that shows its value is the one at the smaller coordinate (the top of a column that stands). */
   | { kind: 'bar'; x: number; y: number; width: number; height: number; lying: boolean; low: boolean; stacked: boolean }

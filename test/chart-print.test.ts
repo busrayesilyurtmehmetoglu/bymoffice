@@ -150,7 +150,7 @@ test('chart sheets are printed in their place among the sheets; one whose chart 
   assert.deepEqual(all.pages.map((page) => `${page.sheet}:${page.index}:${page.number}`), ['0:0:1', '1:0:2'], 'pages are numbered through the job');
   assert.equal(all.pages[0].chart, undefined, 'a worksheet page has no chart of its own');
   assert.deepEqual(planSheetPages(workbook, [1, 0, 1]).pages.map((page) => `${page.sheet}:${page.number}`), ['1:1', '0:2', '1:3'], 'the page of a chart sheet counts: what follows it has the next number');
-  const surface = await book(undefined, CHART('surfaceChart'));
+  const surface = await book(undefined, CHART('contourChart'));
   assert.equal(codeOf(() => planSheetPages(surface, [1])), 'empty', 'a chart sheet that shows a note has nothing to print');
   assert.deepEqual(planSheetPages(surface, [0, 1]).sheets, [0]);
   assert.equal(codeOf(() => planSheetPages(workbook, [1], { maxPages: 1 })), undefined, 'one page fits a limit of one');

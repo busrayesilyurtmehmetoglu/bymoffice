@@ -10,6 +10,7 @@ import { childElements, localName, serializeXml, type XmlDocument, type XmlEleme
 import { parseChart } from './chart';
 import { pivotTableParts, readPivots } from './pivot';
 import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
+import { parseChartEx } from './chartex';
 import { readSheetDrawings, type ChartReading, type DrawingPartFacts } from './drawings';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
@@ -92,7 +93,7 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   /** Parts of the pictures the drawings show: the only ones the view may ask for. */
   const mediaParts = new Set<string>();
   /** What the charts of the whole workbook may cost: the limits hold for all sheets together. */
-  const chartReading: ChartReading = { read: parseChart, charts: MAX_WORKBOOK_CHARTS, points: MAX_WORKBOOK_CHART_POINTS };
+  const chartReading: ChartReading = { read: parseChart, readEx: parseChartEx, charts: MAX_WORKBOOK_CHARTS, points: MAX_WORKBOOK_CHART_POINTS };
 
   const sheets: Sheet[] = [];
   const seenParts = new Set<string>();

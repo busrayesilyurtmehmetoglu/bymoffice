@@ -39,7 +39,7 @@ export interface ColumnsSpec {
   uncached?: boolean;
   /** Elements of <c:chart> before the plot area (a title). */
   head?: string;
-  /** The element name of the chart type. Default "barChart"; "surfaceChart" is a type that is not drawn. */
+  /** The element name of the chart type. Default "barChart"; "contourChart" stands for a type that is not drawn. */
   type?: string;
   /** More series, after the first: whole <c:ser> elements. */
   more?: string;

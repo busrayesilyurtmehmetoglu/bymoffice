@@ -12,6 +12,8 @@ export interface UiStrings {
   chartSheetNote: string;
   /** The name of a series of a chart that has none: `n` counts from 1. */
   chartSeries(n: number): string;
+  /** The words a chart shows of its own: the entries of the legend of a waterfall. */
+  chartWord(word: 'increase' | 'decrease' | 'total'): string;
   otherSheetNote: string;
   /** Said after the active cell when more than one cell is selected. */
   selected(range: string): string;
@@ -698,6 +700,7 @@ export const STRINGS_EN: UiStrings = {
   sheet: (name) => `Sheet ${name}`,
   chartSheetNote: 'This sheet is a chart sheet. Its chart is of a kind that is not shown yet.',
   chartSeries: (n) => `Series${n}`,
+  chartWord: (word) => (word === 'increase' ? 'Increase' : word === 'decrease' ? 'Decrease' : 'Total'),
   otherSheetNote: 'This kind of sheet is not shown yet.',
   selected: (range) => `${range} selected`,
   insertRowsAbove: (count) => `Insert ${rows(count)} above`,
@@ -1345,6 +1348,7 @@ export const STRINGS_TR: UiStrings = {
   sheet: (name) => `Sayfa ${name}`,
   chartSheetNote: 'Bu sayfa bir grafik sayfası. Grafiği henüz gösterilmeyen bir türde.',
   chartSeries: (n) => `Seri${n}`,
+  chartWord: (word) => (word === 'increase' ? 'Artış' : word === 'decrease' ? 'Azalış' : 'Toplam'),
   otherSheetNote: 'Bu tür sayfalar henüz gösterilmiyor.',
   selected: (range) => `${range} seçili`,
   insertRowsAbove: (count) => `Üste ${satir(count)} ekle`,

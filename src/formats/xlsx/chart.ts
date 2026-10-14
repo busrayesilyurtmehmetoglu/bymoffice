@@ -3,9 +3,10 @@
 // area with their series, the axes, the title and the legend.
 //
 // Nothing here is ever serialized: the part stays in the package and is
-// written back from there. A chart that holds a type that is not drawn (a
-// surface) or that cannot be read is not a chart of the model: parseChart()
-// answers undefined and the drawing shows a placeholder.
+// written back from there. A chart that holds a type that is not drawn or
+// that cannot be read is not a chart of the model: parseChart() answers
+// undefined and the drawing shows a placeholder. The parts of the newer
+// chart types (chartex) are read by chartex.ts, with the helpers exported here.
 
 import {
   MAX_CHART_AXES,
@@ -42,12 +43,12 @@ export const MAX_CHART_CACHE = 1000000;
 export const MAX_CHART_DATA_POINTS = 4096;
 /** Levels of categories (c:lvl) read from one reference. */
 const MAX_CHART_LEVELS = 8;
-const MAX_TEXT = 4096;
+export const MAX_TEXT = 4096;
 const MAX_NOTES = 32;
 
 /** The accent colours of the Office theme, for a workbook without a theme part. */
-const OFFICE_ACCENTS = ['4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47'];
-const HEX6 = /^[0-9A-Fa-f]{6}$/;
+export const OFFICE_ACCENTS = ['4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47'];
+export const HEX6 = /^[0-9A-Fa-f]{6}$/;
 const NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 
 const GROUPS: { [local: string]: { kind: ChartKind; threeD?: true } } = {
@@ -66,11 +67,14 @@ const GROUPS: { [local: string]: { kind: ChartKind; threeD?: true } } = {
   stockChart: { kind: 'stock' },
   // Only the pie of a pie with a second plot is drawn.
   ofPieChart: { kind: 'pie' },
+  // Drawn from above, as bands of colour.
+  surfaceChart: { kind: 'surface' },
+  surface3DChart: { kind: 'surface', threeD: true },
 };
 
 const AXES: { [local: string]: 'cat' | 'val' } = { catAx: 'cat', dateAx: 'cat', serAx: 'cat', valAx: 'val' };
 
-interface ReadState {
+export interface ReadState {
   themeColors: string[];
   notes: string[];
   /** Cached values (<c:pt>) read so far. */
@@ -80,26 +84,28 @@ interface ReadState {
   /** A cache was cut short at that limit. */
   cut?: boolean;
   series: number;
+  /** The plot area holds a surface chart (whose series axis is drawn). */
+  surface?: boolean;
 }
 
-function note(state: ReadState, text: string): void {
+export function note(state: ReadState, text: string): void {
   if (state.notes.length < MAX_NOTES && state.notes.indexOf(text) < 0) state.notes.push(text);
 }
 
-function child(parent: XmlElement | undefined, local: string): XmlElement | undefined {
+export function child(parent: XmlElement | undefined, local: string): XmlElement | undefined {
   if (!parent) return undefined;
   for (const node of parent.children) if (node.type === 'element' && localName(node.name) === local) return node;
   return undefined;
 }
 
-function children(parent: XmlElement | undefined, local: string): XmlElement[] {
+export function children(parent: XmlElement | undefined, local: string): XmlElement[] {
   const found: XmlElement[] = [];
   if (!parent) return found;
   for (const node of parent.children) if (node.type === 'element' && localName(node.name) === local) found.push(node);
   return found;
 }
 
-function textOf(el: XmlElement | undefined): string {
+export function textOf(el: XmlElement | undefined): string {
   if (!el) return '';
   let text = '';
   for (const node of el.children) if (node.type === 'text') text += node.value;
@@ -107,20 +113,20 @@ function textOf(el: XmlElement | undefined): string {
 }
 
 /** The `val` attribute of a child element; undefined when the child or the attribute is missing. */
-function val(parent: XmlElement | undefined, local: string): string | undefined {
+export function val(parent: XmlElement | undefined, local: string): string | undefined {
   const el = child(parent, local);
   return el ? el.attrs.get('val') : undefined;
 }
 
 /** A flag element: missing -> `missing`; present without a value -> true (the default of the schema). */
-function flag(parent: XmlElement | undefined, local: string, missing: boolean): boolean {
+export function flag(parent: XmlElement | undefined, local: string, missing: boolean): boolean {
   const el = child(parent, local);
   if (!el) return missing;
   const value = el.attrs.get('val');
   return value === undefined ? true : value === '1' || value === 'true';
 }
 
-function number(text: string | undefined): number | undefined {
+export function number(text: string | undefined): number | undefined {
   if (text === undefined) return undefined;
   const trimmed = text.trim();
   if (!NUMBER.test(trimmed)) return undefined;
@@ -128,12 +134,12 @@ function number(text: string | undefined): number | undefined {
   return Number.isFinite(value) ? value : undefined;
 }
 
-function int(text: string | undefined): number | undefined {
+export function int(text: string | undefined): number | undefined {
   const value = number(text);
   return value !== undefined && Math.floor(value) === value && Math.abs(value) <= 2147483647 ? value : undefined;
 }
 
-const clamp = (value: number, low: number, high: number): number => (value < low ? low : value > high ? high : value);
+export const clamp = (value: number, low: number, high: number): number => (value < low ? low : value > high ? high : value);
 
 // ------------------------------------------------------------------ colours
 
@@ -143,7 +149,7 @@ const clamp = (value: number, low: number, high: number): number => (value < low
  * drawn against white; a gradient is its first colour, a pattern its
  * foreground colour.
  */
-function fillOf(state: ReadState, holder: XmlElement | undefined): string | null | undefined {
+export function fillOf(state: ReadState, holder: XmlElement | undefined): string | null | undefined {
   if (!holder) return undefined;
   for (const node of holder.children) {
     if (node.type !== 'element') continue;
@@ -167,7 +173,7 @@ function fillOf(state: ReadState, holder: XmlElement | undefined): string | null
 }
 
 /** The first colour element inside `holder`; null when it is fully transparent, undefined when there is none that can be read. */
-function colorOf(state: ReadState, holder: XmlElement | undefined): string | null | undefined {
+export function colorOf(state: ReadState, holder: XmlElement | undefined): string | null | undefined {
   if (!holder) return undefined;
   for (const node of holder.children) {
     if (node.type !== 'element') continue;
@@ -189,7 +195,7 @@ function colorOf(state: ReadState, holder: XmlElement | undefined): string | nul
   return undefined;
 }
 
-function lineOf(state: ReadState, props: XmlElement | undefined): ChartLine | undefined {
+export function lineOf(state: ReadState, props: XmlElement | undefined): ChartLine | undefined {
   const outline = child(props, 'ln');
   if (!outline) return undefined;
   const line: ChartLine = {};
@@ -202,7 +208,7 @@ function lineOf(state: ReadState, props: XmlElement | undefined): ChartLine | un
   return line.color !== undefined || line.width !== undefined || line.dash ? line : undefined;
 }
 
-function shapeOf(state: ReadState, props: XmlElement | undefined): ChartShape | undefined {
+export function shapeOf(state: ReadState, props: XmlElement | undefined): ChartShape | undefined {
   if (!props) return undefined;
   const shape: ChartShape = {};
   const fill = fillOf(state, props);
@@ -214,7 +220,7 @@ function shapeOf(state: ReadState, props: XmlElement | undefined): ChartShape | 
 
 // --------------------------------------------------------------------- text
 
-function runStyle(state: ReadState, props: XmlElement | undefined, into: ChartTextStyle): void {
+export function runStyle(state: ReadState, props: XmlElement | undefined, into: ChartTextStyle): void {
   if (!props) return;
   const size = int(props.attrs.get('sz'));
   if (size !== undefined && size >= 100 && size <= 400000) into.size = size / 100;
@@ -231,7 +237,7 @@ function runStyle(state: ReadState, props: XmlElement | undefined, into: ChartTe
 }
 
 /** What a <c:txPr> (or the body of a rich text) says about the text it does not set itself. */
-function bodyStyle(state: ReadState, body: XmlElement | undefined): ChartTextStyle | undefined {
+export function bodyStyle(state: ReadState, body: XmlElement | undefined): ChartTextStyle | undefined {
   if (!body) return undefined;
   const style: ChartTextStyle = {};
   runStyle(state, child(child(child(body, 'lstStyle'), 'lvl1pPr'), 'defRPr'), style);
@@ -240,7 +246,7 @@ function bodyStyle(state: ReadState, body: XmlElement | undefined): ChartTextSty
 }
 
 /** The plain text of a rich text (c:rich), its paragraphs as lines; the look of the first run goes into `style`. */
-function richText(state: ReadState, rich: XmlElement, style: ChartTextStyle): string {
+export function richText(state: ReadState, rich: XmlElement, style: ChartTextStyle): string {
   Object.assign(style, bodyStyle(state, rich) || {});
   let text = '';
   let first = true;
@@ -266,7 +272,7 @@ function richText(state: ReadState, rich: XmlElement, style: ChartTextStyle): st
 }
 
 /** A place set by hand (c:layout with c:manualLayout), as the file states it. */
-function readLayout(holder: XmlElement | undefined): ChartManualLayout | undefined {
+export function readLayout(holder: XmlElement | undefined): ChartManualLayout | undefined {
   const manual = child(child(holder, 'layout'), 'manualLayout');
   if (!manual) return undefined;
   const layout: ChartManualLayout = {};
@@ -313,7 +319,7 @@ function readTitle(state: ReadState, title: XmlElement | undefined): ChartTitle 
 
 // --------------------------------------------------------------------- data
 
-function readCache(state: ReadState, holder: XmlElement | undefined, kind: 'num' | 'str', data: ChartData): void {
+export function readCache(state: ReadState, holder: XmlElement | undefined, kind: 'num' | 'str', data: ChartData): void {
   if (!holder) return;
   if (kind === 'num') {
     const code = textOf(child(holder, 'formatCode'));
@@ -355,7 +361,7 @@ function readCache(state: ReadState, holder: XmlElement | undefined, kind: 'num'
 }
 
 /** Puts the points of a cache in the order of their indexes; of two points with one index the later one of the file stays. */
-function sortCache(data: ChartData): void {
+export function sortCache(data: ChartData): void {
   const { index, values } = data.cache;
   const order: number[] = [];
   for (let i = 0; i < index.length; i++) order.push(i);
@@ -640,7 +646,17 @@ function readGroup(state: ReadState, el: XmlElement, kind: ChartKind, threeD: bo
   };
   if (threeD) {
     group.threeD = true;
-    note(state, 'A 3-D chart is drawn flat');
+    note(state, kind === 'surface' ? 'A 3-D surface chart is drawn from above, as bands of colour' : 'A 3-D chart is drawn flat');
+  }
+  if (kind === 'surface') {
+    if (child(el, 'wireframe') && flag(el, 'wireframe', true)) group.wireframe = true;
+    const bands: { index: number; shape: ChartShape }[] = [];
+    for (const node of children(child(el, 'bandFmts'), 'bandFmt')) {
+      const index = int(val(node, 'idx'));
+      const shape = shapeOf(state, child(node, 'spPr'));
+      if (index !== undefined && index >= 0 && index < 1000 && shape && bands.length < 256 && !bands.some((band) => band.index === index)) bands.push({ index, shape });
+    }
+    if (bands.length > 0) group.bands = bands.sort((a, b) => a.index - b.index);
   }
   if (kind === 'bar') {
     group.barDir = val(el, 'barDir') === 'bar' ? 'bar' : 'col';
@@ -745,7 +761,8 @@ function readAxis(state: ReadState, el: XmlElement, kind: 'cat' | 'val'): ChartA
   };
   const local = localName(el.name);
   if (local === 'dateAx') axis.date = true;
-  if (local === 'serAx') note(state, 'A series axis is not drawn');
+  // The series axis of a surface chart names its rows; that of a 3-D chart of another type is not drawn.
+  if (local === 'serAx' && !state.surface) note(state, 'A series axis is not drawn');
   // UNSURE: an axis without the element is drawn. (The default of the element in the schema is "deleted"; Excel always writes it.)
   if (child(el, 'delete') && flag(el, 'delete', false)) axis.deleted = true;
   const scaling = child(el, 'scaling');
@@ -884,6 +901,7 @@ function readChart(root: XmlElement, state: ReadState): Chart | undefined {
   if (!chartEl || !plot) return undefined;
   const groups: ChartGroup[] = [];
   const axes: ChartAxis[] = [];
+  state.surface = plot.children.some((node) => node.type === 'element' && /^surface(3D)?Chart$/.test(localName(node.name)));
   for (const node of plot.children) {
     if (node.type !== 'element') continue;
     const local = localName(node.name);
@@ -894,7 +912,7 @@ function readChart(root: XmlElement, state: ReadState): Chart | undefined {
       const axis = axes.length < MAX_CHART_AXES ? readAxis(state, node, AXES[local]) : undefined;
       if (axis) axes.push(axis);
     } else if (/Chart$/.test(local)) {
-      // surfaceChart, surface3DChart, ...: one type that is not drawn hides the whole chart.
+      // A type that is not drawn hides the whole chart.
       return undefined;
     } else if (local === 'dTable') note(state, 'The data table of a chart is not drawn');
   }
@@ -937,6 +955,8 @@ function readChart(root: XmlElement, state: ReadState): Chart | undefined {
     note(state, 'A pie combined with another chart type: only the pie is drawn');
   } else if (groups.some((group) => group.kind === 'radar') && groups.some((group) => group.kind !== 'radar')) {
     note(state, 'A radar combined with another chart type: only the radar is drawn');
+  } else if (groups.some((group) => group.kind === 'surface') && groups.some((group) => group.kind !== 'surface')) {
+    note(state, 'A surface combined with another chart type: only the surface is drawn');
   }
   return chart;
 }

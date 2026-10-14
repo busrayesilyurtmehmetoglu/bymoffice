@@ -57,6 +57,7 @@ import {
   MAX_EMU,
   MAX_NESTING,
   MAX_TWIPS,
+  CHARTEX_SPACE,
   MAX_CHART_FRAME_WARNINGS,
   MAX_XML_DEPTH,
   anyAttr,
@@ -205,6 +206,7 @@ const GRAPHIC_KINDS: [suffix: string, kind: DrawingItem['kind']][] = [
   ['/wordprocessingGroup', 'group'],
   ['/wordprocessingCanvas', 'canvas'],
   ['/chart', 'chart'],
+  ['/chartex', 'chart'],
   ['/diagram', 'diagram'],
 ];
 
@@ -216,6 +218,43 @@ const WRAP_KINDS: [local: string, wrap: NonNullable<DrawingAnchor['wrap']>][] = 
   ['wrapTopAndBottom', 'topAndBottom'],
 ];
 
+/** Whether a prefix a Choice requires stands for a namespace of the newer chart parts, declared on the part or on the Choice. */
+function chartExPrefix(ctx: PartContext, choice: XmlElement, prefix: string): boolean {
+  const own = choice.attrs.get(`xmlns:${prefix}`);
+  return own !== undefined ? CHARTEX_SPACE.test(own) : ctx.prefixes.get(prefix) === 'cx';
+}
+
+/**
+ * Whether every frame of a chart of the newer types in a Choice shows a chart that was read
+ * (ReaderState.chartExDrawn), and there is one. Frames nested deeper than a drawing holds are not looked for.
+ */
+function chartExDrawn(ctx: PartContext, choice: XmlElement): boolean {
+  const drawn = ctx.state.chartExDrawn;
+  if (!drawn) return false;
+  let found = 0;
+  const stack: { el: XmlElement; depth: number }[] = [{ el: choice, depth: 0 }];
+  while (stack.length > 0) {
+    const { el, depth } = stack.pop() as { el: XmlElement; depth: number };
+    if (localOf(el.name) === 'graphicData') {
+      if (!/\/chartex$/.test(el.attrs.get('uri') || '')) continue;
+      const reference = child(el, 'chart');
+      const rId = reference ? anyAttr(reference, 'id') : undefined;
+      const rel = rId === undefined ? undefined : ctx.relationships.get(rId);
+      if (!rel || rel.external || rel.part === null || rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chartEx') return false;
+      const part = ctx.state.partName ? ctx.state.partName(rel.part) : rel.part;
+      if (part === undefined || !drawn.has(part)) return false;
+      found++;
+      continue;
+    }
+    if (depth >= 16) continue;
+    for (const node of el.children) if (node.type === 'element') stack.push({ el: node, depth: depth + 1 });
+  }
+  return found > 0;
+}
+
+/** Choices of alternate content that hold a chart of a newer type: whether the reader took them (see selectBranch()). */
+const CHARTEX_CHOICES = new WeakMap<XmlElement, boolean>();
+
 /** The branch of an <mc:AlternateContent> the reader goes with. */
 function selectBranch(ctx: PartContext, el: XmlElement): { selected: 'choice' | 'fallback' | 'none'; branch?: XmlElement } {
   let fallback: XmlElement | undefined;
@@ -226,6 +265,17 @@ function selectBranch(ctx: PartContext, el: XmlElement): { selected: 'choice' | 
       const requires = (node.attrs.get('Requires') || '').split(/\s+/).filter(Boolean);
       if (requires.length && requires.every((prefix) => KNOWN_REQUIREMENTS.indexOf(prefix) >= 0)) {
         return { selected: 'choice', branch: node };
+      }
+      // A chart of a newer type: the Choice is taken where its chart can be drawn, else what stands in for it.
+      const extended = requires.filter((prefix) => KNOWN_REQUIREMENTS.indexOf(prefix) < 0);
+      if (extended.length > 0 && extended.every((prefix) => chartExPrefix(ctx, node, prefix))) {
+        // Decided once, when the document is read: the writer reads the tree again without the charts at hand.
+        let drawn = CHARTEX_CHOICES.get(node);
+        if (drawn === undefined && ctx.state.chartExDrawn) {
+          drawn = chartExDrawn(ctx, node);
+          CHARTEX_CHOICES.set(node, drawn);
+        }
+        if (drawn) return { selected: 'choice', branch: node };
       }
     } else if (kind === 'mc:Fallback' && !fallback) fallback = node;
   }
@@ -434,7 +484,8 @@ function chartPart(ctx: PartContext, el: XmlElement | undefined): string | undef
   if (!el || localOf(el.name) !== 'chart') return undefined;
   const rId = anyAttr(el, 'id');
   const rel = rId === undefined ? undefined : ctx.relationships.get(rId);
-  if (!rel || rel.type.slice(rel.type.lastIndexOf('/') + 1) !== 'chart') return undefined;
+  const type = rel ? rel.type.slice(rel.type.lastIndexOf('/') + 1) : '';
+  if (!rel || (type !== 'chart' && type !== 'chartEx')) return undefined;
   const state = ctx.state;
   const warn = (text: string) => {
     if (state.chartWarnings++ < MAX_CHART_FRAME_WARNINGS) state.warnings.push(text);

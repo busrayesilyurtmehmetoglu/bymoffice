@@ -71,6 +71,7 @@ export * from './model/sheet/color';
 export type {
   Chart,
   ChartAxis,
+  ChartBinning,
   ChartCache,
   ChartData,
   ChartDataLabels,
@@ -85,6 +86,7 @@ export type {
   ChartPoint,
   ChartPointLabel,
   ChartSeries,
+  ChartSeriesEx,
   ChartShape,
   ChartTextStyle,
   ChartTitle,

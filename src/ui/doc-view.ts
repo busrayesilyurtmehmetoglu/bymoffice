@@ -885,6 +885,7 @@ export class DocumentView {
       family: doc.theme.minorFont.latin,
       locale: () => this.chartLocale,
       seriesName: (n) => this.strings.chartSeries(n),
+      chartWord: (word) => this.strings.chartWord(word),
     });
     // Pictures put in while editing are in the model (a view may be made editable later); the others where the document was read from.
     const source = options.package;

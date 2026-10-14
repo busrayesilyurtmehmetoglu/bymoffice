@@ -31,8 +31,77 @@ export const MAX_CHART_AXES = 16;
 /** Trend lines read from one series. */
 export const MAX_CHART_TRENDLINES = 8;
 
-/** "stock" is a line chart whose series are the open, high, low and close of each category, in that order. */
-export type ChartKind = 'bar' | 'line' | 'pie' | 'doughnut' | 'area' | 'scatter' | 'radar' | 'bubble' | 'stock';
+/**
+ * "stock" is a line chart whose series are the open, high, low and close of each category, in that order.
+ * "surface" is a surface chart (c:surfaceChart, c:surface3DChart), drawn from above as bands of colour.
+ * The rest are the kinds of the newer chart parts (chartex, see ChartSeriesEx): "histogram" (a pareto
+ * chart is one with ChartSeriesEx.pareto), "waterfall", "funnel", "boxWhisker", "treemap", "sunburst".
+ */
+export type ChartKind =
+  | 'bar'
+  | 'line'
+  | 'pie'
+  | 'doughnut'
+  | 'area'
+  | 'scatter'
+  | 'radar'
+  | 'bubble'
+  | 'stock'
+  | 'surface'
+  | 'histogram'
+  | 'waterfall'
+  | 'funnel'
+  | 'boxWhisker'
+  | 'treemap'
+  | 'sunburst';
+
+/** The kinds of the newer chart parts (chartex): each is laid out by a rule of its own, not along axes of series. */
+export const EXTENDED_CHART_KINDS: readonly ChartKind[] = ['histogram', 'waterfall', 'funnel', 'boxWhisker', 'treemap', 'sunburst'];
+
+/** Whether a kind is one of the newer chart parts (chartex). */
+export function chartKindExtended(kind: ChartKind): boolean {
+  return EXTENDED_CHART_KINDS.indexOf(kind) >= 0;
+}
+
+/** How a histogram puts its values into bins (cx:binning). */
+export interface ChartBinning {
+  /** Which end of a bin belongs to it: "r" (a, b], the default, or "l" [a, b). */
+  closed: 'l' | 'r';
+  /** Values at or below it go into one bin of their own; "auto" is stated and taken as none. */
+  underflow?: number | 'auto';
+  /** Values above it go into one bin of their own. */
+  overflow?: number | 'auto';
+  /** The width of a bin; with neither this nor `count` it is worked out. */
+  size?: number;
+  /** How many bins there are between the lowest and the highest value. */
+  count?: number;
+}
+
+/**
+ * What a series of a newer chart part (chartex) states about its layout (cx:layoutPr), as far as
+ * it is drawn. What a kind does not use is not read for it.
+ */
+export interface ChartSeriesEx {
+  /** Waterfall: the points that are totals (their bar stands on zero). */
+  subtotals?: number[];
+  /** Waterfall: lines join the end of one bar to the start of the next. Default true. */
+  connectorLines?: boolean;
+  /** Histogram: how the values are put into bins; undefined when they are counted by category. */
+  binning?: ChartBinning;
+  /** Histogram: the values of equal categories are added up (cx:aggregation), each category a bar. */
+  aggregate?: boolean;
+  /** Pareto: the line of the running share (a series of layout "paretoLine" that names this one as its owner). */
+  pareto?: { line?: ChartLine; axisId?: number };
+  /** Box and whisker: how the quartiles are worked out. Default "exclusive". */
+  quartiles?: 'inclusive' | 'exclusive';
+  /** Box and whisker: what is shown besides the box. Defaults: mean marker and outliers yes, mean line and inner points no. */
+  meanLine?: boolean;
+  meanMarker?: boolean;
+  nonoutliers?: boolean;
+  outliers?: boolean;
+  /** Treemap: where the names of the parent categories stand. Default "overlapping". */
+  parentLabels?: 'none' | 'banner' | 'overlapping';
+}
 
 /** How the text of a part of a chart is set; what is missing is the default of the place it stands in. */
 export interface ChartTextStyle {
@@ -89,6 +158,8 @@ export interface ChartData {
   count: number;
   /** Number format of the cached numbers (c:formatCode). */
   formatCode?: string;
+  /** Of a newer chart part: the levels of the reference are its rows, not its columns (cx:f dir="row"). */
+  byRow?: boolean;
 }
 
 /** The place of a point index in a cache, or -1 when the file has no value for the point. */
@@ -260,6 +331,8 @@ export interface ChartSeries {
   explosion?: number;
   /** Bubble chart: the sizes of the bubbles (c:bubbleSize). */
   bubbleSizes?: ChartData;
+  /** A series of a newer chart part: what its layout states (see ChartSeriesEx). */
+  ex?: ChartSeriesEx;
 }
 
 /** The boxes between the first and the last series of a line or stock chart (c:upDownBars). */
@@ -316,6 +389,10 @@ export interface ChartGroup {
    * cent ("percent"), or the ones listed ("cust").
    */
   ofPie?: { split: 'auto' | 'pos' | 'val' | 'percent' | 'cust'; position?: number; points?: number[] };
+  /** Surface chart: only the lines between the bands are drawn (c:wireframe). */
+  wireframe?: boolean;
+  /** Surface chart: the look of single bands of values, by their place from the lowest (c:bandFmts). */
+  bands?: { index: number; shape: ChartShape }[];
   /** Ids of the axes the group is drawn against. */
   axisIds: number[];
   series: ChartSeries[];
@@ -404,9 +481,15 @@ export interface Chart {
   /**
    * Set by the reader of the old binary format (xls): the chart is shown and never written from
    * its model. Its records were read by the specification alone, without a file of Excel to
-   * compare with; a workbook that is saved as xlsx leaves it out and says so.
+   * compare with; a workbook that is saved as xlsx leaves it out and says so. Set as well on a
+   * chart of a newer chart part (`extended`): neither is changed, moved nor deleted.
    */
   shownOnly?: boolean;
+  /**
+   * Read from a newer chart part (chartex: histogram, waterfall, funnel, box and whisker, treemap,
+   * sunburst). Such a chart is only shown (`shownOnly`): its part is never written from the model.
+   */
+  extended?: boolean;
   /** The chart types of the plot area, in the order of the file. Never empty. */
   groups: ChartGroup[];
   axes: ChartAxis[];
