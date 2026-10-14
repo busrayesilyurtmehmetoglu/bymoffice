@@ -23,7 +23,9 @@ Aktarıcı **her iki tür için aynıdır** (biçimden habersizdir): oda, sıra,
 
 Ek kurallar (aktarıcı):
 
-5. **Sürüm (`pv`):** `join` protokol sürümünü taşır (şimdi **`2`**; `1`: dönem adı ve damga yoktu, `since` tek başına kabul ediliyordu — sessiz ıraksamaya yol açtığı için `1` konuşan istemci `2` odasına alınmaz). Odanın sürümü ilk katılanla sabitlenir; başka sürümle gelen `error version` alır. (Yeni bir sürümün tanıdığı işlem türü eskilerde atlanırdı; aynı odada iki sürüm ıraksama demektir.)
+5. **Sürüm (`pv`):** `join` protokol sürümünü taşır (şimdi **`3`**; `2`: tablo `pane` adımı ve belgede sekme durakları — `para.f.tabs`, `put` paragraflarında `tabs` listesi — yoktu; `1`: dönem adı ve damga yoktu, `since` tek başına kabul ediliyordu). Odanın sürümü ilk katılanla sabitlenir; başka sürümle gelen `error version` alır. `hello` odanın sürümünü `pv` ile söyler; istemci kendi sürümünden farklı `pv` görürse de katılmaz. `pv` bir sayıdır (1–1000 tamsayı); istemci `hello.pv`'de yalnız rakamlardan oluşan dizgeyi de (`"3"`; ör. PHP arka uçları) kabul eder, başka biçim (`"3.0"`, `"x"`) iletiyi geçersiz kılar. Örnek aktarıcılar `join.pv`'de dizge kabul etmez. İstemci `version` hatasını genel retten (`refused`) ayırır: oturum `closed` olur, `reason` `version`'dır, kullanıcıya "Bu dosya başka bir sürümle düzenleniyor; sayfayı yenileyin." denir. (Yeni bir sürümün tanıdığı işlem türü eskilerde atlanırdı; aynı odada iki sürüm ıraksama demektir.)
+
+   **Sürüm kuralı:** tel adımına (tablo `ops` ya da belge komutu) yeni bir tür ya da alan eklendiğinde, ya da var olan bir adımın anlamı değiştiğinde `PROTOCOL_VERSION` (`src/collab/room.ts`) bir artırılır. Bunu `test/collab-protocol-version.test.ts` hatırlatır: tablo ve belge çözücülerinin kabul ettiği adım türlerinden ve her türde adıyla okudukları alanlardan bir "parmak izi" çıkarır (örnek adımlar, okunan her anahtarı not eden bir vekil (proxy) içinden çözülür); parmak izi değişip sürüm aynı kalırsa test düşer ve "pv'yi artır, parmak izini güncelle" der. Parmak izinin görmediği: komut bağımsız değişkenlerinin içi (`cmd.a`), alanların alabildiği değerler (sıralı listelerin üyeleri) ve aktarıcı iletileri (`join`, `hello`…) — bunlarda değişiklik yine sürüm ister, ama elle.
 6. **Gizli anahtar (`key`):** `join` bir `key` taşır (1–64 karakter, `[A-Za-z0-9_-]`). Anahtar katılımcı ile aktarıcı arasında **sırdır**: hiçbir iletide, günlükte ya da oda listesinde yer almaz. Aynı odaya aynı anahtarla gelen bağlantı o katılımcının kendisidir (kopup dönen): eski bağlantı `error replaced` alır ve kapanır, yenisi yerine geçer. `op.id` herhangi bir dizgedir (1–100 karakter) ve anahtarla ilgisi yoktur; istemci adımlarını anahtardan türetilmeyen, herkesin gördüğü ayrı bir önekle adlandırır ve kendi adımını yalnız adından değil **içeriğinden** de tanır (aynı adla gelen başka içerik başkasının adımıdır). İçerik karşılaştırması anahtar sırasından bağımsızdır; yine de aktarıcı `ops`'u **aldığı metinle** aktarmalıdır (örnek sunucu öyle yapar). Gönderilen adım 30 sn içinde ne onay ne ret alırsa istemci bunu söyler ve yeniden bağlanır.
 7. **Bağlantı başına tek oda:** katılmış bağlantıdan ikinci `join` → `bad-message`. `reset` almış bağlantı yalnız aynı odaya yeniden katılabilir. Sırası bozuk adım gören istemci yeni bağlantı kurup `since` ile katılır (dosya yeniden yüklenmez).
 8. **Sürüm tablosu:** bir sürüm dizgesinin hangi adımı tuttuğu bir kez yazılır (ilk yazan kazanır; odanın kuruluş sürümleri 0'a kilitlidir). `saved` yalnız yazma yetkili üyeden kabul edilir ve `rev` yalnız gönderenin gerçekten gördüğü aralıkta (`katıldığı adım ≤ rev ≤ odanın adımı`). Tablo sınırlıdır (16 sürüm); kuruluş sürümleri ve son kaydedilen sürüm atılmaz. Atılan sürümlerin **son** 4.096'sı hatırlanır ve hatırlandıkça yeniden yazılamaz (kayan pencere; oda yazmayı hiçbir zaman bırakmaz — tablo kimseyi içeri almadığı için unutulan bir sürümün yeniden yazılması zararsızdır, yazmayı bırakan oda ise kaydettiği dosyayla dönen herkesi dışarıda bırakırdı). Tabloyla çelişen ya da hatırlanan bir sürümü anan `saved`, `rev`'i olmadan aktarılır. Yeni sürüm yazan `saved` hız sınırlıdır (örnek sunucu: bağlantı başına dakikada **40**, oda başına **120**; istemcinin kendiliğinden kaydı en sık 2 sn'de birdir = dakikada 30, sınır bunun üstünde olmalıdır: sınırı aşan kayıt tabloya yazılmaz ve o dosyayla dönen istemci odaya ancak yeni bir kayıttan sonra girer).
@@ -40,7 +42,7 @@ Her ileti tek bir JSON nesnesidir (WebSocket'te bir metin çerçevesi). En büy�
 
 | İleti | Alanlar |
 |---|---|
-| `join` | `{ "t":"join", "pv":2, "key":dizge, "v":[dizge…], "since"?:tamsayı, "ep"?:dizge, "user"?:{ "name"?:dizge, "color"?:"#RRGGBB" }, "token"?:dizge, "ro"?:true, "room"?:dizge }` |
+| `join` | `{ "t":"join", "pv":3, "key":dizge, "v":[dizge…], "since"?:tamsayı, "ep"?:dizge, "user"?:{ "name"?:dizge, "color"?:"#RRGGBB" }, "token"?:dizge, "ro"?:true, "room"?:dizge }` |
 | `op` | `{ "t":"op", "base":tamsayı, "id":dizge, "ops":[…] }` |
 | `presence` | `{ "t":"presence", "data":{ "s":sayfa, "a":[satır,sütun], "r":[üst,sol,alt,sağ] } \| null }` |
 | `saved` | `{ "t":"saved", "v":[dizge…], "rev"?:tamsayı }` |
@@ -56,7 +58,7 @@ Her ileti tek bir JSON nesnesidir (WebSocket'te bir metin çerçevesi). En büy�
 
 | İleti | Alanlar |
 |---|---|
-| `hello` | `{ "t":"hello", "pv":2, "ep":dizge, "rev":tamsayı, "from":tamsayı, "you":dizge, "ro":mantıksal, "v":[dizge…], "peers":[{ "id", "user":{name?,color?}, "ro", "presence"? }…] }` |
+| `hello` | `{ "t":"hello", "pv":3, "ep":dizge, "rev":tamsayı, "from":tamsayı, "you":dizge, "ro":mantıksal, "v":[dizge…], "peers":[{ "id", "user":{name?,color?}, "ro", "presence"? }…] }` |
 | `op` | `{ "t":"op", "rev":tamsayı, "id":dizge, "from":dizge, "ops":[…] }` |
 | `nack` | `{ "t":"nack", "id":dizge, "rev":tamsayı, "reason"?:"read-only"\|"rate" }` |
 | `sync` | `{ "t":"sync" }` — biri katılamıyor: kaydedebilen kaydetsin |
@@ -65,7 +67,7 @@ Her ileti tek bir JSON nesnesidir (WebSocket'te bir metin çerçevesi). En büy�
 | `saved` | `{ "t":"saved", "from":dizge, "v":[dizge…], "rev"?:tamsayı }` |
 | `peer` / `left` | `{ "t":"peer", "id", "user", "ro" }` / `{ "t":"left", "id" }` |
 | `pong` | `{ "t":"pong" }` |
-| `error` | `{ "t":"error", "code":dizge }` — ardından bağlantı kapanır (`bad-message`, `unauthorized`, `room-full`, `server-full`, `join-timeout`, `version`, `replaced` — aynı anahtarla yeni bağlantı geldi; istemci bunu hata saymaz) |
+| `error` | `{ "t":"error", "code":dizge }` — ardından bağlantı kapanır (`bad-message`, `unauthorized`, `room-full`, `server-full`, `join-timeout`, `version` — oda başka bir protokol sürümünde; istemci bunu genel retten ayrı söyler —, `replaced` — aynı anahtarla yeni bağlantı geldi; istemci bunu hata saymaz) |
 
 `hello.user` (isteğe bağlı): katılımcının odada nasıl göründüğü (`{ name?, color? }`); aktarıcı adı kendisi verdiyse (örnek sunucuda `authorize` → `{ user }`) istemci kendini o adla gösterir. `hello.from`: günlüğün oynatılmaya başlandığı sürüm; `hello`'dan hemen sonra `rev > from` olan bütün adımlar sırayla gelir.
 

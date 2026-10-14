@@ -21,6 +21,7 @@ import { independent } from './one-go-fixtures';
 import { CompositionHold, movedSelection, peerPlaces, placeNear } from '../src/ui/doc-collab';
 import type { Mark } from '../src/collab/doc/rebase';
 import { DocNet, actDoc, assertSameDoc, at, bodyText, canonDoc, docFile, firstDifference, joinDoc, lookOfDoc, saveDoc, seeded, type DocMember } from './collab-doc-fixtures';
+import { PROTOCOL_VERSION } from '../src/collab/room';
 
 const TBX = '<w:p><w:r><w:t>pre</w:t></w:r><w:r><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="wps"><w:drawing><wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>0</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV><wp:extent cx="914400" cy="457200"/><wp:wrapNone/><wp:docPr id="1" name="T"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr><wps:txbx><w:txbxContent><w:p w14:paraId="66666666"><w:bookmarkStart w:id="31" w:name="inbox"/><w:r><w:t>box</w:t></w:r><w:bookmarkEnd w:id="31"/></w:p></w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict/></mc:Fallback></mc:AlternateContent></w:r></w:p>';
 
@@ -512,7 +513,7 @@ function intruder(net: DocNet, bytes: Uint8Array): { send(message: unknown): voi
   const got: { t: string; rev?: number; id?: string }[] = [];
   rawTransport.onMessage((text) => got.push(JSON.parse(text)));
   rawTransport.onState!((state) => {
-    if (state === 'open') rawTransport.send(JSON.stringify({ t: 'join', v: [contentVersion(bytes)], key: 'evil', pv: 2 }));
+    if (state === 'open') rawTransport.send(JSON.stringify({ t: 'join', v: [contentVersion(bytes)], key: 'evil', pv: PROTOCOL_VERSION }));
   });
   return { send: (message) => rawTransport.send(JSON.stringify(message)), got };
 }

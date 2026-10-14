@@ -107,6 +107,13 @@ export const COMMANDS: { [name: string]: Command } = {
   },
 };
 
+/**
+ * Every kind of command of a document that travels: with COMMANDS, what the fingerprint of the
+ * wire is taken from (see PROTOCOL_VERSION). A kind of DocWire that is left out here is an error
+ * of the type checker.
+ */
+export const DOC_WIRE_KINDS: { readonly [K in DocWire['t']]: true } = { text: true, del: true, split: true, run: true, unrun: true, para: true, cmd: true, put: true };
+
 function readWire(value: unknown): DocWire {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return fail('operation');
   const from = value as Record<string, unknown>;

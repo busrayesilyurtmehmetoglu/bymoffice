@@ -360,6 +360,8 @@ export interface UiStrings {
     stale: string;
     reloaded(n: number): string;
     refused: string;
+    /** The room is edited with another version of the package. */
+    version: string;
     backlog(n: number): string;
     badStep: string;
     readOnly: string;
@@ -1001,6 +1003,7 @@ export const STRINGS_EN: UiStrings = {
     stale: 'The file was changed elsewhere and could not be loaded again; editing together has ended.',
     reloaded: (n) => (n === 1 ? 'The file was loaded again; one change that was not sent yet was lost.' : `The file was loaded again; ${n} changes that were not sent yet were lost.`),
     refused: 'The server does not take changes from here; editing together has ended.',
+    version: 'This file is being edited with another version; reload the page.',
     backlog: (n) => `${n} changes wait to be sent.`,
     badStep: 'Someone sent a change that is none for this workbook. It was left out for everybody.',
     readOnly: 'The server takes no changes from you: the workbook is read-only here.',
@@ -1652,6 +1655,7 @@ export const STRINGS_TR: UiStrings = {
     stale: 'Dosya başka yerde değişti ve yeniden yüklenemedi; birlikte düzenleme sona erdi.',
     reloaded: (n) => (n === 1 ? 'Dosya yeniden yüklendi; henüz gönderilmemiş bir değişiklik kayboldu.' : `Dosya yeniden yüklendi; henüz gönderilmemiş ${n} değişiklik kayboldu.`),
     refused: 'Sunucu buradan değişiklik almıyor; birlikte düzenleme sona erdi.',
+    version: 'Bu dosya başka bir sürümle düzenleniyor; sayfayı yenileyin.',
     backlog: (n) => `${n} değişiklik gönderilmeyi bekliyor.`,
     badStep: 'Biri bu kitabın değişikliği olmayan bir şey gönderdi. Herkeste atlandı.',
     readOnly: 'Sunucu sizden değişiklik almıyor: kitap burada salt okunur.',

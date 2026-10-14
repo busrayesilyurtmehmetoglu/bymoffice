@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import { CollabDocHistory, holdsRevisions } from '../src/collab/doc/history';
 import type { DocChange, DocCollabSession } from '../src/collab/doc/session';
 import { contentVersion } from '../src/collab/protocol';
+import { PROTOCOL_VERSION } from '../src/collab/room';
 import { MemoryServer } from '../src/collab/server';
 import { createBridge, type BridgeDocumentView, type BridgeHost } from '../src/embed/bridge';
 import { readCollabStamp, samePackage, writeSharedFile } from '../src/formats/xlsx/collab-stamp';
@@ -211,6 +212,27 @@ test('bridge: a docx with `collab` is edited together, and the application hears
   assert.equal(stamp && stamp.rev, 1);
   a.destroy();
   b.destroy();
+});
+
+test('bridge: a room of another version of the contract closes the session, and the application hears "version", not a refusal', async () => {
+  const server = new MemoryServer();
+  const bytes = await docFile(['one']);
+  // A page of an older package holds the room.
+  const older = server.connect();
+  older.onMessage(() => undefined);
+  older.onState!((state) => {
+    if (state === 'open') older.send(JSON.stringify({ t: 'join', pv: PROTOCOL_VERSION - 1, key: 'older', v: [contentVersion(bytes)] }));
+  });
+  await settled();
+  const f = page(server);
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', id: 'a', data: base64Encode(bytes), collab: 'wss://relay.example/doc' });
+  await settled();
+  const state = f.sent.filter((message) => message.type === 'collabState').pop()!;
+  assert.deepEqual([state.state, state.reason], ['closed', 'version']);
+  assert.deepEqual(f.notices, ['version'], 'the view says so');
+  assert.equal(f.sent.some((message) => message.type === 'loaded'), true, 'the document is shown all the same');
+  bridge.destroy();
 });
 
 test('bridge: a document that tracks its changes, or is no docx, is shown without a room, and the application is told', async () => {

@@ -1551,6 +1551,8 @@ export function createBridge(host: BridgeHost): Bridge {
       send({
         type: 'collabState',
         state: session.state,
+        // Why a closed session ended by itself ('version': the room is edited with another version of the package).
+        ...(session.reason === undefined ? {} : { reason: session.reason }),
         rev: session.rev,
         pending: session.pending,
         // Names are whatever the others said: text, to be shown as text.
@@ -1625,6 +1627,8 @@ export function createBridge(host: BridgeHost): Bridge {
       send({
         type: 'collabState',
         state: session.state,
+        // Why a closed session ended by itself ('version': the room is edited with another version of the package).
+        ...(session.reason === undefined ? {} : { reason: session.reason }),
         rev: session.rev,
         pending: session.pending,
         // Names are whatever the others said: text, to be shown as text.

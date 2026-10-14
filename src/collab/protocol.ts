@@ -141,6 +141,13 @@ export function parseServerMessage(textOf: string): ServerMessage {
       const hello: ServerMessage = { t: 'hello', rev: m.rev, from: m.from, ep: m.ep, you: text(m.you, 100, 'hello'), ro: m.ro === true, v: m.v === undefined ? [] : versions(m.v, 0), peers: m.peers.map(peer) };
       // The participant as the room has it, when the relay says (it may have given the name itself).
       if (m.user !== undefined) (hello as { user?: CollabUser }).user = cleanUser(m.user);
+      // The version of the contract the room speaks, when the relay says: the session compares it with its own.
+      // A relay of another language may write it as a text of digits ("3"); nothing else is a version.
+      if (m.pv !== undefined) {
+        const pv = typeof m.pv === 'string' && /^[1-9][0-9]{0,3}$/.test(m.pv) ? Number(m.pv) : m.pv;
+        if (!isRev(pv) || pv < 1 || pv > 1000) return fail('hello');
+        (hello as { pv?: number }).pv = pv;
+      }
       return hello;
     }
     case 'op':

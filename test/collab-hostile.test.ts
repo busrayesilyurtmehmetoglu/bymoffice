@@ -13,6 +13,7 @@ import { decodeStep } from '../src/collab/wire';
 import { setCellInput } from '../src/ops/commands';
 import { packageProblems } from './chart-edit-fixtures';
 import { Net, act, assertSame, canon, join, saveOf, seeded, startFile, type Member } from './collab-fixtures';
+import { PROTOCOL_VERSION } from '../src/collab/room';
 
 /** A connection that says whatever the test tells it to. */
 function intruder(net: Net, bytes: Uint8Array, key = 'evil'): { send(message: unknown): void; got: { t: string; rev?: number; id?: string }[] } {
@@ -20,7 +21,7 @@ function intruder(net: Net, bytes: Uint8Array, key = 'evil'): { send(message: un
   const got: { t: string; rev?: number; id?: string }[] = [];
   raw.onMessage((text) => got.push(JSON.parse(text)));
   raw.onState!((state) => {
-    if (state === 'open') raw.send(JSON.stringify({ t: 'join', v: [contentVersion(bytes)], key, pv: 2 }));
+    if (state === 'open') raw.send(JSON.stringify({ t: 'join', v: [contentVersion(bytes)], key, pv: PROTOCOL_VERSION }));
   });
   return { send: (message) => raw.send(JSON.stringify(message)), got };
 }

@@ -14,6 +14,7 @@ import { setComment, cellNow } from '../src/ops/notes';
 import { deleteSheet, insertSheet, moveSheet, renameSheet } from '../src/ops/sheets';
 import type { Op } from '../src/ops/ops';
 import { bookOf } from './chart-edit-fixtures';
+import { PROTOCOL_VERSION } from '../src/collab/room';
 
 export function rng(seed: number) { let s = seed >>> 0; return () => { s = (s + 0x9e3779b9) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 16), 0x85ebca6b); t = Math.imul(t ^ (t >>> 13), 0xc2b2ae35); return ((t ^ (t >>> 16)) >>> 0) / 4294967296; }; }
 const ri = (r: () => number, a: number, b: number) => a + Math.floor(r() * (b - a + 1));
@@ -123,7 +124,7 @@ export async function run(cfg: Config): Promise<Result> {
   const order: string[] = [];
   const obs = server.connect();
   obs.onMessage((text) => { const m = JSON.parse(text); if (m.t === 'op') order.push(m.id); });
-  obs.onState!((st) => { if (st === 'open') obs.send(JSON.stringify({ t: 'join', pv: 2, key: 'obs', v: [contentVersion(bytes)] })); });
+  obs.onState!((st) => { if (st === 'open') obs.send(JSON.stringify({ t: 'join', pv: PROTOCOL_VERSION, key: 'obs', v: [contentVersion(bytes)] })); });
   while (stepNet());
   interface M { name: string; wb: Workbook; session: CollabSession; t: any; notices: { code: string; count?: number }[]; cut: boolean; key: string }
   const members: M[] = [];

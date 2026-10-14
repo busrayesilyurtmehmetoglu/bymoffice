@@ -18,6 +18,7 @@ import { addConditionalRule, conditionalRules, removeConditionalRule, setValidat
 import { copySheet, deleteSheet, insertSheet, renameSheet } from '../src/ops/sheets';
 import { sortRange } from '../src/ops/sort';
 import { Net, act, assertSame, join, saveOf, seeded, settleAll, startFile, type Member } from './collab-fixtures';
+import { PROTOCOL_VERSION } from '../src/collab/room';
 
 const value = (wb: Workbook, sheet: number, row: number, col: number): unknown => {
   const cell = getCell(wb.sheets[sheet], row, col);
@@ -586,7 +587,7 @@ test('random bytes and random values are no message and no step: reading them th
 // ------------------------------------------- the session and a relay it is handed by the test
 
 /** A session on a transport whose other end is the test. */
-async function alone(options: { reload?: () => Promise<string[]>; pausable?: boolean } = {}) {
+async function alone(options: { reload?: () => Promise<string[]>; pausable?: boolean; heard?: (code: string) => void } = {}) {
   const wb = await (await (await import('../src/index')).open(await startFile())).workbook();
   const sent: { t: string; [name: string]: unknown }[] = [];
   const notices: string[] = [];
@@ -605,7 +606,7 @@ async function alone(options: { reload?: () => Promise<string[]>; pausable?: boo
   }
   const { CollabSession } = await import('../src/collab/session');
   const session = new CollabSession(
-    { workbook: () => wb, changed: () => undefined, notice: (notice) => notices.push(notice.code), reload: options.reload ? async () => (reloads++, options.reload!()) : undefined },
+    { workbook: () => wb, changed: () => undefined, notice: (notice) => void (notices.push(notice.code), options.heard && options.heard(notice.code)), reload: options.reload ? async () => (reloads++, options.reload!()) : undefined },
     { transport: transport as never, versions: ['h:1:x'], timer: () => () => undefined, onReadOnly: () => readOnly++ },
   );
   const tell = (message: unknown): void => listener(JSON.stringify(message));
@@ -672,9 +673,50 @@ test('steps that arrive out of turn make the session ask again from where it is,
 
 test('a relay of another version of the contract ends the session; a room that says no name, or another room than the one this side was in, is not trusted', async () => {
   const s = await alone();
-  assert.deepEqual([s.sent[0].pv, typeof s.sent[0].key, (s.sent[0] as { since?: number }).since], [2, 'string', undefined], '"join" names the version; a first join names no step');
+  assert.deepEqual([s.sent[0].pv, typeof s.sent[0].key, (s.sent[0] as { since?: number }).since], [PROTOCOL_VERSION, 'string', undefined], '"join" names the version; a first join names no step');
+  assert.equal(PROTOCOL_VERSION, 3);
+  assert.equal(s.session.reason, undefined, 'an open session has no reason');
   s.tell({ t: 'error', code: 'version' });
-  assert.deepEqual([s.session.state, s.notices], ['closed', ['refused']], 'refused');
+  assert.deepEqual([s.session.state, s.notices, s.session.reason], ['closed', ['version'], 'version'], 'a room of another version is told apart from a refusal');
+  // Any other refusal is a refusal.
+  const refused = await alone();
+  refused.tell({ t: 'error', code: 'unauthorized' });
+  assert.deepEqual([refused.session.state, refused.notices, refused.session.reason], ['closed', ['refused'], 'refused']);
+  // The relay says the version of the room in "hello": another one is not joined, whatever the relay let in.
+  for (const pv of [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1]) {
+    const older = await alone();
+    older.hello(0, 0, { pv });
+    assert.deepEqual([older.session.state, older.notices, older.session.reason], ['closed', ['version'], 'version'], `a "hello" of version ${pv}`);
+  }
+  const same = await alone();
+  same.hello(0, 0, { pv: PROTOCOL_VERSION });
+  assert.deepEqual([same.session.state, same.notices], ['online', []], 'a "hello" of this version is joined');
+  const silent = await alone();
+  silent.hello(0, 0);
+  assert.equal(silent.session.state, 'online', 'a relay that names no version is taken at its word that it let this side in');
+  // A relay of another language may write the version as a text of digits; nothing else is a version.
+  const digits = await alone();
+  digits.hello(0, 0, { pv: String(PROTOCOL_VERSION) });
+  assert.deepEqual([digits.session.state, digits.notices], ['online', []], 'a version written as digits is that version');
+  const otherDigits = await alone();
+  otherDigits.hello(0, 0, { pv: String(PROTOCOL_VERSION - 1) });
+  assert.deepEqual([otherDigits.session.state, otherDigits.session.reason], ['closed', 'version'], 'and another one written so is another version');
+  for (const pv of [`${PROTOCOL_VERSION}.0`, 'x', '', ' 3', '03', '1001', 3.5, true]) {
+    const odd = await alone();
+    odd.hello(0, 0, { pv });
+    assert.deepEqual([odd.session.state, odd.session.reason], ['closed', 'peer'], `a version that is no number makes the "hello" no message: ${JSON.stringify(pv)}`);
+  }
+  // Whoever hears the notice of the end can read why already.
+  const box: { s?: Awaited<ReturnType<typeof alone>> } = {};
+  const heard: (string | undefined)[] = [];
+  box.s = await alone({ heard: () => void heard.push(box.s!.session.reason) });
+  box.s.tell({ t: 'error', code: 'version' });
+  assert.deepEqual(heard, ['version'], 'the reason is there when the notice is given');
+  // Left by its own will: no reason.
+  const left = await alone();
+  left.hello(0, 0);
+  left.session.leave();
+  assert.deepEqual([left.session.state, left.session.reason], ['closed', undefined]);
   // A relay that names no room is none of this contract.
   const bare = await alone();
   bare.tell({ t: 'hello', rev: 0, from: 0, you: 'me', ro: false, v: [], peers: [] });
@@ -946,34 +988,34 @@ test('the relay of the page: a key that joins again takes the place of its conne
     });
     return { got, send: (message) => raw.send(JSON.stringify(message)) };
   };
-  const writer = connect({ t: 'join', pv: 2, v: ['v1'], key: 'secret-of-a' });
-  const reader = connect({ t: 'join', pv: 2, v: ['v1'], key: 'secret-of-b', ro: true });
+  const writer = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v1'], key: 'secret-of-a' });
+  const reader = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v1'], key: 'secret-of-b', ro: true });
   drain();
   assert.deepEqual([writer.got[0].t, reader.got[0].t], ['hello', 'hello'], 'both are in');
   assert.equal(JSON.stringify(writer.got.concat(reader.got)).indexOf('secret-of-'), -1, 'the key of a participant is told to nobody');
   // The same key again: the old connection is told that it was replaced, and the new one is in.
-  const again = connect({ t: 'join', pv: 2, v: ['v1'], key: 'secret-of-a' });
+  const again = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v1'], key: 'secret-of-a' });
   drain();
   assert.equal(again.got[0].t, 'hello', 'the key joins again');
   assert.deepEqual(writer.got.filter((message) => message.t === 'error').map((message) => message.code), ['replaced'], 'and the connection it had is told so');
   // Another version of the contract is no participant.
-  const old = connect({ t: 'join', pv: 3, v: ['v1'], key: 'c' });
+  const old = connect({ t: 'join', pv: PROTOCOL_VERSION + 1, v: ['v1'], key: 'c' });
   drain();
   assert.equal(old.got[0].t, 'error', 'a contract the relay does not speak');
   // Who cannot join: those who write are asked to save, those who only read are not; and a reader who cannot join asks nobody.
   const asked = (who: { got: Got[] }): number => who.got.filter((message) => message.t === 'sync').length;
-  connect({ t: 'join', pv: 2, v: ['other'], key: 'd', ro: true });
+  connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['other'], key: 'd', ro: true });
   drain();
   assert.deepEqual([asked(again), asked(reader)], [0, 0], 'someone who only reads makes nobody save');
-  connect({ t: 'join', pv: 2, v: ['other'], key: 'e' });
+  connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['other'], key: 'e' });
   drain();
   assert.deepEqual([asked(again), asked(reader)], [1, 0], 'someone who writes does; who only reads is not asked');
-  connect({ t: 'join', pv: 2, v: ['other'], key: 'f' });
-  connect({ t: 'join', pv: 2, v: ['other'], key: 'g' });
+  connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['other'], key: 'f' });
+  connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['other'], key: 'g' });
   drain();
   assert.equal(asked(again), 2, 'twice a minute and no more');
   clock += 61000;
-  connect({ t: 'join', pv: 2, v: ['other'], key: 'h' });
+  connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['other'], key: 'h' });
   drain();
   assert.equal(asked(again), 3, 'and again a minute later');
   // "saved": of a step the room does not have, the step is not passed on; nor may a version move to another step.
@@ -992,11 +1034,11 @@ test('the relay of the page: a key that joins again takes the place of its conne
   // file itself (the room and the step that were written into it), never on what was said of it.
   const ep = (again.got[0] as { ep?: string }).ep;
   assert.equal(typeof ep, 'string', 'the room says what it is called');
-  const said = connect({ t: 'join', pv: 2, v: ['v3'], key: 'i' });
-  const stamped = connect({ t: 'join', pv: 2, v: ['v3'], key: 'k', since: 1, ep });
-  const stranger = connect({ t: 'join', pv: 2, v: ['v3'], key: 'l', since: 1, ep: 'another-room' });
-  const bare = connect({ t: 'join', pv: 2, v: ['v3'], key: 'm', since: 1 });
-  const first = connect({ t: 'join', pv: 2, v: ['v1'], key: 'j' });
+  const said = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v3'], key: 'i' });
+  const stamped = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v3'], key: 'k', since: 1, ep });
+  const stranger = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v3'], key: 'l', since: 1, ep: 'another-room' });
+  const bare = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v3'], key: 'm', since: 1 });
+  const first = connect({ t: 'join', pv: PROTOCOL_VERSION, v: ['v1'], key: 'j' });
   drain();
   assert.equal(said.got[0].t, 'reset', 'what was said of a file is no ground to join on');
   assert.deepEqual([stamped.got[0].t, stamped.got[0].rev, stamped.got[0].from, stamped.got[0].v], ['hello', 1, 1, ['v3']], 'who has the saved file starts behind the step it names, and hears that the room knows the file');
@@ -1126,10 +1168,10 @@ test('the relay of the page: an empty room that is started again on another file
     while (queue.length > 0) queue.shift()!();
     return got[0];
   };
-  const first = visit({ t: 'join', pv: 2, v: ['file-1'], key: 'a' });
-  const same = visit({ t: 'join', pv: 2, v: ['file-1'], key: 'b' });
-  const other = visit({ t: 'join', pv: 2, v: ['file-2'], key: 'c' });
-  const back = visit({ t: 'join', pv: 2, v: ['file-1'], key: 'a', since: 0, ep: first.ep });
+  const first = visit({ t: 'join', pv: PROTOCOL_VERSION, v: ['file-1'], key: 'a' });
+  const same = visit({ t: 'join', pv: PROTOCOL_VERSION, v: ['file-1'], key: 'b' });
+  const other = visit({ t: 'join', pv: PROTOCOL_VERSION, v: ['file-2'], key: 'c' });
+  const back = visit({ t: 'join', pv: PROTOCOL_VERSION, v: ['file-1'], key: 'a', since: 0, ep: first.ep });
   assert.deepEqual([first.t, same.t, other.t], ['hello', 'hello', 'hello'], 'each of them starts the empty room');
   assert.equal(same.ep, first.ep, 'on the file it was started with, it is the room it was');
   assert.notEqual(other.ep, first.ep, 'on another file it is another room');
@@ -1144,7 +1186,7 @@ test('the relay of the page takes only so many joins a minute of one connection;
   const got: { t: string; code?: string }[] = [];
   raw.onMessage((text) => got.push(JSON.parse(text)));
   raw.onState!((state) => {
-    if (state === 'open') raw.send(JSON.stringify({ t: 'join', pv: 2, v: ['v1'], key: 'a' }));
+    if (state === 'open') raw.send(JSON.stringify({ t: 'join', pv: PROTOCOL_VERSION, v: ['v1'], key: 'a' }));
   });
   const drain = (): void => {
     while (queue.length > 0) queue.shift()!();
@@ -1152,7 +1194,7 @@ test('the relay of the page takes only so many joins a minute of one connection;
   drain();
   for (let i = 1; i < MAX_JOINS_PER_MINUTE + 1; i++) {
     raw.send(JSON.stringify({ t: 'leave' }));
-    raw.send(JSON.stringify({ t: 'join', pv: 2, v: ['v1'], key: 'a' }));
+    raw.send(JSON.stringify({ t: 'join', pv: PROTOCOL_VERSION, v: ['v1'], key: 'a' }));
     drain();
   }
   assert.deepEqual(got.filter((message) => message.t === 'hello').length, MAX_JOINS_PER_MINUTE, 'ten joins get in');

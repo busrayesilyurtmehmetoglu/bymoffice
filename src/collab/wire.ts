@@ -592,6 +592,18 @@ const COMMANDS: { [name: string]: { family: 'validation' | 'conditional' | 'char
   pasteChart: { family: 'chart', run: (wb, s, a) => pasteChartOf(wb, s, a[0] as never, a[1] as never, a[2] as never) },
 };
 
+/**
+ * Every kind of operation of a workbook that travels: with the names of the commands, what the
+ * fingerprint of the wire is taken from (see PROTOCOL_VERSION). A kind of WireOp that is left
+ * out here is an error of the type checker.
+ */
+export const WIRE_KINDS: { readonly [K in WireOp['t']]: true } = { cells: true, rows: true, cols: true, merges: true, filter: true, sort: true, ins: true, del: true, notes: true, 'sheet+': true, 'sheet-': true, name: true, move: true, state: true, tab: true, pane: true, cmd: true };
+
+/** The names of the commands that travel. */
+export function commandNames(): string[] {
+  return Object.keys(COMMANDS);
+}
+
 /** What a command is about: its rules or its charts are one list, which two commands of a kind change one after the other. */
 export function commandFamily(name: string): 'validation' | 'conditional' | 'chart' | undefined {
   return Object.prototype.hasOwnProperty.call(COMMANDS, name) ? COMMANDS[name].family : undefined;

@@ -25,8 +25,15 @@ export interface CollabTransport {
  */
 export type CollabState = 'connecting' | 'online' | 'offline' | 'detached' | 'closed';
 
-/** The version of the contract this side speaks: a room takes participants of one version only. */
-export const PROTOCOL_VERSION = 2;
+/**
+ * The version of the contract this side speaks: a room takes participants of one version only.
+ * It goes up whenever a kind of step or a field of one is added to what goes over the wire (of
+ * workbooks or of documents), or a step that is there comes to mean something else: a side that
+ * does not know the new step would pass it over, and the room would drift apart. The fingerprint
+ * of the wire in test/collab-protocol-version.test.ts says when.
+ * 3: panes of a sheet (`pane`), tab stops of paragraphs (`tabs`).
+ */
+export const PROTOCOL_VERSION = 3;
 
 /** A participant of a room as the others see it; `P` is how it says where it is. */
 export interface RoomPeer<P> {
@@ -61,6 +68,8 @@ export type CollabNoticeCode =
   | 'reloaded'
   /** The relay refused this participant or closed the room. */
   | 'refused'
+  /** The room is edited with another version of this package (another version of the contract): the page is to be loaded again. */
+  | 'version'
   /** Many changes wait to be sent. */
   | 'backlog'
   /** A step arrived that is no step of this workbook; everybody skipped it. */
@@ -175,6 +184,8 @@ export abstract class RoomSession<S extends { id: string }, P> {
   /** The order was asked for again after a step was missing, and the answer is not there yet. */
   private resyncing = false;
   private badStepSaid = false;
+  /** What closed the session, when it closed by itself (see reason). */
+  private endedBy: CollabNoticeCode | undefined;
   /** What the steps of this session are named with, for everybody to see; the key is told to the relay alone. */
   protected readonly tag = `${hashOf(String(Math.random())).toString(36)}${hashOf(String(Date.now())).toString(36)}`;
   private flyTimer: (() => void) | undefined;
@@ -279,6 +290,16 @@ export abstract class RoomSession<S extends { id: string }, P> {
 
   get state(): CollabState {
     return this.current;
+  }
+
+  /**
+   * Why a session that is `closed` ended by itself: `version` (the room speaks another version of
+   * the contract), `refused`, `peer` or `stale`, from the moment its notice is given (the session
+   * closes right after); undefined while it is open, and for one that was left.
+   */
+  get reason(): CollabNoticeCode | undefined {
+    // Set before the notice is given, so that whoever hears the notice can read it.
+    return this.endedBy;
   }
 
   /** How many steps of the common order are held. */
@@ -434,6 +455,7 @@ export abstract class RoomSession<S extends { id: string }, P> {
 
   private fatal(code: CollabNoticeCode): void {
     if (this.current === 'closed') return;
+    this.endedBy = code;
     this.roomHost.notice({ code });
     this.close();
   }
@@ -508,6 +530,8 @@ export abstract class RoomSession<S extends { id: string }, P> {
       case 'hello': {
         // The log from before where this side is brings steps it has, which are passed over; one that starts
         // behind it leaves steps out.
+        // A relay that names a version names that of the room; one of another version is not joined.
+        if (message.pv !== undefined && message.pv !== PROTOCOL_VERSION) return this.fatal('version');
         this.inRoom = true;
         // A room that is behind this side is another room (the relay was started anew, or the room was let go of).
         if (this.joined && (message.ep !== this.epoch || message.from > this.confirmed || message.rev < this.confirmed)) return this.restart();
@@ -646,6 +670,8 @@ export abstract class RoomSession<S extends { id: string }, P> {
       case 'error':
         // This side's own new connection took the place of this one: nothing to say.
         if (message.code === 'replaced') return;
+        // The room is edited by a page of another version: what is wrong is the page, not this participant.
+        if (message.code === 'version') return this.fatal('version');
         return this.fatal('refused');
     }
   }

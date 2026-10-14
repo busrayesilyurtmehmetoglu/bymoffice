@@ -6,6 +6,10 @@ import net from 'node:net';
 import { test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createCollabServer, type CollabServerOptions } from '../server/collab-server.mjs';
+import { PROTOCOL_VERSION } from '../src/collab/room';
+import { CollabSession } from '../src/collab/session';
+import { open } from '../src/index';
+import { startFile } from './collab-fixtures';
 
 // The example relay of collaborative editing: the WebSocket it speaks by hand
 // (handshake, frames, limits) and the contract of a room (join, op, nack,
@@ -1262,6 +1266,29 @@ test('the protocol version of a room is that of the first to join it, and anothe
       });
     }
     assert.equal(server.rooms().some((room) => room.key === '/odd'), false, 'a join that is refused makes no room');
+  });
+});
+
+test('a session of this package that comes to a room of another version is told "version" and says so: it is not a refusal', async () => {
+  await withServer({}, async (port) => {
+    const older = await joined(port, { v: ['v1'], pv: PROTOCOL_VERSION - 1 });
+    assert.equal(older.hello.pv, PROTOCOL_VERSION - 1);
+    // The session speaks over a raw connection: what the server sends is passed on as it comes.
+    const c = await connect(port);
+    let listener: (text: string) => void = () => undefined;
+    const transport = { send: (text: string) => c.send(JSON.parse(text)), onMessage: (given: (text: string) => void) => void (listener = given), close: () => c.end() };
+    const wb = await (await open(await startFile())).workbook();
+    const notices: string[] = [];
+    const session = new CollabSession(
+      { workbook: () => wb, changed: () => undefined, notice: (notice) => notices.push(notice.code) },
+      { transport, versions: ['v1'], timer: () => () => undefined },
+    );
+    while (session.state !== 'closed') {
+      const frame = await c.frame();
+      if (frame.opcode === 1) listener(frame.payload.toString('utf8'));
+    }
+    assert.deepEqual([session.reason, notices], ['version', ['version']]);
+    older.c.end();
   });
 });
 

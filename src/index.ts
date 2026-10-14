@@ -36,7 +36,7 @@ import { askOverwrite } from './ui/save-confirm';
 import { listPeople, type CollabPerson, type People } from './collab/people';
 import { createSaveSync, type SaveSync } from './collab/save-sync';
 import { proofFile, readCollabStamp, samePackage, writeSharedFile } from './formats/xlsx/collab-stamp';
-import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
+import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabNoticeCode, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
 import { DocCollabSession, type DocPeer } from './collab/doc/session';
 import { holdsRevisions } from './collab/doc/history';
 import {
@@ -382,6 +382,11 @@ export interface CollabOptions {
 /** What mount() answers for a workbook that is edited together. */
 export interface MountedCollab {
   readonly state: CollabState;
+  /**
+   * Why a `closed` session ended by itself: `version` (the room is edited with another version of
+   * the package: the page is to be loaded again), `refused`, `peer` or `stale`; undefined otherwise.
+   */
+  readonly reason?: CollabNoticeCode;
   /** How many steps of the common order the workbook holds. */
   readonly rev: number;
   /** How many changes made here wait for the relay. */
@@ -1857,6 +1862,9 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         get state() {
           return room ? room.state : 'closed';
         },
+        get reason() {
+          return room ? room.reason : undefined;
+        },
         get rev() {
           return room ? room.rev : 0;
         },
@@ -2126,6 +2134,9 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     const handle: MountedCollab = {
       get state() {
         return room ? room.state : 'closed';
+      },
+      get reason() {
+        return room ? room.reason : undefined;
       },
       get rev() {
         return room ? room.rev : 0;

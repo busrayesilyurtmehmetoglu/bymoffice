@@ -4801,6 +4801,7 @@ export class DocumentView {
       stale: [words.stale, 'error'],
       reloaded: [words.reloaded(n), 'error'],
       refused: [words.refused, 'error'],
+      version: [words.version, 'error'],
       backlog: [words.backlog(n), 'info'],
       'bad-step': [words.doc.badStep, 'error'],
       'read-only': [words.doc.readOnly, 'error'],

@@ -6860,6 +6860,7 @@ export class WorkbookView {
       stale: [words.stale, 'error'],
       reloaded: [words.reloaded(n), 'error'],
       refused: [words.refused, 'error'],
+      version: [words.version, 'error'],
       backlog: [words.backlog(n), 'info'],
       'bad-step': [words.badStep, 'error'],
       'read-only': [words.readOnly, 'error'],

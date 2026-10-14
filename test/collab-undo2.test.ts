@@ -14,6 +14,7 @@ import { deleteRows } from '../src/ops/filter';
 import type { Op } from '../src/ops/ops';
 import { bookOf } from './chart-edit-fixtures';
 import { rng } from './collab-semantic2-model';
+import { PROTOCOL_VERSION } from '../src/collab/room';
 const ri = (r: () => number, a: number, b: number) => a + Math.floor(r() * (b - a + 1));
 const look = (wb: Workbook) => { const rows: { id: string; pos: number; vals: string[] }[] = []; for (const [p, row] of wb.sheets[0].rows) { const c = row.cells[0]; if (c && /^R\d+$/.test(String(c.value))) rows.push({ id: String(c.value), pos: p, vals: [1, 2, 3].map((k) => (row.cells[k] ? String(row.cells[k].value) : '')) }); else if (row.cells.some((x) => x && x.kind !== 'blank')) rows.push({ id: '?', pos: p, vals: [] }); } return rows.sort((a, b) => a.pos - b.pos); };
 type It = { k: 'w'; row: string; col: number; v: string } | { k: 'ins'; rows: string[]; snap: string[] } | { k: 'del'; rows: string[]; snap: string[]; content: Map<string, string[]> } | { k: 'undo'; of: string; snap: string[] };
@@ -21,7 +22,7 @@ export async function run(seed: number, withDel: boolean, trace = false) {
   const r = rng(seed); let next = 1; const init: (string | null)[][] = []; for (let i = 0; i < 8; i++) init.push([`R${next++}`, null, null, null]);
   const bytes = await buildXlsx(bookOf(init)); const lanes = new Map<string, (() => void)[]>(); const server = new MemoryServer({ deliver: (fn, lane) => { let q = lanes.get(lane); if (!q) lanes.set(lane, (q = [])); q.push(fn); } });
   const log: string[] = []; const stepNet = () => { const busy = [...lanes.entries()].filter((q) => q[1].length); if (!busy.length) return false; const pick = busy[Math.floor(r() * busy.length)]; if (trace) log.push(`   deliver ${pick[0]}`); pick[1].shift()!(); return true; };
-  const order: string[] = []; const obs = server.connect(); obs.onMessage((t) => { const q = JSON.parse(t); if (q.t === 'op') order.push(q.id); }); obs.onState!((s) => { if (s === 'open') obs.send(JSON.stringify({ t: 'join', pv: 2, key: 'obs', v: [contentVersion(bytes)] })); }); while (stepNet());
+  const order: string[] = []; const obs = server.connect(); obs.onMessage((t) => { const q = JSON.parse(t); if (q.t === 'op') order.push(q.id); }); obs.onState!((s) => { if (s === 'open') obs.send(JSON.stringify({ t: 'join', pv: PROTOCOL_VERSION, key: 'obs', v: [contentVersion(bytes)] })); }); while (stepNet());
   const ms: any[] = []; for (let i = 0; i < 2 + (seed % 2); i++) { const wb = await (await open(bytes)).workbook(); const m: any = { name: 'm' + i, wb, notices: [] }; m.session = new CollabSession({ workbook: () => m.wb, changed: () => undefined, notice: (n) => m.notices.push(n) }, { transport: server.connect(), versions: [contentVersion(bytes)], timer: () => () => undefined }); m.key = m.session.tag; ms.push(m); }
   while (stepNet());
   const its = new Map<string, It>(); let tok = 1; log.length = 0;
