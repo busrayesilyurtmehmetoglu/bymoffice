@@ -4,6 +4,7 @@
 // record is never changed, since other cells share it.
 
 import { resolveCellStyle } from '../model/sheet/color';
+import { tableState } from '../model/sheet/pivot';
 import {
   MAX_COLS,
   MAX_ROWS,
@@ -399,7 +400,7 @@ export function mergeProblem(workbook: Workbook, sheetIndex: number, range: Cell
   if (fullHeight(range) || fullWidth(range)) return 'Whole rows or columns cannot be merged';
   if ((sheet.anchored || []).indexOf('table') >= 0) return 'Cannot merge cells in a sheet with a table: not supported yet';
   const pivots = workbook.pivots;
-  if (pivots) for (const table of pivots.tables) if (table.sheet === sheet && intersects(table.location.ref, range)) return `Cannot merge cells of the pivot table "${table.name}"`;
+  if (pivots) for (const table of pivots.tables) if (table.sheet === sheet && intersects(tableState(table).location.ref, range)) return `Cannot merge cells of the pivot table "${table.name}"`;
   for (const { area, ref } of arrayAreas(sheet)) if (intersects(area, range)) return `Cannot merge cells through the array formula in ${ref}`;
   if (range.bottom > range.top && rowsHiddenByFilter(sheet, range.top, range.bottom).length > 0) return 'Cannot merge cells across rows the filter hides';
   return undefined;

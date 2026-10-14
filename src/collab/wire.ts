@@ -38,6 +38,7 @@ import {
 } from '../model/sheet/types';
 import { addChart, moveChart, pasteChartOf, removeChart, updateChart } from '../ops/charts';
 import { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, MAX_SHEET_NOTES, cellNow, notesBlocked } from '../ops/notes';
+import { pivotSourceLostBy } from '../ops/pivot-places';
 import { MAX_CELL_FORMATS, applyOp, ensureNumberFormat, explicitFormula, sameFormat, sharedMasters, shiftAutoFilter, type CellChange, type Op, type RowProps, type SharedMasters } from '../ops/ops';
 import { addConditionalRule, clearConditionalRules, moveConditionalRule, removeConditionalRule, setValidation, updateConditionalRule } from '../ops/rules';
 import { CollabUnsupportedError, WireError, type Rec, type Shift, type WireCellPatch, type WireColumn, type WireContent, type WireNote, type WireOp, type WireRange, type WireRowProps } from './types';
@@ -1202,6 +1203,8 @@ function deletionUndo(workbook: Workbook, index: number, axis: 'row' | 'col', at
   for (const other of workbook.sheets) {
     if ((other.dataValidations && other.dataValidations.length > 0) || (other.conditionalFormats && other.conditionalFormats.length > 0) || (other.drawings && other.drawings.length > 0)) lossy = true;
   }
+  // The source of a pivot table that loses its last rows does not grow back by them.
+  if (pivotSourceLostBy(workbook, sheet, gone)) lossy = true;
   for (const name of workbook.definedNames) {
     const home = name.localSheet !== undefined && workbook.sheets[name.localSheet] ? workbook.sheets[name.localSheet].name : '';
     const after = adjustFormula(name.value, home, gone);

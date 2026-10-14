@@ -11,6 +11,7 @@ import type { PivotCacheState, PivotTableState } from '../model/sheet/pivot';
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
 import { chartsFollow, chartsMoved, chartsRenamed } from './charts';
+import { pivotPlacesAfter, pivotsFollow, swapPivotPlaces, type PivotPlaces } from './pivot-places';
 import { liveRulesMoved, liveRulesRenamed, swapRuleLists, type RuleLists } from './rules';
 import {
   FILTER_NAME,
@@ -189,6 +190,8 @@ export type Op =
       definedNames: DefinedName[];
       /** Lists of rules that were added or changed since the file was read (live rules), as they were: of this sheet, and of sheets whose rules name it. */
       rules?: RuleLists[];
+      /** Where the pivot tables and the sources of their caches stood (see pivot-places.ts). */
+      pivots?: PivotPlaces;
       /** Roughly how many rows this operation keeps alive for undo; History uses it to bound memory. */
       weight?: number;
     }
@@ -581,10 +584,14 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   // Content placed by cell position but stored in other parts has to move with the cells. The writer
   // moves pictures and comments; for anything else the edit is refused rather than leave it behind.
   // Charts follow when the model holds every reference of every chart of the workbook (see charts.ts).
+  // So do pivot tables and their sources, when the model holds every one of them (see pivot-places.ts).
   const follow = chartsFollow(workbook);
-  const stuck = (sheet.anchored || []).filter((part) => !MOVABLE_PARTS.has(part) && !(part === 'chart' && follow));
+  const pivotsMove = pivotsFollow(workbook);
+  const stuck = (sheet.anchored || []).filter((part) => !MOVABLE_PARTS.has(part) && !(part === 'chart' && follow) && !(part === 'pivotTable' && pivotsMove));
   if (stuck.length > 0) throw new RangeError(`Cannot ${kind} ${axis}s in a sheet with ${stuck.join(', ')}: not supported yet`);
   checkArrayFormulas(sheet, edit);
+  // Worked out before anything changes: an edit that cuts through a pivot table or takes what its source needs is refused.
+  const pivotPlaces = pivotPlacesAfter(workbook, sheet, edit);
 
   const snapshot = snapshotOf(sheet);
   const refEdit: StructuralEdit = { ...edit, sheetName: sheet.name };
@@ -696,8 +703,9 @@ function structural(workbook: Workbook, index: number, edit: SheetStructuralEdit
   // left as the file has them, and are read through the edit from now on.
   // So are the references of charts: wherever one names cells that moved, it is written anew.
   const rules = swapRuleLists(liveRulesMoved(workbook, sheet, refEdit).concat(chartsMoved(workbook, refEdit)));
+  const pivots = pivotPlaces ? swapPivotPlaces(workbook, pivotPlaces) : undefined;
 
-  return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), weight };
+  return { type: 'restore', sheet: index, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), ...(pivots ? { pivots } : {}), weight };
 }
 
 /**
@@ -1674,7 +1682,8 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       const definedNames = workbook.definedNames;
       workbook.definedNames = op.definedNames;
       const rules = swapRuleLists(op.rules);
-      return { type: 'restore', sheet: op.sheet, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), weight: op.weight };
+      const pivots = op.pivots ? swapPivotPlaces(workbook, op.pivots) : undefined;
+      return { type: 'restore', sheet: op.sheet, snapshot, others, otherLinks, definedNames, ...(rules.length > 0 ? { rules } : {}), ...(pivots ? { pivots } : {}), weight: op.weight };
     }
     case 'insertSheet':
       return insertSheetOp(workbook, op.sheet, op.name);

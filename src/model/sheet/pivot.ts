@@ -12,7 +12,7 @@
 // objects: each holds what the file says, and `now` holds what a refresh made of it (undone,
 // `now` goes back to what it was; see the "setPivot" operation).
 
-import type { CellRange, Sheet, Workbook } from './types';
+import { MAX_COLS, MAX_ROWS, foldSheetName, parseRange, type CellRange, type Sheet, type Workbook } from './types';
 
 /** The functions a value of a pivot table can be summarized by, as the file names them. */
 export const PIVOT_AGGREGATES = ['sum', 'count', 'average', 'max', 'min', 'product', 'countNums', 'stdDev', 'stdDevp', 'var', 'varp'] as const;
@@ -99,6 +99,15 @@ export interface PivotCache {
   referred?: string;
   /** What the last refresh made of it; undefined while it is as the file has it. */
   now?: PivotCacheState;
+  /**
+   * The range of its source (a source of kind "range") after rows and columns of its sheet were
+   * inserted or deleted, as the file writes it; undefined while it is the one the file has. A
+   * refresh reads this range, and the writer puts it in the place of the file's (see
+   * src/ops/pivot-places.ts). The records are not changed with it: Excel does not either.
+   */
+  sourceRef?: string;
+  /** Set by the reader: why the places its source names cannot follow rows and columns that move; undefined when they can. */
+  placesFixed?: string;
 }
 
 /** An item of a field of a pivot table (<item>). */
@@ -220,6 +229,14 @@ export interface PivotTable {
   refusal?: string;
   /** What the last refresh made of it; undefined while it is as the file has it. */
   now?: PivotTableState;
+  /**
+   * The body of the table after rows or columns were inserted or deleted above it or to its left,
+   * while it is not refreshed (a refresh has its place in `now`, and moves it there as well);
+   * undefined while it stands where the file has it.
+   */
+  placed?: CellRange;
+  /** The rows and the columns of fields of the page that stand above the body (location rowPageCount, colPageCount); undefined without such fields. */
+  pages?: { rows: number; cols: number };
 }
 
 /** The pivot tables of a workbook and their caches. Neither list changes after the file is read. */
@@ -233,13 +250,19 @@ export interface WorkbookPivots {
    * a file does not do it; a refresh does it each time.
    */
   lookThrough?: (workbook: Workbook) => void;
+  /**
+   * Set by the reader: why rows and columns cannot be inserted or deleted in the workbook because
+   * of its pivot tables (a table or a cache of the package that the model does not hold, whose
+   * places would not follow); undefined when the model holds every one of them.
+   */
+  fixed?: string;
 }
 
 /** The state of a table: what the last refresh made of it, else what the file has. */
 export function tableState(table: PivotTable): PivotTableState {
   if (table.now) return table.now;
   return {
-    location: table.location,
+    location: table.placed ? { ...table.location, ref: table.placed } : table.location,
     items: table.fields.map((field) => field.items),
     rowItems: table.rowItems,
     colItems: table.colItems,
@@ -250,6 +273,104 @@ export function tableState(table: PivotTable): PivotTableState {
 /** The fields of a cache: as the last refresh made them, else as the file has them. */
 export function cacheFieldsNow(cache: PivotCache): PivotCacheField[] {
   return cache.now ? cache.now.fields : cache.fields;
+}
+
+/** The source of a cache as it stands now: with the range that rows and columns which moved left it (PivotCache.sourceRef). */
+export function cacheSourceNow(cache: PivotCache): PivotSource | undefined {
+  const source = cache.source;
+  return source && source.kind === 'range' && cache.sourceRef !== undefined ? { ...source, ref: cache.sourceRef } : source;
+}
+
+function columnIndex(letters: string): number {
+  let n = 0;
+  for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.toUpperCase().charCodeAt(i) - 64);
+  return n - 1;
+}
+
+/**
+ * The cells the range of a source names, as the file writes it: "A1:C9", one cell, whole columns
+ * ("A:C") or whole rows ("1:9"), with or without "$". Undefined for anything else.
+ */
+export function sourceArea(ref: string): CellRange | undefined {
+  const plain = ref.replace(/\$/g, '');
+  let match = /^([A-Za-z]{1,3}):([A-Za-z]{1,3})$/.exec(plain);
+  if (match) {
+    const a = columnIndex(match[1]);
+    const b = columnIndex(match[2]);
+    if (a >= MAX_COLS || b >= MAX_COLS) return undefined;
+    return { top: 0, bottom: MAX_ROWS - 1, left: Math.min(a, b), right: Math.max(a, b) };
+  }
+  match = /^(\d{1,7}):(\d{1,7})$/.exec(plain);
+  if (match) {
+    const a = Number(match[1]) - 1;
+    const b = Number(match[2]) - 1;
+    if (a < 0 || b < 0 || a >= MAX_ROWS || b >= MAX_ROWS) return undefined;
+    return { top: Math.min(a, b), bottom: Math.max(a, b), left: 0, right: MAX_COLS - 1 };
+  }
+  if (!/^[A-Za-z]{1,3}\d{1,7}(?::[A-Za-z]{1,3}\d{1,7})?$/.test(plain)) return undefined;
+  return parseRange(plain);
+}
+
+/**
+ * The columns of a source (`area` on `sheet`, where it stands now) that are fields of its cache,
+ * read from the header row of the source as the cells have it now: the header texts matched to
+ * the names of the fields, without regard to case, in their order; the columns as absolute
+ * indexes. 'all' when the match is not one and whole (a name that is missing, found twice or
+ * given to two fields, or names that do not come in the order of the fields): every column of
+ * the source is then taken for a field. A column whose header is empty or names no field is none.
+ *
+ * Nothing about it is kept: it is read anew whenever it is asked for, from the model alone, so
+ * that every participant of a shared workbook (who has the same model) comes to the same answer.
+ * The header row is read once, over its cells that stand inside the source.
+ */
+export function fieldColumnsNow(cache: PivotCache, sheet: Sheet, area: CellRange): number[] | 'all' {
+  const fields = cacheFieldsNow(cache);
+  if (fields.length === 0) return 'all';
+  // Each header text once, with its column; -1 for a text two columns have.
+  const headers = new Map<string, number>();
+  const row = sheet.rows.get(area.top);
+  if (row) {
+    row.cells.forEach((cell, c) => {
+      if (c < area.left || c > area.right) return;
+      const value = cell.value;
+      const text = typeof value === 'string' ? value.toLowerCase() : typeof value === 'number' ? String(value) : typeof value === 'boolean' ? (value ? 'true' : 'false') : '';
+      if (text !== '') headers.set(text, headers.has(text) ? -1 : c);
+    });
+  }
+  const out: number[] = [];
+  for (const field of fields) {
+    const name = field.name.toLowerCase();
+    if (name === '') return 'all';
+    // Two fields of one name find the same column: the second is not after the first, and that refuses it below.
+    const at = headers.get(name);
+    if (at === undefined || at < 0 || (out.length > 0 && at <= out[out.length - 1])) return 'all';
+    out.push(at);
+  }
+  return out;
+}
+
+/** A defined name that stands for one range of a sheet: "Data!$A$1:$C$9", "'My data'!A1:C9". */
+const NAMED_RANGE = /^(?:'((?:[^']|'')+)'|([^!'"\s]+))!(\$?[A-Za-z]{1,3}\$?\d{1,7}(?::\$?[A-Za-z]{1,3}\$?\d{1,7})?)$/;
+
+/**
+ * The sheet and the range a source of kind "name" stands for: the defined name local to the sheet
+ * the source names, else the one of the workbook. A reason, as text, when there is no such name
+ * or it stands for something else than one range of a sheet.
+ */
+export function namedSourceRange(workbook: Workbook, source: { name: string; sheet?: string }): { sheetName: string; ref: string } | string {
+  const wanted = source.name.toLowerCase();
+  let sheetIndex = -1;
+  if (source.sheet !== undefined) {
+    const folded = foldSheetName(source.sheet);
+    sheetIndex = workbook.sheets.findIndex((sheet) => foldSheetName(sheet.name) === folded);
+  }
+  const found =
+    workbook.definedNames.find((name) => name.name.toLowerCase() === wanted && name.localSheet !== undefined && name.localSheet === sheetIndex) ||
+    workbook.definedNames.find((name) => name.name.toLowerCase() === wanted && name.localSheet === undefined);
+  if (!found) return `its source "${source.name}" is a table or a name that is not known here`;
+  const match = NAMED_RANGE.exec(found.value.trim());
+  if (!match) return `its source "${source.name}" is not one range of cells`;
+  return { sheetName: match[1] !== undefined ? match[1].replace(/''/g, "'") : match[2], ref: match[3] };
 }
 
 /** Whether two values of a cache are one item: text without regard to case, as Excel groups it. */

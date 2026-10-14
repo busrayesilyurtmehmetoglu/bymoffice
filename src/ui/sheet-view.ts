@@ -5993,6 +5993,11 @@ export class WorkbookView {
     if ((match = /^Cannot (insert|delete) (row|col)s through the array formula in (.+)$/.exec(message))) {
       return strings.arrayFormulaBlocks(match[1] as 'insert' | 'delete', match[2], match[3]);
     }
+    if ((match = /^Cannot (insert|delete) (row|col)s through the pivot table "(.*)"$/.exec(message))) return strings.pivotCut(match[1] as 'insert' | 'delete', match[2], match[3]);
+    if ((match = /^Cannot delete (row|col)s of the source of the pivot table "(.*)": /.exec(message))) return strings.pivotSourceCut(match[1], match[2]);
+    if ((match = /^Cannot (insert|delete) (row|col)s: the pivot table "(.*)" would be pushed off the sheet$/.exec(message))) return strings.pivotPushedOff(match[1] as 'insert' | 'delete', match[2], match[3]);
+    if ((match = /^Cannot (insert|delete) (row|col)s: the source of the pivot table "(.*)" is not one range of cells$/.exec(message))) return strings.pivotSourceNotRange(match[1] as 'insert' | 'delete', match[2], match[3]);
+    if ((match = /^Cannot (insert|delete) (row|col)s in a workbook with pivot tables: (.+)$/.exec(message))) return strings.pivotsFixed(match[1] as 'insert' | 'delete', match[2], match[3]);
     if ((match = /^Cannot (insert|delete) (row|col)s in a sheet with (.+): not supported yet$/.exec(message))) {
       return strings.notSupportedWith(match[1] as 'insert' | 'delete', match[2], match[3]);
     }

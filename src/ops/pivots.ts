@@ -21,6 +21,8 @@ import {
   MAX_PIVOT_WORK,
   MAX_PIVOT_SOURCE_CELLS,
   cacheFieldsNow,
+  cacheSourceNow,
+  namedSourceRange,
   tableState,
   valueKey,
   type PivotAggregate,
@@ -121,18 +123,15 @@ export function pivotAt(workbook: Workbook, sheetIndex: number, row: number, col
 // ---------------------------------------------------------------------------------------------
 // The source
 
-/** A defined name that stands for one range of a sheet: "Data!$A$1:$C$9", "'My data'!A1:C9". */
-const NAMED_RANGE = /^(?:'((?:[^']|'')+)'|([^!'"\s]+))!(\$?[A-Za-z]{1,3}\$?\d{1,7}(?::\$?[A-Za-z]{1,3}\$?\d{1,7})?)$/;
-
 function sheetNamed(workbook: Workbook, name: string): Sheet | undefined {
   const wanted = foldSheetName(name);
   for (const sheet of workbook.sheets) if (foldSheetName(sheet.name) === wanted) return sheet;
   return undefined;
 }
 
-/** The sheet and the range a cache reads. */
+/** The sheet and the range a cache reads: where its source stands now (rows and columns may have moved it). */
 function sourceRange(workbook: Workbook, cache: PivotCache, table: PivotTable): { sheet: Sheet; range: CellRange } {
-  const source = cache.source;
+  const source = cacheSourceNow(cache);
   if (!source) return refuse(table, 'its source is not stated');
   let sheetName: string;
   let ref: string;
@@ -140,16 +139,10 @@ function sourceRange(workbook: Workbook, cache: PivotCache, table: PivotTable): 
     sheetName = source.sheet;
     ref = source.ref;
   } else {
-    const wanted = source.name.toLowerCase();
-    const sheetIndex = source.sheet === undefined ? -1 : workbook.sheets.indexOf(sheetNamed(workbook, source.sheet) as Sheet);
-    const found =
-      workbook.definedNames.find((name) => name.name.toLowerCase() === wanted && name.localSheet !== undefined && name.localSheet === sheetIndex) ||
-      workbook.definedNames.find((name) => name.name.toLowerCase() === wanted && name.localSheet === undefined);
-    if (!found) return refuse(table, `its source "${source.name}" is a table or a name that is not known here`);
-    const match = NAMED_RANGE.exec(found.value.trim());
-    if (!match) return refuse(table, `its source "${source.name}" is not one range of cells`);
-    sheetName = match[1] !== undefined ? match[1].replace(/''/g, "'") : match[2];
-    ref = match[3];
+    const found = namedSourceRange(workbook, source);
+    if (typeof found === 'string') return refuse(table, found);
+    sheetName = found.sheetName;
+    ref = found.ref;
   }
   const sheet = sheetNamed(workbook, sheetName);
   if (!sheet || sheet.kind !== 'worksheet') return refuse(table, `the sheet of its source ("${sheetName}") is not in the workbook`);
@@ -215,6 +208,9 @@ function readSource(workbook: Workbook, cache: PivotCache, table: PivotTable): P
   const { sheet, range } = sourceRange(workbook, cache, table);
   const fields = cacheFieldsNow(cache);
   const width = range.right - range.left + 1;
+  // A column inserted inside the source is no field of the cache (see fieldColumnsNow()); a file read with more columns than
+  // fields has the same. Excel adds a field for it; a refresh here does not, so it is refused rather than leave it out.
+  if (width > fields.length) refuse(table, `its source has ${width} columns and its cache ${fields.length} fields: columns were inserted into it, and a refresh here adds no fields`);
   if (width !== fields.length) refuse(table, `its source has ${width} columns and its cache ${fields.length} fields`);
   if (range.bottom <= range.top) refuse(table, 'its source has no rows below its header');
   if ((range.bottom - range.top) * width > MAX_PIVOT_SOURCE_CELLS) refuse(table, `its source has more than ${MAX_PIVOT_SOURCE_CELLS} cells`);

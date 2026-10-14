@@ -227,6 +227,8 @@ export function writeCacheDefinition(original: Uint8Array, cache: PivotCache, st
   const doc = parseXml(original);
   const root = doc.root;
   if (localName(root.name) !== 'pivotCacheDefinition') throw new Error('Cannot write a pivot cache: its part is not a cache definition');
+  // Where its source stands now, when rows or columns moved it.
+  if (cache.sourceRef !== undefined) sourceElement(root).attrs.set('ref', cache.sourceRef);
   const p = prefixOf(root);
   if (cache.recordsPart !== undefined || root.attrs.has('recordCount')) root.attrs.set('recordCount', String(state.records.length));
   const fieldsEl = child(root, 'cacheFields');
@@ -298,6 +300,145 @@ export function writeCacheRecords(original: Uint8Array, state: PivotCacheState, 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Places that moved
+//
+// Rows and columns inserted or deleted move the range of a source and where a table stands (see
+// src/ops/pivot-places.ts). A part that was not refreshed keeps every byte but those of the value
+// of that one attribute; a part whose text cannot be changed in place that way (not UTF-8, or the
+// attribute not found once) is written out from its tree, with the attribute changed.
+
+/** The element of a cache definition that states the range of its source (cacheSource/worksheetSource). */
+function sourceElement(root: XmlElement): XmlElement {
+  const source = child(root, 'cacheSource');
+  const sheet = source ? child(source, 'worksheetSource') : undefined;
+  if (!sheet || !sheet.attrs.has('ref')) throw new Error('Cannot write a pivot cache: its part does not state the range of its source');
+  return sheet;
+}
+
+/** The element at a path of local names from the root (the first of each name, as the reader takes it). */
+function elementAt(root: XmlElement, path: string[]): XmlElement | undefined {
+  if (localName(root.name) !== path[0]) return undefined;
+  let el: XmlElement | undefined = root;
+  for (let i = 1; i < path.length && el; i++) el = child(el, path[i]);
+  return el;
+}
+
+/** The text of a part that is UTF-8 and says nothing else; undefined for any other. */
+function utf8Text(bytes: Uint8Array): string | undefined {
+  if (bytes.length >= 2 && ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))) return undefined;
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error) {
+    return undefined;
+  }
+  const declared = /^﻿?<\?xml\b[^?>]*?\bencoding\s*=\s*["']([^"']*)["']/.exec(text);
+  return declared && !/^utf-?8$/i.test(declared[1]) ? undefined : text;
+}
+
+const isNameEnd = (c: number) => c === 32 || c === 9 || c === 10 || c === 13 || c === 47 || c === 62 || c === 61;
+const isBlank = (c: number) => c === 32 || c === 9 || c === 10 || c === 13;
+
+/**
+ * Where the value of an attribute (by its name as written, without a prefix) of the element at a
+ * path of local names stands in the text of a well-formed part: between its quotes. Undefined
+ * unless there is exactly one such attribute. Comments, CDATA and instructions are passed over.
+ */
+function attributeSpan(text: string, path: string[], attr: string): { start: number; end: number } | undefined {
+  const stack: string[] = [];
+  const n = text.length;
+  let found: { start: number; end: number } | undefined;
+  let count = 0;
+  let i = 0;
+  while (i < n) {
+    const lt = text.indexOf('<', i);
+    if (lt < 0) break;
+    const skipTo = (close: string, from: number): number => {
+      const at = text.indexOf(close, from);
+      return at < 0 ? -1 : at + close.length;
+    };
+    if (text.startsWith('<!--', lt) || text.startsWith('<![CDATA[', lt) || text.startsWith('<?', lt)) {
+      i = skipTo(text.startsWith('<!--', lt) ? '-->' : text.startsWith('<?', lt) ? '?>' : ']]>', lt + 2);
+      if (i < 0) return undefined;
+      continue;
+    }
+    if (text.charCodeAt(lt + 1) === 33) return undefined;
+    if (text.charCodeAt(lt + 1) === 47) {
+      i = skipTo('>', lt);
+      if (i < 0) return undefined;
+      stack.pop();
+      continue;
+    }
+    let j = lt + 1;
+    while (j < n && !isNameEnd(text.charCodeAt(j))) j++;
+    const name = text.slice(lt + 1, j);
+    const local = name.slice(name.indexOf(':') + 1);
+    const depth = stack.length;
+    const onPath = depth === path.length - 1 && local === path[depth] && stack.every((one, k) => one === path[k]);
+    let self = false;
+    for (;;) {
+      while (j < n && isBlank(text.charCodeAt(j))) j++;
+      if (j >= n) return undefined;
+      const c = text.charCodeAt(j);
+      if (c === 62) {
+        j++;
+        break;
+      }
+      if (c === 47) {
+        self = true;
+        j += 2;
+        break;
+      }
+      let k = j;
+      while (k < n && !isNameEnd(text.charCodeAt(k))) k++;
+      const attrName = text.slice(j, k);
+      while (k < n && text.charCodeAt(k) !== 61) k++;
+      k++;
+      while (k < n && isBlank(text.charCodeAt(k))) k++;
+      const quote = text.charAt(k);
+      if (quote !== '"' && quote !== "'") return undefined;
+      const end = text.indexOf(quote, k + 1);
+      if (end < 0) return undefined;
+      if (onPath && attrName === attr) {
+        count++;
+        found = { start: k + 1, end };
+      }
+      j = end + 1;
+    }
+    if (!self) stack.push(local);
+    i = j;
+  }
+  return count === 1 ? found : undefined;
+}
+
+/**
+ * The part with the value of one attribute of the element at `path` (local names from the root)
+ * replaced: its bytes with only that value changed where that can be done, else its tree.
+ */
+export function patchedAttribute(original: Uint8Array, path: string[], attr: string, value: string): Uint8Array | XmlDocument {
+  const text = utf8Text(original);
+  const span = text === undefined ? undefined : attributeSpan(text, path, attr);
+  if (text !== undefined && span) {
+    const bytes = encoder.encode(text.slice(0, span.start) + escapeAttr(value) + text.slice(span.end));
+    // What was changed is read back: the attribute of the element the reader takes, and nothing else of the part.
+    try {
+      const el = elementAt(parseXml(bytes).root, path);
+      if (el && el.attrs.get(attr) === value) return bytes;
+    } catch (error) {
+      // Written from its tree below.
+    }
+  }
+  const doc = parseXml(original);
+  const el = elementAt(doc.root, path);
+  if (!el || !el.attrs.has(attr)) throw new Error(`Cannot write a pivot part: it has no ${path.join('/')} with ${attr}`);
+  el.attrs.set(attr, value);
+  return doc;
+}
+
+const SOURCE_PATH = ['pivotCacheDefinition', 'cacheSource', 'worksheetSource'];
+const LOCATION_PATH = ['pivotTableDefinition', 'location'];
+
+// ---------------------------------------------------------------------------------------------
 // One save
 
 /** What earlier saves of a workbook left of its pivot parts: the bytes the file had, and the parts the last save wrote. */
@@ -318,11 +459,10 @@ export function pivotPartsToRead(workbook: Workbook): string[] {
     if (!(saved && saved.originals.has(part)) && out.indexOf(part) < 0) out.push(part);
   };
   for (const cache of pivots.caches) {
-    if (!cache.now) continue;
-    want(cache.part);
-    if (cache.recordsPart !== undefined) want(cache.recordsPart);
+    if (cache.now || cache.sourceRef !== undefined) want(cache.part);
+    if (cache.now && cache.recordsPart !== undefined) want(cache.recordsPart);
   }
-  for (const table of pivots.tables) if (table.now) want(table.part);
+  for (const table of pivots.tables) if (table.now || table.placed) want(table.part);
   return out;
 }
 
@@ -353,7 +493,14 @@ export function pivotWrites(workbook: Workbook, bytesOf: (part: string) => Uint8
   const writes: [string, Uint8Array | XmlDocument][] = [];
   const written = new Set<string>();
   for (const cache of pivots.caches) {
-    if (!cache.now) continue;
+    if (!cache.now) {
+      // Only the range of its source moved: its records stay as they are, as Excel keeps them.
+      if (cache.sourceRef !== undefined) {
+        writes.push([cache.part, patchedAttribute(original(cache.part), SOURCE_PATH, 'ref', cache.sourceRef)]);
+        written.add(cache.part);
+      }
+      continue;
+    }
     writes.push([cache.part, writeCacheDefinition(original(cache.part), cache, cache.now, workbook.date1904)]);
     written.add(cache.part);
     if (cache.recordsPart !== undefined) {
@@ -362,8 +509,9 @@ export function pivotWrites(workbook: Workbook, bytesOf: (part: string) => Uint8
     }
   }
   for (const table of pivots.tables) {
-    if (!table.now) continue;
-    writes.push([table.part, writeTableDefinition(original(table.part), table, table.now)]);
+    if (table.now) writes.push([table.part, writeTableDefinition(original(table.part), table, table.now)]);
+    else if (table.placed) writes.push([table.part, patchedAttribute(original(table.part), LOCATION_PATH, 'ref', rangeName(table.placed))]);
+    else continue;
     written.add(table.part);
   }
   // What an earlier save wrote and this one does not goes back to the bytes of the file.

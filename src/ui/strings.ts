@@ -47,6 +47,16 @@ export interface UiStrings {
   arrayFormulaBlocks(kind: 'insert' | 'delete', axis: string, ref: string): string;
   /** `what` names the content in the way: comments, drawings, tables. */
   notSupportedWith(kind: 'insert' | 'delete', axis: string, what: string): string;
+  /** Rows or columns that would cut through the pivot table `name`. */
+  pivotCut(kind: 'insert' | 'delete', axis: string, name: string): string;
+  /** A deletion that would take the header row or a column of the source of the pivot table `name`. */
+  pivotSourceCut(axis: string, name: string): string;
+  /** Rows or columns that would push the pivot table `name` off the sheet. */
+  pivotPushedOff(kind: 'insert' | 'delete', axis: string, name: string): string;
+  /** The source of the pivot table `name` is not, or would not stay, one range of cells. */
+  pivotSourceNotRange(kind: 'insert' | 'delete', axis: string, name: string): string;
+  /** Rows or columns cannot move for a pivot table the model does not hold; `reason` as the engine says it. */
+  pivotsFixed(kind: 'insert' | 'delete', axis: string, reason: string): string;
   pasteTooLarge(max: string): string;
   tooManyFormats: string;
   badFormula: string;
@@ -736,6 +746,12 @@ export const STRINGS_EN: UiStrings = {
   insertPushesOff: (count, axis) => `Cannot insert ${count} ${axis === 'row' ? 'row' : 'column'}(s): cells would be pushed off the sheet`,
   arrayFormulaBlocks: (kind, axis, ref) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'} through the array formula in ${ref}`,
   notSupportedWith: (kind, axis, what) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'} in a sheet with ${what}: not supported yet`,
+  pivotCut: (kind, axis, name) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'} through the pivot table "${name}"`,
+  pivotSourceCut: (axis, name) =>
+    axis === 'row' ? `The header row of the source of the pivot table "${name}" cannot be deleted` : `Columns of the fields of the source of the pivot table "${name}" cannot be deleted`,
+  pivotPushedOff: (kind, axis, name) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'}: the pivot table "${name}" would be pushed off the sheet`,
+  pivotSourceNotRange: (kind, axis, name) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'}: the source of the pivot table "${name}" is not one range of cells`,
+  pivotsFixed: (kind, axis, reason) => `Cannot ${kind} ${axis === 'row' ? 'rows' : 'columns'} in this workbook because of its pivot tables: ${reason}`,
   pasteTooLarge: (max) => `Cannot paste more than ${max} cells at once`,
   tooManyFormats: 'The workbook has too many cell formats',
   badFormula: 'This formula cannot be read. Use English function names and commas between arguments.',
@@ -1384,6 +1400,12 @@ export const STRINGS_TR: UiStrings = {
     `${ref} aralığındaki dizi formülünün içinden ${axis === 'row' ? 'satır' : 'sütun'} ${kind === 'insert' ? 'eklenemez' : 'silinemez'}`,
   notSupportedWith: (kind, axis, what) =>
     `Bu sayfada ${axis === 'row' ? 'satır' : 'sütun'} ${kind === 'insert' ? 'ekleme' : 'silme'} henüz desteklenmiyor (sayfada bulunan: ${what})`,
+  pivotCut: (kind, axis, name) => `"${name}" özet tablosunun içinden ${axis === 'row' ? 'satır' : 'sütun'} ${kind === 'insert' ? 'eklenemez' : 'silinemez'}`,
+  pivotSourceCut: (axis, name) =>
+    axis === 'row' ? `"${name}" özet tablosunun kaynağındaki başlık satırı silinemez` : `"${name}" özet tablosunun kaynağındaki alan sütunları silinemez`,
+  pivotPushedOff: (kind, axis, name) => `${axis === 'row' ? 'Satır' : 'Sütun'} ${kind === 'insert' ? 'eklenemez' : 'silinemez'}: "${name}" özet tablosu sayfanın dışına itilirdi`,
+  pivotSourceNotRange: (kind, axis, name) => `${axis === 'row' ? 'Satır' : 'Sütun'} ${kind === 'insert' ? 'eklenemez' : 'silinemez'}: "${name}" özet tablosunun kaynağı tek bir hücre aralığı değil`,
+  pivotsFixed: (kind, axis, reason) => `Bu çalışma kitabında özet tabloları yüzünden ${axis === 'row' ? 'satır' : 'sütun'} ${kind === 'insert' ? 'eklenemez' : 'silinemez'}: ${pivotReasonTr(reason)}`,
   pasteTooLarge: (max) => `Bir kerede ${max} hücreden fazlası yapıştırılamaz`,
   tooManyFormats: 'Çalışma kitabında çok fazla hücre biçimi var',
   badFormula: 'Bu formül okunamadı. Argümanları noktalı virgülle (;) ayırın, ondalıkları virgülle yazın; tanınmayan fonksiyonlarda İngilizce adı kullanın.',
@@ -1998,6 +2020,21 @@ const PIVOT_REASONS_TR: [RegExp, (m: RegExpExecArray) => string][] = [
   [/^the sheet of its source \("(.*)"\) is not in the workbook$/, (m) => `kaynağının sayfası ("${m[1]}") çalışma kitabında yok`],
   [/^its source \("(.*)"\) is not a range of cells$/, (m) => `kaynağı ("${m[1]}") bir hücre aralığı değil`],
   [/^its source has (\d+) columns and its cache (\d+) fields$/, (m) => `kaynağında ${m[1]} sütun, önbelleğinde ${m[2]} alan var`],
+  [/^its source has (\d+) columns and its cache (\d+) fields: columns were inserted into it, and a refresh here adds no fields$/, (m) => `kaynağında ${m[1]} sütun, önbelleğinde ${m[2]} alan var: kaynağa sütun eklenmiş, buradaki yenileme önbelleğe yeni alan eklemez`],
+  // Why rows and columns cannot move in a workbook with pivot tables (see src/ops/pivot-places.ts).
+  [/^the workbook has more pivot tables than are read$/, () => 'çalışma kitabında okunabilenden çok pivot tablo var'],
+  [/^a sheet names a pivot table that is not in the package$/, () => 'bir sayfa pakette olmayan bir pivot tabloyu anıyor'],
+  [/^a pivot table has no cache$/, () => 'bir pivot tablonun önbelleği yok'],
+  [/^the cache of a pivot table cannot be read$/, () => 'bir pivot tablonun önbelleği okunamıyor'],
+  [/^two sheets show the same pivot table$/, () => 'iki sayfa aynı pivot tabloyu gösteriyor'],
+  [/^a pivot table cannot be read$/, () => 'bir pivot tablo okunamıyor'],
+  [/^the package has a pivot table no sheet shows$/, () => 'pakette hiçbir sayfanın göstermediği bir pivot tablo var'],
+  [/^the package has a pivot cache no table is made from$/, () => 'pakette hiçbir tablonun kullanmadığı bir pivot önbelleği var'],
+  [/^its pivot tables cannot be read$/, () => 'pivot tabloları okunamıyor'],
+  [/^its source is not a range or a name of the workbook$/, () => 'bir önbelleğin kaynağı çalışma kitabında bir aralık ya da ad değil'],
+  [/^its data is a consolidation of several ranges$/, () => 'bir önbelleğin verisi birden çok aralığın birleştirmesi'],
+  [/^its source states both a name and a range$/, () => 'bir önbelleğin kaynağı hem ad hem aralık belirtiyor'],
+  [/^its source \("(.*)"\) is not one range of cells$/, (m) => `bir önbelleğin kaynağı ("${m[1]}") tek bir hücre aralığı değil`],
   [/^its source has no rows below its header$/, () => 'kaynağında başlığın altında satır yok'],
   [/^its source has more than (\d+) cells$/, (m) => `kaynağında ${m[1]} hücreden fazlası var`],
   [/^the header of column (\S+) of its source is empty$/, (m) => `kaynağındaki ${m[1]} başlığı boş`],
@@ -2049,6 +2086,15 @@ const PIVOT_REASONS_TR: [RegExp, (m: RegExpExecArray) => string][] = [
   [/^its sheet is not in the workbook$/, () => 'sayfası çalışma kitabında yok'],
   [/^it does not stand on a worksheet$/, () => 'bir çalışma sayfasında durmuyor'],
 ];
+
+/** A reason of the engine about pivot tables, in Turkish; as it is where no translation fits. */
+function pivotReasonTr(reason: string): string {
+  for (const [pattern, say] of PIVOT_REASONS_TR) {
+    const found = pattern.exec(reason);
+    if (found) return say(found);
+  }
+  return reason;
+}
 
 /** The reason a pivot table was not refreshed, in Turkish; the text of the engine where no translation fits. */
 function pivotRefusalTr(message: string): string {

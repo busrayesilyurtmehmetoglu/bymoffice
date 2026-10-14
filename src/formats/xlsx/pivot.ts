@@ -28,6 +28,7 @@ import {
   type PivotTable,
   type PivotValue,
   type WorkbookPivots,
+  sourceArea,
 } from '../../model/sheet/pivot';
 import { parseRange, type Sheet, type Workbook } from '../../model/sheet/types';
 import { isoToSerial } from '../../format/cell-format';
@@ -127,6 +128,11 @@ function parseCache(root: XmlElement, cacheId: number, part: string, recordsPart
     }
   }
   if (source && child(source, 'consolidation')) refuse('its data is a consolidation of several ranges');
+  // Rows and columns that move take its source along only when it is one range, or a defined name (which follows by itself).
+  if (!cache.source) cache.placesFixed = 'its source is not a range or a name of the workbook';
+  else if (child(source as XmlElement, 'consolidation')) cache.placesFixed = 'its data is a consolidation of several ranges';
+  else if (cache.source.kind === 'name' && sheetSource && sheetSource.attrs.get('ref') !== undefined) cache.placesFixed = 'its source states both a name and a range';
+  else if (cache.source.kind === 'range' && !sourceArea(cache.source.ref)) cache.placesFixed = `its source ("${cache.source.ref.slice(0, 40)}") is not one range of cells`;
   for (const local of OLAP_ELEMENTS) if (child(root, local)) refuse('its data comes from an OLAP source');
   const fields = child(root, 'cacheFields');
   const list = fields ? childElements(fields, 'cacheField') : [];
@@ -455,6 +461,12 @@ function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCa
     if (item !== undefined) page.item = item;
     table.pageFields.push(page);
   }
+  if (table.pageFields.length > 0) {
+    // Where the fields of the page stand above the body: as many rows and columns of them as the file says, at least what they need.
+    const rows = int(locationEl.attrs.get('rowPageCount'), 1, 16384) || 0;
+    const cols = int(locationEl.attrs.get('colPageCount'), 1, 16384) || 0;
+    table.pages = { rows: Math.max(rows, cols > 0 ? Math.ceil(table.pageFields.length / cols) : table.pageFields.length), cols: Math.max(cols, 1) };
+  }
   const dataEl = child(root, 'dataFields');
   for (const el of dataEl ? childElements(dataEl, 'dataField') : []) {
     const fld = int(el.attrs.get('fld'), 0, table.fields.length - 1);
@@ -533,17 +545,34 @@ export async function readPivots(
     caches.set(key, cache);
     return cache;
   };
+  /** Why the places of the pivot tables cannot follow rows and columns that move: the first table the model does not hold as one. */
+  let fixed: string | undefined;
+  const miss = (reason: string) => {
+    if (fixed === undefined) fixed = reason;
+  };
   every: for (const entry of tables) {
     for (const part of entry.parts) {
       // The tables beyond are left out; their parts refer to their caches, which are then not refreshed (lookThrough()).
-      if (out.tables.length >= MAX_PIVOT_TABLES) break every;
+      if (out.tables.length >= MAX_PIVOT_TABLES) {
+        miss('the workbook has more pivot tables than are read');
+        break every;
+      }
       try {
-        if (!pkg.hasPart(part)) continue;
+        if (!pkg.hasPart(part)) {
+          miss('a sheet names a pivot table that is not in the package');
+          continue;
+        }
         const rels = await pkg.relationships(part);
         const cacheRel = rels.find((rel) => rel.type.slice(rel.type.lastIndexOf('/') + 1) === 'pivotCacheDefinition' && !rel.external && rel.part && pkg.hasPart(rel.part));
-        if (!cacheRel || !cacheRel.part) continue;
+        if (!cacheRel || !cacheRel.part) {
+          miss('a pivot table has no cache');
+          continue;
+        }
         const cache = await cacheOf(cacheRel.part);
-        if (!cache) continue;
+        if (!cache) {
+          miss('the cache of a pivot table cannot be read');
+          continue;
+        }
         const root = await read(part);
         const table = parseTable(root, part, entry.sheet, cache, budget);
         const id = int(root.attrs.get('cacheId'), 0, 4294967295);
@@ -551,16 +580,31 @@ export async function readPivots(
         // A part two sheets name is one table: it is refreshed for neither.
         if (out.tables.some((other) => other.part.toLowerCase() === part.toLowerCase())) {
           for (const other of out.tables) if (other.part.toLowerCase() === part.toLowerCase() && other.refusal === undefined) other.refusal = 'two sheets show the same table';
+          miss('two sheets show the same pivot table');
           continue;
         }
         out.tables.push(table);
       } catch (error) {
         // The table stays as the file has it, and is not refreshed.
         if (!(error instanceof Unreadable) && !(error instanceof Error)) throw error;
+        miss('a pivot table cannot be read');
       }
     }
   }
   if (out.tables.length === 0) return undefined;
+  // Parts of tables and caches that no sheet shows (or that were not read) hold places of cells as well.
+  if (fixed === undefined) {
+    const tableParts = new Set(out.tables.map((table) => table.part.toLowerCase()));
+    const cacheParts = new Set(out.caches.map((cache) => cache.part.toLowerCase()));
+    for (const name of pkg.partNames()) {
+      const lower = name.toLowerCase();
+      if (/\/_rels\//.test(lower)) continue;
+      const type = (pkg.contentTypeOf(name) || '').toLowerCase();
+      if ((/pivottable\+xml$/.test(type) || /^\/xl\/pivottables\/[^/]+\.xml$/.test(lower)) && !tableParts.has(lower)) miss('the package has a pivot table no sheet shows');
+      if ((/pivotcachedefinition\+xml$/.test(type) || /^\/xl\/pivotcache\/pivotcachedefinition[^/]*\.xml$/.test(lower)) && !cacheParts.has(lower)) miss('the package has a pivot cache no table is made from');
+    }
+  }
+  if (fixed !== undefined) out.fixed = fixed;
   // What else refers to the caches is looked through when a refresh is asked for: opening costs nothing more.
   out.lookThrough = (workbook: Workbook) => lookThrough(pkg, out, main, slicers, workbook);
   return out;
