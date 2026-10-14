@@ -2226,17 +2226,19 @@ test('bridge: exportPdf answers with the file as base64, its name, its pages and
   };
   await bridge.receive({ type: 'load', data: DATA, name: 'Rapor 2026.docx' });
   await bridge.receive({ type: 'exportPdf', id: 'p1' });
-  await bridge.receive({ type: 'exportPdf', id: 'p2', dpi: 96, image: 'lossless', quality: 0.5, title: 'T', author: 'A', sheets: 'all', text: 'vector' });
+  await bridge.receive({ type: 'exportPdf', id: 'p2', dpi: 96, image: 'lossless', quality: 0.5, title: 'T', author: 'A', sheets: 'all', text: 'vector', links: false, outline: false });
   const given = (options: any) => {
     const copy = { ...options };
     assert.equal(typeof copy.onProgress, 'function', 'the bridge listens to the progress');
     assert.equal(typeof copy.onPage, 'function', 'and to how each page is written');
+    assert.equal(typeof copy.onLinks, 'function', 'and to what became of the links');
     delete copy.onProgress;
     delete copy.onPage;
+    delete copy.onLinks;
     return copy;
   };
   // A document has no sheets to choose from: a valid choice is left out.
-  assert.deepEqual(jobs.map((job) => given(job.options)), [{}, { dpi: 96, image: 'lossless', quality: 0.5, title: 'T', author: 'A', text: 'vector' }]);
+  assert.deepEqual(jobs.map((job) => given(job.options)), [{}, { dpi: 96, image: 'lossless', quality: 0.5, title: 'T', author: 'A', text: 'vector', links: false, outline: false }]);
   const before = f.sent.length;
   await bridge.receive({ type: 'undo', id: 'u' });
   assert.deepEqual(f.sent.slice(before), [{ type: 'done', id: 'u', command: 'undo' }]);
@@ -2248,11 +2250,12 @@ test('bridge: exportPdf answers with the file as base64, its name, its pages and
   jobs[0].options.onPage({ page: 1, mode: 'vector' });
   jobs[0].options.onPage({ page: 2, mode: 'image', reason: 'text is painted with a font of the device ("Arial")' });
   jobs[0].options.onPage({ page: 3, mode: 'vector' });
+  jobs[0].options.onLinks({ external: 2, internal: 1, refused: 1, unresolved: 0, dropped: 0, outline: 4 });
   jobs[0].resolve(Uint8Array.from([0x25, 0x50, 0x44, 0x46]));
   jobs[1].reject(Object.assign(new Error('Page 2 cannot be written as text and drawings: a font of the device'), { code: 'unsupported' }));
   await settle();
   assert.deepEqual(f.sent.slice(before + 1), [
-    { type: 'pdf', id: 'p1', data: 'JVBERg==', name: 'Rapor 2026.pdf', pages: 3, vector: 2 },
+    { type: 'pdf', id: 'p1', data: 'JVBERg==', name: 'Rapor 2026.pdf', pages: 3, vector: 2, links: { external: 2, internal: 1, refused: 1, unresolved: 0, dropped: 0, outline: 4 } },
     { type: 'error', id: 'p2', code: 'pdf-unsupported', message: 'Page 2 cannot be written as text and drawings: a font of the device' },
   ]);
   await bridge.receive({ type: 'exportPdf', id: 'p2b' });
@@ -2283,7 +2286,7 @@ test('bridge: exportPdf is refused without a file and with options that cannot b
   await bridge.receive({ type: 'exportPdf', id: 'a' });
   assert.deepEqual(f.sent[f.sent.length - 1], { type: 'error', id: 'a', code: 'not-loaded', message: 'No file is open' });
   await bridge.receive({ type: 'load', data: DATA, name: 'Budget 2026.xlsx' });
-  const wrong: object[] = [{ dpi: 0 }, { dpi: '150' }, { image: 'png' }, { image: 1 }, { quality: 0 }, { quality: 1.5 }, { quality: 'high' }, { sheets: 'visible' }, { sheets: [0] }, { title: 5 }, { author: true }, { text: 'sharp' }, { text: true }];
+  const wrong: object[] = [{ dpi: 0 }, { dpi: '150' }, { image: 'png' }, { image: 1 }, { quality: 0 }, { quality: 1.5 }, { quality: 'high' }, { sheets: 'visible' }, { sheets: [0] }, { title: 5 }, { author: true }, { text: 'sharp' }, { text: true }, { links: 'yes' }, { outline: 1 }];
   for (const options of wrong) {
     await bridge.receive({ type: 'exportPdf', id: 'c', ...options });
     assert.equal(f.sent[f.sent.length - 1].code, 'bad-message', JSON.stringify(options));
@@ -2292,10 +2295,10 @@ test('bridge: exportPdf is refused without a file and with options that cannot b
   await bridge.receive({ type: 'exportPdf', id: 'p1' });
   await bridge.receive({ type: 'exportPdf', id: 'p2', sheets: 'all', dpi: 200, image: 'auto', text: 'image' });
   assert.deepEqual(
-    jobs.map((job) => ({ ...job.options, onProgress: undefined, onPage: undefined })),
+    jobs.map((job) => ({ ...job.options, onProgress: undefined, onPage: undefined, onLinks: undefined })),
     [
-      { onProgress: undefined, onPage: undefined, fileName: 'Budget 2026.xlsx' },
-      { onProgress: undefined, onPage: undefined, dpi: 200, image: 'auto', text: 'image', sheets: 'all', fileName: 'Budget 2026.xlsx' },
+      { onProgress: undefined, onPage: undefined, onLinks: undefined, fileName: 'Budget 2026.xlsx' },
+      { onProgress: undefined, onPage: undefined, onLinks: undefined, dpi: 200, image: 'auto', text: 'image', sheets: 'all', fileName: 'Budget 2026.xlsx' },
     ],
   );
 });

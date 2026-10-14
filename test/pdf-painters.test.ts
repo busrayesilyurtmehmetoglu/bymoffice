@@ -406,6 +406,29 @@ test('pdf export: every page is written as text and drawings when it can be, and
   );
 });
 
+test('pdf export: the links of a page are written over it whether it is drawn or a picture, where its text is', async () => {
+  const pdf = new PdfDocument({ date: DATE });
+  const links = [{ rects: [{ x: 10, y: 38, width: 90, height: 16 }], uri: 'https://example.com/a' }];
+  await writePdfPage(pdf, { ...pictureJob(1, good, []), links }, pdfSettings({}), tools());
+  await writePdfPage(pdf, { ...pictureJob(2, bad, []), links }, pdfSettings({}), tools());
+  await pdf.finish();
+  const checked = checkPdf(joinParts(pdf.takeParts()));
+  const root = checked.objects.get((checked.trailer.Root as { id: number }).id)!.value as { Pages: { id: number } };
+  const kids = (checked.objects.get(root.Pages.id)!.value as { Kids: { id: number }[] }).Kids;
+  for (let i = 0; i < 2; i++) {
+    const page = checked.objects.get(kids[i].id)!.value as { Annots: { id: number }[] };
+    assert.equal(page.Annots.length, 1, `page ${i + 1}`);
+    const annot = checked.objects.get(page.Annots[0].id)!.value as { Rect: number[] };
+    // From the top of a page of 100 points: 38 to 54 is 62 to 46 from the bottom.
+    assert.deepEqual(annot.Rect, [10, 46, 100, 62]);
+    // The text of the page, drawn or lying invisible over its picture, starts inside the link, on its baseline (50).
+    const text = checked.pages[i].texts[0];
+    assert.ok(text.x >= 10 && text.x < 100, `page ${i + 1}: text at ${text.x}`);
+    assert.ok(Math.abs(100 - text.y - 50) < 0.5, `page ${i + 1}: baseline at ${text.y}`);
+  }
+  assert.equal(pdf.links.external, 2);
+});
+
 test('pdf export: "image" paints no page on the PDF canvas, "vector" refuses the file for a page that cannot be drawn', async () => {
   const asked: string[] = [];
   let painted = 0;

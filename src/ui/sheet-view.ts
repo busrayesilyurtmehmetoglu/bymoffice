@@ -152,7 +152,8 @@ import {
   type PrintPlan,
 } from './doc-print';
 import { PdfDocument } from '../pdf/document';
-import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, reportLinks, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { sheetPdfLinks, type SheetPdfLinks } from '../pdf/sheet-links';
 import { MAX_PAGE_RUNS, captureText, type PdfTextRun } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
 import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
@@ -1600,7 +1601,7 @@ export class WorkbookView {
    * meanwhile, the sink is let go of and the pages are painted again from the
    * start. The sink of the pages that were all painted stays in `job.sink`.
    */
-  private async preparePages(job: PageJob, options: PageJobOptions, limits: PrintLimits, words: PageJobWords, open: (plan: PrintPlan) => PageSink): Promise<PrintPlan> {
+  private async preparePages(job: PageJob, options: PageJobOptions, limits: PrintLimits, words: PageJobWords, open: (plan: PrintPlan, pages: SheetJobPlan, metrics: (sheet: Sheet) => SheetMetrics) => PageSink): Promise<PrintPlan> {
     const cancelled = () => new DocumentPrintError('cancelled', words.destroyed);
     const doc = this.container.ownerDocument || document;
     let plan: PrintPlan;
@@ -1655,7 +1656,7 @@ export class WorkbookView {
         options,
         limits,
       );
-      const sink = open(plan);
+      const sink = open(plan, pages, (sheet) => metricsOf.get(sheet) || createSheetMetrics(sheet));
       job.sink = sink;
       this.setPageProgress(job, { done: 0, total: plan.pages.length });
       const complete = await this.paintPages(job, epoch, pages, plan, sink, store, doc, options, words, (sheet) => metricsOf.get(sheet) as SheetMetrics, layerOf);
@@ -1920,17 +1921,23 @@ export class WorkbookView {
     const tools = await pdfVectorTools(doc, settings);
     if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
     checkCancelled(options.signal);
-    await this.preparePages(job, { dpi: settings.dpi, sheets, fileName }, limits, PDF_WORDS, () => {
+    let found: SheetPdfLinks | undefined;
+    await this.preparePages(job, { dpi: settings.dpi, sheets, fileName }, limits, PDF_WORDS, (_plan, pages, metrics) => {
       const pdf = new PdfDocument({ title: options.title, author: options.author, date: options.date, maxBytes: limits.maxBytes });
       const taken: Uint8Array[] = [];
       file = pdf;
       parts = taken;
+      // The links of all pages are known before the first is written: a link may go to a page that comes later.
+      const links = sheetPdfLinks(this.workbook, pages.pages, { scale: 0.75, metrics, links: settings.links, outline: settings.outline });
+      found = links;
+      pdf.setOutline(links.outline);
       return {
         take: async (canvas, context, index, entry, planned, stale, runs, paintOn) => {
           const paper = entry.layout.paper;
           const done = await writePdfPage(
             pdf,
             {
+              links: links.pages[index],
               number: index + 1,
               width: toPoints(paper.width),
               height: toPoints(paper.height),
@@ -1968,6 +1975,7 @@ export class WorkbookView {
     // The parts are taken from the sink before it is let go of with the job.
     const out = parts.concat(pdf.takeParts());
     if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    reportLinks(options, pdf.links, found || {});
     this.notify(this.strings.pdfReady, 'info');
     return out;
   }

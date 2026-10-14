@@ -124,6 +124,8 @@
           <label title="exportPdf({ text }): 'auto' her sayfayı mümkünse vektör (gerçek metin + çizim), değilse görüntü yazar; 'image' her sayfayı görüntü; 'vector' vektör yazılamayan sayfada hata verir.">PDF sayfaları
             <select id="pdf-text"><option value="auto">kendiliğinden (vektör, olmazsa görüntü)</option><option value="image">görüntü</option><option value="vector">yalnız vektör</option></select>
           </label>
+          <label title="exportPdf({ links }): köprüler PDF bağlantısı olur (yalnız http, https, mailto ve dosya içi hedefler)."><input type="checkbox" id="pdf-links" checked /> bağlantılar</label>
+          <label title="exportPdf({ outline }): belgenin başlıkları ya da tablonun sayfa adları PDF anahattı (yer imleri) olur."><input type="checkbox" id="pdf-outline" checked /> anahat</label>
           <button id="pdf-make" disabled>PDF üret</button>
         </div>
         <p class="muted" id="pdf-state"></p>
@@ -1009,11 +1011,15 @@
         if (!target || typeof target.exportPdf !== 'function') return;
         const state = $('pdf-state');
         const pages = [];
+        let links = null;
         pdfButton.dataset.busy = '1';
         state.textContent = 'PDF hazırlanıyor…';
         try {
           const bytes = await target.exportPdf({
             text: $('pdf-text').value,
+            links: $('pdf-links').checked,
+            outline: $('pdf-outline').checked,
+            onLinks: (report) => (links = report),
             // The pages are painted anew when the file changes under them: the list starts over with page 1.
             onPage: (info) => {
               if (info.page === 1) pages.length = 0;
@@ -1026,6 +1032,7 @@
           // Only ever as text: a reason may quote a font name of the file.
           state.textContent =
             `${pages.length} sayfa: ${vector} vektör, ${pages.length - vector} görüntü — ${Math.round(bytes.length / 1024)} KB` +
+            (links ? ` — bağlantı: ${links.external} dış, ${links.internal} iç, ${links.refused} reddedilen, ${links.unresolved} hedefsiz, ${links.dropped} sınır dışı; anahat: ${links.outline} girdi` : '') +
             (reasons.length ? ` — görüntü kalma nedeni: ${reasons.slice(0, 3).join(' | ')}` : '');
           const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
           const link = document.createElement('a');

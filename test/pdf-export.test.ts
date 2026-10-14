@@ -20,10 +20,10 @@ import {
 import { PdfError } from '../src/pdf/writer';
 
 test('the options of a PDF have defaults and limits', () => {
-  assert.deepEqual(pdfSettings({}), { dpi: 150, image: 'auto', quality: 0.85, text: 'auto' });
+  assert.deepEqual(pdfSettings({}), { dpi: 150, image: 'auto', quality: 0.85, text: 'auto', links: true, outline: true });
   assert.equal(pdfSettings({ image: 'jpeg' }).image, 'jpeg');
   assert.deepEqual([DEFAULT_PDF_DPI, MIN_PDF_DPI, MAX_PDF_DPI, DEFAULT_PDF_QUALITY], [150, 72, 300, 0.85]);
-  assert.deepEqual(pdfSettings({ dpi: 300, image: 'lossless', quality: 0.5 }), { dpi: 300, image: 'lossless', quality: 0.5, text: 'auto' });
+  assert.deepEqual(pdfSettings({ dpi: 300, image: 'lossless', quality: 0.5 }), { dpi: 300, image: 'lossless', quality: 0.5, text: 'auto', links: true, outline: true });
   assert.equal(pdfSettings({ dpi: 10 }).dpi, 72, 'a resolution below the range is the lowest');
   assert.equal(pdfSettings({ dpi: 1200 }).dpi, 300, 'one above it the highest');
   assert.equal(pdfSettings({ quality: 1 }).quality, 1);

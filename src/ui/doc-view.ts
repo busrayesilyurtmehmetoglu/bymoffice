@@ -55,8 +55,9 @@ import {
   type PrintPagePlan,
   type PrintPlan,
 } from './doc-print';
+import { docPdfLinks, type DocPdfLinks } from '../pdf/doc-links';
 import { PdfDocument } from '../pdf/document';
-import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
+import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, reportLinks, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
 import { docPageRuns } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
 import { resolveUiStrings, type UiStrings } from './strings';
@@ -1644,6 +1645,7 @@ export class DocumentView {
     };
     let file: PdfDocument | undefined;
     let parts: Uint8Array[] = [];
+    let found: DocPdfLinks | undefined;
     // Where the characters of a line are, for a line that the edge of the paper cuts off.
     const measureText = (font: LayoutFont, text: string): number => this.measurer.width(font, text);
     const tools = await pdfVectorTools(doc, settings);
@@ -1654,11 +1656,16 @@ export class DocumentView {
       const taken: Uint8Array[] = [];
       file = pdf;
       parts = taken;
+      // All pages are laid out by now: the links and the headings are found on them before the first one is written.
+      const links = docPdfLinks(this.pages, this.document, { scale: 0.75, links: settings.links, outline: settings.outline, metrics: (font) => this.measurer.metrics(font) });
+      found = links;
+      pdf.setOutline(links.outline);
       return {
         take: async (canvas, context, index, page, planned, stale, paintOn) => {
           const done = await writePdfPage(
             pdf,
             {
+              links: links.pages[index],
               number: index + 1,
               width: toPoints(planned.width),
               height: toPoints(planned.height),
@@ -1696,6 +1703,7 @@ export class DocumentView {
     // The parts are taken from the sink before it is let go of with the job.
     const out = parts.concat(written);
     if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
+    reportLinks(options, pdf.links, found || {});
     this.notify(this.strings.pdfReady, 'info');
     return out;
   }

@@ -16,6 +16,7 @@ import type { DocumentViewOptions } from '../ui/doc-view';
 import type { SpreadsheetEditorOptions } from '../ui/editor';
 import type { SheetPrintOptions } from '../ui/sheet-print';
 import { pdfFileName, type PdfExportOptions } from '../pdf/export';
+import type { PdfLinkReport } from '../pdf/links';
 import type { SheetPdfExportOptions, WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
@@ -2178,13 +2179,19 @@ export function createBridge(host: BridgeHost): Bridge {
     if (text !== undefined && text !== 'auto' && text !== 'image' && text !== 'vector') throw new BadMessage('"text" must be "auto", "image" or "vector"');
     const title = field<string>(message, 'title', 'string', false);
     const author = field<string>(message, 'author', 'string', false);
+    const links = field<boolean>(message, 'links', 'boolean', false);
+    const outline = field<boolean>(message, 'outline', 'boolean', false);
     if (!shown) return fail('not-loaded', 'No file is open', id);
     const pages = shown.pages;
     const view = shown.view;
     if (pages ? !pages.exportPdf && !pages.exportPdfParts : !view || typeof view.exportPdf !== 'function') return fail('pdf-unavailable', 'This view cannot make a PDF', id);
     let count = 0;
     let vector = 0;
+    let linkReport: PdfLinkReport | undefined;
     const options: SheetPdfExportOptions = {
+      onLinks: (report) => {
+        linkReport = report;
+      },
       onProgress: (_done, total) => {
         count = total;
       },
@@ -2200,6 +2207,8 @@ export function createBridge(host: BridgeHost): Bridge {
     if (quality !== undefined) options.quality = quality;
     if (title !== undefined) options.title = title;
     if (author !== undefined) options.author = author;
+    if (links !== undefined) options.links = links;
+    if (outline !== undefined) options.outline = outline;
     const name = pdfFileName(shown.name, pages ? 'document' : 'workbook');
     // The file in the parts it was written in, where the view hands them out: it is never held as one array here.
     let job: Promise<Uint8Array[]>;
@@ -2234,6 +2243,8 @@ export function createBridge(host: BridgeHost): Bridge {
         out.name = name;
         out.pages = count;
         out.vector = vector;
+        // What became of the hyperlinks and the outline: written, left out and why.
+        if (linkReport) out.links = { ...linkReport };
         send(out);
       } catch (error) {
         failed(error);

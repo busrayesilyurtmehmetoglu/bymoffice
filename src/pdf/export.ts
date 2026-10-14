@@ -15,6 +15,7 @@ import type { PdfDocument, PdfPage } from './document';
 import { PHOTO_SHARE, TEXT_SHARE, changeShare, imageOfPixels, jpegInfo, packSamples, type PdfImage } from './image';
 import { canvasMeasure, canvasPictures, drawPage, loadPdfFonts, type PdfPageInfo, type PdfVectorTools } from './vector';
 import { cleanReason } from './canvas';
+import type { PdfLink, PdfLinkReport } from './links';
 import { PdfError } from './writer';
 
 export type { PdfPageInfo };
@@ -78,6 +79,21 @@ export interface PdfExportOptions {
   signal?: PdfAbortSignal;
   /** Called when a page is done, with the number of pages done and of all pages. */
   onProgress?(page: number, total: number): void;
+  /**
+   * The hyperlinks of the file become links of the PDF (default true): an
+   * address outside the file (only http, https and mailto) and a place in
+   * it (a bookmark of a document, a cell of a workbook). False leaves them
+   * out.
+   */
+  links?: boolean;
+  /**
+   * The PDF gets an outline that readers show beside its pages (default
+   * true): the headings of a document, the sheets of a workbook. False
+   * leaves it out.
+   */
+  outline?: boolean;
+  /** Called once the file is made, with what became of its links and its outline. */
+  onLinks?(report: PdfLinkReport): void;
 }
 
 /** What downloadPdf() of a view says of the file it handed to the browser. */
@@ -118,6 +134,8 @@ export interface PdfSettings {
   image: 'auto' | 'jpeg' | 'lossless';
   quality: number;
   text: 'auto' | 'image' | 'vector';
+  links: boolean;
+  outline: boolean;
 }
 
 /**
@@ -143,7 +161,10 @@ export function pdfSettings(options: PdfExportOptions): PdfSettings {
   if (options.onProgress !== undefined && typeof options.onProgress !== 'function') throw new TypeError('"onProgress" must be a function');
   if (options.onPage !== undefined && typeof options.onPage !== 'function') throw new TypeError('"onPage" must be a function');
   if (options.signal !== undefined && (options.signal === null || typeof options.signal !== 'object')) throw new TypeError('"signal" must be an AbortSignal');
-  return { dpi, image: options.image || 'auto', quality, text: options.text || 'auto' };
+  if (options.links !== undefined && typeof options.links !== 'boolean') throw new TypeError('"links" must be true or false');
+  if (options.outline !== undefined && typeof options.outline !== 'boolean') throw new TypeError('"outline" must be true or false');
+  if (options.onLinks !== undefined && typeof options.onLinks !== 'function') throw new TypeError('"onLinks" must be a function');
+  return { dpi, image: options.image || 'auto', quality, text: options.text || 'auto', links: options.links !== false, outline: options.outline !== false };
 }
 
 /**
@@ -192,6 +213,30 @@ export interface PdfPageJob {
   picture(): Promise<Pick<PdfPage, 'image' | 'fill' | 'text'>>;
   /** Called before the page is written into the file; false ends the work without a page (what it throws ends it too). */
   proceed?(): boolean;
+  /** The links of the page, in points from its top left corner. */
+  links?: readonly PdfLink[];
+}
+
+/**
+ * Tells `onLinks` what became of the links and the outline of a file: what
+ * the file says of what it wrote, with what was left out before it saw them.
+ */
+export function reportLinks(options: PdfExportOptions, written: PdfLinkReport, before: { refused?: number; unresolved?: number; dropped?: number; rotated?: number; outlineSkipped?: number; unread?: number }): PdfLinkReport {
+  const report: PdfLinkReport = { ...written };
+  report.refused += before.refused || 0;
+  report.unresolved += before.unresolved || 0;
+  report.dropped += before.dropped || 0;
+  report.rotated += before.rotated || 0;
+  report.outlineSkipped += before.outlineSkipped || 0;
+  report.unread += before.unread || 0;
+  if (options.onLinks) {
+    try {
+      options.onLinks({ ...report });
+    } catch {
+      // What the caller does with the news is its own; the file is made all the same.
+    }
+  }
+  return report;
 }
 
 /**
@@ -207,7 +252,7 @@ export async function writePdfPage(pdf: PdfDocument, job: PdfPageJob, settings: 
     const drawn = tools ? drawPage(tools, { pixelWidth: job.pixelWidth, pixelHeight: job.pixelHeight, pageWidth: job.width, pageHeight: job.height }, job.paint) : { reason: 'there is no canvas to measure text with' };
     if (drawn.vector) {
       if (job.proceed && !job.proceed()) return false;
-      await pdf.addPage({ width: job.width, height: job.height, vector: drawn.vector });
+      await pdf.addPage({ width: job.width, height: job.height, vector: drawn.vector, links: job.links });
       info.mode = 'vector';
       written = true;
     } else {
@@ -218,7 +263,7 @@ export async function writePdfPage(pdf: PdfDocument, job: PdfPageJob, settings: 
   if (!written) {
     const picture = await job.picture();
     if (job.proceed && !job.proceed()) return false;
-    await pdf.addPage({ width: job.width, height: job.height, image: picture.image, fill: picture.fill, text: picture.text });
+    await pdf.addPage({ width: job.width, height: job.height, image: picture.image, fill: picture.fill, text: picture.text, links: job.links });
   }
   if (onPage) {
     try {

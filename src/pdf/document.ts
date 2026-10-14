@@ -13,9 +13,10 @@ import { PdfEmbeddedFont } from './embed';
 import { adler32, zlibDeflate } from './flate';
 import { PdfTextFont } from './font';
 import { jpegInfo, packSamples, type PdfImage, type PdfPacked } from './image';
+import { MAX_FILE_LINKS, MAX_LINK_RECTS, MAX_OUTLINE_ENTRIES, MAX_PAGE_LINKS, emptyLinkReport, finitePlace, outlineTitle, outlineTree, pdfLinkUri, type PdfDestination, type PdfLink, type PdfLinkReport, type PdfOutlineEntry } from './links';
 import { textLayer, type PdfTextRun } from './text';
 import type { PdfFontFace } from './sfnt';
-import { PdfError, PdfWriter, joinParts, latin1, name, pdfDate, pdfNumber, pdfText, type PdfDict, type PdfRef } from './writer';
+import { PdfError, PdfRef, PdfString, PdfWriter, joinParts, latin1, name, pdfDate, pdfNumber, pdfText, type PdfDict, type PdfValue } from './writer';
 
 export interface PdfDocumentOptions {
   /** The title and the author in the information of the document; left out when missing or empty. */
@@ -44,6 +45,12 @@ export interface PdfPage {
    * and `text` are not looked at with it (its text is text already).
    */
   vector?: PdfVectorPage;
+  /**
+   * The links of the page, in points from its top left corner (see
+   * links.ts): written as link annotations over the page, whichever way the
+   * page itself is written.
+   */
+  links?: readonly PdfLink[];
 }
 
 /** A page of a PDF may be 200 inches long at most. */
@@ -51,6 +58,13 @@ export const MAX_PAGE_POINTS = 14400;
 /** And no smaller than this: what readers of PDF files take for a page at all. */
 export const MIN_PAGE_POINTS = 3;
 const MAX_INFO_CHARS = 1024;
+/**
+ * Links into the file held until the end of the file, of one page and of all
+ * pages: more than can be written (some may have no page to go to), but not
+ * without end.
+ */
+const MAX_WAITING_PAGE_LINKS = MAX_PAGE_LINKS * 4;
+const MAX_WAITING_LINKS = MAX_FILE_LINKS * 4;
 const PRODUCER = 'BYM Office';
 
 const whole = (value: unknown): value is number => typeof value === 'number' && value >= 1 && Math.floor(value) === value && value <= 0x7fffffff;
@@ -72,6 +86,22 @@ export class PdfDocument {
   private readonly digest = [0x811c9dc5, 0x01000193, 0x9e3779b9, 0x85ebca6b];
   private busy = false;
   private over = false;
+  /** The heights of the pages written, in points: where a place on a page is from its bottom. */
+  private readonly heights: number[] = [];
+  /**
+   * The annotations of the pages with links into the file: such a page names
+   * its /Annots array by reference, and the array (and the links into the
+   * file in it) is written when the file is ended, when every page a link can
+   * go to is in it. A link whose page is not is then left out of its array.
+   */
+  private readonly pending: { array: PdfRef; items: (PdfRef | { rects: number[][]; dest: PdfDestination })[]; written: number }[] = [];
+  private outline: PdfOutlineEntry[] = [];
+  private outlineDropped = 0;
+  /** Links written (out of the file as they come, into it at the end): what the limits count. */
+  private linkCount = 0;
+  /** Links into the file waiting for the end of the file. */
+  private waiting = 0;
+  private readonly report: PdfLinkReport = emptyLinkReport();
 
   constructor(options: PdfDocumentOptions = {}) {
     this.options = options;
@@ -82,6 +112,170 @@ export class PdfDocument {
   /** Pages added so far. */
   get pageCount(): number {
     return this.kids.length;
+  }
+
+  /** What became of the links and the outline so far; final once the file is finished. */
+  get links(): PdfLinkReport {
+    return { ...this.report };
+  }
+
+  /**
+   * The outline of the file: its entries in the order they are shown, each
+   * with its level (see links.ts). Entries beyond MAX_OUTLINE_ENTRIES are left
+   * out and counted; an entry without a title, or whose page is not in the
+   * file when it is ended, is left out. Set before finish(); a second call
+   * replaces the first.
+   */
+  setOutline(entries: readonly PdfOutlineEntry[]): void {
+    if (this.over) throw new PdfError('invalid', 'The PDF is finished: no outline can be given to it');
+    const kept: PdfOutlineEntry[] = [];
+    let dropped = 0;
+    const list = Array.isArray(entries) ? entries : [];
+    for (let i = 0; i < list.length; i++) {
+      const entry = list[i];
+      if (!entry || typeof entry.title !== 'string' || !entry.dest) continue;
+      if (kept.length >= MAX_OUTLINE_ENTRIES) {
+        dropped = list.length - i;
+        break;
+      }
+      kept.push(entry);
+    }
+    this.outlineDropped = dropped;
+    this.outline = kept;
+  }
+
+  /** The rectangles of a link as they are written, [left bottom right top] in points, cut to the page; empty ones are left out. */
+  private linkRects(link: PdfLink, width: number, height: number): number[][] {
+    const out: number[][] = [];
+    const rects = Array.isArray(link.rects) ? link.rects : [];
+    for (let i = 0; i < rects.length && out.length < MAX_LINK_RECTS; i++) {
+      const rect = rects[i];
+      if (!rect || !finitePlace(rect.x) || !finitePlace(rect.y) || !finitePlace(rect.width) || !finitePlace(rect.height)) continue;
+      const left = Math.max(0, Math.min(rect.x, rect.x + rect.width));
+      const right = Math.min(width, Math.max(rect.x, rect.x + rect.width));
+      const top = Math.max(0, Math.min(rect.y, rect.y + rect.height));
+      const bottom = Math.min(height, Math.max(rect.y, rect.y + rect.height));
+      if (!(right - left >= 0.01) || !(bottom - top >= 0.01)) continue;
+      out.push([Number(pdfNumber(left, 2)), Number(pdfNumber(height - bottom, 2)), Number(pdfNumber(right, 2)), Number(pdfNumber(height - top, 2))]);
+    }
+    return out;
+  }
+
+  /**
+   * The /Annots of a page: the annotations of its links that go out of the
+   * file are written now; with a link into the file among them, the array is
+   * a reference to one that is written when the file is ended. Undefined for
+   * a page without links.
+   */
+  private annotations(links: readonly PdfLink[] | undefined, width: number, height: number): PdfRef[] | PdfRef | undefined {
+    const items: (PdfRef | { rects: number[][]; dest: PdfDestination })[] = [];
+    let inward = false;
+    if (!Array.isArray(links) || links.length === 0) return undefined;
+    const report = this.report;
+    // Only what is written counts against the limits: a link into the file is counted when it is written, at the end.
+    let onPage = 0;
+    let waiting = 0;
+    for (let i = 0; i < links.length; i++) {
+      const link = links[i];
+      if (!link) continue;
+      const inwardLink = !!link.dest;
+      if (inwardLink ? waiting >= MAX_WAITING_PAGE_LINKS || this.waiting >= MAX_WAITING_LINKS : onPage >= MAX_PAGE_LINKS || this.linkCount >= MAX_FILE_LINKS) {
+        report.dropped++;
+        continue;
+      }
+      let uri: string | undefined;
+      let dest: PdfDestination | undefined;
+      if (link.dest) {
+        const page = link.dest.page;
+        if (typeof page !== 'number' || !(page >= 0) || Math.floor(page) !== page || page > 0x7fffffff) {
+          report.unresolved++;
+          continue;
+        }
+        dest = { page };
+        if (finitePlace(link.dest.x)) dest.x = link.dest.x;
+        if (finitePlace(link.dest.y)) dest.y = link.dest.y;
+      } else {
+        uri = pdfLinkUri(link.uri);
+        if (uri === undefined) {
+          report.refused++;
+          continue;
+        }
+      }
+      const rects = this.linkRects(link, width, height);
+      if (rects.length === 0) {
+        // A link that lies nowhere on the page cannot be pressed.
+        report.dropped++;
+        continue;
+      }
+      if (dest) {
+        // Counted when it is written, once its page is known to be in the file.
+        items.push({ rects, dest });
+        inward = true;
+        waiting++;
+        this.waiting++;
+        continue;
+      }
+      onPage++;
+      this.linkCount++;
+      report.external++;
+      for (let r = 0; r < rects.length; r++) items.push(this.writer.add(linkAnnotation(rects[r], { A: { S: name('URI'), URI: new PdfString(latin1(uri as string)) } })));
+    }
+    if (items.length === 0) return undefined;
+    if (!inward) return items as PdfRef[];
+    const array = this.writer.reserve();
+    this.pending.push({ array, items, written: onPage });
+    return array;
+  }
+
+  /** [page /XYZ left top null] of a place in the file; undefined for a page that is not in it. */
+  private destination(dest: PdfDestination): PdfValue[] | undefined {
+    const page = this.kids[dest.page];
+    if (!page) return undefined;
+    const height = this.heights[dest.page];
+    const left = finitePlace(dest.x) ? Number(pdfNumber(Math.max(0, dest.x), 2)) : null;
+    const top = finitePlace(dest.y) ? Number(pdfNumber(Math.min(height, Math.max(0, height - dest.y)), 2)) : null;
+    return [page, name('XYZ'), left, top, null];
+  }
+
+  /** Writes the outline; its reference, undefined when no entry is left. */
+  private writeOutline(): PdfRef | undefined {
+    const usable: PdfOutlineEntry[] = [];
+    for (let i = 0; i < this.outline.length; i++) {
+      const entry = this.outline[i];
+      const title = outlineTitle(entry.title);
+      if (title === '' || !this.destination(entry.dest)) {
+        this.report.outlineSkipped++;
+        continue;
+      }
+      usable.push({ title, level: entry.level, dest: entry.dest });
+    }
+    this.outline = [];
+    this.report.dropped += this.outlineDropped;
+    if (usable.length === 0) return undefined;
+    const writer = this.writer;
+    const { nodes, top } = outlineTree(usable);
+    const root = writer.reserve();
+    const refs: PdfRef[] = [];
+    for (let i = 0; i < nodes.length; i++) refs.push(writer.reserve());
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      const siblings = node.parent < 0 ? top : nodes[node.parent].children;
+      const at = node.index;
+      const dict: PdfDict = { Title: pdfText(node.entry.title), Parent: node.parent < 0 ? root : refs[node.parent] };
+      if (at > 0) dict.Prev = refs[siblings[at - 1]];
+      if (at < siblings.length - 1) dict.Next = refs[siblings[at + 1]];
+      if (node.children.length > 0) {
+        dict.First = refs[node.children[0]];
+        dict.Last = refs[node.children[node.children.length - 1]];
+        // Open: every entry under it is shown.
+        dict.Count = node.descendants;
+      }
+      dict.Dest = this.destination(node.entry.dest);
+      writer.add(dict, refs[i]);
+    }
+    writer.add({ Type: name('Outlines'), First: refs[top[0]], Last: refs[top[top.length - 1]], Count: nodes.length }, root);
+    this.report.outline = nodes.length;
+    return root;
   }
 
   /** Bytes of the file so far. */
@@ -235,6 +429,9 @@ export class PdfDocument {
       }
       const dict: PdfDict = { Type: name('Page'), Parent: this.pagesRef, MediaBox: [0, 0, Number(w), Number(h)], Resources: resources };
       if (content.length > 0) dict.Contents = await this.stream({}, latin1(content.join('\n')));
+      const annotations = this.annotations(page.links, Number(w), Number(h));
+      if (annotations) dict.Annots = annotations;
+      this.heights.push(Number(h));
       this.kids.push(this.writer.add(dict));
       this.mix(this.writer.size);
     } catch (error) {
@@ -277,7 +474,44 @@ export class PdfDocument {
       this.mix(adler32(latin1(map)));
     }
     writer.add({ Type: name('Pages'), Kids: this.kids, Count: this.kids.length }, this.pagesRef);
-    const root = writer.add({ Type: name('Catalog'), Pages: this.pagesRef });
+    // The links into the file, now that every page they can go to is in it; one whose page is not is left out of its page.
+    const pending = this.pending;
+    for (let i = 0; i < pending.length; i++) {
+      const refs: PdfRef[] = [];
+      const items = pending[i].items;
+      let onPage = pending[i].written;
+      for (let k = 0; k < items.length; k++) {
+        const item = items[k];
+        if (item instanceof PdfRef) {
+          refs.push(item);
+          continue;
+        }
+        const dest = this.destination(item.dest);
+        if (!dest) {
+          this.report.unresolved++;
+          continue;
+        }
+        if (onPage >= MAX_PAGE_LINKS || this.linkCount >= MAX_FILE_LINKS) {
+          this.report.dropped++;
+          continue;
+        }
+        onPage++;
+        this.linkCount++;
+        this.report.internal++;
+        for (let r = 0; r < item.rects.length; r++) refs.push(writer.add(linkAnnotation(item.rects[r], { Dest: dest })));
+      }
+      writer.add(refs, pending[i].array);
+    }
+    pending.length = 0;
+    const catalog: PdfDict = { Type: name('Catalog'), Pages: this.pagesRef };
+    const outline = this.writeOutline();
+    if (outline) {
+      catalog.Outlines = outline;
+      catalog.PageMode = name('UseOutlines');
+    }
+    const report = this.report;
+    this.mix(report.external * 31 + report.internal * 7 + report.outline);
+    const root = writer.add(catalog);
     const info: PdfDict = {};
     const said = (value: unknown): string => (typeof value === 'string' ? value.slice(0, MAX_INFO_CHARS) : '');
     const title = pdfText(said(options.title));
@@ -298,6 +532,11 @@ export class PdfDocument {
     for (let i = 0; i < 4; i++) for (let b = 0; b < 4; b++) id[i * 4 + b] = (this.digest[i] >>> (24 - b * 8)) & 255;
     writer.finish({ root, info: writer.add(info), id });
   }
+}
+
+/** A link annotation: no border, printed, with what it does. */
+function linkAnnotation(rect: number[], action: PdfDict): PdfDict {
+  return { Type: name('Annot'), Subtype: name('Link'), Rect: rect, Border: [0, 0, 0], F: 4, ...action };
 }
 
 /** A PDF of the given pages, as one array. */
