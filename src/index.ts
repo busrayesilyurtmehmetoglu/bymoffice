@@ -30,10 +30,11 @@ import type { SheetPrintOptions } from './ui/sheet-print';
 import type { PdfExportOptions } from './pdf/export';
 import type { SheetPdfExportOptions } from './ui/sheet-view';
 import { OpcPackage } from './opc';
+import { PACKAGE_TURN, packageTurn } from './package-turn';
 import { askOverwrite } from './ui/save-confirm';
 import { listPeople, type CollabPerson, type People } from './collab/people';
 import { createSaveSync, type SaveSync } from './collab/save-sync';
-import { keepStamp, readCollabStamp, samePackage, writeSharedFile } from './formats/xlsx/collab-stamp';
+import { proofFile, readCollabStamp, samePackage, writeSharedFile } from './formats/xlsx/collab-stamp';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
 import {
   SaveController,
@@ -725,6 +726,20 @@ async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOpt
     };
   const finish = (file: Omit<OfficeFile, 'passwordProtected' | 'setPassword' | 'close'>): OfficeFile => {
     const out = file as OfficeFile;
+    // Whatever writes the package of the file does so alone: a second save waits for the first, whoever asks
+    // for it (a save, a save as, a file that is written to compare). Two that write one package at once write
+    // a file that cannot be opened.
+    let turn: Promise<unknown> = Promise.resolve();
+    const locked = <T>(run: () => Promise<T>): Promise<T> => {
+      const next = turn.then(run, run);
+      turn = next.catch(() => undefined);
+      return next;
+    };
+    const inner = { save: out.save, saveAsXlsx: out.saveAsXlsx, saveAsDocx: out.saveAsDocx };
+    out.save = (saveOptions?: SaveOptions) => locked(() => inner.save(saveOptions));
+    if (inner.saveAsXlsx) out.saveAsXlsx = inner.saveAsXlsx === inner.save ? out.save : (saveOptions?: SaveOptions) => locked(() => (inner.saveAsXlsx as (o?: SaveOptions) => Promise<Uint8Array>)(saveOptions));
+    if (inner.saveAsDocx) out.saveAsDocx = inner.saveAsDocx === inner.save ? out.save : (saveOptions?: SaveOptions) => locked(() => (inner.saveAsDocx as (o?: SaveOptions) => Promise<Uint8Array>)(saveOptions));
+    Object.defineProperty(out, PACKAGE_TURN, { value: { locked, save: (saveOptions?: SaveOptions) => inner.save(saveOptions) }, enumerable: false });
     Object.defineProperty(out, 'passwordProtected', { get: () => protection.session !== undefined, enumerable: true });
     out.setPassword = (password: string | null): void => {
       if (password !== null) checkPassword(password);
@@ -1460,9 +1475,11 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
                         run: () => {
                           void saveAsIs().then(
                             (bytes) => {
+                              // Whether the browser kept the file is not known here: it is said that it was handed over, or that it could not be.
                               if (downloadFile(document, bytes, options.fileName !== undefined ? options.fileName : fileName || 'workbook.xlsx')) notice(fork.downloaded, 'info');
+                              else notice(fork.downloadFailed, 'error');
                             },
-                            () => undefined,
+                            () => notice(fork.downloadFailed, 'error'),
                           );
                         },
                       },
@@ -1510,10 +1527,13 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
    * place in the common order (or after a short wait), and with what arrives held back until
    * the file is written, so that it is the workbook of one moment.
    */
-  const sharedBytes = async (take: () => Promise<Uint8Array>): Promise<Uint8Array> => {
+  const sharedBytes = async (take: (raw: (saveOptions?: SaveOptions) => Promise<Uint8Array>) => Promise<Uint8Array>, saveOptions?: SaveOptions): Promise<Uint8Array> => {
     const shared = session;
-    if (!shared) return take();
-    const done = await writeSharedFile(shared, file.package, take);
+    // Not edited together: the save of the file, which takes the turn of its package itself.
+    if (!shared) return file.save(saveOptions);
+    // The stamp and the save are one step under the turn of the package: no other save of the file cuts into it.
+    const turn = packageTurn(file);
+    const done = await writeSharedFile(shared, file.package, () => take(turn.save), turn.locked);
     // The file could not be made to say which step it holds: saved all the same, and said once.
     if (done.unstamped && !unstampedSaid) {
       unstampedSaid = true;
@@ -1716,7 +1736,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   save = async (saveOptions?: SaveOptions) => {
     // What is being typed (in a cell, in the field of a note, in a tab) is written first, as leaving it would do.
     if (!view.commitPending()) throw new Error('Cannot save: a note or a sheet name that is being typed cannot be applied, or a dialog of rules is open with changes (confirm or close it first)');
-    return sharedBytes(() => file.save(saveOptions));
+    return sharedBytes((raw) => raw(saveOptions), saveOptions);
   };
   commit = () => {
     try {
@@ -1728,7 +1748,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     }
   };
   pendingInput = () => view.hasPendingInput();
-  saveAsIs = () => sharedBytes(() => file.save());
+  saveAsIs = () => sharedBytes((raw) => raw());
   notice = (message, kind) => view.showNotice(message, kind);
   focusView = () => view.focus();
   editorRoot = () => editor.element;
@@ -1765,10 +1785,15 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
   } else if (collabPlan && readBytes) {
     const plan = collabPlan;
     let peopleTold = '';
+    let barShown = '';
     const peopleNow = (): People => (session ? listPeople(session.user, session.peers, session.state, resolveUiStrings(options.locale).collab.guest) : { list: [], more: 0, count: 0 });
     const show = (): void => {
       if (!session) return;
       const people = peopleNow();
+      // Nothing is built anew when nothing that is shown changed (where the others are is told many times a second).
+      const shown = `${session.state} ${session.pending > 0} ${controller ? controller.state.autoWaits : ''} ${JSON.stringify(people.list)} ${people.more}`;
+      if (shown === barShown) return;
+      barShown = shown;
       mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending, autoWaits: controller ? controller.state.autoWaits : undefined, people });
       // Whoever listens hears of the list when it is another one.
       const key = JSON.stringify(people.list);
@@ -1827,6 +1852,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       mounted.view = view;
       mounted.editor = editor;
       view.attachCollab(session);
+      // A new editor has no bar of the room yet.
+      barShown = '';
       // The file as it is on the server is what is shown: there is nothing to save, and the next save names it.
       if (controller) controller.adopt(tag === null ? undefined : tag, true);
       touched = false;
@@ -1865,20 +1892,17 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
           controller,
           session: () => session,
           target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials, headers: saveTarget.headers } : undefined,
-          people: () => (session ? session.peers.length + 1 : 1),
+          // Those who may write: who only reads saves nothing, and is not waited for.
+          people: () => (session ? session.peers.filter((peer) => !peer.readOnly).length + (session.readOnly ? 0 : 1) : 1),
           strong: strongETag,
           readOnly: () => mounted.view.readOnly,
           // What this workbook would be written as now: with it a save of someone else is proven to hold the work done here.
           watchMs: typeof plan.options.saveWatchMs === 'number' && plan.options.saveWatchMs >= 1000 ? plan.options.saveWatchMs : undefined,
+          // What this workbook would be stored as now, written from a copy: the package of the file is not changed for it.
           ownBytes: async () => {
             if (!session) return { bytes: new Uint8Array(0), rev: undefined };
-            // A file that is written to be looked at leaves the package as it was: what it says of the room is put back.
-            const restore = file.package ? await keepStamp(file.package) : () => undefined;
-            try {
-              return await writeSharedFile(session, file.package, () => file.save());
-            } finally {
-              restore();
-            }
+            const turn = packageTurn(file);
+            return proofFile(session, () => turn.save(), (bytes) => OpcPackage.open(bytes), turn.locked);
           },
           // Part by part, unpacked: two browsers do not compress alike.
           sameFile: samePackage,

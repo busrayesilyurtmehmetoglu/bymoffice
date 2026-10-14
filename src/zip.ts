@@ -357,7 +357,24 @@ export class ZipArchive {
     }
   }
 
-  async write(): Promise<Uint8Array> {
+  /** The write that is under way: one at a time, each of the archive as it is when its turn comes. */
+  private writing: Promise<unknown> = Promise.resolve();
+
+  /**
+   * The archive as a file. Writes of one archive follow each other (a second one waits for the
+   * first), and each writes the entries as they are when it starts: what is set or deleted while
+   * it runs is in the next write, never half in this one.
+   */
+  write(): Promise<Uint8Array> {
+    const run = this.writing.then(
+      () => this.writeNow(),
+      () => this.writeNow(),
+    );
+    this.writing = run.catch(() => undefined);
+    return run;
+  }
+
+  private async writeNow(): Promise<Uint8Array> {
     // Entries the archive had come first, in its order; whatever was deleted and came back is among them again.
     let ordered = true;
     let last = -1;
@@ -380,13 +397,21 @@ export class ZipArchive {
       for (const { name } of sorted) next.set(name, this.entries.get(name) as ZipEntry);
       this.entries = next;
     }
-    for (const [name, entry] of this.entries) {
-      if (!entry.data) continue;
-      const original = this.originals.get(name);
-      if (original && (await this.isOriginal(entry, original.entry))) {
-        this.entries.set(name, original.entry);
+    // The entries of this write: fixed here, whatever becomes of the archive while they are compressed.
+    const mine = [...this.entries];
+    const written: ZipEntry[] = [];
+    for (const [name, entry] of mine) {
+      if (!entry.data) {
+        written.push(entry);
         continue;
       }
+      const original = this.originals.get(name);
+      if (original && (await this.isOriginal(entry, original.entry))) {
+        if (this.entries.get(name) === entry) this.entries.set(name, original.entry);
+        written.push(original.entry);
+        continue;
+      }
+      written.push(entry);
       const compressed = entry.data.length > 0 ? await deflate(entry.data) : entry.data;
       const useDeflate = compressed.length < entry.data.length;
       entry.method = useDeflate ? METHOD_DEFLATE : METHOD_STORE;
@@ -400,7 +425,7 @@ export class ZipArchive {
     const chunks: Uint8Array[] = [];
     const central: Uint8Array[] = [];
     let offset = 0;
-    for (const entry of this.entries.values()) {
+    for (const entry of written) {
       const name = entry.rawName ?? encoder.encode(entry.name);
       // Keep the deflate-level bits; drop the data-descriptor bit since sizes go in the header.
       let flags = entry.flags & 0x0006;

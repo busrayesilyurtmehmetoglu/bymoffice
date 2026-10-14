@@ -85,6 +85,22 @@ test('names are text that is shown: no control or direction characters, no more 
   assert.equal(cleanName('😀'.repeat(100)).length, 128, 'none of them cut in half');
   assert.equal(cleanName('x'.repeat(100000)).length, 64, 'however long it was');
   assert.equal(cleanName('a\uD83Db'), 'ab', 'half a character is none');
+  assert.equal(cleanName('a \uD83D b'), 'a b', 'and leaves one space behind, not two');
+  assert.equal(cleanName('A\u00AD\u034F\u115F\u1160\u180E\u2800\u3164\uFFA0\u206A\u206F\uFFF9\uFFFB\uFE0F\u{E0001}\u{E007F}\u{E0100}B'), 'AB', 'more of what cannot be seen is taken out');
+  // Cleaning what was cleaned changes nothing.
+  let state = 12345;
+  const random = (): number => {
+    state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+    return state / 4294967296;
+  };
+  const alphabet = ['a', 'B', ' ', '  ', '\t', '\u0000', '\u00AD', '\u200B', '\u202E', '\u2066', '\uFEFF', '\uD83D', '\uDE00', '😀', '\u{E0041}', '\uFE0F', '\u3164', 'é', '\u0301', '<', '\u2028'];
+  for (let i = 0; i < 20000; i++) {
+    let text = '';
+    for (let k = Math.floor(random() * 90); k > 0; k--) text += alphabet[Math.floor(random() * alphabet.length)];
+    const once = cleanName(text);
+    if (cleanName(once) !== once) assert.fail(`cleaning twice is not cleaning once: ${JSON.stringify(text)} -> ${JSON.stringify(once)} -> ${JSON.stringify(cleanName(once))}`);
+    if (/^\s|\s$|\s\s/.test(once) || Array.from(once).length > 64) assert.fail(`not clean: ${JSON.stringify(once)}`);
+  }
   assert.equal(cleanName('‮​ '), '', 'a name of nothing is no name');
   assert.deepEqual(cleanUser({ name: '‮', color: '#abcdef' }), { color: '#ABCDEF' }, 'and its participant is a guest');
   assert.deepEqual([initials('Ada Lovelace'), initials('ben'), initials('😀 x'), initials('')], ['AL', 'B', '😀X', '?'], 'the letters in the small circle');

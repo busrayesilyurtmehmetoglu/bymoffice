@@ -193,34 +193,49 @@ export interface SharedFile {
  * mount() saves this way, and a program that runs a CollabSession without mount() does the same,
  * then tells the room with `session.announceSaved(versions, rev)`.
  */
-export async function writeSharedFile(session: StampingSession, pkg: OpcPackage | undefined, take: () => Promise<Uint8Array>): Promise<SharedFile> {
+export async function writeSharedFile(
+  session: StampingSession,
+  pkg: OpcPackage | undefined,
+  take: () => Promise<Uint8Array>,
+  /**
+   * Runs what it is given when nothing else writes the package (see packageTurn()): the stamp and the
+   * save are one step, which no other save of the file may cut into. `take` must then not wait for that
+   * turn itself. Without it the caller sees to it that nothing else writes the package meanwhile.
+   */
+  locked: <T>(run: () => Promise<T>) => Promise<T> = (run) => run(),
+): Promise<SharedFile> {
   if (session.state === 'closed') {
     // On its own for good: the file is of no room any more.
-    if (pkg) await writeCollabStamp(pkg, undefined);
-    return { bytes: await take(), rev: undefined };
+    return locked(async () => {
+      if (pkg) await writeCollabStamp(pkg, undefined);
+      return { bytes: await take(), rev: undefined };
+    });
   }
   if (session.state === 'online') await session.whenSettled(3000);
   for (let attempt = 0; ; attempt++) {
-    const rev = session.savableRev;
-    // Never a step the file may not be of: after two tries into which something was typed, it says nothing.
-    const stamp = attempt < 2 ? session.stampNow : undefined;
-    session.pause();
-    let bytes: Uint8Array;
-    let touched = false;
-    try {
-      if (pkg && stamp !== undefined && !(await writeCollabStamp(pkg, stamp))) {
-        // The file cannot be made to say its step (its custom properties cannot be read): it is saved all the same,
-        // as the file of no step, and whoever opens it joins as with any file the room has not saved.
+    const done = await locked(async (): Promise<SharedFile | undefined> => {
+      const rev = session.savableRev;
+      // Never a step the file may not be of: after two tries into which something was typed, it says nothing.
+      const stamp = attempt < 2 ? session.stampNow : undefined;
+      session.pause();
+      let bytes: Uint8Array;
+      let touched = false;
+      try {
+        if (pkg && stamp !== undefined && !(await writeCollabStamp(pkg, stamp))) {
+          // The file cannot be made to say its step (its custom properties cannot be read): it is saved all the same,
+          // as the file of no step, and whoever opens it joins as with any file the room has not saved.
+          bytes = await take();
+          return { bytes, rev: undefined, unstamped: true };
+        }
+        if (pkg && stamp === undefined) await writeCollabStamp(pkg, undefined);
         bytes = await take();
-        return { bytes, rev: undefined, unstamped: true };
+      } finally {
+        touched = session.resume();
       }
-      if (pkg && stamp === undefined) await writeCollabStamp(pkg, undefined);
-      bytes = await take();
-    } finally {
-      touched = session.resume();
-    }
-    if (touched && stamp !== undefined) continue;
-    return { bytes, rev: touched ? undefined : rev };
+      if (touched && stamp !== undefined) return undefined;
+      return { bytes, rev: touched ? undefined : rev };
+    });
+    if (done) return done;
   }
 }
 
@@ -239,13 +254,23 @@ export async function samePackage(a: Uint8Array, b: Uint8Array): Promise<boolean
     const names = first.names().slice().sort();
     const others = second.names().slice().sort();
     if (names.length !== others.length) return false;
-    for (let i = 0; i < names.length; i++) if (names[i] !== others[i]) return false;
+    // Before anything is unpacked: the same names, each part as long as its counterpart says it is, and no more in
+    // all than is looked at. (A part that claims to unpack to more than its counterpart is another part: a file
+    // that is small and unpacks to gigabytes is turned away here, by what its directory says.)
     let total = 0;
+    for (let i = 0; i < names.length; i++) {
+      if (names[i] !== others[i]) return false;
+      const x = first.entry(names[i]);
+      const y = second.entry(names[i]);
+      if (!x || !y || x.uncompressedSize !== y.uncompressedSize) return false;
+      total += x.uncompressedSize * 2;
+      if (total > MAX_COMPARED_BYTES) return false;
+    }
+    // Unpacking stops at the length the directory gave (the reader of archives sees to that).
     for (const name of names) {
       const x = await first.read(name);
       const y = await second.read(name);
-      total += x.length + y.length;
-      if (total > MAX_COMPARED_BYTES || x.length !== y.length) return false;
+      if (x.length !== y.length) return false;
       for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
     }
     return true;
@@ -255,22 +280,39 @@ export async function samePackage(a: Uint8Array, b: Uint8Array): Promise<boolean
 }
 
 /**
- * Remembers what the package says of a room, and answers what puts it back: for a file that is
- * written only to be looked at (the proof that a save of someone else holds this workbook), which is
- * to leave the package as a save of the user left it.
+ * The file this workbook would be stored as now, to compare with what someone else stored: written from
+ * a COPY of the package, which gets the stamp, so that the package of the file itself is read and never
+ * changed for it. `save`: the bytes of the file as it is (called with the turn of the package held);
+ * `open`: a package of bytes. `rev` undefined: the file of no one step (something of this participant
+ * waits, was typed meanwhile, or the bytes are no package - a file that is kept with a password).
  */
-export async function keepStamp(pkg: OpcPackage): Promise<() => void> {
-  const kept: [string, Uint8Array | undefined][] = [];
-  try {
-    const part = (await partOf(pkg)) || DEFAULT_PART;
-    for (const name of [part, '/_rels/.rels']) kept.push([name, pkg.hasPart(name) ? await pkg.readPart(name) : undefined]);
-  } catch {
-    return () => undefined;
-  }
-  return () => {
-    for (const [name, bytes] of kept) {
-      if (bytes) pkg.writePart(name, bytes);
-      else if (pkg.hasPart(name)) pkg.deletePart(name);
+export async function proofFile(
+  session: StampingSession,
+  save: () => Promise<Uint8Array>,
+  open: (bytes: Uint8Array) => Promise<OpcPackage>,
+  locked: <T>(run: () => Promise<T>) => Promise<T> = (run) => run(),
+): Promise<{ bytes: Uint8Array; rev: number | undefined }> {
+  if (session.state !== 'online') return { bytes: new Uint8Array(0), rev: undefined };
+  await session.whenSettled(3000);
+  const taken = await locked(async () => {
+    const rev = session.savableRev;
+    const stamp = session.stampNow;
+    session.pause();
+    let bytes: Uint8Array;
+    let touched = false;
+    try {
+      bytes = await save();
+    } finally {
+      touched = session.resume();
     }
-  };
+    return { bytes, rev: touched ? undefined : rev, stamp: touched ? undefined : stamp };
+  });
+  if (taken.rev === undefined || taken.stamp === undefined) return { bytes: taken.bytes, rev: undefined };
+  try {
+    const copy = await open(taken.bytes);
+    if (!(await writeCollabStamp(copy, taken.stamp))) return { bytes: taken.bytes, rev: undefined };
+    return { bytes: await copy.save(), rev: taken.rev };
+  } catch {
+    return { bytes: taken.bytes, rev: undefined };
+  }
 }

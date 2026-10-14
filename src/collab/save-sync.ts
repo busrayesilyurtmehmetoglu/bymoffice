@@ -65,6 +65,8 @@ export const PROOF_MAX_BYTES = 32 * 1024 * 1024;
 export const PROOF_DELAY_MS = 400;
 /** For how long what the server said of the name of the file is taken to hold when the same name is said again. */
 export const CONFIRMED_FOR_MS = 5000;
+/** The widest those who wait are spread, however many they are. */
+export const WATCH_SPREAD_MAX_MS = 30000;
 /** How far apart, for each further participant, those who wait are spread. */
 export const WATCH_SLOT_MS = 3000;
 /** The least time this side's own work waits for a save of the room before this side saves it itself. */
@@ -146,6 +148,8 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     return found;
   };
   const nowMs = (): number => (host.now ? host.now() : Date.now());
+  /** Tags the server itself was found to name the file otherwise than: a word of one of them is no hint of anything. */
+  const refuted = new Set<string>();
   const asks = async (tag: string): Promise<boolean> => {
     const target = host.target;
     if (!target || !ask || host.strong(tag) === undefined) return false;
@@ -160,7 +164,13 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
         if (answer.body) void answer.body.cancel().catch(() => undefined);
         return same;
       }
-      return answer.ok && host.strong(answer.headers.get('ETag')) === tag;
+      const named = answer.ok ? host.strong(answer.headers.get('ETag')) : undefined;
+      // The server names the file otherwise: what was said is no longer so (or never was), and leads nowhere.
+      if (named !== undefined && named !== tag) {
+        refuted.add(tag);
+        if (refuted.size > 64) refuted.delete(refuted.values().next().value as string);
+      }
+      return named === tag;
     } catch {
       return false;
     }
@@ -183,8 +193,8 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     } finally {
       checking--;
       // Whoever waited for this hears whether it moved what the file is known by.
+      // (A word that could not be confirmed ends nobody's wait: the one that can be may be a moment behind it.)
       if (host.controller.currentETag !== before) answer(true);
-      else if (checking === 0) answer(false);
     }
   };
 
@@ -200,7 +210,8 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
     const now = host.session();
     if (!now || now !== session || now.state !== 'online') return;
     // Not found to be so: nothing is taken to be saved. The ETag is only tried, as a condition, if a save here meets a conflict.
-    if (!stored) return host.controller.hint(tag);
+    // (Only when the server could not be asked: a name the server itself says is not the file's is no hint of anything.)
+    if (!stored) return refuted.has(tag) ? undefined : host.controller.hint(tag);
     // Saved here as well only when this workbook is, right now, the workbook of the step that was saved.
     const atStep = !stale && said.rev !== undefined && now.rev === said.rev && now.pending === 0;
     if (!host.controller.ownChanges) {
@@ -282,14 +293,18 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
   let watch: (() => void) | undefined;
   /** How long this side's own work waits for the one who saves for all: five delays of auto-save, a quarter more or less. */
   let patience: number | undefined;
+  const baseMs = (): number => {
+    const auto = host.controller.autoSave;
+    return host.watchMs !== undefined ? host.watchMs : Math.max(WATCH_MIN_MS, (auto ? auto.delayMs : 0) * 5);
+  };
   const watchMs = (): number => {
     if (patience === undefined) {
-      const auto = host.controller.autoSave;
-      const base = host.watchMs !== undefined ? host.watchMs : Math.max(WATCH_MIN_MS, (auto ? auto.delayMs : 0) * 5);
-      // Wider apart the more there are: one save takes a moment, and the word of it clears the others before
-      // their turn comes. (A quarter of the wait at least, for two.)
+      const base = baseMs();
+      // Wider apart the more there are who may stand in (those who write; who only reads saves nothing): one save
+      // takes a moment, and the word of it clears the others before their turn comes. A quarter of the wait at
+      // least, for two; half a minute at most, however many there are.
       const people = Math.max(2, host.people ? host.people() : 2);
-      const spread = Math.max(base * 0.25, (people - 1) * WATCH_SLOT_MS);
+      const spread = Math.min(WATCH_SPREAD_MAX_MS, Math.max(base * 0.25, (people - 1) * WATCH_SLOT_MS));
       patience = Math.round(base + spread * (host.random ? host.random() : Math.random()));
     }
     return patience;
@@ -370,16 +385,25 @@ export function createSaveSync(host: SaveSyncHost): SaveSync {
   };
 
   let wasOnline = false;
+  let awaySince: number | undefined;
   const roomChanged = (): void => {
     const session = host.session();
     const online = session !== undefined && session.state === 'online';
-    // Back in the room: the wait starts over, for everybody at a moment of their own. (Who waited through the
-    // time the room could not be reached would otherwise all stand in at once.)
+    if (!online && awaySince === undefined) awaySince = clock();
+    // Back in the room after a long time away: everybody who waited through it would stand in at once. Each
+    // gets a moment of its own within the spread instead - and no more than that: the wait itself is over.
+    // After a short break (a connection that comes and goes) the wait goes on where it was; a room that is
+    // lost every few seconds does not keep work unsaved for ever.
     if (online && !wasOnline) {
-      ownSince = undefined;
-      standingIn = false;
-      if (watch) watch();
-      watch = undefined;
+      const away = awaySince === undefined ? 0 : clock() - awaySince;
+      if (ownSince !== undefined && away >= baseMs()) {
+        patience = undefined;
+        ownSince = clock() - baseMs();
+        standingIn = false;
+        if (watch) watch();
+        watch = undefined;
+      }
+      awaySince = undefined;
     }
     wasOnline = online;
     // Also when nothing is to be sent: why auto-save waits is another thing now.

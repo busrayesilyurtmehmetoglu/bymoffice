@@ -66,6 +66,14 @@ function versions(value: unknown, min: number): string[] {
 }
 
 /** A name and a colour as they may be shown: plain text of one line, a colour of six hex digits. */
+/**
+ * Characters that take no room or turn the text around: the soft hyphen, the combining grapheme joiner, the
+ * Arabic letter mark, Hangul fillers, the Mongolian vowel separator, spaces and joiners of no width, marks,
+ * embeddings, overrides and isolates of direction, deprecated format characters, the byte order mark, the
+ * interlinear annotation marks, the blank of Braille, variation selectors, and the block of tags.
+ */
+const INVISIBLE = /[\u00AD\u034F\u061C\u115F\u1160\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\u2800\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB]|\uDB40[\uDC00-\uDFFF]/g;
+
 /** Most code points of a name that is shown. */
 export const MAX_NAME_LENGTH = 64;
 
@@ -77,16 +85,17 @@ export const MAX_NAME_LENGTH = 64;
  * (never through one).
  */
 export function cleanName(value: string): string {
-  const plain = value
-    .slice(0, 4096)
+  // In this order, so that cleaning what was cleaned changes nothing: halves of characters go first, then what
+  // cannot be seen, then space is made one, the ends are trimmed, and the length is cut (and trimmed again).
+  const whole = Array.from(value.slice(0, 4096))
+    .filter((point) => !(point.length === 1 && point.charCodeAt(0) >= 0xd800 && point.charCodeAt(0) <= 0xdfff))
+    .join('');
+  const plain = whole
     .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]+/g, ' ')
-    .replace(/[\u061C\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, '')
+    .replace(INVISIBLE, '')
     .replace(/\s+/g, ' ')
     .trim();
-  const points = Array.from(plain);
-  // A half of a pair that stands alone is no character.
-  const whole = points.filter((point) => !(point.length === 1 && point.charCodeAt(0) >= 0xd800 && point.charCodeAt(0) <= 0xdfff));
-  return whole.slice(0, MAX_NAME_LENGTH).join('').trim();
+  return Array.from(plain).slice(0, MAX_NAME_LENGTH).join('').trim();
 }
 
 export function cleanUser(value: unknown): CollabUser {

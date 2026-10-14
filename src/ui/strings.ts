@@ -344,7 +344,7 @@ export interface UiStrings {
     typedKept(text: string): string;
     autoWaits: { room: string; offline: string };
     /** The question when the stored file is another one than the workbook that was kept apart from its room was opened as. */
-    fork: { title: string; question: string; load: string; save: string; download: string; downloaded: string };
+    fork: { title: string; question: string; load: string; save: string; download: string; downloaded: string; downloadFailed: string };
     noStamp: string;
     copySheet: string;
     /** A chart is not cut while the workbook is edited together: it was copied, and stays where it is. */
@@ -928,7 +928,8 @@ export const STRINGS_EN: UiStrings = {
       load: 'Load the stored file',
       save: 'Save mine over it',
       download: 'Download my copy',
-      downloaded: 'Your copy was downloaded.',
+      downloaded: 'The download of your copy was started. Check that the file is there before you load the stored one.',
+      downloadFailed: 'Your copy could not be downloaded here. Nothing was changed: your workbook is as it was.',
     },
     autoWaits: { room: 'Not saved yet: another participant saves for all', offline: 'Not saved: auto-save waits for the connection. Save to store the file now' },
     typedKept: (text) => `The file is loaded again, and what you were typing was not applied. You typed: ${text}`,
@@ -1521,7 +1522,8 @@ export const STRINGS_TR: UiStrings = {
       load: 'Saklanan dosyayı yükle',
       save: 'Benimkini üzerine kaydet',
       download: 'Kopyamı indir',
-      downloaded: 'Kopyanız indirildi.',
+      downloaded: 'Kopyanızın indirilmesi başlatıldı. Saklanan dosyayı yüklemeden önce dosyanın indiğini denetleyin.',
+      downloadFailed: 'Kopyanız burada indirilemedi. Hiçbir şey değişmedi: kitabınız olduğu gibi duruyor.',
     },
     autoWaits: { room: 'Henüz kaydedilmedi: herkes için başka bir katılımcı kaydediyor', offline: 'Kaydedilmedi: kendiliğinden kaydetme bağlantıyı bekliyor. Şimdi saklamak için Kaydet' },
     typedKept: (text) => `Dosya yeniden yükleniyor; yazmakta olduğunuz uygulanmadı. Yazdığınız: ${text}`,

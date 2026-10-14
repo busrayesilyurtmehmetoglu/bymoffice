@@ -137,9 +137,9 @@ test('a part of custom properties that cannot be read is not touched, and the fi
   assert.match(decoder.decode(await pkg.readPart(CUSTOM)), /pid="3" name="BymOfficeCollab"/, 'the least number from 2 that nobody has');
 });
 
-test('two files are the same file when their parts are, however they were packed; and a file that is written to be looked at leaves the package as it was', async () => {
+test('two files are the same file when their parts are, however they were packed', async () => {
   const { ZipArchive } = await import('../src/index');
-  const { keepStamp, samePackage } = await import('../src/formats/xlsx/collab-stamp');
+  const { samePackage } = await import('../src/formats/xlsx/collab-stamp');
   const bytes = await startFile();
   const archive = ZipArchive.read(bytes);
   // The same parts, written in the opposite order (and so as other bytes).
@@ -163,29 +163,35 @@ test('two files are the same file when their parts are, however they were packed
   assert.equal(await samePackage(bytes, await more.write()), false, 'a part more is another file');
   assert.equal(await samePackage(await more.write(), bytes), false, 'either way round');
   assert.equal(await samePackage(bytes, new Uint8Array([1, 2, 3])), false, 'what is no archive is no file');
-  // The proof: a stamp is written for it, and taken back.
-  const file = await open(bytes);
-  const pkg = file.package!;
-  const before = pkg.partNames().slice().sort();
-  const restore = await keepStamp(pkg);
-  await writeCollabStamp(pkg, { ep: 'room', rev: 3 });
-  assert.notDeepEqual(pkg.partNames().slice().sort(), before, 'the stamp is in the package while the file is written');
-  restore();
-  assert.deepEqual(pkg.partNames().slice().sort(), before, 'and not afterwards: the package has the parts it had');
-  assert.equal(await readCollabStamp(pkg), undefined, 'it says nothing of a room');
-  assert.equal(await samePackage(await pkg.save(), bytes), true, 'a save of it is the file as it was');
-  // One that had a stamp keeps the stamp it had.
-  await writeCollabStamp(pkg, { ep: 'mine', rev: 1 });
-  const again = await keepStamp(pkg);
-  await writeCollabStamp(pkg, { ep: 'room', rev: 9 });
-  again();
-  assert.deepEqual(await readCollabStamp(pkg), { ep: 'mine', rev: 1 }, 'the stamp of the last save of the user is back');
+  // A file that unpacks to far more than it is: turned away by what its directory says, with nothing unpacked.
+  const bomb = ZipArchive.read(bytes);
+  bomb.set(sheet, new Uint8Array(24 * 1024 * 1024));
+  const small = await bomb.write();
+  assert.ok(small.length < bytes.length + 64 * 1024, `the file is small (${small.length} bytes) and its part is 24 MiB`);
+  const reads: string[] = [];
+  const read = ZipArchive.prototype.read;
+  ZipArchive.prototype.read = function (this: InstanceType<typeof ZipArchive>, name: string) {
+    reads.push(name);
+    return read.call(this, name);
+  };
+  try {
+    assert.equal(await samePackage(small, bytes), false, 'another file');
+    assert.equal(await samePackage(bytes, small), false, 'either way round');
+    assert.deepEqual(reads, [], 'and not one part was unpacked to find that out');
+    assert.equal(await samePackage(bytes, await more.write()), false, 'nor for a file with other parts');
+    assert.deepEqual(reads, [], 'whose names say so');
+    assert.equal(await samePackage(bytes, other), true, 'the same file is unpacked and compared');
+    assert.equal(reads.length, names.length * 2, 'every part of both, once');
+  } finally {
+    ZipArchive.prototype.read = read;
+  }
 });
 
-test('save after save, the file one participant stores is the file another would write at that step - also after it wrote one only to look', async () => {
+test('save after save, the file one participant stores is the file another would write at that step - and writing one to compare changes nothing of the package', async () => {
   const { Net, act, join, saveOf, seeded } = await import('./collab-fixtures');
-  const { keepStamp, samePackage } = await import('../src/formats/xlsx/collab-stamp');
-  const { writeXlsx } = await import('../src/formats/xlsx/write');
+  const { proofFile, samePackage } = await import('../src/formats/xlsx/collab-stamp');
+  const { packageTurn } = await import('../src/package-turn');
+  const { OpcPackage } = await import('../src/index');
   const { setCellInput } = await import('../src/ops/commands');
   const bytes = await startFile();
   const net = new Net();
@@ -197,16 +203,16 @@ test('save after save, the file one participant stores is the file another would
     const who = round % 2 === 0 ? b : a;
     act(who, () => setCellInput(who.wb, 0, 12 + round, 0, `typed in round ${round}`));
     net.drain(random);
-    // The one saves (its package keeps the stamp of every save); the other writes its file to compare, and puts its package back.
+    // The one saves (its package keeps the stamp of every save); the other writes its file to compare.
     const stored = await saveOf(a);
     const pkg = b.file.package!;
-    const restore = await keepStamp(pkg);
-    const own = await writeSharedFile(b.session, pkg, async () => {
-      await writeXlsx(pkg, b.wb);
-      return pkg.save();
-    });
-    restore();
+    const before = [pkg.partNames().slice().sort().join(), await readCollabStamp(pkg)];
+    const turn = packageTurn(b.file);
+    const own = await proofFile(b.session, () => turn.save(), (given) => OpcPackage.open(given), turn.locked);
     assert.equal(own.rev, round + 1, `round ${round}: the file of the step`);
     assert.equal(await samePackage(stored, own.bytes), true, `round ${round}: the same file, part for part`);
+    assert.deepEqual([pkg.partNames().slice().sort().join(), await readCollabStamp(pkg)], before, `round ${round}: the package has the parts and the stamp it had (none: this participant never saved)`);
+    // In round 2 this participant saves as well: from then on its package carries a stamp of its own, and the proof still holds.
+    if (round === 1) await saveOf(b);
   }
 });

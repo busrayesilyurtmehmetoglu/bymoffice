@@ -22,6 +22,7 @@ import { askOverwrite, editorRootIn } from '../ui/save-confirm';
 import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
 import { readCollabStamp, writeSharedFile, type CollabStamp } from '../formats/xlsx/collab-stamp';
 import { listPeople } from '../collab/people';
+import { packageTurn } from '../package-turn';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabTransport, type CollabUser } from '../collab/index';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
@@ -1797,7 +1798,9 @@ export function createBridge(host: BridgeHost): Bridge {
   const sharedBytes = async (current: Shown): Promise<Uint8Array> => {
     const session = current.collab;
     if (!session) return current.file.save();
-    const done = await writeSharedFile(session, current.file.package, () => current.file.save());
+    // The stamp and the save are one step under the turn of the package.
+    const turn = packageTurn(current.file);
+    const done = await writeSharedFile(session, current.file.package, () => turn.save(), turn.locked);
     // Told to the others only once the application says it has stored the file (see userSaver()).
     if (session.state !== 'closed') current.written = done;
     return done.bytes;

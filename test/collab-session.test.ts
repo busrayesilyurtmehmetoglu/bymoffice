@@ -1133,3 +1133,25 @@ test('the relay of the page takes only so many joins a minute of one connection;
   for (const run of due) run();
   assert.equal(said(), 2, 'once, for all three');
 });
+
+test('a save that was made while the room could not be reached is said when the room is back', async () => {
+  const bytes = await startFile();
+  const net = new Net();
+  const random = seeded(61);
+  const heard: string[][] = [];
+  const a = await join(net, 'a', bytes);
+  const b = await join(net, 'b', bytes, { onSaved: (saved) => heard.push(saved.versions) });
+  net.drain(random);
+  a.transport.suspend();
+  net.drain(random);
+  a.session.announceSaved(['e:"saved-offline"'], a.session.savableRev);
+  net.drain(random);
+  assert.deepEqual(heard, [], 'nobody hears of it while its participant is out of reach');
+  a.transport.resume();
+  net.drain(random);
+  assert.deepEqual(heard, [['e:"saved-offline"']], 'the others hear of it when it is back: the file is known by another name now, and their next save is no conflict');
+  a.transport.suspend();
+  a.transport.resume();
+  net.drain(random);
+  assert.equal(heard.length, 1, 'once');
+});

@@ -14,7 +14,7 @@ const settle = async () => {
 
 /** A file on a server that names it by an ETag, the controller of one participant, and that participant's session as the test sets it. */
 function rig(options: { head?: boolean; typing?: () => boolean } = {}) {
-  const server = { etag: '"v1"', puts: [] as { match: string | undefined }[], heads: 0, gets: 0, answer: undefined as number | undefined };
+  const server = { etag: '"v1"', puts: [] as { match: string | undefined }[], heads: 0, gets: 0, answer: undefined as number | undefined, down: false };
   const session: { state: SyncSession['state']; rev: number; pending: number; leads: boolean } = { state: 'online', rev: 3, pending: 0, leads: true };
   const asked: string[] = [];
   const serve = (async (_url: unknown, init?: RequestInit) => {
@@ -22,6 +22,7 @@ function rig(options: { head?: boolean; typing?: () => boolean } = {}) {
     const headers = ((init && init.headers) || {}) as { [name: string]: string };
     const reply = (status: number, etag?: string) => ({ status, ok: status >= 200 && status < 300, headers: { get: (name: string) => (name.toLowerCase() === 'etag' && etag !== undefined ? etag : null) }, body: { cancel: async () => undefined } }) as unknown as Response;
     if (method === 'HEAD') {
+      if (server.down) throw new TypeError('no connection');
       server.heads++;
       return options.head === false ? reply(405) : reply(200, server.etag);
     }
@@ -108,16 +109,26 @@ test('an ETag that could not be confirmed is only a condition to try once after 
   const r = rig();
   r.controller.changed();
   r.server.etag = '"v2"';
-  // The server cannot be asked right now (it answers the question with an error).
-  const real = r.server.etag;
-  r.server.etag = '"hidden"';
+  // The server cannot be asked right now (the question does not get through).
+  r.server.down = true;
   await r.sync.saved({ versions: ['e:"v2"'], rev: 3 });
-  r.server.etag = real;
+  r.server.down = false;
   assert.equal(r.controller.currentETag, '"v1"', 'not taken');
   const done = r.controller.saveNow();
   await settle();
   assert.deepEqual(r.server.puts.map((put) => put.match), ['"v1"', '"v2"'], 'the save meets a conflict and is tried once with what was said, as a condition');
   assert.equal(await done, true, 'which the server takes');
+  // A name the server itself says is not the file's is no hint: a save that meets a conflict is not sent again with it.
+  r.controller.changed();
+  await r.sync.saved({ versions: ['e:"never-was"'], rev: 3 });
+  r.server.etag = '"moved"';
+  const before = r.server.puts.length;
+  const refused = r.controller.saveNow();
+  await settle();
+  assert.deepEqual(r.server.puts.slice(before).map((put) => put.match), ['"v3"'], 'sent once, with the name it knows; not again with what was refuted');
+  r.controller.dismissConflict();
+  assert.equal(await refused, false, 'the conflict is the user\'s');
+  r.asked.length = 0;
   // The same with a lie: the condition does not hold, and the user is asked.
   r.controller.changed();
   r.server.etag = '"elsewhere"';
@@ -172,7 +183,7 @@ test('when the room asks for a save, the one who leads saves, as a save nobody a
  * server that takes a save only when it is conditional on what the file is known by. A workbook is
  * the list of what was typed, in the order of the room; its file is that list as bytes, with the step.
  */
-function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => void; put?: (name: string, texts: string[]) => void } = {}) {
+function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => void; put?: (name: string, texts: string[]) => void; latency?: () => number } = {}) {
   const encoder = new TextEncoder();
   const fileOf = (book: string[], rev: number): Uint8Array => encoder.encode(JSON.stringify({ rev, book }));
   const server = { etag: '"v1"', n: 1, body: fileOf([], 0), puts: [] as { by: string; match: string | undefined; status: number }[], gets: [] as string[], asked: [] as (string | undefined)[] };
@@ -196,6 +207,8 @@ function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => 
           body: { cancel: async () => undefined },
           arrayBuffer: async () => (body || new Uint8Array(0)).slice().buffer,
         }) as unknown as Response;
+      // An answer of the server takes its time, when the test says so: saves and words of saves cross each other.
+      if (options.latency) await new Promise<void>((resolve) => void timer(resolve, options.latency!()));
       if (method !== 'PUT') server.asked.push(headers['X-Who']);
       if (method === 'HEAD') return reply(200, server.etag);
       if (method !== 'PUT') {
@@ -553,4 +566,71 @@ test('work that was proven to be saved is saved like anybody\'s from then on: th
   assert.ok(r.server.gets.filter((who) => who === 'c').length <= 10, 'who types is the one who looks');
   // What the page sends with a save to say who it is goes with the questions as well; what is about a body or a condition does not.
   assert.deepEqual(Array.from(new Set(r.server.asked)), ['a user'], 'every HEAD and GET carried the header of the page');
+});
+
+test(`among honest people, with a server that takes its time, nobody is ever asked whether to write over a save of the room (${RUNS * 4} runs); a change from outside the room still is`, async () => {
+  let saves = 0;
+  let met = 0;
+  for (let seed = 1; seed <= RUNS * 4; seed++) {
+    let state = seed * 40503;
+    const random = (): number => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const count = 2 + (seed % 3);
+    const r = room(count, { auto: Array.from({ length: count }, () => random() < 0.7), latency: () => 10 + Math.floor(random() * 390) });
+    for (let tick = 0; tick < 30; tick++) {
+      const roll = random();
+      const who = Math.floor(random() * count);
+      if (roll < 0.45) r.edit(who, `s${seed}-${tick}`);
+      else if (roll < 0.65) void r.sides[who].controller.saveNow();
+      else await r.pass(Math.floor(random() * 3000));
+    }
+    await r.pass(120000);
+    saves += r.server.puts.length;
+    met += r.server.puts.filter((put) => put.status === 412).length;
+    for (const side of r.sides) assert.deepEqual(side.asked, [], `seed ${seed}: ${side.name} was asked about a conflict with a save of the room (puts ${r.server.puts.map((put) => `${put.by}${put.status}`).join(' ')})`);
+  }
+  assert.ok(met > 0 && saves > RUNS * 4, `saves met each other (${met} of ${saves}), and nobody was asked`);
+  // Someone outside the room writes the file: that is a conflict, and the user who saves is asked, soon.
+  const r = room(2, { auto: [false, false] });
+  r.edit(1, 'mine');
+  r.server.etag = '"written elsewhere"';
+  const saving = r.sides[1].controller.saveNow();
+  await r.pass(6000);
+  assert.deepEqual(r.sides[1].asked, ['asked'], 'asked, within a few seconds');
+  r.sides[1].controller.dismissConflict();
+  assert.equal(await saving, false, 'and nothing is written over what was written elsewhere');
+});
+
+test('a connection that comes and goes does not keep work unsaved: the wait goes on through short breaks; and those who only read are not waited for', async () => {
+  // The saver has auto-save off; the other loses the room for a second every ten.
+  const r = room(2, { auto: [false, true] });
+  const b = r.sides[1];
+  r.edit(1, 'typed by b');
+  for (let i = 0; i < 12 && r.server.puts.length === 0; i++) {
+    await r.pass(9000);
+    b.session.state = 'offline';
+    b.sync.roomChanged();
+    await r.pass(1000);
+    b.session.state = 'online';
+    b.sync.roomChanged();
+  }
+  await r.pass(5000);
+  assert.deepEqual(r.stored(), ['typed by b'], 'saved, though the room was lost every ten seconds');
+  assert.ok(r.server.puts.length >= 1 && b.controller.dirty === false, 'by the one who waited');
+  // The spread among those who wait is of those who may stand in, and half a minute at most.
+  const { WATCH_MIN_MS, WATCH_SPREAD_MAX_MS, createSaveSync: make } = await import('../src/collab/save-sync');
+  for (const [people, most] of [[2, WATCH_MIN_MS * 1.25], [5, WATCH_MIN_MS + 12000], [500, WATCH_MIN_MS + WATCH_SPREAD_MAX_MS]] as [number, number][]) {
+    let clock = 0;
+    let due: { run: () => void; at: number } | undefined;
+    let rearmed = -1;
+    const controller = { currentETag: '"x"', dirty: true, ownChanges: true, adopt: () => undefined, hint: () => undefined, changed: () => undefined, saveQuietly: async () => false, rearm: () => void (rearmed = rearmed < 0 && due === undefined ? clock : rearmed), autoSave: { delayMs: 1000 }, changes: 0, saving: false };
+    const sync = make({ controller, session: () => ({ state: 'online', rev: 1, pending: 0, leads: false }), target: undefined, strong: (tag) => tag || undefined, readOnly: () => false, people: () => people, random: () => 0.999, now: () => clock, timer: (run, ms) => ((due = { run, at: clock + ms }), () => (due = undefined)) });
+    sync.localChanged();
+    assert.ok(due !== undefined && (due as { at: number }).at <= most + 1 && (due as { at: number }).at > WATCH_MIN_MS, `${people} who may write: the longest wait is ${due ? (due as { at: number }).at : '?'} ms, no more than ${most}`);
+  }
 });

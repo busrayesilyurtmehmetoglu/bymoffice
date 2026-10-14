@@ -7,7 +7,7 @@
 // answered with "nack" to its author alone. Whoever joins gets the log from where its file
 // (or its last step) is. Selections and "saved" are passed on and not kept in the log.
 
-import { TAB_ALIVE_MS } from './transport';
+import { TAB_ALIVE_MS, TAB_SILENT_MS } from './transport';
 import { MAX_MESSAGE_CHARS, MAX_PRESENCE_BYTES, parseClientMessage, utf8Length, type CollabUser, type ServerMessage } from './protocol';
 import type { CollabTransport } from './session';
 
@@ -416,7 +416,7 @@ export class MemoryServer {
     const sweep = setInterval(() => {
       const now = clock();
       connections.forEach((connection, from) => {
-        if (now - (heard.get(from) || 0) <= TAB_ALIVE_MS * 3.5) return;
+        if (now - (heard.get(from) || 0) <= TAB_SILENT_MS) return;
         this.drop(connection);
         connections.delete(from);
         heard.delete(from);

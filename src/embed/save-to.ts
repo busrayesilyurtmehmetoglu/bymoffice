@@ -623,6 +623,8 @@ export class SaveController implements SaveCommand {
   private error: string | undefined;
   private etag: string | undefined;
   private hinted: string | undefined;
+  /** What the file was known by before (the latest few): see hint(). */
+  private pastTags: string[] = [];
   /** Something was changed here, by this side itself, that no save of this side holds. */
   private own = false;
   private ownAtSave = false;
@@ -796,7 +798,12 @@ export class SaveController implements SaveCommand {
   adopt(etag: string | undefined, clean: boolean): void {
     if (this.destroyed) return;
     const strong = strongETag(etag);
-    if (strong !== undefined) this.etag = strong;
+    // (A name the file was known by before is not taken again: word of it arrived late.)
+    if (strong !== undefined && this.pastTags.indexOf(strong) < 0) {
+      const from = this.etag;
+      this.etag = strong;
+      this.moved(from);
+    }
     if (clean && !this.busy) {
       this.savedCount = this.count;
       // The file holds everything, this side's own work too: from here on it is saved like anybody's, and auto-save,
@@ -838,7 +845,21 @@ export class SaveController implements SaveCommand {
    */
   hint(etag: string | undefined): void {
     if (this.destroyed) return;
-    this.hinted = strongETag(etag);
+    const strong = strongETag(etag);
+    // Only forward: a name the file was known by before (or is known by now) leads nowhere it has not been.
+    if (strong === undefined || strong === this.etag || this.pastTags.indexOf(strong) >= 0) return;
+    this.hinted = strong;
+  }
+
+  /** The file is known by another name now: the one before it is remembered as past, and a hint that is past is dropped. */
+  private moved(from: string | undefined): void {
+    if (from === this.etag) return;
+    if (from !== undefined) {
+      this.pastTags.push(from);
+      if (this.pastTags.length > 64) this.pastTags.shift();
+    }
+    // What was hinted before the file moved on names a file that is behind it.
+    this.hinted = undefined;
   }
 
   run(): void {
@@ -1285,11 +1306,13 @@ export class SaveController implements SaveCommand {
       // Someone the file is edited together with saved it while this save was on its way (see adopt()):
       // the conflict is with a file this side has heard of since, and the save is sent again with its name.
       // (In a room several may save one after the other: each such conflict is explained by a save that is heard of, and tried again.)
-      if (error instanceof SaveError && error.code === 'conflict' && !overwrite && tries < (host.conflictWait ? 6 : 2)) {
+      if (error instanceof SaveError && error.code === 'conflict' && !overwrite && tries < (host.conflictWait ? 20 : 2)) {
         if (this.etag !== sentWith) return this.start(overwrite, auto, tries + 1);
         if (this.hinted !== undefined && this.hinted !== sentWith) {
+          const from = this.etag;
           this.etag = this.hinted;
           this.hinted = undefined;
+          this.moved(from);
           return this.start(overwrite, auto, tries + 1);
         }
         if (host.conflictWait) {
@@ -1540,7 +1563,11 @@ export class SaveController implements SaveCommand {
           if (status >= 200 && status < 300) {
             // What the server holds now. Without a new ETag the old one names a file that is gone:
             // sending it again would have every later save refused.
-            if (target.sameAsFile) this.etag = strongETag(response.headers && typeof response.headers.get === 'function' ? response.headers.get('etag') : undefined);
+            if (target.sameAsFile) {
+              const was = this.etag;
+              this.etag = strongETag(response.headers && typeof response.headers.get === 'function' ? response.headers.get('etag') : undefined);
+              this.moved(was);
+            }
             return end();
           }
           if (status === 412) return end(new SaveError('conflict', 'The file on the server is not the one that was opened (HTTP 412)', status));

@@ -303,6 +303,8 @@ export class CollabSession {
   private versions: string[];
   private me = '';
   private resendTimer: (() => void) | undefined;
+  /** A save was made while the room could not be reached, and nobody was told. */
+  private savedUnsaid = false;
   private seenAs: CollabUser | undefined;
   private others: Map<string, PeerMessage> = new Map();
   private peerList: CollabPeer[] = [];
@@ -872,6 +874,9 @@ export class CollabSession {
         for (const peer of message.peers) this.others.set(peer.id, peer);
         this.refreshPeers();
         this.setState('online');
+        // A save that was made while the room could not be reached is said now.
+        if (this.savedUnsaid && this.lastSaved) this.send(this.lastSaved);
+        this.savedUnsaid = false;
         // The selection is told anew: the relay does not remember it across connections.
         this.presenceSent = '';
         this.flushPresence();
@@ -1038,6 +1043,7 @@ export class CollabSession {
     this.pendingSteps = [];
     this.wanted = [];
     this.lastSaved = undefined;
+    this.savedUnsaid = false;
     this.flying = undefined;
     this.joined = false;
     this.epoch = undefined;
@@ -1092,6 +1098,7 @@ export class CollabSession {
     this.reloading = true;
     this.wanted = [];
     this.lastSaved = undefined;
+    this.savedUnsaid = false;
     this.pendingSteps = [];
     this.flying = undefined;
     this.undoStack = [];
@@ -1350,10 +1357,15 @@ export class CollabSession {
   /** Tells the others that the file was saved: what it is known by now and, when known, the step it holds. */
   announceSaved(versions: string[], rev: number | undefined): void {
     const v = versions.filter((version) => typeof version === 'string' && version !== '' && version.length <= 200).slice(0, 8);
-    if (v.length === 0 || this.current !== 'online') return;
+    if (v.length === 0 || this.current === 'closed' || this.current === 'detached') return;
     const message: ClientMessage = { t: 'saved', v };
     if (rev !== undefined) message.rev = rev;
     this.lastSaved = message;
+    // Out of reach of the room: said when it is reached again (the others would meet a conflict with a file nobody told them of).
+    if (this.current !== 'online') {
+      this.savedUnsaid = true;
+      return;
+    }
     this.send(message);
   }
 }

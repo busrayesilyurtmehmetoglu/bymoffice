@@ -185,6 +185,11 @@ export interface BroadcastTransportOptions {
  */
 /** How often a tab tells the relay of a page that it is still there; three times as long without a word, and the relay lets it go. */
 export const TAB_ALIVE_MS = 10000;
+/**
+ * How long a tab may be silent before the relay of a page lets it go: far longer than the beat, because a
+ * browser slows the timers of a tab that is hidden to one a minute. (A tab that is closed says so itself.)
+ */
+export const TAB_SILENT_MS = 150000;
 
 export function broadcastTransport(name: string, options: BroadcastTransportOptions = {}): PausableTransport {
   if (!options.channel && typeof BroadcastChannel === 'undefined') throw new TypeError('There is no BroadcastChannel here');
@@ -217,6 +222,12 @@ export function broadcastTransport(name: string, options: BroadcastTransportOpti
   };
   const page = typeof window !== 'undefined' && typeof window.addEventListener === 'function' ? window : undefined;
   if (page) page.addEventListener('pagehide', gone);
+  // Hidden or shown again: said at once, before the timers of the tab are slowed down (or after they were).
+  const seen = (): void => {
+    if (isOpen) port.postMessage({ to: 'relay', from: id, kind: 'alive' });
+  };
+  const sheet = typeof document !== 'undefined' && typeof document.addEventListener === 'function' ? document : undefined;
+  if (sheet) sheet.addEventListener('visibilitychange', seen);
   const cut = (tell: boolean): void => {
     if (asking !== undefined) clearInterval(asking);
     asking = undefined;
@@ -262,6 +273,7 @@ export function broadcastTransport(name: string, options: BroadcastTransportOpti
       over = true;
       wanted = false;
       if (page) page.removeEventListener('pagehide', gone);
+      if (sheet) sheet.removeEventListener('visibilitychange', seen);
       port.onmessage = null;
       port.close();
     },
