@@ -29,8 +29,9 @@ import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import type { SheetPrintOptions } from './ui/sheet-print';
 import type { PdfExportOptions } from './pdf/export';
 import type { SheetPdfExportOptions } from './ui/sheet-view';
+import { writeSteady } from './model/edits';
 import { OpcPackage } from './opc';
-import { PACKAGE_TURN, packageTurn } from './package-turn';
+import { PACKAGE_TURN, makeTurn, packageTurn, registerTurn, type PackageTurn } from './package-turn';
 import { askOverwrite } from './ui/save-confirm';
 import { listPeople, type CollabPerson, type People } from './collab/people';
 import { createSaveSync, type SaveSync } from './collab/save-sync';
@@ -729,17 +730,15 @@ async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOpt
     // Whatever writes the package of the file does so alone: a second save waits for the first, whoever asks
     // for it (a save, a save as, a file that is written to compare). Two that write one package at once write
     // a file that cannot be opened.
-    let turn: Promise<unknown> = Promise.resolve();
-    const locked = <T>(run: () => Promise<T>): Promise<T> => {
-      const next = turn.then(run, run);
-      turn = next.catch(() => undefined);
-      return next;
-    };
     const inner = { save: out.save, saveAsXlsx: out.saveAsXlsx, saveAsDocx: out.saveAsDocx };
+    const turn = makeTurn<SaveOptions>((saveOptions) => inner.save(saveOptions));
+    const locked = turn.locked;
     out.save = (saveOptions?: SaveOptions) => locked(() => inner.save(saveOptions));
     if (inner.saveAsXlsx) out.saveAsXlsx = inner.saveAsXlsx === inner.save ? out.save : (saveOptions?: SaveOptions) => locked(() => (inner.saveAsXlsx as (o?: SaveOptions) => Promise<Uint8Array>)(saveOptions));
     if (inner.saveAsDocx) out.saveAsDocx = inner.saveAsDocx === inner.save ? out.save : (saveOptions?: SaveOptions) => locked(() => (inner.saveAsDocx as (o?: SaveOptions) => Promise<Uint8Array>)(saveOptions));
-    Object.defineProperty(out, PACKAGE_TURN, { value: { locked, save: (saveOptions?: SaveOptions) => inner.save(saveOptions) }, enumerable: false });
+    Object.defineProperty(out, PACKAGE_TURN, { value: turn, enumerable: false });
+    // Whoever has only the package (writeSharedFile of a program without mount()) finds the same turn.
+    if (out.package) registerTurn(out.package, turn as PackageTurn<unknown>);
     Object.defineProperty(out, 'passwordProtected', { get: () => protection.session !== undefined, enumerable: true });
     out.setPassword = (password: string | null): void => {
       if (password !== null) checkPassword(password);
@@ -766,11 +765,12 @@ async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOpt
       // Saving writes the edited stories of the model into the package first; a model that
       // was never read, or read and not changed, leaves the package as it is.
       const save = async (saveOptions?: SaveOptions) => {
-        if (model) {
-          const doc = await model.catch(() => undefined);
+        const doc = model ? await model.catch(() => undefined) : undefined;
+        // The file of one moment of the document: one that was changed while it was written is written again.
+        return writeSteady(doc, async () => {
           if (doc) await writeDocx(pkg, doc);
-        }
-        return protect(await pkg.save(), saveOptions);
+          return protect(await pkg.save(), saveOptions);
+        });
       };
       return finish({ format: 'docx', kind: 'document', ...base, save, workbook: notASpreadsheet, document: () => (model ??= readDocx(pkg)), saveAsDocx: save });
     }
@@ -779,12 +779,13 @@ async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOpt
       // Saving writes the changes made to the model into the package first; a model
       // that was never read, or read and not changed, leaves the package as it is.
       const save = async (saveOptions?: SaveOptions) => {
-        if (workbook) {
-          // A file whose model could not be read was not changed either: it is saved as it is.
-          const model = await workbook.catch(() => undefined);
+        // A file whose model could not be read was not changed either: it is saved as it is.
+        const model = workbook ? await workbook.catch(() => undefined) : undefined;
+        // The file of one moment of the workbook: one that was changed while it was written is written again.
+        return writeSteady(model, async () => {
           if (model) await writeXlsx(pkg, model);
-        }
-        return protect(await pkg.save(), saveOptions);
+          return protect(await pkg.save(), saveOptions);
+        });
       };
       return finish({ format: 'xlsx', kind: 'spreadsheet', ...base, save, workbook: () => (workbook ??= readXlsx(pkg)), saveAsXlsx: save });
     }

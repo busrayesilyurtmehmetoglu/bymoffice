@@ -798,8 +798,9 @@ export class SaveController implements SaveCommand {
   adopt(etag: string | undefined, clean: boolean): void {
     if (this.destroyed) return;
     const strong = strongETag(etag);
-    // (A name the file was known by before is not taken again: word of it arrived late.)
-    if (strong !== undefined && this.pastTags.indexOf(strong) < 0) {
+    // What the server itself names the file by now is taken, also a name it had before (a server that names a file
+    // by its content names it so again when the content comes back).
+    if (strong !== undefined) {
       const from = this.etag;
       this.etag = strong;
       this.moved(from);
@@ -858,6 +859,8 @@ export class SaveController implements SaveCommand {
       this.pastTags.push(from);
       if (this.pastTags.length > 64) this.pastTags.shift();
     }
+    // The name the file has now is not a past one, whatever it was before.
+    if (this.etag !== undefined) this.pastTags = this.pastTags.filter((tag) => tag !== this.etag);
     // What was hinted before the file moved on names a file that is behind it.
     this.hinted = undefined;
   }
@@ -1468,7 +1471,9 @@ export class SaveController implements SaveCommand {
     // What auto-save does about it. A request that did not get through, one without an answer in time and
     // a server that failed (5xx) are tried again, each time after twice the wait; anything else is not
     // mended by trying, and holds auto-save still until the user saves.
-    const again = error.code === 'network' || error.code === 'timeout' || (error.code === 'http' && error.status !== undefined && error.status >= 500) || (error.code === 'conflict' && this.crowded);
+    const again = error.code === 'network' || error.code === 'timeout' || (error.code === 'http' && error.status !== undefined && error.status >= 500) || (error.code === 'conflict' && this.crowded) ||
+      // The file kept being changed while it was written: nothing was sent, and trying again a little later mends it.
+      (error.code === 'write' && (error as { cause?: { name?: string } }).cause !== undefined && (error as { cause?: { name?: string } }).cause!.name === 'SaveInterruptedError');
     if (again) {
       this.retries++;
       this.hold(Math.min(AUTO_SAVE_MAX_RETRY_MS, AUTO_SAVE_RETRY_MS * Math.pow(2, Math.min(this.retries - 1, 30))));

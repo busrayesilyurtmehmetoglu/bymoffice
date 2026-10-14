@@ -478,7 +478,8 @@ export class ZipArchive {
       if (offset > 0xfffffffe) throw new Error('Archive too large: writing archives of 4 GB or more is not supported yet');
     }
 
-    const count = this.entries.size;
+    // Of this write, like everything else in it: what the archive holds by now may be more or less.
+    const count = written.length;
     const centralSize = central.reduce((sum, c) => sum + c.length, 0);
     if (offset + centralSize > 0xfffffffe) {
       throw new Error('Archive too large: writing archives of 4 GB or more is not supported yet');

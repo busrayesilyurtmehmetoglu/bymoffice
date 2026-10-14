@@ -3,6 +3,7 @@
 // stay as they are.
 
 import type { OpcPackage } from '../../opc';
+import { turnOfPackage } from '../../package-turn';
 import { ZipArchive } from '../../zip';
 import { childElements, localName, parseXml, type XmlElement } from '../../xml';
 
@@ -198,17 +199,21 @@ export async function writeSharedFile(
   pkg: OpcPackage | undefined,
   take: () => Promise<Uint8Array>,
   /**
-   * Runs what it is given when nothing else writes the package (see packageTurn()): the stamp and the
-   * save are one step, which no other save of the file may cut into. `take` must then not wait for that
-   * turn itself. Without it the caller sees to it that nothing else writes the package meanwhile.
+   * Runs what it is given when nothing else writes the package: the stamp and the save are one step,
+   * which no other save of the file may cut into. Without it the turn of the file the package belongs
+   * to is taken (and `take` may be `() => file.save()`: called from within the turn, it does not wait
+   * for it).
    */
-  locked: <T>(run: () => Promise<T>) => Promise<T> = (run) => run(),
+  lock?: <T>(run: () => Promise<T>) => Promise<T>,
 ): Promise<SharedFile> {
+  const turn = lock ? undefined : turnOfPackage(pkg);
+  const locked = lock || (turn ? turn.locked : <T>(run: () => Promise<T>): Promise<T> => run());
+  const taken = turn ? (): Promise<Uint8Array> => turn.inside(take) : take;
   if (session.state === 'closed') {
     // On its own for good: the file is of no room any more.
     return locked(async () => {
       if (pkg) await writeCollabStamp(pkg, undefined);
-      return { bytes: await take(), rev: undefined };
+      return { bytes: await taken(), rev: undefined };
     });
   }
   if (session.state === 'online') await session.whenSettled(3000);
@@ -224,11 +229,11 @@ export async function writeSharedFile(
         if (pkg && stamp !== undefined && !(await writeCollabStamp(pkg, stamp))) {
           // The file cannot be made to say its step (its custom properties cannot be read): it is saved all the same,
           // as the file of no step, and whoever opens it joins as with any file the room has not saved.
-          bytes = await take();
+          bytes = await taken();
           return { bytes, rev: undefined, unstamped: true };
         }
         if (pkg && stamp === undefined) await writeCollabStamp(pkg, undefined);
-        bytes = await take();
+        bytes = await taken();
       } finally {
         touched = session.resume();
       }

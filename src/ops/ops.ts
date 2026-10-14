@@ -6,6 +6,7 @@
 // place instead of altering the old one. That is what lets a structural
 // operation keep the previous state for undo by reference, without copying it.
 
+import { touchModel } from '../model/edits';
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
 import { chartsFollow, chartsMoved, chartsRenamed } from './charts';
@@ -1468,6 +1469,8 @@ function normalizeColumns(columns: ColumnRange[]): ColumnRange[] {
 
 /** Applies an operation to the workbook and returns the operation that undoes it. */
 export function applyOp(workbook: Workbook, op: Op): Op {
+  // Counted before anything is changed: a file that is being written from this workbook is of no one moment now.
+  touchModel(workbook);
   switch (op.type) {
     case 'setCells': {
       const sheet = sheetAt(workbook, op.sheet);

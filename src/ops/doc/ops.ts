@@ -9,6 +9,7 @@
 // back by reference, source spans and all, and restores `modified`, so that
 // "edit, undo, save" writes the bytes that were read.
 
+import { touchModel } from '../../model/edits';
 import type { AbstractNum, Block, Body, Comment, DocMedia, DocModel, DocRelationship, DocStyles, FontInfo, Note, NumInstance, SectionProps, SourceSpan, Story, StoryCollection, Table, TableCell, TableRow } from '../../model/doc/types';
 import { storyOf, type StoryHandle } from './position';
 
@@ -174,6 +175,8 @@ function replaceTop(doc: DocModel, handle: StoryHandle, op: Extract<DocOp, { typ
 
 /** Applies one operation to the document and returns the operation that undoes it. Throws RangeError for an operation that does not fit the document, which is then unchanged. */
 export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
+  // Counted before anything is changed: a file that is being written from this document is of no one moment now.
+  touchModel(doc);
   switch (op.type) {
     case 'replaceBlocks': {
       const handle = storyOf(doc, op.story);

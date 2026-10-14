@@ -145,6 +145,34 @@ test('an ETag that could not be confirmed is only a condition to try once after 
   assert.equal(await again, false, 'and the save did not happen');
 });
 
+test('a server that names a file by its content names it so again when the content comes back: the name is taken again, and the next save is no conflict', async () => {
+  const r = rig();
+  // X -> Y -> X, each said by someone and confirmed by the server.
+  r.controller.changed(true);
+  r.server.etag = '"Y"';
+  await r.sync.saved({ versions: ['e:"Y"'], rev: 3 });
+  assert.equal(r.controller.currentETag, '"Y"', 'the file is known by its new name');
+  r.controller.changed(true);
+  r.server.etag = '"v1"';
+  await r.sync.saved({ versions: ['e:"v1"'], rev: 3 });
+  assert.equal(r.controller.currentETag, '"v1"', 'and by the name it had before, when the server says so now');
+  r.controller.changed();
+  assert.equal(await r.controller.saveNow(), true, 'a save is taken');
+  assert.deepEqual([r.server.puts.map((put) => put.match), r.asked], [['"v1"'], []], 'sent once with the name the file has, and nobody is asked');
+  // A name that is only said (the server could not be asked) and is a past one is still no hint.
+  r.server.down = true;
+  await r.sync.saved({ versions: ['e:"Y"'], rev: 3 });
+  r.server.down = false;
+  r.controller.changed();
+  r.server.etag = '"elsewhere"';
+  const before = r.server.puts.length;
+  const refused = r.controller.saveNow();
+  await settle();
+  assert.equal(r.server.puts.length, before + 1, 'a conflict is not tried again with a name the file had before');
+  r.controller.dismissConflict();
+  assert.equal(await refused, false, 'it is the user\'s');
+});
+
 test('a server without HEAD is asked with a GET that fetches nothing', async () => {
   const r = rig({ head: false });
   r.controller.changed(true);
@@ -190,7 +218,8 @@ function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => 
   let clock = 1000;
   const order: string[] = [];
   const sides = Array.from({ length: count }, (_unused, index) => {
-    const name = 'abcdef'[index];
+    // A name of its own for every participant, however many there are.
+    const name = index < 26 ? 'abcdefghijklmnopqrstuvwxyz'[index] : `p${index}`;
     const session = { state: 'online' as SyncSession['state'], rev: 0, pending: 0, leads: index === 0 };
     const book: string[] = [];
     let timers: { run: () => void; at: number }[] = [];
@@ -524,7 +553,7 @@ test(`whenever a participant is told it has nothing to save, the stored file hol
 });
 
 test('after the room could not be reached for a while, those who waited do not all save at once; nobody is stopped, and everybody ends with nothing to save', async () => {
-  for (const count of [2, 4, 8, 12]) {
+  for (const count of [2, 4, 8, 12, 16, 64]) {
     const r = room(count);
     // Everybody typed; then the relay is gone for longer than anybody waits.
     for (let who = 0; who < count; who++) r.edit(who, `typed by ${who}`);
@@ -545,6 +574,7 @@ test('after the room could not be reached for a while, those who waited do not a
     assert.deepEqual(r.sides.filter((side) => side.controller.dirty).map((side) => side.name), [], `${count}: everybody has nothing left to save`);
     assert.deepEqual(r.sides.reduce((all: string[], side) => all.concat(side.errors), []).filter((code) => code !== 'conflict'), [], `${count}: no other error`);
     assert.deepEqual(r.stored(), r.sides[0].book, `${count}: the stored file is the workbook`);
+    if (process.env.COLLAB_STATS) console.log(`STORM ${count}: ${r.server.puts.length} PUT, ${refused} refused`);
   }
 });
 
