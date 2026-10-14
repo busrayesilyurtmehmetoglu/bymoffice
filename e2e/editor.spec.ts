@@ -215,13 +215,13 @@ test.describe('layout', () => {
         viewport: document.documentElement.clientWidth,
       };
     });
-    expect(facts.buttons).toBe(24);
+    expect(facts.buttons).toBe(28);
     expect(facts.sizes).toEqual([facts.coarse ? '40x40' : '32x32']);
     expect(facts.scrolls).toBe(true);
     expect(facts.scrolled).toBe(true);
     expect(facts.pageWidth).toBeLessThanOrEqual(facts.viewport);
     await expect(page.locator('#host .bym-canvas')).toBeVisible();
-    await expect(command(page, 'rowsColumns')).toBeInViewport();
+    await expect(command(page, 'find')).toBeInViewport();
   });
 
   test('on a phone the editor is as wide as the screen and the grid stays in view', async ({ page, isMobile }) => {
@@ -616,16 +616,17 @@ test.describe('toolbar', () => {
           fill: host.querySelector('[data-command="fillColor"] .bym-icon-bar')!.getAttribute('data-color'),
         };
       });
-    expect(await states()).toEqual({ pressed: [], size: '11', format: 'general', text: '#000000', fill: 'none' });
+    // A cell without a vertical alignment is aligned at the bottom: that button is pressed.
+    expect(await states()).toEqual({ pressed: ['alignBottom'], size: '11', format: 'general', text: '#000000', fill: 'none' });
     await select(page, 'D1');
-    await expect.poll(states).toEqual({ pressed: ['bold', 'italic', 'underline', 'strikethrough', 'alignRight', 'wrapText'], size: '13', format: 'custom', text: '#FF0000', fill: '#FFFF00' });
+    await expect.poll(states).toEqual({ pressed: ['bold', 'italic', 'underline', 'strikethrough', 'alignRight', 'alignBottom', 'wrapText'], size: '13', format: 'custom', text: '#FF0000', fill: '#FFFF00' });
     // With the keyboard, in the grid.
     await page.evaluate(() => (window as any).__editor.view.focus());
     await page.keyboard.press('ArrowLeft');
-    await expect.poll(states).toEqual({ pressed: [], size: '11', format: 'general', text: '#000000', fill: 'none' });
+    await expect.poll(states).toEqual({ pressed: ['alignBottom'], size: '11', format: 'general', text: '#000000', fill: 'none' });
     // The active cell decides, not the rest of the range.
     await select(page, 'C1:D1');
-    await expect.poll(states).toMatchObject({ pressed: [] });
+    await expect.poll(states).toMatchObject({ pressed: ['alignBottom'] });
   });
 
   test('a command that fails says why in the status bar and leaves the workbook alone', async ({ page, hasTouch }) => {
@@ -655,12 +656,12 @@ test.describe('keyboard and focus', () => {
       });
     const focused = () => page.evaluate(() => (document.activeElement ? document.activeElement.getAttribute('data-command') || document.activeElement.className : ''));
     // Undo and redo have nothing to do yet, so the first button that can take the focus is Print.
-    expect(await stops()).toEqual(['print', 'bym-tb-select bym-tb-size', 'bym-tb-select bym-tb-format']);
+    expect(await stops()).toEqual(['print', 'bym-tb-select bym-tb-font', 'bym-tb-select bym-tb-size', 'bym-tb-select bym-tb-format']);
 
     await command(page, 'bold').focus();
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('italic');
-    expect(await stops()).toEqual(['bym-tb-select bym-tb-size', 'italic', 'bym-tb-select bym-tb-format']);
+    expect(await stops()).toEqual(['bym-tb-select bym-tb-font', 'bym-tb-select bym-tb-size', 'italic', 'bym-tb-select bym-tb-format']);
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('bold');
     // Print and PDF are the only buttons before the font size list that can do something now; the arrows stop at the first.
@@ -670,8 +671,10 @@ test.describe('keyboard and focus', () => {
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('print');
     await page.keyboard.press('End');
-    expect(await focused()).toBe('rowsColumns');
+    expect(await focused()).toBe('find');
     await page.keyboard.press('ArrowRight');
+    expect(await focused()).toBe('find');
+    await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('rowsColumns');
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('chart');
@@ -693,7 +696,7 @@ test.describe('keyboard and focus', () => {
     expect(await focused()).toBe('print');
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('pdf');
-    // The font size list lies between these two buttons.
+    // The lists of fonts and of font sizes lie between these two buttons.
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('bold');
     await page.keyboard.press('ArrowRight');
@@ -705,7 +708,7 @@ test.describe('keyboard and focus', () => {
     expect(await focused()).toBe('bym-input');
     await settled(page);
     // The button that was left is still the Tab stop, and now Undo can be reached from it.
-    expect(await stops()).toEqual(['bym-tb-select bym-tb-size', 'italic', 'bym-tb-select bym-tb-format']);
+    expect(await stops()).toEqual(['bym-tb-select bym-tb-font', 'bym-tb-select bym-tb-size', 'italic', 'bym-tb-select bym-tb-format']);
     await command(page, 'italic').focus();
     await page.keyboard.press('Home');
     expect(await focused()).toBe('undo');
@@ -722,12 +725,12 @@ test.describe('keyboard and focus', () => {
     await page.evaluate(() => (window as any).__editor.view.focus());
     const focused = () => page.evaluate(() => document.activeElement!.className);
     const order: string[] = [];
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 7; i++) {
       await page.keyboard.press('Shift+Tab');
       order.push(await page.evaluate(() => document.activeElement!.getAttribute('data-command') || document.activeElement!.id || document.activeElement!.className));
     }
     // The buttons are one stop (the first that can do something: nothing to undo yet, so Print); each list is its own.
-    expect(order).toEqual(['bym-formula-input', 'bym-namebox', 'bym-tb-select bym-tb-format', 'bym-tb-select bym-tb-size', 'print', 'before']);
+    expect(order).toEqual(['bym-formula-input', 'bym-namebox', 'bym-tb-select bym-tb-format', 'bym-tb-select bym-tb-size', 'bym-tb-select bym-tb-font', 'print', 'before']);
     await page.keyboard.press('Tab');
     expect(await focused()).toBe('bym-tb-btn');
   });
@@ -1069,9 +1072,9 @@ test.describe('read-only', () => {
   test('disables every editing control, locks the formula bar and says so', async ({ page }) => {
     await mount(page, await editorWorkbook(), { readOnly: true });
     const controls = page.locator('#host .bym-toolbar button, #host .bym-toolbar select');
-    await expect(controls).toHaveCount(26);
-    // Printing and making a PDF change nothing: their buttons are the controls that stay on.
-    expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).map((control) => control.getAttribute('data-command')))).toEqual(['print', 'pdf']);
+    await expect(controls).toHaveCount(31);
+    // Printing, making a PDF and finding change nothing: their buttons are the controls that stay on.
+    expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).map((control) => control.getAttribute('data-command')))).toEqual(['print', 'pdf', 'find']);
     await expect(page.locator('#host .bym-formula-input')).toHaveAttribute('readonly', '');
     const badge = page.locator('#host .bym-status-badge');
     await expect(badge).toBeVisible();

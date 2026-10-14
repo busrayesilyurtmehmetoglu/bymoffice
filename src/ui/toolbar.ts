@@ -1,4 +1,4 @@
-// The editor's toolbar: one row of buttons and two lists that format the
+// The editor's toolbar: one row of buttons and three lists that format the
 // selection, and show what the active cell has. Its buttons are a single Tab
 // stop with the arrow keys moving between them; each list is a Tab stop of
 // its own, because a list needs the arrow keys for itself. A command ends
@@ -11,7 +11,9 @@ import type { BorderPreset } from '../ops/format';
 import { EDITOR_STRINGS_EN, EDITOR_STRINGS_TR, withShortcut, type EditorStrings } from './editor-strings';
 import { ICON_BAR_CLASS, createBorderIcon, createIcon, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
+import { fontChoices } from './font-list';
 import type { SaveCommand } from './save-command';
+import { onFontsChanged } from '../render/fonts';
 import type { WorkbookView } from './sheet-view';
 
 /** What the parts of the shell need from the editor that holds them. */
@@ -76,6 +78,11 @@ function formatKindOf(code: string, strings: EditorStrings): FormatKind | typeof
   return CUSTOM;
 }
 
+/** How a cell is aligned vertically as far as the buttons go: what Excel draws as the top, the middle, the bottom. */
+function verticalOf(vertical: Alignment['vertical']): 'top' | 'center' | 'bottom' {
+  return vertical === 'top' || vertical === 'justify' ? 'top' : vertical === 'center' || vertical === 'distributed' ? 'center' : 'bottom';
+}
+
 function fontSizeOf(format: ResolvedCellStyle): number {
   const size = format.font.size;
   // From the file: anything that is not a usable size reads as the default.
@@ -101,8 +108,12 @@ export class Toolbar {
   /** Every button in visual order, for the arrow keys. */
   private readonly controls: Control[] = [];
   private readonly buttons: { [key in ButtonKey]?: HTMLButtonElement } = {};
+  private readonly fontSelect: HTMLSelectElement;
   private readonly sizeSelect: HTMLSelectElement;
   private readonly formatSelect: HTMLSelectElement;
+  private readonly unwatchFonts: () => void;
+  /** Font names the font list holds now; it is rebuilt only when this changes. */
+  private fontKey = '';
   private readonly bars: { textColor?: SVGElement; fillColor?: SVGElement } = {};
   /** The line after the Save button: it goes when the button does. */
   private saveSeparator: HTMLElement | undefined;
@@ -142,6 +153,7 @@ export class Toolbar {
       if (!host.view.exportingPdf) void host.view.downloadPdf().catch(() => undefined);
     }).setAttribute('aria-busy', 'false');
     this.addSeparator();
+    this.fontSelect = this.addSelect('bym-tb-font');
     this.sizeSelect = this.addSelect('bym-tb-size');
     this.addSeparator();
     this.addButton('bold', () => toggleFont(host.view, 'bold'), true);
@@ -158,6 +170,10 @@ export class Toolbar {
     this.addButton('alignCenter', () => this.align('center'), true);
     this.addButton('alignRight', () => this.align('right'), true);
     this.addSeparator();
+    this.addButton('alignTop', () => this.alignVertically('top'), true);
+    this.addButton('alignMiddle', () => this.alignVertically('center'), true);
+    this.addButton('alignBottom', () => this.alignVertically('bottom'), true);
+    this.addSeparator();
     this.addButton('wrapText', () => host.view.format({ wrapText: host.view.selectionFormat.alignment.wrapText !== true }), true);
     // Values the merge would discard are asked about first.
     this.addButton('merge', () => (host.view.selectionMerged ? host.view.unmerge() : void host.view.requestMerge()), true);
@@ -173,6 +189,9 @@ export class Toolbar {
     this.addMenuButton('chart', 'menu', () => this.openCharts());
     this.addSeparator();
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
+    this.addSeparator();
+    // The bar of Find and Replace takes the focus itself; finding works in a read-only view too.
+    this.addDialogButton('find', () => void host.view.openFind(false));
 
     this.bars.textColor = this.barOf('textColor');
     this.bars.fillColor = this.barOf('fillColor');
@@ -182,8 +201,11 @@ export class Toolbar {
     element.addEventListener('keydown', this.onKeyDown);
     element.addEventListener('focusin', this.onFocusIn);
     element.addEventListener('scroll', this.onScroll, { passive: true });
+    this.fontSelect.addEventListener('change', this.onFontChange);
     this.sizeSelect.addEventListener('change', this.onSizeChange);
     this.formatSelect.addEventListener('change', this.onFormatChange);
+    // The list of fonts follows the fonts that are registered.
+    this.unwatchFonts = onFontsChanged(() => this.update());
 
     this.applyStrings();
   }
@@ -218,8 +240,9 @@ export class Toolbar {
     this.setDisabled('undo', view.readOnly || typing || !view.canUndo);
     this.setDisabled('redo', view.readOnly || typing || !view.canRedo);
     this.updateSave(typing);
-    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
+    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'alignTop', 'alignMiddle', 'alignBottom', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
+    this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;
     this.formatSelect.disabled = !editable;
     if (!editable) this.closePopover();
@@ -231,10 +254,16 @@ export class Toolbar {
     this.setPressed('alignLeft', horizontal === 'left');
     this.setPressed('alignCenter', horizontal === 'center');
     this.setPressed('alignRight', horizontal === 'right');
+    // A cell without a vertical alignment is aligned at the bottom.
+    const vertical = verticalOf(format.alignment.vertical);
+    this.setPressed('alignTop', vertical === 'top');
+    this.setPressed('alignMiddle', vertical === 'center');
+    this.setPressed('alignBottom', vertical === 'bottom');
     this.setPressed('wrapText', format.alignment.wrapText === true);
     this.setPressed('merge', view.selectionMerged);
     this.setPressed('filter', view.hasFilter);
 
+    this.showFont(typeof font.name === 'string' ? font.name : undefined);
     this.showFontSize(fontSizeOf(format));
     this.showFormat(formatKindOf(format.numFmt, this.strings));
     this.paintBar(this.bars.textColor, this.textColorOf(format) || '#000000');
@@ -283,12 +312,14 @@ export class Toolbar {
     if (this.destroyed) return;
     this.destroyed = true;
     this.closePopover();
+    this.unwatchFonts();
     const element = this.element;
     element.removeEventListener('click', this.onClick);
     element.removeEventListener('mousedown', this.onMouseDown);
     element.removeEventListener('keydown', this.onKeyDown);
     element.removeEventListener('focusin', this.onFocusIn);
     element.removeEventListener('scroll', this.onScroll);
+    this.fontSelect.removeEventListener('change', this.onFontChange);
     this.sizeSelect.removeEventListener('change', this.onSizeChange);
     this.formatSelect.removeEventListener('change', this.onFormatChange);
     if (element.parentNode) element.parentNode.removeChild(element);
@@ -371,6 +402,9 @@ export class Toolbar {
       alignLeft: s.alignLeft,
       alignCenter: s.alignCenter,
       alignRight: s.alignRight,
+      alignTop: s.alignTop,
+      alignMiddle: s.alignMiddle,
+      alignBottom: s.alignBottom,
       wrapText: s.wrapText,
       merge: s.mergeCells,
       mergeOptions: s.mergeOptions,
@@ -382,6 +416,7 @@ export class Toolbar {
       // The words of charts are the view's (its menu and its dialog use the same): set once there is a view, see update().
       chart: '',
       rowsColumns: s.rowsAndColumns,
+      find: withShortcut(s.findReplace, 'F'),
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {
       const button = this.buttons[key];
@@ -389,6 +424,8 @@ export class Toolbar {
       button.setAttribute('aria-label', labels[key]);
       button.title = labels[key];
     }
+    this.fontSelect.setAttribute('aria-label', s.fontName);
+    this.fontSelect.title = s.fontName;
     this.sizeSelect.setAttribute('aria-label', s.fontSize);
     this.sizeSelect.title = s.fontSize;
     this.formatSelect.setAttribute('aria-label', s.numberFormat);
@@ -421,6 +458,30 @@ export class Toolbar {
   private setPressed(key: ButtonKey, pressed: boolean): void {
     const button = this.buttons[key];
     if (button) button.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+  }
+
+  /**
+   * Selects a font in the list: the common fonts, the registered ones, those the workbook names
+   * and the font of the active cell. A cell without a font name shows an entry without text.
+   */
+  private showFont(name: string | undefined): void {
+    const fromFile: string[] = [];
+    const fonts = this.host.view.workbook.styles.fonts;
+    for (let i = 0; i < fonts.length && i < 4096; i++) if (typeof fonts[i].name === 'string') fromFile.push(fonts[i].name as string);
+    const { names, shown } = fontChoices(fromFile, name);
+    const key = names.join('\u0001');
+    const select = this.fontSelect;
+    if (key !== this.fontKey) {
+      this.fontKey = key;
+      while (select.firstChild) select.removeChild(select.firstChild);
+      // An entry without text stands for "no name".
+      const blank = option('\u0000', '');
+      blank.hidden = true;
+      select.appendChild(blank);
+      for (let i = 0; i < names.length; i++) select.appendChild(option(names[i], names[i]));
+    }
+    const wanted = shown === undefined ? '\u0000' : shown;
+    if (select.value !== wanted) select.value = wanted;
   }
 
   /** Selects a size in the list; a size the list does not have is added in its place. */
@@ -489,6 +550,16 @@ export class Toolbar {
   private align(horizontal: NonNullable<Alignment['horizontal']>): void {
     const view = this.host.view;
     view.format({ horizontal: view.selectionFormat.alignment.horizontal === horizontal ? null : horizontal });
+  }
+
+  /**
+   * The three vertical alignments work like radio buttons. A cell without one is aligned at the bottom: "bottom"
+   * is that, and pressing the one that is on goes back to it, as in Excel.
+   */
+  private alignVertically(vertical: 'top' | 'center' | 'bottom'): void {
+    const view = this.host.view;
+    const now = verticalOf(view.selectionFormat.alignment.vertical);
+    view.format({ vertical: vertical === 'bottom' || now === vertical ? null : vertical });
   }
 
   private openPalette(key: 'textColor' | 'fillColor'): void {
@@ -685,7 +756,7 @@ export class Toolbar {
   private onKeyDown = (event: KeyboardEvent): void => {
     if (event.defaultPrevented) return;
     const target = event.target as Element | null;
-    if (target === this.sizeSelect || target === this.formatSelect) {
+    if (target === this.fontSelect || target === this.sizeSelect || target === this.formatSelect) {
       // Every key is the list's own (arrows, Home, End and letters choose in it); Enter and Escape
       // are how the keyboard says it is done there.
       if (event.key === 'Enter' || event.key === 'Escape') {
@@ -726,6 +797,13 @@ export class Toolbar {
     for (let i = start; i >= 0 && i < this.controls.length; i += step) if (!this.controls[i].disabled) return this.controls[i];
     return undefined;
   }
+
+  private onFontChange = (): void => {
+    const name = this.fontSelect.value;
+    if (name === '\u0000' || name === '') return;
+    // A value chosen with the keyboard may be one step on the way to another: the focus stays in the list.
+    this.host.run(() => this.host.view.format({ fontName: name }), this.listByKey);
+  };
 
   private onSizeChange = (): void => {
     const size = Number(this.sizeSelect.value);

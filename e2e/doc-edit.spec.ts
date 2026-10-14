@@ -680,7 +680,10 @@ test.describe('document editor: formatting', () => {
     await page.keyboard.press('ArrowRight');
     await expect(toolbarButton(page, 'italic')).toBeFocused();
     await page.keyboard.press('End');
-    // The last button that can be pressed: the document has no tracked changes, so that is the one that turns tracking on.
+    // The last button: Find and Replace.
+    await expect(toolbarButton(page, 'find')).toBeFocused();
+    // Before it, the last one that can be pressed: the document has no tracked changes, so that is the one that turns tracking on.
+    await page.keyboard.press('ArrowLeft');
     await expect(toolbarButton(page, 'trackChanges')).toBeFocused();
     await page.keyboard.press('Escape');
     await expect(input(page)).toBeFocused();

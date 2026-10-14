@@ -223,6 +223,8 @@ export {
 } from './ops/rules';
 export { clearRange, copyRange, cutRange, editTextAt, pasteAt, setCellInput, type CopiedNote, type CopiedRange, type EditOptions, type PasteResult } from './ops/commands';
 export { MAX_FILTER_VALUES, clearFilter, filterSummary, filterValues, setAutoFilter, setFilterColumn, type FilterCriterion, type FilterValue, type FilterValueList } from './ops/filter';
+export { MAX_REPLACE_CELLS, ReplaceAll, SheetSearch, cellSearchText, compileSheetFind, findNextCell, replaceAllOps, replaceInCell, searchStart, type CellAddress, type CellReplacement, type ReplaceAllResult, type SheetFindOptions } from './ops/find';
+export { MAX_FIND_TEXT, compileFind, findIn, findLastIn, matchesIn, replaceIn, type CompiledFind, type FindQuery } from './edit/find';
 export { collationKey, currentRegion, sortRange, type SortKey, type SortOptions } from './ops/sort';
 export { parseCellInput, cellEditText, type ParsedInput, type InputOptions } from './edit/input';
 export { formulaFromLocal, formulaToLocal } from './edit/formula-locale';

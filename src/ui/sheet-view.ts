@@ -35,6 +35,10 @@ import {
 } from '../ops/format';
 import { freezePanes as freezePaneOps } from '../ops/panes';
 import { askOverwrite, editorRootIn } from './save-confirm';
+import { FindBar, type FindBarQuery } from './find-bar';
+import { runSliced } from './sliced';
+import { checkReplacement } from '../edit/find';
+import { MAX_REPLACE_CELLS, ReplaceAll, SheetSearch, compileSheetFind, replaceInCell, searchStart, type CellAddress, type SheetFindOptions } from '../ops/find';
 import { CalcEngine, type CalcEngineOptions } from '../calc/engine';
 import { ConditionalFormats } from '../format/conditional';
 import { DataValidations, MAX_LIST_ITEMS, ValidationError, tryOps } from '../format/validation';
@@ -453,6 +457,8 @@ const ADD_SHEET_WIDTH = 36;
 const ADD_SHEET_WIDTH_COARSE = 44;
 /** Longest name a sheet can have, in UTF-16 units as the field counts them. */
 const MAX_SHEET_NAME = 31;
+/** Most matches the bar of Find counts; beyond it says "more than". */
+const MAX_COUNTED = 10000;
 
 /** Language of the view's own words: the tag given as `locale`, else the browser's. */
 const resolveStrings = resolveUiStrings;
@@ -1051,8 +1057,22 @@ export class WorkbookView {
   private pdfTurn: Promise<unknown> = Promise.resolve();
   /** Counts the changes of the workbook and of how it is shown: pages prepared for printing before are out of date. */
   private printEpoch = 0;
+  /**
+   * Counts the changes of the workbook made by a step (of the user, of the API, of undo, of someone else in a
+   * room) - not the results a calculation writes as it goes on: a search that collects what to replace is about
+   * the cells as they were typed, which only a step changes.
+   */
+  private changeEpoch = 0;
   /** Language tag the paper of a sheet without one is chosen by. */
   private languageTag: string | undefined;
+  /** The bar of Find and Replace, while it is open. */
+  private findBar: FindBar | undefined;
+  /** Counts the searches: one that was overtaken by another gives up. */
+  private findToken = 0;
+  private countToken = 0;
+  private countTimer: ReturnType<typeof setTimeout> | undefined;
+  /** What the bar says about the matches of its query, between searches. */
+  private findCount = '';
 
   constructor(container: HTMLElement, workbook: Workbook, options: WorkbookViewOptions = {}) {
     if (workbook.sheets.length === 0) throw new Error('The workbook has no sheets');
@@ -1282,6 +1302,8 @@ export class WorkbookView {
     this.showSheet();
     this.schedule();
     this.noteActiveSheet();
+    // A search of the sheet is about another sheet now: its matches are counted anew.
+    if (this.findBar) this.scheduleCount(100);
     if (this.options.onSheetChange) this.options.onSheetChange(index);
   }
 
@@ -1366,6 +1388,7 @@ export class WorkbookView {
     if (typeof locale === 'string') {
       this.strings = resolveStrings(locale);
       this.languageTag = locale;
+      if (this.findBar) this.findBar.setStrings(this.strings.find);
     }
     this.printEpoch++;
     this.drawings.forEach((layer) => layer.setLabels(this.drawingLabels()));
@@ -1404,6 +1427,7 @@ export class WorkbookView {
     this.destroyed = true;
     if (this.mergeQuestion) this.mergeQuestion();
     this.mergeQuestion = undefined;
+    this.closeFind(false);
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.unwatchFonts) this.unwatchFonts();
     this.unwatchFonts = undefined;
@@ -5643,6 +5667,12 @@ export class WorkbookView {
       this.print().catch(() => undefined);
       return;
     }
+    // Ctrl+F and Ctrl+H: Find, and Find and Replace (Cmd+F as well on Apple's; Cmd+H is the system's there).
+    if (!this.edit && (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === 'f' || event.key === 'F' || event.key === 'h' || event.key === 'H')) {
+      event.preventDefault();
+      this.openFind(event.key === 'h' || event.key === 'H');
+      return;
+    }
     if (this.edit) {
       this.onEditKey(event);
       return;
@@ -6223,6 +6253,289 @@ export class WorkbookView {
     this.freezePanes(0, 0);
   }
 
+  // ------------------------------------------------------------ find and replace
+
+  /**
+   * Opens the bar of Find (with `replace`, of Find and Replace) at the top of the editor, or
+   * brings the focus to it when it is open. Finding works in a read-only view too; replacing
+   * does not. Returns whether the bar is open.
+   */
+  openFind(replace = false): boolean {
+    if (this.destroyed) return false;
+    if (!this.tryCommit()) return false;
+    const open = this.findBar;
+    if (open && open.isOpen) {
+      if (replace) open.setReplace(true);
+      open.focus(replace ? 'replace' : 'find');
+      return true;
+    }
+    this.closeMenu();
+    const bar = new FindBar({
+      root: editorRootIn(this.container, this.root),
+      below: this.root,
+      strings: this.strings.find,
+      kind: 'sheet',
+      openReplace: replace,
+      canReplace: () => !this.locked && !this.destroyed,
+      find: (query, backward) => this.barSearch(query, backward),
+      replace: (query, replacement) => this.barReplace(query, replacement, false),
+      replaceAll: (query, replacement) => this.barReplace(query, replacement, true),
+      changed: () => this.scheduleCount(0),
+      onClose: () => this.closeFind(true),
+    });
+    this.findBar = bar;
+    this.findCount = '';
+    bar.focus(replace ? 'replace' : 'find');
+    return true;
+  }
+
+  /** Closes the bar of Find and Replace; with `focus` the grid takes the focus back when the bar had it. */
+  closeFind(focus = true): void {
+    const bar = this.findBar;
+    if (!bar) return;
+    this.findBar = undefined;
+    this.findToken++;
+    this.countToken++;
+    if (this.countTimer !== undefined) clearTimeout(this.countTimer);
+    this.countTimer = undefined;
+    const had = bar.hasFocus;
+    bar.close();
+    if (focus && had && !this.destroyed) this.focus();
+  }
+
+  /** Whether the bar of Find and Replace is open. */
+  get findOpen(): boolean {
+    return this.findBar !== undefined;
+  }
+
+  /** The options of a search of the view: those given, in the locale of the view. */
+  private findOptions(options: SheetFindOptions | undefined): SheetFindOptions {
+    const out: SheetFindOptions = { ...(options || {}), locale: this.locale };
+    if (out.range) {
+      const range = out.range;
+      const a = { row: toIndex(range.top, MAX_ROWS), col: toIndex(range.left, MAX_COLS) };
+      const b = { row: toIndex(range.bottom, MAX_ROWS), col: toIndex(range.right, MAX_COLS) };
+      out.range = rangeBetween(a, b);
+    }
+    return out;
+  }
+
+  /**
+   * Finds the next cell that has the text (with `backward`, the one before) from the active
+   * cell, round the end of the sheet (or, `within: 'workbook'`, of the workbook), and selects
+   * it. The search goes a slice at a time; a later search or the bar closing gives it up.
+   * Resolves to the cell, or undefined when there is none. The text is plain text: no
+   * character of it has a meaning of its own.
+   */
+  findNext(text: string, options?: SheetFindOptions & { backward?: boolean }): Promise<CellAddress | undefined> {
+    if (this.destroyed) return Promise.resolve(undefined);
+    let find;
+    try {
+      find = compileSheetFind(text, this.findOptions(options));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!find) return Promise.resolve(undefined);
+    if (!this.tryCommit()) return Promise.resolve(undefined);
+    const token = ++this.findToken;
+    const state = this.state();
+    const from: CellAddress = { sheet: this.sheetIndex, row: state.active.row, col: state.active.col };
+    const search = new SheetSearch(this.workbook, find, this.findOptions(options), from, !!(options && options.backward));
+    let hit: CellAddress | null | undefined;
+    return runSliced(
+      () => (hit = search.step(4096)) !== undefined,
+      () => !this.destroyed && token === this.findToken,
+    ).then((done) => {
+      if (!done || !hit || this.destroyed || token !== this.findToken) return undefined;
+      const sheet = this.workbook.sheets[hit.sheet];
+      if (!sheet || sheet.kind !== 'worksheet') return undefined;
+      if (hit.sheet !== this.sheetIndex) this.setActiveSheet(hit.sheet);
+      this.select({ top: hit.row, left: hit.col, bottom: hit.row, right: hit.col });
+      return { sheet: hit.sheet, row: hit.row, col: hit.col };
+    });
+  }
+
+  /**
+   * Replaces the text in the active cell when the cell has it, then goes on to the next cell
+   * that has it (Excel's Replace). Replacing reads formulas (see src/ops/find.ts). Resolves to
+   * whether a cell was changed, as one undo step. Nothing is replaced in a read-only view.
+   */
+  replace(text: string, replacement: string, options?: SheetFindOptions): Promise<boolean> {
+    if (this.destroyed) return Promise.resolve(false);
+    let find;
+    try {
+      checkReplacement(replacement);
+      find = compileSheetFind(text, this.findOptions(options));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!find) return Promise.resolve(false);
+    if (this.locked) {
+      this.notify(this.strings.find.readOnly, 'info');
+      return Promise.resolve(false);
+    }
+    if (!this.tryCommit()) return Promise.resolve(false);
+    const state = this.state();
+    const result = replaceInCell(this.workbook, this.sheetIndex, state.active.row, state.active.col, find, replacement, this.locale);
+    let changed = false;
+    try {
+      if (result && 'change' in result) changed = this.applyOps([{ type: 'setCells', sheet: this.sheetIndex, cells: [result.change] }]);
+      else if (result) this.notify(this.strings.find.replaced(0, result.count), 'info');
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const next = { ...(options || {}), lookIn: 'formulas' as const };
+    return this.findNext(text, next).then(() => changed);
+  }
+
+  /**
+   * Replaces the text everywhere the search reaches (the sheet, the workbook, or `range`), as
+   * one undo step; rows the filter hides are left alone. The cells are gone through a slice
+   * at a time; when the workbook changes meanwhile that is said and nothing is replaced.
+   * Resolves to the matches replaced, the cells written, and the matches in cells that could
+   * not be written. Refused (said, nothing replaced) above MAX_REPLACE_CELLS cells, in a
+   * read-only view, and - where the workbook is edited together - for a change too large to
+   * be shared in one step.
+   */
+  replaceAll(text: string, replacement: string, options?: SheetFindOptions): Promise<{ replaced: number; cells: number; skipped: number }> {
+    const none = { replaced: 0, cells: 0, skipped: 0 };
+    if (this.destroyed) return Promise.resolve(none);
+    let find;
+    try {
+      checkReplacement(replacement);
+      find = compileSheetFind(text, this.findOptions(options));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!find) return Promise.resolve(none);
+    if (this.locked) {
+      this.notify(this.strings.find.readOnly, 'info');
+      return Promise.resolve(none);
+    }
+    if (!this.tryCommit()) return Promise.resolve(none);
+    const token = ++this.findToken;
+    const epoch = this.changeEpoch;
+    const job = new ReplaceAll(this.workbook, find, replacement, this.findOptions(options), searchStart(this.sheetIndex));
+    const words = this.strings.find;
+    return runSliced(
+      () => this.changeEpoch !== epoch || job.step(4096),
+      () => !this.destroyed && token === this.findToken,
+    ).then((done) => {
+      if (!done || this.destroyed || token !== this.findToken) return none;
+      if (this.changeEpoch !== epoch) {
+        this.notify(words.changedMeanwhile, 'error');
+        return none;
+      }
+      const result = job.result();
+      if (result.tooMany) {
+        this.notify(words.tooMany(MAX_REPLACE_CELLS), 'error');
+        return none;
+      }
+      if (result.ops.length > 0) {
+        try {
+          if (!this.applyOps(result.ops)) return none;
+        } catch (error) {
+          this.notify(this.localizeError(error), 'error');
+          return none;
+        }
+      }
+      this.notify(words.replaced(result.replaced, result.skipped), 'info');
+      return { replaced: result.replaced, cells: result.cells, skipped: result.skipped };
+    });
+  }
+
+  /** A search the bar asked for: what came of it is said in the bar. */
+  private barSearch(query: FindBarQuery, backward: boolean): void {
+    const bar = this.findBar;
+    if (!bar) return;
+    bar.setStatus(this.strings.find.searching);
+    this.findNext(query.text, { ...this.barOptions(query), backward }).then(
+      (hit) => {
+        if (this.findBar === bar) bar.setStatus(hit ? this.findCount : this.strings.find.noMatches);
+      },
+      (error) => {
+        if (this.findBar === bar) bar.setStatus(this.localizeError(error));
+      },
+    );
+  }
+
+  private barReplace(query: FindBarQuery, replacement: string, all: boolean): void {
+    const bar = this.findBar;
+    if (!bar) return;
+    bar.setStatus(this.strings.find.searching);
+    const options = { ...this.barOptions(query), lookIn: 'formulas' as const };
+    const say = (text: string): void => {
+      if (this.findBar === bar) bar.setStatus(text);
+    };
+    const failed = (error: unknown): void => say(this.localizeError(error));
+    if (all) this.replaceAll(query.text, replacement, options).then((result) => say(this.strings.find.replaced(result.replaced, result.skipped)), failed);
+    else this.replace(query.text, replacement, options).then(() => say(this.findCount), failed);
+  }
+
+  private barOptions(query: FindBarQuery): SheetFindOptions {
+    return { matchCase: query.matchCase, entireCell: query.whole, lookIn: query.lookIn, within: query.within };
+  }
+
+  /**
+   * Counts the matches of the bar's query anew, after a pause. After a change of the file the count is kept for
+   * the next search and not said at once: the bar goes on saying what the change was (how many were replaced).
+   */
+  private scheduleCount(delay = 300, say = true): void {
+    if (this.countTimer !== undefined) clearTimeout(this.countTimer);
+    this.countTimer = setTimeout(() => {
+      this.countTimer = undefined;
+      this.countMatches(say);
+    }, delay);
+  }
+
+  /** Counts the cells that match the bar's query, a slice at a time, and says how many in the bar. */
+  private countMatches(say: boolean): void {
+    const bar = this.findBar;
+    if (!bar || this.destroyed) return;
+    const query = bar.query;
+    const token = ++this.countToken;
+    const options = this.findOptions(this.barOptions(query));
+    let find;
+    try {
+      find = compileSheetFind(query.text, options);
+    } catch (error) {
+      bar.setStatus(this.localizeError(error));
+      return;
+    }
+    if (!find) {
+      this.findCount = '';
+      if (say) bar.setStatus('');
+      return;
+    }
+    const search = new SheetSearch(this.workbook, find, options, searchStart(this.sheetIndex));
+    let count = 0;
+    let more = false;
+    const epoch = this.changeEpoch;
+    runSliced(
+      () => {
+        if (this.changeEpoch !== epoch) return true;
+        for (;;) {
+          const hit = search.step(4096);
+          if (hit === undefined) return false;
+          if (hit === null) return true;
+          if (++count >= MAX_COUNTED) {
+            more = true;
+            return true;
+          }
+        }
+      },
+      () => !this.destroyed && token === this.countToken && this.findBar === bar,
+    ).then(
+      (done) => {
+        if (!done || token !== this.countToken || this.findBar !== bar || this.changeEpoch !== epoch) return;
+        const words = this.strings.find;
+        this.findCount = count === 0 ? words.noMatches : words.matches(count, more);
+        if (say) bar.setStatus(this.findCount);
+      },
+      () => undefined,
+    );
+  }
+
   /** The format of the active cell (font, fill, border, alignment, numFmt), for a toolbar to reflect. */
   get selectionFormat(): ResolvedCellStyle {
     const state = this.state();
@@ -6416,6 +6729,7 @@ export class WorkbookView {
     }
     this.locked = next;
     this.input.readOnly = next;
+    if (this.findBar) this.findBar.refresh();
     this.cellInfo = undefined;
     this.placeAddButton();
     this.schedule();
@@ -6777,6 +7091,9 @@ export class WorkbookView {
   /** Everything that has to follow a change of the model. */
   private afterChange(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): void {
     this.printEpoch++;
+    this.changeEpoch++;
+    // What the bar of Find counted may be other now.
+    if (this.findBar) this.scheduleCount(300, false);
     // A rule may read any cell of any sheet.
     this.conditional.forEach((formats) => formats.invalidate());
     this.cellInfo = undefined;

@@ -429,6 +429,49 @@ export interface UiStrings {
   charts: ChartStrings;
   /** Pivot tables: the commands of the menu of a cell of one, and what is said about a refresh. */
   pivots: PivotStrings;
+  /** The bar of Find and Replace of both views. */
+  find: FindStrings;
+}
+
+/** What the bar of Find and Replace says. */
+export interface FindStrings {
+  /** The label of the bar. */
+  title: string;
+  findLabel: string;
+  replaceLabel: string;
+  previous: string;
+  next: string;
+  replace: string;
+  replaceAll: string;
+  /** Shows or hides the field of the replacement. */
+  toggleReplace: string;
+  close: string;
+  matchCase: string;
+  /** Of a document: the text is a word of its own. */
+  wholeWord: string;
+  /** Of a workbook: the text is the whole content of the cell. */
+  entireCell: string;
+  lookIn: string;
+  lookInFormulas: string;
+  lookInValues: string;
+  within: string;
+  withinSheet: string;
+  withinWorkbook: string;
+  /** Said while a search goes through a large document or workbook. */
+  searching: string;
+  noMatches: string;
+  /** How many matches there are; `more`: at least that many. */
+  matches(count: number, more: boolean): string;
+  /** Said after replacing: how many were replaced, and how many could not be. */
+  replaced(count: number, skipped: number): string;
+  /** A replacement in a room that had to be made in several steps. */
+  replacedInSteps(steps: number): string;
+  /** Said when the search was given up because the file changed while it ran. */
+  changedMeanwhile: string;
+  /** Said when there are more matches to replace than one command takes. */
+  tooMany(limit: number): string;
+  /** Nothing is replaced in a view that is read-only. */
+  readOnly: string;
 }
 
 /** What the commands of pivot tables say. */
@@ -1339,6 +1382,34 @@ export const STRINGS_EN: UiStrings = {
     refused: (message) => message,
     none: 'The workbook has no pivot table to refresh',
   },
+  find: {
+    title: 'Find and replace',
+    findLabel: 'Find',
+    replaceLabel: 'Replace with',
+    previous: 'Previous match (Shift+Enter)',
+    next: 'Next match (Enter)',
+    replace: 'Replace',
+    replaceAll: 'Replace all',
+    toggleReplace: 'Show replace',
+    close: 'Close (Esc)',
+    matchCase: 'Match case',
+    wholeWord: 'Whole words only',
+    entireCell: 'Entire cell contents',
+    lookIn: 'Look in',
+    lookInFormulas: 'Formulas',
+    lookInValues: 'Values',
+    within: 'Within',
+    withinSheet: 'Sheet',
+    withinWorkbook: 'Workbook',
+    searching: 'Searching…',
+    noMatches: 'No matches',
+    matches: (count, more) => (more ? `More than ${count} matches` : count === 1 ? '1 match' : `${count} matches`),
+    replaced: (count, skipped) => (count === 1 ? '1 replacement' : `${count} replacements`) + (skipped > 0 ? `; ${skipped} could not be replaced` : ''),
+    replacedInSteps: (steps) => `Replaced in ${steps} steps, each undone on its own, because the file is edited together`,
+    changedMeanwhile: 'The file changed during the search: try again',
+    tooMany: (limit) => `There are more than ${limit} matches to replace at once: narrow the search`,
+    readOnly: 'Nothing can be replaced: the file is read-only',
+  },
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -1990,6 +2061,34 @@ export const STRINGS_TR: UiStrings = {
     refreshed: (count) => (count === 1 ? 'Pivot tablo yenilendi' : `${count} pivot tablo yenilendi`),
     refused: pivotRefusalTr,
     none: 'Çalışma kitabında yenilenecek pivot tablo yok',
+  },
+  find: {
+    title: 'Bul ve değiştir',
+    findLabel: 'Bul',
+    replaceLabel: 'Yeni metin',
+    previous: 'Önceki (Shift+Enter)',
+    next: 'Sonraki (Enter)',
+    replace: 'Değiştir',
+    replaceAll: 'Tümünü değiştir',
+    toggleReplace: 'Değiştirmeyi göster',
+    close: 'Kapat (Esc)',
+    matchCase: 'Büyük/küçük harf duyarlı',
+    wholeWord: 'Yalnız tam sözcükler',
+    entireCell: 'Hücrenin tamamı',
+    lookIn: 'Aranan yer',
+    lookInFormulas: 'Formüller',
+    lookInValues: 'Değerler',
+    within: 'Kapsam',
+    withinSheet: 'Sayfa',
+    withinWorkbook: 'Çalışma kitabı',
+    searching: 'Aranıyor…',
+    noMatches: 'Sonuç yok',
+    matches: (count, more) => (more ? `${count} sonuçtan fazla` : `${count} sonuç`),
+    replaced: (count, skipped) => `${count} yer değiştirildi` + (skipped > 0 ? `; ${skipped} yer değiştirilemedi` : ''),
+    replacedInSteps: (steps) => `Dosya birlikte düzenlendiği için ${steps} adımda değiştirildi; her adım ayrı geri alınır`,
+    changedMeanwhile: 'Arama sürerken dosya değişti: yeniden deneyin',
+    tooMany: (limit) => `Bir seferde değiştirilecek ${limit} sonuçtan fazlası var: aramayı daraltın`,
+    readOnly: 'Hiçbir şey değiştirilemez: dosya salt okunur',
   },
 };
 

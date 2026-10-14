@@ -26,6 +26,7 @@ export {
 } from './format';
 export { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertImage, insertRow, insertTable, type InsertImageOptions, type NewImage } from './structure';
 export { FRAGMENT_LIMITS, MAX_TABLE_DEPTH, fragmentHasContent, fragmentNeeds, fragmentOf, insertFragment, originOf, type DocFragment, type FragmentMedia, type InsertFragmentOptions } from './fragment';
+export { DocMatchScan, DocSearch, MAX_FIND_PARAGRAPHS, compileDocFind, docParagraphs, findAllInDocument, findInDocument, matchRange, paragraphMatches, replaceMatches, docFindCounters, type ReplaceMatchesOptions, type DocFindOptions, type DocMatch, type DocParagraphRef } from './find';
 export { DEFAULT_AUTHOR, TRACK_UNSUPPORTED, forcesTracking, isTracking, nextRevisionId, revisionDate, setTracking, type TrackOptions, type TrackingSetup } from './track';
 export {
   REVISIONS_PROTECTED,

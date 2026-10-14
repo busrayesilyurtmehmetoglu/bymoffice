@@ -37,6 +37,10 @@ export interface EditorStrings {
   alignLeft: string;
   alignCenter: string;
   alignRight: string;
+  /** Vertical alignment of the cells: top, middle, bottom. */
+  alignTop: string;
+  alignMiddle: string;
+  alignBottom: string;
   wrapText: string;
   mergeCells: string;
   /** The menu beside the merge button, and its entries. */
@@ -87,6 +91,8 @@ export interface EditorStrings {
   /** Name of the default paragraph style when the document gives it none. */
   normalStyle: string;
   fontName: string;
+  /** The button that opens the bar of Find and Replace. */
+  findReplace: string;
   highlightColor: string;
   noHighlight: string;
   alignJustify: string;
@@ -181,6 +187,9 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   alignLeft: 'Align left',
   alignCenter: 'Align centre',
   alignRight: 'Align right',
+  alignTop: 'Align top',
+  alignMiddle: 'Align middle',
+  alignBottom: 'Align bottom',
   wrapText: 'Wrap text',
   mergeCells: 'Merge cells',
   mergeOptions: 'Merge options',
@@ -223,6 +232,7 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   paragraphStyle: 'Paragraph style',
   normalStyle: 'Normal',
   fontName: 'Font',
+  findReplace: 'Find and replace',
   highlightColor: 'Highlight colour',
   noHighlight: 'No highlight',
   alignJustify: 'Justify',
@@ -294,6 +304,9 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   alignLeft: 'Sola hizala',
   alignCenter: 'Ortaya hizala',
   alignRight: 'Sağa hizala',
+  alignTop: 'Üste hizala',
+  alignMiddle: 'Ortaya hizala',
+  alignBottom: 'Alta hizala',
   wrapText: 'Metni kaydır',
   mergeCells: 'Hücreleri birleştir',
   mergeOptions: 'Birleştirme seçenekleri',
@@ -336,6 +349,7 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   paragraphStyle: 'Paragraf stili',
   normalStyle: 'Normal',
   fontName: 'Yazı tipi',
+  findReplace: 'Bul ve değiştir',
   highlightColor: 'Vurgu rengi',
   noHighlight: 'Vurgu yok',
   alignJustify: 'İki yana yasla',

@@ -2,7 +2,7 @@
 // font and its size, character and paragraph formatting, lists, tables, a
 // picture, a link, a page break, the tracked changes (tracking on and off,
 // the change before and after, accept, reject, and a menu for all of them) and
-// the comments (a new one, the one before and after). It has the looks and the keys of the
+// the comments (a new one, the one before and after), and Find and Replace. It has the looks and the keys of the
 // spreadsheet editor's toolbar: its buttons are a single Tab stop with the
 // arrow keys moving between them, each list is a Tab stop of its own, and a
 // command ends with the focus back in the document.
@@ -16,8 +16,8 @@ import type { DocumentView } from './doc-view';
 import { ICON_BAR_CLASS, createDocIcon, createIcon, type DocIconName, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
 import type { SaveCommand } from './save-command';
-import { onFontsChanged, registeredFonts } from '../render/fonts';
-import { embeddedFontNames } from '../render/embedded-fonts';
+import { onFontsChanged } from '../render/fonts';
+import { fontChoices } from './font-list';
 
 /** What the toolbar needs from the editor that holds it. */
 export interface DocShellHost {
@@ -62,7 +62,8 @@ type ButtonKey =
   | 'changesMenu'
   | 'newComment'
   | 'previousComment'
-  | 'nextComment';
+  | 'nextComment'
+  | 'find';
 
 type CommentKey = 'newComment' | 'previousComment' | 'nextComment';
 
@@ -112,12 +113,11 @@ const SHARED_ICONS: { [key: string]: IconName } = {
   alignCenter: 'alignCenter',
   alignRight: 'alignRight',
   rowsColumns: 'rowsColumns',
+  find: 'find',
 };
 
 /** Font sizes offered, in points. */
 const FONT_SIZES = [8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 36, 48, 72];
-/** Fonts offered besides those the document names. */
-const COMMON_FONTS = ['Arial', 'Calibri', 'Cambria', 'Courier New', 'Georgia', 'Tahoma', 'Times New Roman', 'Verdana'];
 const MAX_LIST_ENTRIES = 120;
 
 const PALETTE_COLUMNS = 10;
@@ -258,6 +258,11 @@ export class DocToolbar {
     this.addButton('acceptChange', () => view().acceptRevision(undefined, true));
     this.addButton('rejectChange', () => view().rejectRevision(undefined, true));
     this.addMenuButton('changesMenu', 'menu', () => this.openChangesMenu());
+    this.addSeparator();
+    // The bar of Find and Replace takes the focus itself.
+    const find = this.addButton('find', () => view().openFind(false));
+    find.setAttribute('aria-haspopup', 'dialog');
+    this.openers.add(find);
 
     // The picture button only opens the browser's own file dialog: it has nothing that stays open.
     const pictureButton = this.buttons.insertPicture as HTMLButtonElement;
@@ -582,6 +587,7 @@ export class DocToolbar {
       newComment: `${s.newComment} (${apple() ? '\u2325\u2318M' : 'Ctrl+Alt+M'})`,
       previousComment: s.previousComment,
       nextComment: s.nextComment,
+      find: withShortcut(s.findReplace, 'F'),
     };
     for (const key of Object.keys(labels) as ButtonKey[]) {
       const button = this.buttons[key];
@@ -646,27 +652,9 @@ export class DocToolbar {
   }
 
   private showFont(font: string | undefined): void {
-    const names = new Map<string, string>();
-    const add = (name: string) => {
-      if (name !== '' && names.size < MAX_LIST_ENTRIES && !names.has(name.toLowerCase())) names.set(name.toLowerCase(), name);
-    };
-    for (let i = 0; i < COMMON_FONTS.length; i++) add(COMMON_FONTS[i]);
-    // The fonts the application registered: they are there for certain.
-    const registered = registeredFonts();
-    for (let i = 0; i < registered.length; i++) if (registered[i].status === 'loaded') add(registered[i].family);
-    // The names the font of the package is shown for (Bookman Old Style): the document gets that name, and where
-    // the device lacks the font the text is drawn with the one of the package.
-    const embedded = embeddedFontNames();
-    for (let i = 0; i < embedded.length; i++) add(embedded[i]);
-    this.host.view.document.fonts.forEach((_info, name) => add(name));
-    if (font !== undefined) add(font);
-    const list: string[] = [];
-    names.forEach((name) => list.push(name));
-    list.sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1));
-    const entries = list.map((name): [string, string] => [name, name]);
-    let shown = font;
-    if (shown !== undefined) shown = names.get(shown.toLowerCase());
-    this.fontKey = this.fill(this.fontSelect, entries, list.join('\u0001'), this.fontKey, shown);
+    const { names, shown } = fontChoices(this.host.view.document.fonts.keys(), font);
+    const entries = names.map((name): [string, string] => [name, name]);
+    this.fontKey = this.fill(this.fontSelect, entries, names.join('\u0001'), this.fontKey, shown);
   }
 
   private showSize(size: number | undefined): void {

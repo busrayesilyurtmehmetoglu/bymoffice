@@ -478,10 +478,17 @@ export class SpreadsheetEditor {
     }
   }
 
-  /** Ctrl+P in the toolbar and the formula bar prints the workbook as it does in the grid (which handles it itself). */
+  /** Ctrl+P in the toolbar and the formula bar prints the workbook as it does in the grid (which handles it itself); Ctrl+F and Ctrl+H find. */
   private onKeyDown = (event: KeyboardEvent): void => {
     if (this.destroyed || event.defaultPrevented || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-    if (event.key !== 'p' && event.key !== 'P') return;
+    const key = event.key;
+    // Ctrl+F and Ctrl+H open the bar of Find and Replace there too.
+    if ((key === 'f' || key === 'F' || key === 'h' || key === 'H') && !this.view.isEditing) {
+      event.preventDefault();
+      this.view.openFind(key === 'h' || key === 'H');
+      return;
+    }
+    if (key !== 'p' && key !== 'P') return;
     event.preventDefault();
     this.view.print().catch(() => undefined);
   };

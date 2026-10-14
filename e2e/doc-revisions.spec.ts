@@ -397,6 +397,8 @@ test.describe('tracked changes: accepting, rejecting, stepping', () => {
     await select(page, [0], 0);
     await button(page, 'bold').focus();
     await page.keyboard.press('End');
+    await expect(button(page, 'find')).toBeFocused();
+    await page.keyboard.press('ArrowLeft');
     await expect(button(page, 'changesMenu')).toBeFocused();
     await page.keyboard.press('ArrowLeft');
     // Accept and reject have nothing to work on at the caret: the arrow passes them.

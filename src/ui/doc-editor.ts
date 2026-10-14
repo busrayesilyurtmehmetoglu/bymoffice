@@ -356,10 +356,17 @@ export class DocumentEditor {
     this.toolbar.update();
   }
 
-  /** Ctrl+P on the toolbar prints the document as it does in the pages (which handle it themselves). */
+  /** Ctrl+P on the toolbar prints the document as it does in the pages (which handle it themselves); Ctrl+F and Ctrl+H find. */
   private onKeyDown = (event: KeyboardEvent): void => {
     if (this.destroyed || event.defaultPrevented || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-    if (event.key !== 'p' && event.key !== 'P') return;
+    const key = event.key;
+    // Ctrl+F and Ctrl+H open the bar of Find and Replace there too.
+    if ((key === 'f' || key === 'F' || key === 'h' || key === 'H')) {
+      event.preventDefault();
+      this.view.openFind(key === 'h' || key === 'H');
+      return;
+    }
+    if (key !== 'p' && key !== 'P') return;
     event.preventDefault();
     this.view.print().catch(() => undefined);
   };

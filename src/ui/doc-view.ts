@@ -63,6 +63,9 @@ import { joinParts } from '../pdf/writer';
 import { resolveUiStrings, type UiStrings } from './strings';
 import { TabStopsDialog } from './doc-tabs-dialog';
 import { editorRootIn } from './save-confirm';
+import { FindBar, type FindBarQuery } from './find-bar';
+import { runSliced } from './sliced';
+import { checkReplacement, type CompiledFind } from '../edit/find';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
 export { declaredImagePixels, declaredImageSize, decodedImageSize, sniffImageType } from '../render/images';
@@ -200,6 +203,13 @@ const MAX_MARKED_COMMENTS = 2000;
 const COMMENT_MARK = 22;
 /** Marks that would lie over each other stand beside each other, in at most so many columns. */
 const MAX_MARK_COLUMNS = 6;
+/** Most matches the bar of Find counts; beyond it says "more than". */
+const MAX_COUNTED = 10000;
+/** Most replacements "Replace all" makes at once where the document is edited together: each travels as a command of its own. */
+const ROOM_REPLACE_LIMIT = 200;
+/** Counts the runs of "Replace all": the steps of one are undone together. */
+let replaceRuns = 0;
+
 /** The locale the numbers of charts are written in: that of the language of the view (Turkish or English), by default that of the browser. */
 function chartLocaleOf(locale: string | object | undefined): FormatLocale {
   return getLocale(typeof locale === 'string' ? locale : typeof locale === 'undefined' && typeof navigator !== 'undefined' ? navigator.language : undefined);
@@ -761,6 +771,16 @@ export class DocumentView {
   private layoutTabStop = -1;
   /** The dialog of tab stops, while it is open. */
   private tabsDialog: TabStopsDialog | undefined;
+  /** The bar of Find and Replace, while it is open. */
+  private findBar: FindBar | undefined;
+  /** Counts the searches: one that was overtaken by another gives up. */
+  private findToken = 0;
+  private countToken = 0;
+  private countTimer: ReturnType<typeof setTimeout> | undefined;
+  /** What the bar says about the matches of its query, between searches. */
+  private findCount = '';
+  /** The paragraphs searched last, with the count of changes they are good for. */
+  private findList: { changes: number; stories: 'all' | 'body'; doc: DocModel; list: ops.DocParagraphRef[] } | undefined;
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
@@ -1185,6 +1205,7 @@ export class DocumentView {
   setLocale(locale: string | object): void {
     if (this.destroyed) return;
     this.strings = resolveStrings(locale);
+    if (this.findBar) this.findBar.setStrings(this.strings.find);
     // Numbers and the made-up names of series of the charts are in the language of the view.
     this.chartLocale = chartLocaleOf(locale);
     this.charts.clear();
@@ -1278,6 +1299,7 @@ export class DocumentView {
     if (this.destroyed) return;
     this.destroyed = true;
     if (this.tabsDialog) this.tabsDialog.close();
+    this.closeFind(false);
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
@@ -2973,6 +2995,12 @@ export class DocumentView {
       this.print().catch(() => undefined);
       return;
     }
+    // Ctrl+F and Ctrl+H: Find, and Find and Replace (Cmd+F as well on Apple's; Cmd+H is the system's there).
+    if (command && !event.altKey && !event.shiftKey && (key === 'f' || key === 'F' || key === 'h' || key === 'H') && !(this.bar && target && this.bar.contains(target))) {
+      event.preventDefault();
+      this.openFind(key === 'h' || key === 'H');
+      return;
+    }
     // The other keys on the buttons of the bar are theirs.
     if (this.bar && target && this.bar.contains(target)) return;
     // And those on the mark of a comment: Enter and the space bar press it.
@@ -4335,6 +4363,7 @@ export class DocumentView {
       return;
     }
     if (this.editable === !readOnly) return;
+    if (this.findBar) setTimeout(() => this.findBar && this.findBar.refresh(), 0);
     // A drag does not go on from one kind of view into the other.
     this.endDrag();
     this.typing.commit();
@@ -4699,6 +4728,300 @@ export class DocumentView {
     return range !== undefined && range.focus.path.length >= 4 && range.focus.path.indexOf(-1) < 0;
   }
 
+  // ------------------------------------------------------------ find and replace
+
+  /**
+   * Opens the bar of Find (with `replace`, of Find and Replace) at the top of the editor, or
+   * brings the focus to it when it is open. Text that is selected in one paragraph is what it
+   * looks for first. Finding works in a read-only document too; replacing does not.
+   */
+  openFind(replace = false): boolean {
+    if (this.destroyed) return false;
+    this.typing.commit();
+    let initial = '';
+    try {
+      const selected = this.selection !== 'all' ? this.getSelectedText() : '';
+      if (selected.length <= 200 && !/[\r\n\u000b]/.test(selected)) initial = selected;
+    } catch {
+      initial = '';
+    }
+    const open = this.findBar;
+    if (open && open.isOpen) {
+      open.setText(initial);
+      if (replace) open.setReplace(true);
+      open.focus(replace ? 'replace' : 'find');
+      return true;
+    }
+    const bar = new FindBar({
+      root: editorRootIn(this.container, this.root),
+      below: this.root,
+      strings: this.strings.find,
+      kind: 'doc',
+      openReplace: replace,
+      initial,
+      canReplace: () => this.editable && !this.destroyed,
+      find: (query, backward) => this.barSearch(query, backward),
+      replace: (query, replacement) => this.barReplace(query, replacement, false),
+      replaceAll: (query, replacement) => this.barReplace(query, replacement, true),
+      changed: () => this.scheduleCount(0),
+      onClose: () => this.closeFind(true),
+    });
+    this.findBar = bar;
+    this.findCount = '';
+    if (initial !== '') this.scheduleCount(0);
+    bar.focus(replace ? 'replace' : 'find');
+    return true;
+  }
+
+  /** Closes the bar of Find and Replace; with `focus` the document takes the focus back when the bar had it. */
+  closeFind(focus = true): void {
+    const bar = this.findBar;
+    if (!bar) return;
+    this.findBar = undefined;
+    this.findToken++;
+    this.countToken++;
+    if (this.countTimer !== undefined) clearTimeout(this.countTimer);
+    this.countTimer = undefined;
+    const had = bar.hasFocus;
+    bar.close();
+    if (focus && had && !this.destroyed) this.focus();
+  }
+
+  /** Whether the bar of Find and Replace is open. */
+  get findOpen(): boolean {
+    return this.findBar !== undefined;
+  }
+
+  /** The paragraphs a search goes through, kept while the document does not change. */
+  private findParagraphs(stories: 'all' | 'body' | undefined): ops.DocParagraphRef[] {
+    const which = stories === 'body' ? 'body' : 'all';
+    const kept = this.findList;
+    if (kept && kept.changes === this.changes && kept.stories === which && kept.doc === this.document) return kept.list;
+    const list = ops.docParagraphs(this.document, which);
+    this.findList = { changes: this.changes, stories: which, doc: this.document, list };
+    return list;
+  }
+
+  private docFind(text: string, options: ops.DocFindOptions | undefined): CompiledFind | undefined {
+    return ops.compileDocFind(text, { ...(options || {}), locale: this.chartLocale });
+  }
+
+  /**
+   * Finds the next place that has the text (with `backward`, the one before) from the end (the
+   * start) of the selection, round the end of the document, and selects it. The text is plain
+   * text, found within one paragraph; what is searched is said in src/ops/doc/find.ts. The
+   * search goes a slice at a time; a later search, a change of the document or the bar closing
+   * gives it up. Resolves to the range found, or undefined.
+   */
+  findNext(text: string, options?: ops.DocFindOptions & { backward?: boolean }): Promise<DocRange | undefined> {
+    if (this.destroyed) return Promise.resolve(undefined);
+    let find: CompiledFind | undefined;
+    try {
+      find = this.docFind(text, options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!find) return Promise.resolve(undefined);
+    this.typing.commit();
+    const token = ++this.findToken;
+    const backward = !!(options && options.backward);
+    const range = this.range();
+    const from = range ? (backward ? ops.orderRange(range).start : ops.orderRange(range).end) : undefined;
+    const search = new ops.DocSearch(find, this.findParagraphs(options && options.stories), from, backward);
+    const changes = this.changes;
+    let hit: ops.DocMatch | null | undefined;
+    return runSliced(
+      () => (hit = search.step(256)) !== undefined,
+      () => !this.destroyed && token === this.findToken && this.changes === changes,
+    ).then((done) => {
+      if (!done || !hit || this.destroyed || token !== this.findToken || this.changes !== changes) return undefined;
+      try {
+        this.setSelection(hit.range);
+      } catch {
+        return undefined;
+      }
+      return { anchor: copyPosition(hit.range.anchor), focus: copyPosition(hit.range.focus) };
+    });
+  }
+
+  /** The match the selection is, when it is one. */
+  private selectedMatch(find: CompiledFind, stories: 'all' | 'body' | undefined): ops.DocMatch | undefined {
+    const range = this.range();
+    if (!range || ops.isCollapsed(range)) return undefined;
+    const { start, end } = ops.orderRange(range);
+    if (start.story !== end.story || start.path.join(',') !== end.path.join(',')) return undefined;
+    const ref = this.findParagraphs(stories).find((entry) => entry.story === start.story && entry.path.join(',') === start.path.join(','));
+    if (!ref) return undefined;
+    const matches = ops.paragraphMatches(find, ref);
+    for (let i = 0; i < matches.length; i++) {
+      const m = matches[i];
+      if (m.range.anchor.offset === start.offset && m.range.focus.offset === end.offset) return m;
+    }
+    return undefined;
+  }
+
+  /**
+   * Replaces the selection when it is a match of the text, then goes on to the next match
+   * (Word's Replace). Where changes are tracked the replacement is a tracked change. Resolves to
+   * whether something was replaced, as one undo step. Nothing is replaced in a read-only document.
+   */
+  replace(text: string, replacement: string, options?: ops.DocFindOptions): Promise<boolean> {
+    if (this.destroyed) return Promise.resolve(false);
+    let find: CompiledFind | undefined;
+    try {
+      checkReplacement(replacement);
+      find = this.docFind(text, options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!find) return Promise.resolve(false);
+    if (!this.editable) {
+      this.notify(this.strings.find.readOnly, 'info');
+      return Promise.resolve(false);
+    }
+    this.typing.commit();
+    const match = this.selectedMatch(find, options && options.stories);
+    let changed = false;
+    if (match && match.replaceable) changed = this.perform(() => ops.insertText(this.document, match.range, replacement), true);
+    else if (match) this.notify(this.strings.find.replaced(0, 1), 'info');
+    return this.findNext(text, options).then(() => changed);
+  }
+
+  /**
+   * Replaces the text everywhere the search reaches, as one undo step; where changes are
+   * tracked each replacement is a tracked change. The matches are collected a slice at a time;
+   * when the document changes meanwhile that is said and nothing is replaced. Resolves to the
+   * matches replaced and those that could not be (see src/ops/doc/find.ts). Where the document
+   * is edited together each replacement travels as a command of its own, and at most
+   * ROOM_REPLACE_LIMIT of them are made at once (more is refused, and said).
+   */
+  replaceAll(text: string, replacement: string, options?: ops.DocFindOptions): Promise<{ replaced: number; skipped: number }> {
+    const none = { replaced: 0, skipped: 0 };
+    if (this.destroyed) return Promise.resolve(none);
+    let find: CompiledFind | undefined;
+    try {
+      checkReplacement(replacement);
+      find = this.docFind(text, options);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    if (!find) return Promise.resolve(none);
+    if (!this.editable) {
+      this.notify(this.strings.find.readOnly, 'info');
+      return Promise.resolve(none);
+    }
+    this.typing.commit();
+    const token = ++this.findToken;
+    const changes = this.changes;
+    const scan = new ops.DocMatchScan(find, this.findParagraphs(options && options.stories));
+    const words = this.strings.find;
+    return runSliced(
+      () => this.changes !== changes || scan.step(256),
+      () => !this.destroyed && token === this.findToken,
+    ).then((done) => {
+      if (!done || this.destroyed || token !== this.findToken) return none;
+      if (this.changes !== changes || !this.editable) {
+        this.notify(words.changedMeanwhile, 'error');
+        return none;
+      }
+      this.typing.commit();
+      this.history.seal();
+      const range = this.range();
+      const before = range ? { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) } : undefined;
+      const key = `replace-all:${++replaceRuns}`;
+      const history = this.history;
+      const result = ops.replaceMatches(this.document, scan.matches, replacement, {
+        // The commands of the view: in a room each travels as the command it is.
+        insert: (doc, at, text) => ops.insertText(doc, at, text),
+        apply: (edit) => history.applyEdit({ ops: edit.ops, selection: edit.selection, mergeKey: key }, before),
+        limit: this.collab ? ROOM_REPLACE_LIMIT : undefined,
+      });
+      if (result.refused) {
+        this.notify(words.tooMany(ROOM_REPLACE_LIMIT), 'error');
+        return none;
+      }
+      const { replaced, skipped, last } = result;
+      this.history.seal();
+      if (replaced > 0) this.changed(last);
+      this.notify(words.replaced(replaced, skipped), 'info');
+      return { replaced, skipped };
+    });
+  }
+
+  /** A search the bar asked for: what came of it is said in the bar. */
+  private barSearch(query: FindBarQuery, backward: boolean): void {
+    const bar = this.findBar;
+    if (!bar) return;
+    bar.setStatus(this.strings.find.searching);
+    this.findNext(query.text, { matchCase: query.matchCase, wholeWord: query.whole, backward }).then(
+      (hit) => {
+        if (this.findBar === bar) bar.setStatus(hit ? this.findCount : this.strings.find.noMatches);
+      },
+      () => {
+        if (this.findBar === bar) bar.setStatus(this.strings.find.noMatches);
+      },
+    );
+  }
+
+  private barReplace(query: FindBarQuery, replacement: string, all: boolean): void {
+    const bar = this.findBar;
+    if (!bar) return;
+    bar.setStatus(this.strings.find.searching);
+    const options = { matchCase: query.matchCase, wholeWord: query.whole };
+    const say = (text: string): void => {
+      if (this.findBar === bar) bar.setStatus(text);
+    };
+    const failed = (): void => say(this.strings.find.noMatches);
+    if (all) this.replaceAll(query.text, replacement, options).then((result) => say(this.strings.find.replaced(result.replaced, result.skipped)), failed);
+    else this.replace(query.text, replacement, options).then(() => say(this.findCount), failed);
+  }
+
+  /**
+   * Counts the matches of the bar's query anew, after a pause. After a change of the file the count is kept for
+   * the next search and not said at once: the bar goes on saying what the change was (how many were replaced).
+   */
+  private scheduleCount(delay = 300, say = true): void {
+    if (this.countTimer !== undefined) clearTimeout(this.countTimer);
+    this.countTimer = setTimeout(() => {
+      this.countTimer = undefined;
+      this.countMatches(say);
+    }, delay);
+  }
+
+  /** Counts the matches of the bar's query, a slice at a time, and says how many in the bar. */
+  private countMatches(say: boolean): void {
+    const bar = this.findBar;
+    if (!bar || this.destroyed) return;
+    const query = bar.query;
+    const token = ++this.countToken;
+    let find: CompiledFind | undefined;
+    try {
+      find = this.docFind(query.text, { matchCase: query.matchCase, wholeWord: query.whole });
+    } catch {
+      find = undefined;
+    }
+    if (!find) {
+      this.findCount = '';
+      if (say) bar.setStatus('');
+      return;
+    }
+    const scan = new ops.DocMatchScan(find, this.findParagraphs('all'), MAX_COUNTED);
+    const changes = this.changes;
+    runSliced(
+      () => this.changes !== changes || scan.step(256),
+      () => !this.destroyed && token === this.countToken && this.findBar === bar,
+    ).then(
+      (done) => {
+        if (!done || token !== this.countToken || this.findBar !== bar || this.changes !== changes) return;
+        const words = this.strings.find;
+        const count = scan.matches.length;
+        this.findCount = count === 0 ? words.noMatches : words.matches(count, scan.more);
+        if (say) bar.setStatus(this.findCount);
+      },
+      () => undefined,
+    );
+  }
+
   /** Ends what an input method is composing: the text it has typed so far stays in the document. Call before saving. */
   commitEditing(): void {
     if (this.destroyed) return;
@@ -4779,6 +5102,7 @@ export class DocumentView {
     this.pendingFormat = undefined;
     this.targetX = undefined;
     this.changes++;
+    if (this.findBar) this.scheduleCount(300, false);
     this.follow();
     // Without bringing the caret into view: the user did not move it.
     this.selectionMoved(false);
@@ -4952,6 +5276,8 @@ export class DocumentView {
   private changed(selection: DocRange | undefined): void {
     this.modified = true;
     this.changes++;
+    // What the bar of Find counted may be other now.
+    if (this.findBar) this.scheduleCount(300, false);
     if (selection) this.adopt(selection);
     this.affinity = 'start';
     this.targetX = undefined;

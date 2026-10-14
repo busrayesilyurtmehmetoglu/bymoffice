@@ -20,6 +20,9 @@ export type IconName =
   | 'alignLeft'
   | 'alignCenter'
   | 'alignRight'
+  | 'alignTop'
+  | 'alignMiddle'
+  | 'alignBottom'
   | 'wrapText'
   | 'merge'
   | 'mergeOptions'
@@ -29,7 +32,8 @@ export type IconName =
   | 'validation'
   | 'conditionalFormat'
   | 'chart'
-  | 'rowsColumns';
+  | 'rowsColumns'
+  | 'find';
 
 type Shape = [tag: string, attrs: { [name: string]: string }];
 
@@ -68,6 +72,10 @@ const ICONS: { [name in IconName]: Shape[] } = {
   alignLeft: [path('M4 6h16 M4 10h10 M4 14h16 M4 18h10')],
   alignCenter: [path('M4 6h16 M7 10h10 M4 14h16 M7 18h10')],
   alignRight: [path('M4 6h16 M10 10h10 M4 14h16 M10 18h10')],
+  // A line of text at the top, in the middle, at the bottom of a cell.
+  alignTop: [path('M4 4h16'), path('M8 8h8 M8 11.5h8')],
+  alignMiddle: [path('M4 4h16 M4 20h16'), path('M8 10.25h8 M8 13.75h8')],
+  alignBottom: [path('M4 20h16'), path('M8 12.5h8 M8 16h8')],
   wrapText: [path('M4 6h16 M4 18h5 M4 12h13a3 3 0 0 1 0 6h-4'), path('m15 16-2 2 2 2')],
   merge: [path('M3 6h18v12H3z'), path('M6 12h4 M8 10l2 2-2 2 M18 12h-4 M16 10l-2 2 2 2')],
   // The other ways of merging: a narrow arrow down beside the merge button.
@@ -83,6 +91,8 @@ const ICONS: { [name in IconName]: Shape[] } = {
   // Three columns on a base line.
   chart: [path('M4 20h16'), path('M6.5 20v-6h3v6 M10.5 20V7h3v13 M14.5 20v-9h3v9')],
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
+  // A magnifying glass: find and replace.
+  find: [path('M10.5 4a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z'), path('m15.3 15.3 4.7 4.7')],
 };
 
 /** Icons only the document editor has; the others it shares with the spreadsheet editor. */
