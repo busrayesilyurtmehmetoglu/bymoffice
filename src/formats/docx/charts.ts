@@ -114,16 +114,16 @@ interface Want {
   text?: { ref?: string; text?: string };
 }
 
-/** What of a chart has a reference without a cache element, in the order the series stand in. */
-function wantsOf(chart: Chart, uncached: Set<string>): Want[] {
+/** What of a chart has a reference without a cache element (`uncached` says which do), in the order the series stand in. */
+function wantsOf(chart: Chart, uncached: (reference: string) => boolean, lacking: (data: ChartData) => boolean = empty): Want[] {
   const out: Want[] = [];
-  const named = (reference: string | undefined): boolean => reference !== undefined && uncached.has(refKey(reference));
+  const named = (reference: string | undefined): boolean => reference !== undefined && uncached(reference);
   for (const group of chart.groups) {
     for (const series of group.series) {
       const sources: [Wanted, ChartData | undefined][] = [['values of series', series.values], ['categories', series.categories], ['bubble sizes', series.bubbleSizes]];
       for (const [kind, data] of sources) {
         // UNSURE: categories of several levels are left to the cache: which column of the block is which level is not certain.
-        if (data && !data.multiLevel && empty(data) && named(data.ref)) out.push({ kind, data });
+        if (data && !data.multiLevel && lacking(data) && named(data.ref)) out.push({ kind, data });
       }
       if (series.name && series.name.text === undefined && named(series.name.ref)) out.push({ kind: 'names of series', text: series.name });
     }
@@ -283,6 +283,33 @@ function fillFromBook(chart: Chart, book: Workbook, wants: Want[], budget: { poi
   return { read, missing, problem };
 }
 
+/** Says in the notes of the chart what was read from the workbook and what stayed empty, and why. */
+function noteFilled(chart: Chart, result: { read: Want[]; missing: Want[]; problem?: string }): void {
+  // What came from where: each part of the chart is named in the note that is true of it.
+  if (result.read.length > 0) chart.notes.push(BOOK_NOTE + kindsOf(result.read).join(', '));
+  if (result.missing.length > 0) chart.notes.push(`${EMPTY_NOTE}${kindsOf(result.missing).join(', ')} (${result.problem || 'the embedded workbook of the chart could not be read'})`);
+}
+
+/**
+ * Gives what a chart lacks a cache for (whose reference `uncached` names and whose data holds
+ * no point) the cells of the workbook it was read with or beside; the values taken count
+ * against `budget`. The notes of the chart say what was read and what stayed empty. Used for
+ * the charts of objects embedded in a doc or RTF file, whose workbook is the object itself. There a
+ * chart that cached no value has no cache, whatever number of values it states: `lacking` then
+ * says which data holds no cached point (default: no point and no count of points, as a part
+ * says that it caches nothing).
+ */
+export function fillChartFromBook(
+  chart: Chart,
+  book: Workbook,
+  budget: { points: number },
+  uncached: (reference: string) => boolean,
+  lacking: (data: ChartData) => boolean = empty,
+): void {
+  const wants = wantsOf(chart, uncached, lacking);
+  if (wants.length > 0) noteFilled(chart, fillFromBook(chart, book, wants, budget));
+}
+
 /**
  * Reads the chart parts of one document, all within one set of limits: the parts of the newer
  * chart types (chartex) before the stories are read (a Choice of alternate content is taken only
@@ -360,7 +387,8 @@ export class DocChartReader {
           continue;
         }
         if (!extended) {
-          const wants = wantsOf(chart, uncachedRefs(root));
+          const uncached = uncachedRefs(root);
+          const wants = wantsOf(chart, (reference) => uncached.has(refKey(reference)));
           if (wants.length > 0) {
             // Only now, and only for this chart, the workbook beside the part is looked at.
             let result: { read: Want[]; missing: Want[]; problem?: string };
@@ -370,9 +398,7 @@ export class DocChartReader {
             } catch (error) {
               result = { read: [], missing: wants, problem: 'the embedded workbook of the chart could not be read' };
             }
-            // What came from where: each part of the chart is named in the note that is true of it.
-            if (result.read.length > 0) chart.notes.push(BOOK_NOTE + kindsOf(result.read).join(', '));
-            if (result.missing.length > 0) chart.notes.push(`${EMPTY_NOTE}${kindsOf(result.missing).join(', ')} (${result.problem || 'the embedded workbook of the chart could not be read'})`);
+            noteFilled(chart, result);
           }
         } else if (chart.groups.some((group) => group.series.some((series) => empty(series.values) && series.values !== undefined && series.values.ref !== undefined))) {
           // UNSURE: the workbook beside a part of a newer type is not opened; Word caches the values in the part.

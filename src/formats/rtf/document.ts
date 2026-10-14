@@ -47,6 +47,7 @@ import {
   type Border,
   type Comment,
   type DocColor,
+  type DrawingItem,
   type DocModel,
   type DocRelationship,
   type FontInfo,
@@ -67,7 +68,10 @@ import {
   type TabStop,
   type Wrapper,
 } from '../../model/doc/types';
-import { MediaStore } from '../doc/drawings';
+import { MediaStore, drawingXml } from '../doc/drawings';
+import { OleChartReader, ole1Native, oleChartKind } from '../doc/ole-chart';
+import { CfbFile } from '../../cfb';
+import { MAX_DOC_CHART_BOOK_BYTES } from '../docx/charts';
 import { dttm, languageTag } from '../doc/sprm';
 import { linkFields } from '../docx/body';
 import { resolveParaProps, resolveRunProps } from '../docx/resolve';
@@ -75,7 +79,7 @@ import { charsetCodepage, decodeByte, decodePair, decodeRange, isDoubleByte, isK
 import * as D from './destinations';
 import { WORDS, isCharacterWord, isLegacyDrawingWord, type WordHandler } from './keywords';
 import { MAX_LEVEL_TEXT, MAX_LISTS, buildNumbering, levelWord, newLevel, type LevelState, type ListState, type OverrideState } from './lists';
-import { newPict, newShape, pictBin, pictHex, pictItem, pictWord, shapeItem, shapeWord, type PictState, type ShapeState } from './pictures';
+import { newPict, newShape, pictBin, pictBytes, pictHex, pictItem, pictWord, shapeItem, shapeWord, type PictState, type ShapeState } from './pictures';
 import { defaultDop, defaultSep, pageBorderSide, sectionProps, setPageBorder, type Dop, type Sep } from './sections';
 import {
   borderWith,
@@ -204,6 +208,9 @@ const C_FONT_ALT = 26;
 const C_PANOSE = 27;
 const C_DISCARD = 28;
 const C_REV_AUTHOR = 29;
+const C_OBJECT = 30;
+const C_OBJCLASS = 31;
+const C_OBJDATA = 32;
 
 /** What a group saves and restores. */
 interface State {
@@ -425,6 +432,10 @@ export class RtfReader {
   private readonly buffers: string[] = [];
   private readonly store = new MediaStore();
   private pict: PictState | undefined;
+  /** The embedded object ("\object") being read, and the charts of objects (made for the first object of a chart). */
+  private object: ObjectState | undefined;
+  private objects: OleChartReader | undefined;
+  private objectCount = 0;
   private readonly shapes: ShapeState[] = [];
   private boxDepth = 0;
   private openStories = 0;
@@ -1640,12 +1651,40 @@ export class RtfReader {
         // The description of a row of a table in a cell; that of the row around it is put back afterwards.
         this.setCloser(C_ROW_PROPS, this.story.row.save());
         return true;
-      case 'object':
+      case 'object': {
         if (st.dest !== D.D_NORMAL) return false;
+        const object: ObjectState = { width: 0, height: 0, scaleX: 100, scaleY: 100, outer: this.object };
+        this.setCloser(C_OBJECT, object);
+        this.object = object;
         st.dest = D.D_OBJECT;
         return true;
+      }
+      case 'objclass':
+        if (st.dest !== D.D_OBJECT || !this.object) {
+          this.skipRest();
+          return true;
+        }
+        this.collect(D.D_OBJCLASS, C_OBJCLASS);
+        return true;
+      case 'objdata': {
+        // Only the data of an object of a chart is read: the workbook in it. That of other objects is passed over, as before.
+        const object = this.object;
+        if (st.dest !== D.D_OBJECT || !object || object.data || !oleChartKind(object.className)) {
+          this.skipRest();
+          return true;
+        }
+        const data = newPict();
+        // The workbook and what the object says around it.
+        data.limit = MAX_DOC_CHART_BOOK_BYTES + 65536;
+        object.data = data;
+        this.setCloser(C_OBJDATA, this.pict);
+        this.pict = data;
+        st.dest = D.D_PICT;
+        return true;
+      }
       case 'result':
         if (st.dest !== D.D_OBJECT) return false;
+        if (this.object) this.object.result = true;
         st.dest = D.D_NORMAL;
         return true;
       case 'upr':
@@ -1748,12 +1787,23 @@ export class RtfReader {
         this.overrideLevel = undefined;
         return;
       }
+      case C_OBJECT:
+        this.endObject(payload as unknown as ObjectState);
+        return;
+      case C_OBJCLASS:
+        if (this.object) this.object.className = this.collected().trim().slice(0, 256);
+        else this.collected();
+        return;
+      case C_OBJDATA:
+        this.pict = payload as unknown as PictState | undefined;
+        return;
       case C_PICT: {
         const pict = payload.pict as PictState;
         this.pict = payload.outer as PictState | undefined;
         const item = pictItem(pict, this.store);
         if (pict.tooLarge) this.warnings.push('A picture is larger than the reader keeps and was left out');
         if (!item) return;
+        if (!payload.shape) this.shownByObject(item);
         const shape = payload.shape as ShapeState | undefined;
         if (shape) {
           if (item.image && shape.images.length < MAX_SHAPE_PARTS) {
@@ -1789,7 +1839,9 @@ export class RtfReader {
         const parent = this.stack[this.depth - 1];
         if (!parent || parent.dest !== D.D_NORMAL) return;
         const chp = parent.chp;
-        this.story.addItem(shapeItem(shape, payload.legacy === true), this.runPropsFor(chp, parent.rtl, this.paraStyle()), this.fullRun(chp, parent.rtl), undefined);
+        const item = shapeItem(shape, payload.legacy === true);
+        this.shownByObject(item);
+        this.story.addItem(item, this.runPropsFor(chp, parent.rtl, this.paraStyle()), this.fullRun(chp, parent.rtl), undefined);
         return;
       }
       case C_SHAPE_NAME: {
@@ -2041,6 +2093,17 @@ export class RtfReader {
       case D.D_PICT:
         if (this.pict && pictWord(this.pict, word, param)) return;
         break;
+      case D.D_OBJECT: {
+        const object = this.object;
+        if (!object) break;
+        const value = param < 0 ? 0 : param > 1000000 ? 1000000 : param;
+        if (word === 'objw') object.width = value;
+        else if (word === 'objh') object.height = value;
+        else if (word === 'objscalex') object.scaleX = value;
+        else if (word === 'objscaley') object.scaleY = value;
+        else break;
+        return;
+      }
       case D.D_SHP:
       case D.D_SHPINST:
         if (this.shapes.length && shapeWord(this.shapes[this.shapes.length - 1], word, param)) return;
@@ -2250,9 +2313,106 @@ export class RtfReader {
     const kind = dop.enforceProtection === undefined ? dop.protection : dop.protectionLevel || dop.protection;
     if (kind !== undefined) settings.protection = { edit: kind, enforced: dop.enforceProtection !== false };
     if (this.store.media.size) model.media = this.store.media;
+    if (this.objects) {
+      this.objects.finish();
+      if (this.objects.charts.size > 0) model.charts = this.objects.charts;
+    }
     return model;
   }
+
+  /** Something the result of the open object shows: the first of them that is a picture is the frame of its chart. */
+  private shownByObject(item: RunItem): void {
+    const object = this.object;
+    if (!object || object.shown) return;
+    object.shown = true;
+    if (item.type === 'drawing' && item.image && !item.textBoxes) object.item = item;
+  }
+
+  /**
+   * The end of an embedded object. An object of a chart whose data holds a
+   * workbook with a chart that is read shows that chart: in place of the picture of its result,
+   * which stays with it (a document converted to docx shows the picture), or, when it has no
+   * result, in a frame of the size the object states. A result that is no picture (text, a text
+   * box, another object) is left as it is, and so is any other object.
+   */
+  private endObject(object: ObjectState): void {
+    this.object = object.outer;
+    const data = object.data;
+    if (!data) return;
+    object.data = undefined;
+    // A result that shows something other than a picture (text, a text box, a shape, another object) is left as it is.
+    if (object.result && !object.item) return;
+    const label = object.className || 'object';
+    const objects = this.objects || (this.objects = new OleChartReader(this.warnings));
+    const notShown = (why: string) => objects.warn(`The chart of an embedded object (${label}) is not shown: ${why}`);
+    if (data.tooLarge) {
+      notShown('its data is too large');
+      return;
+    }
+    const native = ole1Native(pictBytes(data));
+    if (!native || !CfbFile.isCfb(native.data)) {
+      notShown('its data is not that of an embedded object');
+      return;
+    }
+    let cfb: CfbFile;
+    try {
+      cfb = CfbFile.read(native.data);
+    } catch (error) {
+      notShown('its data cannot be read');
+      return;
+    }
+    const kind = objects.kindOf(cfb, '', object.className || native.className);
+    if (!kind) return;
+    const key = `/rtf/object${++this.objectCount}`;
+    const read = objects.readChart(cfb, '', key, kind, label);
+    if (!read.chart) return;
+    const item = object.item;
+    if (item) {
+      // The picture the object shows becomes the frame of its chart.
+      if (item.type === 'drawing') {
+        item.kind = 'chart';
+        item.chartPart = key;
+      }
+      return;
+    }
+    // An object without a picture: a frame of the size it states, else of the size of its chart sheet.
+    let width = Math.round((object.width * object.scaleX) / 100) * TWIP_EMU;
+    let height = Math.round((object.height * object.scaleY) / 100) * TWIP_EMU;
+    if (!(width > 0 && height > 0) && read.width !== undefined && read.height !== undefined) {
+      width = read.width;
+      height = read.height;
+    }
+    const drawing: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'chart', xml: drawingXml(), chartPart: key };
+    // The largest frame Word gives a picture: 22 inches; a frame of no size is as large as Word makes a new chart.
+    drawing.width = width > 0 && height > 0 ? Math.min(width, 31680 * TWIP_EMU) : 5486400;
+    drawing.height = width > 0 && height > 0 ? Math.min(height, 31680 * TWIP_EMU) : 3200400;
+    const parent = this.stack[this.depth - 1];
+    if (!parent || parent.dest !== D.D_NORMAL) return;
+    const chp = parent.chp;
+    this.story.addItem(drawing, this.runPropsFor(chp, parent.rtl, this.paraStyle()), this.fullRun(chp, parent.rtl), this.wrapper(chp));
+  }
 }
+
+/** An embedded object ("\object") while its group is read. */
+interface ObjectState {
+  /** "\objclass": the ProgID. */
+  className?: string;
+  /** "\objdata", while it is read; only for an object of a chart. */
+  data?: PictState;
+  /** "\objw", "\objh": twips; "\objscalex", "\objscaley": percent. */
+  width: number;
+  height: number;
+  scaleX: number;
+  scaleY: number;
+  /** The picture the result of the object shows; `shown`: the result shows something; `result`: the object has a result. */
+  item?: DrawingItem;
+  shown?: boolean;
+  result?: boolean;
+  /** The object around this one. */
+  outer?: ObjectState;
+}
+
+const TWIP_EMU = 635;
 
 /**
  * Reads an RTF document. Throws an Error that starts with "Invalid rtf:" for

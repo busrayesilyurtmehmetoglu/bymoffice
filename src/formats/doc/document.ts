@@ -42,6 +42,7 @@ import {
   type DocModel,
   type DocRelationship,
   type DocSettings,
+  type DrawingItem,
   type Inline,
   type Note,
   type ParaProps,
@@ -60,9 +61,10 @@ import {
 } from '../../model/doc/types';
 import { styleChain } from '../docx/resolve';
 import { bytesKey, invalid, readPlc, readSttb, u16, u32, u8, utf16, type Plc } from './bytes';
-import { MediaStore, floatingDrawing, inlinePicture, readDrawings, type Drawings } from './drawings';
+import { MediaStore, drawingXml, floatingDrawing, inlinePicture, readDrawings, type Drawings } from './drawings';
 import { FC, readFib, type Fib } from './fib';
 import { linkDocFields } from './fields';
+import { MAX_OLE_SMALL_STREAM, OleChartReader, olePictureSize, placeableWmf } from './ole-chart';
 import { readChpxTable, readPapxTable, type RunTable } from './fkp';
 import { readNumbering } from './lists';
 import { readPieceTable, type Piece, type PieceTable } from './piece-table';
@@ -112,6 +114,9 @@ export interface ReadDocOptions {
 
 /** Text boxes in text boxes that are read; a genuine file has none. */
 const MAX_BOX_DEPTH = 4;
+
+/** Bytes of the picture of an embedded object (its metafile) that are read. */
+const MAX_OBJECT_PICTURE = 16 * 1024 * 1024;
 
 type StoryKind = 'main' | 'footnote' | 'endnote' | 'comment' | 'header' | 'textbox';
 
@@ -175,6 +180,12 @@ class DocReader {
   private readonly model: DocModel;
   private readonly store = new MediaStore();
   private drawings: Drawings | undefined;
+  /** The file, for the storages of embedded objects (ObjectPool). */
+  private readonly source: DocStreamSource;
+  /** Reads the charts of embedded objects; made for the first object. */
+  private objects: OleChartReader | undefined;
+  /** What each embedded object (by its id) came to: its drawing, or null for none. */
+  private readonly objectItems = new Map<number, DrawingItem | null>();
 
   /** Starts of the parts of the text, in characters: main text, footnotes, headers, macros, comments, endnotes, text boxes, header text boxes, end. */
   private readonly starts: number[];
@@ -214,6 +225,7 @@ class DocReader {
     const limit = options.maxParagraphs;
     this.maxParagraphs = limit !== undefined && limit >= 1 && limit < MAX_PARAGRAPHS ? Math.floor(limit) : MAX_PARAGRAPHS;
     if (!cfb.has('WordDocument')) throw invalid('the file has no WordDocument stream');
+    this.source = cfb;
     const word = (this.word = cfb.stream('WordDocument'));
     const fib = (this.fib = readFib(word));
     // The header names its table stream; a file that has only the other one is read from that.
@@ -742,8 +754,10 @@ class DocReader {
       case 0x00:
         return PAGE_NUMBER;
       case 0x01: {
-        // A picture, unless the place in the Data stream holds field data or an embedded object.
-        if (info.picture === undefined || info.data || info.ole2 || info.object) return undefined;
+        // An embedded object of OLE2: shown when it is a chart that is read (see embeddedChart).
+        if (info.picture !== undefined && !info.data && info.ole2) return this.embeddedChart(info.picture);
+        // A picture, unless the place in the Data stream holds field data or an object.
+        if (info.picture === undefined || info.data || info.object) return undefined;
         const item = inlinePicture(this.data, info.picture, this.store);
         if (!item) this.count('picture/unreadable');
         return item;
@@ -784,6 +798,73 @@ class DocReader {
       }
     }
     return undefined;
+  }
+
+  /**
+   * The chart of the embedded object in the storage ObjectPool/_<id> (the id is what
+   * sprmCPicLocation gives a character of an object), as a drawing of the size the stream
+   * "\3PIC" states, else of the size of its chart sheet. Undefined for an object that is no
+   * chart, or whose chart cannot be read - which shows nothing, as before; the document then
+   * says why. The picture of the object (the metafile in "\3META") goes with the chart: it
+   * is what a document converted to docx shows in its place.
+   *
+   * Each object is looked at once, however many characters show it: what came of it is kept by
+   * its id. Its streams are read within the limits of OleChartReader; the metafile also within
+   * what the pictures of the document may still take.
+   *
+   * UNSURE: that the storage is named by sprmCPicLocation when sprmCFOle2 is set (as other
+   * readers of the format do), and what "\3META" holds (see placeableWmf).
+   */
+  private embeddedChart(id: number): DrawingItem | undefined {
+    const known = this.objectItems.get(id);
+    if (known !== undefined) return known === null ? undefined : known;
+    const item = this.readEmbeddedChart(id);
+    this.objectItems.set(id, item || null);
+    return item;
+  }
+
+  private readEmbeddedChart(id: number): DrawingItem | undefined {
+    const prefix = `ObjectPool/_${id}/`;
+    const source = this.source;
+    if (!source.has(prefix + '\u0001CompObj')) return undefined;
+    const objects = this.objects || (this.objects = new OleChartReader(this.warnings));
+    const kind = objects.kindOf(source, prefix);
+    if (!kind) return undefined;
+    const key = `/ObjectPool/_${id}`;
+    const read = objects.readChart(source, prefix, key, kind, `ObjectPool/_${id}`);
+    if (!read.chart) return undefined;
+    const item: DrawingItem = { type: 'drawing', placement: 'inline', kind: 'chart', xml: drawingXml(), chartPart: key };
+    let size: { width: number; height: number } | undefined;
+    const pic = objects.readStream(source, prefix + '\u0003PIC', MAX_OLE_SMALL_STREAM);
+    if (pic instanceof Uint8Array) size = olePictureSize(pic);
+    if (!size && read.width !== undefined && read.height !== undefined) size = { width: Math.min(read.width, 31680 * 635), height: Math.min(read.height, 31680 * 635) };
+    // The size Word gives a new chart: 15.24 by 8.89 centimetres.
+    item.width = size ? size.width : 5486400;
+    item.height = size ? size.height : 3200400;
+    const budget = this.store.budget;
+    const meta = objects.readStream(source, prefix + '\u0003META', Math.min(MAX_OBJECT_PICTURE, budget.left));
+    const wmf = meta instanceof Uint8Array ? placeableWmf(meta, item.width / 635, item.height / 635) : undefined;
+    // A picture that is there and is not kept is said: a conversion writes an empty frame for it.
+    if (meta !== 'missing' && !wmf) {
+      const why =
+        meta === 'large'
+          ? 'it is larger than the reader keeps'
+          : meta === 'budget'
+            ? 'the embedded objects of the document hold too many bytes'
+            : meta instanceof Error
+              ? `it cannot be read (${meta.message})`
+              : 'it is no Windows metafile';
+      objects.warn(`The picture of an embedded object (ObjectPool/_${id}) is not kept: ${why}`);
+    }
+    if (wmf) {
+      budget.left -= wmf.length;
+      const image = this.store.get('object:' + id, () => ({ bytes: wmf, type: 'image/x-wmf' }));
+      if (image) {
+        item.image = image;
+        item.images = [{ image }];
+      }
+    }
+    return item;
   }
 
   private count(key: string): void {
@@ -936,6 +1017,10 @@ class DocReader {
     this.headers(starts[2], starts[3]);
 
     if (this.store.media.size) model.media = this.store.media;
+    if (this.objects) {
+      this.objects.finish();
+      if (this.objects.charts.size > 0) model.charts = this.objects.charts;
+    }
     return model;
   }
 

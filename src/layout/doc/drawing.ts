@@ -481,6 +481,16 @@ export function drawingContent(
   const width = size(emu(item.width));
   let height = size(emu(item.height));
   const items: PageItem[] = [];
+  // A chart the reader could read: drawn in the frame by a painter that draws charts. The chart of
+  // an object embedded in a doc or RTF file comes with the picture the file stores for it, which
+  // it is drawn in place of.
+  const chart = item.kind === 'chart' && item.chartPart !== undefined && ctx.doc.charts ? ctx.doc.charts.get(item.chartPart) : undefined;
+  if (chart && item.image && !item.textBoxes) {
+    const frame: ImageItem = { type: 'image', x: 0, y: 0, width, height, placeholder: 'chart', chart };
+    if (item.description !== undefined) frame.alt = item.description;
+    items.push(frame);
+    return { width, height, items };
+  }
   if (item.image) {
     const image: ImageItem = { type: 'image', x: 0, y: 0, width, height };
     if (!item.image.external && item.image.target !== undefined) image.part = item.image.target;
@@ -530,8 +540,6 @@ export function drawingContent(
     else {
       const placeholder: ImageItem = { type: 'image', x: 0, y: 0, width, height, placeholder: item.kind };
       if (item.description !== undefined) placeholder.alt = item.description;
-      // A chart the reader could read: drawn in the frame by a painter that draws charts.
-      const chart = item.kind === 'chart' && item.chartPart !== undefined && ctx.doc.charts ? ctx.doc.charts.get(item.chartPart) : undefined;
       if (chart) placeholder.chart = chart;
       items.push(placeholder);
     }

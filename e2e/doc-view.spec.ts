@@ -1472,8 +1472,8 @@ test.describe('document view: review fixes', () => {
       await settled(page);
       return page.evaluate(() => (window as any).__docView.getSelectedText());
     };
-    // Down a column: only that column.
-    expect(await drag('B1', 'B3')).toBe('B1 two\nB2 two\nB3 two');
+    // Down a column: only that column. Polled: in Firefox the first drag once came before a late relayout moved the text.
+    await expect.poll(() => drag('B1', 'B3')).toBe('B1 two\nB2 two\nB3 two');
     expect(await drag('B3', 'B1')).toBe('B1 two\nB2 two\nB3 two');
     // A block of cells: tabs between the cells of a row.
     expect(await drag('A1', 'B2')).toBe('A1 one\tB1 two\nA2 one\tB2 two');

@@ -1264,7 +1264,7 @@ function builtDocx(model: DocModel, options: BuildDocxOptions, pictures: Map<str
   const shared: WriteCounters = { dropped: { count: 0 }, drawingIds: { next: 1 } };
   const counts = { copied: 0, written: 0 };
   // What the new file does not carry over; the report says how much of each.
-  const lost = { shapes: 0, geometries: 0, groups: 0, pictures: 0, fills: 0, opacities: 0, colors: 0, links: 0, theme: false };
+  const lost = { shapes: 0, geometries: 0, groups: 0, pictures: 0, fills: 0, opacities: 0, colors: 0, charts: 0, chartFrames: 0, links: 0, theme: false };
   const parts: [name: string, data: Uint8Array][] = [];
   const defaults = new Map<string, string>([
     ['rels', RELS_TYPE],
@@ -1492,6 +1492,8 @@ function builtDocx(model: DocModel, options: BuildDocxOptions, pictures: Map<str
     if (lost.colors) warn(`${lost.colors} shape(s) with a colour that is an index into a palette or a system colour were written without that colour: no fill, a black outline`);
     if (lost.groups) warn(`${lost.groups} group(s) of shapes were written with every part over the whole area of the group, without outlines and fills`);
     if (lost.pictures) warn(`${lost.pictures} picture(s) whose data is not available were written as empty frames`);
+    if (lost.charts) warn(`${lost.charts} chart(s) of embedded objects (Excel, Microsoft Graph) were written as the picture the file stores for them: the chart and its data were not carried over`);
+    if (lost.chartFrames) warn(`${lost.chartFrames} chart(s) of embedded objects (Excel, Microsoft Graph) were written as empty frames: no picture of them was kept (the file stores none, or one the reader did not keep - see the warnings of the document), and the chart and its data were not carried over`);
     if (lost.links) warn(`${lost.links} link(s) with an address that is not followed were written as plain text`);
     if (revisions.defaulted) warn(`${revisions.defaulted} tracked change(s) were carried over without their authors: they are written under the name "${DEFAULT_AUTHOR}"`);
     if (lost.theme) warn('The theme was not carried over: theme colours and theme fonts were written as the plain values they stand for');

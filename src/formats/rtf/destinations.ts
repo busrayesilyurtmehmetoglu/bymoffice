@@ -49,6 +49,8 @@ export const D_DO = 32;
 export const D_REVTBL = 33;
 /** One name of that table. */
 export const D_REVAUTHOR = 34;
+/** The class of an embedded object ("\objclass"). */
+export const D_OBJCLASS = 35;
 
 /** Destinations that only gather text (a name, a value). */
 export const isCollector = (dest: number): boolean =>
@@ -62,6 +64,7 @@ export const isCollector = (dest: number): boolean =>
   dest === D_ATNID ||
   dest === D_ATNAUTHOR ||
   dest === D_REVAUTHOR ||
+  dest === D_OBJCLASS ||
   dest === D_ATRFSTART ||
   dest === D_ATRFEND ||
   dest === D_ATNREF;

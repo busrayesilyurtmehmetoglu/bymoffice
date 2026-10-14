@@ -104,7 +104,7 @@ export class CfbFile {
     }
     const root = rawEntries[0];
     if (!root) throw new Error('Corrupt compound file: empty directory');
-    this.miniStream = this.readChain(root.start).subarray(0, root.size);
+    this.miniStream = this.readChain(root.start, Math.ceil(root.size / this.sectorSize)).subarray(0, root.size);
 
     // Children of a storage form a binary tree linked through left/right.
     const seen = new Set<number>();
@@ -129,17 +129,22 @@ export class CfbFile {
     return (sector + 1) * this.sectorSize;
   }
 
-  private chain(start: number, table: number[]): number[] {
+  /**
+   * The sectors of a chain, `max` of them at most: a stream needs no more than its size fills,
+   * whatever the chain goes on to (a chain that runs on would be copied whole for each entry
+   * that names it).
+   */
+  private chain(start: number, table: number[], max = Infinity): number[] {
     const sectors: number[] = [];
-    for (let sector = start; sector <= MAX_REGULAR_SECTOR; sector = table[sector] ?? NO_STREAM) {
+    for (let sector = start; sector <= MAX_REGULAR_SECTOR && sectors.length < max; sector = table[sector] ?? NO_STREAM) {
       if (sectors.length > table.length) throw new Error('Corrupt compound file: sector chain loop');
       sectors.push(sector);
     }
     return sectors;
   }
 
-  private readChain(start: number): Uint8Array {
-    const sectors = this.chain(start, this.fat);
+  private readChain(start: number, max = Infinity): Uint8Array {
+    const sectors = this.chain(start, this.fat, max);
     const out = new Uint8Array(sectors.length * this.sectorSize);
     sectors.forEach((sector, i) => {
       const offset = this.offsetOf(sector);
@@ -178,9 +183,9 @@ export class CfbFile {
   stream(path: string): Uint8Array {
     const entry = this.raw.get(path);
     if (!entry || entry.type !== TYPE_STREAM) throw new Error(`Stream not found: ${path}`);
-    if (entry.size >= this.miniCutoff) return this.readChain(entry.start).subarray(0, entry.size);
+    if (entry.size >= this.miniCutoff) return this.readChain(entry.start, Math.ceil(entry.size / this.sectorSize)).subarray(0, entry.size);
 
-    const sectors = this.chain(entry.start, this.miniFat);
+    const sectors = this.chain(entry.start, this.miniFat, Math.ceil(entry.size / MINI_SECTOR_SIZE));
     const out = new Uint8Array(sectors.length * MINI_SECTOR_SIZE);
     sectors.forEach((sector, i) => {
       const offset = sector * MINI_SECTOR_SIZE;

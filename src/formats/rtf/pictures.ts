@@ -53,6 +53,8 @@ export interface PictState {
   half: number;
   /** The picture is larger than the reader keeps. */
   tooLarge: boolean;
+  /** The most bytes that are kept; default the limit of a picture. */
+  limit?: number;
 }
 
 export function newPict(): PictState {
@@ -163,7 +165,7 @@ function flushGathered(pict: PictState): void {
 
 function addChunk(pict: PictState, chunk: Uint8Array): void {
   if (!chunk.length) return;
-  if (pict.size + chunk.length > MAX_PICTURE) {
+  if (pict.size + chunk.length > (pict.limit !== undefined ? pict.limit : MAX_PICTURE)) {
     pict.tooLarge = true;
     pict.chunks = [];
     pict.gathered = undefined;
@@ -216,7 +218,8 @@ export function pictBin(pict: PictState, bytes: Uint8Array, start: number, stop:
   addChunk(pict, bytes.subarray(start, stop));
 }
 
-function pictBytes(pict: PictState): Uint8Array {
+/** The bytes gathered so far, in one array. */
+export function pictBytes(pict: PictState): Uint8Array {
   flushGathered(pict);
   if (pict.chunks.length === 1) return pict.chunks[0];
   const out = new Uint8Array(pict.size);

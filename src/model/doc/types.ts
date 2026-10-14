@@ -797,7 +797,10 @@ export interface DrawingItem {
    * For a drawing of kind "chart" read from a docx: the chart part its frame
    * names ("/word/charts/chart1.xml"), as the package spells it, when the
    * relationship leads to a part of the package. The chart itself is DocModel.charts.get() of it; a part
-   * that could not be read has none there.
+   * that could not be read has none there. For a chart of an object embedded in a doc or RTF file
+   * (Excel, Microsoft Graph): the key it was read under ("/ObjectPool/_12", "/rtf/object1"), which
+   * names no part; such a drawing may carry the picture the file stores for the object, which the
+   * chart is drawn in place of and which a conversion to docx writes.
    */
   chartPart?: string;
   /** The first of `images`, with its cropping. */
@@ -1253,8 +1256,9 @@ export interface DocModel {
    * The charts of the document by the name of their part
    * (DrawingItem.chartPart): what the parts state, with the values they
    * cached, as far as they could be read. A view for showing them; the parts
-   * stay in the package and are written back from there. Only set by the
-   * docx reader, and only when a chart was read.
+   * stay in the package and are written back from there. Set by the docx
+   * reader, and by the doc and RTF readers for the charts of embedded objects
+   * (never written), and only when a chart was read.
    */
   charts?: Map<string, Chart>;
   /** The document uses the strict (ISO/IEC 29500) namespaces. */

@@ -87,9 +87,11 @@ export interface BodyContext extends PropsContext {
    * (the reader does not know their geometry), `groups` with their parts over
    * the whole area of the group, `pictures` as empty frames; `fills`,
    * `opacities` and `colors` count the shapes whose look names that loss
-   * (ShapeLook.lost).
+   * (ShapeLook.lost). `charts` counts the charts of embedded objects of a doc
+   * or RTF file, written as the picture the file stored for them, and
+   * `chartFrames` those of them it stored none for, written as empty frames.
    */
-  generated?: { shapes: number; geometries: number; groups: number; pictures: number; fills: number; opacities: number; colors: number };
+  generated?: { shapes: number; geometries: number; groups: number; pictures: number; fills: number; opacities: number; colors: number; charts?: number; chartFrames?: number };
   /**
    * Content controls written so far. One wrapper written a second time (an
    * edit split what it wraps over two paragraphs) gives a second control,
@@ -989,10 +991,15 @@ function generateDrawing(ctx: BodyContext, item: DrawingItem, out: string[], dep
   } else if (boxes.length) {
     uri = NS_WPS;
     graphic = shape(boxes[0], pictures.length ? pictures[0].image : undefined, true);
-  } else if (pictures.length || item.kind === 'picture') {
+  } else if (pictures.length || item.kind === 'picture' || item.kind === 'chart') {
     uri = ns.pic;
+    // The chart of an embedded object is not written: the picture the file stored for it is.
+    if (item.kind === 'chart' && ctx.generated) {
+      if (pictures.length) ctx.generated.charts = (ctx.generated.charts || 0) + 1;
+      else ctx.generated.chartFrames = (ctx.generated.chartFrames || 0) + 1;
+    }
     // A picture the reader found no image for.
-    if (!pictures.length && ctx.generated) ctx.generated.pictures++;
+    else if (!pictures.length && ctx.generated) ctx.generated.pictures++;
     graphic = picture(pictures.length ? pictures[0].image : undefined, pictures.length ? pictures[0].crop || item.crop : item.crop, true);
   } else {
     uri = NS_WPS;

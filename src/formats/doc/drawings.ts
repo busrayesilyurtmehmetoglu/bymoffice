@@ -377,7 +377,7 @@ export class MediaStore {
 }
 
 /** A stand-in for the element a docx reader keeps a drawing in: a doc file has none. */
-function drawingXml(insets?: (number | undefined)[]): XmlElement {
+export function drawingXml(insets?: (number | undefined)[]): XmlElement {
   const xml: XmlElement = { type: 'element', name: 'doc:drawing', attrs: new Map(), children: [] };
   if (insets && insets.some((value) => value !== undefined)) {
     // The insets of a text box, where layout looks for them in a DrawingML shape.
