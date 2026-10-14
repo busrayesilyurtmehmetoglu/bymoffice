@@ -152,6 +152,8 @@ export class Toolbar {
     this.addButton('pdf', () => {
       if (!host.view.exportingPdf) void host.view.downloadPdf().catch(() => undefined);
     }).setAttribute('aria-busy', 'false');
+    // The dialog of the page setup of the shown sheet takes the focus, and hands it back when it closes.
+    this.addDialogButton('pageSetup', () => void host.view.openPageSetup());
     this.addSeparator();
     this.fontSelect = this.addSelect('bym-tb-font');
     this.sizeSelect = this.addSelect('bym-tb-size');
@@ -240,7 +242,7 @@ export class Toolbar {
     this.setDisabled('undo', view.readOnly || typing || !view.canUndo);
     this.setDisabled('redo', view.readOnly || typing || !view.canRedo);
     this.updateSave(typing);
-    const others: ButtonKey[] = ['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'alignTop', 'alignMiddle', 'alignBottom', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
+    const others: ButtonKey[] = ['pageSetup', 'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'alignTop', 'alignMiddle', 'alignBottom', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
     this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;
@@ -392,6 +394,7 @@ export class Toolbar {
       // The same label as the button of the document bar.
       print: s.print,
       pdf: s.pdfDownload,
+      pageSetup: s.pageSetup,
       bold: withShortcut(s.bold, 'B'),
       italic: withShortcut(s.italic, 'I'),
       underline: withShortcut(s.underline, 'U'),

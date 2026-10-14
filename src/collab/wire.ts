@@ -1018,6 +1018,10 @@ export function encodeOp(workbook: Workbook, op: Op): Encoded {
     }
     case 'copySheet':
       throw new CollabUnsupportedError('copySheet', 'A sheet cannot be copied while the workbook is edited together');
+    case 'setPageSetup':
+    case 'setDefinedNames':
+      // How a sheet is printed does not travel: refused, before anything is changed.
+      throw new CollabUnsupportedError('other', 'The page setup cannot be changed while the workbook is edited together');
     case 'setPivot':
       // A refresh reads the source as this participant has it, and its cache is not sent: refused, before anything is changed.
       throw new CollabUnsupportedError('other', 'A pivot table cannot be refreshed while the workbook is edited together');

@@ -16,6 +16,7 @@ import { cellNow, setComment } from '../src/ops/notes';
 import type { Op } from '../src/ops/ops';
 import { addConditionalRule, conditionalRules, removeConditionalRule, setValidation, validationsIn } from '../src/ops/rules';
 import { copySheet, deleteSheet, insertSheet, renameSheet } from '../src/ops/sheets';
+import { insertPageBreak, setPageSetup } from '../src/ops/page-setup';
 import { sortRange } from '../src/ops/sort';
 import { Net, act, assertSame, join, saveOf, seeded, settleAll, startFile, type Member } from './collab-fixtures';
 import { PROTOCOL_VERSION } from '../src/collab/room';
@@ -282,6 +283,17 @@ test('a deleted sheet cannot be brought back by undo, which says so', async () =
   assert.equal(a.session.undo(), undefined, 'nothing was undone');
   assert.deepEqual(codes(a), ['undo-none'], 'and a was told');
   assertSame([a, b], 'after it');
+});
+
+test('the page setup is refused in a room, before anything is changed', async () => {
+  const { a } = await two();
+  const before = a.wb.sheets[0].pageSetup;
+  const names = a.wb.definedNames;
+  assert.throws(() => a.session.submit(setPageSetup(a.wb, 0, { orientation: 'landscape' })), (error: unknown) => error instanceof CollabUnsupportedError && error.what === 'other');
+  assert.throws(() => a.session.submit(setPageSetup(a.wb, 0, { printArea: [{ top: 0, left: 0, bottom: 1, right: 1 }] })), (error: unknown) => error instanceof CollabUnsupportedError);
+  assert.throws(() => a.session.submit(insertPageBreak(a.wb, 0, { row: 3 })), (error: unknown) => error instanceof CollabUnsupportedError);
+  assert.equal(a.wb.sheets[0].pageSetup, before, 'the setup is as it was');
+  assert.equal(a.wb.definedNames, names, 'and so are the names');
 });
 
 test('a sheet cannot be copied, and rules do not come with a paste: both are said', async () => {

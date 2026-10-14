@@ -24,6 +24,25 @@ export {
   type RunFormatPatch,
   type ToggleKey,
 } from './format';
+export {
+  DEFAULT_SECTION_MARGINS,
+  DEFAULT_SECTION_PAGE,
+  MAX_PAGE_TWIPS,
+  MIN_PAGE_TWIPS,
+  SECTION_PAPERS,
+  documentSections,
+  insertSectionBreak,
+  patchedSection,
+  sectionSetup,
+  sectionsAt,
+  setSectionSetup,
+  type SectionBreakKind,
+  type SectionMarginName,
+  type SectionPatch,
+  type SectionRef,
+  type SectionScope,
+  type SectionSetup,
+} from './section';
 export { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertImage, insertRow, insertTable, type InsertImageOptions, type NewImage } from './structure';
 export { FRAGMENT_LIMITS, MAX_TABLE_DEPTH, fragmentHasContent, fragmentNeeds, fragmentOf, insertFragment, originOf, type DocFragment, type FragmentMedia, type InsertFragmentOptions } from './fragment';
 export { DocMatchScan, DocSearch, MAX_FIND_PARAGRAPHS, compileDocFind, docParagraphs, findAllInDocument, findInDocument, matchRange, paragraphMatches, replaceMatches, docFindCounters, type ReplaceMatchesOptions, type DocFindOptions, type DocMatch, type DocParagraphRef } from './find';

@@ -215,7 +215,7 @@ test.describe('layout', () => {
         viewport: document.documentElement.clientWidth,
       };
     });
-    expect(facts.buttons).toBe(28);
+    expect(facts.buttons).toBe(29);
     expect(facts.sizes).toEqual([facts.coarse ? '40x40' : '32x32']);
     expect(facts.scrolls).toBe(true);
     expect(facts.scrolled).toBe(true);
@@ -664,7 +664,9 @@ test.describe('keyboard and focus', () => {
     expect(await stops()).toEqual(['bym-tb-select bym-tb-font', 'bym-tb-select bym-tb-size', 'italic', 'bym-tb-select bym-tb-format']);
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('bold');
-    // Print and PDF are the only buttons before the font size list that can do something now; the arrows stop at the first.
+    // Print, PDF and Page setup are the only buttons before the font size list that can do something now; the arrows stop at the first.
+    await page.keyboard.press('ArrowLeft');
+    expect(await focused()).toBe('pageSetup');
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('pdf');
     await page.keyboard.press('ArrowLeft');
@@ -696,6 +698,8 @@ test.describe('keyboard and focus', () => {
     expect(await focused()).toBe('print');
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('pdf');
+    await page.keyboard.press('ArrowRight');
+    expect(await focused()).toBe('pageSetup');
     // The lists of fonts and of font sizes lie between these two buttons.
     await page.keyboard.press('ArrowRight');
     expect(await focused()).toBe('bold');
@@ -1072,8 +1076,8 @@ test.describe('read-only', () => {
   test('disables every editing control, locks the formula bar and says so', async ({ page }) => {
     await mount(page, await editorWorkbook(), { readOnly: true });
     const controls = page.locator('#host .bym-toolbar button, #host .bym-toolbar select');
-    await expect(controls).toHaveCount(31);
-    // Printing, making a PDF and finding change nothing: their buttons are the controls that stay on.
+    await expect(controls).toHaveCount(32);
+    // Printing, making a PDF and finding change nothing: their buttons are the controls that stay on (the page setup would change the file).
     expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).map((control) => control.getAttribute('data-command')))).toEqual(['print', 'pdf', 'find']);
     await expect(page.locator('#host .bym-formula-input')).toHaveAttribute('readonly', '');
     const badge = page.locator('#host .bym-status-badge');

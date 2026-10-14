@@ -14,7 +14,7 @@ import type { Chart } from '../model/sheet/chart';
 import { MAX_COLS, MAX_ROWS, cellName, columnName, foldSheetName, getCell, parseCellRef, rangeName, type AutoFilter, type CellRange, type DataValidation, type DrawingAnchor, type Sheet, type SheetComment, type SheetDrawing, type Workbook } from '../model/sheet/types';
 import { cellDisplayText } from '../format/cell-format';
 import { getLocale, normalizeLocale, type FormatLocale } from '../format/locale';
-import { resolveUiStrings, type UiStrings } from './strings';
+import { PAPER_NAMES, resolveUiStrings, type PageSetupStrings, type UiStrings } from './strings';
 import { resolveCellStyle, resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
 import { clearRange, copyRange, cutRange, editTextAt, pasteAt, setCellInput, styleAt, type CopiedRange } from '../ops/commands';
 import { formulaReferences } from '../calc/refs';
@@ -34,6 +34,22 @@ import {
   type StylePatch,
 } from '../ops/format';
 import { freezePanes as freezePaneOps } from '../ops/panes';
+import {
+  OFFERED_PAPERS,
+  insertPageBreak as insertPageBreakOps,
+  pageSetupState,
+  parsePrintArea,
+  parseTitleBand,
+  printAreaText,
+  removePageBreak as removePageBreakOps,
+  resetPageBreaks as resetPageBreaksOps,
+  setPageSetup as setPageSetupOps,
+  titleBandText,
+  type BreakPlace,
+  type PageSetupPatch,
+  type PageSetupState,
+} from '../ops/page-setup';
+import { PageSetupDialog, formatTwips, parseInches, parseWhole, type PageDialogField, type PageDialogGroup } from './page-setup-dialog';
 import { askOverwrite, editorRootIn } from './save-confirm';
 import { FindBar, type FindBarQuery } from './find-bar';
 import { runSliced } from './sliced';
@@ -1067,6 +1083,8 @@ export class WorkbookView {
   private languageTag: string | undefined;
   /** The bar of Find and Replace, while it is open. */
   private findBar: FindBar | undefined;
+  /** The dialog of the page setup, while it is open. */
+  private pageDialog: PageSetupDialog | undefined;
   /** Counts the searches: one that was overtaken by another gives up. */
   private findToken = 0;
   private countToken = 0;
@@ -1427,6 +1445,7 @@ export class WorkbookView {
     this.destroyed = true;
     if (this.mergeQuestion) this.mergeQuestion();
     this.mergeQuestion = undefined;
+    if (this.pageDialog) this.pageDialog.close();
     this.closeFind(false);
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.unwatchFonts) this.unwatchFonts();
@@ -6253,6 +6272,161 @@ export class WorkbookView {
     this.freezePanes(0, 0);
   }
 
+  // ------------------------------------------------------------ page setup
+
+  /** How a sheet (the shown one unless given) is printed now: paper, margins (inches), scale, print area, titles, breaks. */
+  pageSetup(sheet: number = this.sheetIndex): PageSetupState {
+    return pageSetupState(this.workbook, sheet, defaultPaperFor(this.languageTag));
+  }
+
+  /**
+   * Changes how a sheet (the shown one unless given) is printed, as one undo step (see
+   * PageSetupPatch). Returns false when nothing changed or the view is read-only. Throws
+   * RangeError for a patch that is not valid; where the workbook is edited together the change
+   * is refused (it does not travel).
+   */
+  setPageSetup(patch: PageSetupPatch, sheet: number = this.sheetIndex): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (!this.commitPending()) return false;
+    return this.applyOps(setPageSetupOps(this.workbook, sheet, patch));
+  }
+
+  /**
+   * A manual page break at the active cell (above its row and left of its column, as Excel's
+   * Insert Page Break), or at the row and the column given, in the shown sheet unless another is
+   * given: one undo step. Returns false when
+   * there was nothing to add or the view is read-only.
+   */
+  insertPageBreak(at?: BreakPlace, sheet: number = this.sheetIndex): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (!this.commitPending()) return false;
+    const active = this.state().active;
+    return this.applyOps(insertPageBreakOps(this.workbook, sheet, at || { row: active.row, col: active.col }));
+  }
+
+  /** Takes away the page breaks above the active cell and left of it (or at the row and the column given): one undo step. */
+  removePageBreak(at?: BreakPlace, sheet: number = this.sheetIndex): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (!this.commitPending()) return false;
+    const active = this.state().active;
+    return this.applyOps(removePageBreakOps(this.workbook, sheet, at || { row: active.row, col: active.col }));
+  }
+
+  /** Takes away every manual page break of a sheet (the shown one unless given): one undo step. */
+  resetPageBreaks(sheet: number = this.sheetIndex): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (!this.commitPending()) return false;
+    return this.applyOps(resetPageBreaksOps(this.workbook, sheet));
+  }
+
+  /**
+   * Opens the dialog of the page setup of the shown sheet. Only what is changed in it is changed,
+   * as one undo step. Not in a read-only view, nor for a sheet that is not a worksheet.
+   */
+  openPageSetup(): boolean {
+    if (this.destroyed || this.locked || typeof document === 'undefined') return false;
+    const sheet = this.workbook.sheets[this.sheetIndex];
+    if (!sheet || sheet.kind !== 'worksheet') return false;
+    if (!this.commitPending()) return false;
+    if (this.pageDialog) this.pageDialog.close();
+    const s = this.strings.pageSetup;
+    const index = this.sheetIndex;
+    const state = this.pageSetup(index);
+    const inches = (value: number) => formatTwips(value * 1440, s.unit, s.decimal);
+    const papers = OFFERED_PAPERS.map((code) => ({ value: String(code), label: PAPER_NAMES[String(code)] || String(code) }));
+    const paper = state.paperSize !== undefined && OFFERED_PAPERS.indexOf(state.paperSize) >= 0 ? String(state.paperSize) : '';
+    if (paper === '') papers.unshift({ value: '', label: s.otherPaper });
+    const shared = this.collab !== undefined;
+    const length = (key: string, label: string, value: number): PageDialogField => ({ key, label: `${label} (${s.unit})`, kind: 'text', value: inches(value), inputMode: 'decimal', disabled: shared });
+    const groups: PageDialogGroup[] = [
+      {
+        title: s.page,
+        fields: [
+          { key: 'paper', label: s.paper, kind: 'select', value: paper, options: papers, disabled: shared },
+          { key: 'orientation', label: s.orientation, kind: 'select', value: state.orientation, options: [{ value: 'portrait', label: s.portrait }, { value: 'landscape', label: s.landscape }], disabled: shared },
+          { key: 'scaling', label: s.scaling, kind: 'select', value: state.fitToPage ? 'fit' : 'scale', options: [{ value: 'scale', label: s.adjustTo }, { value: 'fit', label: s.fitTo }], disabled: shared },
+          { key: 'scale', label: s.scale, kind: 'text', value: String(state.scale), inputMode: 'numeric', disabled: shared },
+          { key: 'fitWide', label: s.fitWide, kind: 'text', value: String(state.fitToWidth), inputMode: 'numeric', disabled: shared },
+          { key: 'fitTall', label: s.fitTall, kind: 'text', value: String(state.fitToHeight), inputMode: 'numeric', disabled: shared },
+        ],
+      },
+      {
+        title: s.margins,
+        fields: [
+          length('top', s.top, state.margins.top),
+          length('bottom', s.bottom, state.margins.bottom),
+          length('left', s.left, state.margins.left),
+          length('right', s.right, state.margins.right),
+          length('header', s.header, state.margins.header),
+          length('footer', s.footer, state.margins.footer),
+          { key: 'horizontally', label: `${s.centerOnPage}: ${s.horizontally}`, kind: 'check', value: state.horizontalCentered, disabled: shared },
+          { key: 'vertically', label: `${s.centerOnPage}: ${s.vertically}`, kind: 'check', value: state.verticalCentered, disabled: shared },
+        ],
+      },
+      {
+        title: s.sheet,
+        fields: [
+          { key: 'printArea', label: s.printArea, kind: 'text', value: printAreaText(state.printArea, s.decimal === ',' ? ';' : ','), disabled: shared },
+          { key: 'titleRows', label: s.titleRows, kind: 'text', value: titleBandText(state.titleRows, 'row'), disabled: shared },
+          { key: 'titleCols', label: s.titleCols, kind: 'text', value: titleBandText(state.titleCols, 'col'), disabled: shared },
+          { key: 'gridLines', label: s.gridLines, kind: 'check', value: state.gridLines, disabled: shared },
+          { key: 'headings', label: s.headings, kind: 'check', value: state.headings, disabled: shared },
+        ],
+      },
+    ];
+    const act = (run: () => boolean): string | true => {
+      try {
+        run();
+        return true;
+      } catch (error) {
+        return this.localizeError(error);
+      }
+    };
+    const before = typeof document !== 'undefined' ? (document.activeElement as HTMLElement | null) : null;
+    this.pageDialog = new PageSetupDialog({
+      root: editorRootIn(this.container, this.root),
+      title: s.title,
+      strings: { ok: s.ok, cancel: s.cancel, actions: s.actions },
+      groups,
+      actions: shared
+        ? []
+        : [
+            { key: 'insert-break', label: s.insertBreak, run: () => act(() => this.insertPageBreak()) },
+            { key: 'remove-break', label: s.removeBreak, run: () => act(() => this.removePageBreak()) },
+            { key: 'reset-breaks', label: s.resetBreaks, run: () => act(() => this.resetPageBreaks()) },
+          ],
+      note: shared ? s.shared : undefined,
+      onInput: (key, dialog) => {
+        if (key !== 'scaling') return;
+        const fit = dialog.value('scaling') === 'fit';
+        dialog.setHidden('scale', fit);
+        dialog.setHidden('fitWide', !fit);
+        dialog.setHidden('fitTall', !fit);
+      },
+      apply: (changed) => {
+        if (shared) return true;
+        const patch = pageSetupPatchOf(changed, state, s);
+        if ('message' in patch) return patch;
+        // The sheet the dialog was opened for is gone or moved (a call from outside): nothing is changed.
+        if (this.workbook.sheets[index] !== sheet) return true;
+        try {
+          if (Object.keys(patch).length > 0) this.setPageSetup(patch, index);
+        } catch (error) {
+          const message = error instanceof Error && /no room/.test(error.message) ? s.noRoom : this.localizeError(error);
+          return { message };
+        }
+        return true;
+      },
+      onClose: () => {
+        this.pageDialog = undefined;
+        if (this.destroyed) return;
+        if (before && before.isConnected && typeof before.focus === 'function') before.focus({ preventScroll: true });
+        else this.focus();
+      },
+    });
+    return true;
+  }
+
   // ------------------------------------------------------------ find and replace
 
   /**
@@ -8760,4 +8934,64 @@ export class WorkbookView {
     }
     this.autoScrollFrame = requestAnimationFrame(this.autoScroll);
   };
+}
+
+/**
+ * The change the fields of the dialog of the page setup ask for (see openPageSetup()), or what is
+ * wrong with them. Only the fields that changed are looked at; the scale goes with the scaling
+ * that is chosen.
+ */
+export function pageSetupPatchOf(changed: { [key: string]: string | boolean }, state: PageSetupState, s: PageSetupStrings): PageSetupPatch | { message: string; field: string } {
+  const patch: PageSetupPatch = {};
+  const text = (key: string): string | undefined => (typeof changed[key] === 'string' ? (changed[key] as string) : undefined);
+  const paper = text('paper');
+  if (paper !== undefined && paper !== '') patch.paperSize = Number(paper);
+  const orientation = text('orientation');
+  if (orientation === 'portrait' || orientation === 'landscape') patch.orientation = orientation;
+  const margins: NonNullable<PageSetupPatch['margins']> = {};
+  for (const name of ['top', 'bottom', 'left', 'right', 'header', 'footer'] as const) {
+    const typed = text(name);
+    if (typed === undefined) continue;
+    const inches = parseInches(typed, s.unit);
+    if (inches === undefined) return { message: s.badLength, field: name };
+    // Inches, to six decimals: 2,5 cm is 0.984252.
+    margins[name] = Math.round(inches * 1000000) / 1000000;
+  }
+  if (Object.keys(margins).length > 0) patch.margins = margins;
+  const chosen = text('scaling');
+  const mode = chosen !== undefined ? chosen : state.fitToPage ? 'fit' : 'scale';
+  if (mode === 'scale' && (chosen !== undefined || text('scale') !== undefined)) {
+    const scale = parseWhole(text('scale') !== undefined ? (text('scale') as string) : String(state.scale));
+    if (scale === undefined || scale < 10 || scale > 400) return { message: s.badScale, field: 'scale' };
+    patch.scale = scale;
+  } else if (mode === 'fit' && (chosen !== undefined || text('fitWide') !== undefined || text('fitTall') !== undefined)) {
+    const wide = parseWhole(text('fitWide') !== undefined ? (text('fitWide') as string) : String(state.fitToWidth));
+    if (wide === undefined || wide > 32767) return { message: s.badFit, field: 'fitWide' };
+    const tall = parseWhole(text('fitTall') !== undefined ? (text('fitTall') as string) : String(state.fitToHeight));
+    if (tall === undefined || tall > 32767) return { message: s.badFit, field: 'fitTall' };
+    patch.fitTo = { width: wide, height: tall };
+  }
+  if (typeof changed.horizontally === 'boolean') patch.horizontalCentered = changed.horizontally;
+  if (typeof changed.vertically === 'boolean') patch.verticalCentered = changed.vertically;
+  if (typeof changed.gridLines === 'boolean') patch.gridLines = changed.gridLines;
+  if (typeof changed.headings === 'boolean') patch.headings = changed.headings;
+  const area = text('printArea');
+  if (area !== undefined) {
+    const areas = parsePrintArea(area);
+    if (areas === undefined) return { message: s.badArea, field: 'printArea' };
+    patch.printArea = areas;
+  }
+  const rows = text('titleRows');
+  if (rows !== undefined) {
+    const band = parseTitleBand(rows, 'row');
+    if (band === undefined) return { message: s.badRows, field: 'titleRows' };
+    patch.titleRows = band;
+  }
+  const cols = text('titleCols');
+  if (cols !== undefined) {
+    const band = parseTitleBand(cols, 'col');
+    if (band === undefined) return { message: s.badCols, field: 'titleCols' };
+    patch.titleCols = band;
+  }
+  return patch;
 }

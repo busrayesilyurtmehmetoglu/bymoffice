@@ -1168,8 +1168,8 @@ function pageAttrs(source: object, fields: [name: string, valid: (value: unknown
 const isFlag = (value: unknown) => typeof value === 'boolean';
 const oneOf = (names: string[]) => (value: unknown) => typeof value === 'string' && names.indexOf(value) >= 0;
 
-/** <rowBreaks> or <colBreaks>: the breaks inside the sheet, one per row or column, in order. */
-function pageBreaksXml(name: string, breaks: PageBreak[] | undefined, rows: boolean, notes: Notes): string {
+/** <rowBreaks> or <colBreaks>: the breaks inside the sheet, one per row or column, in order. `name` may carry a prefix ("x:rowBreaks"). */
+export function pageBreaksXml(name: string, breaks: PageBreak[] | undefined, rows: boolean, notes: { add(note: string): void } = new Notes()): string {
   if (!Array.isArray(breaks) || breaks.length === 0) return '';
   const limit = rows ? MAX_ROWS : MAX_COLS;
   const crossLimit = rows ? MAX_COLS : MAX_ROWS;
@@ -1186,11 +1186,19 @@ function pageBreaksXml(name: string, breaks: PageBreak[] | undefined, rows: bool
   if (kept.length === 0) return '';
   if (kept.length > MAX_PAGE_BREAKS) notes.add(`Page setup: a sheet has more than ${MAX_PAGE_BREAKS} page breaks in one direction, which applications may refuse`);
   kept.sort((a, b) => a.at - b.at);
+  const prefix = name.slice(0, name.lastIndexOf(':') + 1);
   let manual = 0;
   let inner = '';
   for (const item of kept) {
     if (item.manual) manual++;
-    inner += `<brk id="${item.at}" min="${item.min}" max="${item.max}"${item.manual ? ' man="1"' : ''}${item.pivot ? ' pt="1"' : ''}/>`;
+    // 0 is the default of min and max: it is not written.
+    let attrs = ` id="${item.at}"${item.min !== 0 ? ` min="${item.min}"` : ''}${item.max !== 0 ? ` max="${item.max}"` : ''}${item.manual ? ' man="1"' : ''}${item.pivot ? ' pt="1"' : ''}`;
+    // What else the break said in the file goes back with it.
+    for (const pair of Array.isArray(item.kept) ? item.kept : []) {
+      if (!pair || typeof pair[0] !== 'string' || typeof pair[1] !== 'string' || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(pair[0]) || /^(?:id|min|max|man|pt|xmlns)$/.test(pair[0])) continue;
+      attrs += ` ${pair[0]}="${escapeAttr(pair[1])}"`;
+    }
+    inner += `<${prefix}brk${attrs}/>`;
   }
   return `<${name} count="${kept.length}" manualBreakCount="${manual}">${inner}</${name}>`;
 }
@@ -1867,8 +1875,11 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
   if (pageSetup) {
     parts.push(pageSetup.page);
     // Like conditional formats, the breaks are kept as the file has them and follow the rows and columns moved since.
-    if (pageSetup.rowBreaks !== '') parts.push(adjustSheetElement(pageSetup.rowBreaks, ownName, own, foreign));
-    if (pageSetup.colBreaks !== '') parts.push(adjustSheetElement(pageSetup.colBreaks, ownName, own, foreign));
+    // Breaks set since the file was read follow only the edits made after them (SheetPageSetup.breaksSince).
+    const since = sheet.pageSetup && typeof sheet.pageSetup.breaksSince === 'number' && sheet.pageSetup.breaksSince > 0 ? Math.floor(sheet.pageSetup.breaksSince) : 0;
+    const moves = since > 0 ? own.slice(Math.min(since, own.length)) : own;
+    if (pageSetup.rowBreaks !== '') parts.push(adjustSheetElement(pageSetup.rowBreaks, ownName, moves, foreign));
+    if (pageSetup.colBreaks !== '') parts.push(adjustSheetElement(pageSetup.colBreaks, ownName, moves, foreign));
   }
 
   if (sheet.drawings && sheet.drawings.length > 0) {

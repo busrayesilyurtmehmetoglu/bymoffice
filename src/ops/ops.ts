@@ -42,6 +42,7 @@ import {
   type SheetDrawing,
   type SheetNameMap,
   type SheetNeighbours,
+  type SheetPageSetup,
   type SheetState,
   type SheetStructuralEdit,
   type StyleSheet,
@@ -260,6 +261,28 @@ export type Op =
       type: 'setPane';
       sheet: number;
       pane: PaneState;
+    }
+  | {
+      /**
+       * Sets how a worksheet is printed (Sheet.pageSetup; undefined: the sheet states nothing). The
+       * object is held by reference and never altered; what it may hold is the business of the
+       * commands (see page-setup.ts). Its own inverse. A change of the printed page only: the sheet
+       * is not `modified`, and nothing is calculated again.
+       */
+      type: 'setPageSetup';
+      sheet: number;
+      setup: SheetPageSetup | undefined;
+    }
+  | {
+      /**
+       * Replaces the defined names of the workbook as a whole: how a print area and print titles
+       * ("_xlnm.Print_Area", "_xlnm.Print_Titles", local to their sheet) are set and cleared. The
+       * list is held by reference and never altered. Its own inverse. `sheet` is the sheet the
+       * change is about.
+       */
+      type: 'setDefinedNames';
+      sheet: number;
+      names: DefinedName[];
     }
   | {
       /** Sets the colour of the tab of a sheet; undefined removes it. Its own inverse. */
@@ -1713,6 +1736,34 @@ export function applyOp(workbook: Workbook, op: Op): Op {
     }
     case 'setPane':
       return setPaneOp(workbook, op.sheet, op.pane);
+    case 'setPageSetup': {
+      const sheet = sheetAt(workbook, op.sheet);
+      if (sheet.kind !== 'worksheet') throw new RangeError('Only a worksheet has a page setup that can be changed');
+      if (op.setup !== undefined && (op.setup === null || typeof op.setup !== 'object')) throw new RangeError('A page setup is an object');
+      const previous = sheet.pageSetup;
+      // What the sheet came with, noted once: the writer leaves the part alone while the setup is that one.
+      if (!sheet.pageSetupRead) sheet.pageSetupRead = { setup: previous };
+      if (op.setup) sheet.pageSetup = op.setup;
+      else delete sheet.pageSetup;
+      // Not `modified`: no cell changed, and nothing has to be calculated again.
+      sheet.pageSetupModified = true;
+      return { type: 'setPageSetup', sheet: op.sheet, setup: previous };
+    }
+    case 'setDefinedNames': {
+      if (!Array.isArray(op.names)) throw new RangeError('The defined names are a list');
+      const count = workbook.sheets.length;
+      // Everything is checked before anything is changed.
+      for (const name of op.names) {
+        if (!name || typeof name.name !== 'string' || name.name === '' || typeof name.value !== 'string') throw new RangeError('A defined name has a name and a value');
+        if (name.localSheet !== undefined && !(typeof name.localSheet === 'number' && name.localSheet >= 0 && name.localSheet < count && Math.floor(name.localSheet) === name.localSheet)) {
+          throw new RangeError(`The defined name "${name.name}" is local to no sheet of the workbook`);
+        }
+      }
+      const previous = workbook.definedNames;
+      workbook.definedNames = op.names;
+      workbook.definedNamesModified = true;
+      return { type: 'setDefinedNames', sheet: op.sheet, names: previous };
+    }
     case 'restoreSheets':
       return restoreSheets(workbook, op.sheet, op.state, op.weight);
     case 'setPivot': {

@@ -397,7 +397,8 @@ async function readSheet(xml: string): Promise<Workbook> {
 
 test('xlsx page setup: the elements of a worksheet are read into the model', async () => {
   const workbook = await readSheet(sheetWith('<sheetPr><tabColor rgb="FFFF0000"/><pageSetUpPr autoPageBreaks="0" fitToPage="1"/></sheetPr>', PRINT_XML));
-  assert.deepEqual(workbook.sheets[0].pageSetup, EXPECTED);
+  // Listed out of order in the file: each break knows its place there (see PageBreak.fileOrder).
+  assert.deepEqual(workbook.sheets[0].pageSetup, { ...EXPECTED, rowBreaks: [{ ...EXPECTED.rowBreaks![0], fileOrder: 1 }, { ...EXPECTED.rowBreaks![1], fileOrder: 0 }] });
   assert.deepEqual(workbook.sheets[0].tabColor, { rgb: 'FFFF0000' });
   // A sheet that says nothing has none.
   assert.equal((await readSheet(sheetWith('', ''))).sheets[0].pageSetup, undefined);

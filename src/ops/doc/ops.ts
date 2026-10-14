@@ -63,8 +63,10 @@ export type DocOp =
    * body (Body.section). Without `span` the section has no place in the
    * source any more and is written from the model; the inverse carries the
    * span the section had, so that undoing gives the text of the file back.
+   * Null takes the section away: what undoes giving a body without one its
+   * first section.
    */
-  | { type: 'setBodySection'; section: SectionProps; span?: SourceSpan; modified?: Flag }
+  | { type: 'setBodySection'; section: SectionProps | null; span?: SourceSpan; modified?: Flag }
   /**
    * Puts another table of comments, in its order, in the place of the one
    * the document has: how a comment is added, changed or removed (a comment
@@ -269,10 +271,12 @@ export function applyDocOp(doc: DocModel, op: DocOp): DocOp {
     }
     case 'setBodySection': {
       const body = doc.body;
-      if (!op.section || typeof op.section !== 'object' || !body.section) return bad('The body has no section to replace');
-      const inverse: DocOp = { type: 'setBodySection', section: body.section };
+      if (op.section !== null && (!op.section || typeof op.section !== 'object')) return bad('A section needs its properties');
+      if (op.section === null && body.sectionSpan) return bad('The section of the file cannot be taken away');
+      const inverse: DocOp = { type: 'setBodySection', section: body.section || null };
       if (body.sectionSpan) inverse.span = body.sectionSpan;
-      body.section = op.section;
+      if (op.section) body.section = op.section;
+      else delete body.section;
       if (op.span) body.sectionSpan = op.span;
       else delete body.sectionSpan;
       inverse.modified = setFlag(body, op.modified);

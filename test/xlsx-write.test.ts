@@ -745,7 +745,8 @@ test('write: deleting rows drops what applied only to them', async () => {
   ok(xml.includes('<dataValidations count="1"><dataValidation type="list" sqref="C2"><formula1>"a,b"</formula1></dataValidation></dataValidations>'));
   ok(xml.includes('<hyperlinks><hyperlink ref="A2" location="Diğer!A1"/></hyperlinks>'));
   ok(xml.includes('<selection pane="bottomLeft" activeCell="A1" sqref="A1"/>'));
-  ok(xml.includes('<rowBreaks count="1" manualBreakCount="1"><brk id="3" max="16383" man="1"/></rowBreaks>'));
+  // The break after row 3 goes to the row before the deleted ones (the one rule of page-breaks.ts); the one after row 5 moves up.
+  ok(xml.includes('<rowBreaks count="2" manualBreakCount="2"><brk id="1" max="16383" man="1"/><brk id="3" max="16383" man="1"/></rowBreaks>'));
   ok(xml.includes('<c r="B2" s="2"><f>SUM(#REF!)</f><v>19.5</v></c>'));
   ok((await partText(saved, SHEET2)).includes('<f>Veri!#REF!+1</f>'));
   parseXml(xml);
@@ -864,7 +865,8 @@ test('write: references in extension lists and column breaks follow structural e
   ok(!out.includes('iconSet') && !out.includes('{b}'));
 
   out = run({ type: 'delete', sheet: 0, axis: 'col', at: 1, count: 2 });
-  ok(out.includes('<colBreaks count="1" manualBreakCount="0"><brk id="4" min="2" max="9"/></colBreaks>'));
+  // The break after column B goes to the column before the deleted ones (A).
+  ok(out.includes('<colBreaks count="2" manualBreakCount="1"><brk id="1" max="1048575" man="1"/><brk id="4" min="2" max="9"/></colBreaks>'));
   ok(out.endsWith('</colBreaks></worksheet>'));
 });
 

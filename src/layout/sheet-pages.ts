@@ -21,6 +21,7 @@
 
 import { resolveCellStyle } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, type CellRange, type PageBreak, type PageMargins, type PageSettings, type Sheet, type SheetStructuralEdit, type StyleSheet, type Workbook } from '../model/sheet/types';
+import { movePageBreak } from '../model/sheet/page-breaks';
 import { createSheetMetrics, headerWidthFor, type AxisMetrics, type SheetMetrics } from './sheet-metrics';
 
 const PX_PER_INCH = 96;
@@ -53,6 +54,11 @@ const PAPER_SIZES = new Map<number, [number, number]>([
   [66, [420 * MM, 594 * MM]], // A2
   [70, [105 * MM, 148 * MM]], // A6
 ]);
+/** The size of a paper by its code in inches (width, height upright); undefined for a code that is not known here. */
+export function paperInches(code: number): [number, number] | undefined {
+  const size = PAPER_SIZES.get(code);
+  return size ? [size[0], size[1]] : undefined;
+}
 export const PAPER_LETTER = 1;
 export const PAPER_A4 = 9;
 /** The sides of a custom paper: between half an inch and 100 inches. */
@@ -366,6 +372,24 @@ export function usedRange(sheet: Sheet, options: Pick<SheetPagesOptions, 'styles
 // ---------------------------------------------------------------------------
 // Pages along one axis
 
+/** The rows and columns inserted or deleted after the first `since` of them: those that move breaks set since (SheetPageSetup.breaksSince). */
+export function editsSince(edits: SheetStructuralEdit[] | undefined, since: number | undefined): SheetStructuralEdit[] | undefined {
+  if (!edits || !(typeof since === 'number' && since > 0)) return edits;
+  return edits.slice(Math.min(Math.floor(since), edits.length));
+}
+
+/**
+ * The manual breaks of an axis as they are now (the first rows or columns of their pages, in
+ * order): rows and columns inserted or deleted since the file was read, or since the breaks were
+ * set, move them (see SheetPageSetup.breaksSince).
+ */
+export function breaksNow(sheet: Pick<Sheet, 'pageSetup' | 'structuralEdits'>, axis: 'row' | 'col'): number[] {
+  const setup = sheet.pageSetup;
+  if (!setup) return [];
+  const moves = editsSince(sheet.structuralEdits, setup.breaksSince);
+  return axis === 'row' ? currentBreaks(setup.rowBreaks, moves, 'row', MAX_ROWS) : currentBreaks(setup.colBreaks, moves, 'col', MAX_COLS);
+}
+
 /** The manual breaks of an axis as they are now: rows and columns inserted or deleted since the file was read move them. */
 function currentBreaks(breaks: PageBreak[] | undefined, edits: SheetStructuralEdit[] | undefined, axis: 'row' | 'col', count: number): number[] {
   if (!breaks || breaks.length === 0) return [];
@@ -373,19 +397,9 @@ function currentBreaks(breaks: PageBreak[] | undefined, edits: SheetStructuralEd
   for (let i = 0; i < breaks.length && i < 4096; i++) {
     const entry = breaks[i];
     if (!entry || !finite(entry.at)) continue;
-    let at = Math.floor(entry.at);
-    if (edits) {
-      for (let e = 0; e < edits.length; e++) {
-        const edit = edits[e];
-        if (!edit || edit.axis !== axis || !(edit.count > 0)) continue;
-        if (edit.kind === 'insert') {
-          if (at >= edit.at) at += edit.count;
-        } else if (at >= edit.at + edit.count) at -= edit.count;
-        // UNSURE: a break inside deleted rows is kept at the place of the deletion; Excel may remove it.
-        else if (at > edit.at) at = edit.at;
-      }
-    }
-    if (at > 0 && at < count) out.push(at);
+    const span = { at: Math.floor(entry.at), min: finite(entry.min) ? entry.min : 0, max: finite(entry.max) ? entry.max : count };
+    const moved = movePageBreak(span, edits, axis);
+    if (moved && moved.at > 0 && moved.at < count && out.indexOf(moved.at) < 0) out.push(moved.at);
   }
   out.sort((a, b) => a - b);
   return out;
@@ -516,8 +530,9 @@ export function paginateSheet(sheet: Sheet, options: SheetPagesOptions = {}): Sh
 
   const fit = setup.fitToPage === true;
   // UNSURE: Excel is said to ignore manual breaks while a sheet is fitted to pages; that is what is done here.
-  const rowBreaks = fit ? [] : currentBreaks(setup.rowBreaks, sheet.structuralEdits, 'row', MAX_ROWS);
-  const colBreaks = fit ? [] : currentBreaks(setup.colBreaks, sheet.structuralEdits, 'col', MAX_COLS);
+  const moves = editsSince(sheet.structuralEdits, setup.breaksSince);
+  const rowBreaks = fit ? [] : currentBreaks(setup.rowBreaks, moves, 'row', MAX_ROWS);
+  const colBreaks = fit ? [] : currentBreaks(setup.colBreaks, moves, 'col', MAX_COLS);
 
   /** The pages of every area at a scale; undefined when they are more than the limit. */
   const pagesAt = (scale: number): AreaPages[] | undefined => {

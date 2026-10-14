@@ -19,6 +19,8 @@ import { pdfFileName, type PdfExportOptions } from '../pdf/export';
 import type { PdfLinkReport } from '../pdf/links';
 import type { SheetPdfExportOptions, WorkbookView, WorkbookViewOptions } from '../ui/sheet-view';
 import { resolveUiStrings } from '../ui/strings';
+import { parsePrintArea, parseTitleBand, type PageSetupPatch } from '../ops/page-setup';
+import type { SectionPatch } from '../ops/doc/section';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
 import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
 import { readCollabStamp, writeSharedFile, type CollabStamp } from '../formats/xlsx/collab-stamp';
@@ -50,7 +52,8 @@ export type BridgeErrorCode =
   | 'locale-refused'
   | 'no-document'
   | 'comment-refused'
-  | 'pivot-refused';
+  | 'pivot-refused'
+  | 'page-setup-refused';
 
 /**
  * What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed;
@@ -114,6 +117,12 @@ export interface BridgeDocumentView {
   readonly tabStops?: unknown[];
   /** Sets the distance between the automatic tab stops of the document, twips; whether it changed. */
   setDefaultTabStop?(twips: number): boolean;
+  /** Changes the paper, orientation or margins of the sections of the selection or of the whole document (see SectionPatch); whether anything changed. */
+  setSectionSetup?(patch: unknown, scope?: 'section' | 'document'): boolean;
+  /** A section break at the caret; whether one was put in. */
+  insertSectionBreak?(kind?: string): boolean;
+  /** The page of the section of the caret, in twips, and how many sections there are. */
+  readonly sectionSetup?: unknown;
   readonly defaultTabStop?: number;
   /** The comments of the document, answers after the comment they answer: what the application is told. */
   comments?(): BridgeComment[];
@@ -465,6 +474,94 @@ function sheetIndexField(message: Message, name: string, required: boolean): num
   const value = field<number>(message, name, 'number', required);
   if (value !== undefined && !(Number.isInteger(value) && value >= 0 && value <= 0x7fffffff)) throw new BadMessage(`"${name}" must be a sheet index`);
   return value;
+}
+
+/** A list of numbers by name as a message carries it (margins), each a number; undefined when the message has none. */
+function numbersField(message: Message, name: string, keys: readonly string[]): { [key: string]: number } | undefined {
+  const value = message[name];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new BadMessage(`"${name}" must be an object`);
+  const out: { [key: string]: number } = {};
+  for (const key of keys) {
+    const entry = (value as Record<string, unknown>)[key];
+    if (entry === undefined || entry === null) continue;
+    if (typeof entry !== 'number' || !isFinite(entry)) throw new BadMessage(`"${name}.${key}" must be a number`);
+    out[key] = entry;
+  }
+  return out;
+}
+
+/** The change of the page setup of a sheet a `setPageSetup` message asks for (see PageSetupPatch); what the values may be is checked by the view. */
+function sheetPageSetupPatch(message: Message): PageSetupPatch {
+  const patch: PageSetupPatch = {};
+  const paperSize = field<number>(message, 'paperSize', 'number', false);
+  if (paperSize !== undefined) patch.paperSize = paperSize;
+  const orientation = field<string>(message, 'orientation', 'string', false);
+  if (orientation !== undefined) {
+    if (orientation !== 'portrait' && orientation !== 'landscape') throw new BadMessage('"orientation" must be "portrait" or "landscape"');
+    patch.orientation = orientation;
+  }
+  const margins = numbersField(message, 'margins', ['left', 'right', 'top', 'bottom', 'header', 'footer']);
+  if (margins) patch.margins = margins;
+  const scale = field<number>(message, 'scale', 'number', false);
+  if (scale !== undefined) patch.scale = scale;
+  const fit = numbersField(message, 'fitTo', ['width', 'height']);
+  if (fit) {
+    if (fit.width === undefined || fit.height === undefined) throw new BadMessage('"fitTo" must have a width and a height');
+    patch.fitTo = { width: fit.width, height: fit.height };
+  }
+  for (const name of ['horizontalCentered', 'verticalCentered', 'gridLines', 'headings'] as const) {
+    const value = field<boolean>(message, name, 'boolean', false);
+    if (value !== undefined) patch[name] = value;
+  }
+  // References as text ("A1:D20", "$1:$2"); null or '' clears.
+  const text = (name: string): string | null | undefined => {
+    if (message[name] === null) return null;
+    const value = field<string>(message, name, 'string', false);
+    if (value !== undefined && value.length > 4096) throw new BadMessage(`"${name}" is too long`);
+    return value;
+  };
+  const area = text('printArea');
+  if (area !== undefined) {
+    const areas = area === null ? null : parsePrintArea(area);
+    if (areas === undefined) throw new BadMessage('"printArea" must be references such as "A1:D20"');
+    patch.printArea = areas;
+  }
+  for (const [name, axis] of [['titleRows', 'row'], ['titleCols', 'col']] as const) {
+    const value = text(name);
+    if (value === undefined) continue;
+    const band = value === null ? null : parseTitleBand(value, axis);
+    if (band === undefined) throw new BadMessage(`"${name}" must be ${axis === 'row' ? 'rows such as "$1:$2"' : 'columns such as "$A:$B"'}`);
+    patch[name] = band;
+  }
+  return patch;
+}
+
+/** The change of the page of sections a `setPageSetup` message asks for of a document (see SectionPatch): paper by name, margins in twips. */
+function sectionPatch(message: Message): SectionPatch {
+  const patch: SectionPatch = {};
+  const paper = field<string>(message, 'paper', 'string', false);
+  if (paper !== undefined) {
+    if (paper.length > 32) throw new BadMessage('"paper" is not a paper');
+    patch.paper = paper;
+  }
+  const orientation = field<string>(message, 'orientation', 'string', false);
+  if (orientation !== undefined) {
+    if (orientation !== 'portrait' && orientation !== 'landscape') throw new BadMessage('"orientation" must be "portrait" or "landscape"');
+    patch.orientation = orientation;
+  }
+  const margins = numbersField(message, 'margins', ['top', 'bottom', 'left', 'right', 'header', 'footer', 'gutter']);
+  if (margins) patch.margins = margins;
+  return patch;
+}
+
+/** What a view says of an error, in its language; the error's own text where it says nothing. */
+function refusalText(view: WorkbookView, error: unknown): string {
+  try {
+    return typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
+  } catch {
+    return errorText(error);
+  }
 }
 
 function sheetNameField(message: Message, required: boolean): string | undefined {
@@ -1822,6 +1919,57 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
+   * The page setup through the view, as one undo step: of a sheet (the active one unless `index`
+   * names one) or of the sections of a document. The answer (with an id) says whether anything
+   * changed and how the page is set up now.
+   */
+  const pageSetupCommand = (type: 'setPageSetup' | 'insertPageBreak' | 'removePageBreak' | 'resetPageBreaks' | 'insertSectionBreak', message: Message, id: string | undefined) => {
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const view = shown.view;
+    const pages = shown.pages;
+    const answer: Message = { type: 'done', id, command: type, changed: false };
+    if (view) {
+      if (type === 'insertSectionBreak') return fail('no-document', 'The open file is not a document', id);
+      // Everything that comes from outside is looked at before anything is asked of the view.
+      const index = sheetIndexField(message, 'index', false);
+      const patch = type === 'setPageSetup' ? sheetPageSetupPatch(message) : undefined;
+      const row = type === 'insertPageBreak' || type === 'removePageBreak' ? sheetIndexField(message, 'row', false) : undefined;
+      const col = type === 'insertPageBreak' || type === 'removePageBreak' ? sheetIndexField(message, 'col', false) : undefined;
+      if (shown.locked || view.readOnly === true) return fail('read-only', 'The file is read-only', id);
+      const count = sheetCount ? sheetCount() : 0;
+      if (index !== undefined && index >= count) return fail('no-sheet', `No sheet with index ${index}`, id);
+      const sheet = index !== undefined ? index : view.activeSheet;
+      // A break of another sheet than the shown one has its place: the active cell is of the shown sheet.
+      if ((type === 'insertPageBreak' || type === 'removePageBreak') && sheet !== view.activeSheet && row === undefined && col === undefined) throw new BadMessage('"row" or "col" is needed for a sheet that is not shown');
+      try {
+        if (!commitPendingOf(view)) return fail('page-setup-refused', STILL_EDITING, id);
+        const at = row !== undefined || col !== undefined ? { row, col } : undefined;
+        if (type === 'setPageSetup') answer.changed = view.setPageSetup(patch as PageSetupPatch, sheet);
+        else if (type === 'insertPageBreak') answer.changed = view.insertPageBreak(at, sheet);
+        else if (type === 'removePageBreak') answer.changed = view.removePageBreak(at, sheet);
+        else answer.changed = view.resetPageBreaks(sheet);
+        answer.pageSetup = view.pageSetup(sheet);
+      } catch (error) {
+        return fail('page-setup-refused', refusalText(view, error), id);
+      }
+    } else if (pages) {
+      if (type === 'insertPageBreak' || type === 'removePageBreak' || type === 'resetPageBreaks') return fail('no-sheet', 'The open file is a document: it has no sheets', id);
+      const patch = type === 'setPageSetup' ? sectionPatch(message) : undefined;
+      const scope = type === 'setPageSetup' ? field<string>(message, 'scope', 'string', false) : undefined;
+      if (scope !== undefined && scope !== 'section' && scope !== 'document') throw new BadMessage('"scope" must be "section" or "document"');
+      const kind = type === 'insertSectionBreak' ? field<string>(message, 'kind', 'string', false) : undefined;
+      if (kind !== undefined && kind !== 'nextPage' && kind !== 'continuous' && kind !== 'evenPage' && kind !== 'oddPage') throw new BadMessage('"kind" must be "nextPage", "continuous", "evenPage" or "oddPage"');
+      if (shown.locked || shown.readOnly === true || shown.commentsOnly) return fail('read-only', 'The document is read-only', id);
+      if (typeof pages.setSectionSetup !== 'function' || typeof pages.insertSectionBreak !== 'function') return fail('page-setup-refused', 'This view cannot change the page setup', id);
+      // The view says itself why it did not (tracked changes, a document edited together): nothing changed then.
+      if (type === 'setPageSetup') answer.changed = pages.setSectionSetup(patch, scope === 'document' ? 'document' : 'section') === true;
+      else answer.changed = pages.insertSectionBreak(kind || 'nextPage') === true;
+      if (pages.sectionSetup) answer.pageSetup = pages.sectionSetup;
+    } else return fail('not-loaded', 'No file is open', id);
+    if (id !== undefined) send(answer);
+  };
+
+  /**
    * Inserts, renames or deletes a sheet through the view, as one undo step. The list that
    * results is told by `sheets` (see tellSheets() in load()), whether or not the command
    * has an id; the answer says that the command was done, or why it was not.
@@ -2325,6 +2473,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
       if (type === 'refreshPivots') return refreshPivots(id);
       if (type === 'setTabStops' || type === 'setDefaultTabStop') return tabDocument(type, fields, id);
+      if (type === 'setPageSetup' || type === 'insertPageBreak' || type === 'removePageBreak' || type === 'resetPageBreaks' || type === 'insertSectionBreak') return pageSetupCommand(type, fields, id);
       if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);

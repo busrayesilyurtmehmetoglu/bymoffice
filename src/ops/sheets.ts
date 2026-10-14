@@ -6,6 +6,8 @@
 // names and links that name the sheet) is worked out when they are applied.
 
 import { renameSheetsInFormula } from '../calc/refs';
+import { editsSince } from '../layout/sheet-pages';
+import { movedBreaks } from './page-setup';
 import { protectionNow } from '../formats/xlsx/build';
 import { commentCellNow } from '../render/sheet-drawings';
 import { conditionalFormatNow, dataValidationNow, extensionRuleCount, fittedConditional, fittedRule, keptOver, mainPartRule, ruleContentLosses, ruleSpace, ruleWithFormulas } from './rules';
@@ -228,7 +230,6 @@ export function copySheetLosses(workbook: Workbook, index: number): CopySheetLos
   add('threadedComments', threaded);
   add('externalLinks', sheet.hyperlinks.filter((link) => link.location === undefined).length);
   const setup = sheet.pageSetup;
-  if (setup && sheet.structuralEdits && sheet.structuralEdits.length > 0) add('pageBreaks', (setup.rowBreaks ? setup.rowBreaks.length : 0) + (setup.colBreaks ? setup.colBreaks.length : 0));
   for (const kind of sheet.anchored || []) if (COUNTED_PARTS.indexOf(kind) < 0 && !out.some((loss) => loss.what === kind)) add(kind, 1);
   // What the sheet part holds beside the fields of the model, by the names the reader noted.
   const names = new Map<string, number>();
@@ -354,11 +355,15 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
   }
   if (source.pageSetup) {
     const setup = { ...source.pageSetup };
-    // Page breaks are kept as the file has them; once rows or columns moved they are not where the file says.
-    if (source.structuralEdits && source.structuralEdits.length > 0) {
-      delete setup.rowBreaks;
-      delete setup.colBreaks;
-    }
+    // The page breaks go where they are now: the copy has no rows or columns inserted or deleted of its own.
+    const edits = editsSince(source.structuralEdits, setup.breaksSince);
+    const rows = movedBreaks(setup.rowBreaks, edits, 'row');
+    const cols = movedBreaks(setup.colBreaks, edits, 'col');
+    if (rows.length > 0) setup.rowBreaks = rows;
+    else delete setup.rowBreaks;
+    if (cols.length > 0) setup.colBreaks = cols;
+    else delete setup.colBreaks;
+    delete setup.breaksSince;
     copy.pageSetup = setup;
   }
   const notes: SheetComment[] = [];
@@ -410,3 +415,4 @@ export function copySheet(workbook: Workbook, index: number, options: CopySheetO
   for (const defined of workbook.definedNames) if (defined.localSheet === index) names.push({ ...defined, value: renamed(defined.value) });
   return [{ type: 'copySheet', sheet: at, copy, names }];
 }
+

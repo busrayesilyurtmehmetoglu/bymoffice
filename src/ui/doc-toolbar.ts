@@ -54,6 +54,7 @@ type ButtonKey =
   | 'insertPicture'
   | 'insertLink'
   | 'pageBreak'
+  | 'pageSetup'
   | 'trackChanges'
   | 'previousChange'
   | 'nextChange'
@@ -113,6 +114,7 @@ const SHARED_ICONS: { [key: string]: IconName } = {
   alignCenter: 'alignCenter',
   alignRight: 'alignRight',
   rowsColumns: 'rowsColumns',
+  pageSetup: 'pageSetup',
   find: 'find',
 };
 
@@ -243,6 +245,8 @@ export class DocToolbar {
     this.addMenuButton('insertPicture', 'dialog', () => this.fileInput.click());
     this.addMenuButton('insertLink', 'dialog', () => this.openLink());
     this.addButton('pageBreak', () => view().insertPageBreak());
+    // The dialog of the page setup (and of section breaks) takes the focus, and hands it back when it closes.
+    this.addMenuButton('pageSetup', 'dialog', () => view().openPageSetup());
     this.addSeparator();
     // The comments, before the tracked changes as in Word. The field of a new one takes the focus: the command
     // does not hand it back to the document.
@@ -325,7 +329,7 @@ export class DocToolbar {
     }
     const others: ButtonKey[] = [
       'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'highlight', 'alignLeft', 'alignCenter', 'alignRight', 'alignJustify',
-      'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'tabStops', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak',
+      'bulletList', 'numberedList', 'decreaseIndent', 'increaseIndent', 'tabStops', 'insertTable', 'insertPicture', 'insertLink', 'pageBreak', 'pageSetup',
     ];
     // Where changes are tracked all of these are offered too: each makes its change as a tracked one, and the few
     // it cannot make so (a column through merged cells, a link over a picture) are refused when asked for, and said.
@@ -578,6 +582,7 @@ export class DocToolbar {
       insertPicture: s.insertPicture,
       insertLink: withShortcut(s.insertLink, 'K'),
       pageBreak: s.pageBreak,
+      pageSetup: s.pageSetup,
       trackChanges: s.trackChanges,
       previousChange: s.previousChange,
       nextChange: s.nextChange,

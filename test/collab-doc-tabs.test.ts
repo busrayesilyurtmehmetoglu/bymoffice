@@ -73,6 +73,26 @@ test('collab tabs: the command travels as itself, the default tab stop does not 
   }
 });
 
+test('collab: the page of a section and section breaks do not travel and are refused, the document as it was', async () => {
+  const { a } = await pair(['one', 'two']);
+  tracing(true);
+  try {
+    const at0 = { story: 'body', path: [0], offset: 1 };
+    const history = new CollabDocHistory<unknown>(a.session);
+    const before = a.doc.body.blocks.slice();
+    const section = a.doc.body.section;
+    const page = shared.setSectionSetup(a.doc, at0, { orientation: 'landscape' });
+    assert.ok(page.ops.length > 0);
+    assert.throws(() => history.apply(page.ops, undefined, undefined), (error: unknown) => error instanceof CollabUnsupportedError && error.message === NOT_SHARED);
+    const breaking = shared.insertSectionBreak(a.doc, at0, 'continuous');
+    assert.throws(() => history.apply(breaking.ops, undefined, undefined), (error: unknown) => error instanceof CollabUnsupportedError && error.message === NOT_SHARED);
+    assert.deepEqual(a.doc.body.blocks, before);
+    assert.equal(a.doc.body.section, section);
+  } finally {
+    tracing(false);
+  }
+});
+
 test('collab tabs: a paragraph that is put states its stops as a list; a change of stops in its place is refused', () => {
   const place = ['body', [0], 0];
   const ok = { p: { tabs: [{ pos: 720, align: 'left' }, { pos: 1440, align: 'clear' }] }, r: [{ c: ['x'] }] };

@@ -50,6 +50,7 @@ import {
   type SortCondition,
   type SortState,
 } from '../../model/sheet/types';
+import { breakSpanOf } from '../../model/sheet/page-breaks';
 import { childElements, localName, parseXml, serializeXml, type XmlElement } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { decodeXstring, parseColor, parseStringItem } from './shared-strings';
@@ -1566,19 +1567,29 @@ function parsePageBreaks(sc: XmlScanner, rows: boolean): PageBreak[] {
   eachChild(sc, () => {
     if (sc.local === 'brk') {
       const at = parseUint(sc.attr('id'));
-      const min = Math.max(parseUint(sc.attr('min')), 0);
-      const max = Math.max(parseUint(sc.attr('max')), 0);
+      const { min, max } = breakSpanOf(sc.attr('min'), sc.attr('max'));
       if (at >= 1 && at < limit && min <= max && max < crossLimit && !seen.has(at)) {
         seen.add(at);
         if (breaks.length > 0 && breaks[breaks.length - 1].at > at) sorted = false;
         const item: PageBreak = { at, min, max, manual: parseBool(sc.attr('man'), false) };
         if (parseBool(sc.attr('pt'), false)) item.pivot = true;
+        // What else the break says goes back with it.
+        let kept: [string, string][] | undefined;
+        for (const [name, value] of sc.attrs()) {
+          if (name === 'id' || name === 'min' || name === 'max' || name === 'man' || name === 'pt' || name.indexOf(':') >= 0 || name === 'xmlns') continue;
+          if (!kept) kept = [];
+          if (kept.length < 16) kept.push([name, value]);
+        }
+        if (kept) item.kept = kept;
+        item.fileOrder = breaks.length;
         breaks.push(item);
       }
     }
     sc.skip();
   });
+  // The place in the file counts only where it is another one than in the model.
   if (!sorted) breaks.sort((a, b) => a.at - b.at);
+  else for (const item of breaks) delete item.fileOrder;
   return breaks;
 }
 

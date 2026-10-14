@@ -261,6 +261,22 @@ export {
   type StylePatch,
 } from './ops/format';
 export { freezePanes, frozenPanes } from './ops/panes';
+export {
+  OFFERED_PAPERS,
+  insertPageBreak,
+  pageSetupState,
+  parsePrintArea,
+  parseTitleBand,
+  printAreaValue,
+  printTitlesValue,
+  removePageBreak,
+  resetPageBreaks,
+  setPageSetup,
+  type BreakPlace,
+  type PageSetupPatch,
+  type PageSetupState,
+} from './ops/page-setup';
+export type { SectionBreakKind, SectionPatch, SectionScope, SectionSetup } from './ops/doc/index';
 export { STRINGS_EN, STRINGS_TR, getUiStrings, type UiStrings } from './ui/strings';
 export * from './layout/grid-geometry'; export * from './layout/sheet-metrics';
 export { base64Decode, base64Encode, createBridge, installBridge, type Bridge, type BridgeDocumentView, type BridgeErrorCode, type BridgeHost, type BridgeState, type InstallBridgeOptions } from './embed/bridge';

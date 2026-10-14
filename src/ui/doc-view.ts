@@ -24,7 +24,7 @@ import type { DocChange, DocCollabSession, DocPeer } from '../collab/doc/session
 import { tracing } from '../collab/doc/trace';
 import type { CollabNotice } from '../collab/room';
 import { CompositionHold, PeerCarets, movedSelection, peerFill, peerPlaces, placeNear, type PeerPlace } from './doc-collab';
-import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, TabStopsPatch, ToggleKey } from '../ops/doc/index';
+import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, SectionSetup, TabStopsPatch, ToggleKey } from '../ops/doc/index';
 import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type TabStop, type Table } from '../model/doc/types';
 import { getLocale, type FormatLocale } from '../format/locale';
 import { renderPage } from '../render/doc';
@@ -60,8 +60,9 @@ import { PdfDocument } from '../pdf/document';
 import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFileName, pdfLimits, pdfSettings, pdfVectorTools, pdfWithFallback, reportLinks, toPdfExportError, writePdfPage, type PdfDownload, type PdfExportOptions, type PdfSettings } from '../pdf/export';
 import { docPageRuns } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
-import { resolveUiStrings, type UiStrings } from './strings';
+import { PAPER_NAMES, resolveUiStrings, type UiStrings } from './strings';
 import { TabStopsDialog } from './doc-tabs-dialog';
+import { PageSetupDialog, formatTwips, parseTwips, type PageDialogField, type PageDialogGroup } from './page-setup-dialog';
 import { editorRootIn } from './save-confirm';
 import { FindBar, type FindBarQuery } from './find-bar';
 import { runSliced } from './sliced';
@@ -771,6 +772,8 @@ export class DocumentView {
   private layoutTabStop = -1;
   /** The dialog of tab stops, while it is open. */
   private tabsDialog: TabStopsDialog | undefined;
+  /** The dialog of the page setup, while it is open. */
+  private pageDialog: PageSetupDialog | undefined;
   /** The bar of Find and Replace, while it is open. */
   private findBar: FindBar | undefined;
   /** Counts the searches: one that was overtaken by another gives up. */
@@ -1299,6 +1302,7 @@ export class DocumentView {
     if (this.destroyed) return;
     this.destroyed = true;
     if (this.tabsDialog) this.tabsDialog.close();
+    if (this.pageDialog) this.pageDialog.close();
     this.closeFind(false);
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.frame) cancelAnimationFrame(this.frame);
@@ -4617,6 +4621,132 @@ export class DocumentView {
         else this.focus();
       },
     });
+  }
+
+  /**
+   * The page of the section the caret is in (the first one the selection touches; the first of the
+   * document before there is a caret): paper, orientation and margins in twips, with how many
+   * sections the document has and which one this is (from 0).
+   */
+  get sectionSetup(): SectionSetup & { section: number; sections: number } {
+    const sections = ops.documentSections(this.document);
+    const range = this.range();
+    let index = 0;
+    if (range) {
+      try {
+        index = ops.sectionsAt(this.document, range)[0] || 0;
+      } catch {
+        index = 0;
+      }
+    }
+    return { ...ops.sectionSetup(sections[index].props), section: index, sections: sections.length };
+  }
+
+  /**
+   * Changes the paper, the orientation or the margins (twips) of the sections the selection
+   * touches, or with `scope` "document" of every section: one undo step. Where changes are
+   * tracked, and where the document is edited together, the change is refused and said.
+   */
+  setSectionSetup(patch: ops.SectionPatch, scope: ops.SectionScope = 'section'): boolean {
+    this.caretForParagraphs();
+    return this.perform((range) => ops.setSectionSetup(this.document, range, patch, scope), true);
+  }
+
+  /**
+   * A section break at the caret (in the body, outside of tables): the text before it ends a
+   * section with the page of the one it was in, and the next section starts as `kind` says.
+   */
+  insertSectionBreak(kind: ops.SectionBreakKind = 'nextPage'): boolean {
+    return this.perform((range) => ops.insertSectionBreak(this.document, this.caretOf(range), kind), true);
+  }
+
+  /**
+   * Opens the dialog of the page setup: the paper, the orientation and the margins of the section
+   * of the caret (or of the whole document), and section breaks at the caret. Only what is changed
+   * in it is changed, as one undo step.
+   */
+  openPageSetup(): boolean {
+    if (!this.editable || this.destroyed || typeof document === 'undefined') return false;
+    this.typing.commit();
+    this.caretForParagraphs();
+    if (this.pageDialog) this.pageDialog.close();
+    const s = this.strings.pageSetup;
+    const now = this.sectionSetup;
+    // Neither travels where the document is edited together, nor is either tracked where changes are: the dialog shows
+    // the page then, and says why nothing can be changed.
+    const tracked = this.trackingChanges;
+    const shared = this.collab !== undefined || tracked;
+    const papers = Object.keys(ops.SECTION_PAPERS).map((name) => ({ value: name, label: PAPER_NAMES[name] || name }));
+    const paper = now.paper || '';
+    if (paper === '') papers.unshift({ value: '', label: s.otherPaper });
+    const length = (key: ops.SectionMarginName, label: string): PageDialogField => ({ key, label: `${label} (${s.unit})`, kind: 'text', value: formatTwips(now.margins[key], s.unit, s.decimal), inputMode: 'decimal', disabled: shared });
+    const page: PageDialogField[] = [];
+    if (now.sections > 1) page.push({ key: 'scope', label: s.applyTo, kind: 'select', value: 'section', options: [{ value: 'section', label: s.thisSection }, { value: 'document', label: s.wholeDocument }], disabled: shared });
+    page.push({ key: 'paper', label: s.paper, kind: 'select', value: paper, options: papers, disabled: shared });
+    page.push({ key: 'orientation', label: s.orientation, kind: 'select', value: now.orientation, options: [{ value: 'portrait', label: s.portrait }, { value: 'landscape', label: s.landscape }], disabled: shared });
+    const groups: PageDialogGroup[] = [
+      { title: s.page, fields: page },
+      { title: s.margins, fields: [length('top', s.top), length('bottom', s.bottom), length('left', s.left), length('right', s.right), length('header', s.header), length('footer', s.footer)] },
+    ];
+    const breaks: ops.SectionBreakKind[] = ['nextPage', 'continuous', 'evenPage', 'oddPage'];
+    const before = document.activeElement as HTMLElement | null;
+    const epoch = this.changes;
+    this.pageDialog = new PageSetupDialog({
+      root: editorRootIn(this.container, this.root),
+      title: s.title,
+      strings: { ok: s.ok, cancel: s.cancel, actions: s.actions },
+      groups,
+      actions: shared || this.story !== 'body' ? [] : breaks.map((kind) => ({ key: `section-${kind}`, label: s.sectionBreak(kind), run: () => (this.insertSectionBreak(kind), true as const) })),
+      note: this.collab !== undefined ? s.shared : tracked ? s.tracked : undefined,
+      apply: (changed) => {
+        if (shared) return true;
+        const patch: ops.SectionPatch = {};
+        if (typeof changed.paper === 'string' && changed.paper !== '') patch.paper = changed.paper;
+        if (changed.orientation === 'portrait' || changed.orientation === 'landscape') patch.orientation = changed.orientation;
+        const margins: NonNullable<ops.SectionPatch['margins']> = {};
+        for (const name of ['top', 'bottom', 'left', 'right', 'header', 'footer'] as const) {
+          const typed = changed[name];
+          if (typeof typed !== 'string') continue;
+          const twips = parseTwips(typed, s.unit);
+          if (twips === undefined || twips > ops.MAX_PAGE_TWIPS) return { message: s.badLength, field: name };
+          margins[name] = twips;
+        }
+        if (Object.keys(margins).length > 0) patch.margins = margins;
+        // The scope alone is no change: with the fields as they were, nothing is done.
+        if (Object.keys(patch).length === 0) return true;
+        const scope: ops.SectionScope = (changed.scope !== undefined ? changed.scope : 'section') === 'document' ? 'document' : 'section';
+        // The dialog shows the document as it was when it opened: a change made meanwhile (from outside) leaves it.
+        if (this.changes !== epoch) return true;
+        const range = this.range();
+        if (!range) return true;
+        // Every section the change is for is looked at first: one it cannot be made to is said here, and nothing changes.
+        const sections = ops.documentSections(this.document);
+        let targets: number[];
+        try {
+          targets = scope === 'document' ? sections.map((_, i) => i) : ops.sectionsAt(this.document, range);
+        } catch {
+          targets = [now.section];
+        }
+        for (const index of targets) {
+          try {
+            if (sections[index]) ops.patchedSection(sections[index].props, patch);
+          } catch (error) {
+            if (error instanceof RangeError && /no room/.test(error.message)) return { message: s.noRoom };
+            if (error instanceof RangeError) return { message: s.badLength };
+            throw error;
+          }
+        }
+        this.setSectionSetup(patch, scope);
+        return true;
+      },
+      onClose: () => {
+        this.pageDialog = undefined;
+        if (this.destroyed) return;
+        if (before && before.isConnected && typeof before.focus === 'function') before.focus({ preventScroll: true });
+        else this.focus();
+      },
+    });
+    return true;
   }
 
   /** Makes the paragraphs of the selection items of a list, or takes them out of it. */

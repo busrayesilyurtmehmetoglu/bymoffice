@@ -329,6 +329,12 @@ def document(z, main, trees, ids_of, refs, lower, say):
     if doc is None:
         return
     refs(main, doc, 'the document')
+    # The margins of a section state all seven of their attributes (CT_PageMar).
+    for el in doc.iter():
+        if local(el.tag) == 'pgMar':
+            missing = [name for name in ('top', 'right', 'bottom', 'left', 'header', 'footer', 'gutter') if attr(el, name) is None]
+            if missing:
+                say('a w:pgMar has no ' + ', '.join(missing))
     related = ids_of(main)
     by_kind = {}
     for (kind, target) in related.values():

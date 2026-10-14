@@ -431,7 +431,93 @@ export interface UiStrings {
   pivots: PivotStrings;
   /** The bar of Find and Replace of both views. */
   find: FindStrings;
+  /** The dialog of the page setup of both views. */
+  pageSetup: PageSetupStrings;
 }
+
+/** What the dialog of the page setup says (File -> Page Setup), in a workbook and in a document. */
+export interface PageSetupStrings {
+  title: string;
+  ok: string;
+  cancel: string;
+  /** The row of buttons that act at once (page breaks, section breaks). */
+  actions: string;
+  /** "cm" or "in": the unit margins are given in. */
+  unit: 'cm' | 'in';
+  /** The decimal separator of lengths typed and shown. */
+  decimal: string;
+  page: string;
+  paper: string;
+  /** A paper the list does not have (a size of the file): it stays as it is. */
+  otherPaper: string;
+  orientation: string;
+  portrait: string;
+  landscape: string;
+  scaling: string;
+  adjustTo: string;
+  fitTo: string;
+  /** Percent of the normal size. */
+  scale: string;
+  fitWide: string;
+  fitTall: string;
+  margins: string;
+  top: string;
+  bottom: string;
+  left: string;
+  right: string;
+  header: string;
+  footer: string;
+  centerOnPage: string;
+  horizontally: string;
+  vertically: string;
+  sheet: string;
+  /** The print area as references ("A1:D20"); empty for the used range. */
+  printArea: string;
+  titleRows: string;
+  titleCols: string;
+  gridLines: string;
+  headings: string;
+  /** At the active cell: a break above it and left of it. */
+  insertBreak: string;
+  removeBreak: string;
+  resetBreaks: string;
+  applyTo: string;
+  thisSection: string;
+  wholeDocument: string;
+  /** Section breaks at the caret: how the next section starts. */
+  sectionBreak(kind: 'nextPage' | 'continuous' | 'evenPage' | 'oddPage'): string;
+  badLength: string;
+  badScale: string;
+  badFit: string;
+  badArea: string;
+  badRows: string;
+  badCols: string;
+  noRoom: string;
+  /** Under the dialog where nothing can be changed: the file is edited together, where the page setup does not travel. */
+  shared: string;
+  /** The same in a document whose changes are tracked: a change of the page is not tracked. */
+  tracked: string;
+}
+
+/** The names of papers: the same in both languages (Excel's codes and the names of the document's papers). */
+export const PAPER_NAMES: { readonly [key: string]: string } = {
+  '1': 'Letter',
+  '3': 'Tabloid',
+  '5': 'Legal',
+  '7': 'Executive',
+  '8': 'A3',
+  '9': 'A4',
+  '11': 'A5',
+  '12': 'B4 (JIS)',
+  '13': 'B5 (JIS)',
+  letter: 'Letter',
+  legal: 'Legal',
+  executive: 'Executive',
+  a3: 'A3',
+  a4: 'A4',
+  a5: 'A5',
+  b5: 'B5 (JIS)',
+};
 
 /** What the bar of Find and Replace says. */
 export interface FindStrings {
@@ -1410,6 +1496,58 @@ export const STRINGS_EN: UiStrings = {
     tooMany: (limit) => `There are more than ${limit} matches to replace at once: narrow the search`,
     readOnly: 'Nothing can be replaced: the file is read-only',
   },
+  pageSetup: {
+    title: 'Page setup',
+    ok: 'OK',
+    cancel: 'Cancel',
+    actions: 'Breaks',
+    unit: 'in',
+    decimal: '.',
+    page: 'Page',
+    paper: 'Paper size',
+    otherPaper: 'Other (as it is)',
+    orientation: 'Orientation',
+    portrait: 'Portrait',
+    landscape: 'Landscape',
+    scaling: 'Scaling',
+    adjustTo: 'Adjust to',
+    fitTo: 'Fit to pages',
+    scale: '% of normal size',
+    fitWide: 'Pages wide',
+    fitTall: 'Pages tall (0: as many as needed)',
+    margins: 'Margins',
+    top: 'Top',
+    bottom: 'Bottom',
+    left: 'Left',
+    right: 'Right',
+    header: 'Header',
+    footer: 'Footer',
+    centerOnPage: 'Centre on page',
+    horizontally: 'Horizontally',
+    vertically: 'Vertically',
+    sheet: 'Sheet',
+    printArea: 'Print area',
+    titleRows: 'Rows to repeat at top',
+    titleCols: 'Columns to repeat at left',
+    gridLines: 'Gridlines',
+    headings: 'Row and column headings',
+    insertBreak: 'Insert page break',
+    removeBreak: 'Remove page break',
+    resetBreaks: 'Reset all page breaks',
+    applyTo: 'Apply to',
+    thisSection: 'This section',
+    wholeDocument: 'Whole document',
+    sectionBreak: (kind) => ({ nextPage: 'Section break: next page', continuous: 'Section break: continuous', evenPage: 'Section break: even page', oddPage: 'Section break: odd page' })[kind],
+    badLength: 'Type a length of 0 or more',
+    badScale: 'Type a whole percent from 10 to 400',
+    badFit: 'Type a whole number of pages from 0 to 32767',
+    badArea: 'Type the print area as references, such as A1:D20',
+    badRows: 'Type the rows to repeat, such as $1:$2',
+    badCols: 'Type the columns to repeat, such as $A:$B',
+    noRoom: 'The margins leave no room on the paper',
+    shared: 'The page setup is not changed while the file is edited together',
+    tracked: 'The page setup is not changed while changes are tracked: turn tracking off first',
+  },
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -2089,6 +2227,58 @@ export const STRINGS_TR: UiStrings = {
     changedMeanwhile: 'Arama sürerken dosya değişti: yeniden deneyin',
     tooMany: (limit) => `Bir seferde değiştirilecek ${limit} sonuçtan fazlası var: aramayı daraltın`,
     readOnly: 'Hiçbir şey değiştirilemez: dosya salt okunur',
+  },
+  pageSetup: {
+    title: 'Sayfa yapısı',
+    ok: 'Tamam',
+    cancel: 'İptal',
+    actions: 'Sonlar',
+    unit: 'cm',
+    decimal: ',',
+    page: 'Sayfa',
+    paper: 'Kâğıt boyutu',
+    otherPaper: 'Diğer (olduğu gibi)',
+    orientation: 'Yön',
+    portrait: 'Dikey',
+    landscape: 'Yatay',
+    scaling: 'Ölçek',
+    adjustTo: 'Ayarla',
+    fitTo: 'Sayfaya sığdır',
+    scale: '% normal boyut',
+    fitWide: 'Sayfa genişliği',
+    fitTall: 'Sayfa yüksekliği (0: gerektiği kadar)',
+    margins: 'Kenar boşlukları',
+    top: 'Üst',
+    bottom: 'Alt',
+    left: 'Sol',
+    right: 'Sağ',
+    header: 'Üstbilgi',
+    footer: 'Altbilgi',
+    centerOnPage: 'Sayfada ortala',
+    horizontally: 'Yatay',
+    vertically: 'Dikey',
+    sheet: 'Sayfa ayarları',
+    printArea: 'Yazdırma alanı',
+    titleRows: 'Üstte yinelenecek satırlar',
+    titleCols: 'Solda yinelenecek sütunlar',
+    gridLines: 'Kılavuz çizgileri',
+    headings: 'Satır ve sütun başlıkları',
+    insertBreak: 'Sayfa sonu ekle',
+    removeBreak: 'Sayfa sonunu kaldır',
+    resetBreaks: 'Tüm sayfa sonlarını sıfırla',
+    applyTo: 'Uygulama yeri',
+    thisSection: 'Bu bölüm',
+    wholeDocument: 'Tüm belge',
+    sectionBreak: (kind) => ({ nextPage: 'Bölüm sonu: sonraki sayfa', continuous: 'Bölüm sonu: sürekli', evenPage: 'Bölüm sonu: çift sayfa', oddPage: 'Bölüm sonu: tek sayfa' })[kind],
+    badLength: '0 ya da daha büyük bir uzunluk yazın',
+    badScale: '10 ile 400 arasında tam bir yüzde yazın',
+    badFit: '0 ile 32767 arasında tam bir sayfa sayısı yazın',
+    badArea: 'Yazdırma alanını A1:D20 gibi başvurularla yazın',
+    badRows: 'Yinelenecek satırları $1:$2 gibi yazın',
+    badCols: 'Yinelenecek sütunları $A:$B gibi yazın',
+    noRoom: 'Kenar boşlukları kâğıtta yer bırakmıyor',
+    shared: 'Dosya birlikte düzenlenirken sayfa yapısı değiştirilemez',
+    tracked: 'Değişiklikler izlenirken sayfa yapısı değiştirilemez: önce izlemeyi kapatın',
   },
 };
 

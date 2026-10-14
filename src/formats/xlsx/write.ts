@@ -43,6 +43,7 @@ import {
   type Row,
   type SharedString,
   type Sheet,
+  type SheetPageSetup,
   type SheetSpaces,
   type SheetNameMap,
   type SheetStructuralEdit,
@@ -56,6 +57,7 @@ import { writeInOneGo, type PartReads } from '../part-reads';
 import { decodeXmlBytes, localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
 import { adjustDrawingAnchor, commentCellNow, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
+import { breakSpanOf, movePageBreak } from '../../model/sheet/page-breaks';
 import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, stripChartPart, type DrawingPartEdit } from './chart-write';
 import { drawingSource } from './drawings';
 import type { Chart } from '../../model/sheet/chart';
@@ -64,7 +66,7 @@ import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { pivotPartsToRead, pivotWrites } from './pivot-write';
 import { parseColor } from './styles';
-import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
+import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, pageBreaksXml, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
 import { keptFor, keptNow, ownCellFormulaAt, ownCellSpelling, type CellSpelling } from '../../ops/rules';
 import { paneOf, samePane } from '../../ops/ops';
 
@@ -672,47 +674,41 @@ function plainText(el: XmlElement): string {
   return text;
 }
 
-/** Page breaks: <brk id> is the row (or column) the break follows; min and max bound it on the other axis. */
+/**
+ * Page breaks: <brk id> is the row (or column) the break follows; min and max bound it on the
+ * other axis. They move by the one rule of movePageBreak() (the layout and the commands use it
+ * too); a break that is gone, or that comes to stand where another one is, is taken out.
+ */
 function adjustBreaks(el: XmlElement, rows: boolean, adjuster: Adjuster): number {
   const axis = rows ? 'row' : 'col';
-  const crossLimit = rows ? MAX_COLS : MAX_ROWS;
   const kept: XmlNode[] = [];
+  const seen = new Set<number>();
   let altered = false;
   for (const node of el.children) {
     if (node.type !== 'element' || localName(node.name) !== 'brk') {
       kept.push(node);
       continue;
     }
-    let id = parseUint(node.attrs.get('id'));
-    let min = parseUint(node.attrs.get('min'));
-    let max = parseUint(node.attrs.get('max'));
-    let gone = false;
-    for (const edit of adjuster.own) {
-      if (edit.axis === axis) {
-        if (id < 1) continue;
-        const moved = adjustRange(rows ? { top: id - 1, bottom: id - 1, left: 0, right: 0 } : { top: 0, bottom: 0, left: id - 1, right: id - 1 }, edit);
-        if (!moved) gone = true;
-        else id = (rows ? moved.top : moved.left) + 1;
-      } else if (min >= 0 && max >= min && !(min === 0 && max >= crossLimit - 1)) {
-        // A break that spans the whole sheet keeps doing so.
-        const moved = adjustRange(rows ? { top: 0, bottom: 0, left: min, right: max } : { top: min, bottom: max, left: 0, right: 0 }, edit);
-        if (!moved) gone = true;
-        else {
-          min = rows ? moved.left : moved.top;
-          max = rows ? moved.right : moved.bottom;
-        }
-      }
-      if (gone) break;
+    const id = parseUint(node.attrs.get('id'));
+    // The band as the reader takes it (missing is 0): what the model moves is what moves here.
+    const { min, max } = breakSpanOf(node.attrs.get('min'), node.attrs.get('max'));
+    // A break the reader leaves out (no place, a band that is none) is left as it is: nothing reads it.
+    if (!(id >= 1 && min <= max && max < (rows ? MAX_COLS : MAX_ROWS))) {
+      kept.push(node);
+      continue;
     }
-    if (gone) {
+    const moved = movePageBreak({ at: id, min, max }, adjuster.own, axis);
+    // Of two breaks that come to one place the one the file lists first stays, as the model keeps it.
+    if (!moved || seen.has(moved.at)) {
       altered = true;
       continue;
     }
-    for (const [attr, value] of [['id', id], ['min', min], ['max', max]] as [string, number][]) {
-      if (value >= 0 && node.attrs.has(attr) && node.attrs.get(attr) !== String(value)) {
-        node.attrs.set(attr, String(value));
-        altered = true;
-      }
+    seen.add(moved.at);
+    for (const [attr, value, was] of [['id', moved.at, id], ['min', moved.min, min], ['max', moved.max, max]] as [string, number, number][]) {
+      if (value === was) continue;
+      // A band that is stated anew is written, also where the file left it to the default.
+      node.attrs.set(attr, String(value));
+      altered = true;
     }
     kept.push(node);
   }
@@ -3530,6 +3526,142 @@ function setTabColorIn(original: Uint8Array, color: Color | undefined, sheetName
   return spliceExact(original, [{ start: properties.start + element.openEnd, end: properties.start + element.openEnd, text }]);
 }
 
+/** Whether the page setup of a sheet of the file is another one than it came with ("setPageSetup"). */
+function pageSetupChanged(sheet: Sheet): boolean {
+  return !!sheet.pageSetupModified && sheet.kind === 'worksheet' && sheet.part !== '' && !(sheet.pageSetupRead && sheet.pageSetupRead.setup === sheet.pageSetup);
+}
+
+/** The attributes of the elements of the page setup the model holds, by member of SheetPageSetup. */
+const PAGE_SETUP_ATTRS: { [member in 'page' | 'print' | 'margins']: { element: string; names: string[] } } = {
+  print: { element: 'printOptions', names: ['horizontalCentered', 'verticalCentered', 'headings', 'gridLines', 'gridLinesSet'] },
+  margins: { element: 'pageMargins', names: ['left', 'right', 'top', 'bottom', 'header', 'footer'] },
+  page: {
+    element: 'pageSetup',
+    names: [
+      'paperSize', 'paperHeight', 'paperWidth', 'scale', 'firstPageNumber', 'fitToWidth', 'fitToHeight', 'pageOrder', 'orientation', 'usePrinterDefaults',
+      'blackAndWhite', 'draft', 'cellComments', 'useFirstPageNumber', 'errors', 'horizontalDpi', 'verticalDpi', 'copies',
+    ],
+  },
+};
+
+/** A value of the model as an attribute of the file: booleans as "1" and "0"; undefined for none. */
+function pageAttrValue(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'boolean') return value ? '1' : '0';
+  if (typeof value === 'number') return value === value && value !== Infinity && value !== -Infinity ? String(value) : undefined;
+  return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * A sheet part with the elements that say how the sheet is printed brought in line with the model
+ * (Sheet.pageSetup), each only where the model differs from what the sheet was read with
+ * (Sheet.pageSetupRead): of <printOptions>, <pageMargins> and <pageSetup> only the attributes that
+ * changed are set or removed (the others, the relationship of the printer settings among them,
+ * stay as they are); <rowBreaks> and <colBreaks> are written anew from the model when the breaks
+ * changed, moved by the rows and columns inserted or deleted after they were set (`own`, the edits
+ * of the sheet in order); the flags of <pageSetUpPr> in <sheetPr> likewise. A missing element is
+ * put where the schema has it. Every other byte stays. Undefined when nothing changes.
+ */
+function setPageSetupIn(original: Uint8Array, sheet: Sheet, own: SheetStructuralEdit[]): Uint8Array | undefined {
+  const s = decodeSource(original);
+  const root = rawElement(s);
+  const rootLocal = localName(root.name);
+  if (rootLocal !== 'worksheet' && rootLocal !== 'dialogsheet' && rootLocal !== 'macrosheet') {
+    throw new Error(`Cannot write sheet "${sheet.name}": its part has the root element <${root.name}>, not a worksheet`);
+  }
+  if (root.selfClosing) throw new Error(`Cannot write sheet "${sheet.name}": its part has no <sheetData>`);
+  const prefix = root.name.slice(0, root.name.length - rootLocal.length);
+  const read: SheetPageSetup = (sheet.pageSetupRead ? sheet.pageSetupRead.setup : sheet.pageSetup) || {};
+  const now: SheetPageSetup = sheet.pageSetup || {};
+  const splices: Splice[] = [];
+  /** Where an element that is not there goes: before the first child that comes after it in the schema. */
+  const placeOf = (local: string): number => {
+    const rank = WORKSHEET_ORDER.indexOf(local);
+    const behind = root.children.find((child) => worksheetRank(s, child.start, child.local) > rank);
+    return behind ? behind.start : root.closeStart;
+  };
+
+  // <printOptions>, <pageMargins>, <pageSetup>: the attributes that changed.
+  for (const member of ['print', 'margins', 'page'] as const) {
+    const { element, names } = PAGE_SETUP_ATTRS[member];
+    const before = (read[member] || {}) as Record<string, unknown>;
+    const after = now[member] as Record<string, unknown> | undefined;
+    const changed = names.filter((name) => pageAttrValue(before[name]) !== pageAttrValue(after ? after[name] : undefined));
+    const present = root.children.find((child) => child.local === element);
+    if (!after) {
+      // Gone from the model: the element goes, when the sheet was read with it.
+      if (present && read[member]) splices.push({ start: present.start, end: present.end, text: '' });
+      continue;
+    }
+    if (present) {
+      if (changed.length === 0) continue;
+      const end = startTagEnd(s, present.start);
+      let tag = s.slice(present.start, end);
+      for (const name of changed) tag = withStartAttr(tag, name, pageAttrValue(after[name]));
+      splices.push({ start: present.start, end, text: tag });
+      continue;
+    }
+    let text = `<${prefix}${element}`;
+    for (const name of names) {
+      const value = pageAttrValue(after[name]);
+      if (value !== undefined) text += ` ${name}="${escapeAttr(value)}"`;
+    }
+    const at = placeOf(element);
+    splices.push({ start: at, end: at, text: `${text}/>` });
+  }
+
+  // <rowBreaks> and <colBreaks>: written anew when the breaks are others.
+  const since = typeof now.breaksSince === 'number' && now.breaksSince > 0 ? Math.floor(now.breaksSince) : 0;
+  const moves = since > 0 ? own.slice(Math.min(since, own.length)) : own;
+  for (const [member, element, rows] of [['rowBreaks', 'rowBreaks', true], ['colBreaks', 'colBreaks', false]] as const) {
+    if (read[member] === now[member] && (read.breaksSince || 0) === (now.breaksSince || 0)) continue;
+    let text = pageBreaksXml(`${prefix}${element}`, now[member], rows);
+    if (text !== '' && moves.length > 0) text = adjustSheetElement(text, sheet.name, moves.map((edit) => ({ ...edit, sheetName: sheet.name })), []);
+    const present = root.children.find((child) => child.local === element);
+    if (present) {
+      if (s.slice(present.start, present.end) !== text) splices.push({ start: present.start, end: present.end, text });
+    } else if (text !== '') {
+      const at = placeOf(element);
+      splices.push({ start: at, end: at, text });
+    }
+  }
+
+  // The flags of <pageSetUpPr>, the last child of <sheetPr>.
+  const flags = (['fitToPage', 'autoPageBreaks'] as const).filter((name) => pageAttrValue(read[name]) !== pageAttrValue(now[name]));
+  if (flags.length > 0) {
+    const properties = root.children.find((child) => child.local === 'sheetPr');
+    if (!properties) {
+      let text = `<${prefix}pageSetUpPr`;
+      for (const name of flags) {
+        const value = pageAttrValue(now[name]);
+        if (value !== undefined) text += ` ${name}="${value}"`;
+      }
+      if (text !== `<${prefix}pageSetUpPr`) splices.push({ start: root.openEnd, end: root.openEnd, text: `<${prefix}sheetPr>${text}/></${prefix}sheetPr>` });
+    } else {
+      const raw = s.slice(properties.start, properties.end);
+      const element = rawElement(raw);
+      const p = element.name.slice(0, element.name.length - localName(element.name).length);
+      const inner = element.children.find((child) => child.local === 'pageSetUpPr');
+      if (inner) {
+        const end = startTagEnd(raw, inner.start);
+        let tag = raw.slice(inner.start, end);
+        for (const name of flags) tag = withStartAttr(tag, name, pageAttrValue(now[name]));
+        splices.push({ start: properties.start + inner.start, end: properties.start + end, text: tag });
+      } else {
+        let text = `<${p}pageSetUpPr`;
+        for (const name of flags) {
+          const value = pageAttrValue(now[name]);
+          if (value !== undefined) text += ` ${name}="${value}"`;
+        }
+        if (text !== `<${p}pageSetUpPr`) splices.push(appendInside(element, properties.start, `${text}/>`));
+      }
+    }
+  }
+  if (splices.length === 0) return undefined;
+  const out = spliceExact(original, splices);
+  return sameBytes(out, original) ? undefined : out;
+}
+
 /** Whether the panes of a sheet of the file are other ones than it came with ("setPane"). */
 function panesChanged(sheet: Sheet): boolean {
   return !!sheet.paneModified && sheet.kind === 'worksheet' && sheet.part !== '' && !(sheet.paneRead && samePane(sheet.paneRead, paneOf(sheet)));
@@ -3986,6 +4118,28 @@ const WORKBOOK_ORDER = [
 ];
 
 const isFilterName = (name: string) => name.toLowerCase() === FILTER_NAME.toLowerCase();
+/** The names of a print area and of print titles, which the commands of the page setup add and remove. */
+const isPrintName = (name: string) => {
+  const key = typeof name === 'string' ? name.toLowerCase() : '';
+  return key === '_xlnm.print_area' || key === '_xlnm.print_titles';
+};
+
+/** The defined names of a workbook part, in order: their names and values. */
+function fileNamesOf(root: XmlElement): { name: string; value: string }[] {
+  const out: { name: string; value: string }[] = [];
+  for (const node of root.children) {
+    if (node.type !== 'element' || localName(node.name) !== 'definedNames') continue;
+    for (const child of node.children) if (child.type === 'element' && localName(child.name) === 'definedName') out.push({ name: child.attrs.get('name') || '', value: textOf(child) || '' });
+  }
+  return out;
+}
+
+/** Whether the print areas and print titles of the model are other ones than the workbook part has (see setDefinedNames). */
+function printNamesChanged(root: XmlElement, workbook: Workbook): boolean {
+  const file = fileNamesOf(root).filter((name) => isPrintName(name.name));
+  const model = workbook.definedNames.filter((name) => isPrintName(name.name));
+  return file.length !== model.length || model.some((name, index) => name.value !== file[index].value);
+}
 
 /** A sheet as the workbook part of the file lists it. */
 interface FileSheet {
@@ -4239,7 +4393,7 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook, change: BookCha
       // that is not in the file (a copy brings the names of its sheet); any other name that is not in the
       // file is a mistake of the caller.
       const ofNewSheet = name.localSheet !== undefined && !!workbook.sheets[name.localSheet] && workbook.sheets[name.localSheet].part === '';
-      if (!isFilterName(name.name) && !ofNewSheet) throw new Error(`Cannot write the workbook: the defined name "${name.name}" is not in the file`);
+      if (!isFilterName(name.name) && !isPrintName(name.name) && !ofNewSheet) throw new Error(`Cannot write the workbook: the defined name "${name.name}" is not in the file`);
       const attrs: Attrs = [['name', name.name]];
       if (name.localSheet !== undefined) attrs.push(['localSheetId', String(name.localSheet)]);
       if (name.hidden) attrs.push(['hidden', '1']);
@@ -4258,7 +4412,12 @@ function updateWorkbookXml(doc: XmlDocument, workbook: Workbook, change: BookCha
     if (name.localSheet !== undefined && scope !== undefined && scope >= 0 && target.attrs.get('localSheetId') !== String(name.localSheet)) target.attrs.set('localSheetId', String(name.localSheet));
   });
   // The range of a filter that was switched off goes with it, and the names of a deleted sheet with their sheet; an empty list is not valid.
-  const gone = (el: XmlElement) => !used.has(el) && (isFilterName(el.attrs.get('name') || '') || scopes.get(el) === SCOPE_GONE);
+  // So do a print area and print titles that were cleared: of a sheet that is known (the model would have a name for it otherwise).
+  const gone = (el: XmlElement) => {
+    if (used.has(el)) return false;
+    const scope = scopes.get(el);
+    return isFilterName(el.attrs.get('name') || '') || scope === SCOPE_GONE || (isPrintName(el.attrs.get('name') || '') && scope !== undefined && scope >= 0);
+  };
   if (container && elements.some(gone)) {
     const list = container;
     list.children = list.children.filter((node) => node.type !== 'element' || localName(node.name) !== 'definedName' || !gone(node));
@@ -4542,12 +4701,14 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     (!!sheet.conditionalModified && (!sheet.conditionalRead || sheet.conditionalRead.list !== sheet.conditionalFormats)) ||
     (!!sheet.drawingsModified && (!sheet.drawingsRead || sheet.drawingsRead.list !== sheet.drawings)) ||
     (!!sheet.tabColorModified && !(sheet.tabColorRead && sameColor(sheet.tabColorRead.color, sheet.tabColor))) ||
-    panesChanged(sheet);
-  const flagged = (sheet: Sheet): boolean => !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified || sheet.paneModified);
+    panesChanged(sheet) ||
+    pageSetupChanged(sheet);
+  const flagged = (sheet: Sheet): boolean =>
+    !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified || sheet.paneModified || sheet.pageSetupModified);
   const sheetsModified = !!workbook.sheetsModified || sheets.some((sheet) => sheet.part === '');
   // The parts of refreshed pivot tables, and of those an earlier save wrote, are written from the bytes of the file.
   for (const part of pivotPartsToRead(workbook)) reads.bytes(part);
-  if (!workbook.styles.modified && !sheetsModified && !sheets.some(flagged)) return;
+  if (!workbook.styles.modified && !sheetsModified && !workbook.definedNamesModified && !sheets.some(flagged)) return;
   const saved = SAVES.get(workbook);
   const want = (part: string): Uint8Array | undefined => {
     const kept = saved ? saved.originals.get(part) : undefined;
@@ -4662,7 +4823,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   const chartsModified = workbook.sheets.some((sheet) => sheet.drawingsModified && sheet.kind === 'worksheet');
   // Panes set back to those of the file still bring back a part an earlier save wrote.
   const panesModified = workbook.sheets.some((sheet) => !!sheet.paneModified);
-  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !panesModified && !workbook.pivotsModified) return;
+  // So do a page setup and defined names set back to those of the file.
+  const pagesModified = workbook.sheets.some((sheet) => !!sheet.pageSetupModified) || !!workbook.definedNamesModified;
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !panesModified && !pagesModified && !workbook.pivotsModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
@@ -5428,6 +5591,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   // Frozen panes, the same way: panes that are those the sheet came with again cost nothing.
   const paned = new Set<Sheet>();
   for (const sheet of workbook.sheets) if (panesChanged(sheet)) paned.add(sheet);
+  // The page setup, the same way.
+  const paged = new Set<Sheet>();
+  for (const sheet of workbook.sheets) if (pageSetupChanged(sheet)) paged.add(sheet);
 
   // Rules that were added, changed or deleted: a list that is the one the sheet came with again (undone) is no change.
   const ruled = new Set<Sheet>();
@@ -5440,7 +5606,19 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   const dxfs = planDxfs(workbook);
 
   const edited =
-    modifiedSheets.length > 0 || stylesModified || reordered || renamed || restated || fileNotes.size > 0 || tabbed.size > 0 || paned.size > 0 || ruled.size > 0 || dxfs.added.length > 0 || charting.size > 0;
+    modifiedSheets.length > 0 ||
+    stylesModified ||
+    reordered ||
+    renamed ||
+    restated ||
+    fileNotes.size > 0 ||
+    tabbed.size > 0 ||
+    paned.size > 0 ||
+    paged.size > 0 ||
+    ruled.size > 0 ||
+    dxfs.added.length > 0 ||
+    charting.size > 0 ||
+    printNamesChanged(book.root, workbook);
   const fileActive = fileActiveOf(book.root, file.length);
   const bookViews = childNamed(book.root, 'bookViews');
   const windows = bookViews ? childrenNamed(bookViews, 'workbookView').length : 0;
@@ -5534,8 +5712,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const notes = fileNotes.get(sheet);
     const tab = tabbed.has(sheet);
     const pane = paned.has(sheet);
+    const paging = paged.has(sheet);
     const rules = ruled.has(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !rules && !charting.has(sheet)) continue;
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !rules && !charting.has(sheet)) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
@@ -5592,6 +5771,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       if (bytes && tab) next = next ? setTabColorIn(next, sheet.tabColor, sheet.name) || next : tabbed.get(sheet);
       // The panes, in the part as it is by now.
       if (bytes && pane) next = setPaneIn(next || bytes, sheet) || next;
+      // How the sheet is printed, likewise.
+      if (bytes && paging) next = setPageSetupIn(next || bytes, sheet, sheet.structuralEdits || []) || next;
       if (bytes && next) {
         // From here on the package no longer holds the part as the file had it.
         keep(sheet.part, bytes);
@@ -5604,10 +5785,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       let written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
       if (charts && charts.element !== undefined) written = setSheetDrawing(written, 'drawing', charts.element, sheet.name) || written;
       const coloured = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
-      const next = (pane && setPaneIn(coloured, sheet)) || coloured;
+      const viewed = (pane && setPaneIn(coloured, sheet)) || coloured;
+      const next = (paging && setPageSetupIn(viewed, sheet, sheet.structuralEdits || [])) || viewed;
       // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation. Frozen
-      // panes are of the view only: a part that differs from the file by its panes alone asks for none either.
-      if (sameBytes(next, bytes) || (pane && sameBytes(coloured, bytes))) asInFile.add(sheet);
+      // panes and the page setup are of the view and the printer only: a part that differs from the file by them alone
+      // asks for none either.
+      if (sameBytes(next, bytes) || ((pane || paging) && sameBytes(coloured, bytes))) asInFile.add(sheet);
       writes.push([sheet.part, next]);
       rewritten.push(sheet.part);
     }
@@ -5846,7 +6029,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     }
   };
   gather(book.root, 0);
-  const namesAsInFile = fileNames.length === workbook.definedNames.length && workbook.definedNames.every((name, index) => name.value === fileNames[index]);
+  // A print area or print titles are of the printer only: names that differ from the file by them alone ask for no calculation.
+  const fileNamesBy = fileNamesOf(book.root);
+  const calcNames = workbook.definedNames.filter((name) => !isPrintName(name.name));
+  const calcFileNames = fileNamesBy.filter((name) => !isPrintName(name.name));
+  const namesAsInFile = calcFileNames.length === calcNames.length && calcNames.every((name, index) => name.value === calcFileNames[index].value);
+  const namesChanged = fileNames.length !== workbook.definedNames.length || workbook.definedNames.some((name, index) => name.value !== fileNames[index]);
   const changedSheets = namesAsInFile ? modifiedSheets.filter((sheet) => !asInFile.has(sheet)) : modifiedSheets;
   const recalculate = changedSheets.length > 0 || reordered;
   const chainRel = recalculate ? withType('/calcChain') : undefined;
@@ -5887,7 +6075,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   }
 
   const bookParts: string[] = [];
-  if (recalculate || renamed || activeMoved || restated) {
+  if (recalculate || renamed || activeMoved || restated || namesChanged) {
     updateWorkbookXml(book, workbook, { file, renamed, restated, reordered, relIds, relNamespace: relBase, active, activeMoved, recalculate, hiddenWindows });
     writes.push([main, book]);
     bookParts.push(main);

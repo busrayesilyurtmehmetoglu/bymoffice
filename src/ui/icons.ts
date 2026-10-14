@@ -10,6 +10,7 @@ export type IconName =
   | 'redo'
   | 'print'
   | 'pdf'
+  | 'pageSetup'
   | 'bold'
   | 'italic'
   | 'underline'
@@ -53,6 +54,8 @@ const ICONS: { [name in IconName]: Shape[] } = {
   print: [path('M7 8V4h10v4'), path('M7 17H5a1 1 0 0 1-1-1v-6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1h-2'), path('M7 14h10v6H7z')],
   // The file of the document bar: a sheet of paper with its corner folded, and an arrow down.
   pdf: [path('M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z'), path('M14 3v4h4'), path('M12 10v7'), path('m9 14 3 3 3-3')],
+  // A page with its margins drawn in, and a corner turned: the page setup.
+  pageSetup: [path('M6 3h12v18H6z'), path('M6 7h12 M6 17h12 M9 3v18 M15 3v18', { 'stroke-width': '1', 'stroke-dasharray': '1.5 1.5' })],
   bold: [path('M7 5h6a3.5 3.5 0 0 1 0 7H7z M7 12h7a3.5 3.5 0 0 1 0 7H7z', { 'stroke-width': '2.25' })],
   italic: [path('M10 5h7 M7 19h7 M14 5l-4 14')],
   underline: [path('M7 4v7a5 5 0 0 0 10 0V4 M5 20h14')],

@@ -1163,6 +1163,14 @@ export interface PageBreak {
   manual: boolean;
   /** Made by a pivot table. */
   pivot?: boolean;
+  /** Attributes of the <brk> the model has no field for (without a prefix), as the file has them: written back with the break. */
+  kept?: [string, string][];
+  /**
+   * Where the break stands among the breaks of its element in the file, set by the reader only when
+   * the file does not list them in order (the model does): of two breaks that come to one place the
+   * one the file lists first stays, in the model as in the file.
+   */
+  fileOrder?: number;
 }
 
 /**
@@ -1186,6 +1194,13 @@ export interface SheetPageSetup {
   rowBreaks?: PageBreak[];
   /** In ascending order, one per column. */
   colBreaks?: PageBreak[];
+  /**
+   * The breaks are where they were after this many rows and columns had been inserted or
+   * deleted since the file was read (the first `breaksSince` entries of Sheet.structuralEdits):
+   * only the edits after those move them. Missing (0) for breaks as the file has them. Set by
+   * the commands that change the breaks (see page-setup.ts in ops).
+   */
+  breaksSince?: number;
 }
 
 /** Where the bytes of pictures come from; read only when a picture is first shown. */
@@ -1308,8 +1323,20 @@ export interface Sheet {
   validationsModified?: boolean;
   /** The list the sheet had before its data validations were first changed. Set with `validationsModified`. */
   validationsRead?: { list: DataValidation[] | undefined };
-  /** Margins, paper, scaling, headers and footers and page breaks of the printed sheet, as the file has them. */
+  /**
+   * Margins, paper, scaling, headers and footers and page breaks of the printed sheet, as the file
+   * has them or as they were set since ("setPageSetup"). Never changed in place: an edit puts
+   * another object here.
+   */
   pageSetup?: SheetPageSetup;
+  /**
+   * The page setup was changed ("setPageSetup"); the writer brings the elements of the sheet part
+   * that say how it is printed in line with the model, each only where it differs from what the
+   * sheet was read with. Set on its own, without `modified`: no cell changed.
+   */
+  pageSetupModified?: boolean;
+  /** The page setup the sheet had before it was first changed. Set with `pageSetupModified`. */
+  pageSetupRead?: { setup: SheetPageSetup | undefined };
   /** Set once anything in the sheet was changed after it was read; the writer regenerates only such sheets. */
   modified?: boolean;
   /**
@@ -1452,6 +1479,12 @@ export interface Workbook {
   pivots?: WorkbookPivots;
   /** Set once a pivot table was refreshed (and never cleared, not by undo either): the writer brings the parts of refreshed tables and caches in line with the model. */
   pivotsModified?: boolean;
+  /**
+   * Set once the defined names were replaced as a whole ("setDefinedNames": a print area or print
+   * titles set or cleared), and never cleared: the writer compares the names with those of the
+   * file and writes the workbook part when they differ.
+   */
+  definedNamesModified?: boolean;
 }
 
 /** The sheets on either side of a deleted sheet; undefined where it was the first or the last. */
