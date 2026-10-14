@@ -24,7 +24,7 @@ import type { Workbook } from './model/sheet/types';
 import { SpreadsheetEditor, type SpreadsheetEditorOptions } from './ui/editor';
 import type { WorkbookView } from './ui/sheet-view';
 import type { DocumentView, DocumentZoom } from './ui/doc-view';
-import { DocumentEditor } from './ui/doc-editor';
+import { DocumentEditor, type DocumentEditorOptions } from './ui/doc-editor';
 import type { DocumentPrintOptions, DocumentPrintResult } from './ui/doc-print';
 import type { SheetPrintOptions } from './ui/sheet-print';
 import type { PdfExportOptions } from './pdf/export';
@@ -37,6 +37,8 @@ import { listPeople, type CollabPerson, type People } from './collab/people';
 import { createSaveSync, type SaveSync } from './collab/save-sync';
 import { proofFile, readCollabStamp, samePackage, writeSharedFile } from './formats/xlsx/collab-stamp';
 import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabPeer, type CollabState, type CollabTransport, type CollabUser } from './collab/index';
+import { DocCollabSession, type DocPeer } from './collab/doc/session';
+import { holdsRevisions } from './collab/doc/history';
 import {
   SaveController,
   bindSaveToPage,
@@ -389,6 +391,14 @@ export interface MountedCollab {
   reload(): void;
   /** Leaves the room. The workbook stays; what is changed from here on is told to nobody. */
   leave(): void;
+}
+
+/** What mount() answers for a document that is edited together: as for a workbook, with the others where they are in a document. */
+export interface MountedDocCollab extends Omit<MountedCollab, 'peers' | 'user' | 'onPeers'> {
+  /** The others; `presence` is the story and the two ends of their selection (the same place for a caret). */
+  readonly peers: DocPeer[];
+  readonly user: DocPeer;
+  onPeers?: (peers: DocPeer[]) => void;
 }
 
 interface CollabPlan {
@@ -1269,6 +1279,12 @@ export interface MountedDocument {
   protection?: MountProtection;
   /** Set (true) when the changes made in the editor are tracked: the document asks for it, or MountOptions.trackChanges did. */
   trackChanges?: boolean;
+  /**
+   * Set when the document is edited together with others (MountOptions.collab). When the file
+   * is loaded again (the room is at another version of it), `file`, `document`, `view` and
+   * `editor` are replaced by those of the new file.
+   */
+  collab?: MountedDocCollab;
   document: DocModel;
   /** The pages: zoom, navigation, the caret and the selection, editing, undo and redo. */
   view: DocumentView;
@@ -1480,7 +1496,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
                   return askOverwrite({
                     root: editorRoot(),
                     kind: 'collab-fork',
-                    strings: { saveConflictTitle: fork.title, saveConflictQuestion: fork.question, saveOverwrite: fork.save, saveCancel: words.saveCancel },
+                    strings: { saveConflictTitle: fork.title, saveConflictQuestion: file.kind === 'document' ? words.collab.doc.forkQuestion : fork.question, saveOverwrite: fork.save, saveCancel: words.saveCancel },
                     detail: question.detail,
                     answer: question.answer,
                     focusView: () => focusView(),
@@ -1494,7 +1510,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
                           void saveAsIs().then(
                             (bytes) => {
                               // Whether the browser kept the file is not known here: it is said that it was handed over, or that it could not be.
-                              if (downloadFile(document, bytes, options.fileName !== undefined ? options.fileName : fileName || 'workbook.xlsx')) notice(fork.downloaded, 'info');
+                              if (downloadFile(document, bytes, options.fileName !== undefined ? options.fileName : fileName || (file.kind === 'document' ? 'document.docx' : 'workbook.xlsx'))) notice(fork.downloaded, 'info');
                               else notice(fork.downloadFailed, 'error');
                             },
                             () => notice(fork.downloadFailed, 'error'),
@@ -1526,8 +1542,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         etag,
       })
     : undefined;
-  /** The session, while the workbook is edited together; and the file that was written last, with the step it holds. */
-  let session: CollabSession | undefined;
+  /** The session, while the workbook or the document is edited together; and the file that was written last, with the step it holds. */
+  let session: CollabSession | DocCollabSession | undefined;
   let saveSync: SaveSync | undefined;
   let showRoom: () => void = () => undefined;
   let unstampedSaid = false;
@@ -1632,8 +1648,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
 
   if (file.kind === 'document') {
     if (!file.document) throw new UnsupportedFileError('Showing doc documents is not supported yet');
-    const model = await file.document();
-    const editor = new DocumentEditor(container, model, {
+    let model = await file.document();
+    const editorOptions = (): DocumentEditorOptions => ({
       package: documentPictures(model, file.package),
       locale: options.locale,
       zoom: options.zoom,
@@ -1655,7 +1671,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       // The name the PDF is downloaded under: the one the page states, or the one the file came with.
       fileName: options.fileName !== undefined ? options.fileName : fileName,
     });
-    const view = editor.view;
+    let editor = new DocumentEditor(container, model, editorOptions());
+    let view = editor.view;
     if (file.format !== 'docx') {
       // Nothing may turn editing on: saving gives the original bytes and the edits would be lost.
       const lockView = view.setReadOnly.bind(view);
@@ -1666,10 +1683,11 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     save = async (saveOptions?: SaveOptions) => {
       // A composition still under way belongs to the document that is written.
       view.commitEditing();
-      const changes = view.changeCount;
-      const bytes = await file.save(saveOptions);
+      const shown = view;
+      const changes = shown.changeCount;
+      const bytes = await sharedBytes((raw) => raw(saveOptions), saveOptions);
       // A change made while the file was written is not in these bytes.
-      if (view.changeCount === changes) view.markSaved();
+      if (shown.changeCount === changes) shown.markSaved();
       return bytes;
     };
     commit = () => {
@@ -1679,9 +1697,10 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     pendingInput = () => view.hasPendingInput();
     saveAsIs = async () => {
       // As save(), without ending anything: auto-save only runs while nothing is being composed.
-      const changes = view.changeCount;
-      const bytes = await file.save();
-      if (view.changeCount === changes) view.markSaved();
+      const shown = view;
+      const changes = shown.changeCount;
+      const bytes = await sharedBytes((raw) => raw());
+      if (shown.changeCount === changes) shown.markSaved();
       return bytes;
     };
     // A protection that allows no editing: nothing is written back. One that allows comments is written back with them.
@@ -1693,10 +1712,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     readOnlyNow = () => view.readOnly && !view.canComment;
     // What is typed in a document is in the document: nothing waits in a field to be applied.
     watchReadOnly(view, () => false);
-    const destroy = tie(editor);
+    const destroyTied = tie(editor);
     converted();
-    // Said, not thrown: the document is shown and edited as without the option.
-    if (collabPlan) view.showNotice(resolveUiStrings(options.locale).collab.document, 'error');
     const print = (printOptions?: DocumentPrintOptions) => view.print(printOptions);
     const exportPdf = (pdfOptions?: PdfExportOptions) => view.exportPdf(pdfOptions);
     const mounted: MountedDocument = {
@@ -1705,7 +1722,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       document: model,
       view,
       editor,
-      save,
+      save: (saveOptions?: SaveOptions) => save(saveOptions),
       print,
       exportPdf,
       saveNow,
@@ -1713,12 +1730,205 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         return unsaved();
       },
       setAutoSave,
-      destroy,
+      destroy: () => {
+        if (session) session.leave();
+        mounted.editor.destroy();
+      },
     };
+    void destroyTied;
     if (conversion) mounted.conversion = conversion;
     if (view.trackingChanges) mounted.trackChanges = true;
     const enforced = view.protection;
     if (enforced) mounted.protection = { edit: enforced, exceptions: hasPermissionRanges(model) };
+
+    if (collabPlan && (file.format !== 'docx' || conversion)) {
+      // Everybody in a room has to read the very same file: one that was converted here is not it.
+      view.showNotice(resolveUiStrings(options.locale).collab.doc.unsupported, 'error');
+    } else if (collabPlan && (view.trackingChanges || holdsRevisions(model))) {
+      // A tracked change carries who made it and when, and a number of its own: it is not the same change for two participants.
+      view.showNotice(resolveUiStrings(options.locale).collab.doc.tracked, 'error');
+    } else if (collabPlan && readBytes) {
+      const plan = collabPlan;
+      let room: DocCollabSession | undefined;
+      let peopleTold = '';
+      // A document has no sheets: where the others are is shown on the pages, not in the list.
+      const bare = (peer: DocPeer): CollabPeer => {
+        const out: CollabPeer = { id: peer.id, color: peer.color, guest: peer.guest, readOnly: peer.readOnly };
+        if (peer.name !== undefined) out.name = peer.name;
+        return out;
+      };
+      let docBarShown = '';
+      const peopleNow = (): People => (room ? listPeople(bare(room.user), room.peers.map(bare), room.state, resolveUiStrings(options.locale).collab.guest) : { list: [], more: 0, count: 0 });
+      const show = (): void => {
+        if (!room) return;
+        const people = peopleNow();
+        // Nothing is built anew when nothing that is shown changed (where the others are is told many times a second).
+        const shown = `${room.state} ${room.peers.length} ${room.pending > 0} ${controller ? controller.state.autoWaits : ''} ${JSON.stringify(people.list)} ${people.more}`;
+        if (shown === docBarShown) return;
+        docBarShown = shown;
+        mounted.editor.setCollab({ state: room.state, peers: room.peers.length, pending: room.pending, autoWaits: controller ? controller.state.autoWaits : undefined, people });
+        // Whoever listens hears of the list when it is another one.
+        const key = JSON.stringify(people.list);
+        if (key === peopleTold) return;
+        peopleTold = key;
+        if (plan.options.onPeople) plan.options.onPeople(people.list);
+        const out = mounted.collab;
+        if (out && out.onPeople) out.onPeople(people.list);
+      };
+      showRoom = show;
+      /** The file is loaded again from its address and shown in place (the room is at a version this side does not have). */
+      const reload = async (): Promise<{ versions: string[]; stamp?: { ep: string; rev: number } }> => {
+        if (typeof options.file !== 'string') throw new Error('The file has no address to load it from again');
+        // Until the file is there nothing is typed into the document that is about to go.
+        const editable = !view.readOnly;
+        if (editable) editor.setReadOnly(true);
+        view.showNotice(resolveUiStrings(options.locale).collab.updating, 'info');
+        try {
+          return await loadAgain();
+        } catch (error) {
+          if (editable) mounted.editor.setReadOnly(false);
+          throw error;
+        }
+      };
+      const loadAgain = async (): Promise<{ versions: string[]; stamp?: { ep: string; rev: number } }> => {
+        const address = options.file as string;
+        const response = await fetch(address, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Could not load the file: HTTP ${response.status}`);
+        const tag = fileETag(response);
+        const named = response.headers.get('ETag');
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        // A password-protected file: its next version is opened with the password this one is kept with.
+        const next = await open(bytes, { passwordOf: file, requireIntegrity: options.requireIntegrity });
+        if (next.format !== 'docx' || !next.document) {
+          next.close();
+          throw new Error('The file is no longer a document that can be edited together');
+        }
+        const nextModel = await next.document();
+        if (holdsRevisions(nextModel)) {
+          next.close();
+          throw new Error('The file tracks its changes now: it cannot be edited together');
+        }
+        if (bound) bound.release();
+        detach();
+        // The file that was shown lets go of its password; the new one holds its own.
+        file.close();
+        file = next;
+        model = nextModel;
+        editor = new DocumentEditor(container, model, editorOptions());
+        view = editor.view;
+        watchReadOnly(view, () => false);
+        tie(editor);
+        mounted.file = file;
+        mounted.document = model;
+        mounted.view = view;
+        mounted.editor = editor;
+        view.attachCollab(room);
+        // A new editor has no bar of the room yet.
+        docBarShown = '';
+        // The file as it is on the server is what is shown: there is nothing to save, and the next save names it.
+        if (controller) controller.adopt(tag === null ? undefined : tag, true);
+        touched = false;
+        show();
+        return { versions: fileVersions(named, bytes), stamp: file.package ? await readCollabStamp(file.package) : undefined };
+      };
+      const handle: MountedDocCollab = {
+        get state() {
+          return room ? room.state : 'closed';
+        },
+        get rev() {
+          return room ? room.rev : 0;
+        },
+        get pending() {
+          return room ? room.pending : 0;
+        },
+        get peers() {
+          return room ? room.peers : [];
+        },
+        get people() {
+          return peopleNow().list;
+        },
+        get user() {
+          return (room as DocCollabSession).user;
+        },
+        saved: (bytes, tag) => sayShared(bytes, typeof tag === 'string' ? tag : undefined),
+        reload: () => {
+          if (room) room.reload();
+        },
+        leave: () => {
+          if (room) room.leave();
+        },
+      };
+      saveSync = controller
+        ? createSaveSync({
+            controller,
+            session: () => room,
+            target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials, headers: saveTarget.headers } : undefined,
+            // Those who may write: who only reads saves nothing, and is not waited for.
+            people: () => (room ? room.peers.filter((peer) => !peer.readOnly).length + (room.readOnly ? 0 : 1) : 1),
+            strong: strongETag,
+            readOnly: () => mounted.view.readOnly,
+            watchMs: typeof plan.options.saveWatchMs === 'number' && plan.options.saveWatchMs >= 1000 ? plan.options.saveWatchMs : undefined,
+            // What this document would be written as now: with it a save of someone else is proven to hold the work done here.
+            ownBytes: async () => {
+              if (!room) return { bytes: new Uint8Array(0), rev: undefined };
+              const turn = packageTurn(file);
+              return proofFile(room, () => turn.save(), (bytes) => OpcPackage.open(bytes), turn.locked);
+            },
+            // Part by part, unpacked: two browsers do not compress alike.
+            sameFile: samePackage,
+          })
+        : undefined;
+      room = new DocCollabSession(
+        {
+          document: () => model,
+          changed: (change) => {
+            view.collabChanged(change);
+            // An undoing that waited for its turn is this side's own change, and the view said so itself.
+            if (change.local) return;
+            // What someone else changed is there to be saved: by the one participant who saves for all.
+            touched = true;
+            if (saveSync) saveSync.remoteChanged();
+            else if (controller) controller.changed(true);
+            if (options.onDocumentChange) options.onDocumentChange();
+          },
+          notice: (said) => view.collabNotice(said),
+          reload: typeof options.file === 'string' ? reload : undefined,
+          // With `saveTo`: changes that no save holds. Without it: anything changed at all.
+          unsaved: () => (controller ? controller.dirty : touched),
+        },
+        {
+          transport: plan.transport(),
+          versions: fileVersions(readETag, readBytes),
+          stamp: file.package ? await readCollabStamp(file.package) : undefined,
+          user: plan.options.user,
+          room: plan.options.room,
+          token: plan.options.token,
+          // A document that is only read here (a protection, the option) follows, and sends nothing.
+          readOnly: view.readOnly,
+          onState: (state) => {
+            if (saveSync) saveSync.roomChanged();
+            show();
+            if (plan.options.onState) plan.options.onState(state);
+            if (handle.onState) handle.onState(state);
+          },
+          onPeers: (peers) => {
+            if (saveSync) saveSync.roomChanged();
+            view.collabPeersChanged(peers);
+            show();
+            if (plan.options.onPeers) plan.options.onPeers(peers.map(bare));
+            if (handle.onPeers) handle.onPeers(peers);
+          },
+          onSaved: (saved) => void (saveSync ? saveSync.saved(saved) : undefined),
+          onReadOnly: () => mounted.editor.setReadOnly(true),
+          // Someone cannot join because no file holds the steps of the room: the one participant who saves for the others does.
+          onSync: () => void (saveSync ? saveSync.sync() : undefined),
+        },
+      );
+      session = room;
+      view.attachCollab(room);
+      mounted.collab = handle;
+      show();
+    }
     return mounted;
   }
 
@@ -1814,17 +2024,18 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     view.showNotice(resolveUiStrings(options.locale).collab.unsupported, 'error');
   } else if (collabPlan && readBytes) {
     const plan = collabPlan;
+    let room: CollabSession | undefined;
     let peopleTold = '';
     let barShown = '';
-    const peopleNow = (): People => (session ? listPeople(session.user, session.peers, session.state, resolveUiStrings(options.locale).collab.guest) : { list: [], more: 0, count: 0 });
+    const peopleNow = (): People => (room ? listPeople(room.user, room.peers, room.state, resolveUiStrings(options.locale).collab.guest) : { list: [], more: 0, count: 0 });
     const show = (): void => {
-      if (!session) return;
+      if (!room) return;
       const people = peopleNow();
       // Nothing is built anew when nothing that is shown changed (where the others are is told many times a second).
-      const shown = `${session.state} ${session.pending > 0} ${controller ? controller.state.autoWaits : ''} ${JSON.stringify(people.list)} ${people.more}`;
+      const shown = `${room.state} ${room.pending > 0} ${controller ? controller.state.autoWaits : ''} ${JSON.stringify(people.list)} ${people.more}`;
       if (shown === barShown) return;
       barShown = shown;
-      mounted.editor.setCollab({ state: session.state, peers: session.peers, pending: session.pending, autoWaits: controller ? controller.state.autoWaits : undefined, people });
+      mounted.editor.setCollab({ state: room.state, peers: room.peers, pending: room.pending, autoWaits: controller ? controller.state.autoWaits : undefined, people });
       // Whoever listens hears of the list when it is another one.
       const key = JSON.stringify(people.list);
       if (key === peopleTold) return;
@@ -1881,7 +2092,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       mounted.workbook = workbook;
       mounted.view = view;
       mounted.editor = editor;
-      view.attachCollab(session);
+      view.attachCollab(room);
       // A new editor has no bar of the room yet.
       barShown = '';
       // The file as it is on the server is what is shown: there is nothing to save, and the next save names it.
@@ -1892,53 +2103,53 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
     };
     const handle: MountedCollab = {
       get state() {
-        return session ? session.state : 'closed';
+        return room ? room.state : 'closed';
       },
       get rev() {
-        return session ? session.rev : 0;
+        return room ? room.rev : 0;
       },
       get pending() {
-        return session ? session.pending : 0;
+        return room ? room.pending : 0;
       },
       get peers() {
-        return session ? session.peers : [];
+        return room ? room.peers : [];
       },
       get people() {
         return peopleNow().list;
       },
       get user() {
-        return (session as CollabSession).user;
+        return (room as CollabSession).user;
       },
       saved: (bytes, tag) => sayShared(bytes, typeof tag === 'string' ? tag : undefined),
       reload: () => {
-        if (session) session.reload();
+        if (room) room.reload();
       },
       leave: () => {
-        if (session) session.leave();
+        if (room) room.leave();
       },
     };
     saveSync = controller
       ? createSaveSync({
           controller,
-          session: () => session,
+          session: () => room,
           target: saveTarget && saveTarget.kind === 'request' ? { url: saveTarget.url, credentials: saveTarget.credentials, headers: saveTarget.headers } : undefined,
           // Those who may write: who only reads saves nothing, and is not waited for.
-          people: () => (session ? session.peers.filter((peer) => !peer.readOnly).length + (session.readOnly ? 0 : 1) : 1),
+          people: () => (room ? room.peers.filter((peer) => !peer.readOnly).length + (room.readOnly ? 0 : 1) : 1),
           strong: strongETag,
           readOnly: () => mounted.view.readOnly,
           // What this workbook would be written as now: with it a save of someone else is proven to hold the work done here.
           watchMs: typeof plan.options.saveWatchMs === 'number' && plan.options.saveWatchMs >= 1000 ? plan.options.saveWatchMs : undefined,
           // What this workbook would be stored as now, written from a copy: the package of the file is not changed for it.
           ownBytes: async () => {
-            if (!session) return { bytes: new Uint8Array(0), rev: undefined };
+            if (!room) return { bytes: new Uint8Array(0), rev: undefined };
             const turn = packageTurn(file);
-            return proofFile(session, () => turn.save(), (bytes) => OpcPackage.open(bytes), turn.locked);
+            return proofFile(room, () => turn.save(), (bytes) => OpcPackage.open(bytes), turn.locked);
           },
           // Part by part, unpacked: two browsers do not compress alike.
           sameFile: samePackage,
         })
       : undefined;
-    session = new CollabSession(
+    room = new CollabSession(
       {
         workbook: () => workbook,
         changed: (change) => view.collabChanged(change, change.local !== true),
@@ -1974,7 +2185,8 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
         onSync: () => void (saveSync ? saveSync.sync() : undefined),
       },
     );
-    view.attachCollab(session);
+    session = room;
+    view.attachCollab(room);
     mounted.collab = handle;
     show();
   }

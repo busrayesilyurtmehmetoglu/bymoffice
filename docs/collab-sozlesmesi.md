@@ -1,8 +1,8 @@
 # Birlikte düzenleme sözleşmesi
 
-Bu belge, bir çalışma kitabını (xlsx) birlikte düzenleyen tarayıcılar ile aralarındaki **aktarıcı** (relay) arasındaki iletileri tanımlar. Aktarıcıyı kendi arka ucunuzda yazacaksanız (Laravel Reverb, Pusher, bir Node süreci, başka bir şey) gereken her şey buradadır. Depodaki hazır örnek: `server/collab-server.mjs` (bağımlılıksız Node; **bellekte** çalışır, hiçbir şeyi diske yazmaz). Aynı kuralların sayfa içi sürümü: `BymOffice.collab.memoryServer()`.
+Bu belge, bir çalışma kitabını (xlsx) ya da bir belgeyi (docx) birlikte düzenleyen tarayıcılar ile aralarındaki **aktarıcı** (relay) arasındaki iletileri tanımlar. Aktarıcıyı kendi arka ucunuzda yazacaksanız (Laravel Reverb, Pusher, bir Node süreci, başka bir şey) gereken her şey buradadır. Depodaki hazır örnek: `server/collab-server.mjs` (bağımlılıksız Node; **bellekte** çalışır, hiçbir şeyi diske yazmaz). Aynı kuralların sayfa içi sürümü: `BymOffice.collab.memoryServer()`.
 
-Aşama 4a yalnız **tabloları** kapsar. Belgeler (docx) birlikte düzenlenmez.
+Aktarıcı **her iki tür için aynıdır** (biçimden habersizdir): oda, sıra, günlük, dönem adı, damga, `saved`, `sync`, `presence` kuralları tablolar ve belgeler için birdir. Türe göre değişen yalnız `op.ops`'un ve `presence.data`'nın **içeriğidir** (aktarıcı ikisine de bakmaz): tablolar için aşağıdaki "`ops`: bir adımın içeriği", belgeler için en sondaki "Belgeler (docx)" bölümü. Bir odada tek tür dosya düzenlenir (oda bir dosyanın sürümüne bağlıdır).
 
 ## Güvenlik: önce bunu okuyun
 
@@ -213,3 +213,99 @@ const transport = {
 ```
 
 Bu durumda "dört kural"ı uygulayan taraf sizin arka ucunuzdur: yayın kanalları sıra garantisi vermediği için `op` kabulünü (tek sayaç, `base === rev`) sunucuda yapın ve iletileri bağlantı başına **sırayla** teslim edin. İstemci sırası bozuk gelen (`rev` atlayan) adımı görürse günlüğü `since` ile yeniden ister.
+
+## Belgeler (docx)
+
+Aşama 4b. Bir belge odasında aktarıcı, oda kuralları, damga (`docProps/custom.xml` içinde `BymOfficeCollab = "<ep>:<rev>"`; aynı modül, aynı kayıpsızlık kuralları), `saved` / `sync` / kayıt kuralları tablolardakinin **aynısıdır**. Farklı olan adımın içeriği, yeniden temellendirme kuralları, geri alma ve varlık iletisidir. Kod: `src/collab/doc/` (`wire.ts` tel + doğrulama, `rebase.ts` dönüşüm, `session.ts` oturum, `trace.ts` + `history.ts` görünümün komutlarını adıma çeviren katman). Başvuru modelleri: `test/collab-doc-model.ts` ve ondan habersiz, bağımsız incelemede yazılmış ikincisi `test/collab-doc-model2.ts` (ikisi de dönüşüm kodunu ve belge komutlarını içe aktarmaz).
+
+**Kapsam dışı (oda kurulmaz, söylenir):** docx olmayan ya da burada dönüştürülmüş dosya; **değişiklik izleyen ya da izlenmiş değişiklik taşıyan belge** (`w:trackRevisions`, izlemeyi zorlayan koruma, `mount({ trackChanges: true })`, ya da izleme kapalıyken bile içinde `w:ins` / `w:del` / `w:rPrChange`… bulunan belge): izlenen bir değişiklik yazarını, tarihini ve kendi `w:id`'sini taşır; bölünen bir değişiklik yeni numarasını katılımcının kendi sayacından alır, iki katılımcıda aynı değişiklik olmaz. Koruması yalnız okumaya / yalnız yoruma izin veren belge odaya **izleyici** (`ro`) olarak katılır.
+
+### Konum
+
+Bir konum `[öykü, yol, ofset]` ya da `[öykü, yol, ofset, 1]` dizisidir. Öykü: `"body"`, `"header:<rId>"`, `"footer:<rId>"`, `"footnote:<id>"`, `"endnote:<id>"`. Yol paragrafın yoludur: gövdede `[blok]`, tablo hücresinde `[tablo, satır, hücre, blok]` (iç içe tablolarda uzar; en çok 96 sayı). Ofset, paragrafın görünen metnindeki UTF-16 birimidir (silinmiş metin ve alan kodları ofset almaz; görsel gibi genişliksiz öğeler iki ofset arasında durur). Dördüncü öğe `1`: konum o ofsetteki genişliksiz öğenin **önündedir**. Bütün konumlar **şimdiki** belgedir.
+
+### `ops`: bir adımın içeriği
+
+1–64 öğelik dizi. Her öğe, yazarının çalıştırdığı **komuttur**; her katılımcı aynı komutu kendi belgesinde çalıştırır (aktarıcı, komutun yazarının çalıştırdığı belgenin aynısına uygulanmasını sağlar).
+
+| `t` | Alanlar | Komut |
+|---|---|---|
+| `text` | `at`, `to?`, `x` (metin; `\n` paragraf sonu, sekme sekme, `\u000b` satır sonu), `f?` (karakter biçimi yaması) | Yazma / düz metin yapıştırma; `to` varsa aralığın yerine |
+| `del` | `at`, `to` | Aralığı sil (Backspace / Delete de, yalnız bir aralık sildiklerinde böyle gider) |
+| `split` | `at` | Enter |
+| `run` | `at`, `to`, `f` | Karakter biçimi (`bold`, `italic`, `underline`, `strike`, `font`, `size`, `color`, `highlight`, `vertAlign`, `style`) |
+| `unrun` | `at`, `to`, `k` (`bold` \| `italic` \| `underline` \| `strike`) | Aralığın **tamamında açık** olan özelliği kapat (artık tamamında açık değilse uygulanmaz) |
+| `para` | `at`, `to`, `f` | Paragraf biçimi (`align`, `indent`, `spacing`, `style`, `numbering`, `keepNext`…) |
+| `cmd` | `name`, `at`, `to?`, `a` | Adlı komut: `toggleList` `[tür]`, `indentList` `[±n]`, `insertPageBreak` `[]`, `insertTable` `[satır, sütun]`, `insertRow` `["above"\|"below"]`, `deleteRow` `[]`, `insertColumn` `["left"\|"right"]`, `deleteColumn` `[]`, `insertHyperlink` `[adres, ilişki kimliği?]`, `deleteBackward` / `deleteForward` `["char"\|"word"]` (tuşun aralık silmekten başka bir şey yaptığı durumlar: listeden çıkarma, girintiyi geri alma) |
+| `put` | `at` (ofseti 0), `n`, `x`, `h` | `at`'taki paragraftan başlayan `n` bloğun yerine `x`'teki düz paragrafları koy (geri almanın taşıdığı biçim; aşağıda). `h`: yerine konan blokların özeti (8 onaltılık hane); alıcıdaki bloklar bu özeti vermiyorsa adım uygulanmaz |
+
+Telde **taşınmayanlar** (yerelde yapılmaz, kullanıcıya söylenir): görsel ekleme / boyutlama, yorum ekleme / düzenleme / yanıtlama / çözme, izlenen değişikliği kabul / ret, izlemeyi açıp kapatma, zengin yapıştırma (görsel, alan, dipnot taşıyan parça — metni, biçimi ve tablosu düz yapıştırma yoluyla gider).
+
+Gelen adım **güvenilmezdir**: her alan türüne ve aralığına bakılarak yeni bir nesneye okunur (öykü adı kalıbı, yol uzunluğu, tamsayılar, metinde XML'de yer alamayan karakter yok, yamalar düz JSON ve derinlik / boyut sınırlı, komut adı listeden, bağımsız değişkenler komutun kendi denetiminden). Uygulanırken belge komutlarının kendi denetimlerinden geçer (konum var mı, stil belgede var mı, bağlantı adresi izinli şemada mı…). Okunamayan ya da belgenin kabul etmediği adım **bütünüyle** geri alınır ve **herkeste aynı biçimde atlanır**, bir kez söylenir. Bir adım en çok 900 KB'tır.
+
+**Bütçeler** (aşan adım okunurken ya da uygulanırken **herkeste aynı biçimde** reddedilir; başkasından geldiyse atlanır ve bir kez `bad-step` söylenir): adımda en çok 64 komut; bir `text` en çok 800.000 karakter ve 5.000 paragraf sonu; `insertTable` en çok 100 satır × 63 sütun; bir paragraf en çok 1.000.000, bir öykü (gövde, üstbilgi…) en çok 20.000.000 karakter; bir öyküde en çok 200.000 blok ve 100.000 tablo hücresi.
+
+**`put` paragrafı** `{ p?, m?, a?, r }`. Değerleri, biçim değiştiren komutların (`para`, `run`) okunduğu kuralla, **aynı işlevlerle** (`patchParaProps`, `patchRunProps`) okunur; bu kuralın almadığı hiçbir değer yazılamaz:
+- `p`: paragraf biçimi, `para` komutunun yaması gibi (`align`, `indent`, `spacing`, `style`, `numbering`, `keepNext`, `keepLines`, `pageBreakBefore`, `widowControl`, `contextualSpacing`, `outlineLevel`). Stil belgenin paragraf stili, liste belgenin listesi olmalıdır.
+- `m`: paragraf işaretinin biçimi, bir çalıştırma biçimi gibi (aşağıda). Karakter stili belgede olmalıdır.
+- `a`: öznitelikler; yalnız `w:rsid*`, `w14:paraId`, `w14:textId`, değerleri onaltılık. Ön ek parçada bildirilmiş olmalıdır.
+- `r` satır içi öğeleri:
+  - `{ p?, a?, c }` bir çalıştırma. `p` biçimdir: `f` `run` komutunun yaması gibi (stil belgenin karakter stili olmalı); `cs` karmaşık yazı ayrı durduğunda `{ bold?, italic?, size? }`, aynı kuralla; `fonts` dört yuvanın adları ve `hint` (`default`/`eastAsia`/`cs`); `lang` dil etiketleri. `c` metin parçalarıdır (`"metin"` ya da `["metin", "kaynak yazımı"]`) ve sayıyla öğeler (`0` sekme, `1` satır sonu, `2` sayfa sonu, `3` sütun sonu, `4` bölünmez tire, `5` yumuşak tire, `6` son çizilen sayfa sonu).
+  - `{ e }` yazım işareti; yalnız `spellStart`, `spellEnd`, `gramStart`, `gramEnd`.
+  - `{ b: [0|1, kimlik, ad?] }` yer imi başlangıcı / sonu.
+
+Değerler belgeyle birlikte denetlenir (gönderen ve alıcı aynı işlevle). Sayım, belgenin **kaydedilecek dosyada yazılacağı haliyle** yapılır: her blok docx yazıcının onu yazdığı (ya da değişmemiş bloğun özgün baytlarını kopyaladığı) XML'den, blokların çevresi (kök, son bölüm, saklanan öğeler, arka plan; not ve yorum parçalarının çevresi) yazıcının yazdığı haliyle, yazılmayacak (değişmemiş) parçalar özgün kaynaklarıyla okunur; herhangi bir öğedeki `w14:paraId`, `w:bookmarkStart` (kimlik, ad) ve `w:bookmarkEnd` (kimlik) sayılır. `mc:AlternateContent`'in iki dalı da okunur, aynı değer iki dalda geçiyorsa bir kez sayılır. Test denetleyicisi (`test/tools/package_check.py`, `named()`) kaydedilen dosyayı aynı tanımla okur. Okunamayan (XML olmayan, çok büyük, çok derin) belge "boş" sayılmaz: `put` reddedilir. Bir bloğun sayımı blok nesnesi yaşadıkça saklanır (bloklar değiştirilmez, yenisi yapılır). `put`'tan sonra her paragraf kimliği, yer imi başlangıcı ve sonu (kimlik **sayı olarak**: `09` ile `9` aynı kimliktir) ve yer imi adı (harf büyüklüğü gözetilmeden) belgede **en çok bir kez** geçer — ya da `put`'tan önce kaç kez geçiyorsa en çok o kadar (dosyanın kendi yinelemesi kalabilir, artamaz); `put`'un dokunduğu her yer iminin `put`'tan sonra belge sırasında önce tam bir başı, sonra tam bir sonu vardır (ya da öncekiyle aynı dizilişi). `put`'taki yer imi başlangıcının adı zorunludur, kimliği öne sıfırsız 0–2147483647'dir. rsid tam 8 onaltılık hane, `w14:paraId` / `w14:textId` tam 8 hane ve 80000000'ın altında olmalıdır; yerine konan blokların zaten taşıdığı değerler (öznitelik adı=değer) bu biçim kuralından muaftır. Bir adımda en çok 16 `put` bulunur ve bunların çıkardığı ile koyduğu toplam en çok 4.000 paragraftır (ayrık 17 paragrafa dokunan tek bir geri alma kaydı bu yüzden geri alınamaz); aşan adım geri almada `undo-none` olarak söylenir. Aynı anahtarla birleşmiş bir kaydın (IME bileşimi gibi) art arda aynı paragraflara dokunan `put`'ları geri alınırken tek `put`'ta birleşir.
+
+Yerine konacak bloklar da yalnız böyle düz paragraflar ya da yalnız onlardan oluşan tablolar olabilir. Bu biçimle anlatılamayan özellik taşıyan paragraf (kenarlık, gölgeleme, sekme durakları, `cnfStyle`, renkli alt çizgi…) yolculuk etmez: o paragrafı değiştiren adım birlikte düzenlenirken geri alınamaz (`undo-none`).
+
+### Yeniden temellendirme
+
+Bir blok listesi (gövde, bir üstbilgi, bir hücrenin içi) tek bir uzun metin olarak okunur: paragraf bir satırdır, paragraf sonu herhangi bir karakter gibidir. Yazma, silme, Enter ve iki paragrafı birleştirme o metnin ekleme ve silmeleridir. Her komut uygulandıktan sonra ne yaptığı **belgenin kendisinden okunur**: aralığın önündeki ve arkasındaki metin yerinde duruyor ve arası yalnız paragrafsa "şuraya şu kadar metin geldi / şu aralık gitti" denir; bu kesin görülemiyorsa "şu bloklar değişti", o da görülemiyorsa "bu öyküde bir şey değişti" denir.
+
+| Kural | |
+|---|---|
+| Aynı yere iki ekleme | İkisi de kalır; aktarıcının **sonra** sıraya koyduğu önde durur |
+| Silme × araya giren ekleme | Silme yalnız yazarının **gördüğü** metni siler; aralığın içine başkasının eklediği metin kalır (silme onun iki yanında iki aralık olur) |
+| Ekleme × araya giren silme | Silinen aralığın içine yazılan metin kalır, aralığın olduğu yerde |
+| İki silme | Örtüşen kısım bir kez silinir; hiçbir şey kalmayan silme **sessizce** biter (istenen zaten olmuş) |
+| Aralığın yerine yazma (`text` + `to`) | Aralıktan kalanı siler; metin aralığın başladığı yere, oraya başkasının eklediğinin **önüne** girer |
+| Karakter biçimi | Silme gibi: yazarının gördüğü metni kapsar. Aynı metne iki biçim: sonra gelen kazanır |
+| Paragraf biçimi, liste | Paragrafı (aralığın değdiği paragrafları) kapsar; imlecin iki yanındaki metin başkasınca **paragraf birleşerek** silindiyse **düşer** (kastedilen paragraf artık yok) |
+| Enter | Paragraf sonu eklemesidir |
+| Aynı tabloda yapı değişikliği (satır / sütun ekle-sil) × o tablonun içindeki her değişiklik | Sonra gelen **düşer** |
+| "Şu bloklar değişti" olarak bilinen her komut (tablo ekleme, bir tabloyu kesen silme, tuş olarak giden Backspace) × aynı bloklara değen değişiklik | Sonra gelen **düşer**; başka bloklardaki değişiklikler yalnız kayar |
+| "Bu öyküde bir şey değişti" × aynı öyküdeki her değişiklik | Sonra gelen **düşer** |
+
+**Kanıtlanmamış birleşim düşer**: düşen her adım kullanıcıya söylenir (`dropped`). **Düşen adımın ardında bekleyen adımlar da düşer** (düşenin üzerine yapılmışlardır; nereye gideceklerini kanıtlayamayız) ve sayıya katılıp söylenir. Tek ayrık: düşen adım hiçbir şeyi kaydırmamışsa (yalnız karakter biçimi), ardındakiler yerinde kalır.
+
+**Kısmen yapılamayan değişiklik söylenir** (`partial`): bekleyen bir silme, aralığın yerine yazma ya da karakter biçimi, kapsadığı metnin bir bölümü (ya da tamamı) başkasınca aynı anda silindiği için ancak kalanında yapılabildiyse (ya da hiç yapılamadıysa). Öbürü silmesini geri alırsa o metin bu değişiklik **olmadan** geri gelir: silme de, biçim de orada yapılmamıştır. Söylenmeden kaybolmaz.
+
+Başvuru modellerinin doğruladığı aile: `text`, `del`, `split`, aralığın yerine yazma, `run`, imleçteki `para`, geri al / yinele (2–5 katılımcı, uzun kuyruklar, kopan bağlantılar, rastgele teslim; birinci model her iletiden sonra her katılımcının gördüğü metni ve her söylenen `dropped` / `partial` sayısını, ikinci model her adımda yazarın kastettiğini — önce / sonra — yerleşen belgede arar). Öbür aileler (`cmd`, tablo içi) için sınanan: yakınsama, düşenin söylenmesi, dosyanın sağlamlığı.
+
+### Geri al / yinele
+
+Geri alma **sıradan bir adımdır**: katılımcı, kendi yığınındaki girdinin tersini **komut olarak** üretir ve gönderir; alan taraf geçmiş tutmaz, sonradan katılan da onu her adım gibi uygular. Ters iki biçimdedir:
+
+- Yalnız metin eklemiş bir adımın (yazma, Enter, yapıştırma) tersi `del`: eklenen aralığı sil.
+- Geri kalan her şeyin (silme, biçim, paragraf biçimi, birleştirme, satır sonu) tersi `put`: adımın değiştirdiği paragrafları, adımdan önceki halleriyle (çalıştırmalar, biçim, yer imleri) yerine koy. Herkes — gönderen de — aynı tel verisini uygular.
+
+Tersi komutla anlatılamayan adım (liste yapma / kaldırma, bağlantı, tablo yapısı, tablo ekleme sonrası yineleme, görsel / alan / dipnot taşıyan ya da `put` biçimiyle anlatılamayan paragraf) geri alınamaz ve söylenir (`undo-none`); altındaki adımlar, o adım hiçbir şeyi kaydırmadıysa geri alınabilir kalır.
+
+Geri alma ya da yineleme yoldayken gelen adım yığınlara **her yığının kendi koordinatıyla** okunur: geri almanın çıktığı yığın, geri almadan SONRAKİ belgeye göre; geri almanın oluşturduğu girdinin altındakiler (öbür yığın) ondan ÖNCEKİ belgeye göre.
+
+**Bağlantının ilişkisi** telde gider: `insertHyperlink` `[adres, ilişki kimliği]` (`rId` + 1–32 harf/rakam; yazarı rastgele seçer). Kimlik alıcının belgesinde varsa adım herkeste reddedilir. Kimliksiz gelirse komutun kendisinden türetilir. Böylece dosyadan sonradan katılan, bağlantıya herkesle aynı ilişkiyi verir; yazılan bir ilişki parçası ilişkilerini kimliklerine göre sıralar (hangi dosyadan açılmış olursa olsun aynı dosya).
+
+**İmleç**: başkasının `put` ile yerine koyduğu paragraflarda imleç düz metne göre eşlenir: eski ve yeni metnin ortak önekindeyse aynı ofset, ortak sonekindeyse sondan aynı uzaklık, arada ise değişen bölümün sonu.
+
+Yığın **LIFO**'dur. Girdi katılımcının kendi sonraki adımlarından geçirilmez (önce onlar geri alınır); **başkalarının** adımlarından geçirilir. Başkasının o arada değiştirdiği yer geri alınmaz: `put`'un paragraflarına başkası dokunduysa ya da `del`'in aralığına başkası yazdıysa girdi düşer ve söylenir (`undo-gone`); düşen girdi bir şeyi kaydırmışsa altındakiler de gider (onlar onsuz bir belgeye göre saklanmıştı). Yoldaki geri alma düşerse (`undo-gone`) aynı kural uygulanır. Katılımcının adımı yoldayken istenen geri alma, adımlar yerleşene dek bekler (`undo-wait`). Ardışık yazılan harfler (aynı paragrafta, bir öncekinin bittiği yerde) aktarıcı yanıt vermeden önce **tek adımda** birleşir: bekleyen adım sayısı yazma hızıyla büyümez.
+
+- Değişmez (`test/collab-doc-alone.test.ts`): odada başkası bir şey yapmıyorken (geç yanıt veren aktarıcı, yanında okuyan biri, araya karışan yazma / geri al / yinele dahil) her işlem / geri al / yinele dizisi `collab`'sız düzenleyicinin bıraktığı belgeyi blok blok bırakır ve hiçbir şey söylenmez — `undo-none` olanlar dışında (yukarıdaki aile; testin üreteci onları üretmez). Yazılan dosya **belge olarak** aynıdır; geri almanın koyduğu paragraflar modelden yazıldığından bayt bayt aynı olmayabilir.
+- Oda yeniden yükleme döngüsüne giremez: art arda yüklemeler arasında hiçbir adım işlenmediyse sayılır, altıncıdan sonra `stale` söylenir ve oturum `detached` olur (düzenlenen kalır).
+
+### `presence.data` (belge)
+
+`{ "st": öykü, "a": [yol, ofset], "f": [yol, ofset] }` (seçimin iki ucu; imleçte aynı yer) ya da `null`. Alan öbürlerinin sayfasında imleç çizgisi + ad etiketi ve seçim boyası olarak gösterilir; araya giren değişikliklerle birlikte kayar.
+
+### Dosya ve kayıt
+
+Kayıt kuralları tablolardakiyle aynıdır (tek kaydedici, nöbet, kanıt). Kanıt, iki katılımcının aynı adımda **aynı dosyayı** yazmasına dayanır: aynı dosyadan başlayıp aynı adımları tutan iki katılımcı parça parça (ve ölçülen koşularda bayt bayt) aynı docx'i yazar. Odaya **kaydedilmiş dosyadan** katılan katılımcının yazdığı dosya çoğu zaman aynıdır ama garanti değildir (dosyadan okunan belge ile düzenlenerek oluşan belge blok blok aynı nesneler değildir); tutmadığında o katılımcı işini nöbetle kendi kaydeder.

@@ -806,14 +806,53 @@ test('a file that the room never takes is not loaded again for ever', async () =
     { workbook: () => wb, changed: () => undefined, notice: (notice) => notices.push(notice.code), reload: async () => (loads++, ['h:1:x']) },
     { transport: { send: () => undefined, onMessage: (given) => (listener = given), close: () => undefined }, versions: ['h:1:x'], timer: (callback) => (timers.push(callback), () => undefined) },
   );
-  for (let i = 0; i < 20 && session.state !== 'closed'; i++) {
+  for (let i = 0; i < 20 && session.state !== 'detached'; i++) {
     listener(JSON.stringify({ t: 'reset', rev: 4, v: ['other'] }));
     for (const run of timers.splice(0)) run();
     for (let k = 0; k < 5; k++) await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(session.state, 'closed', 'the session gives up');
+  assert.equal(session.state, 'detached', 'the session gives up, and what is edited stays');
   assert.equal(loads, 6, 'after six tries');
-  assert.deepEqual(notices, ['waiting', 'stale'], 'having said that it waits, and then that it is over');
+  assert.deepEqual(notices, ['waiting', 'stale', 'detached'], 'having said that it waits, and then that it is over');
+});
+
+test('a room that takes the file and sends it away again, time after time, is not joined for ever', async () => {
+  const timers: (() => void)[] = [];
+  const wb = await (await (await import('../src/index')).open(await startFile())).workbook();
+  let listener: (text: string) => void = () => undefined;
+  let loads = 0;
+  const notices: string[] = [];
+  const { CollabSession } = await import('../src/collab/session');
+  const session = new CollabSession(
+    { workbook: () => wb, changed: () => undefined, notice: (notice) => notices.push(notice.code), reload: async () => (loads++, ['h:1:x']) },
+    { transport: { send: () => undefined, onMessage: (given) => (listener = given), close: () => undefined }, versions: ['h:1:x'], timer: (callback) => (timers.push(callback), () => undefined) },
+  );
+  const settle = async (): Promise<void> => {
+    for (const run of timers.splice(0)) run();
+    for (let k = 0; k < 5; k++) await new Promise((resolve) => setImmediate(resolve));
+  };
+  for (let i = 0; i < 20 && session.state !== 'closed' && session.state !== 'detached'; i++) {
+    // The room says welcome, and then that it is at another file: nothing was done in between.
+    listener(JSON.stringify({ t: 'hello', rev: 0, from: 0, ep: `room${i}`, you: 'me', ro: false, v: [], peers: [] }));
+    listener(JSON.stringify({ t: 'reset', rev: 4, v: ['other'] }));
+    await settle();
+  }
+  assert.equal(session.state, 'detached', 'what is edited is kept, apart from the room');
+  assert.equal(loads, 6, 'after six tries');
+  assert.deepEqual(notices, ['waiting', 'stale', 'detached']);
+  // A step that arrives is progress: the count starts again.
+  const again = new CollabSession(
+    { workbook: () => wb, changed: () => undefined, notice: () => undefined, unsaved: () => false, reload: async () => (loads++, ['h:1:x']) },
+    { transport: { send: () => undefined, onMessage: (given) => (listener = given), close: () => undefined }, versions: ['h:1:x'], timer: (callback) => (timers.push(callback), () => undefined) },
+  );
+  for (let i = 0; i < 9; i++) {
+    listener(JSON.stringify({ t: 'hello', rev: 0, from: 0, ep: `again${i}`, you: 'me', ro: false, v: [], peers: [] }));
+    listener(JSON.stringify({ t: 'op', rev: 1, id: 'q:1', from: 'q', ops: [{ t: 'cells', s: 0, c: [[41, 0, { v: { k: 'number', v: i } }]] }] }));
+    listener(JSON.stringify({ t: 'reset', rev: 4, v: ['other'] }));
+    await settle();
+  }
+  assert.notEqual(again.state, 'closed');
+  assert.notEqual(again.state, 'detached', 'a room in which steps arrive is joined again as often as it takes');
 });
 
 test('"saved" is no news of a clean workbook for who has a step waiting', async () => {

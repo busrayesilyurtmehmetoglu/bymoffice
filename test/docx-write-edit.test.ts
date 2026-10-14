@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readDocx } from '../src/formats/docx/document';
-import { emptyWriteReport, writeDocx } from '../src/formats/docx/write';
+import { compareIds, emptyWriteReport, writeDocx } from '../src/formats/docx/write';
 import type { Block, DocModel, Paragraph } from '../src/model/doc/types';
 import { OpcPackage } from '../src/opc';
 import { ZipArchive } from '../src/zip';
@@ -206,11 +206,12 @@ test('a relationship the model has and the part lacks is added; none is removed'
   doc.body.modified = true;
   await writeDocx(pkg, doc);
   const rels = await pkg.relationships('/word/document.xml');
+  // (A part that is written anew lists its relationships by id: see writeDocx.)
   assert.deepEqual(
     rels.map((rel) => rel.id),
-    ['rIdL1', 'rIdUnused', 'rIdNew'],
+    ['rIdL1', 'rIdNew', 'rIdUnused'],
   );
-  assert.deepEqual(rels[2], { id: 'rIdNew', type, target: 'https://example.com/a?b=1&c="2"', external: true, part: null });
+  assert.deepEqual(rels[1], { id: 'rIdNew', type, target: 'https://example.com/a?b=1&c="2"', external: true, part: null });
   const again = await readDocx(await OpcPackage.open(await pkg.save()));
   const added = again.body.blocks[1];
   assert.ok(added.type === 'paragraph' && added.children[0].wrap && added.children[0].wrap.kind === 'hyperlink');
@@ -443,3 +444,26 @@ test('a model that was not read from a package cannot be written into one', asyn
   // Nothing was put into the package.
   assert.equal(encoder.encode(await text(pkg, '/word/document.xml')).length > 0, true);
 });
+
+test('the ids of relationships are put in one order, whatever order they come in', () => {
+  const sets = [
+    ['rId1000000000000000', 'rId9', 'rId10'],
+    ['rId01', 'rId1', 'rId001', 'rId2'],
+    ['rId99999999999999999999', 'rId100000000000000000000', 'rIdA', 'rId', 'rIdS1', 'rIdS01', 'rId0'],
+  ];
+  let seed = 7;
+  const random = (): number => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  for (let i = 0; i < 40; i++) {
+    const set = new Set<string>();
+    while (set.size < 6) set.add('rId' + ['', 'S', 'C'][Math.floor(random() * 3)] + '0'.repeat(Math.floor(random() * 3)) + String(Math.floor(random() * 10 ** Math.floor(random() * 22))));
+    sets.push(Array.from(set));
+  }
+  const permutations = (list: string[]): string[][] => (list.length <= 1 ? [list] : list.reduce((all: string[][], item, i) => all.concat(permutations(list.slice(0, i).concat(list.slice(i + 1))).map((rest) => [item].concat(rest))), []));
+  for (const set of sets) {
+    const orders = new Set<string>();
+    for (const order of permutations(set.slice(0, 6))) orders.add(order.slice().sort(compareIds).join(' '));
+    assert.equal(orders.size, 1, `${set.join(' ')}: ${Array.from(orders).join(' | ')}`);
+  }
+  assert.deepEqual(['rId10', 'rId9', 'rId1000000000000000000'].sort(compareIds), ['rId9', 'rId10', 'rId1000000000000000000']);
+});
+

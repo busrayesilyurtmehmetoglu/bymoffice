@@ -490,7 +490,7 @@ Dosyayı üst sayfa kendisi getirir ve `data` ile verir; iframe içinde `url` ka
 
 ## Birlikte düzenleme: `load.collab` ve `collabState`
 
-`load` iletisi `collab` alanı taşıyabilir: bir aktarıcının adresi (`"wss://…"`) ya da `{ "url": "wss://…", "room"?: "…", "user"?: { "name"?: "…", "color"?: "#RRGGBB" }, "token"?: "…" }`. Çalışma kitabı (dönüştürülmemiş xlsx) o odaya katılır; kurallar ve kapsam kılavuzdaki "Birlikte düzenleme" bölümüyle ve [`collab-sozlesmesi.md`](collab-sozlesmesi.md) ile aynıdır. Adres `ws://` ya da `wss://` değilse `load` `bad-message` ile reddedilir. Özel taşıyıcı köprüde yoktur (gömen yerel kod `BridgeHost.createTransport(url)` verebilir).
+`load` iletisi `collab` alanı taşıyabilir: bir aktarıcının adresi (`"wss://…"`) ya da `{ "url": "wss://…", "room"?: "…", "user"?: { "name"?: "…", "color"?: "#RRGGBB" }, "token"?: "…" }`. Çalışma kitabı (dönüştürülmemiş xlsx) ya da belge (dönüştürülmemiş, değişiklik izlemeyen docx) o odaya katılır; kurallar ve kapsam kılavuzdaki "Birlikte düzenleme" bölümüyle ve [`collab-sozlesmesi.md`](collab-sozlesmesi.md) ile aynıdır. Adres `ws://` ya da `wss://` değilse `load` `bad-message` ile reddedilir. Özel taşıyıcı köprüde yoktur (gömen yerel kod `BridgeHost.createTransport(url)` verebilir).
 
 Sayfa, oturumun durumu ya da öbür katılımcıların listesi her değiştiğinde şunu gönderir:
 
@@ -499,7 +499,7 @@ Sayfa, oturumun durumu ya da öbür katılımcıların listesi her değiştiğin
   "peers": [{ "id": "c3", "name": "Ayşe", "color": "#D93025", "readOnly": false }] }
 ```
 
-- `state`: `connecting`, `online`, `offline` (bağlantı yok; düzenleme sürer, değişiklikler birikir), `closed` (oturum bitti). Belge, xls ya da dönüştürülmüş dosyada `collab` verilirse dosya yine açılır ve bir kez `{ "type": "collabState", "state": "closed", "reason": "unsupported", … }` gönderilir.
+- `state`: `connecting`, `online`, `offline` (bağlantı yok; düzenleme sürer, değişiklikler birikir), `closed` (oturum bitti). xls, doc, RTF, dönüştürülmüş dosya ya da **değişiklik izleyen belge** (`trackChanges: true` verilmiş ya da belge kendisi istiyor) için `collab` verilirse dosya yine açılır ve bir kez `{ "type": "collabState", "state": "closed", "reason": "unsupported", … }` gönderilir. Belgede `people` öğelerinde `sheet` alanı yoktur; başkasından gelen değişiklikte uygulama olağan `changed` iletisini (`sheets: []`) alır ve `saveState.dirty` `true` olur. Birlikte düzenlenen belgede yorum, izleme ve görsel komutları (`addComment`, `setTrackChanges`, `acceptAllRevisions`…) hiçbir şey değiştirmez (sayfa bildirimle söyler); kapsam kılavuzdaki "Belgeleri birlikte düzenleme" bölümündedir.
 - `peers[].name` öbür katılımcının verdiği **metindir** (`null`: ad vermemiş); uygulama onu metin olarak göstermelidir.
 - `changed` iletisindeki `canUndo` / `canRedo`, birlikte düzenlenen kitapta **katılımcının kendi** adımlarını söyler.
 - `state` ayrıca `detached` olabilir: oda başka bir sürümde ve bu kitapta kaydedilmemiş değişiklik var; kitap yerinde kalır, uygulama dosyayı kaydetmeli ve güncelini yeniden `load` etmelidir (köprü dosyayı kendisi yeniden yükleyemez).

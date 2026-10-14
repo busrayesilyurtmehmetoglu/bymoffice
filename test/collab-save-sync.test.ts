@@ -242,7 +242,7 @@ test('when the room asks for a save, the one who leads saves, as a save nobody a
  * server that takes a save only when it is conditional on what the file is known by. A workbook is
  * the list of what was typed, in the order of the room; its file is that list as bytes, with the step.
  */
-function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => void; put?: (name: string, texts: string[]) => void; latency?: () => number } = {}) {
+function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => void; put?: (name: string, texts: string[]) => void; latency?: () => number; /** Sides whose own file is never byte for byte the one the others write (a document whose model and file differ in a detail). */ apart?: number[] } = {}) {
   const encoder = new TextEncoder();
   const fileOf = (book: string[], rev: number): Uint8Array => encoder.encode(JSON.stringify({ rev, book }));
   const server = { etag: '"v1"', n: 1, body: fileOf([], 0), puts: [] as { by: string; match: string | undefined; status: number }[], gets: [] as string[], asked: [] as (string | undefined)[] };
@@ -338,7 +338,7 @@ function room(count = 2, options: { auto?: boolean[]; clean?: (name: string) => 
       timer,
       now: () => clock,
       random: () => ((index * 7919 + 13) % 97) / 97,
-      ownBytes: async () => ({ bytes: fileOf(book, session.rev), rev: session.pending === 0 ? session.rev : undefined }),
+      ownBytes: async () => ({ bytes: options.apart && options.apart.indexOf(index) >= 0 ? encoder.encode(JSON.stringify({ rev: session.rev, book, apart: true })) : fileOf(book, session.rev), rev: session.pending === 0 ? session.rev : undefined }),
     });
     const fire = (): boolean => {
       const due = timers.filter((entry) => entry.at <= clock);
@@ -516,6 +516,18 @@ test('auto-save in a room never stops without a word: when the saver does not sa
   assert.deepEqual([away.server.puts.length, away.sides[0].controller.state.autoWaits, away.sides[0].controller.dirty], [0, 'offline', true], 'offline: not saved by itself, however long; said; and still to be saved');
   assert.equal(away.sides[0].states.indexOf('offline') >= 0, true, 'whoever listens to the state was told');
   assert.equal(await away.sides[0].controller.saveNow(), true, 'Save saves');
+});
+
+test('a participant whose own file is never the very file the others write (a content control that lost its id one way here and another there): it saves its work itself, once, and nothing is left to save; no save goes round', async () => {
+  const r = room(2, { auto: [true, true], apart: [1] });
+  r.edit(1, 'typed by b');
+  await r.pass(60000);
+  assert.deepEqual(r.stored(), ['typed by b'], 'the work is in the file');
+  const puts = r.server.puts.length;
+  assert.ok(puts >= 1 && puts <= 2, `saved, by the saver and at most once by itself: ${puts}`);
+  assert.deepEqual(r.sides.map((side) => [side.controller.dirty, side.controller.state.autoWaits, side.errors, side.asked]), [[false, undefined, [], []], [false, undefined, [], []]], 'nobody has anything left to save, waits, or was told of a conflict');
+  await r.pass(600000);
+  assert.equal(r.server.puts.length, puts, 'and nothing is saved again while nothing changes');
 });
 
 const RUNS = Math.max(1, Math.min(Number(process.env.COLLAB_SEEDS) || 150, 100000));

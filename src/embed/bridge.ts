@@ -23,7 +23,9 @@ import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
 import { readCollabStamp, writeSharedFile, type CollabStamp } from '../formats/xlsx/collab-stamp';
 import { listPeople } from '../collab/people';
 import { packageTurn } from '../package-turn';
-import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabTransport, type CollabUser } from '../collab/index';
+import { CollabSession, contentVersion, isSocketUrl, socketTransport, type CollabNotice, type CollabTransport, type CollabUser } from '../collab/index';
+import { DocCollabSession, type DocChange, type DocPeer } from '../collab/doc/session';
+import { holdsRevisions } from '../collab/doc/history';
 import { SaveController, SaveError, resolveAutoSave, type AutoSaveSettings, type ConflictQuestion, type SaveInfo } from './save-to';
 
 export type BridgeErrorCode =
@@ -122,6 +124,12 @@ export interface BridgeDocumentView {
   showNotice?(message: string, kind?: 'error' | 'info'): void;
   /** Whether an input method composes or something is dragged: auto-save waits meanwhile. */
   hasPendingInput?(): boolean;
+  /** A document that is edited together: the view is tied to its session, and told what the session says (see DocumentView). */
+  attachCollab?(session: DocCollabSession | undefined): void;
+  collabChanged?(change: DocChange): void;
+  collabNotice?(notice: CollabNotice): void;
+  collabPeersChanged?(peers: DocPeer[]): void;
+  readonly collabStrings?: { guest(n: number): string };
 }
 
 /** A comment as a document view lists it; the bridge passes on the fields the contract names. */
@@ -709,8 +717,8 @@ interface Shown {
   commentsOnly?: boolean;
   /** A `load` with `save`: what the Save button and Ctrl+S of the page run. */
   saver?: SaveController;
-  /** A `load` with `collab`: the session the workbook is edited together in. */
-  collab?: CollabSession;
+  /** A `load` with `collab`: the session the workbook or the document is edited together in. */
+  collab?: CollabSession | DocCollabSession;
   /** The file that was written last while it is edited together, and the step it holds (undefined: of no one step). */
   written?: { bytes: Uint8Array; rev: number | undefined };
   /** The language the file was loaded with or `setLocale` chose: what a save is spoken of in. */
@@ -1305,6 +1313,8 @@ export function createBridge(host: BridgeHost): Bridge {
       }
       if (file.kind === 'document') {
         doc = await (file.document as NonNullable<OfficeFile['document']>)();
+        // What the file says of the room it was saved in, for a document that is to be edited together.
+        if (collab && file.package) stamp = await readCollabStamp(file.package);
       } else {
         workbook = await file.workbook();
         // What the file says of the room it was saved in, for a workbook that is to be edited together.
@@ -1427,8 +1437,9 @@ export function createBridge(host: BridgeHost): Bridge {
       setLocale(locale);
       setState('open');
       loaded(0, [], true);
-      // A document is not edited together yet: it is shown as without the field, and the application is told.
-      if (collab) send({ type: 'collabState', state: 'closed', reason: 'unsupported', rev: 0, pending: 0, peers: [] });
+      // Only a docx as it was loaded is edited together, and not one that tracks its changes (a tracked change is
+      // not the same change for two participants): any other is shown as without the field, and the application is told.
+      if (collab) joinDocCollab(shown, pages, doc as DocModel, collab, file.format !== 'docx' || convertedFrom !== undefined || trackChanges === true || holdsRevisions(doc as DocModel) ? undefined : bytes, locked || readOnly === true, stamp);
       return;
     }
     if (!workbook) return;
@@ -1588,6 +1599,84 @@ export function createBridge(host: BridgeHost): Bridge {
     );
     current.collab = session;
     view.attachCollab(session);
+    tell();
+  };
+
+  /**
+   * The same for a document (a docx): the session of a document, and the view of one. `bytes`
+   * is undefined for a document that cannot be edited together (not a docx, converted here,
+   * or one whose changes are tracked).
+   */
+  const joinDocCollab = (current: Shown, pages: BridgeDocumentView, doc: DocModel, plan: { url: string; room?: string; token?: string; user?: CollabUser }, bytes: Uint8Array | undefined, readOnly: boolean, stamp?: CollabStamp): void => {
+    const none = (): void => send({ type: 'collabState', state: 'closed', reason: 'unsupported', rev: 0, pending: 0, peers: [] });
+    if (!bytes || !pages.attachCollab || !pages.collabChanged) return none();
+    let session: DocCollabSession | undefined;
+    const bare = (peer: DocPeer): { id: string; name?: string; color: string; guest: number; readOnly: boolean } => (peer.name === undefined ? { id: peer.id, color: peer.color, guest: peer.guest, readOnly: peer.readOnly } : { id: peer.id, name: peer.name, color: peer.color, guest: peer.guest, readOnly: peer.readOnly });
+    const tell = (): void => {
+      if (!session || shown !== current) return;
+      send({
+        type: 'collabState',
+        state: session.state,
+        rev: session.rev,
+        pending: session.pending,
+        // Names are whatever the others said: text, to be shown as text.
+        peers: session.peers.map((peer) => ({ id: peer.id, name: peer.name === undefined ? null : peer.name, color: peer.color, readOnly: peer.readOnly })),
+        people: listPeople(bare(session.user), session.peers.map(bare), session.state, pages.collabStrings ? pages.collabStrings.guest : (n: number) => `Guest ${n}`).list.map((who) => ({ id: who.id, name: who.name, color: who.color, self: who.self, readOnly: who.readOnly })),
+      });
+    };
+    let transport: CollabTransport;
+    try {
+      transport = host.createTransport ? host.createTransport(plan.url) : socketTransport(plan.url);
+    } catch (error) {
+      return none();
+    }
+    session = new DocCollabSession(
+      {
+        document: () => doc,
+        changed: (change) => {
+          if (shown !== current) return;
+          if (pages.collabChanged) pages.collabChanged(change);
+          // What someone else changed: the application hears that the document changed, and that there is something to save.
+          if (change.local) return;
+          if (current.saver) current.saver.changed(true);
+          tellComments(current);
+          send({ type: 'changed', sheets: [], canUndo: pages.canUndo === true, canRedo: pages.canRedo === true });
+        },
+        notice: (said) => {
+          if (shown === current && pages.collabNotice) pages.collabNotice(said);
+        },
+        // With a save of the page: what the application has not stored. Without one the page cannot know, and nothing is taken to be saved.
+        unsaved: current.saver ? () => (current.saver as SaveController).dirty : undefined,
+      },
+      {
+        transport,
+        versions: [contentVersion(bytes)],
+        // What the file says of the room and the step it was saved at: it joins there, whatever anybody says of it.
+        stamp,
+        user: plan.user,
+        room: plan.room,
+        token: plan.token,
+        readOnly,
+        onState: tell,
+        // What someone else says was saved is passed on as it was said: whether it is so is the application's to find out.
+        onSaved: (saved) => {
+          if (shown !== current) return;
+          let etag: string | null = null;
+          for (const version of saved.versions) if (version.slice(0, 2) === 'e:') etag = version.slice(2);
+          send({ type: 'collabSaved', etag, rev: saved.rev === undefined ? null : saved.rev, versions: saved.versions });
+        },
+        onReadOnly: () => {
+          if (shown === current && pages.setReadOnly) pages.setReadOnly(true);
+        },
+        onPeers: (peers) => {
+          if (shown !== current) return;
+          if (pages.collabPeersChanged) pages.collabPeersChanged(peers);
+          tell();
+        },
+      },
+    );
+    current.collab = session;
+    pages.attachCollab(session);
     tell();
   };
 

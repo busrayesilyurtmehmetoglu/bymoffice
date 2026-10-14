@@ -669,7 +669,7 @@ function cutsControl(wrap: Wrapper | undefined): boolean {
  * a second copy of those would be a second picture, a second reference,
  * half a field, a second field or control.
  */
-export function insertHyperlink(doc: DocModel, range: DocRange, address: string, _options?: DocEditOptions): DocEdit {
+export function insertHyperlink(doc: DocModel, range: DocRange, address: string, _options?: DocEditOptions & { relationshipId?: string }): DocEdit {
   let plain = typeof address === 'string' && address.length <= 2083;
   // Control characters have no place in an address; a browser would drop some of them and read another address.
   for (let i = 0; plain && i < address.length; i++) if (address.charCodeAt(i) < 0x20) plain = false;
@@ -688,7 +688,10 @@ export function insertHyperlink(doc: DocModel, range: DocRange, address: string,
     if (target.charAt(0) === '#') link = { kind: 'hyperlink', anchor: target.slice(1) };
     else {
       const host = storyOf(doc, story).host;
-      const id = freeRelId(host.relationships);
+      // An id that is given (a document that is edited together: everybody makes the same) has to be a free one.
+      const given = _options ? _options.relationshipId : undefined;
+      if (given !== undefined && (typeof given !== 'string' || !/^rId[A-Za-z0-9]{1,32}$/.test(given) || /[0-9]{10}/.test(given) || host.relationships.has(given))) bad('The relationship id of the hyperlink is not valid or not free');
+      const id = given !== undefined ? given : freeRelId(host.relationships);
       draft.apply({ type: 'setRelationship', story, id, relationship: { id, type: (doc.strict ? REL_BASE_STRICT : REL_BASE) + '/hyperlink', target, external: true, part: null } });
       link = { kind: 'hyperlink', rId: id, target };
     }

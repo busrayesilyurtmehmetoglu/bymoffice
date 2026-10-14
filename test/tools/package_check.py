@@ -284,6 +284,46 @@ def book(z, main, trees, ids_of, refs, lower, say):
                         say('%s names author %s of %d' % (target, comment.get('authorId'), authors))
 
 
+NAMES = []
+
+
+def bookmark_key(value):
+    """An id of a bookmark as the number it is ("09" is 9); one that is no number as it is."""
+    return value.lstrip('0') or '0' if value is not None and value.isdigit() else value
+
+
+def named(tree):
+    """What names itself in a story, in document order: paragraphs by their id (and the ids of their text), bookmarks
+    (their starts with their names, their ends), rsids. One walker, the one the engine has too (walkNamed): every
+    element, also between blocks and rows and in text boxes; of an mc:AlternateContent both branches, what they
+    name once (the branches stand for each other)."""
+    stack = [tree]
+    while stack:
+        el = stack.pop()
+        tag = local(el.tag)
+        if tag == 'AlternateContent' and el is not tree:
+            seen = set()
+            for thing in named(el):
+                key = (thing[0], thing[1] if thing[0] != 'start' and thing[0] != 'end' else bookmark_key(thing[1])) + tuple(thing[2:])
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield thing
+            continue
+        if attr(el, 'paraId') is not None:
+            yield ('para', attr(el, 'paraId'))
+        if tag == 'p' and attr(el, 'textId') is not None:
+            yield ('text', attr(el, 'textId'))
+        if tag == 'bookmarkStart':
+            yield ('start', attr(el, 'id'), attr(el, 'name'))
+        elif tag == 'bookmarkEnd':
+            yield ('end', attr(el, 'id'))
+        for key, value in el.attrib.items():
+            if local(key).startswith('rsid'):
+                yield ('rsid', local(key), value)
+        stack.extend(reversed(list(el)))
+
+
 def document(z, main, trees, ids_of, refs, lower, say):
     doc = trees.get(main)
     if doc is None:
@@ -382,17 +422,77 @@ def document(z, main, trees, ids_of, refs, lower, say):
     twice = [wid for wid, count in marks.items() if count > 1 and wid is not None]
     if twice:
         say('tracked changes share the ids ' + ', '.join(sorted(twice)[:5]))
+    # What names itself, from the one walker (named): an id of a bookmark starts once and ends once, a name is one
+    # bookmark's (whatever its case), a start has an end; a paragraph id is one paragraph's, eight hex digits below
+    # 80000000 (and so is the id of its text); an rsid is eight hex digits.
+    starts, ends, names, seen = {}, {}, {}, {}
+    found = []
+    order = []
+    for part, tree in stories:
+        for thing in named(tree):
+            found.append(thing)
+            kind = thing[0]
+            if kind == 'start':
+                key = bookmark_key(thing[1])
+                starts[key] = starts.get(key, 0) + 1
+                order.append(('s', key))
+                if thing[2] is None:
+                    say('%s: a bookmark starts without a name (%s)' % (part, thing[1]))
+                else:
+                    names[thing[2].lower()] = names.get(thing[2].lower(), 0) + 1
+            elif kind == 'end':
+                key = bookmark_key(thing[1])
+                ends[key] = ends.get(key, 0) + 1
+                order.append(('e', key))
+            elif kind == 'para':
+                if not re.match(r'^[0-9A-Fa-f]{8}$', thing[1]) or int(thing[1], 16) >= 0x80000000:
+                    say('%s: a paragraph id that is not eight hex digits below 80000000: %s' % (part, thing[1]))
+                else:
+                    seen[thing[1].upper()] = seen.get(thing[1].upper(), 0) + 1
+            elif kind == 'text':
+                if not re.match(r'^[0-9A-Fa-f]{8}$', thing[1]) or int(thing[1], 16) >= 0x80000000:
+                    say('%s: a text id that is not eight hex digits below 80000000: %s' % (part, thing[1]))
+            elif kind == 'rsid':
+                if not re.match(r'^[0-9A-Fa-f]{8}$', thing[2]):
+                    say('%s: an rsid that is not eight hex digits: %s="%s"' % (part, thing[1], thing[2]))
+    NAMES.append(found)
+    for bid, count in sorted(starts.items(), key=lambda pair: str(pair[0])):
+        if count > 1:
+            say('two bookmarks start with the id %s' % bid)
+        if bid not in ends:
+            say('the bookmark %s starts and never ends' % bid)
+    for bid, count in sorted(ends.items(), key=lambda pair: str(pair[0])):
+        if count > 1:
+            say('two bookmarks end with the id %s' % bid)
+        if bid not in starts:
+            say('the bookmark %s ends and never started' % bid)
+    for name, count in sorted(names.items()):
+        if count > 1:
+            say('two bookmarks have the name %s' % name)
+    first = {}
+    for kind, key in order:
+        first.setdefault((kind, key), len(first))
+    for (kind, key), place in first.items():
+        if kind == 'e' and ('s', key) in first and first[('s', key)] > place:
+            say('the bookmark %s ends before it starts' % key)
+    for value, count in sorted(seen.items()):
+        if count > 1:
+            say('two paragraphs have the paragraph id %s' % value)
 
 
 def main():
     bad = []
     folder = sys.argv[1]
+    names = {}
     for f in sorted(os.listdir(folder)):
+        before = len(NAMES)
         try:
             check(os.path.join(folder, f), bad)
         except Exception as error:
             bad.append(f + ': ' + str(error))
-    print(json.dumps(bad))
+        names[f] = [list(thing) for found in NAMES[before:] for thing in found if thing[0] in ('para', 'start', 'end')]
+    # With --names: what names itself in each file, as the walker found it (for the test that compares it with the engine's).
+    print(json.dumps(names if '--names' in sys.argv[2:] else bad))
 
 
 main()

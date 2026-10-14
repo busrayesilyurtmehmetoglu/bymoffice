@@ -391,6 +391,48 @@ class RelsEdit {
   freeId(): string {
     return freeId((id) => this.ids.has(id));
   }
+
+  /** Puts the relationships in the order of their ids (digits by their value); whatever else the part holds stays where it is. */
+  sortById(): void {
+    const children = this.doc.root.children;
+    const places: number[] = [];
+    const rels: XmlElement[] = [];
+    children.forEach((node, i) => {
+      if (node.type === 'element' && node.name.replace(/^.*:/, '') === 'Relationship') {
+        places.push(i);
+        rels.push(node);
+      }
+    });
+    const sorted = rels.slice().sort((a, b) => compareIds(a.attrs.get('Id') || '', b.attrs.get('Id') || ''));
+    places.forEach((place, i) => (children[place] = sorted[i]));
+  }
+}
+
+/**
+ * Ids in their natural order, a total one: runs of digits by their value (leading zeros dropped,
+ * then the shorter run first, then digit by digit), everything else by its code units; ids that
+ * are the same so far (rId1 and rId01) by how they are written.
+ */
+export function compareIds(a: string, b: string): number {
+  const split = (id: string): string[] => id.match(/\d+|\D+/g) || [];
+  const left = split(a);
+  const right = split(b);
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    const x = left[i];
+    const y = right[i];
+    const xDigits = /^\d/.test(x);
+    const yDigits = /^\d/.test(y);
+    if (xDigits && yDigits) {
+      const p = x.replace(/^0+/, '');
+      const q = y.replace(/^0+/, '');
+      if (p.length !== q.length) return p.length - q.length;
+      if (p !== q) return p < q ? -1 : 1;
+      continue;
+    }
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  if (left.length !== right.length) return left.length - right.length;
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /**
@@ -847,7 +889,13 @@ function produceDocx(pkg: OpcPackage, doc: DocModel, options: WriteDocxOptions, 
   }
 
   for (const [part, edit] of relsEdits) {
-    if (edit.changed) writes.set(relsPartOf(part), { data: new TextEncoder().encode(serializeXml(edit.doc)), contentType: RELS_TYPE });
+    if (edit.changed) {
+      // A relationships part that is written anew lists its relationships by id: a file written from the same model
+      // is the same file whichever file it was opened from (one opened from a file saved on the way holds the
+      // relationships added before that save in another order than one that holds them from the start).
+      edit.sortById();
+      writes.set(relsPartOf(part), { data: new TextEncoder().encode(serializeXml(edit.doc)), contentType: RELS_TYPE });
+    }
   }
 
   if (!writes.size && !saved.written.size) return;

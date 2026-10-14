@@ -6,8 +6,11 @@
 //
 // Nothing in this module touches the DOM at import time.
 
+import type { People } from '../collab/people';
+import type { CollabState } from '../collab/room';
 import type { DocModel } from '../model/doc/types';
 import type { DocRange } from '../ops/doc/index';
+import { PeopleButton } from './collab-people';
 import { DocToolbar, type DocShellHost } from './doc-toolbar';
 import type { DocumentPrintOptions, DocumentPrintResult } from './doc-print';
 import type { PdfDownload, PdfExportOptions } from '../pdf/export';
@@ -119,7 +122,11 @@ const browserLanguage = () => (typeof navigator !== 'undefined' ? navigator.lang
 export class DocumentEditor {
   readonly view: DocumentView;
   private readonly root: HTMLDivElement;
+  private readonly pagesHost: HTMLDivElement;
   private readonly toolbar: DocToolbar | undefined;
+  /** The row that says whether the document is edited together and who else is there; made when it is first needed. */
+  private collabBar: HTMLDivElement | undefined;
+  private peopleButton: PeopleButton | undefined;
   private readonly styleHost: Node;
   private strings: EditorStrings;
   private frame = 0;
@@ -138,6 +145,7 @@ export class DocumentEditor {
     pages.className = 'bym-doc-editor-pages';
     pages.style.cssText = 'position:relative;flex:1 1 0;min-height:0;min-width:0;overflow:hidden';
     this.root = root;
+    this.pagesHost = pages;
 
     const self = this;
     const host: DocShellHost = {
@@ -219,6 +227,78 @@ export class DocumentEditor {
     this.sync();
   }
 
+  /**
+   * Shows the state of editing together and the other participants above the pages; undefined
+   * takes the row away. Names are shown as text.
+   */
+  setCollab(info: { state: CollabState; peers: number; pending: number; autoWaits?: 'room' | 'offline'; people?: People } | undefined): void {
+    if (this.destroyed) return;
+    if (!info) {
+      if (this.peopleButton) this.peopleButton.destroy();
+      this.peopleButton = undefined;
+      if (this.collabBar && this.collabBar.parentNode) this.collabBar.parentNode.removeChild(this.collabBar);
+      this.collabBar = undefined;
+      return;
+    }
+    const words = this.view.collabStrings;
+    let bar = this.collabBar;
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'bym-collab';
+      bar.setAttribute('role', 'status');
+      bar.style.cssText = 'display:flex;align-items:center;gap:6px;flex:0 0 auto;padding:3px 8px;font:12px system-ui,sans-serif;color:#3c4043;background:#f8f9fa;border-bottom:1px solid #dadce0;overflow:hidden;white-space:nowrap';
+      this.root.insertBefore(bar, this.pagesHost);
+      this.collabBar = bar;
+    }
+    let button = this.peopleButton;
+    if (!button) {
+      button = new PeopleButton(this.root, words);
+      this.peopleButton = button;
+      bar.appendChild(button.element);
+    }
+    // Everything but the button is made anew (the button stays where it is: it may have the focus, and its list may be open).
+    for (const child of Array.from(bar.childNodes)) if (child !== button.element) bar.removeChild(child);
+    bar.setAttribute('data-state', info.state);
+    bar.setAttribute('data-peers', String(info.peers));
+    bar.setAttribute('data-pending', String(info.pending));
+    const dot = document.createElement('span');
+    dot.setAttribute('aria-hidden', 'true');
+    dot.style.cssText = `display:inline-block;flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:${info.state === 'online' ? '#188038' : info.state === 'connecting' ? '#E37400' : '#D93025'}`;
+    const label = document.createElement('span');
+    label.className = 'bym-collab-state';
+    label.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis';
+    label.textContent = words.state[info.state];
+    bar.insertBefore(dot, button.element);
+    bar.insertBefore(label, button.element);
+    // Auto-save that holds still on purpose says so, and why.
+    if (info.autoWaits) {
+      bar.setAttribute('data-auto-waits', info.autoWaits);
+      const waits = document.createElement('span');
+      waits.className = 'bym-collab-auto';
+      waits.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis';
+      waits.textContent = words.autoWaits[info.autoWaits];
+      bar.insertBefore(waits, button.element);
+    } else bar.removeAttribute('data-auto-waits');
+    // Who is in the file: how many (this participant too), always; the first of the others by their letters, where there is room.
+    const people: People = info.people || { list: [], more: 0, count: 1 + info.peers };
+    // A document has no sheets to be on.
+    button.update(people, words, () => undefined);
+    bar.setAttribute('data-people', String(people.count));
+    const narrow = this.root.clientWidth > 0 && this.root.clientWidth < 480;
+    const others = people.list.filter((who) => !who.self);
+    const shown = narrow ? [] : others.slice(0, 3);
+    for (const who of shown) bar.appendChild(PeopleButton.avatar(who.name, who.color, who.id));
+    const rest = people.count - 1 - shown.length;
+    if (!narrow && rest > 0) {
+      const more = document.createElement('span');
+      more.className = 'bym-collab-more';
+      more.setAttribute('aria-hidden', 'true');
+      more.textContent = `+${rest}`;
+      bar.appendChild(more);
+    }
+    bar.setAttribute('aria-label', `${words.state[info.state]}. ${words.peopleCount(people.count)}`);
+  }
+
   /** Turns editing off or on, in the pages and in the shell. */
   setReadOnly(readOnly: boolean): void {
     if (this.destroyed) return;
@@ -242,6 +322,8 @@ export class DocumentEditor {
     if (this.unwatchSave) this.unwatchSave();
     this.unwatchSave = undefined;
     if (this.toolbar) this.toolbar.destroy();
+    if (this.peopleButton) this.peopleButton.destroy();
+    this.peopleButton = undefined;
     this.view.destroy();
     if (this.root.parentNode) this.root.parentNode.removeChild(this.root);
     releaseStyle(this.styleHost);

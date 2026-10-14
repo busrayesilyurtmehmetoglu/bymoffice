@@ -311,12 +311,13 @@ test('a read-only page follows and changes nothing', async ({ page, context, req
   clean(b);
 });
 
-test('a document is not edited together: it is shown, and a notice says so', async ({ page }) => {
+test('a document is edited together as well: it joins its room (see collab-doc.spec.ts)', async ({ page }) => {
   await page.goto(PAGE);
   const bytes = await createBlank('docx');
   expect(await mount(page, { file: Array.from(bytes), room: unique(), via: 'host' })).toBe('ok');
-  expect(await notices(page)).toContain('error: Editing together is not available for documents yet.');
-  expect(await page.evaluate(() => (window as any).__mounted.collab), 'no session').toBe(undefined);
+  await online(page);
+  expect(await notices(page), 'nothing is said').toEqual([]);
+  expect(await page.evaluate(() => (window as any).__mounted.kind)).toBe('document');
 });
 
 test('"collab" that is no relay is refused before anything is fetched', async ({ page }) => {

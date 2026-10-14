@@ -11,30 +11,13 @@
 
 import type { Workbook } from '../model/sheet/types';
 import { applyOp, type Op } from '../ops/ops';
-import { MAX_PRESENCE_BYTES, MAX_STEP_BYTES, cleanUser, parseServerMessage, utf8Length, type ClientMessage, type CollabUser, type PeerMessage } from './protocol';
+import { MAX_STEP_BYTES, utf8Length } from './protocol';
 import { carryOf, inverseShift, mapPosition, transformStep, type Carry } from './rebase';
+import { RoomSession, type CollabNotice, type CollabNoticeCode, type RoomHost, type RoomOptions, type RoomPeer } from './room';
 import { CollabUnsupportedError, WireError, type Rec, type Shift, type WireOp } from './types';
 import { MAX_STEP_OPS, StyleTableFull, applyWire, decodeStep, encodeOp, encodeStep, shiftOf, stable, type Applied } from './wire';
 
-/** What carries the messages: a socket, a channel of the application, anything that keeps their order. */
-export interface CollabTransport {
-  send(text: string): void;
-  /** Called once, with what every message that arrives is given to. */
-  onMessage(listener: (text: string) => void): void;
-  /** Called once, when the transport tells whether it is connected; a transport without it is taken to be open, and to stay so. */
-  onState?(listener: (state: 'open' | 'closed') => void): void;
-  close(): void;
-}
-
-/**
- * `detached`: the room is at another version of the file than this participant's workbook, which
- * holds changes no file has; it stays as it is, tells nobody what is changed in it, and joins
- * again once it was saved (rejoin()) or given up for the file as it is stored (reload()).
- */
-export type CollabState = 'connecting' | 'online' | 'offline' | 'detached' | 'closed';
-
-/** The version of the contract this side speaks: a room takes participants of one version only. */
-export const PROTOCOL_VERSION = 2;
+export { PEER_COLORS, PROTOCOL_VERSION, type CollabNotice, type CollabNoticeCode, type CollabState, type CollabTransport, type RoomStamp } from './room';
 
 /** Where a participant is: the sheet, the active cell and the selected range. */
 export interface CollabPresence {
@@ -44,16 +27,7 @@ export interface CollabPresence {
   range: { top: number; left: number; bottom: number; right: number };
 }
 
-export interface CollabPeer {
-  id: string;
-  /** The name the participant gave; undefined for one who gave none (shown as a guest with `guest` as the number). */
-  name?: string;
-  /** "#RRGGBB": the colour given, or one of the palette. */
-  color: string;
-  guest: number;
-  readOnly: boolean;
-  presence?: CollabPresence;
-}
+export type CollabPeer = RoomPeer<CollabPresence>;
 
 /** What a change of the workbook that the host did not make itself was: for bringing a view up to date. */
 export interface SessionChange {
@@ -71,95 +45,15 @@ export interface SessionChange {
   local?: boolean;
 }
 
-export type CollabNoticeCode =
-  /** A change of this participant could not be applied after what someone else did, and was dropped. */
-  | 'dropped'
-  /** Part of a change went with rows, columns or a sheet someone else deleted. */
-  | 'partial'
-  /** What was to be undone was changed or removed by someone else since. */
-  | 'undo-gone'
-  /** The step cannot be undone while the workbook is edited together (a deleted sheet, a rule, a chart). */
-  | 'undo-none'
-  /** Undone, but not everything came back (notes, links or rules of deleted rows). */
-  | 'undo-lossy'
-  /** Rules or drawings that came with a paste or a cut were left out: they do not travel. */
-  | 'skipped'
-  /** Someone sent something that is no change of this workbook; the session was closed. */
-  | 'peer'
-  /** The file was changed elsewhere and could not be loaded again; the session was closed. */
-  | 'stale'
-  /** The file was loaded again; changes that were not sent yet were lost. */
-  | 'reloaded'
-  /** The relay refused this participant or closed the room. */
-  | 'refused'
-  /** Many changes wait to be sent. */
-  | 'backlog'
-  /** A step arrived that is no step of this workbook; everybody skipped it. */
-  | 'bad-step'
-  /** The relay takes no changes from this participant: the view is read from here on. */
-  | 'read-only'
-  /** The room is at another version of the file, and this workbook holds changes no file has: it stays, and is to be saved. */
-  | 'detached'
-  /** The room cannot be joined yet: someone in it has to save first. It is tried again. */
-  | 'waiting'
-  /** Undo was asked for while changes of this participant were still on their way, and they did not arrive in time. */
-  | 'undo-wait'
-  /** A step has been on its way for a long time: the connection is made anew. */
-  | 'slow';
-
-export interface CollabNotice {
-  code: CollabNoticeCode;
-  /** How many changes it is about, where that says something. */
-  count?: number;
-}
-
 /** What the session needs of whoever holds the workbook. */
-export interface SessionHost {
+export interface SessionHost extends RoomHost {
   /** The workbook as it is now (another one after reload()). */
   workbook(): Workbook;
   /** The workbook was changed by something the host did not call for: a step of someone else, a step of its own that was dropped. */
   changed(change: SessionChange): void;
-  notice(notice: CollabNotice): void;
-  /**
-   * Loads the file again (the room is at a version this participant's file is not), after
-   * which workbook() answers with it; resolves with the versions of the file that was loaded.
-   * Without it the session closes when that happens.
-   */
-  reload?(): Promise<string[] | { versions: string[]; stamp?: RoomStamp }>;
-  /** Whether the workbook holds changes that no file holds: such a workbook is never given up for the file without being asked. */
-  unsaved?(): boolean;
 }
 
-/** The room, as its relay names it, and the step of its order a file holds: what a file that was saved in a room says of itself. */
-export interface RoomStamp {
-  ep: string;
-  rev: number;
-}
-
-export interface SessionOptions {
-  transport: CollabTransport;
-  /** What the file that was read says of the room and the step it was saved at, when it says anything. */
-  stamp?: RoomStamp;
-  /** What the file this participant read is known by (an ETag, a hash of its bytes): see docs/collab-sozlesmesi.md. */
-  versions: string[];
-  user?: CollabUser;
-  room?: string;
-  token?: string;
-  /** Only follows: sends no change. */
-  readOnly?: boolean;
-  onState?(state: CollabState): void;
-  onPeers?(peers: CollabPeer[]): void;
-  /** Someone saved the file: its versions, and whether this participant's workbook is what was saved. */
-  onSaved?(saved: { versions: string[]; rev?: number; clean: boolean }): void;
-  /** The relay made this participant one that only reads. */
-  onReadOnly?(): void;
-  /** Someone cannot join because no file holds the steps of the room: a participant that can save should. */
-  onSync?(): void;
-  /** Most steps kept for undo. Default 200. */
-  undoLimit?: number;
-  /** Runs a callback later and returns what calls it off. Default: setTimeout. */
-  timer?(callback: () => void, ms: number): () => void;
-}
+export type SessionOptions = RoomOptions<CollabPresence>;
 
 /** What submit(), undo() and redo() answer with. */
 export interface Submitted {
@@ -203,29 +97,8 @@ interface Step {
   from?: StackEntry;
 }
 
-/** Colours participants are told apart by when they give none. */
-export const PEER_COLORS = ['#D93025', '#1A73E8', '#188038', '#E37400', '#9334E6', '#00838F', '#C2185B', '#5F6368'];
-
-/** How long after someone came in the last save is said again (to everybody who came meanwhile, once). */
-const RESEND_SAVED_MS = 1500;
-/** Most pending steps before it is said that many changes wait. */
-const BACKLOG_NOTICE = 500;
-/** How often a selection is sent at most. */
-const PRESENCE_MS = 100;
-/** How often in a row the file is loaded again before the session gives up. */
-const MAX_RELOADS = 6;
-/** How long what the others say of where they are is gathered before it is passed on. */
-const PEERS_MS = 50;
 /** How long an undo waits for the steps of its participant to be placed. */
 const UNDO_WAIT_MS = 3000;
-/** How long a step may be on its way before the connection is taken to be stuck. */
-const FLY_MS = 30000;
-
-function hashOf(text: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
-  return h >>> 0;
-}
 
 function emptyChange(): SessionChange {
   return { cells: [], layout: false, sheets: false, shifts: [] };
@@ -251,134 +124,30 @@ function readPresence(value: unknown): CollabPresence | undefined {
   return { sheet: from.s, row, col, range: { top, left, bottom, right } };
 }
 
-function cleanStamp(stamp: RoomStamp | undefined): RoomStamp | undefined {
-  if (!stamp || typeof stamp.ep !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(stamp.ep)) return undefined;
-  return Number.isSafeInteger(stamp.rev) && stamp.rev >= 0 ? { ep: stamp.ep, rev: stamp.rev } : undefined;
-}
-
-export class CollabSession {
+export class CollabSession extends RoomSession<Step, CollabPresence> {
   private readonly host: SessionHost;
   private readonly options: SessionOptions;
-  private readonly transport: CollabTransport;
-  /** What the steps of this session are told apart by, whatever the relay calls the connection. */
-  private readonly key: string;
-  private seq = 0;
-  private current: CollabState = 'connecting';
-  /** How many steps of the order the workbook holds under the pending ones. */
-  private confirmed = 0;
-  /** The order was joined at least once: joining again asks for what came since. */
-  private joined = false;
-  /** The order was asked for again after a step was missing, and the answer is not there yet. */
-  private resyncing = false;
-  private badStepSaid = false;
-  /** What the steps of this session are named with, for everybody to see; the key is told to the relay alone. */
-  private readonly tag = `${hashOf(String(Math.random())).toString(36)}${hashOf(String(Date.now())).toString(36)}`;
   /** Undo and redo that wait for the steps on their way. */
   private wanted: ('undo' | 'redo')[] = [];
   private wantedTimer: (() => void) | undefined;
-  private flyTimer: (() => void) | undefined;
-  private slowSaid = false;
-  /** The step the workbook was at when it joined with its file. */
-  private startedAt = 0;
-  private lastSaved: ClientMessage | undefined;
-  /** The relay counts this connection as one of a room: it takes no second "join" from it. */
-  private inRoom = false;
-  private waitingSaid = false;
-  private peersTimer: (() => void) | undefined;
-  private peersStale = false;
-  /** The others moved, and whoever listens was not told yet. */
-  private peersDue = false;
-  /** Something was changed here while what arrives was held back (see pause()). */
-  private touchedWhilePaused = false;
-  /** The step the relay is at as far as this side knows: nothing is sent while the workbook is behind it. */
-  private target = 0;
-  private pendingSteps: Step[] = [];
-  /** The room this side is in, as the relay names it; and what the file says it was saved at, until it was used or found wrong. */
-  private epoch: string | undefined;
-  private stamp: RoomStamp | undefined;
-  /** The id of the step that is on its way. */
-  private flying: string | undefined;
   private undoStack: StackEntry[] = [];
   private redoStack: StackEntry[] = [];
-  private versions: string[];
-  private me = '';
-  private resendTimer: (() => void) | undefined;
-  /** A save was made while the room could not be reached, and nobody was told. */
-  private savedUnsaid = false;
-  private seenAs: CollabUser | undefined;
-  private others: Map<string, PeerMessage> = new Map();
-  private peerList: CollabPeer[] = [];
-  private readonlyNow: boolean;
-  private open = false;
-  private reloads = 0;
-  private reloading = false;
-  private backlogSaid = false;
-  private presenceNow: CollabPresence | undefined;
-  private presenceSent = '';
-  private presenceTimer: (() => void) | undefined;
-  private settled: (() => void)[] = [];
-  private paused = 0;
-  private inbox: string[] = [];
-  /** How many steps this participant queued, and what became of them: placed by the relay, dropped and said, or dropped because what they wanted was so already. */
-  readonly stats = { made: 0, placed: 0, dropped: 0, quiet: 0 };
 
   constructor(host: SessionHost, options: SessionOptions) {
+    super(host, options);
     this.host = host;
     this.options = options;
-    this.stamp = cleanStamp(options.stamp);
-    this.transport = options.transport;
-    this.versions = options.versions.slice(0, 8);
-    this.readonlyNow = options.readOnly === true;
-    this.key = `${hashOf(String(Math.random())).toString(36)}${hashOf(String(Date.now() + Math.random())).toString(36)}`;
-    this.transport.onMessage((text) => this.receive(text));
-    if (this.transport.onState) {
-      this.transport.onState((state) => {
-        if (this.current === 'closed') return;
-        if (state === 'open') {
-          this.open = true;
-          this.inRoom = false;
-          if (this.current !== 'detached') this.join();
-        } else {
-          this.open = false;
-          this.inRoom = false;
-          this.flying = undefined;
-          // A workbook that is detached stays so, whatever the connection does.
-          if (this.current !== 'detached') this.setState('offline');
-        }
-      });
-    } else {
-      this.open = true;
-      this.join();
-    }
-  }
-
-  get state(): CollabState {
-    return this.current;
-  }
-
-  /** How many steps of the common order the workbook holds. */
-  get rev(): number {
-    return this.confirmed;
-  }
-
-  /** How many steps of this participant the relay has not placed yet. */
-  get pending(): number {
-    return this.pendingSteps.length;
+    this.start();
   }
 
   get peers(): CollabPeer[] {
-    if (this.peersStale) this.buildPeers();
-    return this.peerList.slice();
+    return super.peers;
   }
 
-  /** This participant as the others see it; `id` is empty until the relay named the connection. */
   get user(): CollabPeer {
-    return this.lookOf(this.me, this.seenAs || cleanUser(this.options.user), this.readonlyNow, this.presenceNow);
+    return super.user;
   }
 
-  get readOnly(): boolean {
-    return this.readonlyNow;
-  }
 
   get canUndo(): boolean {
     return this.undoStack.some((entry) => !entry.busy) || this.pendingSteps.some((step) => step.kind !== 'undo');
@@ -482,6 +251,17 @@ export class CollabSession {
     return undefined;
   }
 
+  protected idle(): void {
+    if (this.wanted.length > 0) this.runWanted();
+  }
+
+  protected forget(all: boolean): void {
+    this.wanted = [];
+    if (!all) return;
+    this.undoStack = [];
+    this.redoStack = [];
+  }
+
   /** The undoing that waited for the steps of this participant to be placed: done now, one at a time. */
   private runWanted(): void {
     if (this.wanted.length === 0 || this.pendingSteps.length > 0) return;
@@ -544,22 +324,16 @@ export class CollabSession {
     if (carry.length > 0) this.movePresences(carry);
     if (this.paused > 0) this.touchedWhilePaused = true;
     if (this.current === 'closed' || this.current === 'detached') return this.settle(step);
-    step.id = `${this.tag}:${++this.seq}`;
-    this.pendingSteps.push(step);
-    this.stats.made++;
-    if (this.pendingSteps.length > BACKLOG_NOTICE && !this.backlogSaid) {
-      this.backlogSaid = true;
-      this.host.notice({ code: 'backlog', count: this.pendingSteps.length });
-    }
-    this.pump();
+    this.queue(step);
   }
+
 
   /**
    * A step of this participant has its place in the order (or, in a session that tells nobody, was
    * made): what undoes the steps before it is read through it, and what undoes it is kept. The
    * stacks are always about the workbook as the relay has it, without the steps that still wait.
    */
-  private settle(step: Step): void {
+  protected settle(step: Step): void {
     // What it took back, or made again, is done with.
     if (step.from) {
       const source = step.kind === 'undo' ? this.undoStack : this.redoStack;
@@ -648,349 +422,18 @@ export class CollabSession {
     return { recs: out, inverse, undo: undoable ? ([] as Rec[]).concat(...undo) : null, lossy, change };
   }
 
-  // ---------------------------------------------------------------- the relay
-
-  private send(message: ClientMessage): void {
-    if (!this.open || this.current === 'closed') return;
-    try {
-      this.transport.send(JSON.stringify(message));
-    } catch {
-      // A transport that cannot send says so by its state; what was not sent is sent when it is open again.
-    }
+  protected encodeFirst(): unknown[] {
+    return encodeStep(this.pendingSteps[0].recs.map((rec) => rec.w), this.host.workbook().styles);
   }
 
-  /** Makes a new connection where the transport can make one; false where it cannot. */
-  private reconnect(): boolean {
-    const transport = this.transport as CollabTransport & { suspend?(): void; resume?(): void };
-    if (typeof transport.suspend !== 'function' || typeof transport.resume !== 'function') return false;
-    transport.suspend();
-    transport.resume();
-    return true;
-  }
-
-  private join(): void {
-    if (this.reloading) return;
-    // A connection that is in a room joins no second time: the room is joined over a new one, or, where the
-    // transport cannot make one (a transport of the application), left first.
-    if (this.inRoom) {
-      if (this.reconnect()) return;
-      this.inRoom = false;
-      this.send({ t: 'leave' });
-    }
-    const message: ClientMessage = { t: 'join', v: this.versions, pv: PROTOCOL_VERSION, key: this.key };
-    if (this.joined && this.epoch !== undefined) {
-      // Back in the room this side was in: from the step it is at. In another room that step means nothing (the relay sees to it).
-      message.since = this.confirmed;
-      message.ep = this.epoch;
-    } else if (!this.joined && this.stamp) {
-      // With a file that was saved in a room: from the step that was written into it.
-      message.since = this.stamp.rev;
-      message.ep = this.stamp.ep;
-    }
-    const user = cleanUser(this.options.user);
-    if (user.name !== undefined || user.color !== undefined) message.user = user;
-    if (typeof this.options.token === 'string' && this.options.token !== '') message.token = this.options.token;
-    if (this.options.readOnly === true) message.ro = true;
-    if (typeof this.options.room === 'string' && this.options.room !== '') message.room = this.options.room;
-    this.send(message);
-  }
-
-  private pump(): void {
-    if (this.current !== 'online' || this.flying !== undefined || this.pendingSteps.length === 0 || this.confirmed < this.target || this.readonlyNow) {
-      this.checkSettled();
-      return;
-    }
-    const step = this.pendingSteps[0];
-    this.flying = step.id;
-    this.send({ t: 'op', base: this.confirmed, id: step.id, ops: encodeStep(step.recs.map((rec) => rec.w), this.host.workbook().styles) });
-    // A step that is neither placed nor refused for a long time: the connection is not what it seems.
-    if (this.flyTimer) this.flyTimer();
-    const id = step.id;
-    this.flyTimer = this.timer(() => {
-      this.flyTimer = undefined;
-      if (this.flying !== id || this.current !== 'online') return;
-      if (!this.slowSaid) {
-        this.slowSaid = true;
-        this.host.notice({ code: 'slow' });
-      }
-      this.flying = undefined;
-      if (!this.reconnect()) this.pump();
-    }, FLY_MS);
-  }
-
-  private checkSettled(): void {
-    if (this.pendingSteps.length === 0 && this.wanted.length > 0 && this.current === 'online') this.runWanted();
-    if (this.pendingSteps.length > 0 || this.settled.length === 0) return;
-    const waiting = this.settled;
-    this.settled = [];
-    for (const done of waiting) done();
-  }
-
-  /** Resolves once no step of this participant waits for the relay: true; or after `ms`: false. */
-  whenSettled(ms: number): Promise<boolean> {
-    if (this.pendingSteps.length === 0) return Promise.resolve(true);
-    return new Promise<boolean>((resolve) => {
-      let over = false;
-      const stop = this.timer(() => {
-        if (over) return;
-        over = true;
-        resolve(false);
-      }, ms);
-      this.settled.push(() => {
-        if (over) return;
-        over = true;
-        stop();
-        resolve(true);
-      });
-    });
-  }
-
-  private timer(callback: () => void, ms: number): () => void {
-    if (this.options.timer) return this.options.timer(callback, ms);
-    const handle = setTimeout(callback, ms);
-    return () => clearTimeout(handle);
-  }
-
-  private setState(state: CollabState): void {
-    if (this.current === state) return;
-    this.current = state;
-    if (this.options.onState) this.options.onState(state);
-  }
-
-  private fatal(code: CollabNoticeCode): void {
-    if (this.current === 'closed') return;
-    this.host.notice({ code });
-    this.close();
-  }
-
-  private close(): void {
-    if (this.current === 'closed') return;
-    this.setState('closed');
-    this.open = false;
-    this.flying = undefined;
-    if (this.presenceTimer) this.presenceTimer();
-    this.presenceTimer = undefined;
-    // What waits is this participant's alone from here on: steps like any that were placed.
-    for (const step of this.pendingSteps) this.settle(step);
-    this.pendingSteps = [];
-    this.others.clear();
-    this.refreshPeers();
-    this.checkSettled();
-    try {
-      this.transport.close();
-    } catch {
-      // Nothing more to do with a transport that cannot even be closed.
-    }
-  }
-
-  /** Leaves the room. The workbook stays as it is; what is changed from here on is told to nobody. */
-  leave(): void {
-    this.close();
-  }
-
-  /**
-   * Holds what arrives until resume(): while a file is written from the workbook, nothing that
-   * arrives may change it half way through.
-   */
-  pause(): void {
-    if (this.paused++ === 0) this.touchedWhilePaused = false;
-  }
-
-  /** Lets what was held back in. Answers whether the workbook was changed here meanwhile: a file written in that time is of no one step. */
-  resume(): boolean {
-    if (this.paused === 0) return false;
-    const touched = this.touchedWhilePaused;
-    if (--this.paused > 0) return touched;
-    const held = this.inbox;
-    this.inbox = [];
-    for (const text of held) this.receive(text);
-    return touched;
-  }
-
-  private receive(text: string): void {
-    if (this.current === 'closed' || this.current === 'detached') return;
-    if (this.paused > 0) {
-      this.inbox.push(text);
-      return;
-    }
-    let message;
-    try {
-      message = parseServerMessage(text);
-    } catch {
-      return this.fatal('peer');
-    }
-    try {
-      this.handle(message);
-    } catch (error) {
-      // Nothing that arrives may throw out of here. The workbook is kept as it is, apart from the room.
-      const now = this.current as CollabState;
-      if (now !== 'closed' && now !== 'detached') this.detach();
-    }
-  }
-
-  private handle(message: ReturnType<typeof parseServerMessage>): void {
-    switch (message.t) {
-      case 'hello': {
-        // The log from before where this side is brings steps it has, which are passed over; one that starts
-        // behind it leaves steps out.
-        this.inRoom = true;
-        // A room that is behind this side is another room (the relay was started anew, or the room was let go of).
-        if (this.joined && (message.ep !== this.epoch || message.from > this.confirmed || message.rev < this.confirmed)) return this.restart();
-        if (!this.joined) {
-          const stamp = this.stamp;
-          if (stamp && message.ep === stamp.ep) {
-            // The step the file names, in the room it names. The room has to have heard of this very file as well: one
-            // that was changed elsewhere since carries the stamp still, and is another file.
-            if (message.from !== stamp.rev || message.v.length === 0) {
-              this.stamp = undefined;
-              return this.join();
-            }
-          } else if (message.from !== 0) {
-            // Without the word of the file there is only the start of the room to join at.
-            return this.fatal('peer');
-          }
-          this.epoch = message.ep;
-          this.confirmed = message.from;
-          this.startedAt = message.from;
-        }
-        this.joined = true;
-        this.resyncing = false;
-        this.reloads = 0;
-        this.waitingSaid = false;
-        this.target = message.rev;
-        this.me = message.you;
-        // As the room has this participant: the relay may have named it itself.
-        this.seenAs = message.user;
-        if (message.ro && !this.readonlyNow) {
-          this.readonlyNow = true;
-          // Asked for by nobody here: whoever edits is told, and what waits is taken back.
-          if (this.options.readOnly !== true) {
-            this.dropAll('refused');
-            this.host.notice({ code: 'read-only' });
-            if (this.options.onReadOnly) this.options.onReadOnly();
-          }
-        }
-        this.others.clear();
-        for (const peer of message.peers) this.others.set(peer.id, peer);
-        this.refreshPeers();
-        this.setState('online');
-        // A save that was made while the room could not be reached is said now.
-        if (this.savedUnsaid && this.lastSaved) this.send(this.lastSaved);
-        this.savedUnsaid = false;
-        // The selection is told anew: the relay does not remember it across connections.
-        this.presenceSent = '';
-        this.flushPresence();
-        this.pump();
-        return;
-      }
-      case 'op':
-        if (!this.joined) return;
-        if (message.rev <= this.confirmed) return;
-        // A step is missing: the order is asked for again from where it is known.
-        if (message.rev !== this.confirmed + 1) return this.resync();
-        // This participant's own step, as the relay placed it: by its name and by what it says. A step that
-        // only has the name (anybody can read the names) is someone else's.
-        if (this.pendingSteps.length > 0 && this.pendingSteps[0].id === message.id && this.sameAsFirst(message.ops)) {
-          const mine = this.pendingSteps.shift() as Step;
-          this.stats.placed++;
-          this.confirmed = message.rev;
-          this.flying = undefined;
-          this.slowSaid = false;
-          this.settle(mine);
-          if (this.pendingSteps.length < BACKLOG_NOTICE) this.backlogSaid = false;
-        } else if (!this.remote(message.ops)) return;
-        else this.confirmed = message.rev;
-        if (this.target < this.confirmed) this.target = this.confirmed;
-        this.pump();
-        return;
-      case 'nack':
-        if (this.flying !== message.id) return;
-        this.flying = undefined;
-        if (message.reason === 'read-only') {
-          this.readonlyNow = true;
-          this.dropAll('refused');
-          this.host.notice({ code: 'read-only' });
-          if (this.options.onReadOnly) this.options.onReadOnly();
-          return;
-        }
-        if (message.reason === 'rate') {
-          // Too many steps in a short time: the step waits a moment.
-          this.timer(() => this.pump(), 1000);
-          return;
-        }
-        if (message.rev > this.target) this.target = message.rev;
-        this.pump();
-        return;
-      case 'reset':
-        this.inRoom = false;
-        return this.restart();
-      case 'presence': {
-        const peer = this.others.get(message.from);
-        if (!peer) return;
-        peer.presence = message.data;
-        // However often the others say where they are, it is passed on a few times a second.
-        this.peersStale = true;
-        this.peersDue = true;
-        if (!this.peersTimer) {
-          this.peersTimer = this.timer(() => {
-            this.peersTimer = undefined;
-            if (this.peersDue) this.refreshPeers();
-          }, PEERS_MS);
-        }
-        return;
-      }
-      case 'peer':
-        this.others.set(message.id, { id: message.id, user: message.user, ro: message.ro });
-        this.refreshPeers();
-        // Who comes in has not heard what this side last saved: the file it read may be an older one than the one that is stored.
-        // Once for however many come in a moment: each word of a save makes everybody ask the server.
-        if (this.lastSaved && !this.resendTimer) {
-          this.resendTimer = this.timer(() => {
-            this.resendTimer = undefined;
-            if (this.lastSaved && this.current === 'online') this.send(this.lastSaved);
-          }, RESEND_SAVED_MS);
-        }
-        return;
-      case 'left':
-        if (this.others.delete(message.id)) this.refreshPeers();
-        return;
-      case 'saved': {
-        const clean = message.rev !== undefined && message.rev === this.confirmed && this.pendingSteps.length === 0;
-        if (this.options.onSaved) this.options.onSaved({ versions: message.v, rev: message.rev, clean });
-        return;
-      }
-      case 'sync':
-        if (this.options.onSync && !this.readonlyNow) this.options.onSync();
-        return;
-      case 'pong':
-        return;
-      case 'error':
-        // This side's own new connection took the place of this one: nothing to say.
-        if (message.code === 'replaced') return;
-        return this.fatal('refused');
-    }
-  }
-
-  /**
-   * A step is missing (a transport that does not keep the order): the order is asked for again
-   * from the last step that is known, once, over a new connection where the transport can make
-   * one. The file is not loaded again for this.
-   */
-  private resync(): void {
-    if (this.resyncing) return;
-    this.resyncing = true;
-    this.flying = undefined;
-    if (!this.reconnect()) this.join();
-  }
-
-  private sameAsFirst(ops: unknown[]): boolean {
+  protected sameAsFirst(ops: unknown[]): boolean {
     const step = this.pendingSteps[0];
     // As values, not as text: a relay may write the same operations with their members in another order.
     return stable(encodeStep(step.recs.map((rec) => rec.w), this.host.workbook().styles)) === stable(ops);
   }
 
   /** Takes every pending step back and forgets it. */
-  private dropAll(code: CollabNoticeCode): void {
+  protected dropAll(code: CollabNoticeCode): void {
     const workbook = this.host.workbook();
     const count = this.pendingSteps.length;
     const change = emptyChange();
@@ -1012,144 +455,8 @@ export class CollabSession {
     this.checkSettled();
   }
 
-  private badStep(): void {
-    if (this.badStepSaid) return;
-    this.badStepSaid = true;
-    this.host.notice({ code: 'bad-step' });
-  }
-
-  /**
-   * The room is at a version of the file this participant does not have. A workbook that holds
-   * nothing but its file is given up for the file as it is stored now, and the room is joined
-   * anew. One that holds changes no file has is never given up without being asked: it stays as
-   * it is, detached from the room (see CollabState).
-   */
-  private restart(): void {
-    if (this.reloading) return;
-    let ahead = this.pendingSteps.length > 0;
-    try {
-      // A host that does not say whether its workbook is saved is taken to have saved nothing since it joined.
-      if (!ahead) ahead = this.host.unsaved ? this.host.unsaved() === true : this.confirmed > this.startedAt;
-    } catch {
-      ahead = true;
-    }
-    if (ahead) return this.detach();
-    this.loadAgain();
-  }
-
-  private detach(): void {
-    // What waited is in the workbook, and stays there; nobody will be told of it.
-    for (const step of this.pendingSteps) this.settle(step);
-    this.pendingSteps = [];
-    this.wanted = [];
-    this.lastSaved = undefined;
-    this.savedUnsaid = false;
-    this.flying = undefined;
-    this.joined = false;
-    this.epoch = undefined;
-    this.stamp = undefined;
-    this.resyncing = false;
-    this.confirmed = 0;
-    this.target = 0;
-    this.others.clear();
-    this.refreshPeers();
-    this.setState('detached');
-    // Out of the room, where the transport can leave it: nothing of it is of any use here.
-    const transport = this.transport as CollabTransport & { suspend?(): void };
-    if (typeof transport.suspend === 'function') transport.suspend();
-    this.host.notice({ code: 'detached' });
-    this.checkSettled();
-  }
-
-  /**
-   * Joins the room again with the workbook as it is: after it was saved, under what the saved file is
-   * known by. For a detached session; does nothing in any other state.
-   */
-  rejoin(versions: string[]): void {
-    if (this.current !== 'detached') return;
-    this.stamp = undefined;
-    this.epoch = undefined;
-    this.versions = versions.filter((version) => typeof version === 'string' && version !== '' && version.length <= 200).slice(0, 8);
-    this.reloads = 0;
-    this.setState('connecting');
-    const transport = this.transport as CollabTransport & { resume?(): void };
-    if (this.open) this.join();
-    else if (typeof transport.resume === 'function') transport.resume();
-    else this.setState('offline');
-  }
-
-  /**
-   * Gives the workbook up for the file as it is stored and joins the room with that: what a detached
-   * session does when its user says so. Changes that are in no file are lost.
-   */
-  reload(): void {
-    if (this.current === 'closed' || this.reloading) return;
-    this.reloads = 0;
-    const detached = this.current === 'detached';
-    this.loadAgain();
-    const transport = this.transport as CollabTransport & { resume?(): void };
-    if (detached && !this.open && typeof transport.resume === 'function') transport.resume();
-  }
-
-  private loadAgain(): void {
-    const reload = this.host.reload;
-    if (!reload || ++this.reloads > MAX_RELOADS) return this.fatal('stale');
-    const lost = this.pendingSteps.length;
-    this.reloading = true;
-    this.wanted = [];
-    this.lastSaved = undefined;
-    this.savedUnsaid = false;
-    this.pendingSteps = [];
-    this.flying = undefined;
-    this.undoStack = [];
-    this.redoStack = [];
-    this.joined = false;
-    this.epoch = undefined;
-    this.stamp = undefined;
-    this.resyncing = false;
-    this.confirmed = 0;
-    this.target = 0;
-    this.setState('connecting');
-    this.checkSettled();
-    // The file that is stored may be one the room cannot place yet (it was saved, and the room was not told
-    // which step it holds): the relay asks those in the room to save, and this side tries again a little later.
-    const again = this.reloads > 1;
-    if (again && !this.waitingSaid) {
-      this.waitingSaid = true;
-      this.host.notice({ code: 'waiting' });
-    }
-    const load = (): void => {
-      if (this.current === 'closed') return;
-      let loading: Promise<string[] | { versions: string[]; stamp?: RoomStamp }>;
-      try {
-        loading = Promise.resolve(reload.call(this.host));
-      } catch {
-        this.reloading = false;
-        return this.fatal('stale');
-      }
-      loading.then(
-        (loaded) => {
-          this.reloading = false;
-          if (this.current === 'closed') return;
-          const versions = Array.isArray(loaded) ? loaded : loaded.versions;
-          this.stamp = Array.isArray(loaded) ? undefined : cleanStamp(loaded.stamp);
-          this.versions = versions.slice(0, 8);
-          if (lost > 0) this.host.notice({ code: 'reloaded', count: lost });
-          if (this.open) this.join();
-          else this.setState('offline');
-        },
-        () => {
-          this.reloading = false;
-          this.fatal('stale');
-        },
-      );
-    };
-    if (again) this.timer(load, Math.min(500 * Math.pow(2, this.reloads - 2), 8000));
-    else load();
-  }
-
   /** A step of someone else: placed under the pending ones. False when the session was closed over it. */
-  private remote(raw: unknown[]): boolean {
+  protected remote(raw: unknown[]): boolean {
     const workbook = this.host.workbook();
     let wires: WireOp[];
     try {
@@ -1257,40 +564,13 @@ export class CollabSession {
     return true;
   }
 
-  // ----------------------------------------------------------------- presence
 
-  private lookOf(id: string, user: CollabUser, readOnly: boolean, presence?: CollabPresence): CollabPeer {
-    const hash = hashOf(id);
-    const peer: CollabPeer = { id, color: user.color !== undefined ? user.color : PEER_COLORS[hash % PEER_COLORS.length], guest: (hash % 99) + 1, readOnly };
-    if (user.name !== undefined) peer.name = user.name;
-    if (presence) peer.presence = presence;
-    return peer;
+  protected readPresence(value: unknown): CollabPresence | undefined {
+    return readPresence(value);
   }
 
-  private buildPeers(): void {
-    this.peersStale = false;
-    const list: CollabPeer[] = [];
-    this.others.forEach((peer) => list.push(this.lookOf(peer.id, peer.user, peer.ro, readPresence(peer.presence))));
-    this.peerList = list;
-  }
-
-  /** Whether this participant is the one that saves by itself what the others changed: the one of those who write whose name of the relay comes first. */
-  get leads(): boolean {
-    if (this.me === '' || this.readonlyNow || this.current !== 'online') return false;
-    let first = true;
-    this.others.forEach((peer) => {
-      if (!peer.ro && peer.id < this.me) first = false;
-    });
-    return first;
-  }
-
-  private refreshPeers(): void {
-    this.peersStale = false;
-    this.peersDue = false;
-    const list: CollabPeer[] = [];
-    this.others.forEach((peer) => list.push(this.lookOf(peer.id, peer.user, peer.ro, readPresence(peer.presence))));
-    this.peerList = list;
-    if (this.options.onPeers) this.options.onPeers(list.slice());
+  protected writePresence(p: CollabPresence | undefined): unknown {
+    return p ? { s: p.sheet, a: [p.row, p.col], r: [p.range.top, p.range.left, p.range.bottom, p.range.right] } : null;
   }
 
   /** The selections of the others follow rows, columns and sheets that moved, until they say where they are again. */
@@ -1317,60 +597,8 @@ export class CollabSession {
     if (moved) this.refreshPeers();
   }
 
-  /** Tells the others where this participant is; at most ten times a second. */
-  setPresence(presence: CollabPresence | undefined): void {
-    this.presenceNow = presence;
-    if (this.presenceTimer || this.current === 'closed') return;
-    this.presenceTimer = this.timer(() => {
-      this.presenceTimer = undefined;
-      this.flushPresence();
-    }, PRESENCE_MS);
-  }
-
-  private flushPresence(): void {
-    const p = this.presenceNow;
-    const data = p ? { s: p.sheet, a: [p.row, p.col], r: [p.range.top, p.range.left, p.range.bottom, p.range.right] } : null;
-    const text = JSON.stringify(data);
-    if (text === this.presenceSent || this.current !== 'online' || text.length > MAX_PRESENCE_BYTES) return;
-    this.presenceSent = text;
-    this.send({ t: 'presence', data });
-  }
-
-  // ------------------------------------------------------------------- saving
-
-  /**
-   * The step of the common order the workbook is at when nothing of this participant waits:
-   * a file written now is the file of that step. Undefined while something waits.
-   */
-  /**
-   * What a file written now is to say of itself: the room, and the step of its order the workbook is at.
-   * Undefined while something of this participant waits, or the workbook is in no room.
-   */
-  get stampNow(): RoomStamp | undefined {
-    return this.current === 'online' && this.pendingSteps.length === 0 && this.epoch !== undefined ? { ep: this.epoch, rev: this.confirmed } : undefined;
-  }
-
   /** The workbook that is edited: what a file of the room is written from. */
   get model(): Workbook {
     return this.host.workbook();
-  }
-
-  get savableRev(): number | undefined {
-    return this.current === 'online' && this.pendingSteps.length === 0 ? this.confirmed : undefined;
-  }
-
-  /** Tells the others that the file was saved: what it is known by now and, when known, the step it holds. */
-  announceSaved(versions: string[], rev: number | undefined): void {
-    const v = versions.filter((version) => typeof version === 'string' && version !== '' && version.length <= 200).slice(0, 8);
-    if (v.length === 0 || this.current === 'closed' || this.current === 'detached') return;
-    const message: ClientMessage = { t: 'saved', v };
-    if (rev !== undefined) message.rev = rev;
-    this.lastSaved = message;
-    // Out of reach of the room: said when it is reached again (the others would meet a conflict with a file nobody told them of).
-    if (this.current !== 'online') {
-      this.savedUnsaid = true;
-      return;
-    }
-    this.send(message);
   }
 }

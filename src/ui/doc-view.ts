@@ -18,7 +18,12 @@ import { FocusRetry, pressOf } from './focus-retry';
 import { isContextPress } from './rules-dialog';
 import { DocLayout } from '../layout/doc/layout';
 import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, LayoutProgress, LineMark, TextItem, TextMeasurer } from '../layout/doc/types';
-import * as ops from '../ops/doc/index';
+import * as ops from '../collab/doc/commands';
+import { CollabDocHistory, NOT_SHARED, type DocHistoryLike } from '../collab/doc/history';
+import type { DocChange, DocCollabSession, DocPeer } from '../collab/doc/session';
+import { tracing } from '../collab/doc/trace';
+import type { CollabNotice } from '../collab/room';
+import { CompositionHold, PeerCarets, movedSelection, peerFill, peerPlaces, placeNear, type PeerPlace } from './doc-collab';
 import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, ToggleKey } from '../ops/doc/index';
 import { enforcedProtection, findWrapper, inFieldCode, paragraphText, safeHyperlinkTarget, type Block, type DocModel, type Paragraph, type RunItem, type Table } from '../model/doc/types';
 import { getLocale, type FormatLocale } from '../format/locale';
@@ -769,8 +774,14 @@ export class DocumentView {
   private pinch: { distance: number; zoom: number } | undefined;
   private gestureZoom = 0;
 
-  /** Undo and redo of what was changed in the view. */
-  readonly history: ops.DocHistory<DocRange | undefined>;
+  /** Undo and redo of what was changed in the view; the steps of the session while the document is edited together (attachCollab). */
+  history: DocHistoryLike<DocRange | undefined>;
+  /** The session, while the document is edited together. */
+  private collab: DocCollabSession | undefined;
+  private collabPeers: PeerPlace[] = [];
+  private peerCarets: PeerCarets | undefined;
+  /** What arrives is held back while an input method composes. */
+  private collabHold: CompositionHold | undefined;
   private editable = false;
   private readonly lines: DocLines;
   private readonly typing: DocInput;
@@ -991,12 +1002,16 @@ export class DocumentView {
       compositionStart: () => {
         this.history.seal();
         this.composed = 0;
+        // What the others do waits until the composition is over: a change of the text around it would end it.
+        // Not for ever: see CompositionHold.
+        if (this.collabHold) this.collabHold.begin();
       },
       compositionEnd: () => {
         this.history.seal();
         this.composed = 0;
         this.schedule();
         this.fontsSettled();
+        this.releaseCollab(true);
       },
     });
     this.applyInputMode();
@@ -1263,6 +1278,11 @@ export class DocumentView {
     this.endDrag();
     this.endPress();
     this.typing.destroy();
+    this.releaseCollab(false);
+    if (this.collab) tracing(false);
+    this.collab = undefined;
+    this.collabHold = undefined;
+    if (this.peerCarets) this.peerCarets.destroy();
     this.charts.clear();
     if (this.balloon) this.balloon.destroy();
     this.balloon = undefined;
@@ -1726,6 +1746,7 @@ export class DocumentView {
     }
     input.addEventListener('focus', this.onFocus);
     input.addEventListener('blur', this.onBlur);
+    if (input.ownerDocument) input.ownerDocument.addEventListener('visibilitychange', this.onVisibility);
     strip.addEventListener('click', this.onStripClick);
     strip.addEventListener('mousemove', this.onHover);
     strip.addEventListener('dblclick', this.onDoubleClick);
@@ -1769,6 +1790,7 @@ export class DocumentView {
     }
     input.removeEventListener('focus', this.onFocus);
     input.removeEventListener('blur', this.onBlur);
+    if (input.ownerDocument) input.ownerDocument.removeEventListener('visibilitychange', this.onVisibility);
     strip.removeEventListener('click', this.onStripClick);
     strip.removeEventListener('mousemove', this.onHover);
     strip.removeEventListener('dblclick', this.onDoubleClick);
@@ -2423,6 +2445,7 @@ export class DocumentView {
         charts: this.charts,
       });
       this.paintSelection(context, slot.index, scale);
+      this.paintPeers(context, slot.index, scale);
       this.paintComments(context, slot, scale);
     } catch {
       // One page that cannot be painted must not take the view down; it stays blank.
@@ -2587,6 +2610,42 @@ export class DocumentView {
       if (!(b > a)) continue;
       const box = this.measurer.metrics(item.font);
       context.fillRect(item.x + a, item.y - box.ascent, b - a, box.ascent + box.descent);
+    }
+    context.restore();
+  }
+
+  /** Paints what the others have selected over a page, each in its colour. */
+  private paintPeers(context: CanvasRenderingContext2D, pageIndex: number, scale: number): void {
+    if (this.collabPeers.length === 0) return;
+    const items = this.pages[pageIndex].items;
+    context.save();
+    context.scale(scale, scale);
+    for (const peer of this.collabPeers) {
+      let range: TextRange | undefined;
+      try {
+        range = orderedRange(peer.anchor, peer.focus);
+      } catch {
+        // Two places that are not in one story, or not in this document any more.
+        range = undefined;
+      }
+      if (!range) continue;
+      context.fillStyle = peerFill(peer.color);
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type !== 'text' || !(item.width > 0) || item.rotation !== undefined) continue;
+        let part: [number, number] | undefined;
+        try {
+          part = selectedPart(range, item);
+        } catch {
+          part = undefined;
+        }
+        if (!part) continue;
+        const a = this.advance(item, part[0]);
+        const b = this.advance(item, part[1]);
+        if (!(b > a)) continue;
+        const box = this.measurer.metrics(item.font);
+        context.fillRect(item.x + a, item.y - box.ascent, b - a, box.ascent + box.descent);
+      }
     }
     context.restore();
   }
@@ -3032,6 +3091,8 @@ export class DocumentView {
   };
 
   private onBlur = (): void => {
+    // Whatever was being composed is over as far as the others are concerned.
+    this.releaseCollab(true);
     this.root.classList.remove('bym-doc-focus');
     this.focused = false;
     if (!this.editable || this.destroyed) return;
@@ -4539,6 +4600,126 @@ export class DocumentView {
     return this.typing.composing || this.dragging;
   }
 
+  // ------------------------------------------------------- editing together
+
+  /**
+   * Ties the view to the session of a document that is edited together: every change, undo
+   * and redo is a step of the session from here on, what cannot be shared is refused and said,
+   * and the others are told where the caret is. mount() makes the session and tells the view
+   * what it says (collabChanged(), collabNotice(), collabPeersChanged()).
+   */
+  attachCollab(session: DocCollabSession | undefined): void {
+    if (this.destroyed) return;
+    if (session && !this.collab) tracing(true);
+    if (!session && this.collab) tracing(false);
+    this.releaseCollab(false);
+    this.collab = session;
+    this.collabHold = session ? new CompositionHold(session) : undefined;
+    if (session) this.history = new CollabDocHistory<DocRange | undefined>(session);
+    this.collabPeersChanged(session ? session.peers : []);
+    this.sayPresence();
+  }
+
+  /** The others, as the session lists them now. */
+  collabPeersChanged(peers: DocPeer[]): void {
+    if (this.destroyed) return;
+    const wide = (list: PeerPlace[]): boolean => list.some((peer) => !ops.samePosition(peer.anchor, peer.focus));
+    const had = wide(this.collabPeers);
+    this.collabPeers = peerPlaces(peers, this.strings.collab.guest);
+    // Only a selection is painted on the pages; a caret is an element of its own.
+    if (had || wide(this.collabPeers)) this.repaintAll();
+    this.schedule();
+  }
+
+  /**
+   * The document was changed by the session: by a step of someone else, by a step of this
+   * participant that was dropped, or by an undoing that had to wait for its turn. The pages
+   * follow, and the caret stays with the text it stood in.
+   */
+  collabChanged(change: DocChange): void {
+    if (this.destroyed) return;
+    if (change.local) {
+      this.afterHistory(change.meta as DocRange | undefined);
+      return;
+    }
+    const selection = this.selection;
+    if (selection !== undefined && selection !== 'all') {
+      // Where the place is no more (its paragraph was replaced, its text went) the caret stays as near as it can:
+      // in the paragraph that stands there, else in a neighbour. Never at the start of the document for no reason.
+      const moved = movedSelection(selection, change.marks) || selection;
+      const anchor = placeNear(this.document, moved.anchor);
+      const focus = placeNear(this.document, moved.focus);
+      let next: DocRange | undefined = anchor && focus ? { anchor, focus } : undefined;
+      if (next) {
+        try {
+          if (!ops.samePosition(next.anchor, next.focus)) ops.comparePositions(next.anchor, next.focus);
+        } catch {
+          next = ops.collapsed(next.focus);
+        }
+      }
+      this.selection = next ? { anchor: copyPosition(next.anchor), focus: copyPosition(next.focus) } : undefined;
+      if (next) this.story = next.focus.story;
+    }
+    this.pendingFormat = undefined;
+    this.targetX = undefined;
+    this.changes++;
+    this.follow();
+    // Without bringing the caret into view: the user did not move it.
+    this.selectionMoved(false);
+    this.commentsFollow();
+  }
+
+  /** What the session has to say, in the words of the view. */
+  collabNotice(notice: CollabNotice): void {
+    if (this.destroyed) return;
+    const words = this.strings.collab;
+    const n = notice.count === undefined ? 1 : notice.count;
+    const said: { [code in CollabNotice['code']]: [string, 'error' | 'info'] } = {
+      dropped: [words.doc.dropped(n), 'error'],
+      partial: [words.doc.partial, 'info'],
+      'undo-gone': [words.doc.undoGone, 'error'],
+      'undo-none': [words.doc.undoNone, 'error'],
+      'undo-lossy': [words.undoLossy, 'info'],
+      skipped: [words.doc.notShared, 'info'],
+      peer: [words.doc.peer, 'error'],
+      stale: [words.stale, 'error'],
+      reloaded: [words.reloaded(n), 'error'],
+      refused: [words.refused, 'error'],
+      backlog: [words.backlog(n), 'info'],
+      'bad-step': [words.doc.badStep, 'error'],
+      'read-only': [words.doc.readOnly, 'error'],
+      detached: [words.doc.detached, 'error'],
+      waiting: [words.waiting, 'info'],
+      'undo-wait': [words.undoWait, 'error'],
+      slow: [words.slow, 'info'],
+    };
+    const line = said[notice.code];
+    if (line) this.notify(line[0], line[1]);
+  }
+
+  /** The words of editing together, in the language of the view. */
+  get collabStrings(): UiStrings['collab'] {
+    return this.strings.collab;
+  }
+
+  /** Lets in what was held back while an input method composed; `later`: once whoever ended the composition is done with it. */
+  private releaseCollab(later: boolean): void {
+    if (this.collabHold) this.collabHold.end(later);
+  }
+
+  /** The page went out of sight: whatever was being composed is over as far as the others are concerned. */
+  private onVisibility = (): void => {
+    if (this.root.ownerDocument && this.root.ownerDocument.visibilityState === 'hidden') this.releaseCollab(false);
+  };
+
+  /** Tells the others where the caret or the selection is. */
+  private sayPresence(): void {
+    const session = this.collab;
+    if (!session) return;
+    const range = this.range();
+    session.setPresence(range ? { story: range.focus.story, anchor: { path: range.anchor.path.slice(), offset: range.anchor.offset }, focus: { path: range.focus.path.slice(), offset: range.focus.offset } } : undefined);
+  }
+
   /** The selection as a range of the model; undefined for "everything" in a read-only view and without a selection. */
   private range(): DocRange | undefined {
     const selection = this.selection;
@@ -4580,7 +4761,9 @@ export class DocumentView {
     const s = this.strings;
     const message = error.message;
     this.notify(
-      message === ops.TRACK_UNSUPPORTED
+      message === NOT_SHARED
+        ? s.collab.doc.notShared
+        : message === ops.TRACK_UNSUPPORTED
         ? s.cannotTrackChange
         : message === ops.REVISIONS_PROTECTED
           ? s.revisionsProtected
@@ -4702,6 +4885,7 @@ export class DocumentView {
     if (reveal) this.reveal();
     this.followComment();
     this.schedule();
+    this.sayPresence();
     if (this.options.onSelectionChange) this.options.onSelectionChange(this.getSelection());
   }
 
@@ -4923,6 +5107,21 @@ export class DocumentView {
     if (!composing && underline.parentNode) underline.parentNode.removeChild(underline);
     if (box && slot && this.editable) this.placeInput(box, slot);
     this.placeTouchTools();
+    this.placePeers();
+  }
+
+  /** The carets of the others, on the pages that are there. */
+  private placePeers(): void {
+    if (!this.peerCarets && this.collabPeers.length === 0) return;
+    const carets = this.peerCarets || (this.peerCarets = new PeerCarets());
+    carets.place(this.collabPeers, (position) => {
+      const box = this.lines.caret(position, 'start', this.caretPage);
+      const slot = box ? this.slots.get(box.page) : undefined;
+      if (!box || !slot) return undefined;
+      const width = this.pageWidth(box.page);
+      const height = this.pageHeight(box.page);
+      return { host: slot.element, left: box.x / width, top: box.top / height, height: box.height / height };
+    });
   }
 
   /** A point of a page in px of the view's root, whatever transforms lie on the view. */
@@ -5369,7 +5568,8 @@ export class DocumentView {
     // Where changes are tracked the copy goes in whole all the same, as a tracked insertion (see insertFragment).
     const asked = this.range();
     const fragment = copy.slice.fragment;
-    if (!fragment) {
+    // In a room what is pasted travels as text, formatting and tables: a copy with everything in it (pictures, fields) does not travel.
+    if (!fragment || this.collab) {
       this.pasteSlice(copy.slice);
       return;
     }

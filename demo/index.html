@@ -212,12 +212,13 @@
       <section id="collab-section">
         <h2>Birlikte düzenleme (<code>collab</code>)</h2>
         <p class="muted">
-          İki düzenleyici aynı boş çalışma kitabını açar ve aynı odaya katılır: birine yazdığınız öbüründe görünür, seçimler renkli çerçeveyle ve adla gösterilir,
+          İki düzenleyici aynı boş çalışma kitabını ya da aynı boş belgeyi açar ve aynı odaya katılır: birine yazdığınız öbüründe görünür, seçimler (belgede imleçler) renkli ve adla gösterilir,
           <b>Geri al</b> yalnız o düzenleyicinin kendi adımını geri alır. "Bağlantıyı kes" ikinci düzenleyiciyi çevrimdışı yapar (yazmaya devam edebilirsiniz); yeniden bağlanınca bekleyen değişiklikler gönderilir.
           Oda varsayılan olarak <b>bu sayfanın içindedir</b> (<code>BymOffice.collab.memoryServer()</code>, hiçbir şey sayfadan çıkmaz); kutu işaretliyse sayfayı sunan yerel sunucunun aktarıcısı (WebSocket) kullanılır.
         </p>
         <div class="row">
           <label title="collab: 'ws://…/e2e/collab/oda' — yalnız sayfa pnpm demo ile sunulduğunda."><input type="checkbox" id="collab-socket" /> Sunucunun aktarıcısıyla (WebSocket)</label>
+          <label>Dosya <select id="collab-kind"><option value="xlsx">Çalışma kitabı (xlsx)</option><option value="docx">Belge (docx)</option></select></label>
           <button id="collab-start">İki düzenleyiciyi aç</button>
           <button id="collab-cut" disabled>İkincinin bağlantısını kes</button>
         </div>
@@ -1158,7 +1159,7 @@
         const socket = $('collab-socket').checked;
         if (socket && !/^https?:$/.test(location.protocol)) return void ($('collab-state').textContent = 'Sunucunun aktarıcısı, sayfa bir sunucudan açıldığında çalışır: pnpm demo.');
         try {
-          const bytes = await BymOffice.createBlank('xlsx', { locale: 'tr' });
+          const bytes = await BymOffice.createBlank($('collab-kind').value === 'docx' ? 'docx' : 'xlsx', { locale: 'tr' });
           const room = `demo-${Math.random().toString(36).slice(2, 10)}`;
           if (!socket) collabRelay = BymOffice.collab.memoryServer();
           $('collab-editors').hidden = false;
@@ -1170,6 +1171,7 @@
               locale: 'tr',
               collab: { transport, user: users[i], onState: collabSay, onPeers: collabSay },
               onChange: collabSay,
+              onDocumentChange: collabSay,
               onNotice: (notice) => {
                 $('collab-notice').textContent = `${i + 1}. düzenleyici: ${notice.message}`;
               },

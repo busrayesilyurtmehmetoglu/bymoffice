@@ -358,7 +358,25 @@ export interface UiStrings {
     editGone: string;
     formulaGone(text: string): string;
     dialogClosed: string;
-    document: string;
+    /** The same for a document, where it is said in other words. */
+    doc: {
+      dropped(n: number): string;
+      undoGone: string;
+      undoNone: string;
+      peer: string;
+      badStep: string;
+      readOnly: string;
+      detached: string;
+      /** Part of what was deleted or formatted here was deleted by someone else at the same time. */
+      partial: string;
+      /** A change that does not travel: a picture, a comment, a revision that is accepted, a paste with everything in it. */
+      notShared: string;
+      /** The document tracks its changes: it is not edited together. */
+      tracked: string;
+      /** The file is no docx (or was converted here): everybody in a room has to read the very same file. */
+      unsupported: string;
+      forkQuestion: string;
+    };
   };
   sheetDeleted(name: string): string;
   /** Said when a reference was put into the formula being typed by pointing at cells: "Reference B5:D9". */
@@ -950,7 +968,20 @@ export const STRINGS_EN: UiStrings = {
     autoWaits: { room: 'Not saved yet: another participant saves for all', offline: 'Not saved: auto-save waits for the connection. Save to store the file now' },
     typedKept: (text) => `The file is loaded again, and what you were typing was not applied. You typed: ${text}`,
     dialogClosed: 'Someone else changed the sheet or its rules: the dialog was closed without applying anything.',
-    document: 'Editing together is not available for documents yet.',
+    doc: {
+      dropped: (n) => (n === 1 ? 'One of your changes could not be applied because someone else changed the same place at the same time.' : `${n} of your changes could not be applied because someone else changed the same place at the same time.`),
+      undoGone: 'This step cannot be undone any more: someone else changed the same paragraphs since.',
+      undoNone: 'This step cannot be undone while the document is edited together.',
+      partial: 'Someone else deleted, at the same time, part of the text you deleted or formatted. If they undo their deletion, that text comes back without your change.',
+      peer: 'Something that is no change of this document arrived; editing together has ended. Your changes stay here.',
+      badStep: 'Someone sent a change that is none for this document. It was left out for everybody.',
+      readOnly: 'The server takes no changes from you: the document is read-only here.',
+      detached: 'The file was changed elsewhere, or the room was started anew, while this document holds changes that are in no file. Nothing was thrown away: your changes are here, and nobody else sees them. Save the file to go on together.',
+      notShared: 'This cannot be done while the document is edited together.',
+      tracked: 'This document tracks its changes, or holds tracked changes: it cannot be edited together yet. It is edited here alone.',
+      unsupported: 'Only a docx file can be edited together: this one is edited here alone.',
+      forkQuestion: 'Your document is apart from the others, and the file was saved by someone else meanwhile. Load the stored file (your unsaved changes are lost; save a copy first if you need them), or save yours over it (what the others saved is lost).',
+    },
   },
   sheetDeleted: (name) => `Sheet ${name} was deleted. Undo brings it back.`,
   referenceAdded: (reference) => `Reference ${reference}`,
@@ -1552,7 +1583,20 @@ export const STRINGS_TR: UiStrings = {
     autoWaits: { room: 'Henüz kaydedilmedi: herkes için başka bir katılımcı kaydediyor', offline: 'Kaydedilmedi: kendiliğinden kaydetme bağlantıyı bekliyor. Şimdi saklamak için Kaydet' },
     typedKept: (text) => `Dosya yeniden yükleniyor; yazmakta olduğunuz uygulanmadı. Yazdığınız: ${text}`,
     dialogClosed: 'Başkası sayfayı ya da kurallarını değiştirdi: kutu hiçbir şey uygulanmadan kapatıldı.',
-    document: 'Birlikte düzenleme belgelerde henüz yok.',
+    doc: {
+      dropped: (n) => (n === 1 ? 'Bir değişikliğiniz, aynı yeri aynı anda başkası değiştirdiği için uygulanamadı.' : `${n} değişikliğiniz, aynı yeri aynı anda başkası değiştirdiği için uygulanamadı.`),
+      undoGone: 'Bu adım artık geri alınamaz: aynı paragrafı sonradan başkası değiştirdi.',
+      undoNone: 'Bu adım, belge birlikte düzenlenirken geri alınamaz.',
+      partial: 'Sildiğiniz ya da biçimlediğiniz metnin bir bölümünü aynı anda başkası sildi. O silmesini geri alırsa metin sizin değişikliğiniz olmadan geri gelir.',
+      peer: 'Bu belgenin değişikliği olmayan bir ileti geldi; birlikte düzenleme sona erdi. Değişiklikleriniz burada duruyor.',
+      badStep: 'Biri bu belgenin değişikliği olmayan bir şey gönderdi. Herkeste atlandı.',
+      readOnly: 'Sunucu sizden değişiklik almıyor: belge burada salt okunur.',
+      detached: 'Dosya başka yerde değişti ya da oda yeniden başladı; bu belgede ise hiçbir dosyada olmayan değişiklikler var. Hiçbir şey atılmadı: değişiklikleriniz burada ve başkası görmüyor. Birlikte devam etmek için dosyayı kaydedin.',
+      notShared: 'Bu, belge birlikte düzenlenirken yapılamaz.',
+      tracked: 'Bu belge değişikliklerini izliyor ya da izlenen değişiklik taşıyor: henüz birlikte düzenlenemez. Burada tek başına düzenleniyor.',
+      unsupported: 'Yalnız docx dosyası birlikte düzenlenebilir: bu dosya burada tek başına düzenleniyor.',
+      forkQuestion: 'Belgeniz öbürlerinden ayrı düştü ve dosyayı bu arada başkası kaydetti. Saklanan dosyayı yükleyin (kaydedilmemiş değişiklikleriniz gider; gerekiyorsa önce kopyanızı indirin) ya da kendinizinkini üzerine kaydedin (öbürlerinin kaydettiği gider).',
+    },
   },
   sheetDeleted: (name) => `${name} sayfası silindi. Geri al ile geri gelir.`,
   referenceAdded: (reference) => `Başvuru ${reference}`,
