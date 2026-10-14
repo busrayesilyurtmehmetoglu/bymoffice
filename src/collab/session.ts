@@ -1350,6 +1350,11 @@ export class CollabSession {
     return this.current === 'online' && this.pendingSteps.length === 0 && this.epoch !== undefined ? { ep: this.epoch, rev: this.confirmed } : undefined;
   }
 
+  /** The workbook that is edited: what a file of the room is written from. */
+  get model(): Workbook {
+    return this.host.workbook();
+  }
+
   get savableRev(): number | undefined {
     return this.current === 'online' && this.pendingSteps.length === 0 ? this.confirmed : undefined;
   }

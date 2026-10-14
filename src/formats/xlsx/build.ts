@@ -65,6 +65,7 @@ import { adjustCommentCell, adjustDrawingAnchor, commentEdits, drawingAnchorNow 
 import { CHART_CONTENT_TYPE, chartCellsOf, chartSpaceXml, chartWritable } from './chart-write';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
 import { ZipArchive } from '../../zip';
+import { readModel } from '../../model/edits';
 import {
   STYLESHEET_ORDER,
   adjustSheetElement,
@@ -1926,6 +1927,30 @@ function sheetIdsOf(sheets: Sheet[]): number[] {
  * carry is listed in `options.report`.
  */
 export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = {}): Promise<Uint8Array> {
+  // The pictures are read first (which takes moments); then the workbook is read in one go, so that the
+  // file is the workbook of one moment. A picture the workbook shows by then and that was not read is read, and the reading starts over.
+  const pictures = new Map<string, Uint8Array | undefined>();
+  for (;;) {
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    for (const sheet of workbook.sheets) if (sheet.drawings) collectMedia(sheet.drawings.map((drawing) => drawing.object), keys, seen, 0);
+    for (const key of keys) {
+      if (pictures.has(key)) continue;
+      let bytes: Uint8Array | undefined;
+      try {
+        bytes = workbook.media ? await workbook.media.readPart(key) : undefined;
+      } catch (error) {
+        bytes = undefined;
+      }
+      pictures.set(key, bytes);
+    }
+    const zip = readModel(workbook, () => builtXlsx(workbook, options, pictures));
+    if (zip) return zip.write();
+  }
+}
+
+/** The package of a workbook, from the workbook as it is and the pictures that were read; undefined when the workbook shows a picture that was not. */
+function builtXlsx(workbook: Workbook, options: BuildXlsxOptions, pictures: Map<string, Uint8Array | undefined>): ZipArchive | undefined {
   const notes = new Notes();
   const strings = new StringTable(workbook.sharedStrings);
 
@@ -1958,13 +1983,9 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
   const keys: string[] = [];
   const seenKeys = new Set<string>();
   for (const sheet of sheets) if (sheet.drawings) collectMedia(sheet.drawings.map((drawing) => drawing.object), keys, seenKeys, 0);
+  for (const key of keys) if (!pictures.has(key)) return undefined;
   for (const key of keys) {
-    let bytes: Uint8Array | undefined;
-    try {
-      bytes = workbook.media ? await workbook.media.readPart(key) : undefined;
-    } catch (error) {
-      bytes = undefined;
-    }
+    const bytes = pictures.get(key);
     const kind = bytes && bytes.length > 0 ? mediaKind(bytes) : undefined;
     if (!bytes || !kind) {
       media.parts.set(key, undefined);
@@ -2108,5 +2129,5 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
     options.report.parts.push(...partNames);
     options.report.warnings.push(...notes.list());
   }
-  return zip.write();
+  return zip;
 }

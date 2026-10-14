@@ -766,7 +766,8 @@ async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOpt
       // was never read, or read and not changed, leaves the package as it is.
       const save = async (saveOptions?: SaveOptions) => {
         const doc = model ? await model.catch(() => undefined) : undefined;
-        // The file of one moment of the document: one that was changed while it was written is written again.
+        // The file of one moment of the document: the writer reads it in one go, and what is changed around that
+        // reading is in the file (before it) or is not (after it). writeSteady() is what is left for a writer that does not.
         return writeSteady(doc, async () => {
           if (doc) await writeDocx(pkg, doc);
           return protect(await pkg.save(), saveOptions);
@@ -781,7 +782,7 @@ async function openWith(input: Uint8Array | ArrayBuffer | Blob, options: OpenOpt
       const save = async (saveOptions?: SaveOptions) => {
         // A file whose model could not be read was not changed either: it is saved as it is.
         const model = workbook ? await workbook.catch(() => undefined) : undefined;
-        // The file of one moment of the workbook: one that was changed while it was written is written again.
+        // The file of one moment of the workbook: read in one go, as the document above.
         return writeSteady(model, async () => {
           if (model) await writeXlsx(pkg, model);
           return protect(await pkg.save(), saveOptions);

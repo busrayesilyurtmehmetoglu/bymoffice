@@ -2,6 +2,7 @@
 // Only a workbook that is edited together writes it; whatever other properties the file has
 // stay as they are.
 
+import { editsOf, readMomentOf, readingsOf } from '../../model/edits';
 import type { OpcPackage } from '../../opc';
 import { turnOfPackage } from '../../package-turn';
 import { ZipArchive } from '../../zip';
@@ -170,6 +171,25 @@ export interface StampingSession {
   whenSettled(ms: number): Promise<unknown>;
   pause(): void;
   resume(): boolean;
+  /**
+   * The workbook the file is written from, when the session knows it. With it, what is changed here after
+   * the writer has read the workbook (which it does in one go) does not make the file one of no step: it
+   * is not in the file.
+   */
+  readonly model?: object;
+}
+
+/**
+ * Tells whether a file that was written while its session was held is the workbook as it was when the
+ * holding began: `begin()` is called at that moment, and what it answers after the file was written - true
+ * when the writer read the workbook in one go and nothing had changed it until then.
+ */
+function sameMoment(session: StampingSession): () => boolean {
+  const model = session.model;
+  if (!model) return () => false;
+  const at = editsOf(model);
+  const told = readingsOf(model);
+  return () => readingsOf(model) !== told && readMomentOf(model) === at;
 }
 
 /** A file written by writeSharedFile(). */
@@ -222,6 +242,7 @@ export async function writeSharedFile(
       const rev = session.savableRev;
       // Never a step the file may not be of: after two tries into which something was typed, it says nothing.
       const stamp = attempt < 2 ? session.stampNow : undefined;
+      const asHeld = sameMoment(session);
       session.pause();
       let bytes: Uint8Array;
       let touched = false;
@@ -237,6 +258,8 @@ export async function writeSharedFile(
       } finally {
         touched = session.resume();
       }
+      // What was changed here only after the workbook was read for the file is not in the file.
+      if (touched && asHeld()) touched = false;
       if (touched && stamp !== undefined) return undefined;
       return { bytes, rev: touched ? undefined : rev };
     });
@@ -302,6 +325,7 @@ export async function proofFile(
   const taken = await locked(async () => {
     const rev = session.savableRev;
     const stamp = session.stampNow;
+    const asHeld = sameMoment(session);
     session.pause();
     let bytes: Uint8Array;
     let touched = false;
@@ -310,6 +334,8 @@ export async function proofFile(
     } finally {
       touched = session.resume();
     }
+    // What was changed here only after the workbook was read for the file is not in the file.
+    if (touched && asHeld()) touched = false;
     return { bytes, rev: touched ? undefined : rev, stamp: touched ? undefined : stamp };
   });
   if (taken.rev === undefined || taken.stamp === undefined) return { bytes: taken.bytes, rev: undefined };

@@ -114,6 +114,8 @@ import {
   type WriteCounters,
 } from './write-package';
 import { treeText } from './write-body';
+import { writeInOneGo, type PartReads } from '../part-reads';
+import { readModel } from '../../model/edits';
 
 /** What a write did; filled in when passed with the options. */
 export interface DocxWriteReport {
@@ -396,10 +398,80 @@ class RelsEdit {
  * stories that were modified, and what the model has that the package lacks
  * (relationships, pictures, numbering definitions, styles). Does nothing when
  * nothing was modified.
+ *
+ * The model is read in one go: what the write needs of the package is read first, then the
+ * model is read and every part written without waiting for anything. The package is the document
+ * of that moment, whatever is changed while this runs.
  */
 export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDocxOptions = {}): Promise<void> {
+  await writeInOneGo(
+    pkg,
+    doc,
+    (reads) => foreseeDocx(pkg, doc, options, reads),
+    (reads) => {
+      // What a reading that starts over said is not said twice.
+      const report = options.report ? emptyWriteReport() : undefined;
+      produceDocx(pkg, doc, options, reads, report);
+      if (report && options.report) {
+        const told = options.report;
+        for (const part of report.parts) told.parts.push(part);
+        for (const warning of report.warnings) told.warnings.push(warning);
+        told.copiedBlocks += report.copiedBlocks;
+        told.writtenBlocks += report.writtenBlocks;
+        told.droppedCharacters += report.droppedCharacters;
+      }
+    },
+  );
+}
+
+/** The parts beside the document that a write looks at, by the end of the type the document relates to each and the name a new one gets. */
+const SIDE_PARTS: [suffix: string, fileName: string][] = [
+  ['/comments', 'comments.xml'],
+  ['/commentsExtended', 'commentsExtended.xml'],
+  ['/commentsIds', 'commentsIds.xml'],
+  ['/commentsExtensible', 'commentsExtensible.xml'],
+  ['/settings', 'settings.xml'],
+  ['/numbering', 'numbering.xml'],
+  ['/styles', 'styles.xml'],
+  ['/fontTable', 'fontTable.xml'],
+];
+
+/**
+ * Asks for the parts a write of the document may need (see writeInOneGo): the model is looked at
+ * for no more than which of its stories are written. What this does not foresee, the write asks
+ * for itself.
+ */
+function foreseeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDocxOptions, reads: PartReads): void {
+  const main = doc.body.part;
+  if (doc.body.rootName === '' || main.charAt(0) !== '/') return;
+  const saved = SAVES.get(pkg);
+  const want = (part: string): Uint8Array | undefined => {
+    const kept = saved ? saved.originals.get(part) : undefined;
+    if (kept !== undefined) return kept === null ? undefined : kept;
+    return reads.bytes(part);
+  };
+  const relsBytes = want(relsPartOf(main));
+  const dir = main.slice(0, main.lastIndexOf('/') + 1);
+  let any = !!doc.numbering.modified || (!!saved && saved.written.size > 0) || doc.settings.trackRevisions === true;
+  for (const entry of storiesOf(doc)) {
+    const story = entry.story;
+    if (story.part.charAt(0) !== '/') {
+      if (entry.kind === 'comments') any = true;
+      continue;
+    }
+    if (options.regenerate !== true && !story.modified && !(saved && saved.written.has(story.part))) continue;
+    any = true;
+    want(story.part);
+    want(relsPartOf(story.part));
+  }
+  const rels = new RelsEdit(relsBytes);
+  // The settings are looked at by every write; the others by one that has something to write.
+  for (const [suffix, fileName] of SIDE_PARTS) if (any || suffix === '/settings') want(rels.partOf(main, suffix) || dir + fileName);
+  if (any && doc.media) for (const target of doc.media.keys()) if (target.charAt(0) === '/') want(target);
+}
+
+function produceDocx(pkg: OpcPackage, doc: DocModel, options: WriteDocxOptions, reads: PartReads, report: DocxWriteReport | undefined): void {
   const regenerate = options.regenerate === true;
-  const report = options.report;
   const main = doc.body.part;
   if (doc.body.rootName === '' || main.charAt(0) !== '/') {
     throw new Error('Cannot write the document into a package: it was not read from one (use buildDocx)');
@@ -408,10 +480,10 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   const saved: SaveState = SAVES.get(pkg) || { originals: new Map(), written: new Set() };
   const { originals } = saved;
   // The first time a part is about to be rewritten, the package still holds it as the file had it.
-  const originalOf = async (part: string): Promise<Uint8Array | undefined> => {
+  const originalOf = (part: string): Uint8Array | undefined => {
     const kept = originals.get(part);
     if (kept !== undefined) return kept === null ? undefined : kept;
-    const bytes = pkg.hasPart(part) ? await pkg.readPart(part) : undefined;
+    const bytes = reads.bytes(part);
     originals.set(part, bytes === undefined ? null : bytes);
     return bytes;
   };
@@ -419,9 +491,9 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes = new Map<string, { data: Uint8Array; contentType?: string }>();
   const relsEdits = new Map<string, RelsEdit>();
-  const relsFor = async (part: string): Promise<RelsEdit> => {
+  const relsFor = (part: string): RelsEdit => {
     let edit = relsEdits.get(part);
-    if (!edit) relsEdits.set(part, (edit = new RelsEdit(await originalOf(relsPartOf(part)))));
+    if (!edit) relsEdits.set(part, (edit = new RelsEdit(originalOf(relsPartOf(part)))));
     return edit;
   };
   const shared: WriteCounters = { dropped: { count: 0 }, drawingIds: { next: 100000 } };
@@ -430,14 +502,14 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
 
   const dir = main.slice(0, main.lastIndexOf('/') + 1);
   /** The part the document relates to by a type that ends so, as the file had it; else a name in the folder of the document that no part of the file has. */
-  const partFor = async (suffix: string, fileName: string): Promise<{ part: string; related: boolean } | undefined> => {
-    const rels = await relsFor(main);
+  const partFor = (suffix: string, fileName: string): { part: string; related: boolean } | undefined => {
+    const rels = relsFor(main);
     const existing = rels.partOf(main, suffix);
     if (existing) return { part: existing, related: true };
     let part = dir + fileName;
     const dot = fileName.lastIndexOf('.');
-    for (let n = 2; n < 1000 && (await originalOf(part)); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
-    return (await originalOf(part)) ? undefined : { part, related: false };
+    for (let n = 2; n < 1000 && originalOf(part); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
+    return originalOf(part) ? undefined : { part, related: false };
   };
 
   let stories = 0;
@@ -452,7 +524,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     if (entry.kind === 'comments' && story.rootName === '' && story.source === '') {
       // Comments that were added to a document without any: their part is made, where the document relates to one
       // that is missing or under a name that is free.
-      const place = await partFor('/comments', 'comments.xml');
+      const place = partFor('/comments', 'comments.xml');
       if (!place) {
         if (report) report.warnings.push('No free name was found for a new comments.xml; the comments were not written');
         continue;
@@ -461,7 +533,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
       rootAttrs = generatedRootAttrs(doc.strict);
       const ctx = createBodyContext(part, rootAttrs, story.relationships, shared);
       newRoot = { name: ctx.w + 'comments', attrs: rootAttrs };
-      if (!place.related) (await relsFor(main)).add((await relsFor(main)).freeId(), ns.rel + 'comments', relativeTarget(main, part), false);
+      if (!place.related) relsFor(main).add(relsFor(main).freeId(), ns.rel + 'comments', relativeTarget(main, part), false);
     } else {
       // A part that an earlier write put into the package is written again whatever the flag says: the
       // model may have been taken back to what was read (undo past the save), and the package has to follow.
@@ -474,7 +546,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
       story = commentsForWriting(story as StoryCollection<Comment>, rootAttrs);
       rootAttrs = newRoot ? rootAttrs : story.rootAttrs;
     }
-    const original = await originalOf(part);
+    const original = originalOf(part);
     stories++;
     const relationships = story.relationships;
     // Relationships made for this write: the model is not changed by writing it.
@@ -504,7 +576,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     // The bytes of the file when the text is what was read from them (they may differ in a byte order mark or line ends).
     writes.set(part, { data: original && text === story.source ? original : encodePart(text), contentType: newRoot ? CONTENT_TYPES.comments : undefined });
     // Relationships the model has and the part lacks.
-    const rels = await relsFor(part);
+    const rels = relsFor(part);
     for (const rel of relationships.values()) {
       if (!rels.has(rel.id)) rels.add(rel.id, rel.type, rel.target, rel.external);
     }
@@ -517,15 +589,15 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   if (commentsWritten) {
     const links = modelLinks(doc.comments);
     const had = paraIdsInSource(doc.comments ? doc.comments.source : '');
-    const mainRels = await relsFor(main);
+    const mainRels = relsFor(main);
     const unreadable = (part: string): void => {
       if (report) report.warnings.push(`${part} could not be followed; what it says of the comments was not brought up to date`);
     };
-    const extendedPlace = await partFor('/commentsExtended', 'commentsExtended.xml');
+    const extendedPlace = partFor('/commentsExtended', 'commentsExtended.xml');
     if (!extendedPlace) {
       if (needsExtended(links) && report) report.warnings.push('No free name was found for a new commentsExtended.xml; the answers and the resolved state of the comments were not written');
     } else {
-      const original = await originalOf(extendedPlace.part);
+      const original = originalOf(extendedPlace.part);
       const tree = parseSidePart(original);
       if (original && !tree) unreadable(extendedPlace.part);
       else {
@@ -538,7 +610,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     }
     // These two are never made: a file without them is one of a Word that does not look for them.
     const idsPart = mainRels.partOf(main, '/commentsIds');
-    const idsOriginal = idsPart ? await originalOf(idsPart) : undefined;
+    const idsOriginal = idsPart ? originalOf(idsPart) : undefined;
     if (idsPart && idsOriginal) {
       const tree = parseSidePart(idsOriginal);
       if (!tree) unreadable(idsPart);
@@ -547,7 +619,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
         if (result) {
           writes.set(idsPart, { data: encodePart(result.text) });
           const extensiblePart = mainRels.partOf(main, '/commentsExtensible');
-          const extensibleOriginal = extensiblePart ? await originalOf(extensiblePart) : undefined;
+          const extensibleOriginal = extensiblePart ? originalOf(extensiblePart) : undefined;
           if (extensiblePart && extensibleOriginal) {
             const extensible = parseSidePart(extensibleOriginal);
             if (!extensible) unreadable(extensiblePart);
@@ -566,10 +638,10 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   let tracking: { part: string; data: Uint8Array; contentType?: string; relate: boolean } | undefined;
   {
     const wanted = doc.settings.trackRevisions === true;
-    const rels = new RelsEdit(await originalOf(relsPartOf(main)));
+    const rels = new RelsEdit(originalOf(relsPartOf(main)));
     const existing = rels.partOf(main, '/settings');
     const part = existing || dir + 'settings.xml';
-    const original = await originalOf(part);
+    const original = originalOf(part);
     if (!original) {
       if (wanted) {
         const attrs = generatedRootAttrs(doc.strict);
@@ -621,14 +693,14 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   // Nothing to do for a document that was not edited and never written.
   if (!stories && !doc.numbering.modified && !saved.written.size && !tracking) return;
 
-  const mainRels = await relsFor(main);
+  const mainRels = relsFor(main);
   if (tracking) {
     writes.set(tracking.part, { data: tracking.data, contentType: tracking.contentType });
     if (tracking.relate) mainRels.add(mainRels.freeId(), ns.rel + 'settings', relativeTarget(main, tracking.part), false);
   }
 
   // Numbering definitions and styles the model has and their parts lack are added to the text of those parts.
-  const additions = async (
+  const additions = (
     suffix: string,
     fileName: string,
     contentType: string,
@@ -636,19 +708,19 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     produce: (ctx: BodyContext, has: (kind: string, attribute: string, value: string) => boolean) => { first: string; second: string } | undefined,
     firstBefore: string[],
     secondBefore: string[],
-  ): Promise<void> => {
+  ): void => {
     const existing = mainRels.partOf(main, suffix);
     let part = existing || dir + fileName;
     if (!existing) {
       // A part of that name the document does not relate to is not this part: it is left alone, and the new one gets a free name.
       const dot = fileName.lastIndexOf('.');
-      for (let n = 2; n < 1000 && (await originalOf(part)); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
-      if (await originalOf(part)) {
+      for (let n = 2; n < 1000 && originalOf(part); n++) part = dir + fileName.slice(0, dot) + n + fileName.slice(dot);
+      if (originalOf(part)) {
         if (report) report.warnings.push(`No free name was found for a new ${fileName}; nothing was added`);
         return;
       }
     }
-    const original = await originalOf(part);
+    const original = originalOf(part);
     if (!original) {
       // No such part in the file: a new one, when the model has anything to put into it.
       const attrs = generatedRootAttrs(doc.strict);
@@ -715,7 +787,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     writes.set(part, { data: splicedPart(original, splices.filter((splice) => splice.text !== '')), contentType: pkg.contentTypeOf(part) === undefined ? contentType : undefined });
   };
 
-  await additions(
+  additions(
     '/numbering',
     'numbering.xml',
     CONTENT_TYPES.numbering,
@@ -732,7 +804,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
     ['num', 'numIdMacAtCleanup'],
     ['numIdMacAtCleanup'],
   );
-  await additions(
+  additions(
     '/styles',
     'styles.xml',
     CONTENT_TYPES.styles,
@@ -747,7 +819,7 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
   );
   // Fonts the model knows and the font table of the file does not name (a paste from another document brought them).
   if (doc.fonts.size) {
-    await additions(
+    additions(
       '/fontTable',
       'fontTable.xml',
       CONTENT_TYPES.fontTable,
@@ -766,8 +838,10 @@ export async function writeDocx(pkg: OpcPackage, doc: DocModel, options: WriteDo
 
   // Pictures the model carries and the file did not have.
   if (doc.media) {
+    // All of them at once: a reading that starts over for each picture would start over often.
+    reads.need([...doc.media.keys()].filter((target) => target.charAt(0) === '/' && !originals.has(target)));
     for (const [target, media] of doc.media) {
-      if (target.charAt(0) !== '/' || (await originalOf(target))) continue;
+      if (target.charAt(0) !== '/' || originalOf(target)) continue;
       writes.set(target, { data: media.bytes, contentType: pkg.contentTypeOf(target) === media.type ? undefined : media.type });
     }
   }
@@ -1054,7 +1128,41 @@ function withCompleteMarks(doc: DocModel, fill: RevisionFill): DocModel {
  * docx file can be given too, with `options.pictures` for its images.
  */
 export async function buildDocx(model: DocModel, options: BuildDocxOptions = {}): Promise<Uint8Array> {
-  const report = options.report;
+  // The pictures are read first (which takes moments); then the document is read in one go, so that the
+  // file is the document of one moment. A picture the document shows by then and that was not read is read, and the reading starts over.
+  const pictures = new Map<string, DocMedia | null>();
+  for (;;) {
+    if (options.pictures) {
+      for (const entry of storiesOf(model)) {
+        for (const rel of entry.story.relationships.values()) {
+          if (rel.external || rel.part === null || !endsWith(rel.type, '/image') || pictures.has(rel.part) || (model.media && model.media.has(rel.part))) continue;
+          try {
+            const extension = rel.part.slice(rel.part.lastIndexOf('.') + 1).toLowerCase();
+            pictures.set(rel.part, { bytes: await options.pictures.readPart(rel.part), type: IMAGE_TYPES[extension] || 'application/octet-stream' });
+          } catch (error) {
+            pictures.set(rel.part, null);
+          }
+        }
+      }
+    }
+    // What a reading that starts over said is not said twice.
+    const report = options.report ? emptyWriteReport() : undefined;
+    const zip = readModel(model, () => builtDocx(model, options, pictures, report));
+    if (!zip) continue;
+    if (report && options.report) {
+      const told = options.report;
+      for (const part of report.parts) told.parts.push(part);
+      for (const warning of report.warnings) told.warnings.push(warning);
+      told.copiedBlocks += report.copiedBlocks;
+      told.writtenBlocks += report.writtenBlocks;
+      told.droppedCharacters += report.droppedCharacters;
+    }
+    return zip.write();
+  }
+}
+
+/** The package of a document, from the document as it is and the pictures that were read; undefined when the document shows a picture that was not. */
+function builtDocx(model: DocModel, options: BuildDocxOptions, pictures: Map<string, DocMedia | null>, report: DocxWriteReport | undefined): ZipArchive | undefined {
   const warn = (text: string) => {
     if (report) report.warnings.push(text);
   };
@@ -1089,12 +1197,10 @@ export async function buildDocx(model: DocModel, options: BuildDocxOptions = {})
     for (const entry of entries) {
       for (const rel of entry.story.relationships.values()) {
         if (rel.external || rel.part === null || !endsWith(rel.type, '/image') || available.has(rel.part)) continue;
-        try {
-          const extension = rel.part.slice(rel.part.lastIndexOf('.') + 1).toLowerCase();
-          available.set(rel.part, { bytes: await options.pictures.readPart(rel.part), type: IMAGE_TYPES[extension] || 'application/octet-stream' });
-        } catch (error) {
-          warn('A picture could not be read and was left out');
-        }
+        const read = pictures.get(rel.part);
+        if (read === undefined) return undefined;
+        if (read) available.set(rel.part, read);
+        else warn('A picture could not be read and was left out');
       }
     }
   }
@@ -1304,5 +1410,5 @@ export async function buildDocx(model: DocModel, options: BuildDocxOptions = {})
     if (lost.theme) warn('The theme was not carried over: theme colours and theme fonts were written as the plain values they stand for');
     for (const name of zip.names()) report.parts.push('/' + name);
   }
-  return zip.write();
+  return zip;
 }

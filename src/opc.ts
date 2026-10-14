@@ -31,6 +31,27 @@ function resolveTarget(source: string, target: string): string {
   return `/${segments.join('/')}`;
 }
 
+/** The part that holds the relationships of a part ("/": those of the package). */
+export function relsPartFor(source: string): string {
+  const slash = source.lastIndexOf('/');
+  return `${source.slice(0, slash)}/_rels/${source.slice(slash + 1)}.rels`;
+}
+
+/** The relationships a relationships part states, for the part they belong to. */
+export function relationshipsOf(source: string, doc: XmlDocument): Relationship[] {
+  return childElements(doc.root, 'Relationship').map((rel) => {
+    const target = rel.attrs.get('Target') ?? '';
+    const external = rel.attrs.get('TargetMode') === 'External';
+    return {
+      id: rel.attrs.get('Id') ?? '',
+      type: rel.attrs.get('Type') ?? '',
+      target,
+      external,
+      part: external ? null : resolveTarget(source, target),
+    };
+  });
+}
+
 /**
  * What a list of content types says, whatever order it says it in: every child of the root
  * with its attributes. Two lists with the same signature declare the same types.
@@ -103,21 +124,9 @@ export class OpcPackage {
 
   /** Relationships of a part; pass "/" for the package-level ones. */
   async relationships(source = '/'): Promise<Relationship[]> {
-    const slash = source.lastIndexOf('/');
-    const relsPart = `${source.slice(0, slash)}/_rels/${source.slice(slash + 1)}.rels`;
+    const relsPart = relsPartFor(source);
     if (!this.hasPart(relsPart)) return [];
-    const doc = await this.readXml(relsPart);
-    return childElements(doc.root, 'Relationship').map((rel) => {
-      const target = rel.attrs.get('Target') ?? '';
-      const external = rel.attrs.get('TargetMode') === 'External';
-      return {
-        id: rel.attrs.get('Id') ?? '',
-        type: rel.attrs.get('Type') ?? '',
-        target,
-        external,
-        part: external ? null : resolveTarget(source, target),
-      };
-    });
+    return relationshipsOf(source, await this.readXml(relsPart));
   }
 
   /** The main document part (word/document.xml, xl/workbook.xml, ...). */

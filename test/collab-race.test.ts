@@ -3,68 +3,13 @@
 // by this engine and by a reader that knows nothing of it.
 
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { join as joinPath } from 'node:path';
 import { test } from 'node:test';
 import { proofFile, readCollabStamp, writeSharedFile } from '../src/formats/xlsx/collab-stamp';
 import { OpcPackage, ZipArchive, createBlank, open } from '../src/index';
 import { setCellInput } from '../src/ops/commands';
 import { packageTurn } from '../src/package-turn';
 import { Net, act, join, saveOf, seeded, startFile } from './collab-fixtures';
-
-/** Every archive: all parts unpack, none is empty that should not be, and every XML part is well formed (Python's zipfile and ElementTree). */
-function independent(files: { [name: string]: Uint8Array }): string[] {
-  try {
-    execFileSync('python3', ['-I', '-c', 'import zipfile, xml.etree.ElementTree'], { stdio: 'ignore', timeout: 60000 });
-  } catch {
-    return [];
-  }
-  const dir = mkdtempSync(joinPath(process.cwd(), 'test', '.race-'));
-  try {
-    for (const name of Object.keys(files)) writeFileSync(joinPath(dir, `${name}.bin`), files[name]);
-    const script = [
-      'import sys, os, json, zipfile, struct, re',
-      'import xml.etree.ElementTree as E',
-      'bad = []',
-      'd = sys.argv[1]',
-      'for f in sorted(os.listdir(d)):',
-      '  try:',
-      '    z = zipfile.ZipFile(os.path.join(d, f))',
-      '    if z.testzip() is not None: bad.append(f + ": a part does not unpack")',
-      '    names = z.namelist()',
-      '    if "[Content_Types].xml" not in names or "_rels/.rels" not in names: bad.append(f + ": no content types or relationships")',
-      '    raw = open(os.path.join(d, f), "rb").read()',
-      '    e = raw.rfind(b"PK\\x05\\x06")',
-      '    said = struct.unpack("<H", raw[e + 10:e + 12])[0]',
-      '    central = raw.count(b"PK\\x01\\x02")',
-      '    local = raw.count(b"PK\\x03\\x04")',
-      '    if not (said == len(names) == central == local): bad.append(f + ": the archive says %d entries, its directory has %d, %d are in it, %d are listed" % (said, central, local, len(names)))',
-      '    if "xl/styles.xml" in names:',
-      '      st = z.read("xl/styles.xml").decode("utf-8")',
-      '      m = re.search(r"<cellXfs[^>]*>(.*?)</cellXfs>", st, re.S)',
-      '      xfs = len(re.findall(r"<xf[ >/]", m.group(1))) if m else 1',
-      '      wbx = z.read("xl/workbook.xml").decode("utf-8")',
-      '      sheets = len(re.findall(r"<sheet ", wbx))',
-      '      parts = [n for n in names if re.match(r"xl/worksheets/[^/]+\\.xml$", n)]',
-      '      if sheets != len(parts): bad.append(f + ": the workbook names %d sheets and has %d sheet parts" % (sheets, len(parts)))',
-      '      for n in parts:',
-      '        for sidx in re.findall(r"<c [^>]*\\bs=\\"(\\d+)\\"", z.read(n).decode("utf-8")):',
-      '          if int(sidx) >= xfs: bad.append(f + ": " + n + " names style %s of %d" % (sidx, xfs)); break',
-      '    for n in names:',
-      '      data = z.read(n)',
-      '      if n.endswith(".xml") or n.endswith(".rels"):',
-      '        if len(data) == 0: bad.append(f + ": " + n + " is empty")',
-      '        else: E.fromstring(data)',
-      '  except Exception as e:',
-      '    bad.append(f + ": " + str(e))',
-      'print(json.dumps(bad))',
-    ].join('\n');
-    return JSON.parse(execFileSync('python3', ['-I', '-c', script, dir], { encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'inherit'] }));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
+import { RACE_DELAYS, changeSheet, docEdit, docStart, independent, load, moments, sameBytes, type Engine } from './one-go-fixtures';
 
 const ticks = async (n: number): Promise<void> => {
   for (let i = 0; i < n; i++) await Promise.resolve();
@@ -264,7 +209,7 @@ test('a model that is changed while its file is written: written again once the 
   const before = editsOf(book);
   const done = engine.recalculate([{ sheet: 0, row: 1, col: 1 }]);
   assert.ok(done.some((part) => part.cells.length > 0), 'the calculation wrote results (or the test tests nothing)');
-  assert.ok(editsOf(book) > before, 'and each of them counts as a change of the workbook: a file that was being written is written again');
+  assert.ok(editsOf(book) > before, 'and each of them counts as a change of the workbook');
 });
 
 test('the turn of a package: a save from within it does not wait for it, and the stamp of a room is written within the turn of its file by itself', async () => {
@@ -308,4 +253,149 @@ test('the turn of a package: a save from within it does not wait for it, and the
     const [x, y] = await Promise.all([first, second]);
     assert.deepEqual([await readCollabStamp((await open(x.bytes)).package!), await readCollabStamp((await open(y.bytes)).package!)], [{ ep: 'room', rev: 1 }, { ep: 'room', rev: 2 }], `${delay} moments apart: each file says the step it was written for`);
   }
+});
+
+/** Counts how often the package of a file is packed: once for a save that writes its file once. */
+function countPacks(file: { package?: { save(): Promise<Uint8Array> } }): () => number {
+  const pkg = file.package!;
+  const packed = pkg.save.bind(pkg);
+  let count = 0;
+  pkg.save = () => {
+    count++;
+    return packed();
+  };
+  return () => count;
+}
+
+test('a workbook that is changed in every way while its file is written: the file is the workbook of the moment it was read at, written once', async () => {
+  const e: Engine = await load(process.cwd());
+  const { applyOp } = e.ops;
+  // The file to begin with holds something of everything, as a file does: a chart, notes, rules, merged cells, a filter, a hidden sheet.
+  const prepared = await open(await startFile());
+  const book = await prepared.workbook();
+  for (const [seed, kind] of [[1, 'chart+'], [2, 'note'], [3, 'note'], [4, 'rule+'], [5, 'rule+'], [6, 'validation'], [7, 'merge'], [8, 'filter'], [9, 'sheet+'], [10, 'style'], [11, 'chart+']] as [number, string][]) {
+    for (let tries = 0; tries < 50 && !changeSheet(e, book, seeded(seed * 100 + tries), kind); tries++);
+  }
+  const start = await prepared.save();
+  const session = async (): Promise<{ file: Awaited<ReturnType<typeof open>>; wb: Awaited<ReturnType<Awaited<ReturnType<typeof open>>['workbook']>> }> => {
+    const file = await open(start);
+    const wb = await file.workbook();
+    // Something to write: the save has work to do.
+    setCellInput(wb, 0, 11, 2, 'changed before the save').forEach((op) => applyOp(wb, op));
+    return { file, wb };
+  };
+  const before = await (await session()).file.save();
+  const kinds = ['type', 'style', 'sheet+', 'sheet-', 'move sheet', 'rename', 'copy sheet', 'hide sheet', 'tab', 'insert rows', 'delete rows', 'insert columns', 'delete columns', 'note', 'validation', 'rule+', 'rule-', 'rule change', 'chart+', 'chart copy', 'chart paste', 'chart-', 'chart move', 'chart change', 'filter', 'merge', 'unmerge', 'sort', 'paste'];
+  const files: { [name: string]: Uint8Array } = { before };
+  const fell = { before: 0, after: 0 };
+  for (const kind of kinds) {
+    // A seed with which the change applies to the file, and does something to it.
+    let seed = 0;
+    let after: Uint8Array | undefined;
+    for (let tries = 1; tries <= 300 && !after; tries++) {
+      const probe = await session();
+      if (!changeSheet(e, probe.wb, seeded(tries), kind)) continue;
+      const bytes = await probe.file.save();
+      if (sameBytes(bytes, before)) continue;
+      seed = tries;
+      after = bytes;
+    }
+    assert.ok(after, `${kind}: a change of this kind applies to the file`);
+    files[`after-${kind.replace(/[^a-z]+/g, '-')}`] = after;
+    let both = 0;
+    for (const delay of RACE_DELAYS) {
+      const { file, wb } = await session();
+      const packs = countPacks(file);
+      const saving = file.save();
+      await moments(delay);
+      assert.ok(changeSheet(e, wb, seeded(seed), kind), `${kind}, ${delay}: the change applies`);
+      const out = await saving;
+      const label = `${kind}, ${delay} moments into the save`;
+      const isBefore = sameBytes(out, before);
+      if (!isBefore && !sameBytes(out, after)) assert.fail(`${label}: the file is the workbook of no moment`);
+      assert.equal(packs(), 1, `${label}: the file was written once`);
+      if (isBefore) fell.before++;
+      else fell.after++;
+      both |= isBefore ? 1 : 2;
+      // And nothing of that save is in the way of the next one, which holds the change.
+      assert.ok(sameBytes(await file.save(), after), `${label}: the save after it is the workbook with the change`);
+      if (!isBefore || delay === 0) files[`${kind.replace(/[^a-z]+/g, '-')}-${delay}`] = out;
+    }
+    assert.ok(both & 1, `${kind}: the change came after the workbook was read in some of the runs (or the test tests nothing)`);
+  }
+  assert.ok(fell.after > 0 && fell.before > 0, `the change came before the workbook was read in some runs and after it in others (${JSON.stringify(fell)})`);
+  if (process.env.RACE_STATS) console.log('workbook', JSON.stringify(fell));
+  assert.deepEqual(independent(files), [], 'every file is whole to a reader that is not this engine');
+});
+
+test('a document that is changed in every way while its file is written: the file is the document of the moment it was read at, written once', async () => {
+  const e: Engine = await load(process.cwd());
+  const { DocHistory, setTracking } = e.doc;
+  const now = (): Date => new Date('2026-10-12T08:09:10Z');
+  const files: { [name: string]: Uint8Array } = {};
+  const fell = { before: 0, after: 0 };
+  // Three files: without comments, with every part beside the comments, with tracking on (what is typed there is a tracked change).
+  for (const fileKind of [0, 3, 4]) {
+    const start = await docStart(e, fileKind);
+    const session = async (): Promise<{ file: Awaited<ReturnType<typeof open>>; doc: unknown; apply(edit: unknown): void }> => {
+      const file = await open(start);
+      const doc = await file.document();
+      setTracking(doc, { author: 'Me', now });
+      const history = new DocHistory(doc);
+      const apply = (edit: unknown): void => {
+        history.applyEdit(edit, undefined);
+        history.seal();
+      };
+      // Something to write: the save has work to do.
+      apply(e.doc.insertText(doc, { story: 'body', path: [1], offset: 2 }, 'typed before the save'));
+      return { file, doc, apply };
+    };
+    const before = await (await session()).file.save();
+    files[`before-${fileKind}`] = before;
+    const kinds = ['insertText', 'insertLines', 'deleteRange', 'splitParagraph', 'setRunFormat', 'setParaFormat', 'toggleList', 'insertTable', 'insertRow', 'deleteRow', 'insertColumn', 'deleteColumn', 'insertHyperlink', 'insertImage', 'add', 'track'].concat(fileKind === 0 ? [] : ['reply', 'remove', 'edit', 'resolve']);
+    for (const kind of kinds) {
+      const made = (doc: unknown, seed: number): { name: string; edit: { ops: unknown[] } } | undefined => {
+        const d = e.docFixtures.dice(seed);
+        const only = ['add', 'reply', 'remove', 'track'].indexOf(kind) >= 0 ? kind : undefined;
+        const edit = only !== undefined ? docEdit(e, doc, d, {}, only) : docEdit(e, doc, d, {});
+        return edit && edit.name === kind && edit.edit.ops.length > 0 ? edit : undefined;
+      };
+      let seed = 0;
+      let after: Uint8Array | undefined;
+      for (let tries = 1; tries <= 600 && !after; tries++) {
+        const probe = await session();
+        const edit = made(probe.doc, tries);
+        if (!edit) continue;
+        probe.apply(edit.edit);
+        const bytes = await probe.file.save();
+        if (sameBytes(bytes, before)) continue;
+        seed = tries;
+        after = bytes;
+      }
+      // Not every kind applies to every file (a row is deleted where there is a table at the place tried).
+      if (!after) continue;
+      files[`after-${fileKind}-${kind}`] = after;
+      for (const delay of RACE_DELAYS) {
+        const { file, doc, apply } = await session();
+        const packs = countPacks(file);
+        const saving = file.save();
+        await moments(delay);
+        const edit = made(doc, seed);
+        assert.ok(edit, `${kind}, ${delay}: the change applies`);
+        apply(edit.edit);
+        const out = await saving;
+        const label = `file ${fileKind}, ${kind}, ${delay} moments into the save`;
+        const isBefore = sameBytes(out, before);
+        if (!isBefore && !sameBytes(out, after)) assert.fail(`${label}: the file is the document of no moment`);
+        assert.equal(packs(), 1, `${label}: the file was written once`);
+        if (isBefore) fell.before++;
+        else fell.after++;
+        assert.ok(sameBytes(await file.save(), after), `${label}: the save after it is the document with the change`);
+        if (!isBefore || delay === 0) files[`${fileKind}-${kind}-${delay}`] = out;
+      }
+    }
+  }
+  assert.ok(fell.after > 0 && fell.before > 0, `the change came before the document was read in some runs and after it in others (${JSON.stringify(fell)})`);
+  if (process.env.RACE_STATS) console.log('document', JSON.stringify(fell), Object.keys(files).filter((name) => name.indexOf('after-') === 0).join(' '));
+  assert.deepEqual(independent(files), [], 'every file is whole to a reader that is not this engine');
 });
