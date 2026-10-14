@@ -8,17 +8,19 @@ import { CalcEngine } from '../src/calc/engine';
 import { lastOneGo, oneGo } from '../src/formats/part-reads';
 import { readCollabStamp, writeSharedFile } from '../src/formats/xlsx/collab-stamp';
 import { buildXlsx } from '../src/formats/xlsx/build';
-import { buildDocx, writeDocx } from '../src/formats/docx/write';
+import { buildDocx, emptyWriteReport, writeDocx } from '../src/formats/docx/write';
 import { readDocx } from '../src/formats/docx/document';
 import { writeXlsx } from '../src/formats/xlsx/write';
 import { OpcPackage, ZipArchive, open, type Workbook } from '../src/index';
 import { SaveInterruptedError, editsOf, readModel, readMomentOf, readingsOf, touchModel, writeSteady } from '../src/model/edits';
 import { setCellInput } from '../src/ops/commands';
-import { DocHistory, insertText } from '../src/ops/doc/index';
+import { DocHistory, insertText, toggleList } from '../src/ops/doc/index';
+import { applyDocOp } from '../src/ops/doc/ops';
 import { applyOp } from '../src/ops/ops';
 import { packageTurn } from '../src/package-turn';
 import { bookOf } from './chart-edit-fixtures';
-import { Net, act, join, seeded, startFile } from './collab-fixtures';
+import { Net, act, canon, join, seeded, settleAll, startFile } from './collab-fixtures';
+import { contentVersion } from '../src/collab/protocol';
 import { p } from './doc-ops-fixtures';
 import { buildDocx as buildSpec } from './docx-fixtures';
 import { changeSheet, docEdit, docOpen, docRun, docStart, load, sameBytes, sheetRun, sheetStart } from './one-go-fixtures';
@@ -382,4 +384,186 @@ test('the file of a room says its step when something is typed after the workboo
   if (said && typedIn) assert.ok(said.rev > stampNow.rev, 'a file that holds what was typed names a step after it');
   if (said && !typedIn) assert.equal(said.rev, stampNow.rev);
   assert.ok(packs >= 1);
+});
+
+test('a file of a room that is alone says no step when a row is inserted while the file is written: what it names is what it holds', async () => {
+  // Only the short wait for the common order is let run (at once); A is alone, so nothing else answers.
+  const timer = (fn: () => void, ms: number): (() => void) => {
+    if (ms !== 3000) return () => undefined;
+    let on = true;
+    setImmediate(() => on && fn());
+    return () => void (on = false);
+  };
+  const start = await startFile();
+  const first = canon(await (await open(start)).workbook());
+  let stamped = 0;
+  for (let k = 0; k <= 40; k++) {
+    const random = seeded(1);
+    const net = new Net();
+    const a = await join(net, 'a', start, { timer });
+    net.drain(random);
+    const before = a.session.stampNow;
+    assert.ok(before, `k ${k}: the workbook is at a step of the room`);
+    const saving = writeSharedFile(a.session, a.file.package, () => a.file.save());
+    for (let i = 0; i < k; i++) await null;
+    act(a, () => [{ type: 'insert', sheet: 0, axis: 'row', at: 1, count: 1 }]);
+    const done = await saving;
+    net.drain(random);
+    if (done.rev === undefined) continue;
+    stamped++;
+    // A file that names a step holds that step: the step before the row, without it; one after, with it.
+    const held = canon(await (await open(done.bytes)).workbook());
+    if (done.rev === before.rev) assert.equal(held, first, `k ${k}: the file of step ${done.rev} does not hold the row inserted after it`);
+    // And whoever joins with the file is the same as A once all is said.
+    a.session.announceSaved([contentVersion(done.bytes)], done.rev);
+    net.drain(random);
+    const c = await join(net, 'c', done.bytes, { timer });
+    await settleAll(net, random, [a, c]);
+    assert.equal(canon(c.wb), canon(a.wb), `k ${k}: who joins with the file of step ${done.rev} is the same as A`);
+  }
+  assert.ok(stamped < 41, `the insert fell into the writing at least once (${stamped} of 41 files named a step)`);
+});
+
+test('a part that the relationships name in other letter case than the archive is read ahead and written all the same', async () => {
+  const archive = ZipArchive.read(await startFile());
+  const relsName = 'xl/_rels/workbook.xml.rels';
+  const rels = new TextDecoder().decode(await archive.read(relsName));
+  assert.ok(archive.has('xl/worksheets/sheet1.xml') && rels.indexOf('Target="worksheets/sheet1.xml"') > 0, 'the start file is as the test expects');
+  archive.set(relsName, new TextEncoder().encode(rels.replace('Target="worksheets/sheet1.xml"', 'Target="Worksheets/Sheet1.xml"')));
+  const file = await open(await archive.write());
+  const wb = await file.workbook();
+  setCellInput(wb, 0, 2, 1, '4242').forEach((op) => applyOp(wb, op));
+  const bytes = await file.save();
+  const out = ZipArchive.read(bytes);
+  assert.ok(!out.has('xl/Worksheets/Sheet1.xml'), 'the part is written under the name the archive had it');
+  assert.ok(new TextDecoder().decode(await out.read('xl/worksheets/sheet1.xml')).indexOf('<v>4242</v>') > 0, 'the change is in the sheet');
+  assert.equal((await (await open(bytes)).workbook()).sheets[0].rows.get(2)!.cells[1]!.value, 4242);
+});
+
+/** A picture of its own bytes: the PNG above with one more byte, which tells it from the first. */
+const PNG2 = new Uint8Array([...PNG, 0x42]);
+
+const drawingOf = (rId: string, id: number): string =>
+  `<w:p><w:r><w:drawing><wp:inline><wp:extent cx="100" cy="200"/><wp:docPr id="${id}" name="P${id}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+  `<pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="p"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${rId}"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`;
+
+test('a picture that comes back while the pictures of a new file are read (an undo) is read as well and is in the file', async () => {
+  // A workbook with two pictures; the second is taken away, and put back while the first is read.
+  const book = bookOf([['a', 1], ['b', 2]]);
+  const picture = (media: string, row: number) => ({ anchor: { kind: 'oneCell', from: { col: 1, colOff: 0, row, rowOff: 0 }, width: 1905000, height: 952500 }, object: { type: 'picture', media, name: `Picture ${media}` } });
+  book.sheets[0].drawings = [picture('one', 2), picture('two', 6)] as never;
+  const undo = applyOp(book, { type: 'setDrawings', sheet: 0, drawings: [picture('one', 2)] as never });
+  const asked: string[] = [];
+  book.media = {
+    readPart: async (key: string) => {
+      asked.push(key);
+      await new Promise((resolve) => setImmediate(resolve));
+      if (key === 'one') applyOp(book, undo);
+      return key === 'one' ? PNG : PNG2;
+    },
+  };
+  const out = ZipArchive.read(await buildXlsx(book));
+  assert.deepEqual(asked, ['one', 'two'], 'the picture that came back was read once the first was');
+  const media = out.names().filter((name) => name.indexOf('xl/media/') === 0);
+  assert.equal(media.length, 2, `both pictures are in the file (${media.join(', ')})`);
+  const held = await Promise.all(media.map((name) => out.read(name)));
+  assert.ok(held.some((bytes) => sameBytes(bytes, PNG2)), 'the second with its bytes');
+  assert.equal((await (await open(await out.write())).workbook()).sheets[0].drawings!.length, 2);
+
+  // A document whose relationship to its second picture is taken away, and put back while the first is read.
+  const bytes = await buildSpec({
+    body: drawingOf('rIdI', 1) + drawingOf('rIdJ', 2),
+    rels: [['rIdI', 'image', 'media/image7.png'], ['rIdJ', 'image', 'media/image8.png']],
+    parts: [['word/media/image7.png', PNG], ['word/media/image8.png', PNG2]],
+  });
+  const pkg = await OpcPackage.open(bytes);
+  const doc = await readDocx(pkg);
+  const back = applyDocOp(doc, { type: 'setRelationship', story: 'body', id: 'rIdJ', relationship: null });
+  const read: string[] = [];
+  const report = emptyWriteReport();
+  const built = await buildDocx(doc, {
+    report,
+    pictures: {
+      readPart: async (part: string) => {
+        read.push(part);
+        await new Promise((resolve) => setImmediate(resolve));
+        if (read.length === 1) applyDocOp(doc, back);
+        return pkg.readPart(part);
+      },
+    },
+  });
+  assert.deepEqual(read, ['/word/media/image7.png', '/word/media/image8.png']);
+  const again = await OpcPackage.open(built);
+  const rels = new TextDecoder().decode(await again.readPart('/word/_rels/document.xml.rels'));
+  const target = /Id="rIdJ"[^>]*Target="([^"]+)"|Target="([^"]+)"[^>]*Id="rIdJ"/.exec(rels);
+  assert.ok(target, `the relationship that came back is in the file (${rels})`);
+  assert.deepEqual(await again.readPart('/word/' + (target![1] || target![2])), PNG2, 'with its picture');
+  assert.deepEqual(report.warnings, [], 'no picture was left out');
+  // The reading that started over said nothing: the report is that of the one that was written.
+  assert.equal(new Set(report.parts).size, report.parts.length, `no part is told twice (${report.parts.join(', ')})`);
+});
+
+test('a write that starts over tells its report once: the same report whether the parts were read ahead or not', async () => {
+  // A numbering part in a single-byte encoding: the list that is added is not written into it, which the
+  // report says before the styles are read.
+  const latin = (text: string): Uint8Array => Uint8Array.from(text, (c) => c.charCodeAt(0));
+  const numbering = latin(
+    '<?xml version="1.0" encoding="ISO-8859-1"?><w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+      '<w:abstractNum w:abstractNumId="7"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="\u00e7"/></w:lvl></w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="7"/></w:num></w:numbering>',
+  );
+  const bytes = await buildSpec({
+    body: p('text'),
+    styles: '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>',
+    rels: [['rIdN', 'numbering', 'numbering.xml']],
+    parts: [['word/numbering.xml', numbering]],
+  });
+  const run = async (): Promise<{ report: ReturnType<typeof emptyWriteReport>; readings: number }> => {
+    const pkg = await OpcPackage.open(bytes);
+    const doc = await readDocx(pkg);
+    const history = new DocHistory(doc);
+    history.applyEdit(toggleList(doc, { story: 'body', path: [0], offset: 0 }, 'number'), undefined);
+    const report = emptyWriteReport();
+    await writeDocx(pkg, doc, { report });
+    return { report, readings: (lastOneGo(doc) || { readings: 0 }).readings };
+  };
+  const ahead = await run();
+  oneGo.foresee = false;
+  let again: Awaited<ReturnType<typeof run>>;
+  try {
+    again = await run();
+  } finally {
+    oneGo.foresee = true;
+  }
+  assert.equal(ahead.readings, 1);
+  assert.ok(again.readings > 1, `the write without reading ahead started over (${again.readings} readings), or the test tests nothing`);
+  assert.equal(ahead.report.warnings.length, 1, `the numbering part is told of (${ahead.report.warnings.join('; ')})`);
+  assert.ok(ahead.report.parts.length > 0 && ahead.report.writtenBlocks + ahead.report.copiedBlocks > 0, 'the report says something');
+  assert.deepEqual(again.report, ahead.report, 'the report of a write that started over is that of one reading');
+
+  // A new file whose reading starts over (a picture came back while the first was read, which could not be): the picture left out is told of once.
+  const built = await buildSpec({
+    body: drawingOf('rIdI', 1) + drawingOf('rIdJ', 2),
+    rels: [['rIdI', 'image', 'media/image7.png'], ['rIdJ', 'image', 'media/image8.png']],
+    parts: [['word/media/image7.png', PNG], ['word/media/image8.png', PNG2]],
+  });
+  const pkg = await OpcPackage.open(built);
+  const doc = await readDocx(pkg);
+  const back = applyDocOp(doc, { type: 'setRelationship', story: 'body', id: 'rIdJ', relationship: null });
+  const report = emptyWriteReport();
+  let asked = 0;
+  await buildDocx(doc, {
+    report,
+    pictures: {
+      readPart: async (part: string) => {
+        if (++asked > 1) return pkg.readPart(part);
+        await new Promise((resolve) => setImmediate(resolve));
+        applyDocOp(doc, back);
+        throw new Error('not there');
+      },
+    },
+  });
+  assert.equal(asked, 2, 'the reading started over for the picture that came back');
+  assert.equal(report.warnings.filter((text) => text === 'A picture could not be read and was left out').length, 1, `told once (${report.warnings.join('; ')})`);
+  assert.equal(new Set(report.warnings).size, report.warnings.length, 'no warning is told twice');
+  assert.equal(new Set(report.parts).size, report.parts.length);
 });
