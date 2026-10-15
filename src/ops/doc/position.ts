@@ -23,6 +23,7 @@ import {
   type Note,
   type Paragraph,
   type RunItem,
+  type Run,
   type RunProps,
   type Story,
   type StoryCollection,
@@ -103,28 +104,49 @@ export function storyIds(doc: DocModel): string[] {
 
 const isIndex = (value: unknown, length: number): value is number => typeof value === 'number' && value >= 0 && value < length && Math.floor(value) === value;
 
-/** The drawing or legacy graphic number `wanted` of a paragraph, counted the way the layout engine numbers them. */
-function graphicOf(paragraph: Paragraph, wanted: number): { textBoxes?: Block[][] } | undefined {
+/** A drawing (<w:drawing>) or legacy graphic (<w:pict>, <w:object>) of a paragraph, which may hold text boxes. */
+export type ParagraphGraphic = Extract<RunItem, { type: 'drawing' | 'pict' | 'object' }>;
+
+/** Where a graphic is: its run, the run item of alternate content it is in (the innermost), and whether that is in alternate content too. */
+export interface GraphicPlace {
+  run: Run;
+  holder?: Extract<RunItem, { type: 'alternate' }>;
+  nested: boolean;
+}
+
+/**
+ * Visits the drawings and legacy graphics of a paragraph in the order the layout engine numbers
+ * them (the number is the one a path into a text box names): not those in the code of a field
+ * or in deleted text, those of alternate content in its selected branch. Stops when `visit`
+ * answers true.
+ */
+export function eachGraphic(paragraph: Paragraph, visit: (item: ParagraphGraphic, index: number, where: GraphicPlace) => boolean | void): void {
   let seen = 0;
-  let found: { textBoxes?: Block[][] } | undefined;
-  const walk = (items: RunItem[], code: true | boolean[] | undefined, depth: number): boolean => {
+  const walk = (items: RunItem[], code: true | boolean[] | undefined, depth: number, run: Run, holder: GraphicPlace['holder']): boolean => {
     for (let i = 0; i < items.length; i++) {
       if (code !== undefined && (code === true || code[i])) continue;
       const item = items[i];
       if (item.type === 'drawing' || item.type === 'pict' || item.type === 'object') {
-        if (seen++ === wanted) {
-          found = item;
-          return true;
-        }
-      } else if (item.type === 'alternate' && depth < 32 && walk(item.items, undefined, depth + 1)) return true;
+        if (visit(item, seen++, { run, holder, nested: depth > 1 }) === true) return true;
+      } else if (item.type === 'alternate' && depth < 32 && walk(item.items, undefined, depth + 1, run, item)) return true;
     }
     return false;
   };
   for (const inline of paragraph.children) {
     if (inline.type !== 'run' || inline.fieldCode === true) continue;
     if (inline.wrap && (findWrapper(inline, 'del') || findWrapper(inline, 'moveFrom'))) continue;
-    if (walk(inline.content, inline.fieldCode, 0)) break;
+    if (walk(inline.content, inline.fieldCode, 0, inline, undefined)) break;
   }
+}
+
+/** The drawing or legacy graphic number `wanted` of a paragraph, counted the way the layout engine numbers them. */
+function graphicOf(paragraph: Paragraph, wanted: number): { textBoxes?: Block[][] } | undefined {
+  let found: { textBoxes?: Block[][] } | undefined;
+  eachGraphic(paragraph, (item, index) => {
+    if (index !== wanted) return false;
+    found = item;
+    return true;
+  });
   return found;
 }
 
@@ -296,7 +318,7 @@ export function resolvePosition(doc: DocModel, position: DocPosition): ResolvedP
 }
 
 /** The part of a path up to and including the last text box it enters: positions with different roots cannot form a range. */
-function rootLength(path: number[]): number {
+export function textBoxRootLength(path: number[]): number {
   for (let i = path.length - 1; i >= 0; i--) if (path[i] === -1) return i + 3;
   return 0;
 }
@@ -309,8 +331,8 @@ function rootLength(path: number[]): number {
 export function comparePositions(a: DocPosition, b: DocPosition): number {
   if (!a || !b || !Array.isArray(a.path) || !Array.isArray(b.path)) return bad('A position needs a path');
   if (a.story !== b.story) return bad('The positions are in different stories');
-  const root = rootLength(a.path);
-  if (root !== rootLength(b.path)) return bad('The positions are in different text boxes');
+  const root = textBoxRootLength(a.path);
+  if (root !== textBoxRootLength(b.path)) return bad('The positions are in different text boxes');
   for (let i = 0; i < root; i++) if (a.path[i] !== b.path[i]) return bad('The positions are in different text boxes');
   const shared = Math.min(a.path.length, b.path.length);
   for (let i = root; i < shared; i++) if (a.path[i] !== b.path[i]) return a.path[i] - b.path[i];
@@ -599,7 +621,7 @@ function paragraphInTable(table: Table, base: number[], row: number, cell: numbe
  */
 export function adjacentParagraph(doc: DocModel, story: string, path: number[], step: 1 | -1): number[] | undefined {
   const top = storyOf(doc, story).blocks;
-  const stop = rootLength(path);
+  const stop = textBoxRootLength(path);
   let at = path.slice();
   // Each turn either finds a paragraph or leaves one level of the path.
   for (let guard = 0; guard <= MAX_PATH && at.length > stop; guard++) {
@@ -746,7 +768,7 @@ export function movePosition(doc: DocModel, position: DocPosition, unit: MoveUni
   if (unit === 'paragraphStart') return first(path.slice(), at.paragraph, 0);
   if (unit === 'paragraphEnd') return here(at.length);
   if (unit === 'story') {
-    if (rootLength(path) === 0) {
+    if (textBoxRootLength(path) === 0) {
       const edge = direction === 1 ? storyEnd(doc, story) : storyStart(doc, story);
       return edge ? (direction === 1 ? edge : startOf(edge.path)) : unchanged();
     }

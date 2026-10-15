@@ -256,7 +256,7 @@ function chartExDrawn(ctx: PartContext, choice: XmlElement): boolean {
 const CHARTEX_CHOICES = new WeakMap<XmlElement, boolean>();
 
 /** The branch of an <mc:AlternateContent> the reader goes with. */
-function selectBranch(ctx: PartContext, el: XmlElement): { selected: 'choice' | 'fallback' | 'none'; branch?: XmlElement } {
+export function selectBranch(ctx: PartContext, el: XmlElement): { selected: 'choice' | 'fallback' | 'none'; branch?: XmlElement } {
   let fallback: XmlElement | undefined;
   for (const node of el.children) {
     if (node.type !== 'element') continue;
@@ -460,8 +460,19 @@ function collectPictures(ctx: PartContext, el: XmlElement, groups: DrawingTransf
   }
 }
 
-function textBoxes(ctx: PartContext, el: XmlElement, depth: number): Block[][] | undefined {
-  const contents = findSelected(ctx, el, 'txbxContent');
+/**
+ * The <w:txbxContent> elements a drawing (<w:drawing>) or legacy graphic (<w:pict>, <w:object>)
+ * holds as its text boxes, in order: of a drawing those of its graphic (<a:graphicData>), of a
+ * legacy graphic all of them. The one count of the text boxes of a graphic, for the reader and
+ * the writer alike.
+ */
+export function graphicTextBoxContents(ctx: PartContext, type: 'drawing' | 'pict' | 'object', el: XmlElement): XmlElement[] {
+  if (type !== 'drawing') return findSelected(ctx, el, 'txbxContent');
+  const data = child(child(child(el, 'inline') || child(el, 'anchor'), 'graphic'), 'graphicData');
+  return data ? findSelected(ctx, data, 'txbxContent') : [];
+}
+
+function textBoxes(ctx: PartContext, contents: XmlElement[], depth: number): Block[][] | undefined {
   if (!contents.length) return undefined;
   const inner = nested(depth);
   return contents.map((content) => {
@@ -618,7 +629,7 @@ function readDrawing(ctx: PartContext, el: XmlElement, depth: number): RunItem {
       item.image = pictures[0].image;
       if (pictures[0].crop) item.crop = pictures[0].crop;
     }
-    const boxes = textBoxes(ctx, data, depth);
+    const boxes = textBoxes(ctx, graphicTextBoxContents(ctx, 'drawing', el), depth);
     if (boxes) item.textBoxes = boxes;
   }
   return item;
@@ -629,7 +640,7 @@ function readLegacyGraphic(ctx: PartContext, el: XmlElement, type: 'pict' | 'obj
   const imageData = findSelected(ctx, el, 'imagedata')[0];
   const rId = imageData ? anyAttr(imageData, 'id') : undefined;
   if (rId) item.image = imageRef(ctx, rId, false);
-  const boxes = textBoxes(ctx, el, depth);
+  const boxes = textBoxes(ctx, graphicTextBoxContents(ctx, type, el), depth);
   if (boxes) item.textBoxes = boxes;
   return item;
 }

@@ -46,7 +46,7 @@ import type {
   Wrapper,
 } from '../../model/doc/types';
 import { parseXml, type XmlComment, type XmlElement, type XmlNode, type XmlPI } from '../../xml';
-import { findSelected, readBlock } from './body';
+import { findSelected, graphicTextBoxContents, readBlock, selectBranch } from './body';
 import { kindOf, parseOnOff } from './common';
 import {
   cellPropsElement,
@@ -104,6 +104,11 @@ export interface BodyContext extends PropsContext {
    * doc or RTF file, where one change may be many elements). Called once for every element that is written.
    */
   revision?(info: RevisionInfo): { id: number; author: string };
+  /**
+   * What the blocks of a text box were written as, by their list: a box is written once in a save, however many
+   * branches of alternate content hold it (and however deep it is in other boxes).
+   */
+  boxTexts?: WeakMap<Block[], string>;
 }
 
 // ------------------------------------------------------------------- escaping
@@ -702,7 +707,7 @@ function writeRunItem(ctx: BodyContext, item: RunItem, out: string[], depth: num
       return;
     case 'pict':
     case 'object':
-      writeTree(ctx, ctx.plain ? item.xml : syncTextBoxes(ctx, item.xml, item.textBoxes, depth), out);
+      writeTree(ctx, ctx.plain ? item.xml : syncTextBoxes(ctx, item.type, item.xml, item.textBoxes, depth), out);
       return;
     case 'alternate': {
       if (ctx.plain) {
@@ -725,7 +730,12 @@ function writeRunItem(ctx: BodyContext, item: RunItem, out: string[], depth: num
         was = parts.join('');
       }
       if (was === text) writeTree(ctx, item.xml, out);
-      else out.push(text);
+      else if (again && again.type === 'alternate' && onlyBoxesChanged(ctx, item, again, depth)) {
+        // Only the text in text boxes changed: every branch gets it (textBoxesWritable() let the edit through). Should
+        // the branches not take it after all, the element is written as it was read: nothing of the file is lost.
+        const plan = alternatePlan(ctx, item);
+        writeTree(ctx, plan ? alternateWithBoxes(ctx, item, plan, text, depth) : item.xml, out);
+      } else out.push(text);
       return;
     }
     case 'misc':
@@ -808,28 +818,199 @@ function rereadTextBox(ctx: BodyContext, content: XmlElement): string | undefine
   return out.join('');
 }
 
-/** The kept tree of a drawing or VML picture with the text boxes of the model, where those were edited. */
-function syncTextBoxes(ctx: BodyContext, xml: XmlElement, boxes: Block[][] | undefined, depth: number): XmlElement {
-  if (!boxes || !boxes.length) return xml;
-  let contents: XmlElement[];
-  try {
-    contents = findSelected(ctx.reader, xml, 'txbxContent');
-  } catch (error) {
-    return xml;
-  }
-  if (contents.length !== boxes.length) return xml;
-  let out = xml;
-  for (let i = 0; i < boxes.length; i++) {
+/** What the blocks of a text box are written as (once in a save: see BodyContext.boxTexts). */
+function boxText(ctx: BodyContext, blocks: Block[], depth: number): string {
+  const cache = ctx.boxTexts;
+  let text = cache ? cache.get(blocks) : undefined;
+  if (text === undefined) {
     const parts: string[] = [];
-    writeBlocks(ctx, boxes[i], parts, depth + 1);
-    const text = parts.join('');
+    writeBlocks(ctx, blocks, parts, depth + 1);
+    text = parts.join('');
+    if (cache) cache.set(blocks, text);
+  }
+  return text;
+}
+
+/**
+ * The text of a text box as written, without what two branches of alternate content may differ in
+ * while they hold the same text: the ids and rsids of paragraphs and runs (w14:paraId, w14:textId,
+ * w:rsid*), the order of attributes, and the hints of the last layout (lastRenderedPageBreak).
+ * The text comes from the writer (one name="value" per attribute), so the patterns are simple and
+ * each looks at one tag.
+ */
+export function canonicalBoxText(text: string): string {
+  return text.replace(/<[^\s<>/]+:lastRenderedPageBreak\/>/g, '').replace(/<([^\s<>/]+)([^<>]*?)(\/?)>/g, (_all, name: string, attrs: string, end: string) => {
+    if (!attrs) return `<${name}${end}>`;
+    const kept: string[] = [];
+    attrs.replace(/\s+([^\s="]+)="([^"]*)"/g, (_one: string, key: string, value: string) => {
+      const local = key.slice(key.indexOf(':') + 1);
+      if (local !== 'paraId' && local !== 'textId' && !/^rsid/.test(local)) kept.push(`${key}="${value}"`);
+      return '';
+    });
+    kept.sort();
+    return `<${name}${kept.length ? ' ' + kept.join(' ') : ''}${end}>`;
+  });
+}
+
+/**
+ * The tree with the <w:txbxContent> elements `contents` holding the blocks of `boxes` (one to one), where those were
+ * edited. `same`: whether a box counts as unchanged (by default when it is written as it was read).
+ */
+function putBoxes(ctx: BodyContext, xml: XmlElement, contents: XmlElement[], boxes: Block[][], depth: number, same = (was: string, text: string) => was === text): XmlElement {
+  let out = xml;
+  for (let i = 0; i < boxes.length && i < contents.length; i++) {
+    const text = boxText(ctx, boxes[i], depth);
     const was = rereadTextBox(ctx, contents[i]);
-    if (was === undefined || was === text) continue;
+    // Unreadable: textBoxesWritable() refuses to edit such a box, so this one is as it was read.
+    if (was === undefined || same(was, text)) continue;
     // Namespace prefixes are not resolved by the parser, so the text parses without the declarations of the part.
     const parsed = parseXml(`<x>${text}</x>`).root.children;
     out = replaceNode(out, contents[i], { type: 'element', name: contents[i].name, attrs: contents[i].attrs, children: parsed });
   }
   return out;
+}
+
+/** The kept tree of a drawing or VML picture with the text boxes of the model, where those were edited. */
+function syncTextBoxes(ctx: BodyContext, type: 'drawing' | 'pict' | 'object', xml: XmlElement, boxes: Block[][] | undefined, depth: number): XmlElement {
+  if (!boxes || !boxes.length) return xml;
+  let contents: XmlElement[];
+  try {
+    contents = graphicTextBoxContents(ctx.reader, type, xml);
+  } catch (error) {
+    return xml;
+  }
+  // The reader counted these boxes in this tree (one count, graphicTextBoxContents()); another number means a tree
+  // the model was not read from, which is written as it is.
+  if (contents.length !== boxes.length) return xml;
+  return putBoxes(ctx, xml, contents, boxes, depth);
+}
+
+type GraphicItem = Extract<RunItem, { type: 'drawing' | 'pict' | 'object' }>;
+type AlternateItem = Extract<RunItem, { type: 'alternate' }>;
+
+const isGraphic = (item: RunItem): item is GraphicItem => item.type === 'drawing' || item.type === 'pict' || item.type === 'object';
+
+/** Of alternate content whose text boxes change: the branch that was read, and the text boxes of each other branch, one for each box of the branch read. */
+interface AlternatePlan {
+  branch: XmlElement;
+  others: Map<XmlElement, XmlElement[]>;
+}
+
+/**
+ * Whether the text boxes of alternate content can take a change of their text in every branch:
+ * the branch read holds no text box beyond those of its graphics, each other branch (a Choice
+ * or a Fallback) holds as many, each box of every branch can be read again, and each holds the
+ * same text as the box of the branch read in its place (as the file has them: Word writes the
+ * same text in both). Undefined otherwise, or for alternate content in alternate content.
+ */
+function alternatePlan(ctx: BodyContext, item: AlternateItem): AlternatePlan | undefined {
+  // Worked out once for an element as read: the editing asks for every graphic in it, and the writer once more.
+  const known = PLANS.get(item.xml);
+  if (known !== undefined) return known || undefined;
+  const plan = workOutPlan(ctx, item);
+  PLANS.set(item.xml, plan || null);
+  return plan;
+}
+
+/** alternatePlan() by the element of alternate content as read (its graphics are read from it, so they come with it). */
+const PLANS = new WeakMap<XmlElement, AlternatePlan | null>();
+
+function workOutPlan(ctx: BodyContext, item: AlternateItem): AlternatePlan | undefined {
+  let branch: XmlElement | undefined;
+  try {
+    branch = selectBranch(ctx.reader, item.xml).branch;
+    if (!branch) return undefined;
+    const texts: string[] = [];
+    for (const sub of item.items) {
+      if (sub.type === 'alternate') return undefined;
+      if (!isGraphic(sub)) continue;
+      for (const content of graphicTextBoxContents(ctx.reader, sub.type, sub.xml)) {
+        const text = rereadTextBox(ctx, content);
+        if (text === undefined) return undefined;
+        texts.push(canonicalBoxText(text));
+      }
+    }
+    if (findSelected(ctx.reader, branch, 'txbxContent').length !== texts.length) return undefined;
+    const others = new Map<XmlElement, XmlElement[]>();
+    for (const node of item.xml.children) {
+      if (node.type !== 'element' || node === branch) continue;
+      const kind = kindOf(ctx.reader, node.name);
+      if (kind !== 'mc:Choice' && kind !== 'mc:Fallback') continue;
+      const contents = findSelected(ctx.reader, node, 'txbxContent');
+      if (contents.length !== texts.length) return undefined;
+      for (let i = 0; i < contents.length; i++) {
+        const text = rereadTextBox(ctx, contents[i]);
+        if (text === undefined || canonicalBoxText(text) !== texts[i]) return undefined;
+      }
+      others.set(node, contents);
+    }
+    return { branch, others };
+  } catch (error) {
+    return undefined;
+  }
+}
+
+/** Whether what the model holds of alternate content differs from what was read only in the text of text boxes. */
+function onlyBoxesChanged(ctx: BodyContext, item: AlternateItem, again: AlternateItem, depth: number): boolean {
+  if (item.items.length !== again.items.length) return false;
+  const plain = plainContext(ctx);
+  for (let i = 0; i < item.items.length; i++) {
+    const now = item.items[i];
+    const then = again.items[i];
+    if (now.type !== then.type) return false;
+    if (isGraphic(now)) {
+      const read = then as GraphicItem;
+      if ((now.textBoxes || []).length !== (read.textBoxes || []).length) return false;
+      if (now.type === 'drawing' && (!isDrawingTree(ctx, now.xml) || syncSize(now, now.xml) !== now.xml)) return false;
+      continue;
+    }
+    // Everything else is written cheaply (no text box in it): as it is, it must be as it was read.
+    const a: string[] = [];
+    const b: string[] = [];
+    writeRunItem(plain, now, a, depth + 1);
+    writeRunItem(plain, then, b, depth + 1);
+    if (a.join('') !== b.join('')) return false;
+  }
+  return true;
+}
+
+/** The <mc:AlternateContent> with the content of the model (`text`, written once) in the branch read and its text boxes in every other branch. */
+function alternateWithBoxes(ctx: BodyContext, item: AlternateItem, plan: AlternatePlan, text: string, depth: number): XmlElement {
+  const boxes: Block[][] = [];
+  for (const sub of item.items) if (isGraphic(sub) && sub.textBoxes) for (const box of sub.textBoxes) boxes.push(box);
+  const children: XmlNode[] = item.xml.children.map((node) => {
+    if (node.type !== 'element') return node;
+    // Namespace prefixes are not resolved by the parser, so the text parses without the declarations of the part.
+    if (node === plan.branch) return { type: 'element', name: node.name, attrs: node.attrs, children: parseXml(`<x>${text}</x>`).root.children };
+    const contents = plan.others.get(node);
+    // A box of the other branch that holds the same text as the model keeps its own ids; an edited one takes those of the
+    // branch read, as Word writes them (one paragraph, the same ids in both branches).
+    return contents ? putBoxes(ctx, node, contents, boxes, depth, (was, now) => canonicalBoxText(was) === canonicalBoxText(now)) : node;
+  });
+  return { type: 'element', name: item.xml.name, attrs: item.xml.attrs, children };
+}
+
+/**
+ * Whether the text in the text boxes of a graphic can be changed and written back: the one rule
+ * the editing (Find and Replace) and the writer follow. The graphic is a frame or VML picture the
+ * writer writes from its kept tree; the reader counted its boxes there, and each can be read
+ * again. In alternate content (`holder`: the run item of alternate content the graphic is in,
+ * the innermost) every branch must take the change: see alternatePlan(). A graphic in alternate
+ * content in alternate content cannot be changed.
+ */
+export function textBoxesWritable(ctx: BodyContext, graphic: GraphicItem, holder?: AlternateItem, nested = false): boolean {
+  if (nested) return false;
+  const boxes = graphic.textBoxes;
+  if (!boxes || boxes.length === 0) return false;
+  if (graphic.type === 'drawing' && !isDrawingTree(ctx, graphic.xml)) return false;
+  try {
+    const contents = graphicTextBoxContents(ctx.reader, graphic.type, graphic.xml);
+    if (contents.length !== boxes.length) return false;
+    for (const content of contents) if (rereadTextBox(ctx, content) === undefined) return false;
+  } catch (error) {
+    return false;
+  }
+  return holder === undefined || alternatePlan(ctx, holder) !== undefined;
 }
 
 interface DrawingNames {
@@ -1078,7 +1259,7 @@ function writeDrawing(ctx: BodyContext, item: DrawingItem, out: string[], depth:
     return;
   }
   let xml = item.xml;
-  if (!ctx.plain) xml = syncTextBoxes(ctx, syncSize(item, xml), item.textBoxes, depth);
+  if (!ctx.plain) xml = syncTextBoxes(ctx, 'drawing', syncSize(item, xml), item.textBoxes, depth);
   writeTree(ctx, xml, out);
 }
 

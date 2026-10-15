@@ -5375,8 +5375,12 @@ export class DocumentView {
     this.typing.commit();
     const match = this.selectedMatch(find, options && options.stories);
     let changed = false;
-    if (match && match.replaceable) changed = this.perform(() => ops.insertText(this.document, match.range, replacement), true);
-    else if (match) this.notify(this.strings.find.replaced(0, 1), 'info');
+    // A match in a text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
+    // In a room the command that travels (insertText); elsewhere the replacement in the place of the match. A match in a
+    // text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
+    if (match && match.replaceable)
+      changed = this.perform(() => (this.collab && !ops.inTextBox(match.range.anchor.path) ? ops.insertText(this.document, match.range, replacement) : ops.replaceMatchEdit(this.document, match.range, replacement)), true);
+    else if (match) this.notify(this.replacedText({ replaced: 0, skipped: 1, textBoxesKept: match.fixed === 'textBox' ? 1 : 0 }), 'info');
     return this.findNext(text, options).then(() => changed);
   }
 
@@ -5386,9 +5390,11 @@ export class DocumentView {
    * when the document changes meanwhile that is said and nothing is replaced. Resolves to the
    * matches replaced and those that could not be (see src/ops/doc/find.ts). Where the document
    * is edited together each replacement travels as a command of its own, and at most
-   * ROOM_REPLACE_LIMIT of them are made at once (more is refused, and said).
+   * ROOM_REPLACE_LIMIT of them are made at once (more is refused, and said); the matches in text
+   * boxes are not replaced there (their change does not travel), nor where changes are tracked,
+   * and are counted and said.
    */
-  replaceAll(text: string, replacement: string, options?: ops.DocFindOptions): Promise<{ replaced: number; skipped: number }> {
+  replaceAll(text: string, replacement: string, options?: ops.DocFindOptions): Promise<{ replaced: number; skipped: number; inTextBoxes?: number; textBoxesKept?: number }> {
     const none = { replaced: 0, skipped: 0 };
     if (this.destroyed) return Promise.resolve(none);
     let find: CompiledFind | undefined;
@@ -5425,9 +5431,11 @@ export class DocumentView {
       const history = this.history;
       const result = ops.replaceMatches(this.document, scan.matches, replacement, {
         // The commands of the view: in a room each travels as the command it is.
-        insert: (doc, at, text) => ops.insertText(doc, at, text),
+        // In a room the command that travels; elsewhere the replacement in the place of the match (replaceText()).
+        insert: this.collab ? (doc, at, text) => ops.insertText(doc, at, text) : undefined,
         apply: (edit) => history.applyEdit({ ops: edit.ops, selection: edit.selection, mergeKey: key }, before),
         limit: this.collab ? ROOM_REPLACE_LIMIT : undefined,
+        textBoxes: this.collab ? 'skip' : 'replace',
       });
       if (result.refused) {
         this.notify(words.tooMany(ROOM_REPLACE_LIMIT), 'error');
@@ -5436,8 +5444,11 @@ export class DocumentView {
       const { replaced, skipped, last } = result;
       this.history.seal();
       if (replaced > 0) this.changed(last);
-      this.notify(words.replaced(replaced, skipped), 'info');
-      return { replaced, skipped };
+      const answer: { replaced: number; skipped: number; inTextBoxes?: number; textBoxesKept?: number } = { replaced, skipped };
+      if (result.inTextBoxes) answer.inTextBoxes = result.inTextBoxes;
+      if (result.textBoxesKept) answer.textBoxesKept = result.textBoxesKept;
+      this.notify(this.replacedText(answer), 'info');
+      return answer;
     });
   }
 
@@ -5446,7 +5457,7 @@ export class DocumentView {
     const bar = this.findBar;
     if (!bar) return;
     bar.setStatus(this.strings.find.searching);
-    this.findNext(query.text, { matchCase: query.matchCase, wholeWord: query.whole, backward }).then(
+    this.findNext(query.text, { ...this.barOptions(query), backward }).then(
       (hit) => {
         if (this.findBar === bar) bar.setStatus(hit ? this.findCount : this.strings.find.noMatches);
       },
@@ -5460,13 +5471,26 @@ export class DocumentView {
     const bar = this.findBar;
     if (!bar) return;
     bar.setStatus(this.strings.find.searching);
-    const options = { matchCase: query.matchCase, wholeWord: query.whole };
+    const options = this.barOptions(query);
     const say = (text: string): void => {
       if (this.findBar === bar) bar.setStatus(text);
     };
     const failed = (): void => say(this.strings.find.noMatches);
-    if (all) this.replaceAll(query.text, replacement, options).then((result) => say(this.strings.find.replaced(result.replaced, result.skipped)), failed);
+    if (all) this.replaceAll(query.text, replacement, options).then((result) => say(this.replacedText(result)), failed);
     else this.replace(query.text, replacement, options).then(() => say(this.findCount), failed);
+  }
+
+  /** What is said after "Replace all": how many were replaced and not, and why those in text boxes were not. */
+  private replacedText(result: { replaced: number; skipped: number; inTextBoxes?: number; textBoxesKept?: number }): string {
+    const words = this.strings.find;
+    const boxes = result.inTextBoxes || 0;
+    const kept = result.textBoxesKept || 0;
+    return words.replaced(result.replaced, result.skipped) + (boxes > 0 ? words.inTextBoxes(boxes, this.collab !== undefined ? 'shared' : 'tracked') : '') + (kept > 0 ? words.inTextBoxes(kept, 'kept') : '');
+  }
+
+  /** What the options of the bar ask of a search. */
+  private barOptions(query: FindBarQuery): ops.DocFindOptions {
+    return { matchCase: query.matchCase, wholeWord: query.whole, stories: query.mainOnly ? 'body' : 'all' };
   }
 
   /**
@@ -5489,7 +5513,7 @@ export class DocumentView {
     const token = ++this.countToken;
     let find: CompiledFind | undefined;
     try {
-      find = this.docFind(query.text, { matchCase: query.matchCase, wholeWord: query.whole });
+      find = this.docFind(query.text, this.barOptions(query));
     } catch {
       find = undefined;
     }
@@ -5498,7 +5522,7 @@ export class DocumentView {
       if (say) bar.setStatus('');
       return;
     }
-    const scan = new ops.DocMatchScan(find, this.findParagraphs('all'), MAX_COUNTED);
+    const scan = new ops.DocMatchScan(find, this.findParagraphs(query.mainOnly ? 'body' : 'all'), MAX_COUNTED);
     const changes = this.changes;
     runSliced(
       () => this.changes !== changes || scan.step(256),

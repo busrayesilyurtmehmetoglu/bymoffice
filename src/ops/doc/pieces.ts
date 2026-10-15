@@ -454,7 +454,7 @@ const UNCHANGED = new WeakMap<RunProps, RunProps>();
  * says who changed that text and is no formatting. The same properties give
  * the same object, so that what is typed next joins what was typed before.
  */
-function withoutChange(props: RunProps): RunProps {
+export function withoutChange(props: RunProps): RunProps {
   if (props.change === undefined) return props;
   let out = UNCHANGED.get(props);
   if (!out) {

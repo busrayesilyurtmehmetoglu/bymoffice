@@ -16,6 +16,8 @@ export interface FindBarQuery {
   matchCase: boolean;
   /** A whole word (document) or the entire cell (workbook). */
   whole: boolean;
+  /** Document only: the body and its tables, not the headers, footers, notes and text boxes. */
+  mainOnly: boolean;
   /** Workbook only. */
   lookIn: 'formulas' | 'values';
   within: 'sheet' | 'workbook';
@@ -60,6 +62,7 @@ export class FindBar {
   private readonly status: HTMLDivElement;
   private readonly matchCase: HTMLInputElement;
   private readonly whole: HTMLInputElement;
+  private readonly mainOnly: HTMLInputElement | undefined;
   private readonly lookIn: HTMLSelectElement | undefined;
   private readonly within: HTMLSelectElement | undefined;
   private readonly labels: { node: HTMLElement; text: (s: FindStrings) => string; attr?: string }[] = [];
@@ -190,6 +193,7 @@ export class FindBar {
     // The options.
     this.matchCase = check('match-case', (s) => s.matchCase);
     this.whole = check('whole', (s) => (options.kind === 'sheet' ? s.entireCell : s.wholeWord));
+    if (options.kind === 'doc') this.mainOnly = check('main-only', (s) => s.mainOnly);
     if (options.kind === 'sheet') {
       this.lookIn = choice('look-in', (s) => s.lookIn, [
         ['formulas', (s) => s.lookInFormulas],
@@ -229,7 +233,7 @@ export class FindBar {
     });
     const watch = (): void => this.queryChanged();
     this.findField.addEventListener('input', watch);
-    for (const control of [this.matchCase, this.whole, this.lookIn, this.within]) if (control) control.addEventListener('change', watch);
+    for (const control of [this.matchCase, this.whole, this.mainOnly, this.lookIn, this.within]) if (control) control.addEventListener('change', watch);
 
     const root = options.root;
     if (typeof window.getComputedStyle === 'function' && window.getComputedStyle(root).position === 'static') {
@@ -263,6 +267,7 @@ export class FindBar {
       text: this.findField.value,
       matchCase: this.matchCase.checked,
       whole: this.whole.checked,
+      mainOnly: !!this.mainOnly && this.mainOnly.checked,
       lookIn: this.lookIn && this.lookIn.value === 'values' && !this.showReplace ? 'values' : 'formulas',
       within: this.within && this.within.value === 'workbook' ? 'workbook' : 'sheet',
     };

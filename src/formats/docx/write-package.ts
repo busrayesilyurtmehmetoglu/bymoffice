@@ -128,6 +128,7 @@ export function createBodyContext(
     drawingIds: shared ? shared.drawingIds : { next: 1 },
     controls: new Set(),
     splitControls: { count: 0 },
+    boxTexts: new WeakMap(),
   };
 }
 

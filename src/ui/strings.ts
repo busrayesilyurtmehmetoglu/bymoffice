@@ -589,6 +589,8 @@ export interface FindStrings {
   wholeWord: string;
   /** Of a workbook: the text is the whole content of the cell. */
   entireCell: string;
+  /** Of a document: only the body and its tables, not the headers, footers, notes and text boxes. */
+  mainOnly: string;
   lookIn: string;
   lookInFormulas: string;
   lookInValues: string;
@@ -602,6 +604,12 @@ export interface FindStrings {
   matches(count: number, more: boolean): string;
   /** Said after replacing: how many were replaced, and how many could not be. */
   replaced(count: number, skipped: number): string;
+  /**
+   * Added to what replaced() says: of those that could not be, how many are in text boxes, and why: 'shared' the file
+   * is edited together, 'tracked' changes are tracked, 'kept' the file holds the box in a form that would lose
+   * something if it were changed (its other version holds other text, say).
+   */
+  inTextBoxes(count: number, why: 'shared' | 'tracked' | 'kept'): string;
   /** A replacement in a room that had to be made in several steps. */
   replacedInSteps(steps: number): string;
   /** Said when the search was given up because the file changed while it ran. */
@@ -1560,6 +1568,7 @@ export const STRINGS_EN: UiStrings = {
     matchCase: 'Match case',
     wholeWord: 'Whole words only',
     entireCell: 'Entire cell contents',
+    mainOnly: 'Main text only',
     lookIn: 'Look in',
     lookInFormulas: 'Formulas',
     lookInValues: 'Values',
@@ -1570,6 +1579,8 @@ export const STRINGS_EN: UiStrings = {
     noMatches: 'No matches',
     matches: (count, more) => (more ? `More than ${count} matches` : count === 1 ? '1 match' : `${count} matches`),
     replaced: (count, skipped) => (count === 1 ? '1 replacement' : `${count} replacements`) + (skipped > 0 ? `; ${skipped} could not be replaced` : ''),
+    inTextBoxes: (count, why) =>
+      ` (${count} in text boxes: ${why === 'shared' ? 'they cannot be changed while the file is edited together' : why === 'tracked' ? 'changes there cannot be tracked' : 'the file keeps them in a form that cannot be changed without loss'})`,
     replacedInSteps: (steps) => `Replaced in ${steps} steps, each undone on its own, because the file is edited together`,
     changedMeanwhile: 'The file changed during the search: try again',
     tooMany: (limit) => `There are more than ${limit} matches to replace at once: narrow the search`,
@@ -2341,6 +2352,7 @@ export const STRINGS_TR: UiStrings = {
     matchCase: 'Büyük/küçük harf duyarlı',
     wholeWord: 'Yalnız tam sözcükler',
     entireCell: 'Hücrenin tamamı',
+    mainOnly: 'Yalnız ana metin',
     lookIn: 'Aranan yer',
     lookInFormulas: 'Formüller',
     lookInValues: 'Değerler',
@@ -2351,6 +2363,8 @@ export const STRINGS_TR: UiStrings = {
     noMatches: 'Sonuç yok',
     matches: (count, more) => (more ? `${count} sonuçtan fazla` : `${count} sonuç`),
     replaced: (count, skipped) => `${count} yer değiştirildi` + (skipped > 0 ? `; ${skipped} yer değiştirilemedi` : ''),
+    inTextBoxes: (count, why) =>
+      ` (${count} tanesi metin kutusunda: ${why === 'shared' ? 'dosya birlikte düzenlenirken değiştirilemez' : why === 'tracked' ? 'orada değişiklik izlenemez' : 'dosya kutuyu kayıpsız değiştirilemeyecek bir biçimde tutuyor'})`,
     replacedInSteps: (steps) => `Dosya birlikte düzenlendiği için ${steps} adımda değiştirildi; her adım ayrı geri alınır`,
     changedMeanwhile: 'Arama sürerken dosya değişti: yeniden deneyin',
     tooMany: (limit) => `Bir seferde değiştirilecek ${limit} sonuçtan fazlası var: aramayı daraltın`,
