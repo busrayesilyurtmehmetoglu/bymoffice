@@ -47,6 +47,7 @@ import {
   type Piece,
 } from './pieces';
 import { asRange, containerBlocks, inTextBox, orderRange, paragraphIn, resolvePosition, storyOf, type DocPosition, type DocRange } from './position';
+import { ownerOf } from './stand-in';
 import { newMarkProps, placeBlock } from './text';
 import { TRACK_UNSUPPORTED, insertionWrap, plainProps, revisionLike, strikePieces, type Tracking } from './track';
 import { insertedCell, insertedRow, insertedTable, isOwnCell, isOwnRow, struckCell, struckRow } from './track-blocks';
@@ -879,7 +880,9 @@ export interface Taken {
  * into the trees kept of drawings, legacy pictures and alternate content,
  * for the names and ids in use.
  */
-export function takenByDocument(doc: DocModel): Taken {
+export function takenByDocument(given: DocModel): Taken {
+  // In a text box (a stand-in) the names and ids are those of the whole document.
+  const doc = ownerOf(given);
   const taken: Taken = { image: 0, parts: new Set<string>(), drawing: 0 };
   const part = (name: string | null | undefined) => {
     if (!name) return;

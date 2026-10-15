@@ -90,5 +90,6 @@ export {
   type CommentOptions,
   type DocComment,
 } from './comments';
-export { insertTextInTextBox, replaceInTextBox, textBoxKey } from './text-box';
+export { TEXT_BOX_OUTSIDE, editInTextBox, expandRangeInTextBox, insertTextInTextBox, readInTextBox, replaceInTextBox, textBoxExit, textBoxKey, textBoxProblem, type BoxCommand } from './text-box';
+export { textLocked } from './find-edit';
 export { replaceText } from './find-edit';

@@ -76,6 +76,7 @@
           <button id="sample-chart" title="Verisi, altı grafiği (sütun, çizgi, pasta; radar, ikincil eksenli ve veri etiketli birleşik, balon) ve bir grafik sayfası olan sentetik bir çalışma kitabı. Hücreleri değiştirince grafikler de değişir. Grafikler taşınabilir, silinebilir, kutularından düzenlenebilir, kopyalanıp yapıştırılabilir ve çoğaltılabilir (Ctrl/Cmd+C, X, V, D; sağ tık menüsü; başka sayfaya da); araç çubuğundan yenileri eklenebilir.">Grafikli örnek xlsx üret ve aç</button>
           <button id="sample-pivot" title="Veri sayfası ve ondan yapılmış iki pivot tablosu (sıkıştırılmış düzende bölge × ürün; tablo düzeninde bölge ve ürün, iki değer) olan sentetik bir çalışma kitabı. Pivotlar eski haliyle açılır: tablonun bir hücresinde sağ tık → Pivot tabloyu yenile / Tüm pivot tabloları yenile. Veri sayfasında bir hücreyi değiştirip yeniden yenileyin; Ctrl/Cmd+Z yenilemeyi geri alır.">Pivotlu örnek xlsx üret ve aç</button>
           <button id="sample-doc-chart" title="İçinde üç grafik olan sentetik bir Word belgesi: satır içinde sütun grafiği, metnin sardığı pasta ve tablo hücresinde çizgi grafiği. Grafikler dosyadaki önbellek değerlerinden çizilir.">Grafikli örnek docx üret ve aç</button>
+          <button id="sample-doc-boxes" title="Metin kutulu sentetik bir Word belgesi: DrawingML kutusu, Word'ün iki dallı (DrawingML + VML) kutusu, yalnız VML kutusu, tablo hücresinde kutu ve metni kilitli kutu. Kutunun metnine tıklayın ve yazın (Enter, Backspace, Ctrl/Cmd+B, Ctrl/Cmd+Z); oklar ve Ctrl/Cmd+A kutuda kalır, Escape kutudan çıkar. Kilitli kutuya imleç girer ama yazılamaz; değişiklik izlenirken kutular düzenlenmez.">Metin kutulu örnek docx üret ve aç</button>
           <button id="blank-docx" title="Sekme durakları: belge araç çubuğu → Sekme durakları… (konum cm, hizalama, dolgu, varsayılan sekme aralığı). Bul ve değiştir: Ctrl/Cmd+F, Ctrl+H ya da araç çubuğunun sonundaki büyüteç (gövde, tablolar, üstbilgi/altbilgi, dipnotlar; izleme açıkken değiştirme izlenir). Sayfa yapısı: Sayfa sonu düğmesinin yanındaki düğme (bölümün ya da tüm belgenin kâğıdı, yönü, kenar boşlukları; imleçte bölüm sonu: sonraki sayfa, sürekli, çift, tek).">Boş docx oluştur ve aç</button>
           <button id="blank-xlsx">Boş xlsx oluştur ve aç</button>
           <button id="clear">Listeyi temizle</button>
@@ -948,6 +949,61 @@
         zip.set('word/_rels/document.xml.rels', utf8(rels(charts.map((_chart, i) => [`rIdC${i + 1}`, 'chart', `charts/chart${i + 1}.xml`]))));
         charts.forEach((xml, i) => zip.set(`word/charts/chart${i + 1}.xml`, utf8(xml)));
         await handle([{ name: 'grafikli-ornek.docx', data: await zip.write() }]);
+      });
+
+      // A synthetic document with text boxes of every kind the editor types in: a DrawingML box, a box Word writes (a DrawingML
+      // Choice and a VML Fallback with the same text), a VML box, a box in a table cell, and a box whose text the shape locks.
+      $('sample-doc-boxes').addEventListener('click', async () => {
+        const utf8 = (text) => new TextEncoder().encode(text);
+        const head = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+        const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const PKG = 'http://schemas.openxmlformats.org/package/2006/relationships';
+        const EMU = 9525;
+        const run = (text, bold) => `<w:r>${bold ? '<w:rPr><w:b/></w:rPr>' : ''}<w:t xml:space="preserve">${text}</w:t></w:r>`;
+        const para = (inner) => `<w:p>${inner}</w:p>`;
+        const drawing = (id, x, width, height, inner, locks) =>
+          '<w:drawing><wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="2" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">' +
+          `<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>${x * EMU}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>` +
+          `<wp:extent cx="${width * EMU}" cy="${height * EMU}"/><wp:wrapSquare wrapText="bothSides"/><wp:docPr id="${id}" name="Metin kutusu ${id}"/>` +
+          '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp>' +
+          (locks ? '<wps:cNvSpPr txBox="1"><a:spLocks noTextEdit="1"/></wps:cNvSpPr>' : '<wps:cNvSpPr txBox="1"/>') +
+          '<wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFF5CC"/></a:solidFill><a:ln w="9525"><a:solidFill><a:srgbClr val="B08800"/></a:solidFill></a:ln></wps:spPr>' +
+          `<wps:txbx><w:txbxContent>${inner}</w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing>`;
+        const vml = (width, height, inner) =>
+          `<w:pict><v:shape style="position:absolute;margin-left:300pt;margin-top:0;width:${width * 0.75}pt;height:${height * 0.75}pt" fillcolor="#e8f0ff"><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict>`;
+        const filler = 'Bu paragraf metin kutusunun çevresinden akar. ';
+        const wordInner = para(run('Word kutusu: ', true) + run('iki dal da yazılır.'));
+        const body =
+          para(run('Metin kutulu örnek belge', true)) +
+          para(`<w:r>${drawing(1, 330, 200, 90, para(run('DrawingML kutusu. ') + run('Buraya tıklayıp yazın.')) + para(run('İkinci paragraf.')))}</w:r>` + run(filler.repeat(5))) +
+          para(`<w:r><mc:AlternateContent><mc:Choice Requires="wps">${drawing(2, 330, 200, 70, wordInner)}</mc:Choice><mc:Fallback>${vml(200, 70, wordInner)}</mc:Fallback></mc:AlternateContent></w:r>` + run(filler.repeat(4))) +
+          para(`<w:r>${vml(200, 60, para(run('Yalnız VML kutusu.')))}</w:r>` + run(filler.repeat(3))) +
+          '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>' +
+          ['top', 'left', 'bottom', 'right', 'insideH', 'insideV'].map((side) => `<w:${side} w:val="single" w:sz="4" w:space="0" w:color="999999"/>`).join('') +
+          '</w:tblBorders></w:tblPr><w:tblGrid><w:gridCol w:w="4500"/><w:gridCol w:w="4500"/></w:tblGrid><w:tr>' +
+          `<w:tc><w:tcPr><w:tcW w:w="4500" w:type="dxa"/></w:tcPr>${para(run('Hücrede kutu:'))}</w:tc>` +
+          `<w:tc><w:tcPr><w:tcW w:w="4500" w:type="dxa"/></w:tcPr>${para(`<w:r>${drawing(3, 0, 180, 50, para(run('Hücredeki kutu.')))}</w:r>`)}${para('')}${para('')}</w:tc>` +
+          '</w:tr></w:tbl>' +
+          para(`<w:r>${drawing(4, 330, 200, 50, para(run('Metni kilitli kutu.')), true)}</w:r>` + run(filler.repeat(3))) +
+          '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>';
+        const ns =
+          'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="' + REL + '" ' +
+          'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
+          'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" ' +
+          'xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"';
+        const rels = (items) => `${head}<Relationships xmlns="${PKG}">${items.map(([id, type, target]) => `<Relationship Id="${id}" Type="${REL}/${type}" Target="${target}"/>`).join('')}</Relationships>`;
+        const zip = new BymOffice.ZipArchive();
+        zip.set(
+          '[Content_Types].xml',
+          utf8(
+            `${head}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+              '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>' +
+              '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+          ),
+        );
+        zip.set('_rels/.rels', utf8(rels([['rId1', 'officeDocument', 'word/document.xml']])));
+        zip.set('word/document.xml', utf8(`${head}<w:document ${ns}><w:body>${body}</w:body></w:document>`));
+        await handle([{ name: 'metin-kutulu-ornek.docx', data: await zip.write() }]);
       });
 
       // A font file of the user's, registered under its file name for the family typed next to it.

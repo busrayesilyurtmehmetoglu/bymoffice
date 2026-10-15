@@ -334,6 +334,8 @@ export class DocToolbar {
     // Where changes are tracked all of these are offered too: each makes its change as a tracked one, and the few
     // it cannot make so (a column through merged cells, a link over a picture) are refused when asked for, and said.
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
+    // In a text box only its text changes: no picture, link or page break goes into one.
+    if (editable && view.inTextBox) for (const key of ['insertPicture', 'insertLink', 'pageBreak'] as ButtonKey[]) this.setDisabled(key, true);
     // Rows and columns are those of the table the caret is in.
     this.setDisabled('rowsColumns', !editable || !view.inTable);
     this.styleSelect.disabled = !editable;

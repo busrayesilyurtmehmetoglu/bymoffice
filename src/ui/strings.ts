@@ -140,6 +140,15 @@ export interface UiStrings {
   /** Label of the field that takes what is typed. */
   documentEditor: string;
   cannotEditHere: string;
+  /**
+   * Said when a change in a text box is refused: `why` is "locked" (the shape or a content control locks its text),
+   * "unwritable" (the file keeps another copy of the box that could not take the change), "tracked" (changes are
+   * tracked), "shared" (the document is edited together) or "command" (this command does not work in a text box).
+   */
+  textBoxRefused(why: 'locked' | 'unwritable' | 'tracked' | 'shared' | 'command'): string;
+  /** Said when the caret goes into a text box (`fixed`: one whose text cannot be changed) and out of it. */
+  textBoxEntered(fixed: boolean): string;
+  textBoxLeft: string;
   /** Said when a change is refused because the document tracks its changes and this kind of change cannot be tracked yet. */
   cannotTrackChange: string;
   /** Said once for a document whose protection keeps it read-only; `kind` is "readOnly", "comments" or "forms". */
@@ -1001,6 +1010,18 @@ export const STRINGS_EN: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Chart' : kind === 'diagram' ? 'Diagram' : kind === 'object' ? 'Embedded object' : kind === 'picture' ? 'Picture' : 'Drawing'),
   documentEditor: 'Document editor',
   cannotEditHere: 'This part of the document cannot be edited',
+  textBoxRefused: (why) =>
+    why === 'locked'
+      ? 'The text of this text box is locked; nothing was changed'
+      : why === 'unwritable'
+        ? 'This text box cannot be changed: the file keeps another copy of it that could not take the change; nothing was changed'
+        : why === 'tracked'
+          ? 'Text boxes cannot be edited while changes are tracked; nothing was changed'
+          : why === 'shared'
+            ? 'Text boxes cannot be edited while the document is edited together; nothing was changed'
+            : 'This cannot be done in a text box; nothing was changed',
+  textBoxEntered: (fixed) => (fixed ? 'In a text box whose text cannot be changed. Escape leaves it' : 'In a text box. Escape leaves it'),
+  textBoxLeft: 'Out of the text box',
   cannotTrackChange: 'Changes are tracked in this document, and this kind of change cannot be tracked yet; nothing was changed',
   protectedDocument: (kind) =>
     kind === 'comments'
@@ -1789,6 +1810,18 @@ export const STRINGS_TR: UiStrings = {
   placeholder: (kind) => (kind === 'chart' ? 'Grafik' : kind === 'diagram' ? 'Diyagram' : kind === 'object' ? 'Gömülü nesne' : kind === 'picture' ? 'Görsel' : 'Çizim'),
   documentEditor: 'Belge düzenleyici',
   cannotEditHere: 'Belgenin bu bölümü düzenlenemez',
+  textBoxRefused: (why) =>
+    why === 'locked'
+      ? 'Bu metin kutusunun metni kilitli; hiçbir şey değiştirilmedi'
+      : why === 'unwritable'
+        ? 'Bu metin kutusu değiştirilemez: dosya kutunun değişikliği alamayan bir kopyasını daha tutuyor; hiçbir şey değiştirilmedi'
+        : why === 'tracked'
+          ? 'Değişiklikler izlenirken metin kutuları düzenlenemez; hiçbir şey değiştirilmedi'
+          : why === 'shared'
+            ? 'Belge birlikte düzenlenirken metin kutuları düzenlenemez; hiçbir şey değiştirilmedi'
+            : 'Bu işlem metin kutusunda yapılamaz; hiçbir şey değiştirilmedi',
+  textBoxEntered: (fixed) => (fixed ? 'Metni değiştirilemeyen bir metin kutusundasınız. Escape ile çıkılır' : 'Metin kutusundasınız. Escape ile çıkılır'),
+  textBoxLeft: 'Metin kutusundan çıkıldı',
   cannotTrackChange: 'Bu belgede değişiklikler izleniyor ve bu tür değişiklik henüz izlenemiyor; hiçbir şey değiştirilmedi',
   protectedDocument: (kind) =>
     kind === 'comments'

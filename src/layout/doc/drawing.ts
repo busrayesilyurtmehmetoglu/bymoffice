@@ -431,7 +431,37 @@ function blocksWeight(blocks: Block[], depth: number): number {
  * of a document together are laid out only up to a limit; the ones after it stay empty.
  */
 function takesBox(ctx: LayoutContext, blocks: Block[], owner: object): boolean {
-  return ctx.boxEvent(blocks, owner, () => decideBox(ctx, blocks, owner));
+  return ctx.boxEvent(
+    blocks,
+    owner,
+    () => decideBox(ctx, blocks, owner),
+    (old) => replaceBox(ctx, old, blocks, owner),
+  );
+}
+
+/**
+ * The text of a box was edited (`blocks` are the new blocks of a box whose old ones, `old`, were
+ * laid out): whether the layout that follows the edit may lay out the new text in the place of the
+ * old one, as a new layout would. It may when no other drawing showed the new blocks before and all the
+ * boxes laid out so far, with the new text in the place of the old, stay under the limit of work:
+ * then a new layout takes every box, this one too, whatever the order. Otherwise the document is
+ * laid out anew.
+ */
+function replaceBox(ctx: LayoutContext, old: Block[], blocks: Block[], owner: object): boolean {
+  // Blocks another drawing showed are not taken; the same drawing shows them again after an undo.
+  const shown = ctx.boxOwners.get(blocks);
+  if (shown !== undefined && shown !== owner) return false;
+  const was = ctx.boxWeights.get(old);
+  if (was === undefined) return false;
+  const stated = ctx.options.maxTextBoxWork;
+  const limit = stated !== undefined && stated >= 0 ? stated : MAX_TEXT_BOX_WORK;
+  let weight = ctx.boxWeights.get(blocks);
+  if (weight === undefined) weight = blocksWeight(blocks, 0);
+  if (ctx.boxWork - was + weight >= limit) return false;
+  ctx.boxWeights.set(blocks, weight);
+  ctx.boxOwners.set(blocks, owner);
+  ctx.boxWork += weight - was;
+  return true;
 }
 
 function decideBox(ctx: LayoutContext, blocks: Block[], owner: object): boolean {
@@ -440,7 +470,12 @@ function decideBox(ctx: LayoutContext, blocks: Block[], owner: object): boolean 
   else if (first !== owner) return false;
   const stated = ctx.options.maxTextBoxWork;
   const limit = stated !== undefined && stated >= 0 ? stated : MAX_TEXT_BOX_WORK;
-  if (ctx.boxWork >= limit) return false;
+  if (ctx.boxWork >= limit) {
+    // After an edit the work may be counted for more than a new layout counts: that one may take this box.
+    if (ctx.relaid) ctx.broken = true;
+    ctx.boxLimited = true;
+    return false;
+  }
   let weight = ctx.boxWeights.get(blocks);
   if (weight === undefined) ctx.boxWeights.set(blocks, (weight = blocksWeight(blocks, 0)));
   ctx.boxWork += weight;

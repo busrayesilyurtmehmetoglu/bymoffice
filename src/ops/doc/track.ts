@@ -50,6 +50,7 @@
 import { createContext, createReaderState } from '../../formats/docx/common';
 import { paraPropsElement, runPropsElement, wEl, type PropsContext } from '../../formats/docx/write-props';
 import { EMPTY_PARA_PROPS, EMPTY_RUN_PROPS, tracksChanges, type AttrList, type Block, type DocModel, type DocRelationship, type ExtraXml, type Inline, type ParaProps, type RevisionInfo, type RunItem, type RunProps, type Wrapper } from '../../model/doc/types';
+import { ownerOf } from './stand-in';
 import type { XmlElement } from '../../xml';
 import { fieldPairs, makeRun, removedPieces, sameProps, type Piece } from './pieces';
 
@@ -85,12 +86,12 @@ const SETUPS = new WeakMap<DocModel, TrackingSetup>();
 
 /** Sets how the changes of a document are tracked from now on; see TrackingSetup. */
 export function setTracking(doc: DocModel, setup: TrackingSetup): void {
-  SETUPS.set(doc, { ...setup });
+  SETUPS.set(ownerOf(doc), { ...setup });
 }
 
 /** Did the application ask for the changes of this document to be tracked whatever the document says (setTracking with `force`). */
 export function forcesTracking(doc: DocModel): boolean {
-  const setup = SETUPS.get(doc);
+  const setup = SETUPS.get(ownerOf(doc));
   return setup !== undefined && setup.force === true;
 }
 
@@ -149,14 +150,14 @@ function isIsoDate(text: string): boolean {
 /** Does a command with these options track its changes in this document. */
 export function isTracking(doc: DocModel, options?: TrackOptions): boolean {
   if (options && options.trackChanges === true) return true;
-  const setup = SETUPS.get(doc);
+  const setup = SETUPS.get(ownerOf(doc));
   return (setup !== undefined && setup.force === true) || tracksChanges(doc);
 }
 
 /** The tracking for a command; undefined when its changes are not tracked. */
 export function trackingFor(doc: DocModel, options?: TrackOptions): Tracking | undefined {
   if (!isTracking(doc, options)) return undefined;
-  const setup = SETUPS.get(doc) || {};
+  const setup = SETUPS.get(ownerOf(doc)) || {};
   const named = options && typeof options.author === 'string' && options.author !== '' ? options.author : setup.author;
   const known = typeof named === 'string' && named !== '';
   const author = known ? (named as string) : DEFAULT_AUTHOR;
@@ -165,8 +166,8 @@ export function trackingFor(doc: DocModel, options?: TrackOptions): Tracking | u
     if (typeof options.date !== 'string' || !isIsoDate(options.date)) throw new RangeError('The date of a tracked change must be ISO 8601 text');
     date = options.date;
   } else date = revisionDate((setup.now || systemClock)());
-  let given = SESSION_IDS.get(doc);
-  if (!given) SESSION_IDS.set(doc, (given = new Map<number, string>()));
+  let given = SESSION_IDS.get(ownerOf(doc));
+  if (!given) SESSION_IDS.set(ownerOf(doc), (given = new Map<number, string>()));
   const ids = given;
   return {
     author,
@@ -188,8 +189,8 @@ export function trackingFor(doc: DocModel, options?: TrackOptions): Tracking | u
  * happens to an own insertion that holds more than typing can put there.
  */
 export function claimRevisions(doc: DocModel, author: string, ids: number[]): void {
-  let given = SESSION_IDS.get(doc);
-  if (!given) SESSION_IDS.set(doc, (given = new Map<number, string>()));
+  let given = SESSION_IDS.get(ownerOf(doc));
+  if (!given) SESSION_IDS.set(ownerOf(doc), (given = new Map<number, string>()));
   for (const id of ids) given.set(id, author);
 }
 
@@ -199,7 +200,7 @@ export function claimRevisions(doc: DocModel, author: string, ids: number[]): vo
  */
 function renewedId(doc: DocModel, from: number | undefined): number {
   const id = nextRevisionId(doc);
-  const given = SESSION_IDS.get(doc);
+  const given = SESSION_IDS.get(ownerOf(doc));
   const author = given && from !== undefined ? given.get(from) : undefined;
   if (given && author !== undefined) given.set(id, author);
   return id;
@@ -326,10 +327,10 @@ export function noteForeignIds(doc: DocModel, blocks: Block[]): void {
     0,
   );
   if (max === 0) return;
-  const state = NEXT_IDS.get(doc);
+  const state = NEXT_IDS.get(ownerOf(doc));
   if (state) {
     if (max >= state.next) state.next = max + 1;
-  } else if (max > (FOREIGN_IDS.get(doc) || 0)) FOREIGN_IDS.set(doc, max);
+  } else if (max > (FOREIGN_IDS.get(ownerOf(doc)) || 0)) FOREIGN_IDS.set(ownerOf(doc), max);
 }
 
 /**
@@ -339,8 +340,8 @@ export function noteForeignIds(doc: DocModel, blocks: Block[]): void {
  * the change it was made for is undone.
  */
 export function nextRevisionId(doc: DocModel): number {
-  let state = NEXT_IDS.get(doc);
-  if (!state) NEXT_IDS.set(doc, (state = { next: Math.max(largestAnnotationId(doc), FOREIGN_IDS.get(doc) || 0) + 1 }));
+  let state = NEXT_IDS.get(ownerOf(doc));
+  if (!state) NEXT_IDS.set(ownerOf(doc), (state = { next: Math.max(largestAnnotationId(ownerOf(doc)), FOREIGN_IDS.get(ownerOf(doc)) || 0) + 1 }));
   if (state.next > MAX_ID) throw new RangeError('The document has no room for another revision');
   return state.next++;
 }

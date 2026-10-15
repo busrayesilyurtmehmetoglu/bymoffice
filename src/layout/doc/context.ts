@@ -17,7 +17,7 @@ import type { ParaEnv } from './paragraph';
 import type { ParaPrep } from './prep';
 import { HIGHLIGHT, symbolFont, type LiveField, type SymbolKind } from './symbols';
 import type { DocLayoutOptions, FontMetrics, LayoutFont, PageItem, TextItem, TextMeasurer } from './types';
-import { eighths, finite, halfPoints, points, twips } from './units';
+import { MAX_TEXT_BOX_WORK, eighths, finite, halfPoints, points, twips } from './units';
 
 // --------------------------------------------------------------------- bands
 
@@ -264,6 +264,18 @@ export class LayoutContext {
   readonly boxWeights = new WeakMap<Block[], number>();
   /** What laying out text boxes has cost so far (see DocLayoutOptions.maxTextBoxWork). */
   boxWork = 0;
+  /**
+   * The layout has followed an edit (DocLayout.edited). From then on boxWork may be more than a new layout counts
+   * (blocks laid out again count again, text that was replaced stays counted): a box it would leave empty for the
+   * limit, or that was left empty before, may be one a new layout fills, and the layout is made again instead.
+   */
+  relaid = false;
+  /**
+   * A box was left empty for the limit of work. Then any edit that changes what the boxes cost (text of a box, a
+   * box that goes or comes) may let a later box in that the pages kept from before show empty: such a layout does
+   * not follow edits (DocLayout.edited answers that it cannot).
+   */
+  boxLimited = false;
   /** Set while a block of the body is prepared (see PrepSession). */
   session: PrepSession | undefined;
   /** The events each block of the body gave when it was first turned into bands. */
@@ -331,12 +343,26 @@ export class LayoutContext {
     else session.record.push({ k: kind, id });
   }
 
-  /** Whether a drawing gets the text of a box: decided by `decide`, or as it was decided for the block this one replaces. */
-  boxEvent(blocks: Block[], owner: object, decide: () => boolean): boolean {
+  /**
+   * Whether a drawing gets the text of a box: decided by `decide`, or as it was decided for the block this one replaces.
+   * `replace`: where the box the block it replaces had at this place was another one (its text was edited), whether
+   * the new text may take the place of that one (see takesBox() in drawing.ts); without it, or when it says no, the
+   * document counts differently now.
+   */
+  boxEvent(blocks: Block[], owner: object, decide: () => boolean, replace?: (old: Block[]) => boolean): boolean {
     const session = this.session;
     if (session && session.expect) {
+      const expect = session.expect;
+      const next = expect.events[expect.at];
+      if (replace && next && next.k === 'b' && next.blocks !== blocks && next.took && replace(next.blocks)) {
+        expect.at++;
+        session.record.push({ k: 'b', blocks, took: true });
+        return true;
+      }
       const event = this.expected((e) => e.k === 'b' && e.blocks === blocks);
       const took = event !== undefined && event.k === 'b' && event.took;
+      // A box that was left empty (for the limit of work) may be one a new layout fills now.
+      if (event !== undefined && !took) this.broken = true;
       if (took) this.boxOwners.set(blocks, owner);
       return took;
     }
@@ -345,15 +371,37 @@ export class LayoutContext {
     return took;
   }
 
+  /**
+   * Whether a block laid out before (an edit undone) may show the text of a box it showed then in the place of
+   * the text the block it replaces showed (the text of the box was edited in between): both were laid out, and all
+   * the boxes laid out, with the one in the place of the other, stay under the limit of work (see replaceBox() in
+   * drawing.ts).
+   */
+  private boxAgain(expected: StateEvent, event: StateEvent): boolean {
+    if (expected.k !== 'b' || event.k !== 'b' || !expected.took || !event.took || expected.blocks === event.blocks) return false;
+    const was = this.boxWeights.get(expected.blocks);
+    const weight = this.boxWeights.get(event.blocks);
+    if (was === undefined || weight === undefined || !this.boxOwners.has(event.blocks)) return false;
+    const stated = this.options.maxTextBoxWork;
+    const limit = stated !== undefined && stated >= 0 ? stated : MAX_TEXT_BOX_WORK;
+    return this.boxWork - was + weight < limit;
+  }
+
   /** Events of something prepared before, met again in the open session. */
   replay(events: StateEvent[]): void {
     const session = this.session;
     if (!session) return;
     const expect = session.expect;
     for (let i = 0; i < events.length; i++) {
+      const own = events[i];
+      // A box that was left empty when the block was laid out before may be one a new layout fills now.
+      if (own.k === 'b' && !own.took) {
+        this.broken = true;
+        return;
+      }
       if (expect) {
         const event = expect.events[expect.at];
-        if (!event || !sameEvent(event, events[i])) {
+        if (!event || !(sameEvent(event, events[i]) || this.boxAgain(event, events[i]))) {
           this.broken = true;
           return;
         }

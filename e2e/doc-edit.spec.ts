@@ -1423,7 +1423,7 @@ test.describe('document editor: focus, stories and places that cannot be edited'
     expect(await pageText(page, 1)).toContain('Header text');
   });
 
-  test('the text of a text box is not a place for the caret: a click goes to the text beside it', async ({ page }) => {
+  test('a click on the text of a text box puts the caret in the box: what is typed goes into the box', async ({ page }) => {
     await mountEdit(page, await sample(p(r('Anchor paragraph') + textBoxRun(300, 40, 160, 60, p('Boxed words'))) + p('After the box.')));
     await laidOut(page);
     const inBox = await page.evaluate(() => {
@@ -1436,21 +1436,19 @@ test.describe('document editor: focus, stories and places that cannot be edited'
     await page.mouse.click(inBox.x, inBox.y);
     const range = (await selection(page))!;
     expect(range.focus.story).toBe('body');
-    expect(range.focus.path.indexOf(-1)).toBe(-1);
+    expect(range.focus.path).toEqual([0, -1, 0, 0, 0]);
     await page.keyboard.type('Q');
     await laidOut(page);
-    expect(await pageText(page, 1)).toContain('Boxed words');
-    expect((await paragraphs(page)).join('|')).toContain('Q');
-    // The API refuses a place in the box without changing anything.
-    const changes = await page.evaluate(() => (window as any).__changes);
-    const refused = await page.evaluate(() => {
+    expect(await page.evaluate(() => (window as any).BymOffice.paragraphText((window as any).__view.document.body.blocks[0]))).toBe('Anchor paragraph');
+    expect((await paragraphs(page)).join('|')).not.toContain('Q');
+    const boxText = await page.evaluate(() => {
       const view = (window as any).__view;
-      view.setSelection({ story: 'body', path: [0, -1, 0, 0, 0], offset: 2 });
-      return view.insertText('nope');
+      return (window as any).BymOffice.docOps.resolvePosition(view.document, { story: 'body', path: [0, -1, 0, 0, 0], offset: 0 }).paragraph;
     });
-    expect(refused).toBe(false);
-    expect(await page.evaluate(() => (window as any).__changes)).toBe(changes);
-    expect(await page.evaluate(() => (window as any).__notices.map((n: any) => n.message))).toContain('This part of the document cannot be edited');
+    expect(JSON.stringify(boxText)).toContain('Q');
+    // Escape leaves the box: the caret is in the paragraph that anchors it again.
+    await page.keyboard.press('Escape');
+    expect((await selection(page))!.focus.path).toEqual([0]);
   });
 
   test('the caret does not blink when the user asked for less motion', async ({ page }) => {

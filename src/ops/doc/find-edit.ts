@@ -14,6 +14,7 @@
 import { createBodyContext } from '../../formats/docx/write-package';
 import { textBoxesWritable, type BodyContext } from '../../formats/docx/write-body';
 import type { DocModel, Paragraph, Wrapper } from '../../model/doc/types';
+import type { XmlElement } from '../../xml';
 import { buildEdit, type DocEdit, type DocEditOptions } from './draft';
 import { cleanText, flatten, paragraphWith, rebuild, textPieces, withoutChange, type Piece } from './pieces';
 import { asRange, orderRange, resolvePosition, storyOf, type DocPosition, type DocRange, type GraphicPlace, type ParagraphGraphic } from './position';
@@ -60,7 +61,38 @@ export function storyContext(doc: DocModel, story: string): BodyContext {
  */
 export function graphicFixed(ctx: BodyContext, graphic: ParagraphGraphic, place: GraphicPlace): boolean {
   if (fixedWrap(place.run.wrap)) return true;
+  if (textLocked(graphic)) return true;
   return !textBoxesWritable(ctx, graphic, place.holder, place.nested);
+}
+
+const isTrue = (value: string | undefined): boolean => value === '1' || value === 't' || value === 'true' || value === 'on';
+
+/**
+ * Whether the shape says its text may not be edited: <a:spLocks noTextEdit="1"/> (DrawingML) or
+ * <o:lock text="t"/> (VML). Only the shape itself is looked at, not the shapes in its text boxes.
+ */
+export function textLocked(graphic: ParagraphGraphic): boolean {
+  const xml = graphic.xml as XmlElement | undefined;
+  if (!xml) return false;
+  let budget = 20000;
+  const walk = (el: XmlElement, depth: number): boolean => {
+    if (depth > 64 || --budget < 0) return false;
+    const local = localName(el.name);
+    if (local === 'txbxContent') return false;
+    if (local === 'spLocks' && isTrue(attrOf(el, 'noTextEdit'))) return true;
+    if (local === 'lock' && isTrue(attrOf(el, 'text'))) return true;
+    for (const node of el.children) if (node.type === 'element' && walk(node, depth + 1)) return true;
+    return false;
+  };
+  return walk(xml, 0);
+}
+
+function attrOf(el: XmlElement, local: string): string | undefined {
+  let value: string | undefined;
+  el.attrs.forEach((v, key) => {
+    if (localName(key) === local) value = v;
+  });
+  return value;
 }
 
 /** Whether a paragraph as a whole may not be replaced in: it is in a locked content control or in alternate content around blocks. */

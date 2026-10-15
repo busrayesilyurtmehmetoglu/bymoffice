@@ -119,6 +119,7 @@ import {
   type DocPosition,
   type DocRange,
 } from './position';
+import { ownerOf } from './stand-in';
 import { freeRelId, rowSpans, takenByDocument, type Taken } from './structure';
 import { cellsBetween, deleteSpan, joinedProps, neighbour, newMarkProps, parting, withoutSection } from './text';
 import { TRACK_UNSUPPORTED, noteForeignIds, plainExtras, plainProps, withFreshChanges, withMarkRevision, withPlainMark, type Tracking } from './track';
@@ -197,8 +198,8 @@ const ORIGINS = new WeakMap<DocModel, object>();
 
 /** What stands for a document in the fragments taken from it: the same object for the same document, and nothing that keeps the document alive. */
 export function originOf(doc: DocModel): object {
-  let origin = ORIGINS.get(doc);
-  if (!origin) ORIGINS.set(doc, (origin = {}));
+  let origin = ORIGINS.get(ownerOf(doc));
+  if (!origin) ORIGINS.set(ownerOf(doc), (origin = {}));
   return origin;
 }
 

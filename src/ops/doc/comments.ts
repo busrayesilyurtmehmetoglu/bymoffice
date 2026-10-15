@@ -65,6 +65,7 @@ import {
   type DocPosition,
   type DocRange,
 } from './position';
+import { ownerOf } from './stand-in';
 import { nextRevisionId, trackingFor } from './track';
 
 /** Thrown for a comment the document does not have (any more). */
@@ -594,7 +595,7 @@ const PARA_IDS = new WeakMap<DocModel, Set<string>>();
 
 /** A paragraph id no paragraph of the document has and none was given before, also not to a comment that was taken back. */
 function freshParaId(doc: DocModel, seed: number): string {
-  let taken = PARA_IDS.get(doc);
+  let taken = PARA_IDS.get(ownerOf(doc));
   if (!taken) {
     // Of every part that holds paragraphs: the body, the comments, the headers and footers, the notes. Paragraphs
     // that an edit made carry no id, so the texts of the parts as they were read say all there is.
@@ -607,7 +608,7 @@ function freshParaId(doc: DocModel, seed: number): string {
     doc.footers.forEach(of);
     of(doc.footnotes);
     of(doc.endnotes);
-    PARA_IDS.set(doc, taken);
+    PARA_IDS.set(ownerOf(doc), taken);
   }
   if (doc.comments) doc.comments.items.forEach((comment) => (comment.paraId !== undefined ? (taken as Set<string>).add(comment.paraId) : 0));
   let value = (Math.imul(seed | 0, 0x9e3779b1) ^ 0x2545f491) >>> 0;

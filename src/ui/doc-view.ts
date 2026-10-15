@@ -68,6 +68,7 @@ import { editorRootIn } from './save-confirm';
 import { FindBar, type FindBarQuery } from './find-bar';
 import { runSliced } from './sliced';
 import { checkReplacement, type CompiledFind } from '../edit/find';
+import { READ_ONLY } from '../ops/doc/pieces';
 
 // The picture decoder lives with the renderers; its helpers are still reachable from here.
 export { declaredImagePixels, declaredImageSize, decodedImageSize, sniffImageType } from '../render/images';
@@ -196,6 +197,14 @@ const MAX_PICTURE_BYTES = 20000000;
 const EDIT_LAYOUT_MS = 120;
 /** Two presses this close in time and place are a double click. */
 const CLICK_MS = 500;
+/** How a command meets a caret in a text box: see DocumentView.runAt(). */
+type BoxMode = 'edit' | 'anchor' | 'raw' | 'refuse';
+/** Messages of the RangeErrors a command in a text box is refused with (said by refuse()). */
+const BOX_COMMAND = 'bym:text-box:command';
+const BOX_SHARED = 'bym:text-box:shared';
+const BOX_TRACKED = 'bym:text-box:tracked';
+const BOX_LOCKED = 'bym:text-box:locked';
+const BOX_UNWRITABLE = 'bym:text-box:unwritable';
 const CLICK_DISTANCE = 5;
 const LONG_PRESS_MS = 500;
 /** A drag this close to the top or bottom of the pages scrolls them. */
@@ -314,8 +323,21 @@ const copyPosition = (position: DocPosition): DocPosition => {
 /** "header" of "header:rId7". */
 const storyKind = (story: string): string => (story.indexOf(':') < 0 ? story : story.slice(0, story.indexOf(':')));
 
-/** Lines of the text itself: not those in a text box, whose text cannot be edited. */
+/** Lines of the text itself: not those in a text box. */
 const outsideBoxes = (mark: LineMark): boolean => mark.source.path.indexOf(-1) < 0;
+
+/** The part of a path that names the text box it is in (up to and with the box); [] outside text boxes. */
+const boxRoot = (path: number[]): number[] => path.slice(0, ops.textBoxRootLength(path));
+
+/** Whether a path is in the text box `root` names, and not in a box in it ([]: outside text boxes). */
+function inRoot(path: number[], root: number[]): boolean {
+  if (ops.textBoxRootLength(path) !== root.length) return false;
+  for (let i = 0; i < root.length; i++) if (path[i] !== root[i]) return false;
+  return true;
+}
+
+/** How far around the lines of a text box a press still goes into the box, px of the page. */
+const BOX_SLOP = 6;
 
 const coarsePointer = (): boolean => typeof window.matchMedia === 'function' && window.matchMedia('(pointer:coarse)').matches;
 
@@ -1203,9 +1225,9 @@ export class DocumentView {
   selectAll(): void {
     if (this.destroyed) return;
     if (this.editable) {
-      // A range of the story the caret is in: what is typed next takes its place.
-      const start = this.storyEdge(-1);
-      const end = this.storyEdge(1);
+      // A range of the story the caret is in (of the text box it is in): what is typed next takes its place.
+      const start = this.edgeHere(-1);
+      const end = this.edgeHere(1);
       if (!start || !end) return;
       this.typing.commit();
       this.selection = { anchor: start, focus: end };
@@ -1251,7 +1273,8 @@ export class DocumentView {
     if (cached && cached.anchor === selection.anchor && cached.focus === selection.focus) return cached.range;
     let range: DocRange = selection;
     try {
-      range = ops.expandRangeForTables(this.document, selection);
+      // In a text box as in the body: whole cells where the selection goes into or out of a table of the box.
+      range = ops.expandRangeInTextBox(this.document, selection);
     } catch {
       range = selection;
     }
@@ -2950,7 +2973,7 @@ export class DocumentView {
           slice = this.selectionSlice();
           // A tracked deletion takes nothing out of the document but text the same author typed, which the
           // clipboard holds as text: there is nothing more the clipboard has to hold for it.
-          if (!this.trackingChanges && cutLoses(this.document, range, slice)) refused = this.strings.cannotCutObjects;
+          if (!this.trackingChanges && ops.readInTextBox(this.document, range, (doc, at) => cutLoses(doc, at, slice))) refused = this.strings.cannotCutObjects;
         } catch (error) {
           event.preventDefault();
           this.refuse(error);
@@ -2972,7 +2995,7 @@ export class DocumentView {
       // The mark of the copy did not reach the clipboard: what a paste gets is the text, so the cut is judged as one of text.
       let loses = true;
       try {
-        loses = cutLoses(this.document, range, undefined);
+        loses = ops.readInTextBox(this.document, range, (doc, at) => cutLoses(doc, at, undefined));
       } catch {
         loses = true;
       }
@@ -2981,7 +3004,7 @@ export class DocumentView {
         return;
       }
     }
-    this.perform((selection) => ops.deleteRange(this.document, selection));
+    this.perform((selection, doc) => ops.deleteRange(doc, selection));
   };
 
   private onPaste = (event: ClipboardEvent): void => {
@@ -4819,7 +4842,7 @@ export class DocumentView {
   /** Types text at the caret, or over the selection: "\n" ends a paragraph, "\t" is a tab. False when nothing was changed. */
   insertText(text: string): boolean {
     if (typeof text !== 'string' || text === '') return false;
-    return this.perform((range) => ops.insertText(this.document, range, text, this.takeFormat()), true);
+    return this.perform((range, doc) => ops.insertText(doc, range, text, this.takeFormat()), true);
   }
 
   /** Character formatting for the selection, or at a caret for what is typed next. */
@@ -4835,7 +4858,7 @@ export class DocumentView {
         empty = false;
       }
       // Where changes are tracked this is a tracked change of the formatting of the mark, like any other.
-      if (empty && this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true)) return true;
+      if (empty && this.perform((selection, doc) => ops.setRunFormat(doc, selection, patch), true)) return true;
       // Checked now, so that a patch that is not valid is refused here and not at the next key.
       try {
         ops.patchRunProps({}, patch);
@@ -4847,7 +4870,7 @@ export class DocumentView {
       this.announceSelection();
       return true;
     }
-    return this.perform((selection) => ops.setRunFormat(this.document, selection, patch), true);
+    return this.perform((selection, doc) => ops.setRunFormat(doc, selection, patch), true);
   }
 
   /** Turns bold, italic, underline or strikethrough on, or off when all of the selection has it. */
@@ -4878,15 +4901,15 @@ export class DocumentView {
       } catch {
         empty = false;
       }
-      if (empty && this.perform((selection) => ops.toggleRunFormat(this.document, selection, key), true)) return true;
+      if (empty && this.perform((selection, doc) => ops.toggleRunFormat(doc, selection, key), true)) return true;
       return this.format({ [key]: false });
     }
-    return this.perform((selection) => ops.toggleRunFormat(this.document, selection, key), true);
+    return this.perform((selection, doc) => ops.toggleRunFormat(doc, selection, key), true);
   }
 
   /** Paragraph formatting (alignment, style, spacing ...) for every paragraph the selection touches. */
   formatParagraph(patch: ParaFormatPatch): boolean {
-    return this.perform((range) => ops.setParaFormat(this.document, range, patch), true);
+    return this.perform((range, doc) => ops.setParaFormat(doc, range, patch), true);
   }
 
   /** The tab stops of the paragraph at the caret (those its style gives it and its own), in order; positions in twips. */
@@ -4907,7 +4930,7 @@ export class DocumentView {
    */
   setTabStops(patch: TabStopsPatch | null): boolean {
     this.caretForParagraphs();
-    return this.perform((range) => ops.setParaFormat(this.document, range, { tabs: patch }), true);
+    return this.perform((range, doc) => ops.setParaFormat(doc, range, { tabs: patch }), true);
   }
 
   /** The distance between the automatic tab stops of the document, twips. */
@@ -4918,7 +4941,7 @@ export class DocumentView {
   /** Sets the distance between the automatic tab stops of the document, twips; one undo step. Refused where changes are tracked. */
   setDefaultTabStop(twips: number): boolean {
     this.caretForParagraphs();
-    return this.perform((range) => ops.setDefaultTabStop(this.document, twips, range), true);
+    return this.perform((range, doc) => ops.setDefaultTabStop(doc, twips, range), true, 'raw');
   }
 
   /**
@@ -4930,12 +4953,18 @@ export class DocumentView {
     if (defaultTab === undefined) return this.setTabStops(patch as TabStopsPatch);
     if (!patch) return this.setDefaultTabStop(defaultTab);
     this.caretForParagraphs();
-    return this.perform((range) => {
-      const stops = ops.setParaFormat(this.document, range, { tabs: patch });
-      const setting = ops.setDefaultTabStop(this.document, defaultTab, range);
-      // Neither depends on the other: both were made on the document as it is.
-      return { ...stops, ops: stops.ops.concat(setting.ops) };
-    }, true);
+    // Each where it belongs: the stops in the paragraphs of the selection (in the text box it is in, if it is), the
+    // distance in the settings of the document. Neither depends on the other: both are made on the document as it
+    // is, and go in as one step.
+    return this.perform(
+      (range, doc) => {
+        const stops = this.runAt(range, (at, owner) => ops.setParaFormat(owner, at, { tabs: patch }));
+        const setting = ops.setDefaultTabStop(doc, defaultTab, range);
+        return { ...stops, ops: stops.ops.concat(setting.ops) };
+      },
+      true,
+      'raw',
+    );
   }
 
   /** A caret at the start of the first paragraph of the body; undefined for a body without one. */
@@ -5012,7 +5041,7 @@ export class DocumentView {
    */
   setSectionSetup(patch: ops.SectionPatch, scope: ops.SectionScope = 'section'): boolean {
     this.caretForParagraphs();
-    return this.perform((range) => ops.setSectionSetup(this.document, range, patch, scope), true);
+    return this.perform((range, doc) => ops.setSectionSetup(doc, range, patch, scope), true, 'anchor');
   }
 
   /**
@@ -5020,7 +5049,7 @@ export class DocumentView {
    * section with the page of the one it was in, and the next section starts as `kind` says.
    */
   insertSectionBreak(kind: ops.SectionBreakKind = 'nextPage'): boolean {
-    return this.perform((range) => ops.insertSectionBreak(this.document, this.caretOf(range), kind), true);
+    return this.perform((range, doc) => ops.insertSectionBreak(doc, this.caretOf(range), kind), true, 'refuse');
   }
 
   /**
@@ -5114,36 +5143,36 @@ export class DocumentView {
 
   /** Makes the paragraphs of the selection items of a list, or takes them out of it. */
   toggleList(kind: 'bullet' | 'number'): boolean {
-    return this.perform((range) => ops.toggleList(this.document, range, kind), true);
+    return this.perform((range, doc) => ops.toggleList(doc, range, kind), true);
   }
 
   /** One level deeper (1) or less deep (-1): list items change their level, other paragraphs their indent. */
   indent(delta: number): boolean {
-    return this.perform((range) => ops.indentList(this.document, range, delta), true);
+    return this.perform((range, doc) => ops.indentList(doc, range, delta), true);
   }
 
   insertTable(rows: number, columns: number): boolean {
-    return this.perform((range) => ops.insertTable(this.document, this.caretOf(range), rows, columns), true);
+    return this.perform((range, doc) => ops.insertTable(doc, this.caretOf(range), rows, columns), true);
   }
 
   insertRow(where: 'above' | 'below'): boolean {
-    return this.perform((range) => ops.insertRow(this.document, range.focus, where), true);
+    return this.perform((range, doc) => ops.insertRow(doc, range.focus, where), true);
   }
 
   deleteRow(): boolean {
-    return this.perform((range) => ops.deleteRow(this.document, range.focus), true);
+    return this.perform((range, doc) => ops.deleteRow(doc, range.focus), true);
   }
 
   insertColumn(side: 'left' | 'right'): boolean {
-    return this.perform((range) => ops.insertColumn(this.document, range.focus, side), true);
+    return this.perform((range, doc) => ops.insertColumn(doc, range.focus, side), true);
   }
 
   deleteColumn(): boolean {
-    return this.perform((range) => ops.deleteColumn(this.document, range.focus), true);
+    return this.perform((range, doc) => ops.deleteColumn(doc, range.focus), true);
   }
 
   insertPageBreak(): boolean {
-    return this.perform((range) => ops.insertPageBreak(this.document, this.caretOf(range)), true);
+    return this.perform((range, doc) => ops.insertPageBreak(doc, this.caretOf(range)), true, 'refuse');
   }
 
   /**
@@ -5157,7 +5186,7 @@ export class DocumentView {
       this.notify(this.strings.linkNotAllowed, 'error');
       return false;
     }
-    return this.perform((range) => ops.insertHyperlink(this.document, range, safe), true);
+    return this.perform((range, doc) => ops.insertHyperlink(doc, range, safe), true, 'refuse');
   }
 
   /**
@@ -5190,7 +5219,7 @@ export class DocumentView {
     // The name of the new part must not be one the package has already, though the model does not know it.
     const source = this.options.package as { hasPart?(part: string): boolean } | undefined;
     const taken = this.options.partTaken || (source && typeof source.hasPart === 'function' ? (part: string) => (source.hasPart as (part: string) => boolean)(part) : undefined);
-    return this.perform((selection) => ops.insertImage(this.document, this.caretOf(selection), image, taken ? { taken } : undefined), true);
+    return this.perform((selection, doc) => ops.insertImage(doc, this.caretOf(selection), image, taken ? { taken } : undefined), true, 'refuse');
   }
 
   /** The formatting in effect for the selection, with what was chosen at a caret for the text typed next; undefined without a selection. */
@@ -5218,7 +5247,10 @@ export class DocumentView {
   /** Whether the caret is in a table cell. */
   get inTable(): boolean {
     const range = this.range();
-    return range !== undefined && range.focus.path.length >= 4 && range.focus.path.indexOf(-1) < 0;
+    if (range === undefined) return false;
+    // In a table of the text or of the text box the caret is in.
+    const path = range.focus.path;
+    return path.length - ops.textBoxRootLength(path) >= 4;
   }
 
   // ------------------------------------------------------------ find and replace
@@ -5379,7 +5411,7 @@ export class DocumentView {
     // In a room the command that travels (insertText); elsewhere the replacement in the place of the match. A match in a
     // text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
     if (match && match.replaceable)
-      changed = this.perform(() => (this.collab && !ops.inTextBox(match.range.anchor.path) ? ops.insertText(this.document, match.range, replacement) : ops.replaceMatchEdit(this.document, match.range, replacement)), true);
+      changed = this.perform(() => (this.collab && !ops.inTextBox(match.range.anchor.path) ? ops.insertText(this.document, match.range, replacement) : ops.replaceMatchEdit(this.document, match.range, replacement)), true, 'raw');
     else if (match) this.notify(this.replacedText({ replaced: 0, skipped: 1, textBoxesKept: match.fixed === 'textBox' ? 1 : 0 }), 'info');
     return this.findNext(text, options).then(() => changed);
   }
@@ -5676,7 +5708,15 @@ export class DocumentView {
   private sayPresence(): void {
     const session = this.collab;
     if (!session) return;
-    const range = this.range();
+    let range = this.range();
+    // The places of text boxes do not travel: a caret in one is shown at the drawing of the box.
+    if (range && (ops.inTextBox(range.focus.path) || ops.inTextBox(range.anchor.path))) {
+      try {
+        range = ops.collapsed(ops.textBoxExit(this.document, range.focus));
+      } catch {
+        range = undefined;
+      }
+    }
     session.setPresence(range ? { story: range.focus.story, anchor: { path: range.anchor.path.slice(), offset: range.anchor.offset }, focus: { path: range.focus.path.slice(), offset: range.focus.offset } } : undefined);
   }
 
@@ -5721,7 +5761,17 @@ export class DocumentView {
     const s = this.strings;
     const message = error.message;
     this.notify(
-      message === NOT_SHARED
+      message === BOX_COMMAND
+        ? s.textBoxRefused('command')
+        : message === BOX_SHARED
+        ? s.textBoxRefused('shared')
+        : message === BOX_TRACKED
+        ? s.textBoxRefused('tracked')
+        : message === BOX_LOCKED
+        ? s.textBoxRefused('locked')
+        : message === BOX_UNWRITABLE
+        ? s.textBoxRefused('unwritable')
+        : message === NOT_SHARED
         ? s.collab.doc.notShared
         : message === ops.TRACK_UNSUPPORTED
         ? s.cannotTrackChange
@@ -5746,6 +5796,19 @@ export class DocumentView {
     );
   }
 
+  /** First (-1) or last (1) place of the text box the caret is in; of the story where it is in none. */
+  private edgeHere(direction: 1 | -1): DocPosition | undefined {
+    const range = this.range();
+    if (range && ops.inTextBox(range.focus.path)) {
+      try {
+        return ops.movePosition(this.document, range.focus, 'story', direction);
+      } catch {
+        // The box is gone: the story it was in.
+      }
+    }
+    return this.storyEdge(direction);
+  }
+
   /** First (-1) or last (1) place of the story the caret is in. */
   private storyEdge(direction: 1 | -1): DocPosition | undefined {
     try {
@@ -5761,7 +5824,7 @@ export class DocumentView {
    * of the history. `seal`: the step is not joined with typing before or
    * after it.
    */
-  private perform(make: (range: DocRange) => DocEdit, seal = false): boolean {
+  private perform(make: (range: DocRange, doc: DocModel) => DocEdit, seal = false, inBox: BoxMode = 'edit'): boolean {
     if (!this.editable || this.destroyed) return false;
     this.typing.commit();
     const range = this.range();
@@ -5769,7 +5832,7 @@ export class DocumentView {
     if (seal) this.history.seal();
     let edit: DocEdit;
     try {
-      edit = make(range);
+      edit = this.runAt(range, make, inBox);
       if (edit.ops.length > 0) this.history.applyEdit(edit, { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) });
     } catch (error) {
       this.refuse(error);
@@ -5784,6 +5847,51 @@ export class DocumentView {
     }
     this.changed(edit.selection);
     return true;
+  }
+
+  /** Whether the caret (or the selection) is in a text box. */
+  get inTextBox(): boolean {
+    const range = this.range();
+    return range !== undefined && (ops.inTextBox(range.focus.path) || ops.inTextBox(range.anchor.path));
+  }
+
+  /**
+   * Runs a command where a range is. Outside text boxes on the document; in a text box as
+   * `inBox` says: 'edit' in the box (ops.editInTextBox: the command sees the box as the body
+   * of a stand-in document, the range lowered into it), 'anchor' on the document at the place
+   * the box leaves to (the section the box is in), 'raw' on the document with the range as it
+   * is (the command does not edit at the range), 'refuse' not at all. Throws RangeError for a
+   * change that is refused, with a message refuse() says the reason of.
+   */
+  private runAt(range: DocRange, make: (range: DocRange, doc: DocModel) => DocEdit, inBox: BoxMode = 'edit'): DocEdit {
+    const boxed = ops.inTextBox(range.anchor.path) || ops.inTextBox(range.focus.path);
+    if (!boxed || inBox === 'raw') return make(range, this.document);
+    if (inBox === 'anchor') return make(ops.collapsed(ops.textBoxExit(this.document, range.focus)), this.document);
+    if (inBox === 'refuse') throw new RangeError(BOX_COMMAND);
+    // The paths of text boxes do not travel: a change there would be this participant's alone.
+    if (this.collab) throw new RangeError(BOX_SHARED);
+    try {
+      return ops.editInTextBox(this.document, range, (doc, lowered) => make(lowered, doc));
+    } catch (error) {
+      throw this.boxError(error, range);
+    }
+  }
+
+  /** An error of a command in a text box, with the reason the user is told. */
+  private boxError(error: unknown, range: DocRange): unknown {
+    if (!(error instanceof RangeError)) return error;
+    if (error.message === ops.TRACK_UNSUPPORTED) return new RangeError(BOX_TRACKED);
+    if (error.message === ops.TEXT_BOX_OUTSIDE) return new RangeError(BOX_COMMAND);
+    if (error.message === READ_ONLY) {
+      let problem: 'locked' | 'unwritable' | undefined;
+      try {
+        problem = ops.textBoxProblem(this.document, range.focus);
+      } catch {
+        problem = undefined;
+      }
+      if (problem) return new RangeError(problem === 'locked' ? BOX_LOCKED : BOX_UNWRITABLE);
+    }
+    return error;
   }
 
   private adopt(selection: DocRange): void {
@@ -5833,9 +5941,34 @@ export class DocumentView {
     this.changed(selection);
   }
 
+  /** The text box the caret was in when the selection last moved ('' outside text boxes): going into one and out of it is said. */
+  private boxKey = '';
+
+  /** Says that the caret went into a text box, or out of it. */
+  private sayBox(range: DocRange | undefined): void {
+    const root = range ? boxRoot(range.focus.path) : [];
+    const key = root.length ? range!.focus.story + ':' + root.join('.') : '';
+    if (key === this.boxKey) return;
+    const was = this.boxKey;
+    this.boxKey = key;
+    if (!range || !this.editable) return;
+    if (key === '') {
+      if (was !== '') this.live.textContent = this.strings.textBoxLeft;
+      return;
+    }
+    let fixed = false;
+    try {
+      fixed = ops.textBoxProblem(this.document, range.focus) !== undefined || this.collab !== undefined || this.trackingChanges;
+    } catch {
+      fixed = true;
+    }
+    this.live.textContent = this.strings.textBoxEntered(fixed);
+  }
+
   /** The caret or the selection moved: the screen, the field for typing and the host are told. */
   private selectionMoved(reveal: boolean): void {
     const range = this.range();
+    this.sayBox(range);
     const wide = range !== undefined && !ops.samePosition(range.anchor, range.focus);
     // Only a selection is painted on the pages; a caret is an element of its own.
     if (wide || this.hadRange) this.repaintAll();
@@ -5896,9 +6029,11 @@ export class DocumentView {
       }
       selection = edit.selection;
     };
+    // Each step where it is: in a text box the command runs in the box (see runAt()).
+    const at1 = (where: DocPosition | DocRange, make: (range: DocRange, doc: DocModel) => DocEdit): DocEdit => this.runAt(ops.asRange(where), make);
     try {
       if (!ops.isCollapsed(range)) {
-        if (change.replaceSelection) apply(change.text === '' ? ops.deleteRange(doc, range) : ops.insertText(doc, range, change.text, this.takeFormat()));
+        if (change.replaceSelection) apply(change.text === '' ? at1(range, (r, d) => ops.deleteRange(d, r)) : at1(range, (r, d) => ops.insertText(d, r, change.text, this.takeFormat())));
       } else {
         const at = range.focus;
         const length = ops.resolvePosition(doc, at).length;
@@ -5921,20 +6056,20 @@ export class DocumentView {
         const single = change.text === '' && change.removeBefore + change.removeAfter === 1 && ops.hasAtomAt(paragraph, at.offset);
         let picture = false;
         if (single && change.removeBefore === 1 && at.before !== true) {
-          apply(ops.deleteBackward(doc, at));
+          apply(at1(at, (r, d) => ops.deleteBackward(d, r.focus)));
           picture = true;
         } else if (single && change.removeAfter === 1 && at.before === true) {
-          apply(ops.deleteForward(doc, at));
+          apply(at1(at, (r, d) => ops.deleteForward(d, r.focus)));
           picture = true;
         } else if (to > from) {
           const span = { anchor: place(from), focus: place(to) };
-          apply(change.text === '' ? ops.deleteRange(doc, span) : ops.insertText(doc, span, change.text, this.takeFormat()));
-        } else if (change.text !== '') apply(ops.insertText(doc, place(from), change.text, this.takeFormat()));
+          apply(change.text === '' ? at1(span, (r, d) => ops.deleteRange(d, r)) : at1(span, (r, d) => ops.insertText(d, r, change.text, this.takeFormat())));
+        } else if (change.text !== '') apply(at1(place(from), (r, d) => ops.insertText(d, r, change.text, this.takeFormat())));
         // The picture was the one thing to go: the paragraph is not joined with its neighbour as well.
         if (picture) {
           // Nothing more.
-        } else if (joinBefore) apply(ops.deleteBackward(doc, place(0)));
-        else if (joinAfter) apply(ops.deleteForward(doc, selection ? (selection as DocRange).focus : place(length)));
+        } else if (joinBefore) apply(at1(place(0), (r, d) => ops.deleteBackward(d, r.focus)));
+        else if (joinAfter) apply(at1(selection ? (selection as DocRange).focus : place(length), (r, d) => ops.deleteForward(d, r.focus)));
       }
     } catch (error) {
       this.refuse(error);
@@ -5954,17 +6089,18 @@ export class DocumentView {
 
   private typeText(text: string): boolean {
     // Typing is joined into one step of the history by the command itself.
-    return this.perform((range) => ops.insertText(this.document, range, text, this.takeFormat()));
+    return this.perform((range, doc) => ops.insertText(doc, range, text, this.takeFormat()));
   }
 
   private removeText(direction: 1 | -1, unit: 'char' | 'word' | 'line'): void {
-    this.perform((range) => {
-      const doc = this.document;
+    // The line is found on the pages, by the place in the document (a command in a text box sees a place of the box alone).
+    const now = this.range();
+    const line = unit === 'line' && now ? this.lines.lineOf(now.focus, this.affinity, this.caretPage) : undefined;
+    this.perform((range, doc) => {
       if (!ops.isCollapsed(range)) return ops.deleteRange(doc, range);
       if (unit === 'line') {
-        // To the start or the end of the line the caret is on.
-        const at = this.lines.lineOf(range.focus, this.affinity, this.caretPage);
-        const edge = at ? (direction === -1 ? at.line.mark.source.offset : lineEnd(at.line)) : range.focus.offset;
+        // To the start or the end of the line the caret is on: the offsets are those of its paragraph, wherever it is.
+        const edge = line ? (direction === -1 ? line.line.mark.source.offset : lineEnd(line.line)) : range.focus.offset;
         if (edge === range.focus.offset) return direction === -1 ? ops.deleteBackward(doc, range.focus) : ops.deleteForward(doc, range.focus);
         return ops.deleteRange(doc, { anchor: range.focus, focus: { story: range.focus.story, path: range.focus.path.slice(), offset: edge } });
       }
@@ -5974,8 +6110,12 @@ export class DocumentView {
 
   /** Enter (a new paragraph), Shift+Enter (a line break) and Ctrl+Enter (a page break). */
   private enter(kind: 'paragraph' | 'line' | 'page'): void {
-    this.perform((range) => {
-      const doc = this.document;
+    // A page break has no place in a text box.
+    if (kind === 'page' && this.inTextBox) {
+      this.refuse(new RangeError(BOX_COMMAND));
+      return;
+    }
+    this.perform((range, doc) => {
       if (kind === 'line') return ops.insertText(doc, range, '\v', this.takeFormat());
       if (kind === 'page') return ops.insertPageBreak(doc, this.caretOf(range));
       return ops.isCollapsed(range) ? ops.splitParagraph(doc, range.focus) : ops.insertText(doc, range, '\n');
@@ -6005,7 +6145,7 @@ export class DocumentView {
           cell = 0;
           if (row >= table.rows.length) {
             // Past the last cell: the table gets a row, as in Word, and the caret goes into its first cell.
-            if (!this.perform((selection) => ops.insertRow(doc, selection.focus, 'below'), true)) return;
+            if (!this.perform((selection, d) => ops.insertRow(d, selection.focus, 'below'), true)) return;
             const grown = ops.containerBlocks(doc, story, tablePath.slice(0, -1))[tablePath[tablePath.length - 1]];
             const cell = grown && grown.type === 'table' && grown.rows[row] ? grown.rows[row].cells[0] : undefined;
             const first = cell ? ops.paragraphIn(cell.blocks, tablePath.concat([row, 0]), 0, 1) : undefined;
@@ -6174,13 +6314,49 @@ export class DocumentView {
     }
   }
 
-  /** The place of a story nearest to a point of the window. */
-  private placeAt(point: { clientX: number; clientY: number }, story: string): { position: DocPosition; affinity: Affinity; page: number; box: boolean } | undefined {
+  /**
+   * The place of a story nearest to a point of the window. `root`: the text box the place is to
+   * be in ([] the text outside text boxes); without it, the box under the point when there is
+   * one (a press goes into the box it is on), else the text outside boxes.
+   */
+  private placeAt(point: { clientX: number; clientY: number }, story: string, root?: number[]): { position: DocPosition; affinity: Affinity; page: number; box: boolean } | undefined {
     const at = this.pagePoint(point.clientX, point.clientY);
     if (!at) return undefined;
-    const hit = this.lines.hit(at.page, at.x, at.y, (mark) => mark.source.story === story && outsideBoxes(mark));
+    const within = root || this.boxUnder(at.page, at.x, at.y, story) || [];
+    const hit = this.lines.hit(at.page, at.x, at.y, (mark) => mark.source.story === story && inRoot(mark.source.path, within));
     const settled = hit ? this.settle(hit.place, hit.affinity) : undefined;
     return settled && hit ? { position: settled.position, affinity: settled.affinity, page: at.page, box: hit.box === true } : undefined;
+  }
+
+  /**
+   * The text box of a story under a point of a page: the innermost one whose lines (and a little
+   * around them) hold the point, as its root path (see boxRoot()); undefined when there is none.
+   * A box is known by the lines it shows: the part of a box below or beside its text is not.
+   */
+  private boxUnder(page: number, x: number, y: number, story: string): number[] | undefined {
+    const boxes = new Map<string, { root: number[]; left: number; right: number; top: number; bottom: number }>();
+    for (const line of this.lines.linesOf(page)) {
+      const mark = line.mark;
+      if (mark.source.story !== story || outsideBoxes(mark)) continue;
+      const root = boxRoot(mark.source.path);
+      const key = root.join('.');
+      let right = mark.x + mark.width;
+      for (const text of line.texts) if (text.x + text.width > right) right = text.x + text.width;
+      const known = boxes.get(key);
+      if (!known) boxes.set(key, { root, left: mark.x, right, top: mark.y, bottom: mark.y + mark.height });
+      else {
+        if (mark.x < known.left) known.left = mark.x;
+        if (right > known.right) known.right = right;
+        if (mark.y < known.top) known.top = mark.y;
+        if (mark.y + mark.height > known.bottom) known.bottom = mark.y + mark.height;
+      }
+    }
+    let found: number[] | undefined;
+    boxes.forEach((box) => {
+      if (x < box.left - BOX_SLOP || x > box.right + BOX_SLOP || y < box.top - BOX_SLOP || y > box.bottom + BOX_SLOP) return;
+      if (!found || box.root.length > found.length) found = box.root;
+    });
+    return found;
   }
 
   /**
@@ -6214,7 +6390,9 @@ export class DocumentView {
     this.pendingFormat = undefined;
     this.touchSelection = false;
     let story = count === 2 ? this.storyAt(event) : this.story;
-    let hit = this.placeAt(event, story);
+    const extending = event.shiftKey && count === 1 ? this.range() : undefined;
+    // Shift and a press: the selection goes on in the text box (or the text) it began in.
+    let hit = this.placeAt(event, story, extending && extending.anchor.story === story ? boxRoot(extending.anchor.path) : undefined);
     if (!hit && story !== 'body') {
       // The page shows nothing of that story: back to the text.
       story = 'body';
@@ -6293,7 +6471,8 @@ export class DocumentView {
   private dragTo(point: { clientX: number; clientY: number }): void {
     const range = this.range();
     if (!range) return;
-    const hit = this.placeAt(point, range.anchor.story);
+    // A selection stays in the text box (or the text outside boxes) it began in.
+    const hit = this.placeAt(point, range.anchor.story, boxRoot(range.anchor.path));
     if (!hit) return;
     if (!ops.samePosition(range.anchor, hit.position)) this.dragMoved = true;
     if (ops.samePosition(range.focus, hit.position) && this.affinity === hit.affinity) return;
@@ -6386,8 +6565,8 @@ export class DocumentView {
         const touch = event.touches[0];
         if (!fixed || !touch) return;
         if (event.cancelable) event.preventDefault();
-        // The finger is below the line it points at.
-        const hit = this.placeAt({ clientX: touch.clientX, clientY: touch.clientY - 22 }, fixed.story);
+        // The finger is below the line it points at; the selection stays in the text box (or the text) it is in.
+        const hit = this.placeAt({ clientX: touch.clientX, clientY: touch.clientY - 22 }, fixed.story, boxRoot(fixed.path));
         if (!hit || ops.samePosition(hit.position, fixed)) return;
         this.selection = { anchor: fixed, focus: hit.position };
         this.caretPage = hit.page;
@@ -6497,11 +6676,20 @@ export class DocumentView {
         return start && end ? sliceOf(this.document, start, end) : undefined;
       }
       // What a deletion would remove is what the copy holds: whole cells where the selection goes into or out of a table.
-      const shown = this.shownRange() || selection;
+      // A selection in a text box is read in the box (the copy holds no place of the document).
+      return ops.readInTextBox(this.document, this.shownRange() || selection, (doc, shown) => this.sliceIn(doc, shown));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** What selectionSlice() gives for a range (as shownRange() widens it) of a document. */
+  private sliceIn(doc: DocModel, shown: DocRange): DocSlice | undefined {
+    try {
       const range = orderedRange(shown.anchor, shown.focus);
       if (!range) return undefined;
       if (range.cells) {
-        const blocks = flowBlocks(this.document, range.start.story, range.start.path.slice(0, range.prefix));
+        const blocks = flowBlocks(doc, range.start.story, range.start.path.slice(0, range.prefix));
         const table = blocks ? tableAt(blocks, range.cells.table.slice(range.prefix)) : undefined;
         if (!table) return undefined;
         const rows: string[][] = [];
@@ -6515,11 +6703,11 @@ export class DocumentView {
           rows.push(row);
         }
         const slice: DocSlice = { paragraphs: [], table: rows };
-        const fragment = fragmentOfRange(this.document, range.start, range.end);
+        const fragment = fragmentOfRange(doc, range.start, range.end);
         if (fragment) slice.fragment = fragment;
         return slice;
       }
-      return sliceOf(this.document, range.start, range.end);
+      return sliceOf(doc, range.start, range.end);
     } catch {
       return undefined;
     }
@@ -6531,7 +6719,7 @@ export class DocumentView {
       this.notify(this.strings.documentPasteTooLarge, 'error');
       return;
     }
-    this.perform((range) => ops.insertText(this.document, range, text), true);
+    this.perform((range, doc) => ops.insertText(doc, range, text), true);
   }
 
   /**
@@ -6546,7 +6734,8 @@ export class DocumentView {
     const asked = this.range();
     const fragment = copy.slice.fragment;
     // In a room what is pasted travels as text, formatting and tables: a copy with everything in it (pictures, fields) does not travel.
-    if (!fragment || this.collab) {
+    // In a text box only the blocks of the box change: the copy goes in as its text with the formatting it had.
+    if (!fragment || this.collab || this.inTextBox) {
       this.pasteSlice(copy.slice);
       return;
     }
@@ -6615,7 +6804,6 @@ export class DocumentView {
   private pasteSlice(slice: DocSlice): void {
     const range = this.range();
     if (!this.editable || !range) return;
-    const doc = this.document;
     const before = { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) };
     const key = 'paste:' + ++this.steps;
     this.history.seal();
@@ -6628,29 +6816,31 @@ export class DocumentView {
       }
       at = edit.selection;
     };
+    // Each step where it is: in a text box the command runs in the box (see runAt()).
+    const run = (where: DocPosition | DocRange, make: (range: DocRange, doc: DocModel) => DocEdit): void => apply(this.runAt(ops.asRange(where), make));
     try {
-      if (!ops.isCollapsed(at)) apply(ops.deleteRange(doc, at));
+      if (!ops.isCollapsed(at)) run(at, (range, doc) => ops.deleteRange(doc, range));
       if (slice.table) {
         const rows = slice.table.length;
         let columns = 1;
         for (const row of slice.table) columns = Math.max(columns, row.length);
-        apply(ops.insertTable(doc, at.focus, rows, columns));
+        run(at.focus, (range, doc) => ops.insertTable(doc, range.focus, rows, columns));
         // The caret is in the first cell of the new table.
         const first = at.focus;
         const table = first.path.slice(0, -3);
         for (let r = 0; r < rows; r++) {
           for (let c = 0; c < slice.table[r].length; c++) {
-            if (slice.table[r][c] !== '') apply(ops.insertText(doc, { story: first.story, path: table.concat([r, c, 0]), offset: 0 }, slice.table[r][c]));
+            if (slice.table[r][c] !== '') run({ story: first.story, path: table.concat([r, c, 0]), offset: 0 }, (range, doc) => ops.insertText(doc, range, slice.table![r][c]));
           }
         }
       } else {
         const ended: { path: number[]; align?: string; style?: string }[] = [];
         for (let i = 0; i < slice.paragraphs.length; i++) {
           const paragraph = slice.paragraphs[i];
-          for (const run of paragraph.runs) if (run.text !== '') apply(ops.insertText(doc, at.focus, run.text, run.format));
+          for (const piece of paragraph.runs) if (piece.text !== '') run(at.focus, (range, doc) => ops.insertText(doc, range, piece.text, piece.format));
           if (i < slice.paragraphs.length - 1) {
             ended.push({ path: at.focus.path.slice(), align: paragraph.align, style: paragraph.style });
-            apply(ops.insertText(doc, at.focus, '\n'));
+            run(at.focus, (range, doc) => ops.insertText(doc, range, '\n'));
           }
         }
         const caret = at;
@@ -6659,7 +6849,7 @@ export class DocumentView {
           const patch: ParaFormatPatch = {};
           if (entry.align !== undefined) patch.align = entry.align;
           if (entry.style !== undefined && this.document.styles.styles.has(entry.style)) patch.style = entry.style;
-          if (patch.align !== undefined || patch.style !== undefined) apply(ops.setParaFormat(doc, { story: caret.focus.story, path: entry.path, offset: 0 }, patch));
+          if (patch.align !== undefined || patch.style !== undefined) run({ story: caret.focus.story, path: entry.path, offset: 0 }, (range, doc) => ops.setParaFormat(doc, range, patch));
         }
         at = caret;
       }
@@ -6754,7 +6944,9 @@ export class DocumentView {
     const box = this.lines.caret(range.focus, this.affinity, this.caretPage);
     if (!box) return;
     const x = this.targetX !== undefined ? this.targetX : box.x;
-    const accept = (mark: LineMark) => mark.source.story === range.focus.story && outsideBoxes(mark);
+    // Up and down stay in the text box the caret is in, or in the text outside boxes.
+    const root = boxRoot(range.focus.path);
+    const accept = (mark: LineMark) => mark.source.story === range.focus.story && inRoot(mark.source.path, root);
     // A line that shows nothing but deleted text has no place of its own: a key never stops on one.
     let found: { place: DocPosition; affinity: Affinity } | undefined;
     if (screen) {
@@ -6773,7 +6965,7 @@ export class DocumentView {
     if (found) target = this.settle(found.place, found.affinity);
     else {
       // No line further on: the very start or end of the text.
-      const edge = this.storyEdge(direction);
+      const edge = this.edgeHere(direction);
       if (edge) target = { position: edge, affinity: 'start' };
     }
     if (!target) return;
@@ -6922,6 +7114,17 @@ export class DocumentView {
         return done();
       case 'Escape': {
         const range = this.range();
+        // Out of a text box: the caret goes to the drawing of the box, in the text around it (Word selects the shape).
+        if (range && ops.inTextBox(range.focus.path)) {
+          let out: DocPosition | undefined;
+          try {
+            out = ops.textBoxExit(this.document, range.focus);
+          } catch {
+            out = this.storyEdge(-1);
+          }
+          if (out) this.moveTo(out, 'start', false, false);
+          return done();
+        }
         if (range && !ops.samePosition(range.anchor, range.focus)) this.moveTo(copyPosition(range.focus), this.affinity, false, false);
         this.escaped = true;
         this.live.textContent = this.strings.tabLeaves;

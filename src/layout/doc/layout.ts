@@ -354,7 +354,7 @@ export class DocLayout {
    */
   edited(budget?: { milliseconds?: number }): EditProgress | undefined {
     const ctx = this.ctx;
-    if (this.truncated || ctx.broken || this.options.maxPages !== undefined) return undefined;
+    if (this.truncated || ctx.broken || ctx.boxLimited || this.options.maxPages !== undefined) return undefined;
     if (this.expect) {
       // The blocks of an earlier edit are still being checked: two edits cannot be told apart.
       ctx.broken = true;
@@ -375,6 +375,8 @@ export class DocLayout {
     const inserted = blocks.length - first - tail;
     this.updated = [];
     if (removed === 0 && inserted === 0) return { from: this.pages.length, done: this.done, updated: [] };
+    // From here on the work of text boxes is counted as a layout that follows edits counts it (see LayoutContext.relaid).
+    ctx.relaid = true;
     this.blocks = blocks.slice();
 
     const sections = findSections(this.doc);
