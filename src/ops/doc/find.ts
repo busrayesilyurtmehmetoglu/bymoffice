@@ -5,7 +5,10 @@
 // order of storyIds() - the body, the headers, the footers, the footnotes, the
 // endnotes - each story with its tables, cell by cell, and then the text boxes
 // anchored in it, in the order of their anchors (a text box in a text box right
-// after the box it is in). That follows Word as far as Word has an order: the
+// after the box it is in), and last the comments, as Word searches its story of
+// comments after the others: each comment in the order of listComments() (the
+// threads in the order of their text, each followed by its answers), in the
+// story commentStory(id). That follows Word as far as Word has an order: the
 // main text, then the text boxes of the main text, then the other stories.
 //
 // A match does not run through what shows without a width of its own and a
@@ -18,7 +21,9 @@
 // write back in every branch (find-edit.ts) are not replaced: replacing passes
 // over them and counts them. A match is replaced by replaceText() (in the
 // place of the matched characters), in a text box through
-// insertTextInTextBox(), which refuses where changes are tracked.
+// insertTextInTextBox(), which refuses where changes are tracked; in a comment
+// through replaceInComment(), which keeps the rest of the comment as it is and
+// is never a tracked change (as no edit of a comment is).
 //
 // A search goes a few paragraphs at a time (DocSearch.step), so that it never
 // holds the page up.
@@ -32,6 +37,7 @@ import { fixedWrap, graphicFixed, lockedControl, replaceText, storyContext } fro
 import { fieldPairs, flatten, isAtom, isRemovable } from './pieces';
 import { insertTextInTextBox, replaceInTextBox, textBoxKey } from './text-box';
 import { TRACK_UNSUPPORTED } from './track';
+import { COMMENT_GONE, commentOfStory, commentStory, listComments, replaceInComment, replaceInComments } from './comments';
 import { eachGraphic, inTextBox, storyIds, storyOf, type DocPosition, type DocRange } from './position';
 
 export interface DocFindOptions {
@@ -40,7 +46,7 @@ export interface DocFindOptions {
   wholeWord?: boolean;
   /** How case is folded (Turkish "I" and "ı", "İ" and "i"). */
   locale?: FormatLocale | 'tr' | 'en';
-  /** 'all' (the default): every story and the text boxes in it (see the head of this file); 'body': the body and its tables only (Word's "Main document"). */
+  /** 'all' (the default): every story, the text boxes in it and the comments (see the head of this file); 'body': the body and its tables only (Word's "Main document"). */
   stories?: 'all' | 'body';
 }
 
@@ -149,7 +155,30 @@ export function docParagraphs(doc: DocModel, stories: 'all' | 'body' = 'all'): D
     let context: BodyContext | undefined;
     addBoxes(out, id, blocks, [], 0, 0, undefined, () => context || (context = storyContext(doc, id)));
   }
+  addComments(out, doc);
   return out;
+}
+
+/**
+ * The paragraphs of the comments (their tables cell by cell; not the text boxes in them), each
+ * comment in the order listComments() gives - the threads in the order of the text they are
+ * about, each followed by its answers - in the story commentStory(id).
+ */
+function addComments(out: DocParagraphRef[], doc: DocModel): void {
+  const collection = doc.comments;
+  if (!collection || collection.items.size === 0) return;
+  let order: number[];
+  try {
+    order = listComments(doc).map((comment) => comment.id);
+  } catch {
+    // Comments whose marks cannot be followed: in the order of the file.
+    order = [];
+    collection.items.forEach((_comment, id) => order.push(id));
+  }
+  for (let i = 0; i < order.length && out.length < MAX_FIND_PARAGRAPHS; i++) {
+    const comment = collection.items.get(order[i]);
+    if (comment) addBlocks(out, commentStory(comment.id), comment.blocks, [], 0, undefined);
+  }
 }
 
 /** What is known of the pieces of a paragraph: which places a match may not run through, which characters may not be replaced. */
@@ -415,6 +444,12 @@ export interface ReplaceMatchesOptions {
   limit?: number;
   /** 'skip': the matches in text boxes are not replaced (counted in `skipped` and `inTextBoxes`): a room, where such a change does not travel. */
   textBoxes?: 'replace' | 'skip';
+  /** 'skip': the matches in comments are not replaced (counted in `skipped` and `inComments`): a room (see docs/kullanim-kilavuzu.md). */
+  comments?: 'replace' | 'skip';
+  /** 'skip': only the matches in comments are replaced, the others are counted in `skipped` and `outsideComments`: a document that takes comments and no other change. */
+  outside?: 'replace' | 'skip';
+  /** The selection of the document an edit of a comment leaves (it does not move); the start of the body when left out. */
+  selection?: DocRange;
 }
 
 export interface ReplaceMatchesResult {
@@ -424,6 +459,11 @@ export interface ReplaceMatchesResult {
   inTextBoxes?: number;
   /** Of `skipped`, the matches in text boxes the writer could not write back (DocMatch.fixed 'textBox'); left out when there are none. */
   textBoxesKept?: number;
+  /** Of `skipped`, the matches in comments that were skipped (options.comments); left out when there are none. */
+  inComments?: number;
+  /** Of `skipped`, the matches outside comments that were skipped (options.outside); left out when there are none. */
+  outsideComments?: number;
+  /** The selection the replacement of the first match outside comments left (one in a comment leaves the selection where it was). */
   last?: DocRange;
   refused?: true;
 }
@@ -433,12 +473,27 @@ export interface ReplaceMatchesResult {
  * the last first, so that the places of the ones before it stay where they are; each through `insert` and `apply`
  * (one edit each: a history merges them into one step by a key of their own), except that the matches of one text
  * box are replaced together, as one edit (replaceInTextBox). Where changes are tracked the replacements are tracked;
- * in text boxes they cannot be, and are not made. `skipped`: matches that cannot be replaced and edits that were
- * refused; `last`: the selection the replacement of the first match left.
+ * in text boxes they cannot be, and are not made. The matches in comments are replaced together, as one edit
+ * (replaceInComments), never tracked. `skipped`: matches that cannot be replaced and edits that were refused;
+ * `last`: the selection the replacement of the first match outside comments left.
  */
 export function replaceMatches(doc: DocModel, matches: readonly DocMatch[], replacement: string, options: ReplaceMatchesOptions): ReplaceMatchesResult {
-  const usable = matches.filter((match) => match.replaceable);
+  let usable = matches.filter((match) => match.replaceable);
   let skipped = matches.length - usable.length;
+  let inComments = 0;
+  let outsideComments = 0;
+  if (options.comments === 'skip' || options.outside === 'skip') {
+    // What is skipped is counted there, whether it could have been replaced or not (and in `skipped` once).
+    const skips = (match: DocMatch): boolean => (commentOfStory(match.range.anchor.story) !== undefined ? options.comments === 'skip' : options.outside === 'skip');
+    for (const match of matches) {
+      if (!skips(match)) continue;
+      if (commentOfStory(match.range.anchor.story) !== undefined) inComments++;
+      else outsideComments++;
+    }
+    const left = usable.filter((match) => !skips(match));
+    skipped += usable.length - left.length;
+    usable = left;
+  }
   if (options.limit !== undefined) {
     // The ones that are skipped are not made: they do not count.
     const made = options.textBoxes === 'skip' ? usable.filter((match) => textBoxKey(match.range) === '').length : usable.length;
@@ -448,6 +503,26 @@ export function replaceMatches(doc: DocModel, matches: readonly DocMatch[], repl
   let replaced = 0;
   let inTextBoxes = 0;
   let last: DocRange | undefined;
+  // The matches in comments (they come last): all of them one edit of the table of comments.
+  const inComment = usable.filter((match) => commentOfStory(match.range.anchor.story) !== undefined);
+  if (inComment.length > 0) {
+    usable = usable.filter((match) => commentOfStory(match.range.anchor.story) === undefined);
+    try {
+      const result = replaceInComments(
+        doc,
+        inComment.map((match) => match.range),
+        replacement,
+        options.selection,
+      );
+      skipped += result.failed;
+      if (result.edit) {
+        options.apply(result.edit);
+        replaced += result.replaced;
+      }
+    } catch {
+      skipped += inComment.length;
+    }
+  }
   for (let i = usable.length - 1; i >= 0; i--) {
     const key = textBoxKey(usable[i].range);
     if (key !== '') {
@@ -486,12 +561,28 @@ export function replaceMatches(doc: DocModel, matches: readonly DocMatch[], repl
   if (inTextBoxes > 0) out.inTextBoxes = inTextBoxes;
   const kept = matches.filter((match) => !match.replaceable && match.fixed === 'textBox').length;
   if (kept > 0) out.textBoxesKept = kept;
+  if (inComments > 0) out.inComments = inComments;
+  if (outsideComments > 0) out.outsideComments = outsideComments;
   if (last) out.last = last;
   return out;
 }
 
-/** The edit that replaces one match (Replace): replaceText(), or insertTextInTextBox() for a match in a text box. */
-export function replaceMatchEdit(doc: DocModel, range: DocRange, text: string): DocEdit {
+/** Thrown by replaceMatchEdit() for a match in a comment that cannot be replaced (see replaceInComment()). */
+export const COMMENT_NOT_REPLACED = 'This text of a comment cannot be replaced';
+
+/**
+ * The edit that replaces one match (Replace): replaceText(), insertTextInTextBox() for a match in a text box,
+ * replaceInComment() for one in a comment (`selection`: the selection of the document it leaves; throws
+ * RangeError(COMMENT_NOT_REPLACED) where nothing would be replaced).
+ */
+export function replaceMatchEdit(doc: DocModel, range: DocRange, text: string, selection?: DocRange): DocEdit {
+  const comment = commentOfStory(range && range.anchor && range.anchor.story);
+  if (comment !== undefined) {
+    if (!doc.comments || !doc.comments.items.has(comment)) throw new RangeError(COMMENT_GONE);
+    const result = replaceInComment(doc, comment, [range], text, selection);
+    if (!result.edit) throw new RangeError(COMMENT_NOT_REPLACED);
+    return result.edit;
+  }
   return inTextBox(range.anchor.path) ? insertTextInTextBox(doc, range, text) : replaceText(doc, range, text);
 }
 

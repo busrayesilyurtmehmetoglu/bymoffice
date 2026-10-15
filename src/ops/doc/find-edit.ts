@@ -131,6 +131,23 @@ export function replaceText(doc: DocModel, at: DocPosition | DocRange, text: str
   if (start.story !== end.story || start.path.length !== end.path.length || start.path.some((value, i) => end.path[i] !== value) || start.offset >= end.offset) return fallback();
   const paragraph = resolvePosition(doc, start).paragraph;
   resolvePosition(doc, end);
+  const next = replacedParagraph(paragraph, start.offset, end.offset, clean);
+  if (!next) return fallback();
+  const caret: DocPosition = { story: start.story, path: start.path.slice(), offset: start.offset + clean.length };
+  return buildEdit(doc, (draft) => {
+    draft.setParagraph(start.story, start.path, next);
+    return { anchor: caret, focus: { ...caret, path: caret.path.slice() } };
+  });
+}
+
+/**
+ * A paragraph with the characters [start, end) of its text replaced by `clean` (text without a
+ * paragraph end, cleaned by cleanText()) in the place of the replaced characters, as replaceText()
+ * does; undefined where that cannot be done: the range holds something other than plain text of
+ * runs, begins inside a tracked change, or is not in the text. Nothing is tracked.
+ */
+export function replacedParagraph(paragraph: Paragraph, start: number, end: number, clean: string): Paragraph | undefined {
+  if (!(start >= 0 && start < end) || clean.indexOf('\n') >= 0) return undefined;
   const pieces = flatten(paragraph);
   const out: Piece[] = [];
   let first: Piece | undefined;
@@ -140,18 +157,18 @@ export function replaceText(doc: DocModel, at: DocPosition | DocRange, text: str
     const from = offset;
     const to = offset + piece.len;
     offset = to;
-    if (piece.len === 0 || to <= start.offset || from >= end.offset) {
+    if (piece.len === 0 || to <= start || from >= end) {
       out.push(piece);
       continue;
     }
-    if (!plainText(piece)) return fallback();
+    if (!plainText(piece)) return undefined;
     const own = (piece.item as { text: string }).text;
-    const head = from < start.offset ? own.slice(0, start.offset - from) : '';
-    const tail = to > end.offset ? own.slice(end.offset - from) : '';
+    const head = from < start ? own.slice(0, start - from) : '';
+    const tail = to > end ? own.slice(end - from) : '';
     if (!first) {
       // Inside another author's tracked change the text would become part of it (rejecting that would take the new
       // text away): insertText() decides where it goes, as for typing.
-      if (inRevision(piece.wrap)) return fallback();
+      if (inRevision(piece.wrap)) return undefined;
       first = piece;
       if (head) out.push(textPart(piece, head));
       at0 = out.length;
@@ -160,15 +177,100 @@ export function replaceText(doc: DocModel, at: DocPosition | DocRange, text: str
     }
     if (tail) out.push(textPart(piece, tail));
   }
-  if (!first) return fallback();
+  if (!first || offset < end) return undefined;
   // Text that was all a content control held, replaced by nothing: an empty text keeps the control (with its properties). Any
   // other wrapper (a link, a smart tag) that holds nothing any more goes, as it does when its text is deleted.
   const control = controlOf(first.wrap);
   if (control && !out.some((piece) => piece.item !== undefined && carries(piece, control))) out.splice(at0, 0, { ...textPart(first, ''), props: withoutChange(first.props), wrap: control });
-  const next = paragraphWith(paragraph, rebuild(out));
-  const caret: DocPosition = { story: start.story, path: start.path.slice(), offset: start.offset + clean.length };
-  return buildEdit(doc, (draft) => {
-    draft.setParagraph(start.story, start.path, next);
-    return { anchor: caret, focus: { ...caret, path: caret.path.slice() } };
-  });
+  return paragraphWith(paragraph, rebuild(out));
+}
+
+/**
+ * replacedParagraph() for many ranges of one paragraph at once, in one pass over its pieces, and
+ * strictly, for text whose replacement is never tracked (a comment): besides what replacedParagraph()
+ * refuses, a range is refused when any of its text is in a tracked change (insertion, deletion,
+ * move) or a tracked deletion lies inside it - replacing it would take that change away without a
+ * trace. `ranges`: [start, end) in the order of the text, none overlapping another. `done` says
+ * which were replaced; `paragraph` is undefined when none was.
+ */
+export function replacedParagraphRanges(paragraph: Paragraph, ranges: readonly { start: number; end: number }[], clean: string): { paragraph?: Paragraph; done: boolean[] } {
+  const done = ranges.map(() => false);
+  if (clean.indexOf('\n') >= 0 || ranges.length === 0) return { done };
+  const pieces = flatten(paragraph);
+  const from: number[] = [];
+  let total = 0;
+  for (const piece of pieces) {
+    from.push(total);
+    total += piece.len;
+  }
+  // Which ranges can be replaced: each looks at the pieces it covers, and the ranges go on in the order of the text.
+  let at = 0;
+  let previous = -1;
+  for (let i = 0; i < ranges.length; i++) {
+    const { start, end } = ranges[i];
+    if (!(start >= 0 && start < end && end <= total && start >= previous)) continue;
+    previous = end;
+    while (at < pieces.length && from[at] + pieces[at].len <= start) at++;
+    let ok = false;
+    for (let k = at; k < pieces.length && from[k] < end; k++) {
+      const piece = pieces[k];
+      if (piece.len === 0) {
+        // Something without width inside the range: a deletion would be taken along.
+        if (from[k] > start && inRevision(piece.wrap)) {
+          ok = false;
+          break;
+        }
+        continue;
+      }
+      if (!plainText(piece) || inRevision(piece.wrap)) {
+        ok = false;
+        break;
+      }
+      ok = true;
+    }
+    done[i] = ok;
+  }
+  if (!done.some(Boolean)) return { done };
+  // The pass that replaces: each piece is cut by the ranges it holds a part of.
+  const out: Piece[] = [];
+  const firsts: { piece: Piece; at: number }[] = [];
+  const used = ranges.filter((_range, i) => done[i]);
+  let r = 0;
+  for (let k = 0; k < pieces.length; k++) {
+    const piece = pieces[k];
+    const start = from[k];
+    const end = start + piece.len;
+    while (r < used.length && used[r].end <= start) r++;
+    if (piece.len === 0 || r >= used.length || used[r].start >= end) {
+      out.push(piece);
+      continue;
+    }
+    const own = (piece.item as { text: string }).text;
+    let cursor = start;
+    for (let q = r; q < used.length && used[q].start < end; q++) {
+      const range = used[q];
+      if (range.start >= cursor && range.start >= start) {
+        if (range.start > cursor) out.push(textPart(piece, own.slice(cursor - start, range.start - start)));
+        firsts.push({ piece, at: out.length });
+        for (const made of textPieces(clean, withoutChange(piece.props), piece.wrap, piece.group)) out.push(made);
+      }
+      cursor = Math.max(cursor, range.end);
+    }
+    if (cursor < end) out.push(textPart(piece, own.slice(cursor - start)));
+  }
+  // A content control whose whole text was replaced by nothing keeps an empty text (once), as in replacedParagraph().
+  const carried = new Set<Wrapper>();
+  for (const piece of out) {
+    if (piece.item === undefined) continue;
+    for (let w = piece.wrap, depth = 0; w && depth < 4096 && !carried.has(w); w = w.parent, depth++) carried.add(w);
+  }
+  const empties: { at: number; piece: Piece }[] = [];
+  for (const first of firsts) {
+    const control = controlOf(first.piece.wrap);
+    if (!control || carried.has(control)) continue;
+    carried.add(control);
+    empties.push({ at: first.at, piece: { ...textPart(first.piece, ''), props: withoutChange(first.piece.props), wrap: control } });
+  }
+  for (let i = empties.length - 1; i >= 0; i--) out.splice(empties[i].at, 0, empties[i].piece);
+  return { paragraph: paragraphWith(paragraph, rebuild(out)), done };
 }

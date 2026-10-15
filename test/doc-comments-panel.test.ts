@@ -24,7 +24,7 @@ import {
   type CommentsPanelHost,
 } from '../src/ui/doc-comments-panel';
 import { STRINGS_EN, STRINGS_TR, type UiStrings } from '../src/ui/strings';
-import { CommentBalloon } from '../src/ui/doc-comments';
+import { CommentBalloon, fillMarked } from '../src/ui/doc-comments';
 import { cEnd, cRef, cStart, openCommented } from './doc-comments-fixtures';
 import { p, r } from './doc-ops-fixtures';
 
@@ -163,6 +163,11 @@ const fakeDocument = {
   body: new FakeElement('body'),
   activeElement: null as FakeElement | null,
   createElement: (tag: string) => new FakeElement(tag),
+  createTextNode: (text: string) => {
+    const node = new FakeElement('#text');
+    node.textContent = text;
+    return node;
+  },
 };
 fakeDocument.activeElement = fakeDocument.body;
 (globalThis as unknown as { document: unknown }).document = fakeDocument;
@@ -531,6 +536,94 @@ test('the filter hides resolved threads, says how many, and shows them again', (
   box.checked = true;
   fire(box, 'change');
   assert.equal(entriesOf(panel).length, 3);
+});
+
+const marksIn = (root: FakeElement) => all(root, (element) => element.tagName === 'mark');
+
+test('a match of Find is marked in a comment of the selected thread, as text; the filter gives way to it; a changed text or another thread is not marked', () => {
+  const { panel, state } = makeHost([thread(1, 1, { text: 'A <b>cat</b> here' }), thread(2, 0, { done: true, text: 'cat' })]);
+  const element = panel.element as unknown as FakeElement;
+  panel.show();
+  panel.select(1);
+  panel.markText({ comment: 1, start: 5, end: 8 });
+  assert.deepEqual(
+    marksIn(element).map((mark) => [mark.className, mark.textContent]),
+    [['bym-doc-find-mark', 'cat']],
+  );
+  // The text around it is text too: nothing of it was read as markup.
+  assert.equal(byClass(entriesOf(panel)[0], 'bym-doc-cpanel-text')[0].textContent, 'A <b>cat</b> here');
+  assert.equal(all(element, (e) => e.tagName === 'b').length, 0);
+  // In an answer.
+  panel.markText({ comment: 1001, start: 0, end: 6 });
+  assert.deepEqual(marksIn(element).map((mark) => mark.textContent), ['Answer']);
+  // A comment that is not in the selected thread, a range beyond the text: no mark.
+  panel.markText({ comment: 2, start: 0, end: 3 });
+  assert.equal(marksIn(element).length, 0);
+  panel.markText({ comment: 1, start: 10, end: 99 });
+  assert.equal(marksIn(element).length, 0);
+  // A resolved thread the filter hides is shown with the others.
+  const box = all(element, (e) => e.tagName === 'input')[0];
+  box.checked = false;
+  fire(box, 'change');
+  assert.deepEqual(entriesOf(panel).map((entry) => entry.getAttribute('data-thread')), ['1']);
+  panel.select(2);
+  panel.markText({ comment: 2, start: 0, end: 3 });
+  assert.equal(box.checked, true);
+  assert.deepEqual(entriesOf(panel).map((entry) => entry.getAttribute('data-thread')), ['1', '2']);
+  assert.deepEqual(marksIn(element).map((mark) => mark.textContent), ['cat']);
+  // The text of the comment changed: the match is no longer where it was.
+  state.threads = [thread(1, 1, { text: 'A <b>cat</b> here' }), thread(2, 0, { done: true, text: 'dog' })];
+  panel.refresh();
+  assert.equal(marksIn(element).length, 0);
+  // Another thread picked: the mark goes.
+  state.threads = [thread(1, 1, { text: 'A <b>cat</b> here' }), thread(2, 0, { done: true, text: 'cat' })];
+  panel.markText({ comment: 2, start: 0, end: 3 });
+  assert.equal(marksIn(element).length, 1);
+  panel.select(1);
+  assert.equal(marksIn(element).length, 0);
+  panel.markText(undefined);
+  assert.equal(marksIn(element).length, 0);
+});
+
+test('the balloon marks a match of Find in a comment of its thread; showing another thread takes the mark away', () => {
+  const root = new FakeElement('div');
+  const balloon = new CommentBalloon({
+    root: root as unknown as HTMLElement,
+    strings: () => STRINGS_EN,
+    canChange: () => true,
+    submit: () => true,
+    resolve: () => undefined,
+    remove: () => undefined,
+    closed: () => undefined,
+  });
+  balloon.show([comment(1, { text: 'one <i>cat</i>' }), comment(2, { parent: 1, text: 'cat two' })], undefined);
+  balloon.markText({ comment: 2, start: 0, end: 3 });
+  assert.deepEqual(marksIn(root).map((mark) => [mark.className, mark.textContent]), [['bym-doc-find-mark', 'cat']]);
+  assert.equal(all(root, (e) => e.tagName === 'i').length, 0);
+  balloon.markText({ comment: 9, start: 0, end: 3 });
+  assert.equal(marksIn(root).length, 0);
+  balloon.markText({ comment: 1, start: 7, end: 10 });
+  assert.deepEqual(marksIn(root).map((mark) => mark.textContent), ['cat']);
+  balloon.show([comment(1, { text: 'one <i>cat</i>' })], undefined);
+  assert.equal(marksIn(root).length, 0);
+});
+
+test('fillMarked: the text as text nodes with the range in a <mark>; never one that cuts a pair of surrogates or lies outside the text', () => {
+  const box = new FakeElement('div');
+  const target = box as unknown as HTMLElement;
+  assert.equal(fillMarked(target, 'abc', { start: 1, end: 2 })!.textContent, 'b');
+  assert.deepEqual(box.children.map((child) => [child.tagName, child.textContent]), [['#text', 'a'], ['mark', 'b'], ['#text', 'c']]);
+  assert.equal(fillMarked(target, 'abc', { start: 0, end: 3 })!.textContent, 'abc');
+  assert.equal(box.children.length, 1);
+  for (const bad of [{ start: 2, end: 2 }, { start: -1, end: 1 }, { start: 1, end: 4 }, { start: 2, end: 1 }]) {
+    assert.equal(fillMarked(target, 'abc', bad), undefined);
+    assert.equal(box.textContent, 'abc');
+    assert.equal(box.children.length, 0);
+  }
+  // "a😀b": the face is two code units; a range that begins or ends between them is not marked.
+  assert.equal(fillMarked(target, 'a\u{1F600}b', { start: 2, end: 4 }), undefined);
+  assert.equal(fillMarked(target, 'a\u{1F600}b', { start: 0, end: 2 }), undefined);
+  assert.equal(fillMarked(target, 'a\u{1F600}b', { start: 1, end: 3 })!.textContent, '\u{1F600}');
 });
 
 test('a panel without comments says so; the Turkish one in Turkish', () => {

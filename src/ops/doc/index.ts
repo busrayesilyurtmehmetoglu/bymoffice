@@ -45,7 +45,7 @@ export {
 } from './section';
 export { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertImage, insertRow, insertTable, type InsertImageOptions, type NewImage } from './structure';
 export { FRAGMENT_LIMITS, MAX_TABLE_DEPTH, fragmentHasContent, fragmentNeeds, fragmentOf, insertFragment, originOf, type DocFragment, type FragmentMedia, type InsertFragmentOptions } from './fragment';
-export { DocMatchScan, DocSearch, MAX_FIND_PARAGRAPHS, compileDocFind, docParagraphs, findAllInDocument, findInDocument, matchRange, paragraphMatches, replaceMatchEdit, replaceMatches, docFindCounters, type ReplaceMatchesOptions, type ReplaceMatchesResult, type DocFixed, type DocFindOptions, type DocMatch, type DocParagraphRef } from './find';
+export { COMMENT_NOT_REPLACED, DocMatchScan, DocSearch, MAX_FIND_PARAGRAPHS, compileDocFind, docParagraphs, findAllInDocument, findInDocument, matchRange, paragraphMatches, replaceMatchEdit, replaceMatches, docFindCounters, type ReplaceMatchesOptions, type ReplaceMatchesResult, type DocFixed, type DocFindOptions, type DocMatch, type DocParagraphRef } from './find';
 export { DEFAULT_AUTHOR, TRACK_UNSUPPORTED, forcesTracking, isTracking, nextRevisionId, revisionDate, setTracking, type TrackOptions, type TrackingSetup } from './track';
 export {
   REVISIONS_PROTECTED,
@@ -75,10 +75,18 @@ export {
   COMMENT_FIXED,
   COMMENT_GONE,
   COMMENT_NOT_HERE,
+  COMMENT_STORY,
   MAX_COMMENTS,
   MAX_COMMENT_TEXT,
   addComment,
   commentAtPosition,
+  commentOfStory,
+  commentReplaceCounters,
+  commentStory,
+  commentTextOffset,
+  replaceInComment,
+  replaceInComments,
+  type CommentReplacement,
   commentText,
   editComment,
   initialsOf,

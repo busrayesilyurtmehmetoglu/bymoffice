@@ -65,6 +65,7 @@ import {
   type DocPosition,
   type DocRange,
 } from './position';
+import { replacedParagraphRanges } from './find-edit';
 import { ownerOf } from './stand-in';
 import { nextRevisionId, trackingFor } from './track';
 
@@ -781,6 +782,210 @@ export function editComment(doc: DocModel, id: number, text: string, selection?:
     }
     return { selection: kept(doc, selection) };
   });
+}
+
+// ------------------------------------------------------- text of a comment
+
+/**
+ * The story Find says a paragraph of the text of a comment is in: "comment:" and the id of the
+ * comment. Its paths are those of the blocks of the comment (Comment.blocks), as in any other
+ * story. No other command takes such a position.
+ */
+export const COMMENT_STORY = 'comment:';
+
+export const commentStory = (id: number): string => COMMENT_STORY + id;
+
+/** The id of the comment a story of Find names; undefined for any other story. */
+export function commentOfStory(story: unknown): number | undefined {
+  if (typeof story !== 'string' || story.slice(0, COMMENT_STORY.length) !== COMMENT_STORY) return undefined;
+  const id = story.slice(COMMENT_STORY.length);
+  return /^-?\d{1,10}$/.test(id) ? Number(id) : undefined;
+}
+
+/** The paragraph of the blocks of a comment at a path ([block] or, in a table, [table, row, cell, ...]); undefined for none. */
+function paragraphOfBlocks(blocks: Block[], path: readonly number[]): Paragraph | undefined {
+  if (!Array.isArray(path) || path.length % 3 !== 1 || path.length > MAX_DEPTH * 3) return undefined;
+  let list = blocks;
+  for (let i = 0; i + 1 < path.length; i += 3) {
+    const table = list[path[i]];
+    const row = table && table.type === 'table' ? table.rows[path[i + 1]] : undefined;
+    const cell = row ? row.cells[path[i + 2]] : undefined;
+    if (!cell) return undefined;
+    list = cell.blocks;
+  }
+  const block = list[path[path.length - 1]];
+  return block && block.type === 'paragraph' ? block : undefined;
+}
+
+/** The blocks with the paragraph at a path (one paragraphOfBlocks() finds) in the place of the one that is there; the tables on the way are copies. */
+function withParagraphAt(blocks: Block[], path: readonly number[], paragraph: Paragraph, at = 0): Block[] {
+  const out = blocks.slice();
+  if (at === path.length - 1) {
+    out[path[at]] = paragraph;
+    return out;
+  }
+  const table = blocks[path[at]];
+  if (!table || table.type !== 'table') return bad(COMMENT_GONE);
+  const rows = table.rows.slice();
+  const row = rows[path[at + 1]];
+  const cells = row.cells.slice();
+  const cell = cells[path[at + 2]];
+  cells[path[at + 2]] = { ...cell, blocks: withParagraphAt(cell.blocks, path, paragraph, at + 3) };
+  rows[path[at + 1]] = { ...row, cells };
+  out[path[at]] = { ...table, rows };
+  return out;
+}
+
+/**
+ * Where a place of a paragraph of a comment (a path and an offset, as Find gives them) is in
+ * the text of the comment (commentText(): its paragraphs separated by "\n"); undefined for a
+ * place the comment does not have.
+ */
+export function commentTextOffset(comment: { blocks: Block[] }, path: readonly number[], offset: number): number | undefined {
+  let before = 0;
+  let found: number | undefined;
+  const walk = (blocks: Block[], prefix: number[], depth: number): boolean => {
+    if (depth > MAX_DEPTH) return false;
+    for (let i = 0; i < blocks.length; i++) {
+      const block = blocks[i];
+      if (block.type === 'paragraph') {
+        const length = paragraphText(block).length;
+        const here = prefix.length + 1 === path.length && path[path.length - 1] === i && prefix.every((step, k) => step === path[k]);
+        if (here) {
+          if (offset >= 0 && offset <= length) found = before + offset;
+          return true;
+        }
+        before += length + 1;
+      } else if (block.type === 'table') {
+        for (let r = 0; r < block.rows.length; r++) {
+          const row = block.rows[r];
+          for (let c = 0; c < row.cells.length; c++) if (walk(row.cells[c].blocks, prefix.concat([i, r, c]), depth + 1)) return true;
+        }
+      }
+    }
+    return false;
+  };
+  walk(comment.blocks, [], 0);
+  return found;
+}
+
+/** How many passes over a paragraph of a comment its replacements made since the module was loaded: for tests, which check that the matches of a paragraph take one. */
+export const commentReplaceCounters = { passes: 0 };
+
+/** What replaceInComment() made of a comment. */
+export interface CommentReplacement {
+  /** The edit that changes the comment; undefined when nothing was replaced. */
+  edit?: CommentEdit;
+  replaced: number;
+  /** Ranges that could not be replaced; they stay as they are. */
+  failed: number;
+}
+
+/**
+ * Replaces ranges of the text of one comment with the same text (Find and Replace): each range
+ * is one paragraph of the comment (the story is commentStory(id), see COMMENT_STORY), and the
+ * new text takes the place of the replaced characters as replaceText() does - with the
+ * formatting of the first of them, in their run - so that nothing else of the comment changes:
+ * not its other text, its formatting, its fields or its paragraphs. A range that holds anything
+ * but plain text of runs, or begins in a tracked change, is not replaced (`failed`); nor is any
+ * when the comment would grow beyond MAX_COMMENT_TEXT. The text has no paragraph end: one with
+ * one replaces nothing. One edit, never a tracked change (as editComment()); `selection` is the
+ * selection of the document it leaves.
+ */
+export function replaceInComment(doc: DocModel, id: number, ranges: readonly DocRange[], text: string, selection?: DocRange): CommentReplacement {
+  if (typeof text !== 'string') bad('The text of a comment must be a string');
+  commentAt(doc, id);
+  const story = commentStory(id);
+  const mine = ranges.filter((range) => range && range.anchor && range.anchor.story === story);
+  const out = replaceInComments(doc, mine, text, selection);
+  out.failed += ranges.length - mine.length;
+  return out;
+}
+
+/**
+ * replaceInComment() for ranges of any number of comments (each in the story of its comment), as one edit: the
+ * comments of a "Replace all" are one change of the table of comments, not one for each comment (which would copy
+ * the table once for each). A range in no comment the document has fails.
+ */
+export function replaceInComments(doc: DocModel, ranges: readonly DocRange[], text: string, selection?: DocRange): CommentReplacement {
+  if (typeof text !== 'string') bad('The text of a comment must be a string');
+  const items = commentsOf(doc);
+  const clean = cleanText(text);
+  const byComment = new Map<number, { path: number[]; start: number; end: number }[]>();
+  let failed = 0;
+  for (const range of ranges) {
+    const a = range && range.anchor;
+    const f = range && range.focus;
+    const id = a ? commentOfStory(a.story) : undefined;
+    const ok =
+      id !== undefined && items.has(id) && f && f.story === a.story && Array.isArray(a.path) && Array.isArray(f.path) && a.path.length === f.path.length && a.path.every((step, k) => step === f.path[k]) && Number.isInteger(a.offset) && Number.isInteger(f.offset);
+    if (!ok || a.offset === f.offset) {
+      failed++;
+      continue;
+    }
+    let places = byComment.get(id as number);
+    if (!places) byComment.set(id as number, (places = []));
+    places.push({ path: a.path.slice(), start: Math.min(a.offset, f.offset), end: Math.max(a.offset, f.offset) });
+  }
+  let replaced = 0;
+  const made: Comment[] = [];
+  byComment.forEach((places, id) => {
+    const comment = items.get(id) as Comment;
+    if (clean.indexOf('\n') >= 0) {
+      failed += places.length;
+      return;
+    }
+    // The places of each paragraph, in the order of the text: a paragraph is gone over once for all of them.
+    const byParagraph = new Map<string, { path: number[]; places: { start: number; end: number }[] }>();
+    for (const place of places) {
+      const key = place.path.join(',');
+      let group = byParagraph.get(key);
+      if (!group) byParagraph.set(key, (group = { path: place.path, places: [] }));
+      group.places.push({ start: place.start, end: place.end });
+    }
+    const before = commentText(comment).length;
+    let length = before;
+    let blocks = comment.blocks;
+    let here = 0;
+    byParagraph.forEach((group) => {
+      group.places.sort((x, y) => x.start - y.start || x.end - y.end);
+      const paragraph = paragraphOfBlocks(comment.blocks, group.path);
+      if (!paragraph) {
+        failed += group.places.length;
+        return;
+      }
+      commentReplaceCounters.passes++;
+      // A place that overlaps the one before it is not replaced (its text would be gone): replacedParagraphRanges() says so.
+      const result = replacedParagraphRanges(paragraph, group.places, clean);
+      for (let i = 0; i < group.places.length; i++) {
+        if (!result.done[i]) {
+          failed++;
+          continue;
+        }
+        here++;
+        length += clean.length - (group.places[i].end - group.places[i].start);
+      }
+      if (result.paragraph) blocks = withParagraphAt(blocks, group.path, result.paragraph);
+    });
+    if (here === 0) return;
+    // A comment that would be longer than a comment may be, and longer than it was, is not changed at all; one that a
+    // file made longer may still be made shorter.
+    if (length > MAX_COMMENT_TEXT && length > before) {
+      failed += here;
+      return;
+    }
+    const next = changed(comment, { blocks });
+    made.push(next);
+    replaced += here;
+  });
+  if (made.length === 0) return { replaced, failed };
+  const edit = build(doc, (draft) => {
+    const next = new Map(items);
+    for (const comment of made) next.set(comment.id, comment);
+    draft.apply({ type: 'setComments', items: next });
+    return { selection: kept(doc, selection) };
+  });
+  return { edit, replaced, failed };
 }
 
 /** The paragraphs a set of places is in, each once, with what happens there. */

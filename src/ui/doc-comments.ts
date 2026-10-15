@@ -74,7 +74,38 @@ export const COMMENT_STYLE_TEXT =
   '.bym-doc-comment-field{box-sizing:border-box;border:1px solid #dadce0;border-radius:6px;background:#fff;color:#202124;font:inherit;outline:none}' +
   '.bym-doc-comment-field:focus{border-color:#1a7f45}' +
   // Text smaller than 16 px makes iOS zoom the page when a field takes the focus.
-  '@media (pointer:coarse){.bym-doc-comment-field{font-size:16px}}';
+  '@media (pointer:coarse){.bym-doc-comment-field{font-size:16px}}' +
+  // A match of Find in the text of a comment.
+  '.bym-doc-find-mark{background:#fbbc04;color:#202124;border-radius:2px;padding:0}';
+
+/** A match of Find in the text of a comment: the comment, and where in its text (DocComment.text) the match is. */
+export interface FoundMark {
+  comment: number;
+  start: number;
+  end: number;
+}
+
+/**
+ * Puts a text into an element as text nodes, the part [start, end) of it in a <mark> (`mark`
+ * applies only where it lies inside the text, never inside a pair of surrogates). Returns the
+ * <mark>, or undefined when there is none. Nothing of the text is ever read as markup.
+ */
+export function fillMarked(target: HTMLElement, text: string, mark: { start: number; end: number } | undefined): HTMLElement | undefined {
+  while (target.firstChild) target.removeChild(target.firstChild);
+  const low = (at: number): boolean => at > 0 && at < text.length && text.charCodeAt(at) >= 0xdc00 && text.charCodeAt(at) <= 0xdfff;
+  if (!mark || !(mark.start >= 0 && mark.start < mark.end && mark.end <= text.length) || low(mark.start) || low(mark.end)) {
+    target.textContent = text;
+    return undefined;
+  }
+  const doc = target.ownerDocument || document;
+  if (mark.start > 0) target.appendChild(doc.createTextNode(text.slice(0, mark.start)));
+  const marked = doc.createElement('mark');
+  marked.className = 'bym-doc-find-mark';
+  marked.textContent = text.slice(mark.start, mark.end);
+  target.appendChild(marked);
+  if (mark.end < text.length) target.appendChild(doc.createTextNode(text.slice(mark.end)));
+  return marked;
+}
 
 /** What the balloon is for at the moment: showing a thread, or taking the text of a new comment, of an answer, or of a comment that is edited. */
 export type BalloonMode = 'view' | 'new' | 'reply' | 'edit';
@@ -122,6 +153,8 @@ export class CommentBalloon {
   private open = false;
   private place: BalloonPlace | undefined;
   private destroyed = false;
+  /** A match of Find that is marked, with the text of its comment as it was then: a text that changed is not marked. */
+  private found: (FoundMark & { text: string }) | undefined;
 
   constructor(host: CommentBalloonHost) {
     this.host = host;
@@ -170,6 +203,7 @@ export class CommentBalloon {
     this.thread = thread;
     this.mode = options.mode || 'view';
     this.editing = this.mode === 'edit' ? options.editing : undefined;
+    this.found = undefined;
     this.place = place;
     this.open = true;
     this.render();
@@ -197,6 +231,30 @@ export class CommentBalloon {
     else this.focusInside();
   }
 
+  /**
+   * Marks a match of Find in the text of a comment of the thread that is shown, and brings it
+   * into sight in the balloon; undefined takes the mark away. A comment the thread does not have
+   * is not marked.
+   */
+  markText(mark: FoundMark | undefined): void {
+    if (this.destroyed) return;
+    const comment = mark ? this.thread.filter((one) => one.id === mark.comment)[0] : undefined;
+    const next = mark && comment ? { comment: mark.comment, start: mark.start, end: mark.end, text: comment.text } : undefined;
+    const had = this.found;
+    if (!next && !had) return;
+    if (next && had && next.comment === had.comment && next.start === had.start && next.end === had.end && next.text === had.text) return;
+    this.found = next;
+    if (!this.open) return;
+    this.refresh(this.thread);
+    const marked = this.element.querySelector('.bym-doc-find-mark') as HTMLElement | null;
+    if (marked && typeof marked.getBoundingClientRect === 'function') {
+      // Only the balloon scrolls: the page stays where it is.
+      const box = this.element.getBoundingClientRect();
+      const at = marked.getBoundingClientRect();
+      if (at.top < box.top || at.bottom > box.bottom) this.element.scrollTop += at.top - box.top - 24;
+    }
+  }
+
   moveTo(place: BalloonPlace | undefined): void {
     this.place = place;
     if (this.open) this.position();
@@ -209,6 +267,7 @@ export class CommentBalloon {
     this.mode = 'view';
     this.field = undefined;
     this.thread = [];
+    this.found = undefined;
     this.element.style.display = 'none';
     while (this.element.firstChild) this.element.removeChild(this.element.firstChild);
   }
@@ -283,7 +342,10 @@ export class CommentBalloon {
         const date = shownDate(comment.date);
         if (date !== '') line.appendChild(element('span', 'bym-doc-comment-date', (comment.author !== '' ? ' \u00b7 ' : '') + date));
         item.appendChild(line);
-        item.appendChild(element('div', 'bym-doc-comment-body', comment.text));
+        const body = element('div', 'bym-doc-comment-body');
+        const found = this.found;
+        fillMarked(body, comment.text, found && found.comment === comment.id && found.text === comment.text ? found : undefined);
+        item.appendChild(body);
         if (can && this.mode === 'view') {
           const actions = element('div', 'bym-doc-comment-actions');
           actions.appendChild(this.button('edit', s.commentEdit, comment.id, true));

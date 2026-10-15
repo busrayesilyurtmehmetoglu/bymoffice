@@ -19,6 +19,7 @@ import { formatValue } from '../format/number-format';
 import type { FormatLocale } from '../format/locale';
 import { paragraphText, type DocModel, type Paragraph } from '../model/doc/types';
 import { resolvePosition, samePosition, type DocComment } from '../ops/doc/index';
+import { fillMarked, type FoundMark } from './doc-comments';
 import type { UiStrings } from './strings';
 
 /** A comment with its answers, as the panel lists it. */
@@ -281,6 +282,8 @@ export class CommentsPanel {
   private destroyed = false;
   /** The strings the entries were built with: entries are built anew when they change. */
   private builtWith: UiStrings | undefined;
+  /** A match of Find that is marked in the selected thread, with the text of its comment as it was then: a text that changed is not marked. */
+  private found: (FoundMark & { text: string; thread: number }) | undefined;
 
   constructor(host: CommentsPanelHost) {
     this.host = host;
@@ -391,6 +394,7 @@ export class CommentsPanel {
     if (!this.open) return;
     this.open = false;
     this.compose = undefined;
+    this.found = undefined;
     this.element.style.display = 'none';
     // Nothing of a hidden panel is kept up to date: it is built anew when it is shown again.
     this.clearEntries();
@@ -418,6 +422,7 @@ export class CommentsPanel {
     if (id !== undefined && this.open && !this.host.threads().some((thread) => thread.root.id === id)) id = undefined;
     if (id !== this.selected) {
       if (this.compose && this.compose.thread !== id) this.compose = undefined;
+      if (this.found && this.found.thread !== id) this.found = undefined;
       this.selected = id;
       if (this.open) this.refresh();
       this.host.selectionChanged(id);
@@ -428,6 +433,35 @@ export class CommentsPanel {
     if (!entry) return;
     if (options.scroll || options.focus) this.bringIntoSight(entry.element);
     if (options.focus) this.focusElement(entry.element);
+  }
+
+  /**
+   * Marks a match of Find in the text of a comment of the selected thread (select() it first)
+   * and brings it into sight in the list; a thread that the filter hides is shown with the
+   * resolved ones. Undefined takes the mark away.
+   */
+  markText(mark: FoundMark | undefined): void {
+    if (this.destroyed) return;
+    let next: (FoundMark & { text: string; thread: number }) | undefined;
+    if (mark && this.open && this.selected !== undefined) {
+      for (const thread of this.host.threads()) {
+        if (thread.root.id !== this.selected) continue;
+        const comment = thread.root.id === mark.comment ? thread.root : thread.replies.filter((reply) => reply.id === mark.comment)[0];
+        if (!comment) break;
+        next = { comment: mark.comment, start: mark.start, end: mark.end, text: comment.text, thread: thread.root.id };
+        if (thread.root.done && !this.showResolved) this.showResolved = true;
+        break;
+      }
+    }
+    const had = this.found;
+    if (!next && !had) return;
+    this.found = next;
+    if (!this.open) return;
+    this.refresh();
+    const entry = next ? this.entries.get(next.thread) : undefined;
+    const marked = entry ? (entry.element.querySelector('.bym-doc-find-mark') as HTMLElement | null) : null;
+    if (marked) this.bringIntoSight(marked);
+    else if (entry) this.bringIntoSight(entry.element);
   }
 
   /** Brings the list up to date with the threads of the document as they are now, keeping what is being written. */
@@ -598,7 +632,8 @@ export class CommentsPanel {
   private keyOf(thread: CommentThread, can: boolean, quote: string): string {
     const selected = thread.root.id === this.selected;
     const compose = selected && this.compose ? `${this.compose.mode}:${this.compose.comment}` : '';
-    const parts: (string | number | boolean)[] = [selected, can, compose, quote, thread.root.start === undefined];
+    const found = selected && this.found ? `${this.found.comment}:${this.found.start}:${this.found.end}` : '';
+    const parts: (string | number | boolean)[] = [selected, can, compose, quote, thread.root.start === undefined, found];
     const add = (comment: DocComment) => parts.push(comment.id, comment.author, comment.date || '', comment.done, comment.canChange, selected ? comment.text : shownText(comment.text, false));
     add(thread.root);
     if (selected) for (const reply of thread.replies) add(reply);
@@ -645,7 +680,7 @@ export class CommentsPanel {
       box.title = `${s.commentAbout}: ${quote}`;
       item.appendChild(box);
     }
-    item.appendChild(element('div', 'bym-doc-cpanel-text', shownText(root.text, selected)));
+    item.appendChild(this.textOf(root, selected));
     const compose = selected ? this.compose : undefined;
     const writing = compose !== undefined;
     if (selected && can && !writing) {
@@ -664,7 +699,7 @@ export class CommentsPanel {
       const box = element('div', 'bym-doc-cpanel-reply');
       box.setAttribute('data-comment', String(reply.id));
       box.appendChild(this.meta(reply, s, false));
-      box.appendChild(element('div', 'bym-doc-cpanel-text', reply.text));
+      box.appendChild(this.textOf(reply, true));
       if (can && !writing) {
         const actions = element('div', 'bym-doc-cpanel-actions');
         actions.appendChild(this.button(entry, 'edit', s.commentEdit, reply.id, true));
@@ -683,6 +718,15 @@ export class CommentsPanel {
       item.appendChild(foot);
     }
     return entry;
+  }
+
+  /** The text of a comment as an entry shows it, with the match of Find in it marked. */
+  private textOf(comment: DocComment, whole: boolean): HTMLDivElement {
+    const out = element('div', 'bym-doc-cpanel-text');
+    const found = this.found;
+    const marked = whole && found && found.comment === comment.id && found.text === comment.text ? found : undefined;
+    fillMarked(out, shownText(comment.text, whole), marked);
+    return out;
   }
 
   private form(entry: Entry, compose: Compose, s: UiStrings): void {
@@ -846,6 +890,7 @@ export class CommentsPanel {
   private pick(id: number, toDocument: boolean): void {
     if (this.selected !== id) {
       this.compose = undefined;
+      this.found = undefined;
       this.selected = id;
       this.render();
       this.host.selectionChanged(id);

@@ -35,7 +35,7 @@ import { CanvasTextMeasurer } from '../render/doc-measure';
 import { onFontsChanged } from '../render/fonts';
 import { onEmbeddedFontNotice } from '../render/embedded-fonts';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
-import { COMMENT_STYLE_TEXT, CommentBalloon, DOCKED_BELOW, commentColor, commentFill, type BalloonPlace } from './doc-comments';
+import { COMMENT_STYLE_TEXT, CommentBalloon, DOCKED_BELOW, commentColor, commentFill, type BalloonPlace, type FoundMark } from './doc-comments';
 import { COMMENTS_PANEL_STYLE_TEXT, CommentsPanel, PANEL_NARROW, commentDateText, commentQuote, coveredBelow, paragraphTexts, type CommentThread } from './doc-comments-panel';
 import { cutLoses, fragmentOfRange, setCopyMedia, sliceHtml, sliceOf, storeCopy, storedCopy, type DocSlice, type StoredCopy } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
@@ -66,6 +66,7 @@ import { TabStopsDialog } from './doc-tabs-dialog';
 import { PageSetupDialog, formatTwips, parseTwips, type PageDialogField, type PageDialogGroup } from './page-setup-dialog';
 import { editorRootIn } from './save-confirm';
 import { FindBar, type FindBarQuery } from './find-bar';
+import { foundInComment, type FoundAt } from './find-at';
 import { runSliced } from './sliced';
 import { checkReplacement, type CompiledFind } from '../edit/find';
 import { READ_ONLY } from '../ops/doc/pieces';
@@ -225,6 +226,18 @@ const MAX_MARK_COLUMNS = 6;
 const MAX_COUNTED = 10000;
 /** Most replacements "Replace all" makes at once where the document is edited together: each travels as a command of its own. */
 const ROOM_REPLACE_LIMIT = 200;
+
+/** What "Replace all" says it did (DocumentView.replaceAll): see ReplaceMatchesResult. */
+export interface DocReplaceAllResult {
+  replaced: number;
+  skipped: number;
+  inTextBoxes?: number;
+  textBoxesKept?: number;
+  /** Of `skipped`, matches in comments that were not replaced because the document is edited together. */
+  inComments?: number;
+  /** Of `skipped`, matches outside comments that were not replaced because the document takes comments and nothing else. */
+  outsideComments?: number;
+}
 /** Counts the runs of "Replace all": the steps of one are undone together. */
 let replaceRuns = 0;
 
@@ -820,6 +833,11 @@ export class DocumentView {
   private findCount = '';
   /** The paragraphs searched last, with the count of changes they are good for. */
   private findList: { changes: number; stories: 'all' | 'body'; doc: DocModel; list: ops.DocParagraphRef[] } | undefined;
+  /**
+   * The match in a comment Find went to last (the selection of the document cannot be there): where the next
+   * search starts and what Replace replaces, while the document and its selection are what they were then.
+   */
+  private findAt: FoundAt | undefined;
   private resizeObserver: ResizeObserver | undefined;
   private dprQuery: MediaQueryList | undefined;
   private destroyed = false;
@@ -3919,6 +3937,8 @@ export class DocumentView {
     }
     this.modified = true;
     this.changes++;
+    // What the bar of Find counted may be other now.
+    if (this.findBar) this.scheduleCount(300, false);
     this.follow();
     this.commentsFollow();
     if (this.options.onChange) this.options.onChange();
@@ -5295,7 +5315,8 @@ export class DocumentView {
       kind: 'doc',
       openReplace: replace,
       initial,
-      canReplace: () => this.editable && !this.destroyed,
+      // A document that takes comments and nothing else: the text of its comments can be replaced.
+      canReplace: () => (this.editable || this.canComment) && !this.destroyed,
       find: (query, backward) => this.barSearch(query, backward),
       replace: (query, replacement) => this.barReplace(query, replacement, false),
       replaceAll: (query, replacement) => this.barReplace(query, replacement, true),
@@ -5316,6 +5337,8 @@ export class DocumentView {
     this.findBar = undefined;
     this.findToken++;
     this.countToken++;
+    this.findAt = undefined;
+    this.markFound(undefined);
     if (this.countTimer !== undefined) clearTimeout(this.countTimer);
     this.countTimer = undefined;
     const had = bar.hasFocus;
@@ -5347,7 +5370,10 @@ export class DocumentView {
    * start) of the selection, round the end of the document, and selects it. The text is plain
    * text, found within one paragraph; what is searched is said in src/ops/doc/find.ts. The
    * search goes a slice at a time; a later search, a change of the document or the bar closing
-   * gives it up. Resolves to the range found, or undefined.
+   * gives it up. Resolves to the range found, or undefined. A match in the text of a comment
+   * (its story is "comment:" and the id, see ops.COMMENT_STORY) is not selected: the panel of
+   * comments opens with its thread selected and the match marked, and the next search starts
+   * after it while the selection stays where it is.
    */
   findNext(text: string, options?: ops.DocFindOptions & { backward?: boolean }): Promise<DocRange | undefined> {
     if (this.destroyed) return Promise.resolve(undefined);
@@ -5361,7 +5387,8 @@ export class DocumentView {
     this.typing.commit();
     const token = ++this.findToken;
     const backward = !!(options && options.backward);
-    const range = this.range();
+    // From the match in a comment that was found last, else from the selection.
+    const range = this.foundInComment() || this.range();
     const from = range ? (backward ? ops.orderRange(range).start : ops.orderRange(range).end) : undefined;
     const search = new ops.DocSearch(find, this.findParagraphs(options && options.stories), from, backward);
     const changes = this.changes;
@@ -5371,18 +5398,88 @@ export class DocumentView {
       () => !this.destroyed && token === this.findToken && this.changes === changes,
     ).then((done) => {
       if (!done || !hit || this.destroyed || token !== this.findToken || this.changes !== changes) return undefined;
-      try {
-        this.setSelection(hit.range);
-      } catch {
-        return undefined;
+      if (ops.commentOfStory(hit.range.anchor.story) !== undefined) {
+        if (!this.showFoundComment(hit.range)) return undefined;
+      } else {
+        try {
+          this.setSelection(hit.range);
+        } catch {
+          return undefined;
+        }
+        this.findAt = undefined;
+        this.markFound(undefined);
       }
       return { anchor: copyPosition(hit.range.anchor), focus: copyPosition(hit.range.focus) };
     });
   }
 
-  /** The match the selection is, when it is one. */
+  /** The match in a comment that was found last, while the document and its selection are as they were then. */
+  private foundInComment(): DocRange | undefined {
+    return foundInComment(this.findAt, this.document, this.changes, this.range());
+  }
+
+  /**
+   * Shows a match in the text of a comment: the panel of comments opens (when it is closed) with the thread of the
+   * comment selected and the match marked in it; where the panel cannot be shown, the balloon of the thread. The
+   * selection of the document stays where it is. False when the comment is not there.
+   */
+  private showFoundComment(range: DocRange): boolean {
+    const id = ops.commentOfStory(range.anchor.story);
+    const comment = id !== undefined && this.document.comments ? this.document.comments.items.get(id) : undefined;
+    if (id === undefined || !comment) return false;
+    const from = Math.min(range.anchor.offset, range.focus.offset);
+    const start = ops.commentTextOffset(comment, range.anchor.path, from);
+    if (start === undefined) return false;
+    const selection = this.range();
+    this.findAt = {
+      range: { anchor: copyPosition(range.anchor), focus: copyPosition(range.focus) },
+      changes: this.changes,
+      selection: selection ? { anchor: copyPosition(selection.anchor), focus: copyPosition(selection.focus) } : undefined,
+    };
+    this.setCommentsPanel(true);
+    if (!this.openThread(id, false, false)) return false;
+    this.markFound({ comment: id, start, end: start + Math.abs(range.focus.offset - range.anchor.offset) });
+    return true;
+  }
+
+  /** Marks a match in the text of a comment where its thread is shown (the panel, else the balloon); undefined takes the mark away. */
+  private markFound(mark: FoundMark | undefined): void {
+    const panel = this.panel;
+    const balloon = this.balloon;
+    if (!mark) {
+      if (panel) panel.markText(undefined);
+      if (balloon) balloon.markText(undefined);
+      return;
+    }
+    if (panel && panel.isOpen) panel.markText(mark);
+    else if (balloon && balloon.isOpen) balloon.markText(mark);
+  }
+
+  /** Replaces a match in a comment that Find went to (Replace): as an edit of comments, where comments can be changed. */
+  private replaceFoundComment(match: ops.DocMatch, replacement: string): boolean {
+    const words = this.strings.find;
+    if (!this.canComment) {
+      this.notify(words.readOnly, 'info');
+      return false;
+    }
+    if (this.collab || !match.replaceable) {
+      this.notify(this.replacedText({ replaced: 0, skipped: 1, inComments: this.collab ? 1 : 0 }), 'info');
+      return false;
+    }
+    const before = this.getSelection();
+    const edit = this.runComment(() => ops.replaceMatchEdit(this.document, match.range, replacement, before), words.replaced(1, 0));
+    if (!edit) return false;
+    // The next search goes on after the replacement.
+    const at = ops.orderRange(match.range).start;
+    const after: DocPosition = { story: at.story, path: at.path.slice(), offset: at.offset + replacement.length };
+    const selection = this.range();
+    this.findAt = { range: { anchor: after, focus: copyPosition(after) }, changes: this.changes, selection: selection ? { anchor: copyPosition(selection.anchor), focus: copyPosition(selection.focus) } : undefined };
+    return true;
+  }
+
+  /** The match the selection is (or the match in a comment that was found last), when it is one. */
   private selectedMatch(find: CompiledFind, stories: 'all' | 'body' | undefined): ops.DocMatch | undefined {
-    const range = this.range();
+    const range = this.foundInComment() || this.range();
     if (!range || ops.isCollapsed(range)) return undefined;
     const { start, end } = ops.orderRange(range);
     if (start.story !== end.story || start.path.join(',') !== end.path.join(',')) return undefined;
@@ -5400,6 +5497,8 @@ export class DocumentView {
    * Replaces the selection when it is a match of the text, then goes on to the next match
    * (Word's Replace). Where changes are tracked the replacement is a tracked change. Resolves to
    * whether something was replaced, as one undo step. Nothing is replaced in a read-only document.
+   * A match in a comment that Find went to is replaced in the comment (never a tracked change),
+   * also in a document that takes comments and no other change; not in a room (said).
    */
   replace(text: string, replacement: string, options?: ops.DocFindOptions): Promise<boolean> {
     if (this.destroyed) return Promise.resolve(false);
@@ -5411,7 +5510,7 @@ export class DocumentView {
       return Promise.reject(error);
     }
     if (!find) return Promise.resolve(false);
-    if (!this.editable) {
+    if (!this.editable && !this.canComment) {
       this.notify(this.strings.find.readOnly, 'info');
       return Promise.resolve(false);
     }
@@ -5421,7 +5520,9 @@ export class DocumentView {
     // A match in a text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
     // In a room the command that travels (insertText); elsewhere the replacement in the place of the match. A match in a
     // text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
-    if (match && match.replaceable)
+    if (match && ops.commentOfStory(match.range.anchor.story) !== undefined) changed = this.replaceFoundComment(match, replacement);
+    else if (match && !this.editable) this.notify(this.replacedText({ replaced: 0, skipped: 1, outsideComments: 1 }), 'info');
+    else if (match && match.replaceable)
       changed = this.perform(() => (this.collab && !ops.inTextBox(match.range.anchor.path) ? ops.insertText(this.document, match.range, replacement) : ops.replaceMatchEdit(this.document, match.range, replacement)), true, 'raw');
     else if (match) this.notify(this.replacedText({ replaced: 0, skipped: 1, textBoxesKept: match.fixed === 'textBox' ? 1 : 0 }), 'info');
     return this.findNext(text, options).then(() => changed);
@@ -5435,9 +5536,11 @@ export class DocumentView {
    * is edited together each replacement travels as a command of its own, and at most
    * ROOM_REPLACE_LIMIT of them are made at once (more is refused, and said); the matches in text
    * boxes are not replaced there (their change does not travel), nor where changes are tracked,
-   * and are counted and said.
+   * and are counted and said. The matches in comments are replaced too, in the same undo step
+   * and never as tracked changes, except in a room (`inComments`); in a document that takes
+   * comments and no other change only they are (`outsideComments`).
    */
-  replaceAll(text: string, replacement: string, options?: ops.DocFindOptions): Promise<{ replaced: number; skipped: number; inTextBoxes?: number; textBoxesKept?: number }> {
+  replaceAll(text: string, replacement: string, options?: ops.DocFindOptions): Promise<DocReplaceAllResult> {
     const none = { replaced: 0, skipped: 0 };
     if (this.destroyed) return Promise.resolve(none);
     let find: CompiledFind | undefined;
@@ -5448,7 +5551,7 @@ export class DocumentView {
       return Promise.reject(error);
     }
     if (!find) return Promise.resolve(none);
-    if (!this.editable) {
+    if (!this.editable && !this.canComment) {
       this.notify(this.strings.find.readOnly, 'info');
       return Promise.resolve(none);
     }
@@ -5462,7 +5565,7 @@ export class DocumentView {
       () => !this.destroyed && token === this.findToken,
     ).then((done) => {
       if (!done || this.destroyed || token !== this.findToken) return none;
-      if (this.changes !== changes || !this.editable) {
+      if (this.changes !== changes || !(this.editable || this.canComment)) {
         this.notify(words.changedMeanwhile, 'error');
         return none;
       }
@@ -5479,6 +5582,13 @@ export class DocumentView {
         apply: (edit) => history.applyEdit({ ops: edit.ops, selection: edit.selection, mergeKey: key }, before),
         limit: this.collab ? ROOM_REPLACE_LIMIT : undefined,
         textBoxes: this.collab ? 'skip' : 'replace',
+        // In a room an edit of a comment travels as its whole new text, which keeps none of its formatting, and the
+        // undoing of one "Replace all" travels as one step, which takes few edits of comments: the comments are
+        // skipped there, and said (see the guide).
+        comments: this.collab || !this.canComment ? 'skip' : 'replace',
+        // A document that takes comments and nothing else.
+        outside: this.editable ? 'replace' : 'skip',
+        selection: before,
       });
       if (result.refused) {
         this.notify(words.tooMany(ROOM_REPLACE_LIMIT), 'error');
@@ -5486,10 +5596,13 @@ export class DocumentView {
       }
       const { replaced, skipped, last } = result;
       this.history.seal();
-      if (replaced > 0) this.changed(last);
-      const answer: { replaced: number; skipped: number; inTextBoxes?: number; textBoxesKept?: number } = { replaced, skipped };
+      if (replaced > 0) this.commentsChanged(last);
+      if (this.findAt) this.findAt = undefined;
+      const answer: DocReplaceAllResult = { replaced, skipped };
       if (result.inTextBoxes) answer.inTextBoxes = result.inTextBoxes;
       if (result.textBoxesKept) answer.textBoxesKept = result.textBoxesKept;
+      if (result.inComments) answer.inComments = result.inComments;
+      if (result.outsideComments) answer.outsideComments = result.outsideComments;
       this.notify(this.replacedText(answer), 'info');
       return answer;
     });
@@ -5524,11 +5637,19 @@ export class DocumentView {
   }
 
   /** What is said after "Replace all": how many were replaced and not, and why those in text boxes were not. */
-  private replacedText(result: { replaced: number; skipped: number; inTextBoxes?: number; textBoxesKept?: number }): string {
+  private replacedText(result: DocReplaceAllResult): string {
     const words = this.strings.find;
     const boxes = result.inTextBoxes || 0;
     const kept = result.textBoxesKept || 0;
-    return words.replaced(result.replaced, result.skipped) + (boxes > 0 ? words.inTextBoxes(boxes, this.collab !== undefined ? 'shared' : 'tracked') : '') + (kept > 0 ? words.inTextBoxes(kept, 'kept') : '');
+    const comments = result.inComments || 0;
+    const outside = result.outsideComments || 0;
+    return (
+      words.replaced(result.replaced, result.skipped) +
+      (boxes > 0 ? words.inTextBoxes(boxes, this.collab !== undefined ? 'shared' : 'tracked') : '') +
+      (kept > 0 ? words.inTextBoxes(kept, 'kept') : '') +
+      (comments > 0 ? words.inComments(comments) : '') +
+      (outside > 0 ? words.outsideComments(outside) : '')
+    );
   }
 
   /** What the options of the bar ask of a search. */
@@ -5794,6 +5915,8 @@ export class DocumentView {
               ? s.revisionGone
               : message === ops.TRACK_ENFORCED
                 ? s.cannotStopTracking
+                : message === ops.COMMENT_NOT_REPLACED
+                  ? s.find.replaced(0, 1)
                 : message === ops.COMMENT_NOT_HERE
                   ? s.cannotCommentHere
                   : message === ops.COMMENT_FIXED
