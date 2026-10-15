@@ -146,8 +146,14 @@ test('cfb writer: names a compound file cannot hold are refused', () => {
 });
 
 test('cfb writer: file(1) calls what is written a compound document', (t) => {
-  const done = spawnSync('file', ['-'], { input: writeCfb([{ path: 'EncryptionInfo', data: fill(900) }, { path: 'EncryptedPackage', data: fill(9000) }]) });
+  // Once, under the load of a full verification, file(1) never answered and the whole file timed out: it is given a
+  // time of its own, and a check that could not be made is skipped and says so, not taken as passed.
+  const done = spawnSync('file', ['-'], {
+    input: writeCfb([{ path: 'EncryptionInfo', data: fill(900) }, { path: 'EncryptedPackage', data: fill(9000) }]),
+    timeout: 30_000,
+  });
   if (done.error && (done.error as { code?: string }).code === 'ENOENT') return t.skip('file(1) not found');
+  if (done.error && (done.error as { code?: string }).code === 'ETIMEDOUT') return t.skip('file(1) did not answer in 30 s');
   // file(1) may stop reading before all of the file was written to it: what it printed is what counts.
   assert.match(String(done.stdout), /Composite Document File V2|CDFV2|Compound Document/, `file(1) said: ${String(done.stdout)} ${String(done.stderr)} ${done.error ? done.error.message : ''}`);
 });
