@@ -15,7 +15,8 @@ import type { DocOp } from '../../ops/doc/ops';
 import { asRange, comparePositions, nextCharOffset, nextWordOffset, resolvePosition, samePosition, type DocPosition, type DocRange } from '../../ops/doc/position';
 import { deleteRange } from '../../ops/doc/text';
 import type { DocWire, WirePos } from './rebase';
-import { toWirePos } from './wire';
+import { runWire, toWirePos } from './wire';
+import { COMMENT_COMMANDS, commentWireOf } from './comments';
 
 const MADE = new WeakMap<DocOp[], DocWire[]>();
 
@@ -179,6 +180,25 @@ export function traced<T extends object>(api: T, always = true): T {
         if (wire) MADE.set(edit.ops, [wire]);
       }
       return edit;
+    };
+  }
+  // A command of comments travels with what its author's side decided (who, when) and the ids it gives; what it does
+  // here is what it does at everybody: the edit handed back is the one the command makes of the document (its new
+  // comment has the number everybody gives it), with the selection the call left.
+  for (const name of COMMENT_COMMANDS) {
+    const command = (api as Record<string, unknown>)[name];
+    if (typeof command !== 'function') continue;
+    out[name] = (doc: DocModel, ...args: unknown[]): DocEdit => {
+      const edit = (command as (doc: DocModel, ...rest: unknown[]) => DocEdit & { id?: number })(doc, ...args);
+      if (!always && watching === 0) return edit;
+      if (!edit || !Array.isArray(edit.ops) || edit.ops.length === 0) return edit;
+      const wire = commentWireOf(doc, name, args, edit);
+      if (!wire) return edit;
+      const shared = runWire(doc, wire) as DocEdit & { id?: number };
+      const made: DocEdit & { id?: number } = { ops: shared.ops, selection: edit.selection };
+      if (shared.id !== undefined) made.id = shared.id;
+      MADE.set(made.ops, [wire]);
+      return made;
     };
   }
   return out as T;

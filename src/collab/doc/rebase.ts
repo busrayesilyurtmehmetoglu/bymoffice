@@ -48,7 +48,31 @@ export type DocWire =
    * cannot be said as a command is taken back (text that was deleted, with how it looked). Everybody, its author
    * too, builds the paragraphs from what travelled.
    */
-  | { t: 'put'; at: WirePos; n: number; x: PutParagraph[]; /** putDigest() of the blocks it replaces. */ h: string };
+  | { t: 'put'; at: WirePos; n: number; x: PutParagraph[]; /** putDigest() of the blocks it replaces. */ h: string }
+  /** A command of comments (see CommentWire). */
+  | CommentWire;
+
+/**
+ * A comment, as a command names it: by the paragraph id it is known by (`"0A1B2C3D"`), or, for
+ * one that has none, by its number and a digest of who wrote it and when (`[3, "89abcdef"]`).
+ */
+export type CommentRef = string | [number, string];
+
+/**
+ * A command of comments. Who wrote a comment (`u`, `i`) and when (`d`) travel as its author's
+ * side decided them; the paragraph ids a command gives (`q`, `r`) are picked by its author. The
+ * number a new comment gets is not said: everybody takes the same from the document (see comments.ts).
+ */
+export type CommentWire =
+  /** A comment about the range `at`..`to`, or about the word at the caret `at`. */
+  | { t: 'cmt'; k: 'add'; at: WirePos; to?: WirePos; x: string; u: string; i: string; d: string; q: string }
+  /** An answer to the thread of `c` (its first comment, when it has no id, gets one made of itself: see comments.ts). */
+  | { t: 'cmt'; k: 'reply'; c: CommentRef; x: string; u: string; i: string; d: string; q: string }
+  /** `h` (only an undoing says it): what the command undoes is to be found as it was left (see commentState in comments.ts). */
+  | { t: 'cmt'; k: 'edit'; c: CommentRef; x: string; h?: string }
+  /** Resolves (`v` 1) or opens again (0) the thread of `c`; its comments that have no id get one made of themselves. */
+  | { t: 'cmt'; k: 'done'; c: CommentRef; v: 0 | 1; h?: string }
+  | { t: 'cmt'; k: 'del'; c: CommentRef; h?: string };
 
 /** A paragraph as it travels in a `put`: its properties and its runs, each a list of texts, tabs and line breaks. See wire.ts for what is taken. */
 export interface PutParagraph {
@@ -60,7 +84,11 @@ export interface PutParagraph {
   r: PutInline[];
 }
 
-export type PutInline = { p?: Record<string, unknown>; a?: [string, string][]; c: (string | [string, string] | number)[] } | { e: string } | { b: [0 | 1, string] | [0 | 1, string, string] };
+/** A piece of a run that travels: text, text with how its file spelled it, an item by its number (see ITEMS in wire.ts), the reference to a comment (`r`: its number). */
+export type PutItem = string | [string, string] | number | { r: number };
+
+/** What a paragraph that travels holds: a run, a mark of proofing, the start or end of a bookmark, the start (0) or end (1) of the range of a comment (`k`: by its number). */
+export type PutInline = { p?: Record<string, unknown>; a?: [string, string][]; c: PutItem[] } | { e: string } | { b: [0 | 1, string] | [0 | 1, string, string] } | { k: [0 | 1, string] };
 
 /** What a change did to the places around it. */
 export type Mark =
@@ -223,6 +251,7 @@ function touches(mark: Mark, blk: Extract<Mark, { k: 'blk' }>): boolean {
 /** The places a change names. */
 function placesOf(wire: DocWire): WirePos[] {
   if (wire.t === 'split' || wire.t === 'put') return [wire.at];
+  if (wire.t === 'cmt') return wire.k !== 'add' ? [] : wire.to ? [wire.at, wire.to] : [wire.at];
   return wire.to ? [wire.at, wire.to] : [wire.at];
 }
 
@@ -364,6 +393,7 @@ export function rebaseWire(wire: DocWire, effect: readonly Mark[], arrivedMarks:
   const on = (mark: Mark): void => {
     own = marksThrough(own, [mark])[0];
   };
+  if (wire.t === 'cmt') return rebaseComment(wire, carry, moved, () => own, on);
   if (wire.t === 'put') {
     let at = wire.at;
     for (const mark of carry) {
@@ -476,6 +506,60 @@ export function rebaseWire(wire: DocWire, effect: readonly Mark[], arrivedMarks:
   // Later ranges first: what goes there does not move what stands before it.
   for (let i = ranges.length - 1; i >= 0; i--) wires.push({ ...wire, at: ranges[i][0], to: ranges[i][1] } as DocWire);
   return cut ? { wires, cut: true, carry: moved } : { wires, carry: moved };
+}
+
+/**
+ * A waiting command of comments read through what got its place first.
+ *
+ * Only a new comment names places: its range covers what its author saw and grows around text
+ * that someone else put into it (a comment is one range; it is not cut in two). A range whose
+ * every character someone else deleted first is no range any more: the comment is dropped and
+ * that is said - the text it was about is gone, and the same command at the place where it was
+ * would be about the word that stands there now. Where only an end of the range went, the
+ * comment is about what is left of it (said as `partial`). A comment at a caret is about the
+ * word at its place when it runs, and is dropped when the place itself was deleted. The other
+ * commands name a comment, which moves with its text by itself.
+ */
+function rebaseComment(wire: CommentWire, carry: readonly Mark[], moved: Mark[], own: () => Mark[], on: (mark: Mark) => void): Rebased {
+  const dropped = (): Rebased => ({ wires: [], drop: true, carry: carry.slice() });
+  if (wire.k !== 'add') {
+    for (const mark of carry) {
+      if (clash([], own(), mark)) return dropped();
+      on(mark);
+    }
+    return { wires: [wire], carry: moved };
+  }
+  let a = wire.at;
+  let b = wire.to;
+  if (b && orderOf(a, b) === 1) [a, b] = [b, a];
+  let cut = false;
+  for (const mark of carry) {
+    if (clash(b ? [a, b] : [a], own(), mark)) return dropped();
+    if (b && mark.k === 'blk') {
+      // Blocks between the two ends were replaced: what the range covered is not known any more.
+      const depth = a.p.length - 1;
+      if (orderOf(a, b) !== undefined && touches(mark, { k: 'blk', s: a.s, c: a.p.slice(0, depth), at: a.p[depth], n: b.p[depth] - a.p[depth] + 1, m: 0 })) return dropped();
+    }
+    if (!b) {
+      const next = mapPos(a, mark, false);
+      if (next.gone) return dropped();
+      a = next.pos;
+    } else {
+      if (mark.k === 'del') {
+        // Text of the range went: the comment is about what is left of it.
+        const first: WirePos = { s: mark.s, p: mark.c.concat([mark.r1]), o: mark.o1 };
+        const last: WirePos = { s: mark.s, p: mark.c.concat([mark.r2]), o: mark.o2 };
+        if (orderOf(a, last) === -1 && orderOf(first, b) === -1) cut = true;
+      }
+      const mapped = mapRange(a, b, mark, false);
+      if (mapped.gone) cut = true;
+      [a, b] = mapped.ranges[0];
+    }
+    on(mark);
+  }
+  if (b && orderOf(a, b) === 0) return dropped();
+  const out: CommentWire = b ? { ...wire, at: a, to: b } : { ...wire, at: a };
+  return cut ? { wires: [out], cut: true, carry: moved } : { wires: [out], carry: moved };
 }
 
 /**

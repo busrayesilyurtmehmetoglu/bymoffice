@@ -26,6 +26,7 @@ import { RoomSession, type CollabNoticeCode, type RoomHost, type RoomOptions, ty
 import { CollabUnsupportedError, WireError } from '../types';
 import { stable } from '../wire';
 import { arrived, mapPos, orderOf, rebaseWire, type DocWire, type Mark, type WirePos } from './rebase';
+import { commentBack, commentMarks, commentPrior } from './comments';
 import { MAX_STEP_WIRES, decodeStep, encodeStep, inverseOf, lookBefore, marksAfter, runWire } from './wire';
 
 /** Where a participant is in a document: the story, and the two ends of its selection (the same place for a caret). */
@@ -242,6 +243,25 @@ export class DocCollabSession extends RoomSession<Step, DocPresence> {
     let back: DocWire[] | null = own ? [] : null;
     try {
       for (const wire of wires) {
+        if (wire.t === 'cmt') {
+          // A command of comments: what it did, and what takes it back, it says itself.
+          const prior = back ? commentPrior(doc, wire) : {};
+          const edit = runWire(doc, wire);
+          const done: DocOp[] = [];
+          try {
+            for (const op of edit.ops) done.unshift(applyDocOp(doc, op));
+          } catch (error) {
+            for (const op of done) applyDocOp(doc, op);
+            throw error;
+          }
+          inverse = done.concat(inverse);
+          effects.push(commentMarks(edit.ops));
+          if (back) {
+            const undo = commentBack(doc, wire, prior, edit.ops);
+            back = undo ? undo.concat(back) : null;
+          }
+          continue;
+        }
         const before = lookBefore(doc, wire);
         const edit = runWire(doc, wire);
         const done: DocOp[] = [];

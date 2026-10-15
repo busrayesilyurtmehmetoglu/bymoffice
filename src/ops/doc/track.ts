@@ -134,7 +134,7 @@ const systemClock = (): Date => new Date();
  * offset of hours and minutes of at most 14:00. Stricter than the type in one place: the hour
  * 24:00:00, which it allows for the end of a day, is not taken.
  */
-function isIsoDate(text: string): boolean {
+export function isIsoDate(text: string): boolean {
   const match = /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d{1,9})?(?:Z|[+-](\d\d):(\d\d))?$/.exec(text);
   if (!match || text.length > 40) return false;
   const [year, month, day, hour, minute, second] = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6])];

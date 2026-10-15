@@ -22,7 +22,7 @@ export interface DocHistoryLike<M> {
 
 export { holdsRevisions } from './session';
 
-/** Said for a change that does not travel: an edit of comments, a picture, a paste with its formatting, an accepted revision. */
+/** Said for a change that does not travel: a picture, a paste with its formatting, an accepted revision. */
 export const NOT_SHARED = 'This change cannot be made while the document is edited together';
 
 export class CollabDocHistory<M> implements DocHistoryLike<M> {

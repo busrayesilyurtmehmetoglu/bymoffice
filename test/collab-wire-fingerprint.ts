@@ -144,10 +144,16 @@ export function docSample(): unknown[] {
           p: { align: 'left', indent: INDENT, spacing: SPACING, tabs: TABS },
           m: PUT_FORMAT,
           a: [['w:rsidR', '00000001']],
-          r: [{ c: ['x', 0, ['y', 'z']], p: PUT_FORMAT, a: [['w:rsidR', '00000001']] }, { e: 'spellStart' }, { b: [0, '1', 'name'] }, { b: [1, '1'] }],
+          r: [{ c: ['x', 0, ['y', 'z'], { r: 1 }], p: PUT_FORMAT, a: [['w:rsidR', '00000001']] }, { e: 'spellStart' }, { b: [0, '1', 'name'] }, { b: [1, '1'] }, { k: [0, '1'] }, { k: [1, '1'] }],
         },
       ],
     },
+    // The commands of comments: every kind, each with all of its fields.
+    { t: 'cmt', k: 'add', at: place(0), to: place(1), x: 'note', u: 'Author', i: 'A', d: '2026-10-15T10:00:00Z', q: '1A2B3C4D' },
+    { t: 'cmt', k: 'reply', c: '1A2B3C4D', x: 'answer', u: 'Author', i: 'A', d: '2026-10-15T10:00:00Z', q: '2A2B3C4D' },
+    { t: 'cmt', k: 'edit', c: [0, '0123abcd'], x: 'edited', h: '0123abcd' },
+    { t: 'cmt', k: 'done', c: '1A2B3C4D', v: 1, h: '0123abcd' },
+    { t: 'cmt', k: 'del', c: '1A2B3C4D', h: '0123abcd' },
   ];
 }
 

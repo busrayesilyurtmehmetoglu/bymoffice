@@ -3799,7 +3799,19 @@ export class DocumentView {
    * read-only (`readOnly` is true): its text cannot be changed.
    */
   get canComment(): boolean {
-    return !this.destroyed && (this.editable || this.commenting);
+    // In a room the comments travel like any change: only a participant the relay takes changes from writes any.
+    return !this.destroyed && (this.editable || this.commenting) && !(this.collab !== undefined && this.collab.readOnly);
+  }
+
+  /**
+   * Who a comment of this view is written by: the author of the options; in a room without one,
+   * the name this participant has there (the others see that name beside its caret). Undefined:
+   * the author the document is edited as.
+   */
+  private commentOptions(): ops.CommentOptions | undefined {
+    if (typeof this.options.author === 'string' && this.options.author !== '') return undefined;
+    const name = this.collab ? this.collab.user.name : undefined;
+    return typeof name === 'string' && name !== '' ? { author: name } : undefined;
   }
 
   private commentState(): { list: DocComment[]; roots: DocComment[]; threads: Map<number, DocComment[]> } {
@@ -3949,7 +3961,7 @@ export class DocumentView {
       return undefined;
     }
     const where = range;
-    const edit = this.runComment(() => ops.addComment(this.document, where, text), this.strings.commentAdded);
+    const edit = this.runComment(() => ops.addComment(this.document, where, text, this.commentOptions()), this.strings.commentAdded);
     return edit ? edit.id : undefined;
   }
 
@@ -3960,7 +3972,7 @@ export class DocumentView {
 
   /** Answers a comment: the answer joins the thread of that comment. Returns the id of the answer. */
   replyToComment(id: number, text: string): number | undefined {
-    const edit = this.runComment(() => ops.replyToComment(this.document, id, text, undefined, this.getSelection()), this.strings.commentReplied);
+    const edit = this.runComment(() => ops.replyToComment(this.document, id, text, this.commentOptions(), this.getSelection()), this.strings.commentReplied);
     return edit ? edit.id : undefined;
   }
 
@@ -4165,8 +4177,7 @@ export class DocumentView {
         root: this.body,
         strings: () => this.strings,
         threads: () => this.threadsForPanel(),
-        // Comments do not travel where the document is edited together: there the panel only lists them.
-        canChange: () => this.canComment && this.collab === undefined,
+        canChange: () => this.canComment,
         quote: (comment) => commentQuote(this.document, comment, this.quoteTexts()),
         date: (date) => commentDateText(date, this.dateLocale),
         reveal: (id, toDocument) => this.revealThread(id, toDocument),
@@ -5606,7 +5617,7 @@ export class DocumentView {
     if (session) this.history = new CollabDocHistory<DocRange | undefined>(session);
     this.collabPeersChanged(session ? session.peers : []);
     this.sayPresence();
-    // Comments do not travel: in a room the panel only lists them.
+    // Comments travel as steps of the room; a participant who only looks on lists them.
     this.refreshPanel();
   }
 

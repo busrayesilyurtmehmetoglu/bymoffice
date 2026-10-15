@@ -39,8 +39,9 @@ export type CollabState = 'connecting' | 'online' | 'offline' | 'detached' | 'cl
  * 4: dynamic array formulas (`d` of a formula).
  * 5: VSTACK, HSTACK, TAKE, DROP, CHOOSEROWS, CHOOSECOLS, EXPAND, TOCOL, TOROW, WRAPROWS, WRAPCOLS and
  *    TEXTSPLIT calculated; TEXTBEFORE and TEXTAFTER take an array of delimiters as one list.
+ * 6: commands of comments of a document (`cmt`).
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /** A participant of a room as the others see it; `P` is how it says where it is. */
 export interface RoomPeer<P> {

@@ -238,16 +238,101 @@ test('what cannot be shared is refused and said, and changes nothing', async ({ 
   const done = await a.evaluate(() => {
     const view = (window as any).__mounted.view;
     view.setSelection({ anchor: { story: 'body', path: [0], offset: 0 }, focus: { story: 'body', path: [0], offset: 5 } });
-    return [view.addComment('a comment'), view.setTrackChanges(true)];
+    return view.setTrackChanges(true);
   });
-  expect(done[0], 'no comment was added').toBeUndefined();
-  expect(done[1], 'tracking was not turned on').toBe(false);
-  expect((await notices(a)).filter((line) => /edited together/.test(line)).length, 'both were said').toBe(2);
+  expect(done, 'tracking was not turned on').toBe(false);
+  expect((await notices(a)).filter((line) => /edited together/.test(line)).length, 'that was said').toBe(1);
   expect(await text(a)).toBe(before);
   expect(await text(b)).toBe(before);
   // What can be shared still is.
   expect(await a.evaluate(() => (window as any).__mounted.view.toggleFormat('bold'))).toBe(true);
   await settled(a);
+  clean(b);
+});
+
+/** The comments a page lists: id, author, text, the comment answered, resolved. */
+const commentsOf = (page: Page): Promise<[number, string, string, number | null, boolean][]> =>
+  page.evaluate(() => (window as any).__mounted.view.comments().map((c: any) => [c.id, c.author, c.text, c.parent === undefined ? null : c.parent, c.done]));
+
+test('a comment added in one page is in the other, under its name; answered, edited and resolved there, and the panel follows', async ({ page, context, request }) => {
+  const { a, b } = await pair(context, page, request);
+  // The panel of the second page is open before anything is said.
+  expect(await b.evaluate(() => (window as any).__mounted.view.setCommentsPanel(true))).toBe(true);
+  const id = await a.evaluate(() => {
+    const view = (window as any).__mounted.view;
+    view.setSelection({ anchor: { story: 'body', path: [0], offset: 0 }, focus: { story: 'body', path: [0], offset: 5 } });
+    return view.addComment('Why first?');
+  });
+  expect(typeof id, 'a comment was added').toBe('number');
+  await expect.poll(() => commentsOf(b), { message: 'the second page has the comment, by the name of the first in the room' }).toEqual([[id, 'Ada', 'Why first?', null, false]]);
+  // The panel of the second page lists it, with what can be done to it.
+  const panel = b.locator('#editor .bym-doc-cpanel');
+  await expect(panel.locator('.bym-doc-cpanel-item')).toHaveCount(1);
+  await expect(panel.locator('.bym-doc-cpanel-author').first()).toHaveText('Ada');
+  // The buttons of the panel are those of the thread that is selected.
+  expect(await b.evaluate((given) => (window as any).__mounted.view.showComment(given), id)).toBe(true);
+  await expect(panel.locator('button[data-action="reply"]')).toHaveCount(1);
+  // Answered there, edited and resolved here: both pages hold the same.
+  expect(typeof (await b.evaluate((given) => (window as any).__mounted.view.replyToComment(given, 'Because.'), id))).toBe('number');
+  await expect.poll(() => commentsOf(a)).toHaveLength(2);
+  expect(await a.evaluate((given) => (window as any).__mounted.view.editComment(given, 'Why first, really?'), id)).toBe(true);
+  expect(await a.evaluate((given) => (window as any).__mounted.view.resolveComment(given, true), id)).toBe(true);
+  await settled(a);
+  await settled(b);
+  await expect.poll(async () => JSON.stringify(await commentsOf(a)) === JSON.stringify(await commentsOf(b)), { message: 'the pages agree' }).toBe(true);
+  const list = await commentsOf(b);
+  expect(list.map((c) => [c[1], c[2], c[4]])).toEqual([
+    ['Ada', 'Why first, really?', true],
+    ['Ben', 'Because.', true],
+  ]);
+  // Removed in the second page: gone from the first, and from its panel.
+  expect(await a.evaluate(() => (window as any).__mounted.view.setCommentsPanel(true))).toBe(true);
+  expect(await b.evaluate((given) => (window as any).__mounted.view.removeComment(given), id)).toBe(true);
+  await expect.poll(() => commentsOf(a)).toEqual([]);
+  await expect(a.locator('#editor .bym-doc-cpanel .bym-doc-cpanel-item')).toHaveCount(0);
+  expect(await notices(a)).toEqual(expect.not.arrayContaining([expect.stringMatching(/edited together/)]));
+  clean(b);
+});
+
+test('two pages that add a comment at the same time both keep theirs, under numbers both pages agree on', async ({ page, context, request }) => {
+  const { a, b } = await pair(context, page, request);
+  const add = (who: Page, row: number, said: string) =>
+    who.evaluate(
+      ([r, t]) => {
+        const view = (window as any).__mounted.view;
+        view.setSelection({ anchor: { story: 'body', path: [r], offset: 0 }, focus: { story: 'body', path: [r], offset: 5 } });
+        return view.addComment(t);
+      },
+      [row, said] as [number, string],
+    );
+  const made = await Promise.all([add(a, 0, 'from Ada'), add(b, 2, 'from Ben')]);
+  expect(made.every((one) => typeof one === 'number')).toBe(true);
+  await settled(a);
+  await settled(b);
+  await expect.poll(async () => JSON.stringify(await commentsOf(a)) === JSON.stringify(await commentsOf(b)), { message: 'the pages agree' }).toBe(true);
+  const list = await commentsOf(a);
+  expect(list.map((c) => c[2]).sort()).toEqual(['from Ada', 'from Ben']);
+  expect(new Set(list.map((c) => c[0])).size, 'two numbers').toBe(2);
+  clean(b);
+});
+
+test('a page that only reads lists the comments and offers nothing to change them', async ({ page, context, request }) => {
+  const { a, b } = await pair(context, page, request, { second: { readOnly: true } });
+  await a.evaluate(() => {
+    const view = (window as any).__mounted.view;
+    view.setSelection({ anchor: { story: 'body', path: [1], offset: 0 }, focus: { story: 'body', path: [1], offset: 6 } });
+    return view.addComment('seen by both');
+  });
+  await expect.poll(() => commentsOf(b)).toHaveLength(1);
+  expect(await b.evaluate(() => (window as any).__mounted.view.canComment)).toBe(false);
+  expect(await b.evaluate(() => (window as any).__mounted.view.setCommentsPanel(true))).toBe(true);
+  const panel = b.locator('#editor .bym-doc-cpanel');
+  await expect(panel.locator('.bym-doc-cpanel-item')).toHaveCount(1);
+  // Selected, the thread shows no buttons either.
+  const id = await b.evaluate(() => (window as any).__mounted.view.comments()[0].id);
+  expect(await b.evaluate((given) => (window as any).__mounted.view.showComment(given), id)).toBe(true);
+  await expect(panel.locator('button[data-action="reply"]')).toHaveCount(0);
+  await expect(panel.locator('button[data-action="delete"]')).toHaveCount(0);
   clean(b);
 });
 
@@ -290,4 +375,27 @@ test('saved to the same place: the file holds what both typed and says where the
   expect(await typeAt(a, 1, 0, 'later ')).toBe(true);
   await expect.poll(() => text(c), { message: 'the third page has what came after the save' }).toBe(await text(a));
   clean(b);
+});
+
+test('saved to the same place with comments: the file holds them, and who opens it joins with them and goes on commenting', async ({ page, context, request }) => {
+  const { a, url, room } = await pair(context, page, request, { saveTo: true });
+  const id = await a.evaluate(() => {
+    const view = (window as any).__mounted.view;
+    view.setSelection({ anchor: { story: 'body', path: [0], offset: 0 }, focus: { story: 'body', path: [0], offset: 5 } });
+    return view.addComment('kept in the file');
+  });
+  expect(typeof id).toBe('number');
+  await settled(a);
+  expect(await a.evaluate(() => (window as any).__mounted.saveNow())).toBe(true);
+  const stored = new Uint8Array(await (await request.get(url)).body());
+  const doc = await (await open(stored)).document!();
+  expect(Array.from(doc.comments ? doc.comments.items.values() : []).map((comment) => comment.author)).toEqual(['Ada']);
+  const c = await context.newPage();
+  await c.goto(PAGE);
+  expect(await mount(c, { file: url, room, via: 'tab', name: 'Cem' })).toBe('document');
+  await online(c);
+  expect(await commentsOf(c)).toEqual(await commentsOf(a));
+  expect(typeof (await c.evaluate((given) => (window as any).__mounted.view.replyToComment(given, 'from Cem'), id))).toBe('number');
+  await expect.poll(() => commentsOf(a)).toHaveLength(2);
+  expect(await commentsOf(a)).toEqual(await commentsOf(c));
 });

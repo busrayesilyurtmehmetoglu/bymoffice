@@ -19,10 +19,12 @@ import { deleteBackward, deleteForward, deleteRange, insertPageBreak, insertText
 import { WireError } from '../types';
 import type { XmlElement } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
+import { commentsForWriting } from '../../formats/docx/comments';
 import { bodyText, collectionText, createBodyContext, storyText } from '../../formats/docx/write-package';
 import { treeText, writeBlocks, type BodyContext } from '../../formats/docx/write-body';
 import { plainCopy, stable, xmlText } from '../wire';
-import type { DocWire, Mark, PutInline, PutParagraph, WirePos } from './rebase';
+import type { DocWire, Mark, PutInline, PutItem, PutParagraph, WirePos } from './rebase';
+import { MAX_STEP_COMMENTS, commentEdit, readComment, writeComment } from './comments';
 
 /** Most commands of one step. */
 export const MAX_STEP_WIRES = 64;
@@ -49,7 +51,7 @@ const fail = (what: string): never => {
 
 const isInt = (value: unknown, low: number, high: number): value is number => typeof value === 'number' && Math.floor(value) === value && value >= low && value <= high;
 
-function readPos(value: unknown): WirePos {
+export function readPos(value: unknown): WirePos {
   if (!Array.isArray(value) || (value.length !== 3 && value.length !== 4)) return fail('place');
   const [s, p, o, b] = value as unknown[];
   if (typeof s !== 'string' || s.length === 0 || s.length > 120 || !xmlText(s) || !/^(body|(header|footer|footnote|endnote):[^\s]{1,110})$/.test(s)) return fail('story');
@@ -112,7 +114,7 @@ export const COMMANDS: { [name: string]: Command } = {
  * wire is taken from (see PROTOCOL_VERSION). A kind of DocWire that is left out here is an error
  * of the type checker.
  */
-export const DOC_WIRE_KINDS: { readonly [K in DocWire['t']]: true } = { text: true, del: true, split: true, run: true, unrun: true, para: true, cmd: true, put: true };
+export const DOC_WIRE_KINDS: { readonly [K in DocWire['t']]: true } = { text: true, del: true, split: true, run: true, unrun: true, para: true, cmd: true, put: true, cmt: true };
 
 function readWire(value: unknown): DocWire {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return fail('operation');
@@ -155,6 +157,8 @@ function readWire(value: unknown): DocWire {
       const x = from.x.map(readPutParagraph);
       return { t: 'put', at, n: isInt(from.n, 1, MAX_PUT_PARAGRAPHS) ? from.n : fail('paragraphs'), x, h: from.h };
     }
+    case 'cmt':
+      return readComment(from);
   }
   return fail('operation');
 }
@@ -369,6 +373,9 @@ function attrsOf(value: unknown): [string, string][] | undefined {
   return out;
 }
 
+/** The number of a comment as a mark names it: digits as a file writes them, 0 to 2^31-1. */
+const commentNumber = (value: unknown): value is string => typeof value === 'string' && /^(0|[1-9][0-9]{0,9})$/.test(value) && Number(value) <= 2147483647;
+
 function inlineOf(value: unknown): PutInline | undefined {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const from = value as Record<string, unknown>;
@@ -382,14 +389,20 @@ function inlineOf(value: unknown): PutInline | undefined {
     if (mark.length === 2) return mark[0] === 1 ? { b: [1, mark[1]] } : undefined;
     return typeof mark[2] === 'string' && /^[A-Za-z0-9_.-]{1,40}$/.test(mark[2]) ? { b: [mark[0], mark[1], mark[2]] } : undefined;
   }
+  if (keys.length === 1 && keys[0] === 'k') {
+    // The start or the end of the range of a comment: its number, as a file writes it.
+    const mark = from.k;
+    return Array.isArray(mark) && mark.length === 2 && (mark[0] === 0 || mark[0] === 1) && commentNumber(mark[1]) ? { k: [mark[0], mark[1]] } : undefined;
+  }
   for (const key of keys) if (key !== 'p' && key !== 'a' && key !== 'c') return undefined;
   if (!Array.isArray(from.c) || from.c.length > 4096) return undefined;
-  const c: (string | [string, string] | number)[] = [];
+  const c: PutItem[] = [];
   const text = (item: unknown): item is string => typeof item === 'string' && item.length <= MAX_TEXT && xmlText(item) && !/[\t\n\r]/.test(item);
   for (const item of from.c) {
     if (isInt(item, 0, ITEMS.length - 1)) c.push(item);
     else if (text(item)) c.push(item);
     else if (Array.isArray(item) && item.length === 2 && text(item[0]) && text(item[1])) c.push([item[0], item[1]]);
+    else if (item !== null && typeof item === 'object' && !Array.isArray(item) && Object.keys(item).length === 1 && isInt((item as { r?: unknown }).r, 0, 2147483647)) c.push({ r: (item as { r: number }).r });
     else return undefined;
   }
   const out: PutInline = { c };
@@ -477,12 +490,21 @@ export function putOf(paragraph: Paragraph): PutParagraph | undefined {
       out.r.push(inline.name !== undefined ? { b: [inline.type === 'bookmarkStart' ? 0 : 1, inline.id, inline.name] } : { b: [inline.type === 'bookmarkStart' ? 0 : 1, inline.id] });
       continue;
     }
+    if (inline.type === 'commentRangeStart' || inline.type === 'commentRangeEnd') {
+      for (const key of Object.keys(all)) if (key !== 'type' && key !== 'id' && all[key] !== undefined) return undefined;
+      if (!commentNumber(inline.id)) return undefined;
+      out.r.push({ k: [inline.type === 'commentRangeStart' ? 0 : 1, inline.id] });
+      continue;
+    }
     if (inline.type !== 'run') return undefined;
     for (const key of Object.keys(all)) if (key !== 'type' && key !== 'props' && key !== 'content' && key !== 'attrs' && all[key] !== undefined) return undefined;
-    const c: (string | [string, string] | number)[] = [];
+    const c: PutItem[] = [];
     for (const item of inline.content) {
       const fields = item as unknown as Record<string, unknown>;
-      if (item.type === 'text') {
+      if (item.type === 'commentReference') {
+        for (const key of Object.keys(fields)) if (key !== 'type' && key !== 'id' && fields[key] !== undefined) return undefined;
+        c.push({ r: item.id });
+      } else if (item.type === 'text') {
         for (const key of Object.keys(fields)) if (key !== 'type' && key !== 'text' && key !== 'source' && fields[key] !== undefined) return undefined;
         c.push(item.source !== undefined ? [item.text, item.source] : item.text);
       } else {
@@ -530,7 +552,13 @@ export function paragraphOf(put: PutParagraph, doc?: DocModel): Paragraph {
       children.push(mark.length === 3 ? { type: mark[0] === 0 ? 'bookmarkStart' : 'bookmarkEnd', id: mark[1], name: mark[2] } : { type: mark[0] === 0 ? 'bookmarkStart' : 'bookmarkEnd', id: mark[1] });
       continue;
     }
-    const content: RunItem[] = inline.c.map((item): RunItem => (typeof item === 'number' ? ({ ...ITEMS[item] } as RunItem) : typeof item === 'string' ? { type: 'text', text: item } : { type: 'text', text: item[0], source: item[1] }));
+    if ('k' in inline) {
+      children.push({ type: inline.k[0] === 0 ? 'commentRangeStart' : 'commentRangeEnd', id: inline.k[1] });
+      continue;
+    }
+    const content: RunItem[] = inline.c.map((item): RunItem =>
+      typeof item === 'number' ? ({ ...ITEMS[item] } as RunItem) : typeof item === 'string' ? { type: 'text', text: item } : Array.isArray(item) ? { type: 'text', text: item[0], source: item[1] } : { type: 'commentReference', id: item.r },
+    );
     const run: Run = { type: 'run', props: inline.p ? runPropsOf(inline.p as PutRunFormat, doc) : EMPTY_RUN_PROPS, content };
     if (inline.a) run.attrs = inline.a.map((pair): [string, string] => [pair[0], pair[1]]);
     children.push(run);
@@ -590,7 +618,7 @@ export function putDigest(blocks: readonly Block[]): string {
 }
 
 /** FNV-1a of a text, in eight hex digits. */
-function hashOf(text: string): string {
+export function hashOf(text: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {
     hash ^= text.charCodeAt(i);
@@ -604,8 +632,15 @@ const MAX_CARET_TEXT = 1 << 20;
 
 const plainOf = (block: Block): string => (block.type === 'paragraph' ? paragraphText(block) : '');
 
-/** One thing that names itself in a document: a paragraph (by its id) or a bookmark (its start, with its name, or its end). */
-type Named = { kind: 'para'; id: string } | { kind: 'start'; id: string; name: string | undefined } | { kind: 'end'; id: string };
+/**
+ * One thing that names itself in a document: a paragraph (by its id) or a bookmark (its start,
+ * with its name, or its end); or the number of a comment that a comment or a mark of one carries
+ * (`cmt`: only told to those who ask for it, see namesOfDocument).
+ */
+type Named = { kind: 'para'; id: string } | { kind: 'start'; id: string; name: string | undefined } | { kind: 'end'; id: string } | { kind: 'cmt'; id: string };
+
+/** The elements whose `id` is the number of a comment. */
+const COMMENT_ELEMENTS: { [local: string]: true } = { comment: true, commentRangeStart: true, commentRangeEnd: true, commentReference: true };
 
 /** Where a thing that names itself stands: outside what a put replaces, in what it replaces, or in what it brings (see namesOfDocument). */
 export type NamedWhere = 'outside' | 'replaced' | 'put';
@@ -648,7 +683,7 @@ function namesInXml(text: string, reading: Reading): Named[] {
   let seen = new Set<string>();
   const add = (thing: Named): void => {
     if (alternate >= 0) {
-      const key = thing.kind === 'para' ? `p ${thing.id}` : thing.kind === 'end' ? `e ${bookmarkKey(thing.id)}` : `s ${bookmarkKey(thing.id)} ${thing.name}`;
+      const key = thing.kind === 'para' ? `p ${thing.id}` : thing.kind === 'end' ? `e ${bookmarkKey(thing.id)}` : thing.kind === 'cmt' ? `c ${thing.id}` : `s ${bookmarkKey(thing.id)} ${thing.name}`;
       if (seen.has(key)) return;
       seen.add(key);
     }
@@ -680,7 +715,7 @@ function namesInXml(text: string, reading: Reading): Named[] {
       if (name === 'bookmarkStart' || name === 'bookmarkEnd') {
         if (id === undefined) throw new RangeError('A bookmark of the document has no id');
         add(name === 'bookmarkStart' ? { kind: 'start', id, name: label } : { kind: 'end', id });
-      }
+      } else if (id !== undefined && COMMENT_ELEMENTS[name] === true) add({ kind: 'cmt', id });
       if (sc.selfClosing) {
         if (alternate >= 0 && depth === alternate) {
           alternate = -1;
@@ -725,10 +760,15 @@ function spanOk(source: string, start: number | undefined, end: number | undefin
  * writes it (the root, the last section, kept children, the background), headers, footers, notes,
  * comments. The tests read the saved file the same way (test/tools/package_check.py, named()).
  * `skip`: the blocks a put replaces; `put`: what it brings, said where the first of them stands.
- * Throws RangeError where the document cannot be read whole: what cannot be seen is not taken to
- * be free.
+ * `comment`: told the number of every comment and every mark of a comment the file will hold
+ * (the comments themselves, their ranges, their references), as the file writes it. Throws
+ * RangeError where the document cannot be read whole: what cannot be seen is not taken to be free.
  */
-export function namesOfDocument(doc: DocModel, skip: readonly Block[], visit: (thing: Named, where: NamedWhere) => void, put?: Named[], target?: string): void {
+export function namesOfDocument(doc: DocModel, skip: readonly Block[], see: (thing: Named, where: NamedWhere) => void, put?: Named[], target?: string, comment?: (id: string) => void): void {
+  const visit = (thing: Named, where: NamedWhere): void => {
+    if (thing.kind !== 'cmt') see(thing, where);
+    else if (comment) comment(thing.id);
+  };
   const fail = (error: unknown): never => {
     if (error instanceof RangeError) throw error;
     throw new RangeError('The document cannot be written to be read for what it names');
@@ -850,12 +890,30 @@ export function namesOfDocument(doc: DocModel, skip: readonly Block[], visit: (t
     if (asRead(collection, target !== undefined && target.indexOf(`${local}:`) === 0)) continue;
     const reading: Reading = { tokens: 0 };
     const ctx = contextOf(collection);
-    const items = collection.items as Map<number, Note | Comment>;
+    // A comment is written with the paragraph id it is known by on its last paragraph (see commentsForWriting).
+    const items = local === 'comment' ? commentsAsWritten(collection as StoryCollection<Comment>) : (collection.items as Map<number, Note | Comment>);
     items.forEach((item) => blocks(ctx, item.blocks, collection.source, reading));
     const empty = new Map<number, Note | Comment>();
     items.forEach((item, id) => empty.set(id, { ...item, blocks: [] }));
     shell(() => collectionText(ctx, { ...collection, items: empty } as StoryCollection<Note>, local, { regenerate: true, root: { name: ctx.w + local + 's', attrs: collection.rootAttrs } }), reading);
   }
+}
+
+/** Each comment as the writer writes it, kept while the comment object lives (comments are not changed, but made anew). */
+const writtenComments = new WeakMap<Comment, Comment>();
+
+function commentsAsWritten(collection: StoryCollection<Comment>): Map<number, Comment> {
+  const out = new Map<number, Comment>();
+  collection.items.forEach((comment, id) => {
+    let written = writtenComments.get(comment);
+    if (!written) {
+      const one = commentsForWriting({ ...collection, items: new Map([[id, comment]]) });
+      written = one.items.get(id) as Comment;
+      writtenComments.set(comment, written);
+    }
+    out.set(id, written);
+  });
+  return out;
 }
 
 /** What a put brings that names itself, and the attributes it brings (name=value). */
@@ -904,7 +962,7 @@ function checkNames(doc: DocModel, wire: Extract<DocWire, { t: 'put' }>, list: n
   const before = new Tally();
   const after = new Tally();
   const carried = new Set<string>();
-  const keys = (thing: Named): string[] => (thing.kind === 'para' ? [`p:${thing.id}`] : thing.kind === 'end' ? [`e:${bookmarkKey(thing.id)}`] : thing.name !== undefined ? [`s:${bookmarkKey(thing.id)}`, `n:${thing.name.toLowerCase()}`] : [`s:${bookmarkKey(thing.id)}`]);
+  const keys = (thing: Named): string[] => (thing.kind === 'para' ? [`p:${thing.id}`] : thing.kind === 'end' ? [`e:${bookmarkKey(thing.id)}`] : thing.kind === 'cmt' ? [] : thing.name !== undefined ? [`s:${bookmarkKey(thing.id)}`, `n:${thing.name.toLowerCase()}`] : [`s:${bookmarkKey(thing.id)}`]);
   const brought = namedIn(wire.x);
   /** The bookmarks in document order, before the put and after it. */
   const orderBefore: string[] = [];
@@ -960,7 +1018,7 @@ const MAX_STORY_CHARS = MAX_STORY_CHARS_LIMIT;
 
 function putLength(item: PutParagraph): number {
   let length = 0;
-  for (const inline of item.r) if ('c' in inline) for (const piece of inline.c) length += typeof piece === 'number' ? 1 : typeof piece === 'string' ? piece.length : piece[0].length;
+  for (const inline of item.r) if ('c' in inline) for (const piece of inline.c) length += typeof piece === 'number' ? 1 : typeof piece === 'string' ? piece.length : Array.isArray(piece) ? piece[0].length : 0;
   return length;
 }
 
@@ -993,7 +1051,7 @@ function countCells(blocks: readonly Block[], budget: { left: number }, depth = 
 }
 
 /** Refuses a command that would make a list or the tables of a story larger than a document is taken to be: everybody finds the same, on the same document. */
-function withinBudget(doc: DocModel, wire: Exclude<DocWire, { t: 'put' }> | Extract<DocWire, { t: 'put' }>): void {
+function withinBudget(doc: DocModel, wire: Exclude<DocWire, { t: 'cmt' }>): void {
   const grows = wire.t === 'put' ? wire.x.length : wire.t === 'text' ? wire.x.split('\n').length - 1 : wire.t === 'split' ? 1 : wire.t === 'cmd' && wire.name === 'insertTable' ? 2 : wire.t === 'cmd' && wire.name === 'insertPageBreak' ? 1 : 0;
   if (grows > 0) {
     let length = 0;
@@ -1054,6 +1112,27 @@ function putEdit(doc: DocModel, wire: Extract<DocWire, { t: 'put' }>): DocEdit {
   if (putDigest(blocks.slice(row, row + wire.n)) !== wire.h) throw new RangeError('The paragraphs to replace are not the ones the step was made for');
   // What names one thing names it once in the document.
   checkNames(doc, wire, c, row);
+  // The marks of comments a put brings are the very marks of the blocks it replaces, in the same order: no comment gets a mark it
+  // did not have, none loses one, none comes to stand before another it stood behind (a range that ends before it begins, two
+  // ranges that cross, two comments that swap their numbers). Which paragraph a mark stands in is not asked: undoing an Enter
+  // or a join brings the same marks back in other paragraphs.
+  const marks = (list: readonly Block[]): string => {
+    const out: string[] = [];
+    const walk = (blocks: readonly Block[], depth: number): void => {
+      for (const block of blocks) {
+        if (block.type === 'paragraph') {
+          for (const inline of block.children) {
+            if (inline.type === 'commentRangeStart' || inline.type === 'commentRangeEnd') out.push(`${inline.type} ${inline.id}`);
+            else if (inline.type === 'run') for (const item of inline.content) if (item.type === 'commentReference') out.push(`commentReference ${item.id}`);
+          }
+        } else if (block.type === 'table' && depth < 32) for (const r of block.rows) for (const cell of r.cells) walk(cell.blocks, depth + 1);
+      }
+    };
+    walk(list, 0);
+    return out.join('|');
+  };
+  const bringsMarks = (wire.x as PutParagraph[]).map((item) => paragraphOf(item));
+  if (marks(bringsMarks) !== marks(blocks.slice(row, row + wire.n))) throw new RangeError('The paragraphs to put back hold other marks of comments than the ones they replace');
   for (const item of wire.x) {
     const paragraph = paragraphOf(item, doc);
     const attrs: AttrList[] = [paragraph.attrs || []];
@@ -1075,6 +1154,8 @@ export function decodeStep(raw: unknown): DocWire[] {
   // (And few puts: each one reads the whole document for what it names. A composition is undone by one: see joinedPuts.)
   let paragraphs = 0;
   let puts = 0;
+  // And few commands of comments: each reads the whole document as well.
+  if (wires.filter((wire) => wire.t === 'cmt').length > MAX_STEP_COMMENTS) return fail('step');
   for (const wire of wires) {
     if (wire.t !== 'put') continue;
     puts++;
@@ -1091,17 +1172,19 @@ export const MAX_STEP_PUTS = 16;
 /** The commands of a step as they go to the relay. */
 export function encodeStep(wires: readonly DocWire[]): unknown[] {
   return wires.map((wire) => {
+    if (wire.t === 'cmt') return writeComment(wire);
     const out: Record<string, unknown> = { ...wire, at: writePos(wire.at) };
     if ('to' in wire && wire.to !== undefined) out.to = writePos(wire.to);
     return out;
   });
 }
 
-const toPosition = (pos: WirePos): DocPosition => (pos.b ? { story: pos.s, path: pos.p.slice(), offset: pos.o, before: true } : { story: pos.s, path: pos.p.slice(), offset: pos.o });
+export const toPosition = (pos: WirePos): DocPosition => (pos.b ? { story: pos.s, path: pos.p.slice(), offset: pos.o, before: true } : { story: pos.s, path: pos.p.slice(), offset: pos.o });
 export const toWirePos = (pos: DocPosition): WirePos => (pos.before ? { s: pos.story, p: pos.path.slice(), o: pos.offset, b: true } : { s: pos.story, p: pos.path.slice(), o: pos.offset });
 
 /** What a command would do to the document: its operations. Throws RangeError for a command the document does not take. */
 export function runWire(doc: DocModel, wire: DocWire): DocEdit {
+  if (wire.t === 'cmt') return commentEdit(doc, wire);
   withinBudget(doc, wire);
   if (wire.t === 'put') return putEdit(doc, wire);
   const at = toPosition(wire.at);
@@ -1154,6 +1237,8 @@ export interface Before {
 
 /** Looks at the document before a command is applied. Undefined for a command about a place the document does not have (applying it will say so). */
 export function lookBefore(doc: DocModel, wire: DocWire): Before | undefined {
+  // A command of comments says what it did itself (see commentMarks).
+  if (wire.t === 'cmt') return undefined;
   let a = wire.at;
   let b = 'to' in wire && wire.to !== undefined ? wire.to : wire.at;
   // The blocks a `put` replaces: the last of them is its other end.
@@ -1252,7 +1337,7 @@ export function marksAfter(doc: DocModel, before: Before | undefined, story: str
  */
 export function inverseOf(doc: DocModel, wire: DocWire, before: Before | undefined, marks: readonly Mark[], ops: readonly DocOp[]): DocWire[] | null {
   if (ops.length === 0) return [];
-  if (!before) return null;
+  if (!before || wire.t === 'cmt') return null;
   for (const op of ops) if (op.type !== 'replaceBlocks' || op.story !== before.s) return null;
   const { s, c, r1, r2 } = before;
   const first = marks[0];
