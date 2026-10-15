@@ -9,7 +9,9 @@
 
 import { formatValue } from '../../format/number-format';
 import {
+  chargeText,
   ERROR_NA,
+  ERROR_NUM,
   ERROR_VALUE,
   isError,
   numberSeparators,
@@ -21,14 +23,21 @@ import {
   type CalcFunction,
   type FunctionSpec,
   type Scalar,
+  type Value,
 } from '../values';
 import {
+  clean,
   compilePattern,
   eachScalar,
+  ERROR_CALC,
+  first,
   foldCase,
   hasWildcard,
   mapScalars,
+  MAX_ARRAY_CELLS,
   MAX_TEXT_LENGTH,
+  single,
+  toArray,
   parseNumberText,
   patternSearch,
   roundTo,
@@ -528,61 +537,348 @@ const numberValue = mapScalars((args, context) => {
   return local === undefined || source.indexOf(local.decimal) < 0 ? number : readNumberValue(source, local.decimal, local.group);
 });
 
+// ---------------------------------------------------------------------------
+// TEXTBEFORE, TEXTAFTER and TEXTSPLIT: text cut at delimiters, of which there may be several
+// (an array constant, a range). Where two of them are found at the same place the longer one
+// is taken (UNSURE: not checked against Excel).
+
+/** Most delimiters one argument may give, those spelled alike counted once. */
+const MAX_DELIMITERS = 1024;
+
+/** The delimiters an argument gives: a text, or an array or range of them; none when it is left empty. */
+function delimiterList(value: Value | undefined, context: CalcContext): string[] | CalcError {
+  if (value === undefined || value === null) return [];
+  const list = toArray(value, context);
+  if (isError(list)) return list;
+  const count = list.rows * list.cols;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < count; i++) {
+    const text = toText(clean(list.data[i]));
+    if (typeof text !== 'string') return text;
+    if (seen.has(text)) continue;
+    if (seen.size >= MAX_DELIMITERS) return ERROR_VALUE;
+    seen.add(text);
+    out.push(text);
+  }
+  return out;
+}
+
+interface Found {
+  start: number;
+  end: number;
+  /** Which delimiter, by its place in the list the index was made with. */
+  which: number;
+}
+
+/**
+ * Delimiters looked up by their first character: for each first character the delimiters that
+ * begin with it, the longest first (and of those as long, the preferred first). Made once for a
+ * call, whatever number of texts it is applied to.
+ */
+class Delimiters {
+  readonly byFirst = new Map<number, number[]>();
+  /** A delimiter of no characters is among them. */
+  readonly empty: boolean;
+
+  constructor(
+    readonly texts: readonly string[],
+    /** Of two found at the same place and as long, the one this prefers (a row delimiter of TEXTSPLIT). */
+    preferred?: (which: number) => boolean,
+  ) {
+    this.empty = texts.indexOf('') >= 0;
+    for (let k = 0; k < texts.length; k++) {
+      if (texts[k] === '') continue;
+      const code = texts[k].charCodeAt(0);
+      const list = this.byFirst.get(code);
+      if (list) list.push(k);
+      else this.byFirst.set(code, [k]);
+    }
+    const rank = (k: number) => (preferred && preferred(k) ? 0 : 1);
+    this.byFirst.forEach((list) => list.sort((a, b) => texts[b].length - texts[a].length || rank(a) - rank(b) || a - b));
+  }
+}
+
+/** Units of work counted before they are handed to the budget of the calculation. */
+const WORK_BATCH = 256;
+
+/**
+ * Finds delimiters in a text one after another, forwards or backwards. One delimiter is searched
+ * for by the engine's own search; several are found by walking the text once, looking at each
+ * place only at the delimiters that begin with its character, so the work grows with the length
+ * of the text and with how many delimiters share a first character, not with the number of
+ * delimiters times the number of pieces. What it does is counted in the budget of the
+ * calculation (CalcContext.tick), so that a call with much to do is cut off by it.
+ */
+class Matcher {
+  private work = 0;
+
+  constructor(
+    private readonly subject: string,
+    private readonly delimiters: Delimiters,
+    private readonly context: CalcContext,
+  ) {}
+
+  private spend(units: number): void {
+    this.work += units;
+    if (this.work >= WORK_BATCH) {
+      if (this.context.tick !== undefined) this.context.tick(this.work);
+      this.work = 0;
+    }
+  }
+
+  /** The first delimiter that starts at `from` or after it. */
+  next(from: number): Found | undefined {
+    const subject = this.subject;
+    const texts = this.delimiters.texts;
+    const n = subject.length;
+    if (texts.length === 1) {
+      const at = subject.indexOf(texts[0], from);
+      this.spend(1 + (((at < 0 ? n : at) - from) >> 6));
+      return at < 0 ? undefined : { start: at, end: at + texts[0].length, which: 0 };
+    }
+    const byFirst = this.delimiters.byFirst;
+    let looked = 0;
+    for (let i = from; i < n; i++) {
+      looked++;
+      const list = byFirst.get(subject.charCodeAt(i));
+      if (list !== undefined) {
+        for (let j = 0; j < list.length; j++) {
+          const delimiter = texts[list[j]];
+          looked += 1 + (delimiter.length >> 4);
+          if (i + delimiter.length <= n && subject.startsWith(delimiter, i)) {
+            this.spend(looked);
+            return { start: i, end: i + delimiter.length, which: list[j] };
+          }
+        }
+      }
+      if (looked >= WORK_BATCH) {
+        this.spend(looked);
+        looked = 0;
+      }
+    }
+    this.spend(looked);
+    return undefined;
+  }
+
+  /** The last delimiter that ends at `limit` or before it. */
+  previous(limit: number): Found | undefined {
+    const subject = this.subject;
+    const texts = this.delimiters.texts;
+    if (texts.length === 1) {
+      const length = texts[0].length;
+      const at = limit - length < 0 ? -1 : subject.lastIndexOf(texts[0], limit - length);
+      this.spend(1 + ((limit - (at < 0 ? 0 : at)) >> 6));
+      return at < 0 ? undefined : { start: at, end: at + length, which: 0 };
+    }
+    const byFirst = this.delimiters.byFirst;
+    let looked = 0;
+    for (let i = limit - 1; i >= 0; i--) {
+      looked++;
+      const list = byFirst.get(subject.charCodeAt(i));
+      if (list !== undefined) {
+        for (let j = 0; j < list.length; j++) {
+          const delimiter = texts[list[j]];
+          looked += 1 + (delimiter.length >> 4);
+          if (i + delimiter.length <= limit && subject.startsWith(delimiter, i)) {
+            this.spend(looked);
+            return { start: i, end: i + delimiter.length, which: list[j] };
+          }
+        }
+      }
+      if (looked >= WORK_BATCH) {
+        this.spend(looked);
+        looked = 0;
+      }
+    }
+    this.spend(looked);
+    return undefined;
+  }
+
+  /** Hands what is left of the work counted to the budget. */
+  done(): void {
+    if (this.work > 0 && this.context.tick !== undefined) this.context.tick(this.work);
+    this.work = 0;
+  }
+}
+
 /** Where the n-th delimiter is: its start and end, or undefined. Negative n counts from the end. */
 function locate(
   subject: string,
-  delimiter: string,
+  delimiters: Delimiters,
   instance: number,
   matchEnd: boolean,
+  context: CalcContext,
 ): { start: number; end: number } | undefined {
   const length = subject.length;
-  if (delimiter === '') return instance > 0 ? { start: 0, end: 0 } : { start: length, end: length };
+  // A delimiter of no characters is found at once.
+  if (delimiters.empty) return instance > 0 ? { start: 0, end: 0 } : { start: length, end: length };
+  const matcher = new Matcher(subject, delimiters, context);
   let seen = 0;
+  let found: Found | undefined;
   if (instance > 0) {
     let at = 0;
     for (;;) {
-      const found = subject.indexOf(delimiter, at);
-      if (found < 0) break;
-      if (++seen === instance) return { start: found, end: found + delimiter.length };
-      at = found + delimiter.length;
+      found = matcher.next(at);
+      if (!found || ++seen === instance) break;
+      at = found.end;
     }
+    matcher.done();
+    if (found) return found;
     // With match_end the end of the text stands in for one more delimiter.
     return matchEnd && seen === instance - 1 ? { start: length, end: length } : undefined;
   }
-  let at = length - delimiter.length;
-  while (at >= 0) {
-    const found = subject.lastIndexOf(delimiter, at);
-    if (found < 0) break;
-    if (++seen === -instance) return { start: found, end: found + delimiter.length };
-    at = found - delimiter.length;
+  let limit = length;
+  for (;;) {
+    found = matcher.previous(limit);
+    if (!found || ++seen === -instance) break;
+    limit = found.start;
   }
+  matcher.done();
+  if (found) return found;
   return matchEnd && seen === -instance - 1 ? { start: 0, end: 0 } : undefined;
 }
 
+/** TEXTBEFORE and TEXTAFTER: applied to each text (and each instance, mode ...) of arrays; the delimiters are one list. */
 function around(after: boolean): CalcFunction {
-  return mapScalars((args, context) => {
-    const subject = toText(args[0]);
-    if (typeof subject !== 'string') return subject;
-    const delimiter = toText(args[1]);
-    if (typeof delimiter !== 'string') return delimiter;
-    const instance = args.length > 2 && args[2] !== null ? integer(args, 2, 1, context) : 1;
-    if (typeof instance !== 'number') return instance;
-    const mode = args.length > 3 ? integer(args, 3, 0, context) : 0;
-    if (typeof mode !== 'number') return mode;
-    const matchEnd = args.length > 4 ? integer(args, 4, 0, context) : 0;
-    if (typeof matchEnd !== 'number') return matchEnd;
-    if (instance === 0 || Math.abs(instance) > subject.length || mode < 0 || mode > 1) return ERROR_VALUE;
-    const insensitive = mode === 1;
-    const place = locate(
-      insensitive ? foldCase(subject) : subject,
-      insensitive ? foldCase(delimiter) : delimiter,
-      instance,
-      matchEnd !== 0,
-    );
-    if (place === undefined) return args.length > 5 ? args[5] : ERROR_NA;
-    return after ? subject.substring(place.end) : subject.substring(0, place.start);
-  });
+  return (args, context) => {
+    // A delimiter left empty is the text of no characters, as an empty cell is. UNSURE: Excel not checked.
+    const given = args[1] === null ? [''] : delimiterList(args[1], context);
+    if (isError(given)) return given;
+    if (given.length === 0) return ERROR_VALUE;
+    const exact = new Delimiters(given);
+    let folded: Delimiters | undefined;
+    const rest = args.slice();
+    rest[1] = null;
+    // Made for each call, so that what it closes over belongs to this call alone.
+    const lifted = mapScalars((values, context) => {
+      const subject = toText(values[0]);
+      if (typeof subject !== 'string') return subject;
+      const instance = values.length > 2 && values[2] !== null ? integer(values, 2, 1, context) : 1;
+      if (typeof instance !== 'number') return instance;
+      const mode = values.length > 3 ? integer(values, 3, 0, context) : 0;
+      if (typeof mode !== 'number') return mode;
+      const matchEnd = values.length > 4 ? integer(values, 4, 0, context) : 0;
+      if (typeof matchEnd !== 'number') return matchEnd;
+      if (instance === 0 || Math.abs(instance) > subject.length || mode < 0 || mode > 1) return ERROR_VALUE;
+      const insensitive = mode === 1;
+      if (insensitive && !folded) folded = new Delimiters(given.map(foldCase));
+      const place = locate(insensitive ? foldCase(subject) : subject, insensitive ? (folded as Delimiters) : exact, instance, matchEnd !== 0, context);
+      if (place === undefined) return values.length > 5 ? values[5] : ERROR_NA;
+      return after ? subject.substring(place.end) : subject.substring(0, place.start);
+    });
+    return lifted(rest, context);
+  };
 }
+
+/**
+ * The rows of a text split at row delimiters, each split at column delimiters; #VALUE! when the
+ * pieces are too much text. With `firstOnly` the search stops at the first piece kept: a single
+ * row of it (no row when no piece is kept).
+ */
+function splitText(
+  subject: string,
+  delimiters: Delimiters,
+  rowDelimiters: number,
+  insensitive: boolean,
+  ignoreEmpty: boolean,
+  firstOnly: boolean,
+  context: CalcContext,
+): string[][] | CalcError {
+  // The row delimiters come first in the list.
+  const matcher = new Matcher(insensitive ? foldCase(subject) : subject, delimiters, context);
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let at = 0;
+  for (;;) {
+    const found = matcher.next(at);
+    const piece = subject.substring(at, found ? found.start : subject.length);
+    if (!(ignoreEmpty && piece === '')) {
+      if (!chargeText(piece)) {
+        matcher.done();
+        return ERROR_VALUE;
+      }
+      row.push(piece);
+      if (firstOnly) {
+        rows.push(row);
+        break;
+      }
+    }
+    if (!found || found.which < rowDelimiters) {
+      if (!(ignoreEmpty && row.length === 0)) rows.push(row);
+      row = [];
+    }
+    if (!found) break;
+    // Every delimiter has characters: the search moves on.
+    at = found.end;
+  }
+  matcher.done();
+  return rows;
+}
+
+/** TEXTSPLIT(text, col_delimiter, [row_delimiter], [ignore_empty], [match_mode], [pad_with]). */
+const textSplit: CalcFunction = (args, context) => {
+  const columns = delimiterList(args[1], context);
+  if (isError(columns)) return columns;
+  const lines = delimiterList(args.length > 2 ? args[2] : undefined, context);
+  if (isError(lines)) return lines;
+  let ignoreEmpty: boolean | CalcError = false;
+  if (args.length > 3 && args[3] !== null) {
+    const value = single(args[3], context);
+    ignoreEmpty = value === undefined ? ERROR_VALUE : toBoolean(value);
+  }
+  if (typeof ignoreEmpty !== 'boolean') return ignoreEmpty;
+  let mode = 0;
+  if (args.length > 4 && args[4] !== null) {
+    const value = single(args[4], context);
+    const number = value === undefined ? ERROR_VALUE : integer([value], 0, 0, context);
+    if (typeof number !== 'number') return number;
+    mode = number;
+  }
+  if (mode !== 0 && mode !== 1) return ERROR_VALUE;
+  const pad: Scalar = args.length > 5 ? first(args[5], context) : ERROR_NA;
+  // A delimiter of no characters splits nothing. UNSURE: what Excel does with one was not checked.
+  const fold = (text: string) => (mode === 1 ? foldCase(text) : text);
+  const rowList = lines.filter((text) => text !== '').map(fold);
+  const columnList = columns.filter((text) => text !== '').map(fold);
+  if (rowList.length + columnList.length === 0) return ERROR_VALUE;
+  const rowCount = rowList.length;
+  const delimiters = new Delimiters(rowList.concat(columnList), (which) => which < rowCount);
+  const ignoring = ignoreEmpty;
+  const split = (value: Scalar, firstOnly: boolean): string[][] | CalcError => {
+    const subject = toText(value);
+    if (typeof subject !== 'string') return subject;
+    return splitText(subject, delimiters, rowCount, mode === 1, ignoring, firstOnly, context);
+  };
+  const one = single(args[0], context);
+  if (one !== undefined) {
+    const rows = split(one, false);
+    if (isError(rows)) return rows;
+    if (rows.length === 0) return ERROR_CALC;
+    let cols = 0;
+    for (const row of rows) if (row.length > cols) cols = row.length;
+    if (!(rows.length * cols <= MAX_ARRAY_CELLS)) return ERROR_NUM;
+    const data: Scalar[] = new Array(rows.length * cols);
+    for (let r = 0; r < rows.length; r++) {
+      const row = rows[r];
+      for (let c = 0; c < cols; c++) data[r * cols + c] = c < row.length ? row[c] : pad;
+    }
+    return { rows: rows.length, cols, data };
+  }
+  // Several texts: each gives the first of its pieces, as an array of arrays does in Excel. UNSURE.
+  const texts = toArray(args[0], context);
+  if (isError(texts)) return texts;
+  const size = texts.rows * texts.cols;
+  const data: Scalar[] = new Array(size);
+  for (let i = 0; i < size; i++) {
+    const rows = split(clean(texts.data[i]), true);
+    data[i] = isError(rows) ? rows : rows.length === 0 ? ERROR_CALC : rows[0].length > 0 ? rows[0][0] : pad;
+  }
+  return { rows: texts.rows, cols: texts.cols, data };
+};
+
+const delimiterArg = (index: number) => index === 1;
+const notDelimiter = (index: number) => index !== 1;
 
 export const TEXT_FUNCTIONS: { [name: string]: FunctionSpec } = {
   CONCATENATE: spec(concatenate, 1),
@@ -612,6 +908,7 @@ export const TEXT_FUNCTIONS: { [name: string]: FunctionSpec } = {
   UNICHAR: spec(unichar, 1, 1),
   UNICODE: spec(unicode, 1, 1),
   NUMBERVALUE: spec(numberValue, 1, 3),
-  TEXTBEFORE: spec(around(false), 2, 6),
-  TEXTAFTER: spec(around(true), 2, 6),
+  TEXTBEFORE: { call: around(false), min: 2, max: 6, arrayArgs: delimiterArg, scalarArgs: notDelimiter },
+  TEXTAFTER: { call: around(true), min: 2, max: 6, arrayArgs: delimiterArg, scalarArgs: notDelimiter },
+  TEXTSPLIT: { call: textSplit, min: 2, max: 6, arrayArgs: (index) => index <= 2, scalarArgs: (index) => index >= 3 },
 };

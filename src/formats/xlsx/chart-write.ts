@@ -1298,6 +1298,27 @@ export function chartAnchorXml(anchor: DrawingAnchor, relId: string, shapeId: nu
   );
 }
 
+/**
+ * The anchor of a picture in a drawing part: the picture names its bytes by a relationship of the
+ * part (`relId`). Its aspect is locked, as Excel locks it for a picture it adds. `box` is where it
+ * stands on the sheet in EMU, for the transform of the picture (an application places it by the
+ * anchor). `strict`: for a part of the strict flavour of the format.
+ */
+export function pictureAnchorXml(anchor: DrawingAnchor, relId: string, shapeId: number, name: string, description?: string, strict = false, box?: { x: number; y: number; width: number; height: number }): string {
+  const place = placeXml(anchor);
+  const editAs = place.name === 'twoCellAnchor' && anchor.editAs && anchor.editAs !== 'twoCell' ? ` editAs="${anchor.editAs}"` : '';
+  const described = description !== undefined && description !== '' ? ` descr="${attr(description)}"` : '';
+  const emu = (value: number | undefined): number => (typeof value === 'number' && value > 0 && value < 2e12 ? Math.round(value) : 0);
+  const at = box || { x: 0, y: 0, width: 0, height: 0 };
+  return (
+    `<xdr:${place.name}${editAs}>${place.inner}` +
+    `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${shapeId}" name="${attr(name)}"${described}/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>` +
+    `<xdr:blipFill><a:blip xmlns:r="${strict ? STRICT_R : NS_R}" r:embed="${attr(relId)}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
+    `<xdr:spPr><a:xfrm><a:off x="${emu(at.x)}" y="${emu(at.y)}"/><a:ext cx="${emu(at.width)}" cy="${emu(at.height)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>` +
+    `</xdr:pic><xdr:clientData/></xdr:${place.name}>`
+  );
+}
+
 /** A drawing part that holds the given anchors and nothing else. */
 export function drawingPartXml(anchors: string[], strict = false): string {
   return `${DECLARATION}<xdr:wsDr xmlns:xdr="${strict ? STRICT_XDR : NS_XDR}" xmlns:a="${strict ? STRICT_A : NS_A}">${anchors.join('')}</xdr:wsDr>`;
@@ -1353,7 +1374,7 @@ export interface DrawingPartEdit {
    * that one, and keeps everything of it but its place, its id, its name, its relationship and
    * the macro it is assigned.
    */
-  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string }[];
+  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string; picture?: { box?: { x: number; y: number; width: number; height: number } } }[];
 }
 
 /** The <c:chart r:id> of a frame: the element that names the chart part, and the name of the attribute that does. */
@@ -1537,6 +1558,7 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
       ids(root, 0);
       const added: XmlNode[] = edit.added.map((item) => {
         const id = ++top;
+        if (item.picture) return made(root, pictureAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict, item.picture.box));
         return (item.from !== undefined ? copiedAnchor(root, item, id) : undefined) || made(root, chartAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict));
       });
       root.children = root.children.concat(added);

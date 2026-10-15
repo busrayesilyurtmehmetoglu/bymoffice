@@ -46,7 +46,16 @@ interface Limits {
   workbookSpillCells?: number;
   /** The session's engine works in slices of a tiny budget (a clock of its own): the result must not depend on them. */
   sliced?: boolean;
+  /** What is typed; INPUTS when not given (the seeds of the tests below were found with them). */
+  inputs?: string[];
 }
+
+/** INPUTS and the functions that shape arrays and split text. */
+const SHAPE_INPUTS = INPUTS.concat([
+  '=VSTACK(A1:A3,B1:B2)', '=HSTACK(A1:A2,B1:B3)', '=TAKE(A1:A9,2)', '=DROP(A1:A9,-6)', '=TOCOL(A1:B4,1)', '=TOROW(A1:A4,3)',
+  '=CHOOSEROWS(A1:B9,1,-1)', '=EXPAND(A1:A2,3,2,0)', '=WRAPROWS(TOCOL(A1:A6,1),2)', '=TEXTSPLIT(A1&",x;y",",",";")',
+  '=SUM(TAKE(B1#,1))', '=VSTACK(A1#,1)',
+]);
 
 /** What a sheet holds, cell by cell: value, kind, spill mark, formula and its `ref`. */
 function snapshot(sheet: Sheet): string[] {
@@ -129,9 +138,10 @@ async function run(seed: number, steps: number, limits: Limits): Promise<void> {
     const what = next();
     const row = Math.floor(next() * ROWS);
     const col = Math.floor(next() * COLS);
+    const unchanged = snapshot(workbook.sheets[0]);
     try {
       if (what < 0.55) {
-        const text = pick(INPUTS);
+        const text = pick(limits.inputs || INPUTS);
         log.push(`type R${row + 1}C${col + 1} ${text}`);
         apply(setCellInput(workbook, 0, row, col, text), { cells: [{ sheet: 0, row, col }], structural: false });
       } else if (what < 0.62) {
@@ -174,9 +184,9 @@ async function run(seed: number, steps: number, limits: Limits): Promise<void> {
         finish();
       }
     } catch (error) {
-      // An edit the engine refuses (through a spill, a merged cell…) changes nothing.
+      // An edit the engine refuses (through a spill, a merged cell…) changes nothing: what follows checks that too.
       log.push(`  refused: ${(error as Error).message}`);
-      continue;
+      assert.deepEqual(snapshot(workbook.sheets[0]), unchanged, `seed ${seed}: a refused edit changed the workbook, after:\n${log.join('\n')}`);
     }
     assert.equal(engine.incomplete, false, `seed ${seed} does not finish, after:\n${log.join('\n')}`);
     const session = snapshot(workbook.sheets[0]);
@@ -198,6 +208,19 @@ test('the same with a recalculation cut into slices of a tiny budget: what it le
   for (let seed = 3001; seed <= 3050; seed++) await run(seed, 40, { sliced: true, spillCells: 6, workbookSpillCells: 10 });
 });
 
+test('the same with VSTACK, TAKE, TOCOL, TEXTSPLIT and the rest typed among the other formulas, in all four ways', async () => {
+  const ways: Limits[] = [{}, { spillCells: 6, workbookSpillCells: 10 }, { sliced: true }, { sliced: true, spillCells: 6, workbookSpillCells: 10 }];
+  for (let seed = 7001; seed <= 7060; seed++) for (const limits of ways) await run(seed, 40, { ...limits, inputs: SHAPE_INPUTS });
+});
+
+// Seed 7009 once left E6 #SPILL! in the session where a workbook built afresh spilled it: a formula the saved file had
+// as circular through its spill (A1: =B1:C1, put back as circular when the file was opened) still took the cells it
+// would spill into from the budget of all spills, though it fills nothing. Not the refused insertion before it, which
+// leaves nothing behind (checked after every step since). See also test/calc-dynamic.test.ts.
+test('a formula put back as circular from the file takes nothing of the budget of spills (seed 7009)', async () => {
+  for (const sliced of [false, true]) await run(7009, 40, { sliced, spillCells: 6, workbookSpillCells: 10, inputs: SHAPE_INPUTS });
+});
+
 test('seeds that once left a session apart from a workbook built afresh, in all four ways (a stale list of spills, a cell two spills were over, a circle the file was saved with)', async () => {
   const ways: Limits[] = [{}, { spillCells: 6, workbookSpillCells: 10 }, { sliced: true }, { sliced: true, spillCells: 6, workbookSpillCells: 10 }];
   for (const seed of [4092, 4335, 4409, 5409, 5775]) for (const limits of ways) await run(seed, 50, limits);
@@ -209,6 +232,24 @@ test('seeds that once left a session apart from a workbook built afresh, in all 
 test('seeds a circle through spills still leaves apart when its partner changes (open)', { todo: 'E3 is open' }, async () => {
   const ways: Limits[] = [{}, { spillCells: 6, workbookSpillCells: 10 }, { sliced: true }, { sliced: true, spillCells: 6, workbookSpillCells: 10 }];
   for (const seed of [4196, 6167, 6225]) for (const limits of ways) await run(seed, 50, limits);
+});
+
+// Found by a wider search (seeds 7061 to 7460, all four ways, 40 steps) after seed 7009 was fixed: the same class, conflicts
+// of spills and their budget that settle on another of two stable answers. 7128 and 7225 with the functions that shape
+// arrays among what is typed, 7293 with the inputs of the first test alone. Known and open; reported, not hidden.
+test('seeds of the wider search that still leave apart (open)', { todo: 'E3 is open' }, async () => {
+  const ways: Limits[] = [{}, { spillCells: 6, workbookSpillCells: 10 }, { sliced: true }, { sliced: true, spillCells: 6, workbookSpillCells: 10 }];
+  const failed: string[] = [];
+  for (const [seed, inputs] of [[7128, SHAPE_INPUTS], [7225, SHAPE_INPUTS], [7293, undefined]] as [number, string[] | undefined][]) {
+    for (let w = 0; w < ways.length; w++) {
+      try {
+        await run(seed, 40, { ...ways[w], inputs });
+      } catch (error) {
+        failed.push(`${seed}/${w}`);
+      }
+    }
+  }
+  assert.deepEqual(failed, [], `still apart: ${failed.join(' ')}`);
 });
 
 /** Every sheet of a workbook, cell by cell (see snapshot()). */
@@ -264,6 +305,7 @@ async function runMore(seed: number, steps: number, sliced: boolean): Promise<vo
     const row = Math.floor(next() * 8);
     const col = Math.floor(next() * 5);
     const sh = workbook.sheets.length > 1 && next() < 0.25 ? 1 : 0;
+    const unchanged = snapshotAll(workbook);
     try {
       if (what < 0.5) {
         const text = pick(MORE_INPUTS);
@@ -309,8 +351,9 @@ async function runMore(seed: number, steps: number, sliced: boolean): Promise<vo
         apply([{ type: insert ? 'insert' : 'delete', sheet: sh, axis: 'col', at: col, count: 1 }]);
       }
     } catch (error) {
+      // Refused: nothing changed, in the workbook (here) or in the engine (what follows).
       log.push(`  refused: ${(error as Error).message}`);
-      continue;
+      assert.deepEqual(snapshotAll(workbook), unchanged, `seed ${seed}: a refused edit changed the workbook, after:\n${log.join('\n')}`);
     }
     assert.equal(engine.incomplete, false);
     const copy = cloneBook(workbook);

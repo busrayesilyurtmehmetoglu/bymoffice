@@ -902,6 +902,19 @@ export interface DrawingPicture extends DrawingObjectBase {
   external?: boolean;
   /** Shares (0..1) cut off each side of the picture. */
   crop?: { left: number; top: number; right: number; bottom: number };
+  /**
+   * Set on a picture that was added since the workbook was read (see ops/pictures.ts): it is in
+   * no file, and these are its bytes. Its `media` is then a key no part has (see pictureSource()),
+   * and the writer gives the bytes a part of their own.
+   */
+  data?: PictureData;
+}
+
+/** The bytes of a picture that is in no file, and what kind of picture they are. Never altered. */
+export interface PictureData {
+  bytes: Uint8Array;
+  /** "image/png", "image/jpeg", "image/gif" or "image/bmp", as the bytes say (never as a name or a caller says). */
+  type: string;
 }
 
 export interface DrawingShape extends DrawingObjectBase {

@@ -398,6 +398,28 @@ export function resizedRect(rect: Rect, handle: DrawingHandle | 'move', dx: numb
 }
 
 /**
+ * A box sized by a corner handle (see resizedRect()) made to keep the proportions of the box it
+ * was sized from: the larger of the two changes wins, and the corner across from the handle stays
+ * where it is. A side handle and a move are left as they are.
+ */
+export function ratioRect(start: Rect, rect: Rect, handle: DrawingHandle | 'move', min: number): Rect {
+  if (handle === 'move' || handle === 'n' || handle === 's' || handle === 'e' || handle === 'w' || !(start.width > 0) || !(start.height > 0)) return rect;
+  const scale = Math.max(rect.width / start.width, rect.height / start.height, min / start.width, min / start.height);
+  const width = start.width * scale;
+  const height = start.height * scale;
+  const left = handle === 'nw' || handle === 'sw' ? start.x + start.width - width : start.x;
+  const top = handle === 'nw' || handle === 'ne' ? start.y + start.height - height : start.y;
+  // Not past the corner of the sheet: the box is made smaller instead, in proportion.
+  if (left < 0 || top < 0) {
+    const room = Math.min(handle === 'nw' || handle === 'sw' ? (start.x + start.width) / width : 1, handle === 'nw' || handle === 'ne' ? (start.y + start.height) / height : 1);
+    const w = width * room;
+    const h = height * room;
+    return { x: handle === 'nw' || handle === 'sw' ? start.x + start.width - w : start.x, y: handle === 'nw' || handle === 'ne' ? start.y + start.height - h : start.y, width: w, height: h };
+  }
+  return { x: left, y: top, width, height };
+}
+
+/**
  * The drawings and comments of one sheet as they are shown. Made once per
  * sheet and asked every frame; what it works out is kept until the sheet's
  * drawings, comments, structural edits or row and column sizes change.

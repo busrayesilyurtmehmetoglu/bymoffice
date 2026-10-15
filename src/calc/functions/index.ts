@@ -11,6 +11,7 @@ import { FINANCIAL_FUNCTIONS } from './financial';
 import { INFO_FUNCTIONS } from './info';
 import { LOOKUP_FUNCTIONS } from './lookup';
 import { MATH_FUNCTIONS } from './math';
+import { SHAPE_FUNCTIONS } from './shape';
 import { STAT_FUNCTIONS } from './stat';
 import { TEXT_FUNCTIONS } from './text';
 
@@ -22,6 +23,7 @@ const GROUPS = [
   TEXT_FUNCTIONS,
   DATE_FUNCTIONS,
   LOOKUP_FUNCTIONS,
+  SHAPE_FUNCTIONS,
   INFO_FUNCTIONS,
   FINANCIAL_FUNCTIONS,
   EXTRA_FUNCTIONS,

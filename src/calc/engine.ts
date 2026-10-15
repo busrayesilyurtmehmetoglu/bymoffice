@@ -2486,7 +2486,9 @@ export class CalcEngine {
           this.wanting.delete(rec);
           return;
         }
-        if (!rec.dynamic || rec.circular) return;
+        // A formula found circular through its spill (see resolve(), rebuildForced()) fills nothing until it is calculated
+        // anew, though the plan it was put back with says where it would spill: it takes nothing of the budget either.
+        if (!rec.dynamic || rec.circular || rec.forced) return;
         const plan = rec.next;
         const want = plan && plan.budget ? plan.want : rec.spill;
         if (!want) return;

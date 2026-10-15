@@ -139,7 +139,7 @@ export class WireError extends Error {
 
 /** Something that cannot be done while a workbook is edited together. `what` names it for the message of the view. */
 export class CollabUnsupportedError extends RangeError {
-  readonly what: 'copySheet' | 'undo' | 'size' | 'readOnly' | 'other';
+  readonly what: 'copySheet' | 'undo' | 'size' | 'readOnly' | 'picture' | 'other';
   constructor(what: CollabUnsupportedError['what'], message: string) {
     super(message);
     this.name = 'CollabUnsupportedError';

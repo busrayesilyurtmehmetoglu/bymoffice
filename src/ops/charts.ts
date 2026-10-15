@@ -532,11 +532,11 @@ function axesNamed(chart: Chart): { category?: ChartAxis; value?: ChartAxis } {
 // ------------------------------------------------------------------ anchors
 
 /** An anchor that covers a rectangle of the sheet (pixels from the corner of cell A1) and moves and sizes with the cells under it. */
-export function anchorOfRect(metrics: SheetMetrics, x: number, y: number, width: number, height: number): DrawingAnchor {
+export function anchorOfRect(metrics: SheetMetrics, x: number, y: number, width: number, height: number, min: number = MIN_CHART_SIZE): DrawingAnchor {
   const limitX = metrics.cols.total;
   const limitY = metrics.rows.total;
-  const w = Math.max(Math.min(width, limitX), MIN_CHART_SIZE);
-  const h = Math.max(Math.min(height, limitY), MIN_CHART_SIZE);
+  const w = Math.max(Math.min(width, limitX), min);
+  const h = Math.max(Math.min(height, limitY), min);
   const left = Math.max(0, Math.min(x, limitX - w));
   const top = Math.max(0, Math.min(y, limitY - h));
   const marker = (px: number, py: number): DrawingMarker => {
@@ -547,7 +547,8 @@ export function anchorOfRect(metrics: SheetMetrics, x: number, y: number, width:
   return { kind: 'twoCell', from: marker(left, top), to: marker(left + w, top + h) };
 }
 
-function checkedAnchor(anchor: DrawingAnchor | CellRange): DrawingAnchor {
+/** An anchor as the commands keep it, or the anchor that covers a range of cells. Throws RangeError for one that names no place of the sheet. */
+export function checkedAnchor(anchor: DrawingAnchor | CellRange, what = 'a chart'): DrawingAnchor {
   if (isRange(anchor)) {
     const to = { col: Math.min(anchor.right + 1, MAX_COLS - 1), row: Math.min(anchor.bottom + 1, MAX_ROWS - 1) };
     return { kind: 'twoCell', from: { col: anchor.left, colOff: 0, row: anchor.top, rowOff: 0 }, to: { col: to.col, colOff: 0, row: to.row, rowOff: 0 } };
@@ -573,7 +574,7 @@ function checkedAnchor(anchor: DrawingAnchor | CellRange): DrawingAnchor {
       return { kind: 'absolute', x: Math.round(given.x as number), y: Math.round(given.y as number), width: Math.round(given.width as number), height: Math.round(given.height as number) };
     }
   }
-  throw new RangeError('The place of a chart is an anchor, or a range of cells');
+  throw new RangeError(`The place of ${what} is an anchor, or a range of cells`);
 }
 
 /** Where a new chart is put when nobody says: beside the cells it shows (below them when there is no room beside), in the default size. */

@@ -33,6 +33,7 @@ export type IconName =
   | 'validation'
   | 'conditionalFormat'
   | 'chart'
+  | 'insertPicture'
   | 'rowsColumns'
   | 'find';
 
@@ -44,6 +45,9 @@ export const ICON_BAR_CLASS = 'bym-icon-bar';
 
 const path = (d: string, extra?: { [name: string]: string }): Shape => ['path', { d, ...(extra || {}) }];
 const bar: Shape = ['rect', { class: ICON_BAR_CLASS, x: '3.5', y: '18', width: '17', height: '4', rx: '1', stroke: 'none', fill: 'currentColor' }];
+
+/** A framed landscape with the sun above it: a picture. Both editors insert one with it. */
+const PICTURE: Shape[] = [path('M4 5h16v14H4z'), path('m4 16 4.5-4.5 4 4 2.5-2.5 5 5'), path('M15.5 9.5h.01', { 'stroke-width': '2.75' })];
 
 const ICONS: { [name in IconName]: Shape[] } = {
   // A disk: its label, its shutter, the notch of its corner.
@@ -93,6 +97,7 @@ const ICONS: { [name in IconName]: Shape[] } = {
   validation: [path('M4 6h16v12H4z'), path('m8.5 12.2 2.4 2.4 4.6-5')],
   // Three columns on a base line.
   chart: [path('M4 20h16'), path('M6.5 20v-6h3v6 M10.5 20V7h3v13 M14.5 20v-9h3v9')],
+  insertPicture: PICTURE,
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
   // A magnifying glass: find and replace.
   find: [path('M10.5 4a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z'), path('m15.3 15.3 4.7 4.7')],
@@ -128,7 +133,7 @@ const DOC_ICONS: { [name in DocIconName]: Shape[] } = {
   // A ruler with the mark of a left tab stop on it.
   tabStops: [path('M3 15h18 M6 15v-2 M10 15v-2 M14 15v-2 M18 15v-2'), path('M8 5v5h4', { 'stroke-width': '2.25' })],
   insertTable: [path('M4 5h16v14H4z M4 10h16 M4 14.5h16 M9.5 5v14 M14.5 5v14')],
-  insertPicture: [path('M4 5h16v14H4z'), path('m4 16 4.5-4.5 4 4 2.5-2.5 5 5'), path('M15.5 9.5h.01', { 'stroke-width': '2.75' })],
+  insertPicture: PICTURE,
   insertLink: [path('M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1'), path('M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1')],
   pageBreak: [path('M6 3v5h12V3 M6 21v-5h12v5'), path('M3 12h2 M8 12h2 M14 12h2 M19 12h2')],
   // A page with a pencil: what is written is marked.

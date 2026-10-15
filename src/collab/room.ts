@@ -30,11 +30,17 @@ export type CollabState = 'connecting' | 'online' | 'offline' | 'detached' | 'cl
  * It goes up whenever a kind of step or a field of one is added to what goes over the wire (of
  * workbooks or of documents), or a step that is there comes to mean something else: a side that
  * does not know the new step would pass it over, and the room would drift apart. The fingerprint
- * of the wire in test/collab-protocol-version.test.ts says when.
+ * of the wire in test/collab-protocol-version.test.ts says when. It goes up too when what a
+ * formula calculates to changes (a function added, or one that gives something else): every
+ * participant calculates the formulas of the room itself, and one that does not know a function
+ * (#NAME?) or calculates it the old way drifts apart from the others with the same steps. The
+ * fingerprint does not see that; it is raised by hand.
  * 3: panes of a sheet (`pane`), tab stops of paragraphs (`tabs`).
  * 4: dynamic array formulas (`d` of a formula).
+ * 5: VSTACK, HSTACK, TAKE, DROP, CHOOSEROWS, CHOOSECOLS, EXPAND, TOCOL, TOROW, WRAPROWS, WRAPCOLS and
+ *    TEXTSPLIT calculated; TEXTBEFORE and TEXTAFTER take an array of delimiters as one list.
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** A participant of a room as the others see it; `P` is how it says where it is. */
 export interface RoomPeer<P> {

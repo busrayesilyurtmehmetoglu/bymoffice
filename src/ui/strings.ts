@@ -382,6 +382,8 @@ export interface UiStrings {
     chartCopyGone: string;
     tooLarge: string;
     unsupported: string;
+    /** Pictures are refused while the workbook is edited together. */
+    pictures: string;
     sheetDeleted(name: string): string;
     editGone: string;
     formulaGone(text: string): string;
@@ -429,10 +431,41 @@ export interface UiStrings {
   charts: ChartStrings;
   /** Pivot tables: the commands of the menu of a cell of one, and what is said about a refresh. */
   pivots: PivotStrings;
+  /** Pictures of a sheet: the button that adds one, the menu of one, and what is said about them. */
+  pictures: PictureStrings;
   /** The bar of Find and Replace of both views. */
   find: FindStrings;
   /** The dialog of the page setup of both views. */
   pageSetup: PageSetupStrings;
+}
+
+/** What is said about pictures of a sheet. */
+export interface PictureStrings {
+  /** The button and the command that add a picture. */
+  insert: string;
+  added: string;
+  moved: string;
+  removed: string;
+  /** Said when a picture is selected; `name` may be empty. */
+  selected(name: string): string;
+  /** The command of the menu of a picture that deletes it. */
+  remove: string;
+  /** The bytes are not a PNG, JPEG, GIF or BMP picture, or cannot be read. */
+  notSupported: string;
+  tooLarge: string;
+  /** Too many pictures, or their bytes together. */
+  tooMany: string;
+  /** The sheet is protected, or its drawing in the file cannot be changed. */
+  protectedSheet: string;
+  placesFixed: string;
+  /** A picture that shares its place in the drawing with another object. */
+  wrapped: string;
+  /** Copy and cut while a picture is selected. */
+  noCopy: string;
+  /** Paste of cells while a picture is selected. */
+  noCellPaste: string;
+  /** A file dropped on the grid while nothing can be inserted (a read-only view, a cell being edited). */
+  dropRefused: string;
 }
 
 /** What the dialog of the page setup says (File -> Page Setup), in a workbook and in a document. */
@@ -1143,6 +1176,7 @@ export const STRINGS_EN: UiStrings = {
     chartCopyGone: 'The chart was changed or deleted since it was copied; while the workbook is edited together it cannot be pasted. Copy the chart again.',
     tooLarge: 'This change is too large to be shared in one step.',
     unsupported: 'This cannot be done while the workbook is edited together.',
+    pictures: 'Pictures cannot be added, moved or deleted while the workbook is edited together.',
     sheetDeleted: (name) => `Sheet ${name} was deleted. This cannot be undone while the workbook is edited together.`,
     editGone: 'The cell you were typing in was deleted by someone else.',
     formulaGone: (text) => `Someone else moved cells or renamed a sheet while you were typing a formula: what you typed may have meant other cells, and was not applied. You typed: ${text}`,
@@ -1460,6 +1494,23 @@ export const STRINGS_EN: UiStrings = {
     copyUnbound: (count) => (count === 1 ? 'One reference of the copy still names no sheet' : `${count} references of the copy still name no sheet`),
     noCellPaste: 'A chart is selected: select a cell to paste cells',
     copyGone: 'The chart on the clipboard was copied elsewhere and cannot be pasted here: copy the chart again',
+  },
+  pictures: {
+    insert: 'Insert picture',
+    added: 'Picture inserted',
+    moved: 'Picture moved',
+    removed: 'Picture deleted',
+    selected: (name) => (name ? `Picture selected: ${name}` : 'Picture selected'),
+    remove: 'Delete picture',
+    notSupported: 'This picture cannot be inserted: only PNG, JPEG, GIF and BMP pictures can',
+    tooLarge: 'This picture is too large to be inserted',
+    tooMany: 'No more pictures can be inserted into this workbook',
+    protectedSheet: 'The sheet is protected: its pictures cannot be changed',
+    placesFixed: 'Pictures cannot be added, moved or deleted on this sheet: its drawing in the file cannot be changed',
+    wrapped: 'This picture cannot be deleted: it shares its place in the file with another object',
+    noCopy: 'Pictures cannot be copied yet',
+    noCellPaste: 'A picture is selected: select a cell to paste cells',
+    dropRefused: 'A picture cannot be dropped here now',
   },
   pivots: {
     refresh: 'Refresh pivot table',
@@ -1875,6 +1926,7 @@ export const STRINGS_TR: UiStrings = {
     chartCopyGone: 'Grafik kopyalandıktan sonra değişti ya da silindi; kitap birlikte düzenlenirken yapıştırılamaz. Grafiği yeniden kopyalayın.',
     tooLarge: 'Bu değişiklik tek adımda paylaşılamayacak kadar büyük.',
     unsupported: 'Bu, kitap birlikte düzenlenirken yapılamaz.',
+    pictures: 'Kitap birlikte düzenlenirken görsel eklenemez, taşınamaz ve silinemez.',
     sheetDeleted: (name) => `${name} sayfası silindi. Kitap birlikte düzenlenirken bu geri alınamaz.`,
     editGone: 'Yazdığınız hücreyi başkası sildi.',
     formulaGone: (text) => `Siz formül yazarken başkası hücreleri kaydırdı ya da bir sayfayı yeniden adlandırdı: yazdığınız başka hücreleri kastediyor olabilirdi, uygulanmadı. Yazdığınız: ${text}`,
@@ -2192,6 +2244,23 @@ export const STRINGS_TR: UiStrings = {
     copyUnbound: (count) => `Kopyanın ${count} başvurusu hâlâ sayfa adı taşımıyor`,
     noCellPaste: 'Bir grafik seçili: hücre yapıştırmak için bir hücre seçin',
     copyGone: 'Panodaki grafik başka bir yerde kopyalanmış, buraya yapıştırılamıyor: grafiği yeniden kopyalayın',
+  },
+  pictures: {
+    insert: 'Görsel ekle',
+    added: 'Görsel eklendi',
+    moved: 'Görsel taşındı',
+    removed: 'Görsel silindi',
+    selected: (name) => (name ? `Görsel seçildi: ${name}` : 'Görsel seçildi'),
+    remove: 'Görseli sil',
+    notSupported: 'Bu görsel eklenemiyor: yalnız PNG, JPEG, GIF ve BMP görseller eklenebilir',
+    tooLarge: 'Bu görsel eklenemeyecek kadar büyük',
+    tooMany: 'Bu çalışma kitabına daha fazla görsel eklenemez',
+    protectedSheet: 'Sayfa korumalı: görselleri değiştirilemez',
+    placesFixed: 'Bu sayfada görsel eklenemez, taşınamaz ve silinemez: dosyadaki çizimi değiştirilemiyor',
+    wrapped: 'Bu görsel silinemez: dosyada yerini başka bir nesneyle paylaşıyor',
+    noCopy: 'Görseller henüz kopyalanamıyor',
+    noCellPaste: 'Bir görsel seçili: hücre yapıştırmak için bir hücre seçin',
+    dropRefused: 'Görsel şu anda buraya bırakılamaz',
   },
   pivots: {
     refresh: 'Pivot tabloyu yenile',

@@ -15,6 +15,7 @@ import { fontChoices } from './font-list';
 import type { SaveCommand } from './save-command';
 import { onFontsChanged } from '../render/fonts';
 import type { WorkbookView } from './sheet-view';
+import { MAX_PICTURE_BYTES } from '../ops/pictures';
 
 /** What the parts of the shell need from the editor that holds them. */
 export interface ShellHost {
@@ -128,6 +129,8 @@ export class Toolbar {
   /** The list in use is being worked with the keyboard, not with a pointer. */
   private listByKey = false;
   private destroyed = false;
+  /** The browser's own file dialog the picture button opens; never shown itself. */
+  private readonly fileInput: HTMLInputElement;
 
   constructor(host: ShellHost, strings: EditorStrings) {
     this.host = host;
@@ -189,6 +192,8 @@ export class Toolbar {
     this.addMenuButton('conditionalFormat', 'menu', () => this.openConditional());
     this.addDialogButton('validation', () => void host.view.openValidationDialog());
     this.addMenuButton('chart', 'menu', () => this.openCharts());
+    // The picture button only opens the browser's own file dialog: it has nothing that stays open.
+    this.addDialogButton('insertPicture', () => this.fileInput.click());
     this.addSeparator();
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
     this.addSeparator();
@@ -197,6 +202,17 @@ export class Toolbar {
 
     this.bars.textColor = this.barOf('textColor');
     this.bars.fillColor = this.barOf('fillColor');
+
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'image/png,image/jpeg,image/gif,image/bmp';
+    fileInput.className = 'bym-tb-file';
+    fileInput.tabIndex = -1;
+    fileInput.setAttribute('aria-hidden', 'true');
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', this.onFileChange);
+    element.appendChild(fileInput);
+    this.fileInput = fileInput;
 
     element.addEventListener('click', this.onClick);
     element.addEventListener('mousedown', this.onMouseDown);
@@ -244,6 +260,14 @@ export class Toolbar {
     this.updateSave(typing);
     const others: ButtonKey[] = ['pageSetup', 'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'alignTop', 'alignMiddle', 'alignBottom', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
+    // The picture button says why it is off where pictures cannot be changed (edited together, a protected sheet).
+    const picture = this.buttons.insertPicture;
+    if (picture) {
+      const why = editable ? view.pictureProblem : undefined;
+      this.setDisabled('insertPicture', !editable || why !== undefined);
+      const title = why !== undefined ? why : this.strings.insertPicture;
+      if (picture.title !== title) picture.title = title;
+    }
     this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;
     this.formatSelect.disabled = !editable;
@@ -324,8 +348,42 @@ export class Toolbar {
     this.fontSelect.removeEventListener('change', this.onFontChange);
     this.sizeSelect.removeEventListener('change', this.onSizeChange);
     this.formatSelect.removeEventListener('change', this.onFormatChange);
+    this.fileInput.removeEventListener('change', this.onFileChange);
     if (element.parentNode) element.parentNode.removeChild(element);
   }
+
+  /** A file chosen in the dialog of the picture button: read, and inserted at the active cell. Its name stays out of the workbook. */
+  private onFileChange = (): void => {
+    const input = this.fileInput;
+    const file = input.files && input.files[0];
+    // The same file can be chosen again next time.
+    input.value = '';
+    if (!file || this.destroyed) return;
+    const view = this.host.view;
+    if (file.size > MAX_PICTURE_BYTES) {
+      // Refused before anything of it is read: the view says why in its own words.
+      this.host.run(() => {
+        throw new RangeError(`A picture cannot be larger than ${MAX_PICTURE_BYTES / 1024 / 1024} MB`);
+      });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (this.destroyed || !(reader.result instanceof ArrayBuffer)) return;
+      const bytes = new Uint8Array(reader.result);
+      // What kind of picture it is, the view reads from the bytes.
+      this.host.run(() => void view.insertPicture(bytes));
+    };
+    // A file that cannot be read (gone, no permission) is said in the words of the view.
+    reader.onerror = () => {
+      if (!this.destroyed) {
+        this.host.run(() => {
+          throw new RangeError('The picture cannot be read');
+        });
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
 
   // ------------------------------------------------------------- building
 
@@ -418,6 +476,7 @@ export class Toolbar {
       conditionalFormat: s.conditionalFormat,
       // The words of charts are the view's (its menu and its dialog use the same): set once there is a view, see update().
       chart: '',
+      insertPicture: s.insertPicture,
       rowsColumns: s.rowsAndColumns,
       find: withShortcut(s.findReplace, 'F'),
     };

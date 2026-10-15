@@ -580,6 +580,9 @@ function readRows(value: unknown, what: string): number[] {
   return arr(value, MAX_ROWS, what).map((row) => int(row, 0, MAX_ROWS - 1, what));
 }
 
+/** The commands of pictures (see ops/pictures.ts): refused in a room. */
+const PICTURE_COMMANDS = ['addPicture', 'movePicture', 'removePicture'];
+
 /** The names of the commands that travel, and how many arguments each takes at most. */
 const COMMANDS: { [name: string]: { family: 'validation' | 'conditional' | 'chart'; run: (workbook: Workbook, sheet: number, args: unknown[]) => Op[] } } = {
   setValidation: { family: 'validation', run: (wb, s, a) => setValidation(wb, s, a[0] as never, (a[1] === null ? undefined : a[1]) as never) },
@@ -997,6 +1000,8 @@ export function encodeOp(workbook: Workbook, op: Op): Encoded {
     case 'setDataValidations':
     case 'setConditionalFormats':
     case 'setDrawings': {
+      // A picture would have to travel with its bytes: pictures are not added, moved or deleted in a room. Refused, before anything is changed.
+      if (op.type === 'setDrawings' && op.by && PICTURE_COMMANDS.indexOf(op.by.name) >= 0) throw new CollabUnsupportedError('picture', 'Pictures cannot be added, moved or deleted while the workbook is edited together');
       if (!op.by || !commandFamily(op.by.name)) return { skipped: op.type === 'setDrawings' ? 'drawings' : 'rules' };
       // As JSON has it: what is left out and what is undefined are the same on the wire.
       const args = JSON.parse(JSON.stringify(op.by.args, (_key, value) => (value === undefined ? null : value))) as unknown[];

@@ -63,6 +63,7 @@ import { KEPT_MAIN, MAX_KEPT_DEPTH, unpackKept, type KeptAttr, type KeptNode, ty
 import { keptFor, keptNow, ruleHolder } from '../../ops/rules';
 import { adjustCommentCell, adjustDrawingAnchor, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
 import { CHART_CONTENT_TYPE, chartCellsOf, chartSpaceXml, chartWritable } from './chart-write';
+import { pictureSource } from '../../model/sheet/pictures';
 import { METADATA_CONTENT_TYPE, METADATA_RELATIONSHIP, newMetadataXml } from './metadata';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
 import { ZipArchive } from '../../zip';
@@ -1956,7 +1957,8 @@ export async function buildXlsx(workbook: Workbook, options: BuildXlsxOptions = 
       if (pictures.has(key)) continue;
       let bytes: Uint8Array | undefined;
       try {
-        bytes = workbook.media ? await workbook.media.readPart(key) : undefined;
+        // Pictures added since the workbook was read are in the model; the others are read from the file.
+        bytes = await pictureSource(workbook).readPart(key);
       } catch (error) {
         bytes = undefined;
       }

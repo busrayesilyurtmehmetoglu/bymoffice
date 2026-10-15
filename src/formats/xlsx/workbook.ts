@@ -16,6 +16,7 @@ import { dynamicArrayCells, METADATA_RELATIONSHIP } from './metadata';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
 import { parseChartSheetSetup, parseWorksheet } from './worksheet';
+import { takenOutPart } from './write';
 
 // Relationship types end the same way in the transitional and the strict namespace.
 const SHEET_KINDS: [suffix: string, kind: SheetKind][] = [
@@ -356,7 +357,16 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   if (mediaParts.size > 0) {
     // Read from the package when a picture is first shown, and only what a drawing of this workbook shows.
     workbook.media = {
-      readPart: (part: string) => (mediaParts.has(part) ? pkg.readPart(part) : Promise.reject(new Error(`Not a picture of this workbook: ${part}`))),
+      readPart: (part: string) => {
+        if (!mediaParts.has(part)) return Promise.reject(new Error(`Not a picture of this workbook: ${part}`));
+        // A save may have taken the part out (nothing showed it any more) and an undo brought back what shows it:
+        // the bytes the file had are then those the writer kept.
+        if (!pkg.hasPart(part)) {
+          const kept = takenOutPart(workbook, part);
+          if (kept) return Promise.resolve(kept);
+        }
+        return pkg.readPart(part);
+      },
     };
   }
   return workbook;

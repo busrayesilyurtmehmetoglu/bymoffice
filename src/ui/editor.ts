@@ -305,6 +305,8 @@ export class SpreadsheetEditor {
    */
   setCollab(info: { state: CollabState; peers: readonly CollabPeer[]; pending: number; autoWaits?: 'room' | 'offline'; people?: People } | undefined): void {
     if (this.destroyed) return;
+    // Buttons that a room turns off (pictures) follow.
+    this.refresh();
     if (!info) {
       if (this.peopleButton) this.peopleButton.destroy();
       this.peopleButton = undefined;

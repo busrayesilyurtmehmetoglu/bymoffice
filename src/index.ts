@@ -176,6 +176,28 @@ export {
   type RangeSeries,
 } from './ops/charts';
 export {
+  DEFAULT_PICTURE_HEIGHT,
+  DEFAULT_PICTURE_WIDTH,
+  MAX_PICTURE_BYTES,
+  MAX_PICTURE_PIXELS,
+  MAX_PICTURE_SIDE,
+  MAX_WORKBOOK_PICTURE_BYTES,
+  PICTURE_TYPES,
+  addPicture,
+  anchorLike,
+  checkPicture,
+  movePicture,
+  movePictureTo,
+  pictureAnchorAt,
+  picturesProblem,
+  removePicture,
+  sheetPictures,
+  type PictureFacts,
+  type PictureInfo,
+  type PictureOptions,
+} from './ops/pictures';
+export { pictureSource } from './model/sheet/pictures';
+export {
   CONDITIONAL_TYPES,
   ICON_SET_NAMES,
   MAX_SHEET_CONDITIONAL_RULES,

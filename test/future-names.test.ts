@@ -72,7 +72,7 @@ test('typed in a locale: Turkish names and separators, then the prefixes', () =>
 });
 
 test('a prefix this engine does not know the function of is shown, and so kept', () => {
-  for (const stored of ['_xlfn.CHISQ.DIST(A1,2,TRUE)+_xlfn.TEXTSPLIT("a",",")', '_xlfn.VSTACK(A1:A2,B1:B2)', '_xlfn.FILTER(A1:A3,B1:B3)', '_XLFN.XLOOKUP(1,A:A,B:B)', "_xlfn.abc!A1+'_xlfn.x'!B2", '_xlpm.x!A1']) {
+  for (const stored of ['_xlfn.CHISQ.DIST(A1,2,TRUE)+_xlfn.REGEXTEST("a",",")', '_xlfn.GROUPBY(A1:A2,B1:B2,C1)', '_xlfn.FILTER(A1:A3,B1:B3)', '_XLFN.XLOOKUP(1,A:A,B:B)', "_xlfn.abc!A1+'_xlfn.x'!B2", '_xlpm.x!A1']) {
     const shown = withoutFuturePrefixes(stored);
     assert.equal(withFuturePrefixes(shown), stored, `${stored} -> ${shown}`);
     for (const locale of [LOCALE_EN, LOCALE_TR]) assert.equal(formulaFromLocal(formulaToLocal(stored, locale), locale), stored, `${stored} in ${locale.decimal}`);

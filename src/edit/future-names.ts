@@ -22,6 +22,8 @@ const FUTURE = new Set([
   'PERCENTILE.EXC', 'PERCENTILE.INC', 'QUARTILE.EXC', 'QUARTILE.INC', 'RANDARRAY', 'RANK.AVG', 'RANK.EQ', 'REDUCE', 'SCAN',
   'SEC', 'SECH', 'SEQUENCE', 'SHEET', 'SHEETS', 'SORTBY', 'STDEV.P', 'STDEV.S', 'SWITCH', 'TEXTAFTER', 'TEXTBEFORE', 'TEXTJOIN',
   'UNICHAR', 'UNICODE', 'UNIQUE', 'VAR.P', 'VAR.S', 'WORKDAY.INTL', 'XLOOKUP', 'XMATCH', 'XOR', 'ANCHORARRAY', 'SINGLE',
+  // The functions that shape arrays and split text. UNSURE: "_xlfn." alone (not "_xlfn._xlws."), as remembered.
+  'VSTACK', 'HSTACK', 'TAKE', 'DROP', 'CHOOSEROWS', 'CHOOSECOLS', 'EXPAND', 'TOCOL', 'TOROW', 'WRAPROWS', 'WRAPCOLS', 'TEXTSPLIT',
 ]);
 
 /** Functions a file stores with "_xlfn._xlws.". */
@@ -276,7 +278,7 @@ export function withFuturePrefixes(text: string): string {
  * How much of a word is a prefix that is not shown: "_xlfn." before a function this engine
  * knows as a newer one ("_xlfn._xlws." before FILTER and SORT), spelled as withFuturePrefixes()
  * writes it, so that what is shown and typed again is stored as it was; "_xlpm." before a name
- * of LET or LAMBDA. Any other prefix ("_xlfn.TEXTSPLIT", of a function the engine does not
+ * of LET or LAMBDA. Any other prefix ("_xlfn.GROUPBY", of a function the engine does not
  * have) is shown as it is, and kept so.
  */
 function shownPrefix(word: string, next: number): number {

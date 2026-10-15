@@ -48,7 +48,7 @@ Yalnız değiştirilen parçalar yeniden üretilir. Her yeni özellik `pnpm corp
 
 - [x] Aşama 0: ZIP, XML, OPC (docx/xlsx kapsayıcısı), CFB okuyucu (doc/xls kapsayıcısı), biçim algılama, gidiş-dönüş denetimi
 - [x] Aşama 1: xlsx tablo modeli, Canvas ızgara, hücre düzenleme, kayıpsız xlsx yazma, editör arayüzü, WebView köprüsü
-- [ ] Aşama 2: formül motoru (253 fonksiyon), biçimlendirme, koşullu biçim gösterimi tamam; süzgeç, sıralama, veri doğrulama sürüyor
+- [ ] Aşama 2: formül motoru (265 fonksiyon), biçimlendirme, koşullu biçim gösterimi tamam; süzgeç, sıralama, veri doğrulama sürüyor
 - [x] Aşama 3: docx belge modeli, sayfa düzeni motoru, salt okunur belge görünümü
 - [ ] Aşama 4: Word düzenleme
 - [ ] Aşama 5: xls (BIFF8), doc (Word 97–2003) ve RTF okuyucuları tamam (salt okunur); bu biçimlere yazma yok

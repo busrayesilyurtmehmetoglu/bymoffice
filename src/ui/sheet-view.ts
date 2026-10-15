@@ -136,7 +136,22 @@ import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridPeer, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
 import { ChartRenderer, type ChartRendererOptions } from '../render/chart';
-import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
+import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, ratioRect, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
+import { pictureSource } from '../model/sheet/pictures';
+import {
+  MAX_PICTURE_BYTES,
+  MIN_PICTURE_SIZE,
+  addPicture as addPictureOps,
+  checkPicture,
+  defaultPictureSize,
+  movePicture as movePictureOps,
+  movePictureTo,
+  pictureAnchorAt,
+  picturesProblem,
+  removePicture as removePictureOps,
+  sheetPictures,
+  type PictureInfo,
+} from '../ops/pictures';
 import {
   MIN_CHART_SIZE,
   addChart as addChartOps,
@@ -1206,6 +1221,9 @@ export class WorkbookView {
     input.addEventListener('paste', this.onPaste);
     canvas.addEventListener('dblclick', this.onDoubleClick);
     canvas.addEventListener('contextmenu', this.onContextMenu);
+    // Picture files dropped on the grid are inserted where they are dropped.
+    canvas.addEventListener('dragover', this.onDragOver);
+    canvas.addEventListener('drop', this.onDrop);
     // Panning and pinching stay with the browser; its double-tap zoom would swallow the double tap that edits.
     canvas.style.touchAction = 'manipulation';
     tabs.addEventListener('click', this.onTabClick);
@@ -1479,6 +1497,8 @@ export class WorkbookView {
     input.removeEventListener('paste', this.onPaste);
     this.canvas.removeEventListener('dblclick', this.onDoubleClick);
     this.canvas.removeEventListener('contextmenu', this.onContextMenu);
+    this.canvas.removeEventListener('dragover', this.onDragOver);
+    this.canvas.removeEventListener('drop', this.onDrop);
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     if (this.resizeObserver) this.resizeObserver.disconnect();
@@ -1668,9 +1688,9 @@ export class WorkbookView {
         if (job.check) job.check();
       }
       const epoch = this.printEpoch;
-      const media = this.workbook.media;
-      // Pictures of its own: those of the view are sized for the screen and come and go with it.
-      const store = media && typeof media.readPart === 'function' ? new ImageStore(media, coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => undefined) : undefined;
+      // Pictures of its own: those of the view are sized for the screen and come and go with it. Those of the file
+      // are read from the file, those added since from the model.
+      const store = new ImageStore(pictureSource(this.workbook), coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => undefined);
       job.store = store;
       const layers = new Map<Sheet, SheetDrawings | undefined>();
       const metricsOf = new Map<Sheet, SheetMetrics>();
@@ -3399,8 +3419,8 @@ export class WorkbookView {
     }
     const conditional = this.conditionalOf(state.sheet);
     const floating = this.drawingsOf(state.sheet);
-    // The chart that is selected, while it is there: a step undone or a sheet changed may have taken it away.
-    const picked = this.pickedChart();
+    // The chart or picture that is selected, while it is there: a step undone or a sheet changed may have taken it away.
+    const picked = this.pickedDrawing();
     if (floating) {
       floating.selected = picked;
       floating.ghost = picked !== undefined && this.chartDrag && this.chartDrag.moved ? this.chartDrag.now : undefined;
@@ -3500,7 +3520,7 @@ export class WorkbookView {
   /** Deletes a chart of the shown sheet. */
   removeChart(id: number): void {
     if (!this.beginRules()) return;
-    const picked = this.pickedChart();
+    const picked = this.pickedDrawing();
     if (!this.applyOps(removeChartOps(this.workbook, this.sheetIndex, id))) return;
     // The charts behind it moved up by one place.
     if (picked !== undefined) this.setChartPick(picked === id ? undefined : picked > id ? picked - 1 : picked, false);
@@ -3553,7 +3573,7 @@ export class WorkbookView {
       this.notifyLater(this.strings.collab.chartCut);
       return put;
     }
-    const picked = this.pickedChart();
+    const picked = this.pickedDrawing();
     const cut = cutChartOps(this.workbook, this.sheetIndex, index);
     if (!this.applyOps(cut.ops)) return this.copyChart(index);
     // The charts behind it moved up by one place.
@@ -3659,11 +3679,39 @@ export class WorkbookView {
     return !!drawing && !!drawing.object && drawing.object.type === 'chart' && this.state().sheet.kind === 'worksheet';
   }
 
+  /**
+   * Whether a picture of the shown sheet stands at a place of its drawings, and can be changed there: what is
+   * selected, moved and deleted. Not while the workbook is edited together: pictures do not travel (the
+   * commands are refused there, and a picture that cannot be moved is not taken hold of).
+   */
+  private isPictureAt(index: number): boolean {
+    const sheet = this.state().sheet;
+    const drawing = sheet.drawings && Math.floor(index) === index ? sheet.drawings[index] : undefined;
+    return !!drawing && !!drawing.object && drawing.object.type === 'picture' && this.picturesEditable();
+  }
+
+  /** Whether the pictures of the shown sheet can be changed: see isPictureAt(). */
+  private picturesEditable(): boolean {
+    return !this.collab && picturesProblem(this.workbook, this.sheetIndex) === undefined;
+  }
+
   /** The place of the selected chart in the drawings of the shown sheet; undefined when no chart of it is selected (any more). */
   private pickedChart(): number | undefined {
+    const index = this.pickedDrawing();
+    return index !== undefined && this.isChartAt(index) ? index : undefined;
+  }
+
+  /** The place of the selected picture; undefined when no picture is selected. */
+  private pickedPicture(): number | undefined {
+    const index = this.pickedDrawing();
+    return index !== undefined && this.isPictureAt(index) ? index : undefined;
+  }
+
+  /** The place of the selected chart or picture in the drawings of the shown sheet; undefined when none of it is selected (any more). */
+  private pickedDrawing(): number | undefined {
     const pick = this.chartPick;
     if (!pick) return undefined;
-    if (pick.sheet !== this.state().sheet || !this.isChartAt(pick.index)) {
+    if (pick.sheet !== this.state().sheet || !(this.isChartAt(pick.index) || this.isPictureAt(pick.index))) {
       this.chartPick = undefined;
       return undefined;
     }
@@ -3671,11 +3719,17 @@ export class WorkbookView {
   }
 
   private setChartPick(index: number | undefined, say = true): void {
-    const before = this.pickedChart();
+    const before = this.pickedDrawing();
     this.chartPick = index === undefined ? undefined : { sheet: this.state().sheet, index };
     if (index === before) return;
     this.schedule();
     if (index === undefined || !say) return;
+    if (this.isPictureAt(index)) {
+      // The name the file gives it is said as text, and no longer than a line.
+      const picture = this.pictures().find((item) => item.id === index);
+      this.live.textContent = this.strings.pictures.selected(picture && picture.name ? picture.name.replace(/\s+/g, ' ').slice(0, 100) : '');
+      return;
+    }
     const info = this.charts().find((chart) => chart.id === index);
     this.live.textContent = this.strings.charts.selected(info && info.title ? info.title.replace(/\s+/g, ' ').slice(0, 100) : '');
   }
@@ -3689,17 +3743,18 @@ export class WorkbookView {
     return { x: left < layout.frozenWidth ? left : left + layout.scrollX, y: top < layout.frozenHeight ? top : top + layout.scrollY };
   }
 
-  /** The chart under a point of the canvas, by its place in the drawings of the sheet; -1 when there is none. */
+  /** The chart (or the picture that can be changed) under a point of the canvas, by its place in the drawings of the sheet; -1 when there is none. */
   private chartUnder(x: number, y: number): number {
     const state = this.state();
     const layer = this.drawingsOf(state.sheet);
     const at = this.sheetPoint(x, y);
-    return layer && at ? layer.hit(state.metrics, at.x, at.y, (object) => object.type === 'chart') : -1;
+    const pictures = this.picturesEditable();
+    return layer && at ? layer.hit(state.metrics, at.x, at.y, (object) => object.type === 'chart' || (pictures && object.type === 'picture')) : -1;
   }
 
   /** What a pointer at a point of the canvas would take of the selected chart: one of its handles, or the chart itself ("move"). */
   private chartGrab(x: number, y: number, coarse: boolean): DrawingHandle | 'move' | undefined {
-    const index = this.pickedChart();
+    const index = this.pickedDrawing();
     const state = this.state();
     const layer = index === undefined ? undefined : this.drawingsOf(state.sheet);
     const box = layer && index !== undefined ? layer.boxOf(state.metrics, index) : undefined;
@@ -3725,7 +3780,7 @@ export class WorkbookView {
   /** A press of the mouse: on a handle of the selected chart, on a chart, or beside the chart that was selected. True when the press was the chart's. */
   private pressChart(pointerId: number, point: { x: number; y: number }): boolean {
     if (this.locked || this.state().sheet.kind !== 'worksheet') return false;
-    const picked = this.pickedChart();
+    const picked = this.pickedDrawing();
     const grab = this.chartGrab(point.x, point.y, false);
     if (picked !== undefined && grab && grab !== 'move') {
       this.beginChartDrag(pointerId, picked, grab, point, false);
@@ -3746,7 +3801,7 @@ export class WorkbookView {
     if (this.locked || this.state().sheet.kind !== 'worksheet') return false;
     const index = this.chartUnder(x, y);
     if (index < 0) {
-      if (this.pickedChart() !== undefined) this.setChartPick(undefined);
+      if (this.pickedDrawing() !== undefined) this.setChartPick(undefined);
       return false;
     }
     this.setChartPick(index);
@@ -3768,7 +3823,7 @@ export class WorkbookView {
     window.addEventListener('blur', this.onChartDragLost);
   }
 
-  private moveChartDrag(point: { x: number; y: number }): void {
+  private moveChartDrag(point: { x: number; y: number }, keepRatio = false): void {
     const drag = this.chartDrag;
     if (!drag) return;
     const state = this.state();
@@ -3780,7 +3835,10 @@ export class WorkbookView {
     this.readScroll();
     const at = this.sheetPoint(Math.max(point.x, state.metrics.headerWidth), Math.max(point.y, state.metrics.headerHeight));
     if (!at) return;
-    drag.now = resizedRect(drag.start, drag.handle, at.x - drag.x, at.y - drag.y, MIN_CHART_SIZE);
+    const picture = drag.drawing.object.type === 'picture';
+    const sized = resizedRect(drag.start, drag.handle, at.x - drag.x, at.y - drag.y, picture ? MIN_PICTURE_SIZE : MIN_CHART_SIZE);
+    // A picture sized by a corner with Shift down keeps its proportions.
+    drag.now = picture && keepRatio ? ratioRect(drag.start, sized, drag.handle, MIN_PICTURE_SIZE) : sized;
     this.schedule();
   }
 
@@ -3792,6 +3850,13 @@ export class WorkbookView {
   private chartClipboard(event: ClipboardEvent, cut: boolean): boolean {
     const asked = this.chartAsked;
     this.chartAsked = undefined;
+    if (asked === undefined && this.pickedPicture() !== undefined) {
+      // A picture is selected: the cells under it are not what is copied or cut, and the picture is not copied yet.
+      event.preventDefault();
+      this.clipboardHandled = true;
+      this.notify(this.strings.pictures.noCopy, 'info');
+      return true;
+    }
     const index = asked !== undefined && this.isChartAt(asked) ? asked : this.pickedChart();
     if (index === undefined) return false;
     event.preventDefault();
@@ -3831,6 +3896,11 @@ export class WorkbookView {
     // The chart that was taken hold of: another one may stand at its place by now (a step undone, another sheet shown).
     const state = this.state();
     if (state.sheet !== drag.sheet || (state.sheet.drawings || [])[drag.index] !== drag.drawing) return;
+    if (drag.drawing.object.type === 'picture') {
+      // A picture keeps the kind of its anchor: it is put where it was dragged to by that kind.
+      if (drag.moved) this.attempt(() => this.applyPictureRect(drag.index, drag.now));
+      return;
+    }
     if (!drag.moved) {
       // A second tap on the selected chart opens its dialog, as a double click does.
       if (drag.touch) {
@@ -3849,6 +3919,7 @@ export class WorkbookView {
     if (this.state().sheet.kind !== 'worksheet' || this.editAway() || this.typingFormula()) return false;
     const index = this.chartUnder(x, y);
     if (index < 0) return false;
+    if (this.isPictureAt(index)) return this.openPictureMenu(index, x, y);
     this.closeMenu();
     if (!this.tryCommit()) return false;
     // A view that changes nothing selects no chart; it copies one all the same.
@@ -3897,8 +3968,13 @@ export class WorkbookView {
     // No chart is selected in a read-only view, and none of these keys is taken there.
     if (state.sheet.kind !== 'worksheet' || this.locked) return false;
     const ctrl = event.ctrlKey || event.metaKey;
-    const picked = this.pickedChart();
-    const ids = (): number[] => this.charts().map((chart) => chart.id);
+    const picked = this.pickedDrawing();
+    // Charts and the pictures that can be changed, in the order they are drawn.
+    const ids = (): number[] =>
+      this.charts()
+        .map((chart) => chart.id)
+        .concat(this.picturesEditable() ? this.pictures().map((picture) => picture.id) : [])
+        .sort((a, b) => a - b);
     if (event.altKey && event.ctrlKey && event.code === 'Digit5') {
       // The first chart, then the next one with every press; after the last one none is selected.
       const all = ids();
@@ -3916,6 +3992,7 @@ export class WorkbookView {
     }
     const layer = this.drawingsOf(state.sheet);
     const box = layer ? layer.boxOf(state.metrics, picked) : undefined;
+    if (this.isPictureAt(picked)) return this.pictureKey(event, picked, box);
     switch (event.key) {
       case 'Escape':
         this.setChartPick(undefined);
@@ -3970,6 +4047,237 @@ export class WorkbookView {
     }
   }
 
+  // ------------------------------------------------------------------ pictures
+
+  /** The pictures of the shown sheet, the one on top last; `id` is what the methods below name a picture by (its place among the drawings of the sheet). */
+  pictures(): PictureInfo[] {
+    if (this.destroyed) return [];
+    return sheetPictures(this.workbook, this.sheetIndex);
+  }
+
+  /**
+   * Why no picture can be inserted into the shown sheet, moved or deleted on it, in the language of the view:
+   * the workbook is edited together, the sheet is protected, its drawing cannot be changed. Undefined when they can
+   * (a read-only view says nothing here: see readOnly).
+   */
+  get pictureProblem(): string | undefined {
+    if (this.destroyed) return undefined;
+    if (this.collab) return this.strings.collab.pictures;
+    const problem = picturesProblem(this.workbook, this.sheetIndex);
+    return problem === undefined ? undefined : this.localizeError(new RangeError(problem));
+  }
+
+  /** The id of the picture that is selected; undefined when none is. */
+  get selectedPicture(): number | undefined {
+    return this.destroyed ? undefined : this.pickedPicture();
+  }
+
+  /**
+   * Selects a picture of the shown sheet (a frame with handles is drawn around it), or none.
+   * Throws RangeError for an id that names no picture that can be changed. A read-only view selects none.
+   */
+  selectPicture(id: number | undefined): void {
+    if (this.destroyed) return;
+    if (id !== undefined && !this.isPictureAt(id)) throw new RangeError(`No picture at index ${id}`);
+    if (this.locked && id !== undefined) return;
+    this.setChartPick(id, false);
+  }
+
+  /**
+   * Inserts a picture (the bytes of a PNG, JPEG, GIF or BMP file: what they are is read from the
+   * bytes) into the shown sheet and selects it; returns its id, or -1 when nothing was inserted
+   * (a read-only view, what is typed cannot be applied). It stands at `at` (default the active
+   * cell) in its own size, no larger than 800 by 600 pixels, and moves with that cell. Throws
+   * RangeError for bytes that are not such a picture, one that is too large, and a sheet that
+   * takes no picture.
+   */
+  insertPicture(bytes: Uint8Array, options: { description?: string; at?: { row: number; col: number } } = {}): number {
+    if (!this.beginRules()) return -1;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return -1;
+    const facts = checkPicture(bytes);
+    if (typeof facts === 'string') throw new RangeError(facts);
+    const size = defaultPictureSize(facts.width, facts.height);
+    const at = options && options.at ? options.at : state.active;
+    const anchor = pictureAnchorAt(state.sheet, at.row, at.col, size.width, size.height);
+    if (!this.applyOps(addPictureOps(this.workbook, this.sheetIndex, bytes, facts.type, anchor, { description: options ? options.description : undefined }))) return -1;
+    const id = (state.sheet.drawings || []).length - 1;
+    this.setChartPick(id, false);
+    this.live.textContent = this.strings.pictures.added;
+    return id;
+  }
+
+  /**
+   * Moves or sizes a picture of the shown sheet: `anchor` is where it stands from now on, an
+   * anchor of the kind the picture has or the cells it covers (see movePicture() of the operations).
+   */
+  movePicture(id: number, anchor: DrawingAnchor | CellRange): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(movePictureOps(this.workbook, this.sheetIndex, id, anchor))) this.live.textContent = this.strings.pictures.moved;
+  }
+
+  /** Deletes a picture of the shown sheet. */
+  removePicture(id: number): void {
+    if (!this.beginRules()) return;
+    const picked = this.pickedDrawing();
+    if (!this.applyOps(removePictureOps(this.workbook, this.sheetIndex, id))) return;
+    // The drawings behind it moved up by one place.
+    if (picked !== undefined) this.setChartPick(picked === id ? undefined : picked > id ? picked - 1 : picked, false);
+    this.live.textContent = this.strings.pictures.removed;
+  }
+
+  /** Puts a picture over a box of the sheet (pixels), with the kind of anchor it has. */
+  private applyPictureRect(id: number, rect: Rect): void {
+    if (!this.beginRules()) return;
+    const metrics = this.state().metrics;
+    if (this.applyOps(movePictureTo(this.workbook, this.sheetIndex, id, rect, metrics))) this.live.textContent = this.strings.pictures.moved;
+  }
+
+  /** The menu of a picture: opened by the press that asks for a menu on it. A read-only view has none (the menu of the cell opens). */
+  private openPictureMenu(index: number, x: number, y: number): boolean {
+    if (this.locked) return false;
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    this.setChartPick(index);
+    const strings = this.strings.pictures;
+    const info = this.pictures().find((picture) => picture.id === index);
+    const removable = !!info && info.removable;
+    const items: MenuItem[] = [
+      {
+        label: strings.remove,
+        disabled: !removable,
+        title: removable ? undefined : strings.wrapped,
+        explain: removable ? undefined : () => this.notify(strings.wrapped, 'error'),
+        action: () => this.attempt(() => this.removePicture(index)),
+      },
+    ];
+    this.showMenu(items, x, y);
+    return true;
+  }
+
+  /**
+   * The keys of a selected picture: the arrows move it (by ten pixels, by one with Shift; with Alt
+   * they size it, from its bottom right corner), Delete deletes it and Escape lets go of it. The
+   * other keys are taken as they are for a chart (see chartKey()); Enter and Ctrl+D do nothing.
+   */
+  private pictureKey(event: KeyboardEvent, picked: number, box: Rect | undefined): boolean {
+    const ctrl = event.ctrlKey || event.metaKey;
+    switch (event.key) {
+      case 'Escape':
+        this.setChartPick(undefined);
+        return true;
+      case 'Delete':
+      case 'Backspace':
+        if (event.shiftKey) return false;
+        if (!ctrl && !event.altKey) this.attempt(() => this.removePicture(picked));
+        return true;
+      case 'Enter':
+        return !(ctrl || event.altKey);
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight': {
+        if (ctrl || !box) return true;
+        const step = event.shiftKey ? 1 : 10;
+        const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
+        const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0;
+        const next = resizedRect(box, event.altKey ? 'se' : 'move', dx, dy, MIN_PICTURE_SIZE);
+        this.attempt(() => this.applyPictureRect(picked, next));
+        return true;
+      }
+      case 'F2':
+      case 'Home':
+      case 'End':
+        return true;
+      case 'PageUp':
+      case 'PageDown':
+        return !ctrl && !event.altKey;
+      default: {
+        if (event.key.length !== 1) return false;
+        if (!ctrl && !event.altKey) return true;
+        if (ctrl && !event.altKey && !event.shiftKey && (event.key === 'd' || event.key === 'D')) return true;
+        return ctrl && !event.altKey && 'biuaBIUA'.indexOf(event.key) >= 0;
+      }
+    }
+  }
+
+  /** The first file of a transfer (a drop, a paste) that says it is a picture that can be inserted; undefined when there is none. */
+  private pictureFile(data: DataTransfer | null): File | undefined {
+    if (!data) return undefined;
+    const wanted = /^image\/(png|jpeg|gif|bmp)$/;
+    const items = data.items;
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].kind !== 'file' || !wanted.test(items[i].type)) continue;
+        const file = items[i].getAsFile();
+        if (file) return file;
+      }
+    }
+    const files = data.files;
+    if (files) for (let i = 0; i < files.length; i++) if (wanted.test(files[i].type)) return files[i];
+    return undefined;
+  }
+
+  /** Reads a file the user gave and inserts it as a picture at a cell. What it is is read from its bytes; its name stays out of the workbook. */
+  private readPictureFile(file: Blob, at?: { row: number; col: number }): void {
+    if (file.size > MAX_PICTURE_BYTES) {
+      this.notify(this.strings.pictures.tooLarge, 'error');
+      return;
+    }
+    const sheet = this.state().sheet;
+    const reader = new FileReader();
+    reader.onload = () => {
+      // A view that went away, or another sheet shown meanwhile: the picture is not put somewhere else.
+      if (this.destroyed || !(reader.result instanceof ArrayBuffer) || this.state().sheet !== sheet) return;
+      const bytes = new Uint8Array(reader.result);
+      this.attempt(() => void this.insertPicture(bytes, at ? { at } : {}));
+    };
+    reader.onerror = () => {
+      if (!this.destroyed) this.notify(this.strings.pictures.notSupported, 'error');
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  /** Whether files dragged over the view may be dropped as a picture. */
+  /** Whether what is dragged over the view holds files. */
+  private dragsFiles(event: DragEvent): boolean {
+    const data = event.dataTransfer;
+    const types = data ? data.types : undefined;
+    if (this.destroyed || !types) return false;
+    for (let i = 0; i < types.length; i++) if (types[i] === 'Files') return true;
+    return false;
+  }
+
+  /** Why files dropped on the grid are not inserted now; undefined when they are. */
+  private dropProblem(): string | undefined {
+    if (this.locked || this.edit || this.state().sheet.kind !== 'worksheet') return this.strings.pictures.dropRefused;
+    return this.pictureProblem;
+  }
+
+  // Files dragged over the grid are never left to the browser, which would open the file in place of the page.
+  private onDragOver = (event: DragEvent): void => {
+    if (!this.dragsFiles(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = this.dropProblem() === undefined ? 'copy' : 'none';
+  };
+
+  private onDrop = (event: DragEvent): void => {
+    if (!this.dragsFiles(event)) return;
+    event.preventDefault();
+    const problem = this.dropProblem();
+    if (problem !== undefined) {
+      this.notify(problem, 'error');
+      return;
+    }
+    const file = this.pictureFile(event.dataTransfer);
+    if (!file) {
+      this.notify(this.strings.pictures.notSupported, 'error');
+      return;
+    }
+    const point = this.canvasPoint(event);
+    this.readPictureFile(file, this.cellAt(point.x, point.y));
+  };
+
   // -------------------------------------------------- drawings and comments
 
   /** What floats above the cells of a sheet; undefined for a sheet without drawings and comments, which then costs nothing to draw. */
@@ -3977,10 +4285,9 @@ export class WorkbookView {
     if (sheet.kind !== 'worksheet' || SheetDrawings.isEmpty(sheet)) return undefined;
     let found = this.drawings.get(sheet);
     if (!found) {
-      const media = this.workbook.media;
-      if (!this.images && media && typeof media.readPart === 'function') {
-        // Pictures are read from the file and decoded when they first come into view.
-        this.images = new ImageStore(media, coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => this.schedule());
+      if (!this.images) {
+        // Pictures are read (from the file, or from the model for those added since) and decoded when they first come into view.
+        this.images = new ImageStore(pictureSource(this.workbook), coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => this.schedule());
       }
       found = new SheetDrawings(sheet, { images: this.images, labels: this.drawingLabels(), charts: this.chartRenderer() });
       this.drawings.set(sheet, found);
@@ -5965,7 +6272,7 @@ export class WorkbookView {
     if (state.sheet.kind !== 'worksheet') return;
     this.closeMenu();
     // Asked for by the application or by a press on the cell: the chart that was selected is let go of.
-    if (this.pickedChart() !== undefined) this.setChartPick(undefined, false);
+    if (this.pickedDrawing() !== undefined) this.setChartPick(undefined, false);
     this.beginEdit();
     const edit = this.edit as Edit | undefined;
     if (!edit) return;
@@ -6050,7 +6357,9 @@ export class WorkbookView {
    */
   localizeError(error: unknown): string {
     const strings = this.strings;
-    if (error instanceof CollabUnsupportedError) return error.what === 'copySheet' ? strings.collab.copySheet : error.what === 'size' ? strings.collab.tooLarge : error.what === 'readOnly' ? strings.collab.readOnly : strings.collab.unsupported;
+    if (error instanceof CollabUnsupportedError) {
+      return error.what === 'copySheet' ? strings.collab.copySheet : error.what === 'size' ? strings.collab.tooLarge : error.what === 'readOnly' ? strings.collab.readOnly : error.what === 'picture' ? strings.collab.pictures : strings.collab.unsupported;
+    }
     // A data validation speaks for itself: the words are those of the file.
     if (error instanceof ValidationError) return error.display;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
@@ -6107,6 +6416,13 @@ export class WorkbookView {
     if (/^The rule needs|^A list needs a value|^A custom rule needs a value/.test(message)) return rules.needValue(rules.value);
     if ((match = /^The items of a list written into the rule cannot be longer than (\d+) characters together$/.exec(message))) return rules.listTooLong(Number(match[1]));
     if ((match = /^The (.+) of a rule cannot be longer than (\d+) characters$/.exec(message))) return rules.textTooLong(/title/.test(match[1]) ? rules.title : rules.message, Number(match[2]));
+    const pictures = strings.pictures;
+    if (/^A picture cannot be larger than/.test(message)) return pictures.tooLarge;
+    if (/^The bytes are (not a PNG|a picture of another kind)|^A picture is (a PNG|given as its bytes)|^The picture cannot be read$/.test(message)) return pictures.notSupported;
+    if (/^The pictures added to a workbook cannot hold more/.test(message)) return pictures.tooMany;
+    if (message === 'Cannot change the pictures of this sheet: it is protected') return pictures.protectedSheet;
+    if (/^Cannot change the pictures of this sheet:/.test(message)) return pictures.placesFixed;
+    if (/^Cannot delete this picture: it shares/.test(message)) return pictures.wrapped;
     const charts = strings.charts;
     if (/is not a range of cells of this workbook$|^The range of a chart is a range of cells/.test(message)) return charts.badRange;
     if (message === 'A series needs a range of values' || message === 'A chart has at least one series') return charts.needValues;
@@ -7013,7 +7329,7 @@ export class WorkbookView {
    */
   paste(text: string, html?: string): void {
     if (this.destroyed || this.locked) return;
-    const picked = this.pickedChart();
+    const picked = this.pickedDrawing();
     const kind = chartPasteKind(html, this.chartHeld ? this.chartHeld.mark : undefined);
     if (kind === 'chart') {
       // With a chart selected the copy goes beside the chart it was taken from; with cells selected, to the active cell.
@@ -7028,7 +7344,7 @@ export class WorkbookView {
     }
     if (picked !== undefined) {
       // Cells are not pasted under a chart that is selected: the selection of cells is not what the user is looking at.
-      this.notify(this.strings.charts.noCellPaste, 'info');
+      this.notify(this.isPictureAt(picked) ? this.strings.pictures.noCellPaste : this.strings.charts.noCellPaste, 'info');
       return;
     }
     this.commitEditing();
@@ -7091,7 +7407,7 @@ export class WorkbookView {
   private structuralKey(kind: 'insert' | 'delete'): boolean {
     // With a chart selected the key is not about the rows and columns that are selected under it; it is
     // not taken either, so that it stays the zoom of the browser.
-    if (this.locked || this.pickedChart() !== undefined) return false;
+    if (this.locked || this.pickedDrawing() !== undefined) return false;
     const range = this.state().range;
     const rows = fullWidth(range) && !fullHeight(range);
     const cols = fullHeight(range) && !fullWidth(range);
@@ -7739,7 +8055,7 @@ export class WorkbookView {
 
   private onInput = (event: Event): void => {
     if (this.destroyed) return;
-    if (!this.edit && this.pickedChart() !== undefined) {
+    if (!this.edit && this.pickedDrawing() !== undefined) {
       // A chart is selected: what an input method or a key the view did not see put into the input goes
       // nowhere. While the method composes the input is left alone; what it leaves is taken out after.
       if ((event as InputEvent).isComposing !== true && !this.composing) this.syncInput();
@@ -7769,7 +8085,7 @@ export class WorkbookView {
   private onCompositionStart = (): void => {
     if (this.destroyed || this.edit || this.locked || this.state().sheet.kind !== 'worksheet') return;
     // With a chart selected no cell is edited (see chartKey()).
-    if (this.pickedChart() !== undefined) return;
+    if (this.pickedDrawing() !== undefined) return;
     // An input method composes in place; the editor has to be there from its first key.
     this.selectIdleText();
     this.beginEdit(this.input.value, true);
@@ -7782,7 +8098,7 @@ export class WorkbookView {
     if (this.destroyed) return;
     this.syncSheetLock();
     // What was composed while a chart was selected is not kept in the input.
-    if (!this.composing && !this.edit && event.target === this.input && this.pickedChart() !== undefined) this.syncInput();
+    if (!this.composing && !this.edit && event.target === this.input && this.pickedDrawing() !== undefined) this.syncInput();
   };
 
   /** A press inside the editor places the caret: from here on the arrow keys move it. */
@@ -8183,6 +8499,12 @@ export class WorkbookView {
     const data = event.clipboardData;
     if (!data) return;
     const text = data.getData('text/plain');
+    // A picture without text (one copied from an image editor or a page) is inserted at the active cell.
+    const picture = text === '' && !this.locked ? this.pictureFile(data) : undefined;
+    if (picture) {
+      this.readPictureFile(picture);
+      return;
+    }
     // What the clipboard holds is all here: no HTML is HTML that is about nothing.
     const html = data.getData('text/html') || '';
     this.attempt(() => this.paste(text, html));
@@ -8559,7 +8881,7 @@ export class WorkbookView {
     }
     const onChart = this.openChartMenu(point.x, point.y);
     // The menu of a cell is about the cells: the chart that was selected is let go of.
-    if (!onChart && this.pickedChart() !== undefined) this.setChartPick(undefined, false);
+    if (!onChart && this.pickedDrawing() !== undefined) this.setChartPick(undefined, false);
     if (onChart || this.openHeaderMenu(point.x, point.y)) {
       event.preventDefault();
       // On a touch screen this is the long press; lifting the finger must not count as a tap.
@@ -8575,7 +8897,7 @@ export class WorkbookView {
     if (touch.domX !== this.domX || touch.domY !== this.domY) return;
     const onChart = this.openChartMenu(touch.x, touch.y);
     // As with a right click: the menu of a cell is about the cells, and the chart that was selected is let go of.
-    if (!onChart && this.pickedChart() !== undefined) this.setChartPick(undefined, false);
+    if (!onChart && this.pickedDrawing() !== undefined) this.setChartPick(undefined, false);
     if (onChart || this.openHeaderMenu(touch.x, touch.y)) touch.consumed = true;
   };
 
@@ -8595,9 +8917,9 @@ export class WorkbookView {
     const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
     const chart = resize || this.locked || this.typingFormula() ? -1 : this.chartUnder(point.x, point.y);
     if (chart >= 0) {
-      // A second click on a chart opens its dialog.
+      // A second click on a chart opens its dialog; a picture has none, and stays selected.
       this.setChartPick(chart);
-      this.attempt(() => void this.openChartDialog(chart));
+      if (this.isChartAt(chart)) this.attempt(() => void this.openChartDialog(chart));
       return;
     }
     if (resize) {
@@ -8783,7 +9105,7 @@ export class WorkbookView {
     const pointerId = pointer.pointerId === undefined ? 0 : pointer.pointerId;
     const point = this.canvasPoint(event);
     if (this.chartDrag && this.chartDrag.pointerId === pointerId) {
-      this.moveChartDrag(point);
+      this.moveChartDrag(point, event.shiftKey);
       return;
     }
     const touch = this.touch;

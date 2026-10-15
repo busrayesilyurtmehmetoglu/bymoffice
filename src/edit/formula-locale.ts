@@ -243,6 +243,23 @@ const TURKISH_FUNCTIONS: [string, string][] = [
   ['BENZERSİZ', 'UNIQUE'],
   ['SIRALI', 'SEQUENCE'],
   ['RASTGELEDİZİ', 'RANDARRAY'],
+  // The functions that shape arrays and split text. UNSURE, from memory only: of VSTACK both
+  // spellings remembered are taken ("DÜŞEY" as in DÜŞEYARA, and "DİKEY").
+  ['DÜŞEYYIĞ', 'VSTACK'],
+  ['DİKEYYIĞ', 'VSTACK'],
+  ['YATAYYIĞ', 'HSTACK'],
+  ['AL', 'TAKE'],
+  ['BIRAK', 'DROP'],
+  ['SATIRSEÇ', 'CHOOSEROWS'],
+  ['SÜTUNSEÇ', 'CHOOSECOLS'],
+  ['GENİŞLET', 'EXPAND'],
+  ['SÜTUNA', 'TOCOL'],
+  ['SATIRA', 'TOROW'],
+  ['SATIRSAR', 'WRAPROWS'],
+  ['SÜTUNSAR', 'WRAPCOLS'],
+  ['METİNBÖL', 'TEXTSPLIT'],
+  ['ÖNCEKİMETİN', 'TEXTBEFORE'],
+  ['SONRAKİMETİN', 'TEXTAFTER'],
   ['KÖPRÜ', 'HYPERLINK'],
   ['FORMÜLMETNİ', 'FORMULATEXT'],
   ['ÇOKEĞER', 'IFS'],
@@ -314,7 +331,7 @@ function nameKey(text: string): string {
  * (as nameKey() has them). Where the workbook has a defined name of that spelling, a call
  * of it is left as it is typed.
  */
-const SHORT_NAMES = new Set(['VAL', 'S', 'M', 'KOD', 'TEK', 'TIP', 'DA', 'BD', 'GD', 'YAT']);
+const SHORT_NAMES = new Set(['VAL', 'S', 'M', 'KOD', 'TEK', 'TIP', 'DA', 'BD', 'GD', 'YAT', 'AL']);
 
 let turkishNames: Map<string, string> | undefined;
 

@@ -50,7 +50,11 @@ export function declaredImageSize(bytes: Uint8Array, type: string): { width: num
   const size = (width: number, height: number) => ({ width, height });
   if (type === 'image/png') return bytes.length >= 24 ? size(u32be(16), u32be(20)) : undefined;
   if (type === 'image/gif') return size(u16le(6), u16le(8));
-  if (type === 'image/bmp') return bytes.length >= 26 ? size(Math.abs(i32le(18)), Math.abs(i32le(22))) : undefined;
+  if (type === 'image/bmp') {
+    // An OS/2 header (BITMAPCOREHEADER, 12 bytes) gives the size in two 16-bit words; the others in two 32-bit numbers, the height negative for a picture stored top down.
+    if (bytes.length >= 22 && i32le(14) === 12) return size(u16le(18), u16le(20));
+    return bytes.length >= 26 ? size(Math.abs(i32le(18)), Math.abs(i32le(22))) : undefined;
+  }
   if (type === 'image/jpeg') {
     // Segments until the frame header; every step moves forward, so the loop ends with the data.
     let at = 2;

@@ -177,6 +177,8 @@ export type Op =
       sheet: number;
       drawings: SheetDrawing[] | undefined;
       by?: OpCommand;
+      /** Set on an inverse that keeps pictures alive which the model no longer holds (see DrawingPicture.data): roughly their kilobytes, for History. */
+      weight?: number;
     }
   | { type: 'insert'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
   | { type: 'delete'; sheet: number; axis: 'row' | 'col'; at: number; count: number }
@@ -1657,7 +1659,11 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       else delete sheet.drawings;
       // Not `modified`: no cell changed, so the sheet part stays as it is and nothing has to be calculated again.
       sheet.drawingsModified = true;
-      return { type: 'setDrawings', sheet: op.sheet, drawings: previous };
+      const inverse: Extract<Op, { type: 'setDrawings' }> = { type: 'setDrawings', sheet: op.sheet, drawings: previous };
+      // The bytes of added pictures the step takes away are kept alive by its inverse: they weigh on the history.
+      const kept = keptPictureBytes(previous, op.drawings);
+      if (kept > 0) inverse.weight = Math.ceil(kept / 1024);
+      return inverse;
     }
     case 'setDataValidations': {
       const sheet = sheetAt(workbook, op.sheet);
@@ -1799,6 +1805,24 @@ export function applyOp(workbook: Workbook, op: Op): Op {
  */
 const MAX_UNDO_WEIGHT = 300000;
 
+/** The bytes of the added pictures of `from` (see DrawingPicture.data) that `to` does not hold, each set of bytes counted once. */
+function keptPictureBytes(from: SheetDrawing[] | undefined, to: SheetDrawing[] | undefined): number {
+  if (!from) return 0;
+  const staying = new Set<Uint8Array>();
+  for (const drawing of to || []) {
+    const object = drawing ? drawing.object : undefined;
+    if (object && object.type === 'picture' && object.data && object.data.bytes) staying.add(object.data.bytes);
+  }
+  let total = 0;
+  for (const drawing of from) {
+    const object = drawing ? drawing.object : undefined;
+    if (!object || object.type !== 'picture' || !object.data || !(object.data.bytes instanceof Uint8Array) || staying.has(object.data.bytes)) continue;
+    staying.add(object.data.bytes);
+    total += object.data.bytes.length;
+  }
+  return total;
+}
+
 function weightOf(ops: Op[]): number {
   let weight = 0;
   for (const op of ops) {
@@ -1807,7 +1831,7 @@ function weightOf(ops: Op[]): number {
     else if (op.type === 'setAutoFilter') weight += ((op.show ? op.show.length : 0) + (op.hide ? op.hide.length : 0)) / 16;
     // The list of comments a step replaced is kept, not the comments themselves.
     else if (op.type === 'setComments') weight += (op.comments ? op.comments.length : 0) / 16;
-    else if (op.type === 'setDrawings') weight += (op.drawings ? op.drawings.length : 0) / 16;
+    else if (op.type === 'setDrawings') weight += (op.drawings ? op.drawings.length : 0) / 16 + (op.weight || 0);
     else if (op.type === 'setDataValidations') weight += (op.validations ? op.validations.length : 0) / 16;
     else if (op.type === 'setConditionalFormats') weight += (op.formats ? op.formats.length : 0) / 16;
     // The records of a cache a refresh replaced are kept for its undo.

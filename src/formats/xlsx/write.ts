@@ -56,9 +56,11 @@ import type { OpcPackage } from '../../opc';
 import { writeInOneGo, type PartReads } from '../part-reads';
 import { decodeXmlBytes, localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
-import { adjustDrawingAnchor, commentCellNow, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
+import { adjustDrawingAnchor, anchorRect, commentCellNow, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
+import { createSheetMetrics, type SheetMetrics } from '../../layout/sheet-metrics';
+import { isAddedPicture, PICTURE_EXTENSIONS } from '../../model/sheet/pictures';
 import { breakSpanOf, movePageBreak } from '../../model/sheet/page-breaks';
-import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, stripChartPart, type DrawingPartEdit } from './chart-write';
+import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, pictureAnchorXml, stripChartPart, type DrawingPartEdit } from './chart-write';
 import { drawingSource } from './drawings';
 import type { Chart } from '../../model/sheet/chart';
 import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
@@ -484,6 +486,13 @@ export function rowXml(writer: CellWriter, index: number, row: Row | undefined):
 }
 
 /** Every row of the model, in order. */
+/** FNV-1a of every byte: what tells the bytes of pictures apart before they are compared. */
+function bytesHash(bytes: Uint8Array): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) hash = Math.imul(hash ^ bytes[i], 0x01000193);
+  return hash >>> 0;
+}
+
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
@@ -4596,6 +4605,23 @@ interface NoteWrites {
 
 const SAVES = new WeakMap<Workbook, SaveState>();
 
+/**
+ * The bytes the file had for a part that a save of the workbook took out of the package (a picture
+ * nothing showed any more, the parts of a sheet that was deleted); undefined for any other part.
+ * What the model may show again (a step undone) is read from here while the package lacks it.
+ */
+export function takenOutPart(workbook: Workbook, part: string): Uint8Array | undefined {
+  const saved = SAVES.get(workbook);
+  if (!saved) return undefined;
+  const lower = part.toLowerCase();
+  for (const name of saved.removed.keys()) {
+    if (name.toLowerCase() !== lower) continue;
+    const bytes = saved.originals.get(name);
+    return bytes ? bytes : undefined;
+  }
+  return undefined;
+}
+
 /** The key of the workbook's own parts in SaveState.moved; no sheet part has it. */
 const BOOK = '';
 
@@ -5382,8 +5408,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     for (const drawing of now) {
       const from = drawing.from || drawing;
       if (places.has(from)) became.set(from, drawing);
-      else if (drawing.object.type === 'chart' && drawing.object.part === undefined) added.push(drawing);
-      else if (sheetXml !== undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing of the model is neither in the file nor a chart that was added`);
+      else if ((drawing.object.type === 'chart' && drawing.object.part === undefined) || isAddedPicture(drawing.object)) added.push(drawing);
+      else if (sheetXml !== undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing of the model is neither in the file nor a chart or a picture that was added`);
     }
     const partEdits = new Map<string, DrawingPartEdit>();
     const editOf = (part: string): DrawingPartEdit => {
@@ -5479,6 +5505,47 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       ]);
       return { anchor: anchorOf(drawing), relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Chart', description: object.description, from: frames.get(drawing), rel };
     };
+    // Pictures that were added: each set of bytes gets one part, however many pictures of the sheet show it, and one
+    // relationship of each drawing part that shows it.
+    let metrics: SheetMetrics | undefined;
+    // Known by their length and a hash of every byte: only bytes that agree in both are compared (many pictures alike in all but a few bytes cost no more than different ones).
+    const media = new Map<string, { bytes: Uint8Array; part: string }[]>();
+    const embeds = new Map<string, string>();
+    const mediaPartOf = (bytes: Uint8Array, type: string): string => {
+      const key = `${bytes.length}:${bytesHash(bytes)}`;
+      const alike = media.get(key) || [];
+      for (const item of alike) if (item.bytes === bytes || sameBytes(item.bytes, bytes)) return item.part;
+      const extension = PICTURE_EXTENSIONS[type];
+      if (extension === undefined) throw new Error(`Cannot write sheet "${sheet.name}": a picture that was added is of a kind that is not written`);
+      const part = freshName(`${dir}/media/image`, `.${extension}`);
+      out.fresh.push([part, bytes, type]);
+      out.names.push(part);
+      alike.push({ bytes, part });
+      media.set(key, alike);
+      return part;
+    };
+    const pictureFor = (drawing: SheetDrawing, drawingPart: string, newId: () => string): { item: DrawingPartEdit['added'][number]; rel?: XmlElement } => {
+      const object = drawing.object;
+      if (!isAddedPicture(object)) throw new Error(`Cannot write sheet "${sheet.name}": a picture that was added has no bytes`);
+      const part = mediaPartOf(object.data.bytes, object.data.type);
+      const key = `${drawingPart.toLowerCase()}\u0000${part.toLowerCase()}`;
+      let relId = embeds.get(key);
+      let rel: XmlElement | undefined;
+      if (relId === undefined) {
+        relId = newId();
+        embeds.set(key, relId);
+        rel = element('Relationship', [
+          ['Id', relId],
+          ['Type', `${relBase}/image`],
+          ['Target', relativeTarget(drawingPart, part)],
+        ]);
+      }
+      const anchor = anchorOf(drawing);
+      if (!metrics) metrics = createSheetMetrics(sheet);
+      const rect = anchorRect(anchor, metrics);
+      const box = { x: rect.x * 9525, y: rect.y * 9525, width: rect.width * 9525, height: rect.height * 9525 };
+      return { item: { anchor, relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Picture', description: object.description, picture: { box } }, rel };
+    };
     if (added.length > 0 && home && !partEdits.has(home.part)) editOf(home.part);
 
     for (const [drawingPart, edit] of partEdits) {
@@ -5501,6 +5568,20 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       const newPartId = relationIds(drawingPart, childrenNamed(partRels.root, 'Relationship'));
       if (home && drawingPart === home.part) {
         for (const drawing of added) {
+          if (drawing.object.type === 'picture') {
+            const made = pictureFor(drawing, drawingPart, () => {
+              const id = newPartId();
+              partIds.add(id);
+              return id;
+            });
+            if (made.rel) {
+              made.rel.name = `${relPrefix}Relationship`;
+              partRels.root.children.push(made.rel);
+              relsChanged = true;
+            }
+            edit.added.push(made.item);
+            continue;
+          }
           const id = newPartId();
           partIds.add(id);
           const made = chartFor(drawing, drawingPart, id);
@@ -5561,6 +5642,17 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       const newPartId = relationIds(drawingPart, []);
       const framed: DrawingPartEdit['added'] = [];
       added.forEach((drawing, i) => {
+        if (drawing.object.type === 'picture') {
+          const made = pictureFor(drawing, drawingPart, newPartId);
+          if (made.rel) {
+            made.rel.name = `${prefixOf(partRels.root)}Relationship`;
+            partRels.root.children.push(made.rel);
+          }
+          const item = made.item;
+          anchors.push(pictureAnchorXml(item.anchor, item.relId, i + 2, item.name, item.description, relBase === NS_REL_STRICT, item.picture && item.picture.box));
+          framed.push(item);
+          return;
+        }
         const made = chartFor(drawing, drawingPart, newPartId());
         made.rel.name = `${prefixOf(partRels.root)}Relationship`;
         partRels.root.children.push(made.rel);

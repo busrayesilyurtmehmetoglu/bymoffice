@@ -470,6 +470,38 @@ test('the values a file has for a dynamic array formula stay until something it 
   assert.deepEqual(column(workbook, 'B1', 4), [1, 2, 3, 4]);
 });
 
+test('a formula the file saved as circular through its spill fills nothing, and takes nothing of the budget of spills (seed 7009)', () => {
+  const make = () => {
+    const workbook = book({
+      // Spilling into B1, A1 would read its own spill: a circle, saved as 0 in its own cell.
+      A1: { f: 'B1:C1', dynamic: true, ref: 'A1', v: 0 },
+      A5: 3,
+      E1: { f: '_xlfn.SEQUENCE(A5)', dynamic: true, ref: 'E1:E3', v: 1 },
+      E2: 2,
+      E3: 3,
+    });
+    for (const address of ['E2', 'E3']) {
+      const at = parseCellRef(address) as { row: number; col: number };
+      place(workbook.sheets[0], address, { ...(getCell(workbook.sheets[0], at.row, at.col) as Cell), spilled: true });
+    }
+    return workbook;
+  };
+  const options = { limits: { spillCells: 6, workbookSpillCells: 3 } };
+  // The session opened the file, then A5 changed: E1 wants two cells, A1 none.
+  const session = make();
+  const engine = new CalcEngine(session, options);
+  engine.recalculate(engine.uncalculated());
+  engine.recalculate([place(session.sheets[0], 'A5', makeCell(2))]);
+  // A workbook built afresh from the same cells.
+  const fresh = make();
+  place(fresh.sheets[0], 'A5', makeCell(2));
+  new CalcEngine(fresh, options).recalculate(undefined, { overwrite: true });
+  assert.deepEqual(column(fresh, 'E1', 3), [1, 2, undefined]);
+  assert.deepEqual(column(session, 'E1', 3), [1, 2, undefined]);
+  assert.equal(shown(session, 'A1'), 0);
+  assert.equal(shown(session, 'B1'), undefined);
+});
+
 test('a volatile array is calculated by every participant alike when the random numbers are', () => {
   const make = () => {
     let seed = 7;
