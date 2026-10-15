@@ -862,6 +862,8 @@ export function tryOps<T>(workbook: Workbook, engine: CalcEngine | undefined, op
       journal.rollback();
     }
     journal.close();
+    // The cells are back as they were, whatever was calculated: the engine follows them (how far a column holds something).
+    if (engine) engine.cellsChanged(changed);
     sheets.forEach((sheet, index) => {
       const was = saved[index];
       if (was.modified === undefined) delete sheet.modified;

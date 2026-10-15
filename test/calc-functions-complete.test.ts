@@ -354,7 +354,8 @@ test('functions that compare text do not depend on the locale', () => {
 
 /** The pairs of the table in formula-locale.ts, read from what the translation does with each name. */
 function storedName(local: string): string {
-  const stored = formulaFromLocal(`=${local}()`, LOCALE_TR);
+  // Without what files add to newer functions ("_xlfn.").
+  const stored = formulaFromLocal(`=${local}()`, LOCALE_TR).replace(/_xlfn\.(_xlws\.)?/, '');
   return stored.slice(1, stored.length - 2);
 }
 

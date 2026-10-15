@@ -682,6 +682,14 @@ export interface CellFormula {
   ref?: string;
   /** Shared formula group index. */
   si?: number;
+  /**
+   * A dynamic array formula (Excel 365): calculated without implicit intersection, its array
+   * result spills from its cell into the cells below and to the right. Its `type` is "normal";
+   * `ref` is where it spilled when it was last calculated (the cell alone when it is #SPILL!),
+   * and a formula with a `ref` is written to a file as a dynamic array formula. A file marks
+   * such a formula with cell metadata (`cm`); a formula typed into a cell is one too.
+   */
+  dynamic?: boolean;
   /** Attributes of <f> the model has no field for, kept to be written back. */
   attrs?: Map<string, string>;
 }
@@ -712,6 +720,14 @@ export interface Cell {
   vm?: number;
   /** The cell shows phonetic text. */
   ph?: boolean;
+  /**
+   * The value is the result of a dynamic array formula that spills into the cell, no content
+   * of the cell's own: such a cell is not in the way of a spill. A change of the format keeps
+   * it (a copy of the cell with another style); anything typed or pasted into the cell is a new
+   * cell without it. The reader marks the cells of a spill a file has (those inside the `ref`
+   * of the formula); nothing of it is written to a file or sent to others editing together.
+   */
+  spilled?: true;
 }
 
 export interface Row {
@@ -1719,4 +1735,12 @@ export function rangeName(range: CellRange): string {
 
 export function getCell(sheet: Sheet, row: number, col: number): Cell | undefined {
   return sheet.rows.get(row)?.cells[col];
+}
+
+/**
+ * Whether a formula fills a range of cells as one unit, the range of its `ref`: an array
+ * formula, a table of data, or a dynamic array formula (the cells it spilled into).
+ */
+export function fillsRange(formula: CellFormula | undefined): formula is CellFormula & { ref: string } {
+  return !!formula && typeof formula.ref === 'string' && (formula.type === 'array' || formula.type === 'dataTable' || formula.dynamic === true);
 }

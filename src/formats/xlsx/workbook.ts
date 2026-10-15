@@ -5,13 +5,14 @@
 
 import type { OpcPackage, Relationship } from '../../opc';
 import { MAX_WORKBOOK_CHARTS, MAX_WORKBOOK_CHART_POINTS } from '../../model/sheet/chart';
-import { createSheet, type DefinedName, type DrawingChart, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
+import { createSheet, parseRange, type CellRange, type DefinedName, type DrawingChart, type Sheet, type SheetKind, type SheetState, type Workbook } from '../../model/sheet/types';
 import { childElements, localName, serializeXml, type XmlDocument, type XmlElement } from '../../xml';
 import { parseChart } from './chart';
 import { pivotTableParts, readPivots } from './pivot';
 import { parsePersons, readSheetComments, vmlTakesNotes } from './comments';
 import { parseChartEx } from './chartex';
 import { readSheetDrawings, type ChartReading, type DrawingPartFacts } from './drawings';
+import { dynamicArrayCells, METADATA_RELATIONSHIP } from './metadata';
 import { parseSharedStrings } from './shared-strings';
 import { parseStyles } from './styles';
 import { parseChartSheetSetup, parseWorksheet } from './worksheet';
@@ -48,6 +49,50 @@ async function optionalXml(pkg: OpcPackage, rels: Relationship[], suffix: string
   return part && pkg.hasPart(part) ? pkg.readXml(part) : undefined;
 }
 
+/**
+ * The array formulas of a sheet whose cells the metadata marks as dynamic array formulas
+ * become such formulas of the model (see CellFormula.dynamic): ordinary formulas that know
+ * where they spill. Their cells keep `cm`, which says the same when they are written again.
+ */
+function markDynamicFormulas(sheet: Sheet, dynamicCells: Set<number>): void {
+  const spills: CellRange[] = [];
+  sheet.rows.forEach((row, index) => {
+    const cells = row.cells;
+    for (let col = 0; col < cells.length; col++) {
+      const cell = cells[col];
+      if (!cell || cell.cm === undefined || !cell.formula || cell.formula.type !== 'array' || !dynamicCells.has(cell.cm)) continue;
+      cells[col] = { ...cell, formula: { ...cell.formula, type: 'normal', dynamic: true } };
+      const range = typeof cell.formula.ref === 'string' ? parseRange(cell.formula.ref) : undefined;
+      // A spill starts at the cell of its formula; one too large for the engine to fill is none.
+      if (range && range.top === index && range.left === col && (range.bottom - range.top + 1) * (range.right - range.left + 1) <= MAX_MARKED_SPILL) spills.push(range);
+    }
+  });
+  // The cells of a spill without a formula of their own hold what it spilled (Cell.spilled). What is looked at in
+  // all is bounded: rows and cells of the spills together, past which the cells of the rest are not marked (they
+  // are then in the way of their formula, which keeps the values the file has until something it reads changes).
+  let budget = MAX_MARKED_CELLS;
+  for (const range of spills) {
+    for (let r = range.top; r <= range.bottom && budget > 0; r++) {
+      budget--;
+      const row = sheet.rows.get(r);
+      if (!row) continue;
+      const cells = row.cells;
+      const last = Math.min(range.right, cells.length - 1);
+      for (let col = range.left; col <= last && budget > 0; col++) {
+        budget--;
+        const cell = cells[col];
+        if (!cell || cell.formula || cell.spilled || (r === range.top && col === range.left)) continue;
+        // The rows were just read: nothing else holds them yet.
+        cells[col] = { ...cell, spilled: true };
+      }
+    }
+  }
+}
+
+/** Largest spill whose cells are marked, as large as the engine fills; and the most cells marked in one sheet. */
+const MAX_MARKED_SPILL = 1000000;
+const MAX_MARKED_CELLS = 4000000;
+
 export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   const main = await pkg.mainPart();
   if (!main) throw new Error('Invalid xlsx: the package has no workbook part');
@@ -58,6 +103,9 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
   const stringsPart = rels.find((rel) => rel.type.endsWith('/sharedStrings'))?.part;
   const sharedStrings = stringsPart && pkg.hasPart(stringsPart) ? parseSharedStrings(await pkg.readPart(stringsPart)) : [];
   const styles = parseStyles(await optionalXml(pkg, rels, '/styles'), await optionalXml(pkg, rels, '/theme'));
+  // The values of `cm` that mark the cells of dynamic array formulas.
+  const metadataPart = rels.find((rel) => rel.type.endsWith(`/${METADATA_RELATIONSHIP}`) && !rel.external)?.part;
+  const dynamicCells = metadataPart && pkg.hasPart(metadataPart) ? dynamicArrayCells(await pkg.readPart(metadataPart)) : new Set<number>();
 
   // A chart or a pivot table reads cells of some sheet from a part that says nothing about which.
   // While a workbook has any, rows and columns stay where they are in all of its sheets.
@@ -124,6 +172,7 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     // A chart sheet holds a drawing, not cells; it stays in the package as it is.
     if (kind !== 'chartsheet') {
       parseWorksheet(await pkg.readPart(rel.part), sharedStrings, sheet);
+      if (dynamicCells.size > 0) markDynamicFormulas(sheet, dynamicCells);
       const sheetRels = await pkg.relationships(rel.part);
       if (kind === 'worksheet') {
         const tables = pivotTableParts(sheetRels);

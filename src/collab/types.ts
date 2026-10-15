@@ -20,6 +20,8 @@ export interface WireFormula {
   r?: string;
   /** Attributes of <f> the model has no field for. */
   a?: [string, string][];
+  /** A dynamic array formula: its array result spills (where to is worked out by every participant). */
+  d?: 1;
 }
 
 /** What a cell holds beside its format. */

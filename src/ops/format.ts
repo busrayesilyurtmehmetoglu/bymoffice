@@ -9,6 +9,7 @@ import {
   MAX_COLS,
   MAX_ROWS,
   getCell,
+  fillsRange,
   parseRange,
   type Alignment,
   type Border,
@@ -375,7 +376,7 @@ function arrayAreas(sheet: Sheet): { area: CellRange; ref: string }[] {
   for (const row of sheet.rows.values()) {
     row.cells.forEach((cell) => {
       const formula = cell.formula;
-      if (!formula || (formula.type !== 'array' && formula.type !== 'dataTable') || formula.ref === undefined) return;
+      if (!fillsRange(formula)) return;
       const area = parseRange(formula.ref);
       if (!area || (area.top === area.bottom && area.left === area.right)) return;
       out.push({ area, ref: formula.ref });

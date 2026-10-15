@@ -2,6 +2,7 @@
 // a range, copying and pasting. These functions only build operations; the
 // caller applies them through a History so that each is one undo step.
 
+import { needsDynamic } from '../calc/dynamic';
 import { parseFormula } from '../calc/parse';
 import { shiftFormula } from '../calc/refs';
 import { MAX_PASTE_CELLS, parseTsvLimited, toHtmlTable, toTsv } from '../edit/clipboard';
@@ -9,7 +10,7 @@ import { cellEditText, parseCellInput } from '../edit/input';
 import { builtinFormatId, formatCell } from '../format/cell-format';
 import type { FormatLocale } from '../format/locale';
 import { resolveCellStyle } from '../model/sheet/color';
-import { MAX_COLS, MAX_ROWS, getCell, type Cell, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, getCell, parseRange, type Cell, type CellRange, type Sheet, type SheetComment, type Workbook } from '../model/sheet/types';
 import { rowRunsWithout, rowsHiddenByFilter } from './filter';
 import { DEFAULT_NOTE_AUTHOR, MAX_SHEET_NOTES, cellNow, clearNotes, notesBlocked } from './notes';
 import { copiedRulesExtent, copyRules, cutRules, pasteRules, type CopiedRules } from './rules';
@@ -17,6 +18,11 @@ import { ensureCellFormat, ensureNumberFormat, explicitFormula, sharedMasters, t
 
 export interface EditOptions {
   locale?: FormatLocale;
+  /**
+   * The shared formulas of the sheet (sharedMasters()), for a caller that writes many cells of
+   * it at once and works them out once; looked for in the sheet when needed otherwise.
+   */
+  masters?: SharedMasters;
 }
 
 /** Format index of a cell position: the cell's own, else its row's, else its column's. */
@@ -89,8 +95,28 @@ export function cellFromInput(workbook: Workbook, sheet: Sheet, row: number, col
     style = ensureCellFormat(workbook.styles, style, implied);
   }
   const cell: Cell = { kind: parsed.kind, value: parsed.value, style };
-  if (parsed.formula !== undefined) cell.formula = { text: parsed.formula, type: 'normal' };
+  if (parsed.formula !== undefined) {
+    cell.formula = { text: parsed.formula, type: 'normal' };
+    // A formula typed in is a dynamic array formula, as in Excel 365, where it means something else written as an
+    // ordinary one (see needsDynamic(): by its text alone). One typed again as it was, an ordinary formula of the file,
+    // stays one, with the implicit intersection it was written for.
+    // UNSURE: Excel shows such a formula with "@" where it intersects, and keeps the "@" when it is typed again.
+    const before = held && held.formula && held.formula.dynamic !== true && (held.formula.type === 'normal' || held.formula.type === 'shared') ? (held.formula.type === 'shared' ? explicitFormula(held, row, col, options.masters || sharedMasters(sheet)).formula : held.formula)
+        : undefined;
+    const legacy = !!before && before.text === parsed.formula;
+    if (!legacy && needsDynamic(parsed.formula)) cell.formula.dynamic = true;
+  }
   return cell;
+}
+
+/** A copy of a cell whose value is no longer what a spill put there. */
+/** Dynamic array formulas of a copy whose spills are looked at when it is pasted (see pasteAt()); past it, their cells are pasted as values. */
+const MAX_PASTED_ANCHORS = 4096;
+
+function withoutSpill(cell: Cell): Cell {
+  const out = { ...cell };
+  delete out.spilled;
+  return out;
 }
 
 function readable(formula: string): boolean {
@@ -408,6 +434,22 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
   const merges = sheet.merges.filter((m) => m.bottom >= selection.top && m.top <= bottom && m.right >= selection.left && m.left <= right);
   const covered = (r: number, c: number) => merges.some((m) => r >= m.top && r <= m.bottom && c >= m.left && c <= m.right && (r !== m.top || c !== m.left));
 
+  // The spills of the dynamic array formulas the copy has, where they were copied from: their cells are pasted
+  // empty, and the pasted formula spills into them again. A spilled cell copied without its formula is a value.
+  const anchors: CellRange[] = [];
+  if (internal && copied) {
+    copied.cells.forEach((row, offset) => {
+      if (!row) return;
+      const fromRow = copied.rows ? copied.rows[offset] : copied.range.top + offset;
+      row.forEach((item, k) => {
+        if (!item || !item.formula || item.formula.dynamic !== true || typeof item.formula.ref !== 'string') return;
+        const area = parseRange(item.formula.ref);
+        if (area && area.top === fromRow && area.left === copied.range.left + k && anchors.length < MAX_PASTED_ANCHORS) anchors.push(area);
+      });
+    });
+  }
+  const withAnchor = (row: number, col: number) => anchors.some((a) => row >= a.top && row <= a.bottom && col >= a.left && col <= a.right);
+
   const cells: CellChange[] = [];
   for (let r = selection.top; r <= bottom; r++) {
     const sourceRow = source[(r - selection.top) % height];
@@ -442,9 +484,17 @@ export function pasteAt(workbook: Workbook, sheetIndex: number, selection: CellR
               kind: 'blank',
               value: null,
               style: item.style,
-              formula: { text: shiftFormula(item.formula.text, r - fromRow, c - fromCol), type: 'normal' },
+              formula: { text: shiftFormula(item.formula.text, r - fromRow, c - fromCol), type: 'normal', ...(item.formula.dynamic ? { dynamic: true } : {}) },
             }
-          : item;
+          : item.spilled
+            ? withAnchor(fromRow, fromCol)
+              ? // Its formula is pasted as well, and fills it again.
+                item.style
+                ? { kind: 'blank', value: null, style: item.style }
+                : undefined
+              : // What a spill left there is a value of its own where it is pasted.
+                withoutSpill(item)
+            : item;
       }
       if (cell === undefined && getCell(sheet, r, c) === undefined) continue;
       cells.push({ row: r, col: c, cell });

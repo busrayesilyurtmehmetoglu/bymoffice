@@ -63,6 +63,7 @@ import { KEPT_MAIN, MAX_KEPT_DEPTH, unpackKept, type KeptAttr, type KeptNode, ty
 import { keptFor, keptNow, ruleHolder } from '../../ops/rules';
 import { adjustCommentCell, adjustDrawingAnchor, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
 import { CHART_CONTENT_TYPE, chartCellsOf, chartSpaceXml, chartWritable } from './chart-write';
+import { METADATA_CONTENT_TYPE, METADATA_RELATIONSHIP, newMetadataXml } from './metadata';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
 import { ZipArchive } from '../../zip';
 import { readModel } from '../../model/edits';
@@ -1708,6 +1709,8 @@ interface SheetNumbers {
   drawing: number;
   comments: number;
   vmlBlocks: { next: number };
+  /** A dynamic array formula was written: the package gets the cell metadata that marks it (`cm="1"`). */
+  dynamic?: boolean;
 }
 
 function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media: MediaStore, numbers: SheetNumbers, notes: Notes, selected: boolean, dxfOf: (rule: ConditionalRule) => number | undefined): SheetParts {
@@ -1745,6 +1748,10 @@ function sheetXml(workbook: Workbook, sheet: Sheet, strings: StringTable, media:
     shared: workbook.sharedStrings,
     styledColumns: columns.filter((range) => !!range.style),
     intern: (text, runs) => strings.intern(text, runs),
+    dynamicCm: () => {
+      numbers.dynamic = true;
+      return 1;
+    },
   };
   const used = { top: -1, bottom: -1, left: MAX_COLS, right: -1 };
   const dataAt = parts.length;
@@ -2111,6 +2118,11 @@ function builtXlsx(workbook: Workbook, options: BuildXlsxOptions, pictures: Map<
   files.push(['xl/styles.xml', stylesXml(workbook.styles, notes, dxfs.added)]);
   overrides.push(['xl/styles.xml', `${TYPE_PREFIX}spreadsheetml.styles+xml`]);
   bookRels.add(`${NS_REL}/styles`, 'styles.xml');
+  if (numbers.dynamic) {
+    files.push(['xl/metadata.xml', newMetadataXml()]);
+    overrides.push(['xl/metadata.xml', METADATA_CONTENT_TYPE]);
+    bookRels.add(`${NS_REL}/${METADATA_RELATIONSHIP}`, 'metadata.xml');
+  }
   if (strings.items.length > 0) {
     files.push(['xl/sharedStrings.xml', strings.xml()]);
     overrides.push(['xl/sharedStrings.xml', `${TYPE_PREFIX}spreadsheetml.sharedStrings+xml`]);

@@ -23,6 +23,8 @@ import {
   parseErrorCode,
   parseNumberText,
   plainNumberText,
+  readRange,
+  tailFrom,
   textToNumber,
   toNumber,
   type ArgSelector,
@@ -96,40 +98,38 @@ export function first(value: Value | undefined, context: CalcContext): Scalar {
   return clean(value);
 }
 
-function isWholeLine(ref: RefValue): boolean {
-  const range = ref.range;
-  return (range.top <= 0 && range.bottom >= MAX_ROWS - 1) || (range.left <= 0 && range.right >= MAX_COLS - 1);
-}
-
 /**
- * An argument as an array. A reference keeps its own shape; a whole row or
- * column (or a range too large to hold) is cut to the used part of its sheet.
- * #REF! for a range that is not one, #NUM! when the cells would not fit.
+ * An argument as an array. A reference of written bounds keeps its own shape, empty cells
+ * included; a whole row or column (or a range too large to hold) is cut to the content of its
+ * sheet (see readRange()). #REF! for a range that is not one, #NUM! when the cells would not fit.
  */
 export function toArray(value: Value, context: CalcContext): ArrayValue | CalcError {
   if (isRef(value)) {
     const range = value.range;
     if (!(range.bottom >= range.top) || !(range.right >= range.left)) return ERROR_REF;
-    let bottom = range.bottom;
-    let right = range.right;
-    if (isWholeLine(value) || (bottom - range.top + 1) * (right - range.left + 1) > MAX_ARRAY_CELLS) {
-      const extent = context.usedExtent(value.sheet);
-      bottom = Math.min(bottom, Math.max(extent.rows - 1, range.top));
-      right = Math.min(right, Math.max(extent.cols - 1, range.left));
-    }
+    const read = readRange(range, value.sheet, context, MAX_ARRAY_CELLS);
+    const bottom = read.bottom;
+    const right = read.right;
     const rows = bottom - range.top + 1;
     const cols = right - range.left + 1;
     const size = rows * cols;
     if (!(size >= 1 && size <= MAX_ARRAY_CELLS) || Math.floor(rows) !== rows || Math.floor(cols) !== cols) {
       return ERROR_NUM;
     }
+    if (context.tick !== undefined) context.tick(size >> 4);
     const data: Scalar[] = new Array(size).fill(null);
+    let filled = 0;
     context.forEachCell(value.sheet, { top: range.top, left: range.left, bottom, right }, (cell, row, col) => {
       const r = row - range.top;
       const c = col - range.left;
-      if (r >= 0 && r < rows && c >= 0 && c < cols && cell !== undefined) data[r * cols + c] = cell;
+      if (r >= 0 && r < rows && c >= 0 && c < cols && cell !== undefined) {
+        const at = r * cols + c;
+        data[at] = cell;
+        if (cell !== null && at >= filled) filled = at + 1;
+      }
     });
-    return { rows, cols, data };
+    const tail = tailFrom(size, filled);
+    return tail === undefined ? { rows, cols, data } : { rows, cols, data, tail };
   }
   if (isArray(value)) {
     if (!(value.rows >= 1 && value.cols >= 1) || value.data.length < value.rows * value.cols) return ERROR_CALC;
@@ -215,16 +215,24 @@ export function toGrid(value: Value, context: CalcContext): Grid {
   };
 }
 
-/** The rows of a grid worth looking at: a reference stops at the last used row of its sheet. */
+/**
+ * The rows of a grid worth looking at in a search that never matches an empty cell: a
+ * reference stops at the last row of its sheet that holds something (CalcContext.usedExtent).
+ * Below it every cell is empty, so the answer is the one the whole range gives; what depends on
+ * how many empty cells follow (a binary search) cuts them off itself.
+ */
+/** Ranges smaller than this are searched whole: working out how far their sheet goes would cost more. */
+const SMALL_SEARCH = 1 << 16;
+
 export function usedRows(value: Value, grid: Grid, context: CalcContext): number {
-  if (!isRef(value)) return grid.rows;
-  const rows = Math.min(grid.rows, context.usedExtent(value.sheet).rows - value.range.top);
+  if (!isRef(value) || grid.rows * grid.cols <= SMALL_SEARCH) return grid.rows;
+  const rows = Math.min(grid.rows, context.usedExtent(value.sheet, value.range).rows - value.range.top);
   return rows > 0 ? Math.floor(rows) : 0;
 }
 
 export function usedCols(value: Value, grid: Grid, context: CalcContext): number {
-  if (!isRef(value)) return grid.cols;
-  const cols = Math.min(grid.cols, context.usedExtent(value.sheet).cols - value.range.left);
+  if (!isRef(value) || grid.rows * grid.cols <= SMALL_SEARCH) return grid.cols;
+  const cols = Math.min(grid.cols, context.usedExtent(value.sheet, value.range).cols - value.range.left);
   return cols > 0 ? Math.floor(cols) : 0;
 }
 

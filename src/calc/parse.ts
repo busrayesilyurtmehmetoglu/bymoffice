@@ -31,7 +31,12 @@ export type Node =
       external?: boolean;
     }
   | { type: 'name'; name: string; sheet?: string }
-  /** `null` is an argument left empty, as in IF(A1,,2). */
+  /**
+   * `null` is an argument left empty, as in IF(A1,,2). Three operators of dynamic arrays are
+   * calls as well, the way files store them: "A1#" is ANCHORARRAY(A1), "@A1:A3" is
+   * SINGLE(A1:A3), and a call of what a call gives ("LAMBDA(x,x+1)(2)") is APPLY_CALL with
+   * the callee as its first argument.
+   */
   | { type: 'call'; name: string; args: (Node | null)[] }
   /** "%" is written after its operand. */
   | { type: 'unary'; op: '-' | '+' | '%'; operand: Node }
@@ -43,6 +48,21 @@ export type Node =
 export type BinaryOp = '+' | '-' | '*' | '/' | '^' | '&' | '=' | '<>' | '<' | '>' | '<=' | '>=' | ':' | ',' | ' ';
 
 export type RefNode = Extract<Node, { type: 'ref' }>;
+
+/**
+ * Name of the call node that calls what another call gives: LAMBDA(x,x+1)(2). It is no name
+ * that can be typed, so no function of the library or of a file can be called that.
+ */
+export const APPLY_CALL = '()';
+
+/** Strips the prefixes files give to names of functions newer than the file format, and to the parameters of LET and LAMBDA. */
+function unprefixed(upper: string): string {
+  for (let guard = 0; guard < 4; guard++) {
+    if (upper.lastIndexOf('_XLFN.', 0) === 0 || upper.lastIndexOf('_XLWS.', 0) === 0 || upper.lastIndexOf('_XLPM.', 0) === 0) upper = upper.slice(6);
+    else break;
+  }
+  return upper;
+}
 
 export class FormulaParseError extends Error {
   /** Offset into the text given to parseFormula() where the problem was found. */
@@ -227,11 +247,13 @@ function parseWordBody(p: Parser, start: number, end: number, sheet: string | un
   if (!isNameStart(s.charCodeAt(start))) fail('Expected a reference or a name', start);
   for (let i = start; i < end; i++) if (s.charCodeAt(i) === 36) fail('Unexpected "$"', i);
   if (sheetEnd !== undefined) fail('A name cannot span sheets', start);
-  const text = s.slice(start, end);
+  let text = s.slice(start, end);
   p.i = end;
   if (sheet === undefined) {
     if (end - start === 4 && text.toUpperCase() === 'TRUE') return { type: 'boolean', value: true };
     if (end - start === 5 && text.toUpperCase() === 'FALSE') return { type: 'boolean', value: false };
+    // "_xlpm.x": a parameter of LET or LAMBDA, the way files store it.
+    if (text.charCodeAt(0) === 95 && text.length > 6 && text.substring(0, 6).toUpperCase() === '_XLPM.') text = text.slice(6);
     return { type: 'name', name: text };
   }
   return { type: 'name', name: text, sheet };
@@ -294,21 +316,24 @@ function parseExternal(p: Parser): Node {
 
 function parseCall(p: Parser, start: number, end: number): Node {
   const s = p.s;
-  let name = s.slice(start, end).toUpperCase();
   // Functions newer than the file format are stored with a prefix.
-  for (;;) {
-    if (name.lastIndexOf('_XLFN.', 0) === 0 || name.lastIndexOf('_XLWS.', 0) === 0) name = name.slice(6);
-    else break;
-  }
+  const name = unprefixed(s.slice(start, end).toUpperCase());
   if (name === '' || !isNameStart(name.charCodeAt(0))) fail('Expected a function name', start);
-  p.i = end + 1;
+  p.i = end;
+  return { type: 'call', name, args: parseArguments(p) };
+}
+
+/** With "(" current: the arguments of a call up to the ")" that closes them. */
+function parseArguments(p: Parser): (Node | null)[] {
+  const s = p.s;
+  p.i++;
   enter(p);
   const args: (Node | null)[] = [];
   skipSpaces(p);
   if (s.charCodeAt(p.i) === 41) {
     p.i++;
     p.depth--;
-    return { type: 'call', name, args };
+    return args;
   }
   for (;;) {
     skipSpaces(p);
@@ -327,7 +352,7 @@ function parseCall(p: Parser, start: number, end: number): Node {
     fail(p.i >= p.n ? 'Missing ")"' : 'Unexpected character', p.i);
   }
   p.depth--;
-  return { type: 'call', name, args };
+  return args;
 }
 
 function parseWord(p: Parser): Node {
@@ -503,6 +528,11 @@ function sameSheetName(a: string | undefined, b: string | undefined): boolean {
 
 /** "A1:B2" and "Sheet1!A1:Sheet1!B2" are one reference; anything else joined by a colon is worked out when calculating. */
 function joinRange(left: Node, right: Node): Node {
+  // "Sheet1!A1:B2#": the spill of B2 of the sheet the range is on, as B2 of "Sheet1!A1:B2" is.
+  if (left.type === 'ref' && left.sheet !== undefined && left.sheetEnd === undefined && !left.external && right.type === 'call' && right.name === 'ANCHORARRAY') {
+    const inner = right.args[0];
+    if (inner && inner.type === 'ref' && inner.sheet === undefined) right = { type: 'call', name: 'ANCHORARRAY', args: [{ ...inner, sheet: left.sheet }] };
+  }
   if (
     left.type === 'ref' &&
     right.type === 'ref' &&
@@ -532,11 +562,42 @@ function joinRange(left: Node, right: Node): Node {
   return { type: 'binary', op: ':', left, right };
 }
 
+/** What follows an operand without a space: "#" of a spill reference, the arguments of a call of a call. */
+function parsePostfix(p: Parser, node: Node): Node {
+  const s = p.s;
+  for (let guard = 0; ; guard++) {
+    if (guard >= MAX_DEPTH) fail('The formula is nested too deeply', p.i);
+    const c = s.charCodeAt(p.i);
+    // "A1#": the cells a dynamic array formula in A1 spills into.
+    if (c === 35 && ((node.type === 'ref' && !node.wholeRows && !node.wholeCols && node.range.top === node.range.bottom && node.range.left === node.range.right) || node.type === 'name')) {
+      p.i++;
+      node = { type: 'call', name: 'ANCHORARRAY', args: [node] };
+    } else if (c === 40 && node.type === 'call') {
+      // LAMBDA(x,x+1)(2): what the call gives is called in turn.
+      const args = parseArguments(p);
+      node = { type: 'call', name: APPLY_CALL, args: [node as Node | null].concat(args) };
+    } else return node;
+  }
+}
+
+function parseOperand(p: Parser): Node {
+  // "@": implicit intersection, asked for by name; it takes what follows up to the next operator.
+  if (p.s.charCodeAt(p.i) === 64) {
+    p.i++;
+    enter(p);
+    skipSpaces(p);
+    const node: Node = { type: 'call', name: 'SINGLE', args: [parseRange(p)] };
+    p.depth--;
+    return node;
+  }
+  return parsePostfix(p, parsePrimary(p));
+}
+
 function parseRange(p: Parser): Node {
-  let left = parsePrimary(p);
+  let left = parseOperand(p);
   while (p.s.charCodeAt(p.i) === 58) {
     p.i++;
-    left = joinRange(left, parsePrimary(p));
+    left = joinRange(left, parseOperand(p));
   }
   return left;
 }
@@ -552,7 +613,7 @@ function parseIntersection(p: Parser): Node {
   for (;;) {
     if (!skipSpaces(p) || p.i >= p.n || !isRefLike(left)) return left;
     const c = p.s.charCodeAt(p.i);
-    const operand = isNameStart(c) || c === 36 || c === 39 || c === 40 || c === 91 || (isDigit(c) && rowRangeAt(p.s, p.i));
+    const operand = isNameStart(c) || c === 36 || c === 39 || c === 40 || c === 91 || c === 64 || (isDigit(c) && rowRangeAt(p.s, p.i));
     if (!operand) return left;
     const at = p.i;
     const right = parseRange(p);

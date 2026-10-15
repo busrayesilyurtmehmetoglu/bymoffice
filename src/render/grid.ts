@@ -135,6 +135,8 @@ export interface GridScene {
   comments?: GridCommentSource;
   /** The cells a formula that is being typed was pointed at: framed with a dashed line. */
   reference?: CellRange;
+  /** The cells a dynamic array formula fills, while the selected cell is one of them: framed with a thin line. */
+  spill?: CellRange;
   /** The selections of the other participants on this sheet. */
   peers?: readonly GridPeer[];
 }
@@ -310,6 +312,7 @@ interface Frame {
   drawings: GridDrawingSource | undefined;
   comments: GridCommentSource | undefined;
   reference: CellRange | undefined;
+  spill: CellRange | undefined;
   peers: readonly GridPeer[] | undefined;
   dpr: number;
   /** Grid lines are drawn, and how wide: on screen as the sheet says and one pixel, on paper as its print options say and thinner. */
@@ -355,6 +358,7 @@ export function renderGrid(ctx: CanvasRenderingContext2D, scene: GridScene): voi
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: scene.comments && typeof scene.comments.has === 'function' ? scene.comments : undefined,
     reference: scene.reference ? clampRange(scene.reference) : undefined,
+    spill: scene.spill ? clampRange(scene.spill) : undefined,
     peers: scene.peers && scene.peers.length > 0 ? scene.peers : undefined,
     dpr,
     gridLines: sheet.view.showGridLines !== false,
@@ -499,6 +503,7 @@ export function renderGridPrint(ctx: CanvasRenderingContext2D, scene: GridPrintS
     drawings: scene.drawings && typeof scene.drawings.paint === 'function' ? scene.drawings : undefined,
     comments: undefined,
     reference: undefined,
+    spill: undefined,
     peers: undefined,
     dpr: scale,
     gridLines: scene.gridLines === true,
@@ -958,6 +963,7 @@ function drawPane(frame: Frame, view: PaneView): void {
   if (frame.dropdown) drawDropdown(frame, view, frame.dropdown);
   if (frame.drawings) drawFloating(frame, view, frame.drawings);
   if (frame.peers) for (let i = 0; i < frame.peers.length; i++) drawPeer(frame, view, frame.peers[i]);
+  if (frame.spill) drawSpill(frame, view, frame.spill);
   if (frame.selection) drawSelection(frame, view, frame.selection);
   if (frame.reference) drawReference(frame, view, frame.reference);
 
@@ -1853,6 +1859,27 @@ function drawPeer(frame: Frame, view: PaneView, peer: GridPeer): void {
     ctx.fillStyle = '#FFFFFF';
     ctx.fillText(label, x0 + 3, ly + height / 2 + 0.5);
   }
+  frame.painter.invalidate();
+}
+
+/** The thin frame around the cells a dynamic array formula fills, while one of them is selected. */
+function drawSpill(frame: Frame, view: PaneView, range: CellRange): void {
+  const { ctx } = frame;
+  const metrics = frame.layout.metrics;
+  const { cols, rows } = view;
+  const rect = view.pane.rect;
+  const x0 = Math.round(cols.origin + metrics.cols.offset(range.left));
+  const x1 = Math.round(cols.origin + metrics.cols.offset(range.right + 1));
+  const y0 = Math.round(rows.origin + metrics.rows.offset(range.top));
+  const y1 = Math.round(rows.origin + metrics.rows.offset(range.bottom + 1));
+  if (x1 <= x0 || y1 <= y0 || x1 < rect.x || y1 < rect.y || x0 > rect.x + rect.width + 1 || y0 > rect.y + rect.height + 1) return;
+  const left = Math.max(x0, rect.x - 8);
+  const top = Math.max(y0, rect.y - 8);
+  const right = Math.min(x1, rect.x + rect.width + 8);
+  const bottom = Math.min(y1, rect.y + rect.height + 8);
+  ctx.strokeStyle = REFERENCE_COLOR;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(left - 0.5, top - 0.5, right - left, bottom - top);
   frame.painter.invalidate();
 }
 

@@ -10,8 +10,9 @@
 //
 // Nothing here throws for a bad formula: what cannot be calculated is an error value.
 
+import { withoutFuturePrefixes } from '../edit/future-names';
 import { MAX_COLS, MAX_ROWS, columnName, parseCellRef, type CellRange } from '../model/sheet/types';
-import { parseFormula, type BinaryOp, type Node, type RefNode } from './parse';
+import { APPLY_CALL, parseFormula, type BinaryOp, type Node, type RefNode } from './parse';
 import {
   ERROR_DIV0,
   ERROR_NA,
@@ -59,6 +60,40 @@ export interface EvaluateOptions {
    * formula): ranges are arrays everywhere, there is no implicit intersection.
    */
   arrayFormula?: boolean;
+  /** The formula is a dynamic array formula: as `arrayFormula`, no implicit intersection ("@" asks for it). */
+  dynamic?: boolean;
+}
+
+/**
+ * A function made by LAMBDA: its parameters (in upper case), its body, and the names of LET
+ * and of outer LAMBDAs it was made among. It is a value only inside a formula: a cell, an
+ * operator or a function of the library that gets one gets #CALC!.
+ */
+export interface LambdaValue {
+  readonly lambda: true;
+  readonly params: readonly string[];
+  readonly body: Node;
+  readonly scope: Scope | undefined;
+  readonly rowShift: number;
+  readonly colShift: number;
+}
+
+/** A name of LET or a parameter of LAMBDA, with the names it was made among. */
+interface Scope {
+  readonly name: string;
+  readonly value: Bound;
+  readonly parent: Scope | undefined;
+}
+
+/** A parameter of LAMBDA that the call gave no argument for (see ISOMITTED). */
+const OMITTED = { omitted: true } as const;
+
+type Bound = Value | LambdaValue | typeof OMITTED;
+
+const isOmitted = (value: Bound): value is typeof OMITTED => value === OMITTED;
+
+function isLambda(value: unknown): value is LambdaValue {
+  return typeof value === 'object' && value !== null && (value as LambdaValue).lambda === true;
 }
 
 /**
@@ -77,7 +112,17 @@ const MAX_ARRAY_CELLS = 5000000;
 /** Excel's limit on the length of a text value. */
 const MAX_TEXT_LENGTH = 32767;
 
+/**
+ * Calls of LAMBDA inside one another (a name that calls itself): deeper ones give #NUM!.
+ * UNSURE: Excel's own limit and its error were not checked against Excel.
+ */
+export const MAX_LAMBDA_DEPTH = 100;
+
+/** Parameters of one LAMBDA and names of one LET; Excel allows 253 of either. */
+const MAX_PARAMS = 253;
+
 const ERROR_NULL = calcError('#NULL!');
+const ERROR_CALC = calcError('#CALC!');
 
 interface State {
   context: CalcContext;
@@ -91,6 +136,14 @@ interface State {
   names: string[];
   /** Ranges are arrays here: the formula is an array formula, or this is an argument that takes an array. */
   arrayMode: boolean;
+  /** What `arrayMode` would be were the formula an ordinary one: false in a dynamic array formula but inside arguments that take arrays. */
+  legacyArray: boolean;
+  /** The formula is a dynamic array formula (see EvaluateOptions.dynamic). */
+  dynamic: boolean;
+  /** The names of LET and the parameters of LAMBDA that are seen here. */
+  scope: Scope | undefined;
+  /** Calls of LAMBDA in progress, one inside the other. */
+  lambdas: number;
 }
 
 // How deep the evaluator is, counted over every evaluation in progress: a cell that needs
@@ -108,7 +161,21 @@ export function evaluationDepth(): number {
  */
 export function evaluate(node: Node, context: CalcContext, functions: Map<string, FunctionSpec>, options?: EvaluateOptions): Value {
   const opts = options || {};
-  const state: State = { context, functions, options: opts, base: depth, rowShift: opts.rowShift || 0, colShift: opts.colShift || 0, names: [], arrayMode: opts.arrayFormula === true };
+  const dynamic = opts.dynamic === true;
+  const state: State = {
+    context,
+    functions,
+    options: opts,
+    base: depth,
+    rowShift: opts.rowShift || 0,
+    colShift: opts.colShift || 0,
+    names: [],
+    arrayMode: opts.arrayFormula === true || dynamic,
+    legacyArray: opts.arrayFormula === true && !dynamic,
+    dynamic,
+    scope: undefined,
+    lambdas: 0,
+  };
   const text = beginTextBudget();
   try {
     return evalNode(node, state);
@@ -206,7 +273,19 @@ function evalArrayConstant(rows: Node[][]): ArrayValue {
   return { rows: rows.length, cols, data };
 }
 
+/** What a name of LET or a parameter of LAMBDA is bound to, or undefined when no such name is seen here. */
+function scoped(name: string, state: State): { value: Bound } | undefined {
+  if (!state.scope) return undefined;
+  const upper = name.toUpperCase();
+  for (let scope: Scope | undefined = state.scope; scope; scope = scope.parent) if (scope.name === upper) return scope;
+  return undefined;
+}
+
 function evalName(node: Extract<Node, { type: 'name' }>, state: State): Value {
+  if (node.sheet === undefined) {
+    const local = scoped(node.name, state);
+    if (local) return isOmitted(local.value) ? null : isLambda(local.value) ? ERROR_CALC : local.value;
+  }
   const resolve = state.options.resolveName;
   let sheet = state.context.sheet;
   if (node.sheet !== undefined) {
@@ -246,12 +325,17 @@ function deref(value: Value, state: State): Scalar | ArrayValue {
   return state.arrayMode ? derefAll(value, state) : intersect(value, state.context);
 }
 
+const isSingleCell = (ref: RefValue) => ref.range.top === ref.range.bottom && ref.range.left === ref.range.right;
+
 /** Calculates an argument that takes an array: ranges inside it are arrays whatever the formula is. */
 function evalArrayArg(arg: Node, state: State): Value {
-  if (state.arrayMode) return evalNode(arg, state);
+  if (state.legacyArray) return evalNode(arg, state);
+  const mode = state.arrayMode;
   state.arrayMode = true;
+  state.legacyArray = true;
   const value = evalNode(arg, state);
-  state.arrayMode = false;
+  state.arrayMode = mode;
+  state.legacyArray = false;
   return value;
 }
 
@@ -326,6 +410,8 @@ function zip(a: Scalar | ArrayValue, b: Scalar | ArrayValue, state: State, fn: (
   const rows = Math.max(left ? left.rows : 1, right ? right.rows : 1);
   const cols = Math.max(left ? left.cols : 1, right ? right.cols : 1);
   if (!(rows * cols <= MAX_ARRAY_CELLS)) return ERROR_VALUE;
+  const fast = zipTail(left, right, a, b, rows, cols, state, fn);
+  if (fast) return fast;
   if (state.context.tick) state.context.tick(rows * cols);
   const data: Scalar[] = new Array(rows * cols);
   let k = 0;
@@ -339,8 +425,44 @@ function zip(a: Scalar | ArrayValue, b: Scalar | ArrayValue, state: State, fn: (
   return { rows, cols, data };
 }
 
+/**
+ * zip() for arrays of the result's shape (or scalars) with tails (ArrayValue.tail): the elements before the
+ * tails are worked out one by one, those after from one pair; the same result, without a call per element
+ * of the empty part of a whole column. Undefined when it does not apply.
+ */
+function zipTail(left: ArrayValue | undefined, right: ArrayValue | undefined, a: Scalar | ArrayValue, b: Scalar | ArrayValue, rows: number, cols: number, state: State, fn: (x: Scalar, y: Scalar) => Scalar): ArrayValue | undefined {
+  const size = rows * cols;
+  const fits = (array: ArrayValue | undefined) => !array || (array.rows === rows && array.cols === cols && array.tail !== undefined && array.data.length >= size);
+  if (!fits(left) || !fits(right) || (!left && !right)) return undefined;
+  const from = Math.max(left ? (left.tail as number) : 0, right ? (right.tail as number) : 0);
+  if (!(from < size)) return undefined;
+  const rest = fn(left ? left.data[from] : (a as Scalar), right ? right.data[from] : (b as Scalar));
+  // Text is charged by the element (chargeText()): not worked out this way.
+  if (typeof rest === 'string') return undefined;
+  if (state.context.tick) state.context.tick(from + (size >> 4));
+  const data: Scalar[] = new Array(size);
+  for (let k = 0; k < from; k++) {
+    const value = fn(left ? left.data[k] : (a as Scalar), right ? right.data[k] : (b as Scalar));
+    if (typeof value === 'string' && !chargeText(value)) return { rows: 1, cols: 1, data: [ERROR_VALUE] };
+    data[k] = value;
+  }
+  data.fill(rest, from);
+  return { rows, cols, data, tail: from };
+}
+
 function mapValues(a: Scalar | ArrayValue, state: State, fn: (x: Scalar) => Scalar): Scalar | ArrayValue {
   if (!isArray(a)) return fn(a);
+  const tail = a.tail;
+  if (tail !== undefined && tail < a.data.length) {
+    const rest = fn(a.data[tail]);
+    if (typeof rest !== 'string') {
+      if (state.context.tick) state.context.tick(tail + (a.data.length >> 4));
+      const data: Scalar[] = new Array(a.data.length);
+      for (let k = 0; k < tail; k++) data[k] = fn(a.data[k]);
+      data.fill(rest, tail);
+      return { rows: a.rows, cols: a.cols, data, tail };
+    }
+  }
   if (state.context.tick) state.context.tick(a.data.length);
   const data: Scalar[] = new Array(a.data.length);
   for (let k = 0; k < data.length; k++) data[k] = fn(a.data[k]);
@@ -443,7 +565,13 @@ function evalCall(node: Extract<Node, { type: 'call' }>, state: State): Value {
   const special = SPECIALS.get(node.name);
   if (special) return special(node.args, state);
   const spec = state.functions.get(node.name);
-  if (!spec) return ERROR_NAME;
+  if (!spec) {
+    // A function the formula makes itself: a name of LET or a defined name that stands for a LAMBDA.
+    const made = calledLambda(node.name, state);
+    if (made === undefined) return ERROR_NAME;
+    if (!isLambda(made)) return made;
+    return valueOf(invoke(made, node.args, state));
+  }
   const nodes = node.args;
   // Excel refuses to accept such a formula; here it is an error value.
   if (nodes.length < spec.min || (spec.max !== undefined && nodes.length > spec.max)) return ERROR_VALUE;
@@ -456,7 +584,7 @@ function evalCall(node: Extract<Node, { type: 'call' }>, state: State): Value {
       // SUM((A1:A3,C1:C3)): a function that takes any number of arguments gets the parts of a union one by one.
       const parts = unionParts(arg);
       for (let j = 0; j < parts.length; j++) args.push(evalNode(parts[j], state));
-    } else if (ordinary && selects(spec.arrayArgs, k)) args.push(evalArrayArg(arg, state));
+    } else if (!state.legacyArray && selects(spec.arrayArgs, k)) args.push(evalArrayArg(arg, state));
     else {
       const value = evalNode(arg, state);
       // Where the function takes one value, a range stands for the cell it intersects.
@@ -812,7 +940,8 @@ function fnFormulaText(args: Args, state: State): Value {
   if (!isRef(ref)) return ref;
   const lookup = state.options.cellFormula;
   const text = lookup ? lookup(ref.sheet, ref.range.top, ref.range.left) : undefined;
-  return text === undefined ? ERROR_NA : `=${text}`;
+  // As the formula is shown: without what files add to newer functions.
+  return text === undefined ? ERROR_NA : `=${withoutFuturePrefixes(text)}`;
 }
 
 function fnSheet(args: Args, state: State): Value {
@@ -897,6 +1026,322 @@ function fnCell(args: Args, state: State): Value {
   return ERROR_VALUE;
 }
 
+// ---------------------------------------------------------------------------
+// LET, LAMBDA and the functions that take a LAMBDA
+//
+// A LAMBDA is a value only inside the formula that makes it: it can be given a name with LET,
+// be called, or be given to MAP and its relatives. Everywhere else (a cell, an operator, a
+// function of the library) it is #CALC!. The names of LET and the parameters of a LAMBDA are
+// seen by everything inside them, before the defined names of the workbook.
+
+/** A LAMBDA, or any other value. */
+type Callable = Value | LambdaValue;
+
+/** A LAMBDA where only a value can be: #CALC!. */
+const valueOf = (value: Callable): Value => (isLambda(value) ? ERROR_CALC : value);
+
+/** Whether the arguments of LAMBDA are distinct names followed by a body. */
+function lambdaShape(args: Args): boolean {
+  if (args.length < 1 || args.length - 1 > MAX_PARAMS || !args[args.length - 1]) return false;
+  const seen: string[] = [];
+  for (let k = 0; k < args.length - 1; k++) {
+    const param = args[k];
+    if (!param || param.type !== 'name' || param.sheet !== undefined) return false;
+    const upper = param.name.toUpperCase();
+    if (seen.indexOf(upper) >= 0) return false;
+    seen.push(upper);
+  }
+  return true;
+}
+
+function makeLambda(args: Args, state: State): LambdaValue | CalcError {
+  if (!lambdaShape(args)) return ERROR_VALUE;
+  const params: string[] = [];
+  for (let k = 0; k < args.length - 1; k++) params.push((args[k] as Extract<Node, { type: 'name' }>).name.toUpperCase());
+  return { lambda: true, params, body: args[args.length - 1] as Node, scope: state.scope, rowShift: state.rowShift, colShift: state.colShift };
+}
+
+/**
+ * A tree where a LAMBDA may come out: LAMBDA itself, a name bound to one, a defined name that
+ * stands for one, a call of a function that gives one. Anything else is evaluated as usual.
+ */
+function evalCallable(node: Node, state: State): Callable {
+  if (node.type === 'name' && node.sheet === undefined) {
+    const local = scoped(node.name, state);
+    if (local) return isOmitted(local.value) ? null : local.value;
+    const target = definedTree(node.name, state);
+    if (target === undefined) return evalNode(node, state);
+    // A name that stands for a name that stands for a name ... is as deep as calls inside one another.
+    if (depth - state.base >= MAX_NODE_DEPTH) return ERROR_VALUE;
+    depth++;
+    const result = withName(node.name, state, () => evalCallable(target, state));
+    depth--;
+    return result;
+  }
+  if (node.type !== 'call') return evalNode(node, state);
+  if (depth - state.base >= MAX_NODE_DEPTH) return ERROR_VALUE;
+  depth++;
+  let result: Callable;
+  if (node.name === 'LAMBDA') result = makeLambda(node.args, state);
+  else if (node.name === 'LET') result = fnLet(node.args, state, true);
+  else if (node.name === APPLY_CALL) result = fnApply(node.args, state);
+  else if (SPECIALS.has(node.name) || state.functions.has(node.name)) result = evalCall(node, state);
+  else {
+    const made = calledLambda(node.name, state);
+    result = made === undefined ? ERROR_NAME : isLambda(made) ? invoke(made, node.args, state) : made;
+  }
+  depth--;
+  return result;
+}
+
+/** The tree of a defined name as seen from the sheet of the formula, or undefined. */
+function definedTree(name: string, state: State): Node | undefined {
+  const resolve = state.options.resolveName;
+  return resolve ? resolve(name, state.context.sheet) : undefined;
+}
+
+/**
+ * Runs `run` for the tree of a defined name: relative references of the formula do not move
+ * it, it sees none of the names of LET, and a name that leads back to itself has no value.
+ */
+function withName(name: string, state: State, run: () => Callable): Callable {
+  const key = `${state.context.sheet}!${name.toUpperCase()}`;
+  if (state.names.indexOf(key) >= 0) return ERROR_NAME;
+  const rowShift = state.rowShift;
+  const colShift = state.colShift;
+  const scope = state.scope;
+  state.names.push(key);
+  state.rowShift = 0;
+  state.colShift = 0;
+  state.scope = undefined;
+  try {
+    return run();
+  } finally {
+    state.rowShift = rowShift;
+    state.colShift = colShift;
+    state.scope = scope;
+    state.names.pop();
+  }
+}
+
+/** What a name called as a function stands for: a name of LET or a defined name; undefined when it is neither. */
+function calledLambda(name: string, state: State): Callable | undefined {
+  const local = scoped(name, state);
+  if (local) return isOmitted(local.value) ? ERROR_VALUE : local.value;
+  const target = definedTree(name, state);
+  if (target === undefined) return undefined;
+  return withName(name, state, () => evalCallable(target, state));
+}
+
+/** Calls a LAMBDA with the arguments written in a formula; an argument left empty is omitted. */
+function invoke(lambda: LambdaValue, nodes: Args, state: State): Callable {
+  if (nodes.length > lambda.params.length) return ERROR_VALUE;
+  const values: Bound[] = new Array(nodes.length);
+  for (let k = 0; k < nodes.length; k++) {
+    const node = nodes[k];
+    values[k] = node ? evalCallable(node, state) : OMITTED;
+  }
+  return call(lambda, values, state);
+}
+
+/** Calls a LAMBDA with values; a parameter without one is omitted. */
+function call(lambda: LambdaValue, values: readonly Bound[], state: State): Callable {
+  if (values.length > lambda.params.length) return ERROR_VALUE;
+  if (state.lambdas >= MAX_LAMBDA_DEPTH || depth - state.base >= MAX_NODE_DEPTH) return ERROR_NUM;
+  if (state.context.tick) state.context.tick(1);
+  let scope = lambda.scope;
+  for (let k = 0; k < lambda.params.length; k++) scope = { name: lambda.params[k], value: k < values.length ? values[k] : OMITTED, parent: scope };
+  const savedScope = state.scope;
+  const rowShift = state.rowShift;
+  const colShift = state.colShift;
+  // Like a defined name, the body of a LAMBDA does not see the names of LET where it is called.
+  state.scope = scope;
+  state.rowShift = lambda.rowShift;
+  state.colShift = lambda.colShift;
+  state.lambdas++;
+  depth++;
+  try {
+    return evalCallable(lambda.body, state);
+  } finally {
+    depth--;
+    state.lambdas--;
+    state.scope = savedScope;
+    state.rowShift = rowShift;
+    state.colShift = colShift;
+  }
+}
+
+/** LET(name1, value1, [name2, value2, ...], calculation): each name is seen by what follows it. */
+function fnLet(args: Args, state: State, callable: boolean): Callable {
+  if (args.length < 3 || args.length % 2 === 0 || (args.length - 1) / 2 > MAX_PARAMS) return ERROR_VALUE;
+  const saved = state.scope;
+  try {
+    for (let k = 0; k + 1 < args.length; k += 2) {
+      const name = args[k];
+      const value = args[k + 1];
+      if (!name || name.type !== 'name' || name.sheet !== undefined || !value) return ERROR_VALUE;
+      state.scope = { name: name.name.toUpperCase(), value: evalCallable(value, state), parent: state.scope };
+    }
+    const body = args[args.length - 1];
+    if (!body) return ERROR_VALUE;
+    return callable ? evalCallable(body, state) : evalNode(body, state);
+  } finally {
+    state.scope = saved;
+  }
+}
+
+/** LAMBDA(x,x+1)(2): the first argument is what is called. */
+function fnApply(args: Args, state: State): Callable {
+  const callee = args.length > 0 && args[0] ? evalCallable(args[0], state) : ERROR_VALUE;
+  if (!isLambda(callee)) return isError(callee) ? callee : ERROR_VALUE;
+  return invoke(callee, args.slice(1), state);
+}
+
+function fnIsOmitted(args: Args, state: State): Value {
+  if (args.length !== 1) return ERROR_VALUE;
+  const arg = args[0];
+  if (!arg || arg.type !== 'name' || arg.sheet !== undefined) return false;
+  const local = scoped(arg.name, state);
+  return !!local && isOmitted(local.value);
+}
+
+/** The LAMBDA given as the last argument of MAP and its relatives, which must take `count` parameters. */
+function lambdaArg(arg: Node | null | undefined, count: number, state: State): LambdaValue | CalcError {
+  if (!arg) return ERROR_VALUE;
+  const value = evalCallable(arg, state);
+  if (!isLambda(value)) return isError(value) ? value : ERROR_VALUE;
+  return value.params.length === count ? value : ERROR_VALUE;
+}
+
+/** An argument of MAP and its relatives as an array: the cells of a reference, a scalar as an array of one. */
+function arrayArgOf(arg: Node | null | undefined, state: State): ArrayValue | CalcError {
+  if (!arg) return ERROR_VALUE;
+  const value = derefAll(evalArrayArg(arg, state), state);
+  if (isArray(value)) return value;
+  return isError(value) ? value : { rows: 1, cols: 1, data: [value] };
+}
+
+/** What one call of the LAMBDA of MAP, SCAN, BYROW, BYCOL or MAKEARRAY gives for one element: one value, an array of arrays being #CALC!. */
+function elementOf(value: Callable, state: State): Scalar {
+  if (isLambda(value)) return ERROR_CALC;
+  if (isRef(value)) return isSingleCell(value) ? state.context.cellValue(value.sheet, value.range.top, value.range.left) : ERROR_CALC;
+  if (isArray(value)) return value.rows === 1 && value.cols === 1 ? value.data[0] : ERROR_CALC;
+  return value;
+}
+
+const tooLarge = (rows: number, cols: number) => !(rows * cols <= MAX_ARRAY_CELLS);
+
+/** MAP(array1, [array2, ...], lambda): the LAMBDA of the elements at each position. */
+function fnMap(args: Args, state: State): Value {
+  if (args.length < 2 || args.length - 1 > MAX_PARAMS) return ERROR_VALUE;
+  const arrays: ArrayValue[] = [];
+  for (let k = 0; k < args.length - 1; k++) {
+    const array = arrayArgOf(args[k], state);
+    if (!isArray(array)) return array;
+    arrays.push(array);
+  }
+  const lambda = lambdaArg(args[args.length - 1], arrays.length, state);
+  if (!isLambda(lambda)) return lambda;
+  let rows = 1;
+  let cols = 1;
+  for (const array of arrays) {
+    rows = Math.max(rows, array.rows);
+    cols = Math.max(cols, array.cols);
+  }
+  if (tooLarge(rows, cols)) return ERROR_NUM;
+  const data: Scalar[] = new Array(rows * cols);
+  const values: Scalar[] = new Array(arrays.length);
+  for (let r = 0, k = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++, k++) {
+      for (let a = 0; a < arrays.length; a++) values[a] = arrayAt(arrays[a], r, c);
+      const value = elementOf(call(lambda, values, state), state);
+      if (typeof value === 'string' && !chargeText(value)) return ERROR_VALUE;
+      data[k] = value;
+    }
+  }
+  return { rows, cols, data };
+}
+
+/** REDUCE(initial, array, lambda(accumulator, value)), and SCAN, which gives every accumulator on the way. */
+function fnReduce(args: Args, state: State, scan: boolean): Value {
+  if (args.length !== 3) return ERROR_VALUE;
+  let accumulator: Value = args[0] ? derefAll(evalNode(args[0], state), state) : null;
+  const array = arrayArgOf(args[1], state);
+  if (!isArray(array)) return array;
+  const lambda = lambdaArg(args[2], 2, state);
+  if (!isLambda(lambda)) return lambda;
+  const count = array.rows * array.cols;
+  const data: Scalar[] = scan ? new Array(count) : [];
+  for (let k = 0; k < count; k++) {
+    const next = call(lambda, [accumulator, array.data[k]], state);
+    if (isLambda(next)) return ERROR_CALC;
+    accumulator = derefAll(next, state);
+    if (scan) {
+      const value = elementOf(accumulator, state);
+      if (typeof value === 'string' && !chargeText(value)) return ERROR_VALUE;
+      data[k] = value;
+    }
+  }
+  return scan ? { rows: array.rows, cols: array.cols, data } : accumulator;
+}
+
+/** BYROW(array, lambda(row)) and BYCOL: one value for each row (or column). */
+function fnByLine(args: Args, state: State, byRow: boolean): Value {
+  if (args.length !== 2) return ERROR_VALUE;
+  const array = arrayArgOf(args[0], state);
+  if (!isArray(array)) return array;
+  const lambda = lambdaArg(args[1], 1, state);
+  if (!isLambda(lambda)) return lambda;
+  const lines = byRow ? array.rows : array.cols;
+  const length = byRow ? array.cols : array.rows;
+  const data: Scalar[] = new Array(lines);
+  for (let i = 0; i < lines; i++) {
+    const line: Scalar[] = new Array(length);
+    for (let j = 0; j < length; j++) line[j] = byRow ? array.data[i * array.cols + j] : array.data[j * array.cols + i];
+    if (state.context.tick) state.context.tick(length);
+    const value = elementOf(call(lambda, [byRow ? { rows: 1, cols: length, data: line } : { rows: length, cols: 1, data: line }], state), state);
+    if (typeof value === 'string' && !chargeText(value)) return ERROR_VALUE;
+    data[i] = value;
+  }
+  return byRow ? { rows: lines, cols: 1, data } : { rows: 1, cols: lines, data };
+}
+
+/** MAKEARRAY(rows, columns, lambda(row, column)). */
+function fnMakeArray(args: Args, state: State): Value {
+  if (args.length !== 3) return ERROR_VALUE;
+  const rows = intArg(args[0], state);
+  if (typeof rows !== 'number') return rows;
+  const cols = intArg(args[1], state);
+  if (typeof cols !== 'number') return cols;
+  if (rows < 1 || cols < 1) return ERROR_VALUE;
+  // UNSURE: what Excel gives for an array too large to make; #NUM!, as SEQUENCE gives here.
+  if (tooLarge(rows, cols)) return ERROR_NUM;
+  const lambda = lambdaArg(args[2], 2, state);
+  if (!isLambda(lambda)) return lambda;
+  const data: Scalar[] = new Array(rows * cols);
+  for (let r = 0, k = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++, k++) {
+      const value = elementOf(call(lambda, [r + 1, c + 1], state), state);
+      if (typeof value === 'string' && !chargeText(value)) return ERROR_VALUE;
+      data[k] = value;
+    }
+  }
+  return { rows, cols, data };
+}
+
+/** ANCHORARRAY(A1), written "A1#": the cells the dynamic array formula of A1 spills into. */
+function fnAnchorArray(args: Args, state: State): Value {
+  if (args.length !== 1 || !args[0]) return ERROR_VALUE;
+  const ref = refArg(args[0], state);
+  if (!isRef(ref)) return ref;
+  if (!isSingleCell(ref)) return ERROR_REF;
+  const ask = state.context.spillRange;
+  const range = ask ? ask.call(state.context, ref.sheet, ref.range.top, ref.range.left) : undefined;
+  if (range === undefined) return ERROR_REF;
+  if (isError(range)) return range;
+  return { ref: true, sheet: ref.sheet, range };
+}
+
 const SPECIALS = new Map<string, Special>([
   ['IF', fnIf],
   ['IFERROR', (args, state) => ifCaught(args, state, isError)],
@@ -927,9 +1372,19 @@ const SPECIALS = new Map<string, Special>([
   ['CELL', fnCell],
   // The "@" of newer versions is stored as a function: implicit intersection, asked for by name.
   ['SINGLE', (args, state) => (args.length !== 1 ? ERROR_VALUE : scalarArg(args[0], state))],
-  // Not supported.
-  ['LET', () => ERROR_NAME],
-  ['LAMBDA', () => ERROR_NAME],
+  // "A1#" is stored as a function: the cells the dynamic array formula of A1 spills into.
+  ['ANCHORARRAY', fnAnchorArray],
+  ['LET', (args, state) => valueOf(fnLet(args, state, false))],
+  // A function is no value a cell can hold.
+  ['LAMBDA', (args) => (lambdaShape(args) ? ERROR_CALC : ERROR_VALUE)],
+  [APPLY_CALL, (args, state) => valueOf(fnApply(args, state))],
+  ['ISOMITTED', fnIsOmitted],
+  ['MAP', fnMap],
+  ['REDUCE', (args, state) => fnReduce(args, state, false)],
+  ['SCAN', (args, state) => fnReduce(args, state, true)],
+  ['BYROW', (args, state) => fnByLine(args, state, true)],
+  ['BYCOL', (args, state) => fnByLine(args, state, false)],
+  ['MAKEARRAY', fnMakeArray],
 ]);
 
 /** Names the evaluator answers itself; the function library is not asked for them. */

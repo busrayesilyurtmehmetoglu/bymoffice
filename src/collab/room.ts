@@ -32,8 +32,9 @@ export type CollabState = 'connecting' | 'online' | 'offline' | 'detached' | 'cl
  * does not know the new step would pass it over, and the room would drift apart. The fingerprint
  * of the wire in test/collab-protocol-version.test.ts says when.
  * 3: panes of a sheet (`pane`), tab stops of paragraphs (`tabs`).
+ * 4: dynamic array formulas (`d` of a formula).
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** A participant of a room as the others see it; `P` is how it says where it is. */
 export interface RoomPeer<P> {

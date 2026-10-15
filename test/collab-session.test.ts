@@ -686,7 +686,7 @@ test('steps that arrive out of turn make the session ask again from where it is,
 test('a relay of another version of the contract ends the session; a room that says no name, or another room than the one this side was in, is not trusted', async () => {
   const s = await alone();
   assert.deepEqual([s.sent[0].pv, typeof s.sent[0].key, (s.sent[0] as { since?: number }).since], [PROTOCOL_VERSION, 'string', undefined], '"join" names the version; a first join names no step');
-  assert.equal(PROTOCOL_VERSION, 3);
+  assert.equal(PROTOCOL_VERSION, 4);
   assert.equal(s.session.reason, undefined, 'an open session has no reason');
   s.tell({ t: 'error', code: 'version' });
   assert.deepEqual([s.session.state, s.notices, s.session.reason], ['closed', ['version'], 'version'], 'a room of another version is told apart from a refusal');
@@ -713,7 +713,7 @@ test('a relay of another version of the contract ends the session; a room that s
   const otherDigits = await alone();
   otherDigits.hello(0, 0, { pv: String(PROTOCOL_VERSION - 1) });
   assert.deepEqual([otherDigits.session.state, otherDigits.session.reason], ['closed', 'version'], 'and another one written so is another version');
-  for (const pv of [`${PROTOCOL_VERSION}.0`, 'x', '', ' 3', '03', '1001', 3.5, true]) {
+  for (const pv of [`${PROTOCOL_VERSION}.0`, 'x', '', ' 4', '04', '1001', 3.5, true]) {
     const odd = await alone();
     odd.hello(0, 0, { pv });
     assert.deepEqual([odd.session.state, odd.session.reason], ['closed', 'peer'], `a version that is no number makes the "hello" no message: ${JSON.stringify(pv)}`);

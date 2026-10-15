@@ -25,7 +25,7 @@ import { formulaToLocal } from '../edit/formula-locale';
 import { cellDisplayText } from '../format/cell-format';
 import type { FormatLocale } from '../format/locale';
 import { resolveCellStyle } from '../model/sheet/color';
-import { MAX_COLS, MAX_ROWS, parseRange, type Cell, type CellRange, type RichRun, type Sheet, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, fillsRange, parseRange, type Cell, type CellRange, type RichRun, type Sheet, type Workbook } from '../model/sheet/types';
 import { setCellInput } from './commands';
 import { rowsHiddenByFilter } from './filter';
 import { explicitFormula, sharedMasters, type CellChange, type Op, type SharedMasters } from './ops';
@@ -261,7 +261,7 @@ function arrayAreas(sheet: Sheet): CellRange[] {
   for (const row of sheet.rows.values()) {
     row.cells.forEach((cell) => {
       const formula = cell.formula;
-      if (!formula || (formula.type !== 'array' && formula.type !== 'dataTable') || formula.ref === undefined) return;
+      if (!fillsRange(formula)) return;
       const area = parseRange(formula.ref);
       if (area && (area.top !== area.bottom || area.left !== area.right)) out.push(area);
     });
@@ -315,7 +315,8 @@ export function replaceInCell(workbook: Workbook, sheetIndex: number, row: numbe
   const count = replaced.count;
   const formula = cell.formula;
   if (formula && (formula.type === 'array' || formula.type === 'dataTable')) return { skipped: true, count };
-  const covered = areas || arrayAreas(sheet);
+  // The cells a dynamic array formula spills into are its result, no content: its own formula can be changed.
+  const covered = formula && formula.dynamic ? [] : areas || arrayAreas(sheet);
   for (let i = 0; i < covered.length; i++) {
     const area = covered[i];
     if (row >= area.top && row <= area.bottom && col >= area.left && col <= area.right) return { skipped: true, count };
@@ -333,7 +334,7 @@ export function replaceInCell(workbook: Workbook, sheetIndex: number, row: numbe
   }
   let ops: Op[];
   try {
-    ops = setCellInput(workbook, sheetIndex, row, col, replaced.text, { locale });
+    ops = setCellInput(workbook, sheetIndex, row, col, replaced.text, { locale, masters });
   } catch {
     return { skipped: true, count };
   }

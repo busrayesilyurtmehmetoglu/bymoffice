@@ -263,7 +263,7 @@ test('validation: limits given by formulas - one that cannot be calculated or gi
   const wb = bookOf(sheet);
   sheet.dataValidations = [
     rule('A1', 'whole', 'NOSUCH(1)', { formula2: '5' }),
-    rule('A2', 'decimal', '1', { formula2: 'LET(x,1,x)' }),
+    rule('A2', 'decimal', '1', { formula2: 'LAMBDA(x,x)' }),
     rule('A3', 'textLength', 'REGEXTEST("a","a")', { operator: 'lessThan' }),
     rule('A4', 'date', '[1]Other!$A$1', { operator: 'greaterThan' }),
     rule('B1', 'whole', '1/0', { formula2: '5' }),
@@ -291,7 +291,7 @@ test('validation: limits given by formulas - one that cannot be calculated or gi
 test('validation: a list whose source cannot be calculated lets every value through and shows no button', () => {
   const sheet = sheetOf({ G1: 'a', G2: 'b' });
   const wb = bookOf(sheet);
-  sheet.dataValidations = [rule('A1', 'list', 'NOSUCH(G1:G2)'), rule('A2', 'list', 'LET(x,G1:G2,x)'), rule('A3', 'list', 'INDIRECT("nowhere")'), rule('A4', 'list', 'OFFSET($G$1,0,0,2,1)')];
+  sheet.dataValidations = [rule('A1', 'list', 'NOSUCH(G1:G2)'), rule('A2', 'list', 'Sheet1:Sheet2!G1:G2'), rule('A3', 'list', 'INDIRECT("nowhere")'), rule('A4', 'list', 'OFFSET($G$1,0,0,2,1)')];
   const { ok, rules } = trial(wb);
   for (const ref of ['A1', 'A2']) {
     assert.equal(ok(ref, 'anything'), true, ref);

@@ -178,7 +178,7 @@ function sheetText(wb: Workbook, sheet: Sheet, index: number): unknown {
       const look = format(cell.style);
       // A cell that holds nothing and looks like none is no cell.
       if (explicit.kind === 'blank' && !explicit.formula && look === plain) return;
-      cells.push([c, explicit.kind, explicit.value, explicit.formula ? [explicit.formula.text, explicit.formula.type === 'shared' ? 'normal' : explicit.formula.type, explicit.formula.type === 'array' || explicit.formula.type === 'dataTable' ? explicit.formula.ref || null : null, explicit.formula.attrs ? Array.from(explicit.formula.attrs.entries()).filter(([name]) => name === 'aca' || name === 'ca' || name === 'bx').sort() : []] : null, look === plain ? '' : look, explicit.runs || null, explicit.ph === true]);
+      cells.push([c, explicit.kind, explicit.value, explicit.formula ? [explicit.formula.text, explicit.formula.type === 'shared' ? 'normal' : explicit.formula.type, explicit.formula.type === 'array' || explicit.formula.type === 'dataTable' || explicit.formula.dynamic === true ? explicit.formula.ref || null : null, explicit.formula.dynamic === true, explicit.formula.attrs ? Array.from(explicit.formula.attrs.entries()).filter(([name]) => name === 'aca' || name === 'ca' || name === 'bx').sort() : []] : null, look === plain ? '' : look, explicit.runs || null, explicit.ph === true, explicit.spilled === true]);
     });
     const props = [row.height === undefined ? null : row.height, row.customHeight, row.hidden, row.style === undefined ? '' : format(row.style), row.outlineLevel || 0, row.collapsed === true];
     if (cells.length > 0 || stable(props) !== stable([null, false, false, '', 0, false])) rows.push([r, props, cells]);

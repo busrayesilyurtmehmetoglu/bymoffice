@@ -136,6 +136,8 @@ export interface XlsxSpec {
   workbookHead?: string;
   /** Extra XML placed inside <workbook> after <sheets> (definedNames). */
   workbookTail?: string;
+  /** Complete cell metadata part (xl/metadata.xml). */
+  metadata?: string;
 }
 
 /** Wraps sheet content in a worksheet root element. */
@@ -181,6 +183,7 @@ export async function buildXlsx(spec: XlsxSpec): Promise<Uint8Array> {
   );
   optional(spec.styles, 'styles.xml', 'styles', 'application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml');
   optional(spec.theme, 'theme/theme1.xml', 'theme', 'application/vnd.openxmlformats-officedocument.theme+xml');
+  optional(spec.metadata, 'metadata.xml', 'sheetMetadata', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml');
 
   zip.set(
     '[Content_Types].xml',

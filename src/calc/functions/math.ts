@@ -8,6 +8,7 @@ import {
   ERROR_NUM,
   ERROR_VALUE,
   isError,
+  isRef,
   type CalcContext,
   type CalcError,
   type CalcFunction,
@@ -28,6 +29,8 @@ import {
   tidy,
   toArray,
   toGrid,
+  usedCols,
+  usedRows,
   type NumberRules,
 } from './helpers';
 import {
@@ -72,14 +75,54 @@ function fold(start: number, step: (total: number, value: number) => number, emp
 const sumProduct: CalcFunction = (args, context) => {
   const shape = toGrid(args[0], context);
   const arrays = [];
+  // When every argument is a reference, the rows (columns) past those the sheets have are empty in all of them:
+  // each of their terms is 0, so they are left out. The sum is the one of the whole ranges.
+  let keepRows = shape.rows;
+  let keepCols = shape.cols;
+  if (args.every(isRef)) {
+    keepRows = 0;
+    keepCols = 0;
+    for (const arg of args) {
+      const grid = toGrid(arg, context);
+      keepRows = Math.max(keepRows, usedRows(arg, grid, context));
+      keepCols = Math.max(keepCols, usedCols(arg, grid, context));
+    }
+    keepRows = Math.max(1, Math.min(keepRows, shape.rows));
+    keepCols = Math.max(1, Math.min(keepCols, shape.cols));
+  }
   for (let i = 0; i < args.length; i++) {
     const grid = toGrid(args[i], context);
     if (grid.rows !== shape.rows || grid.cols !== shape.cols) return ERROR_VALUE;
-    const array = toArray(args[i], context);
+    const arg = args[i];
+    const cut: Value =
+      isRef(arg) && (keepRows < shape.rows || keepCols < shape.cols)
+        ? { ref: true, sheet: arg.sheet, range: { top: arg.range.top, left: arg.range.left, bottom: arg.range.top + keepRows - 1, right: arg.range.left + keepCols - 1 } }
+        : arg;
+    const array = toArray(cut, context);
     if (isError(array)) return array;
     arrays.push(array);
   }
-  // Whole columns are cut to the used rows; what lies beyond is empty and adds nothing.
+  // Arrays of one shape with tails (ArrayValue.tail, the empty part of whole columns): what is after them is one term, so many times.
+  const size = arrays[0].rows * arrays[0].cols;
+  let from = 0;
+  let tails = true;
+  for (const array of arrays) {
+    if (array.tail === undefined || array.rows !== arrays[0].rows || array.cols !== arrays[0].cols || array.data.length < size) tails = false;
+    else if (array.tail > from) from = array.tail;
+  }
+  if (tails && from < size) {
+    let total = 0;
+    for (let k = 0; k <= from; k++) {
+      let term = 1;
+      for (let i = 0; i < arrays.length; i++) {
+        const value = clean(arrays[i].data[k]);
+        if (isError(value)) return value;
+        term *= typeof value === 'number' ? value : 0;
+      }
+      total += k === from ? term * (size - from) : term;
+    }
+    return checkNumber(total);
+  }
   let rows = arrays[0].rows;
   let cols = arrays[0].cols;
   for (let i = 1; i < arrays.length; i++) {

@@ -718,14 +718,14 @@ test('an error the engine wrote itself is not taken for a value of the file late
   const engine = new CalcEngine(workbook, NO_LIMIT);
   assert.deepEqual(addresses(engine.uncalculated()), ['0!B1', '0!B2', '0!B3', '0!B4']);
   engine.recalculate(engine.uncalculated());
-  assert.deepEqual(['B1', 'B2', 'B3', 'B4', 'B5'].map((address) => valueAt(workbook, address)), ['#NAME?', '#REF!', 2, '#NAME?', 7]);
+  assert.deepEqual(['B1', 'B2', 'B3', 'B4', 'B5'].map((address) => valueAt(workbook, address)), ['#NAME?', '#REF!', 2, 1, 7]);
   assert.equal(valueAt(workbook, 'C3'), 20);
   assert.deepEqual(addresses(engine.unsupported), ['0!B5']);
   assert.deepEqual(engine.uncalculated(), []);
   engine.invalidate();
   engine.recalculate();
   assert.deepEqual(addresses(engine.unsupported), ['0!B5']);
-  assert.deepEqual(['B1', 'B2', 'B3', 'B4', 'B5'].map((address) => valueAt(workbook, address)), ['#NAME?', '#REF!', 2, '#NAME?', 7]);
+  assert.deepEqual(['B1', 'B2', 'B3', 'B4', 'B5'].map((address) => valueAt(workbook, address)), ['#NAME?', '#REF!', 2, 1, 7]);
   // Still calculated: the function arrives (here: the formula changes to one that exists).
   engine.recalculate([edit(workbook, 0, 'A1', 5)]);
   assert.equal(valueAt(workbook, 'B3'), 6);

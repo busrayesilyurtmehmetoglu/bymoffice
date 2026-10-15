@@ -359,7 +359,7 @@ test('a formula with an unknown function keeps its stored value', () => {
   assert.equal(valueAt(workbook, 'B1'), 1234);
 });
 
-test('3D references, other workbooks, LET and LAMBDA keep their stored values', () => {
+test('3D references and other workbooks keep their stored values; LET and LAMBDA are calculated', () => {
   const workbook = book({
     S: {
       A1: 1,
@@ -380,13 +380,13 @@ test('3D references, other workbooks, LET and LAMBDA keep their stored values', 
   const engine = new CalcEngine(workbook);
   // Even when every value of the file may be replaced.
   engine.recalculate(undefined, { overwrite: true });
-  const kept = ['B1', 'B2', 'B3', 'B5', 'B6', 'B7', 'B8', 'B9'].map((address) => valueAt(workbook, address));
-  assert.deepEqual(kept, [11, 22, 33, 55, 66, 77, 88, 99]);
+  const kept = ['B1', 'B2', 'B5', 'B6', 'B7', 'B8', 'B9'].map((address) => valueAt(workbook, address));
+  assert.deepEqual(kept, [11, 22, 55, 66, 77, 88, 99]);
   assert.equal(valueAt(workbook, 'B10'), 2);
-  // "LAMBDA(...)(...)" is not syntax the parser knows; it was already left alone.
-  assert.equal(valueAt(workbook, 'B4'), 44);
+  assert.equal(valueAt(workbook, 'B3'), 2);
+  assert.equal(valueAt(workbook, 'B4'), 2);
   const listed = addresses(engine.unsupported.concat(engine.unparsed));
-  assert.deepEqual(listed, ['0!B1', '0!B2', '0!B3', '0!B4', '0!B5', '0!B6', '0!B7', '0!B8', '0!B9']);
+  assert.deepEqual(listed, ['0!B1', '0!B2', '0!B5', '0!B6', '0!B7', '0!B8', '0!B9']);
 });
 
 test('a formula just typed in (no value yet) shows the error instead of nothing', () => {
@@ -395,7 +395,7 @@ test('a formula just typed in (no value yet) shows the error instead of nothing'
   engine.recalculate();
   assert.equal(valueAt(workbook, 'B1'), '#NAME?');
   assert.equal(valueAt(workbook, 'B2'), '#REF!');
-  assert.equal(valueAt(workbook, 'B3'), '#NAME?');
+  assert.equal(valueAt(workbook, 'B3'), 1);
   assert.equal(valueAt(workbook, 'B4'), '#NAME?');
   assert.equal(valueAt(workbook, 'B5'), '#REF!');
   assert.deepEqual(engine.unsupported, []);

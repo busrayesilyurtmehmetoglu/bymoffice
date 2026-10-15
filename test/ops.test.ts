@@ -236,6 +236,7 @@ test('commands: typed input becomes values and picks up formats', async () => {
   assert.equal(shown(10, 2), '15%');
   assert.equal(valueAt(sheet, 10, 3), 45366);
   assert.equal(shown(10, 3), '15.03.2024');
+  // A formula that means the same as an ordinary one is one (see needsDynamic()).
   assert.deepEqual(getCell(sheet, 10, 4)?.formula, { text: 'A11*2', type: 'normal' });
   assert.deepEqual([valueAt(sheet, 10, 5), valueAt(sheet, 10, 6), getCell(sheet, 10, 6)?.kind], ['metin', '0123', 'string']);
 

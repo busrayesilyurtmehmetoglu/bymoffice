@@ -17,7 +17,7 @@ import { versionProblem, wireFingerprint } from './collab-wire-fingerprint';
  * test below fails: raise PROTOCOL_VERSION, and put the lines it prints here with the new version.
  */
 const PINNED = {
-  pv: 3,
+  pv: 4,
   lines: [
     'doc commands: deleteBackward deleteColumn deleteForward deleteRow indentList insertColumn insertHyperlink insertPageBreak insertRow insertTable toggleList',
     'doc kinds: cmd del para put run split text unrun',
@@ -57,7 +57,7 @@ const PINNED = {
     'doc:unrun: at k t to',
     'sheet commands: addChart addConditionalRule clearConditionalRules moveChart moveConditionalRule pasteChart removeChart removeConditionalRule setValidation updateChart updateConditionalRule',
     'sheet kinds: cells cmd cols del filter ins merges move name notes pane rows sheet+ sheet- sort state tab',
-    'sheet:cells.c[][].v.f: a r t x',
+    'sheet:cells.c[][].v.f: a d r t x',
     'sheet:cells.c[][].v.r[].font.color: auto indexed rgb theme tint',
     'sheet:cells.c[][].v.r[].font: bold charset color family italic name scheme size strike underline vertAlign',
     'sheet:cells.c[][].v.r[]: font text',

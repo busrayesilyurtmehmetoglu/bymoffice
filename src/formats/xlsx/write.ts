@@ -64,6 +64,7 @@ import type { Chart } from '../../model/sheet/chart';
 import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
+import { dynamicArrayMetadata, METADATA_CONTENT_TYPE, METADATA_RELATIONSHIP } from './metadata';
 import { pivotPartsToRead, pivotWrites } from './pivot-write';
 import { parseColor } from './styles';
 import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, pageBreaksXml, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
@@ -266,6 +267,18 @@ export interface CellWriter {
    * a text is written into the cell.
    */
   intern?(text: string, runs: RichRun[] | undefined): number;
+  /**
+   * The value of `cm` that marks a dynamic array formula, for a formula the model made one
+   * (see writtenDynamic()); asked the first time such a cell is written, and the metadata part
+   * is made or added to then. Undefined (or giving undefined): the formula is written without.
+   */
+  dynamicCm?(): number | undefined;
+  /**
+   * A row of the model with nothing to write is written as an empty element (<row r="5"/>), as the file had it:
+   * the model holds such a row only when the file did (an edit that empties a row takes it out, and so does an
+   * engine with a row it made for a spill).
+   */
+  keepEmptyRows?: boolean;
 }
 
 /** Whether a position without a cell would take a format from its column. */
@@ -336,10 +349,23 @@ function inlineString(text: string, runs: RichRun[] | undefined, prefix: string)
   return `<${prefix}is>${body}</${prefix}is>`;
 }
 
-function formulaXml(formula: CellFormula, prefix: string): string {
+/**
+ * Whether a formula is written as a dynamic array formula: an array formula whose cell has cell
+ * metadata that says so. Every dynamic formula of the model is, also one that gives one value (its
+ * `ref` is then its own cell) and one never calculated, whose spill is not known yet.
+ */
+export function writtenDynamic(formula: CellFormula | undefined): boolean {
+  return !!formula && formula.dynamic === true && formula.type === 'normal';
+}
+
+/** `at`: the name of the cell, the `ref` of a dynamic array formula that has none. */
+function formulaXml(formula: CellFormula, prefix: string, at: string): string {
   let out = `<${prefix}f`;
+  const dynamic = writtenDynamic(formula);
   if (formula.type !== 'normal') out += ` t="${formula.type}"`;
-  if (formula.ref !== undefined) out += ` ref="${escapeAttr(formula.ref)}"`;
+  else if (dynamic) out += ' t="array"';
+  const ref = formula.ref !== undefined ? formula.ref : dynamic ? at : undefined;
+  if (ref !== undefined) out += ` ref="${escapeAttr(ref)}"`;
   if (formula.si !== undefined) out += ` si="${formula.si}"`;
   if (formula.attrs) for (const [name, value] of formula.attrs) out += ` ${name}="${escapeAttr(value)}"`;
   // Formula text is literal: "_x0041_" in a formula is a name, not an escape.
@@ -360,11 +386,13 @@ function cellXml(writer: CellWriter, cell: Cell, rowNumber: number, col: number,
 
   let out = `<${prefix}c r="${columnLetters(col)}${rowNumber}"`;
   if (cell.style) out += ` s="${cell.style}"`;
-  if (cell.cm !== undefined) out += ` cm="${cell.cm}"`;
+  // A dynamic array formula made in the model gets the cell metadata that marks one.
+  const cm = cell.cm !== undefined ? cell.cm : writtenDynamic(formula) && writer.dynamicCm ? writer.dynamicCm() : undefined;
+  if (cm !== undefined) out += ` cm="${cm}"`;
   if (cell.vm !== undefined) out += ` vm="${cell.vm}"`;
   if (cell.ph) out += ' ph="1"';
 
-  let body = formula ? formulaXml(formula, prefix) : '';
+  let body = formula ? formulaXml(formula, prefix, `${columnLetters(col)}${rowNumber}`) : '';
   const value = cell.value;
   switch (cell.kind) {
     case 'number':
@@ -451,7 +479,7 @@ export function rowXml(writer: CellWriter, index: number, row: Row | undefined):
     }
   }
 
-  if (cells === '') return attrs === '' ? '' : `<${prefix}row r="${rowNumber}"${attrs}/>`;
+  if (cells === '') return attrs === '' && !(row && writer.keepEmptyRows) ? '' : `<${prefix}row r="${rowNumber}"${attrs}/>`;
   return `<${prefix}row r="${rowNumber}"${attrs}>${cells}</${prefix}row>`;
 }
 
@@ -1347,6 +1375,8 @@ interface SheetRewrite {
   legacyDrawing?: string | null;
   /** The record of the style sheet that holds the format of a conditional rule, as this save writes the style sheet (see planDxfs()). */
   dxfOf?: (rule: ConditionalRule) => number | undefined;
+  /** The value of `cm` that marks a dynamic array formula (see CellWriter.dynamicCm). */
+  dynamicCm?: () => number | undefined;
 }
 
 interface SheetRenames {
@@ -2228,7 +2258,7 @@ function rewriteSheet(original: Uint8Array, sheet: Sheet, workbook: Workbook, op
    */
   const made: { index: number; start: number; end: number }[] = [];
 
-  const writer: CellWriter = { prefix, shared: workbook.sharedStrings, styledColumns: sheet.columns.filter((range) => !!range.style), overrides: options.overrides };
+  const writer: CellWriter = { prefix, shared: workbook.sharedStrings, styledColumns: sheet.columns.filter((range) => !!range.style), overrides: options.overrides, dynamicCm: options.dynamicCm, keepEmptyRows: true };
   const fresh = !!options.fresh;
   // The raw content names sheets as the file does, this one included.
   const fileName = options.fileName !== undefined ? options.fileName : sheet.name;
@@ -4735,6 +4765,9 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   if (sheetsModified || sheets.some((sheet) => sheet.modified)) {
     const chain = bookPart('calcChain');
     if (chain !== undefined && !(saved && saved.removed.has(chain))) want(chain);
+    // A dynamic array formula the model made is marked with the cell metadata of the file.
+    const metadata = bookPart(METADATA_RELATIONSHIP);
+    if (metadata !== undefined) want(metadata);
   }
   if (sheetsModified) for (const rel of reads.relationships('/')) if (endsWith(rel.type, '/extended-properties') && rel.part) want(rel.part);
   const moving = sheets.some((sheet) => !!sheet.structuralEdits && sheet.structuralEdits.length > 0);
@@ -5637,6 +5670,30 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
 
   // Everything is produced before anything is put into the package: a failure leaves the package as it was.
   const writes: PartWrite[] = [];
+  // The cell metadata that marks a dynamic array formula: asked for by the first cell of one the model made, which
+  // the part of the file may already have, or which is added to it (or a part is made for it) by this save.
+  let dynamicCmOf: number | null | undefined;
+  let metadataWritten: string | undefined;
+  const dynamicCm = (): number | undefined => {
+    if (dynamicCmOf === undefined) {
+      const rel = withType(`/${METADATA_RELATIONSHIP}`);
+      // A new part gets a name no part of the package has (a part nothing leads to is kept as it is).
+      let part = rel ? resolveTarget(main, rel.attrs.get('Target') || '') : `${main.slice(0, slash)}/metadata.xml`;
+      if (!rel) {
+        const taken = new Set(pkg.partNames().map((name) => name.toLowerCase()));
+        for (let k = 2; taken.has(part.toLowerCase()) && k < 10000; k++) part = `${main.slice(0, slash)}/metadata${k}.xml`;
+      }
+      const made = dynamicArrayMetadata(rel ? originalOf(part) : undefined);
+      dynamicCmOf = made ? made.cm : null;
+      if (made && made.xml !== undefined) {
+        if (!rel && !originals.has(part)) originals.set(part, null);
+        writes.push([part, encoder.encode(made.xml), METADATA_CONTENT_TYPE]);
+        if (!rel) relate(METADATA_RELATIONSHIP, part);
+        metadataWritten = part;
+      }
+    }
+    return dynamicCmOf === null ? undefined : dynamicCmOf;
+  };
   /** Sheets marked as modified whose part came out as the bytes of the file. */
   const asInFile = new Set<Sheet>();
 
@@ -5763,7 +5820,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       // Only the notes of the sheet changed: every byte of the part stays but the element that names their boxes.
       if (bytes && legacyDrawing !== undefined && foreign.length === 0 && !rename && tabSelected === undefined && !rules) next = setLegacyDrawing(bytes, legacyDrawing, sheet.name);
       else if (bytes && (foreign.length > 0 || rename || tabSelected !== undefined || legacyDrawing !== undefined || rules)) {
-        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf });
+        next = rewriteSheet(bytes, sheet, workbook, { foreign, rawOnly: true, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf, dynamicCm });
       }
       // The drawing the sheet names, once it got its first chart or lost its last.
       if (bytes && charts && charts.element !== undefined) next = setSheetDrawing(next || bytes, 'drawing', charts.element, sheet.name) || next;
@@ -5782,7 +5839,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     } else {
       const bytes = originalOf(sheet.part);
       if (!bytes) throw new Error(`Cannot write sheet "${sheet.name}": its part ${sheet.part} is missing`);
-      let written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf }) as Uint8Array;
+      let written = rewriteSheet(bytes, sheet, workbook, { foreign, overrides, fileName, rename, tabSelected, tabWindows, legacyDrawing, dxfOf: dxfs.indexOf, dynamicCm }) as Uint8Array;
       if (charts && charts.element !== undefined) written = setSheetDrawing(written, 'drawing', charts.element, sheet.name) || written;
       const coloured = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
       const viewed = (pane && setPaneIn(coloured, sheet)) || coloured;
@@ -5940,7 +5997,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const hyperlinks = sheet.hyperlinks.filter((link) => link.location !== undefined).map((link) => (link.rId === undefined ? link : { ...link, rId: undefined }));
     // Its charts: all of them were added, and so are the parts that hold them.
     const charts = charting.has(sheet) ? chartsOf(sheet, part, undefined, undefined, undefined, sheet.name, undefined) : undefined;
-    let bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf }) as Uint8Array;
+    let bytes = rewriteSheet(encoder.encode(skeleton), { ...sheet, hyperlinks }, workbook, { fresh: true, legacyDrawing: notes ? notes.legacy : undefined, dxfOf: dxfs.indexOf, dynamicCm }) as Uint8Array;
     if (charts && charts.element) bytes = setSheetDrawing(bytes, 'drawing', charts.element, sheet.name) || bytes;
     if (!originals.has(part)) originals.set(part, null);
     writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
@@ -6106,6 +6163,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   // The style sheet an earlier save wrote and this one does not goes back to what the file had; one
   // the file did not have goes away again.
   if (styled !== undefined) bookParts.push(styled);
+  // So does a metadata part this save made or added to.
+  if (metadataWritten !== undefined) bookParts.push(metadataWritten);
   for (const part of moved.get(BOOK) || []) if (bookParts.indexOf(part) < 0 && originals.get(part) === null && part !== relsPart) deletions.push(part);
   for (const part of moved.get(BOOK) || []) {
     const original = originals.get(part);

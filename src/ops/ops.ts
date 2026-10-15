@@ -23,6 +23,7 @@ import {
   isFileSheet,
   foldSheetName,
   parseCellRef,
+  fillsRange,
   parseRange,
   type AutoFilter,
   type Cell,
@@ -574,7 +575,7 @@ function checkArrayFormulas(sheet: Sheet, edit: SheetStructuralEdit): void {
   for (const row of sheet.rows.values()) {
     row.cells.forEach((cell) => {
       const formula = cell.formula;
-      if (!formula || formula.type !== 'array' || formula.ref === undefined) return;
+      if (!fillsRange(formula) || formula.type === 'dataTable') return;
       const range = parseRange(formula.ref);
       if (!range) return;
       const first = edit.axis === 'row' ? range.top : range.left;
@@ -951,10 +952,10 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
   for (const [rowIndex, row] of sheet.rows) {
     row.cells.forEach((cell, col) => {
       const formula = cell.formula;
-      if (!formula || (formula.type !== 'array' && formula.type !== 'dataTable')) return;
+      if (!formula || (formula.type !== 'array' && formula.type !== 'dataTable' && !(formula.dynamic && formula.ref !== undefined))) return;
       const area = (formula.ref !== undefined && parseRange(formula.ref)) || { top: rowIndex, left: col, bottom: rowIndex, right: col };
       if (!intersects(area, range)) return;
-      const single = formula.type === 'array' && area.top === area.bottom && area.left === area.right;
+      const single = formula.type !== 'dataTable' && area.top === area.bottom && area.left === area.right;
       if (!single) throw new RangeError(`Cannot sort through the array formula in ${formula.ref === undefined ? cellName(rowIndex, col) : formula.ref}`);
     });
   }
@@ -1019,7 +1020,7 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
         // As when a cell is copied: what it refers to relative to itself is still that far from it.
         // What it refers to by sheet name stays where it is.
         const text = shiftUnqualified(formula.text, i - from);
-        const single = formula.type === 'array' && formula.ref !== undefined;
+        const single = (formula.type === 'array' || formula.dynamic === true) && formula.ref !== undefined;
         if (text !== formula.text || single) cell = { ...cell, formula: { ...formula, text, ...(single ? { ref: cellName(at, range.left + k) } : {}) } };
       }
       cells[range.left + k] = cell;

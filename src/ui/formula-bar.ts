@@ -79,7 +79,26 @@ export class FormulaBar {
     if (!this.focused(this.nameBox)) this.nameBox.value = this.name;
     this.content.readOnly = view.readOnly;
     // While the field is being typed in, the text in it is the newest there is.
-    if (!(view.isEditing && this.focused(this.content))) this.setContent(view.editText);
+    if (!(view.isEditing && this.focused(this.content))) this.setContent(this.shownText());
+  }
+
+  /**
+   * What the field shows when nothing is being typed: the content of the active cell, or for a
+   * cell a dynamic array formula spills into, that formula, greyed as Excel shows it.
+   */
+  private shownText(): string {
+    const view = this.host.view;
+    const source = view.isEditing ? undefined : view.spilledFrom;
+    if (source) {
+      this.content.setAttribute('data-spilled', '');
+      this.content.style.color = 'GrayText';
+      return source.text;
+    }
+    if (this.content.hasAttribute('data-spilled')) {
+      this.content.removeAttribute('data-spilled');
+      this.content.style.color = '';
+    }
+    return view.editText;
   }
 
   /** The grid's editor opened, changed or closed. */
@@ -87,7 +106,11 @@ export class FormulaBar {
     if (this.destroyed) return;
     // Typing here comes back as an echo; writing it into the field again would move the caret.
     if (state.editing && this.focused(this.content)) return;
-    this.setContent(state.editing ? state.text : this.host.view.editText);
+    if (state.editing) {
+      this.content.removeAttribute('data-spilled');
+      this.content.style.color = '';
+      this.setContent(state.text);
+    } else this.setContent(this.shownText());
   }
 
   destroy(): void {
@@ -173,7 +196,7 @@ export class FormulaBar {
     } else if (event.key === 'Escape') {
       event.preventDefault();
       view.cancelEditing();
-      this.setContent(view.editText);
+      this.setContent(this.shownText());
       view.focus();
     } else if (event.key === 'F4' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
       // The reference at the caret goes from relative to absolute and on; without one the key is the browser's.

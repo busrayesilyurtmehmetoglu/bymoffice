@@ -141,7 +141,8 @@ function database(kind: Kind): CalcFunction {
           tests += conditions.length;
         }
       }
-      if (!everything && tests * rows > MAX_TESTS) return ERROR_NUM;
+      // The full height of the table, not the rows of it the sheet has: whether the work is too much must not depend on that.
+      if (!everything && tests * table.rows > MAX_TESTS) return ERROR_NUM;
 
       let total = 0;
       let count = 0;
@@ -172,9 +173,22 @@ function database(kind: Kind): CalcFunction {
           count++;
         } else if (isError(value) && kind !== 'count') return value;
       }
-      // A database cut to the used part of its sheet may have empty records below; with criteria
-      // that ask for nothing they match as well, but they hold no value to add.
-      if (everything && rows < table.rows) matched += table.rows - Math.max(rows, 1);
+      // A database cut to the rows its sheet has has empty records below. They match where an
+      // empty record does (criteria that ask for nothing, "=", "<>x"), and hold no value to add.
+      if (rows < table.rows) {
+        let blankMatches = everything;
+        for (let a = 0; a < alternatives.length && !blankMatches; a++) {
+          const conditions = alternatives[a];
+          blankMatches = true;
+          for (let i = 0; i < conditions.length && blankMatches; i++) blankMatches = conditions[i].criterion.test(null);
+        }
+        if (blankMatches) {
+          const below = table.rows - Math.max(rows, 1);
+          matched += below;
+          // DGET finds the empty record when it is the only one.
+          if (matched === below) found = null;
+        }
+      }
       switch (kind) {
         case 'sum':
           return isFinite(total) ? total : ERROR_NUM;

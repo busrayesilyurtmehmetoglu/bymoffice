@@ -3423,6 +3423,8 @@ export class WorkbookView {
       comments: floating && state.sheet.comments && state.sheet.comments.length > 0 ? floating : undefined,
       // What the formula being typed was pointed at, on the sheet it is on.
       reference: (this.edit || this.rulesDialog) && this.point && this.point.sheet === state.sheet ? this.point.range : undefined,
+      // The cells of the dynamic array formula the active cell is part of.
+      spill: this.edit ? undefined : this.spillOfActive()?.range,
       peers: this.collab ? this.gridPeers() : undefined,
     });
     if (this.collab) this.collab.setPresence({ sheet: this.sheetIndex, row: state.active.row, col: state.active.col, range: { ...state.range } });
@@ -5978,6 +5980,29 @@ export class WorkbookView {
     }
     this.placeInput();
     this.emitEditing();
+  }
+
+  /**
+   * While the active cell is one a dynamic array formula spills into (not its own): where the
+   * formula is, the cells it fills, and its text as the editor shows it. What is in such a cell
+   * is the result of that formula; typing into it puts something in the way of the spill.
+   */
+  get spilledFrom(): { row: number; col: number; range: CellRange; text: string } | undefined {
+    const state = this.state();
+    const spill = this.spillOfActive();
+    if (!spill || (spill.row === state.active.row && spill.col === state.active.col)) return undefined;
+    return { row: spill.row, col: spill.col, range: spill.range, text: editTextAt(this.workbook, state.sheet, spill.row, spill.col, { locale: this.locale }) };
+  }
+
+  /** The spill the active cell is part of, its formula's own cell included. */
+  private spillOfActive(): { row: number; col: number; range: CellRange } | undefined {
+    const state = this.state();
+    if (!this.engine || state.sheet.kind !== 'worksheet') return undefined;
+    const found = this.engine.spillAt({ sheet: this.sheetIndex, row: state.active.row, col: state.active.col });
+    if (!found || found.sheet !== this.sheetIndex) return undefined;
+    // The engine knows the spill as it last calculated it: the model must still have the formula there.
+    const anchor = getCell(state.sheet, found.row, found.col);
+    return anchor && anchor.formula && anchor.formula.dynamic ? found : undefined;
   }
 
   /** While editing: the text in the editor. Otherwise: the edit text of the active cell. */

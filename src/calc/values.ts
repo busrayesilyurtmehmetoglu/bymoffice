@@ -5,7 +5,7 @@
 import { parseCellInput } from '../edit/input';
 import type { FormatLocale } from '../format/locale';
 import { serialToDate } from '../format/number-format';
-import type { CellRange } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, type CellRange } from '../model/sheet/types';
 
 export type ErrorCode = '#NULL!' | '#DIV/0!' | '#VALUE!' | '#REF!' | '#NAME?' | '#NUM!' | '#N/A' | '#SPILL!' | '#CALC!';
 
@@ -23,6 +23,20 @@ export interface ArrayValue {
   readonly cols: number;
   /** Row by row; length is rows * cols. */
   readonly data: readonly Scalar[];
+  /**
+   * A hint: from this index on, every element of `data` is the same as `data[tail]` (the empty cells
+   * below what a sheet holds, in a whole column read as an array). The elements are there all the
+   * same; what works element by element may work out the rest from one of them.
+   */
+  readonly tail?: number;
+}
+
+/** Arrays of fewer elements are not worth a tail. */
+const MIN_TAIL = 1024;
+
+/** The index from which an array's elements are all the same, when `uniform` says from where they are null; undefined when not worth it. */
+export function tailFrom(size: number, filled: number): number | undefined {
+  return size - filled >= MIN_TAIL ? filled : undefined;
 }
 
 /**
@@ -535,8 +549,12 @@ export interface CalcContext {
    * Whole rows and columns cost only what is in them.
    */
   forEachCell(sheet: number, range: CellRange, visit: (value: Scalar, row: number, col: number) => void): void;
-  /** One past the last row and column in use on a sheet: the limit a range is cut to when it is read as an array. */
-  usedExtent(sheet: number): { rows: number; cols: number };
+  /**
+   * One past the last row and column of a sheet that hold something (a value or a formula; of spills, those
+   * that reach into `range`, the range being read), whatever was written and cleared since: the limit a whole
+   * column or row is cut to when it is read as an array.
+   */
+  usedExtent(sheet: number, range?: CellRange): { rows: number; cols: number };
   /** Index of a sheet by name (not case sensitive), or undefined. */
   sheetIndex(name: string): number | undefined;
   sheetName(index: number): string | undefined;
@@ -579,32 +597,70 @@ export interface CalcContext {
    * such rows are left out by every SUBTOTAL, rows hidden otherwise only by SUBTOTAL 101 to 111.
    */
   rowFiltered?(sheet: number, row: number): boolean;
+  /**
+   * The cells the dynamic array formula of a cell spills into ("A1#"), its own cell included;
+   * an error when the formula cannot spill (#SPILL!), undefined when the cell holds no such
+   * formula. Calculates the formula first when needed.
+   */
+  spillRange?(sheet: number, row: number, col: number): CellRange | CalcError | undefined;
 }
 
 /** Largest array a reference is read into. */
 const MAX_REF_CELLS = 5000000;
 
+/** Whether a range is a whole column (or several) or a whole row: "A:A", "1:1", "A:C". */
+export function isWholeLine(range: CellRange): boolean {
+  return (range.top <= 0 && range.bottom >= MAX_ROWS - 1) || (range.left <= 0 && range.right >= MAX_COLS - 1);
+}
+
 /**
- * The cells of a reference as an array, cut to the used part of its sheet. Never throws:
- * a reference that is not a rectangle gives a single #REF!, one too large to hold a single #NUM!.
+ * The part of a range that is read as an array. A range whose bounds are written (A1:A30) is read
+ * whole, empty cells included. A whole column or row (A:A, 1:1), and a range larger than `limit`, is
+ * cut to the content of its sheet (CalcContext.usedExtent: the last row and column that hold a value,
+ * a formula or a spill, never how far the sheet was once written), at least its first cell kept.
+ */
+export function readRange(range: CellRange, sheet: number, context: CalcContext, limit: number): CellRange {
+  if (!isWholeLine(range) && (range.bottom - range.top + 1) * (range.right - range.left + 1) <= limit) return range;
+  const extent = context.usedExtent(sheet, range);
+  // A side is looked at only when it is long: a whole column needs how far the rows go, not the columns.
+  return {
+    top: range.top,
+    left: range.left,
+    bottom: range.bottom > range.top ? Math.min(range.bottom, Math.max(extent.rows - 1, range.top)) : range.bottom,
+    right: range.right > range.left ? Math.min(range.right, Math.max(extent.cols - 1, range.left)) : range.right,
+  };
+}
+
+/**
+ * The cells of a reference as an array, all of them. A reference that is not a rectangle
+ * gives a single #REF!, one too large to hold a single #NUM!. Only the abort of a
+ * calculation's budget (CalcContext.tick) is thrown.
  */
 export function refToArray(ref: RefValue, context: CalcContext): ArrayValue {
   const range = ref.range;
   if (!range || !(range.top >= 0) || !(range.left >= 0) || !(range.bottom >= range.top) || !(range.right >= range.left)) return scalarArray(ERROR_REF);
-  const extent = context.usedExtent(ref.sheet);
-  const bottom = Math.min(range.bottom, Math.max(extent.rows - 1, range.top));
-  const right = Math.min(range.right, Math.max(extent.cols - 1, range.left));
+  // A range of written bounds whole, empty cells included; a whole column or row to the content of its sheet.
+  const read = readRange(range, ref.sheet, context, MAX_REF_CELLS);
+  const bottom = read.bottom;
+  const right = read.right;
   const rows = bottom - range.top + 1;
   const cols = right - range.left + 1;
   if (!(rows >= 1 && cols >= 1) || Math.floor(rows) !== rows || Math.floor(cols) !== cols) return scalarArray(ERROR_REF);
   if (rows * cols > MAX_REF_CELLS) return scalarArray(ERROR_NUM);
+  if (context.tick !== undefined) context.tick((rows * cols) >> 4);
   const data: Scalar[] = new Array(rows * cols).fill(null);
+  let filled = 0;
   context.forEachCell(ref.sheet, { top: range.top, left: range.left, bottom, right }, (value, row, col) => {
     const r = row - range.top;
     const c = col - range.left;
-    if (r >= 0 && r < rows && c >= 0 && c < cols) data[r * cols + c] = value;
+    if (r >= 0 && r < rows && c >= 0 && c < cols) {
+      const at = r * cols + c;
+      data[at] = value;
+      if (value !== null && at >= filled) filled = at + 1;
+    }
   });
-  return { rows, cols, data };
+  const tail = tailFrom(rows * cols, filled);
+  return tail === undefined ? { rows, cols, data } : { rows, cols, data, tail };
 }
 
 /** A function of the library. Arguments arrive evaluated; references stay references. */

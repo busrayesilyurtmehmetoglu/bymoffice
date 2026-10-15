@@ -9,6 +9,7 @@
 
 import {
   ERROR_NA,
+  ERROR_NUM,
   ERROR_REF,
   ERROR_VALUE,
   isError,
@@ -45,6 +46,9 @@ import {
 } from './helpers';
 
 type Getter = (index: number) => Scalar;
+
+/** Most cells of the row or column XLOOKUP returns: a whole column of a sheet. */
+const MAX_LOOKUP_RESULT = 1 << 20;
 
 /** Order of two values of the same kind (text without regard to case); undefined when the kinds differ. */
 function compareSame(cell: Scalar, lookup: Scalar): number | undefined {
@@ -144,6 +148,9 @@ function findMatch(get: Getter, count: number, lookup: Scalar, matchMode: number
   if (lookup === null) lookup = 0;
   if (searchMode === 2 || searchMode === -2) {
     const descending = searchMode === -2;
+    // Empty cells at the end change where a binary search looks, and how many there are depends on
+    // how far the sheet was once written (usedRows()): the search ends at the last cell that holds something.
+    while (count > 0 && get(count - 1) === null) count--;
     const at = bisect(get, count, lookup, descending);
     const exact = at >= 0 && compareSame(get(at), lookup) === 0;
     if (exact) return at;
@@ -358,11 +365,12 @@ const xlookup: CalcFunction = (args, context) => {
   if (isError(lookup)) return lookup;
   const at = find(lookup);
   if (at < 0) return missing();
-  const width = byRow ? usedCols(args[2], results, context) : usedRows(args[2], results, context);
   const full = byRow ? results.cols : results.rows;
   if (full === 1) return byRow ? results.get(at, 0) : results.get(0, at);
-  // The whole row (or column) of the return range; a whole-sheet range is cut to its used part.
-  const size = Math.max(1, width);
+  // The whole row (or column) of the return range, empty cells included.
+  if (!(full <= MAX_LOOKUP_RESULT)) return ERROR_NUM;
+  if (context.tick !== undefined) context.tick(full >> 4);
+  const size = full;
   const data: Scalar[] = new Array(size);
   for (let i = 0; i < size; i++) data[i] = byRow ? results.get(at, i) : results.get(i, at);
   return byRow ? { rows: 1, cols: size, data } : { rows: size, cols: 1, data };
@@ -480,6 +488,44 @@ const sort: CalcFunction = (args, context) => {
   return byCol ? transposed(result) : result;
 };
 
+/**
+ * SORTBY(array, by_array1, [sort_order1], [by_array2, sort_order2], ...): the rows (or, when
+ * the keys are rows, the columns) of `array` in the order of the keys, the first key first.
+ * Every key is one column as tall as the array, or one row as wide.
+ */
+const sortBy: CalcFunction = (args, context) => {
+  const source = toArray(args[0], context);
+  if (isError(source)) return source;
+  const keys: { values: readonly Scalar[]; direction: number }[] = [];
+  let byCol: boolean | undefined;
+  for (let k = 1; k < args.length; k += 2) {
+    const key = toArray(args[k], context);
+    if (isError(key)) return key;
+    const direction = k + 1 < args.length ? optionalNumber(args, k + 1, 1, context) : 1;
+    if (typeof direction !== 'number') return direction;
+    if (direction !== 1 && direction !== -1) return ERROR_VALUE;
+    // A key of one cell sorts an array of one row or one column, either way.
+    const column = key.cols === 1 && key.rows === source.rows && (key.rows > 1 || source.rows === 1);
+    const row = !column && key.rows === 1 && key.cols === source.cols;
+    if (!column && !row) return ERROR_VALUE;
+    if (byCol === undefined) byCol = row;
+    else if (byCol !== row) return ERROR_VALUE;
+    keys.push({ values: key.data, direction });
+  }
+  const array = byCol ? transposed(source) : source;
+  const order: number[] = new Array(array.rows);
+  for (let r = 0; r < array.rows; r++) order[r] = r;
+  order.sort((x, y) => {
+    for (const key of keys) {
+      const by = sortCompare(clean(key.values[x]), clean(key.values[y]), key.direction);
+      if (by !== 0) return by;
+    }
+    return x - y;
+  });
+  const result = takeRows(array, order);
+  return byCol ? transposed(result) : result;
+};
+
 const filter: CalcFunction = (args, context) => {
   const array = toArray(args[0], context);
   if (isError(array)) return array;
@@ -514,5 +560,6 @@ export const LOOKUP_FUNCTIONS: { [name: string]: FunctionSpec } = {
   TRANSPOSE: spec(transpose, 1, 1, true),
   UNIQUE: spec(unique, 1, 3, true),
   SORT: spec(sort, 1, 4, true),
+  SORTBY: spec(sortBy, 2, 254, true),
   FILTER: spec(filter, 2, 3, true),
 };

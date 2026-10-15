@@ -665,8 +665,9 @@ test('information about cells', () => {
   assert.deepEqual(cell('CELL("width",A1)'), err('#VALUE!'));
   assert.deepEqual(cell('CELL("row",5)'), err('#VALUE!'));
 
-  assert.deepEqual(cell('LET(x,1,x+1)'), err('#NAME?'));
-  assert.deepEqual(cell('LAMBDA(x,x+1)'), err('#NAME?'));
+  assert.equal(cell('LET(x,1,x+1)'), 2);
+  // A function is no value a cell can hold.
+  assert.deepEqual(cell('LAMBDA(x,x+1)'), err('#CALC!'));
 });
 
 test('the built-in forms are never looked up in the library', () => {

@@ -471,6 +471,10 @@ function readContent(value: unknown): WireContent {
         return [oneOf(item[0], FORMULA_FLAGS, 'formula'), oneOf(item[1], ['1', '0', 'true', 'false'] as const, 'formula')] as [string, string];
       });
     }
+    if (has(f, 'd')) {
+      if (f.d !== 1) fail('formula');
+      formula.d = 1;
+    }
     content.f = formula;
   }
   if (has(from, 'r')) content.r = readRuns(from.r);
@@ -768,6 +772,8 @@ export function decodeStep(raw: unknown, styles: StyleSheet): WireOp[] {
 
 function contentOf(cell: Cell | undefined, row: number, col: number, masters: () => SharedMasters): WireContent {
   if (!cell) return { k: 'blank', v: null };
+  // What a dynamic array formula spilled is no content: the others work it out themselves (Cell.spilled).
+  if (cell.spilled === true && !cell.formula) return { k: 'blank', v: null };
   const explicit = cell.formula && cell.formula.type === 'shared' ? explicitFormula(cell, row, col, masters()) : cell;
   const content: WireContent = { k: explicit.kind, v: explicit.value };
   const formula = explicit.formula;
@@ -775,6 +781,7 @@ function contentOf(cell: Cell | undefined, row: number, col: number, masters: ()
     // What a formula is beside the formula of its own cell does not travel (see readContent()).
     if (formula.type === 'array' || formula.type === 'dataTable') throw new CollabUnsupportedError('other', 'Array formulas and data tables cannot be changed while the workbook is edited together');
     content.f = { x: formula.text };
+    if (formula.dynamic === true) content.f.d = 1;
     if (formula.attrs && formula.attrs.size > 0) {
       const flags: [string, string][] = [];
       formula.attrs.forEach((value, name) => {
@@ -1070,6 +1077,7 @@ function cellFrom(content: WireContent, style: number): Cell {
     cell.formula = { text: content.f.x, type: content.f.t || 'normal' };
     if (content.f.r !== undefined && content.f.t) cell.formula.ref = content.f.r;
     if (content.f.a) cell.formula.attrs = new Map(content.f.a);
+    if (content.f.d === 1 && !content.f.t) cell.formula.dynamic = true;
   }
   if (content.r) cell.runs = content.r;
   if (content.ph) cell.ph = true;

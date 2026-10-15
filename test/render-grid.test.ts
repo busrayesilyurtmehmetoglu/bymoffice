@@ -272,6 +272,7 @@ interface DrawOptions {
   drawings?: GridScene['drawings'];
   comments?: GridScene['comments'];
   reference?: GridScene['reference'];
+  spill?: GridScene['spill'];
 }
 
 function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
@@ -304,6 +305,7 @@ function draw(sheet: Sheet, options: DrawOptions = {}): FakeContext {
     drawings: options.drawings,
     comments: options.comments,
     reference: options.reference,
+    spill: options.spill,
   });
   assert.equal(ctx.saves, ctx.restores, 'save() and restore() are balanced');
   return ctx;
@@ -883,6 +885,20 @@ test('grid: the cells a formula is pointed at get a dashed frame, cut to the pan
   // With frozen panes each pane frames its part.
   sheet.view.frozenCols = 1;
   assert.equal(frames(draw(sheet, { scrollX: CW, reference: range(0, 0, 0, 2) })).length, 2);
+});
+
+test('grid: the cells a dynamic array formula fills get a thin frame, under the selection', () => {
+  const sheet = newSheet();
+  const COLOR = '#1A73E8';
+  const frames = (ctx: FakeContext) => ctx.strokeRects.filter((rect) => rect.style === COLOR).map((rect) => [rect.x, rect.y, rect.width, rect.height, rect.lineWidth]);
+  const ctx = draw(sheet, { selection: { active: { row: 1, col: 0 }, range: range(1, 0, 1, 0) }, spill: range(0, 0, 2, 1) });
+  assert.deepEqual(frames(ctx), [[HX - 0.5, HY - 0.5, 2 * CW, 3 * RH, 1]]);
+  // Drawn before the selection, which stays on top.
+  const order = ctx.strokeRects.map((rect) => rect.style);
+  assert.ok(order.indexOf(COLOR) < order.lastIndexOf(DEFAULT_GRID_THEME.selectionBorder));
+  assert.deepEqual(frames(draw(sheet, {})), []);
+  assert.deepEqual(frames(draw(sheet, { spill: range(5000, 0, 5001, 0) })), []);
+  for (const bad of [range(Number.NaN, 0, 1, 1), range(5, 5, 1, 1)]) assert.deepEqual(frames(draw(sheet, { spill: bad })), []);
 });
 
 test('grid: the selection is clipped by the frozen panes', () => {

@@ -16,6 +16,7 @@
 // formula ("5,1" is a number), and the parser would have nothing to object to.
 
 import type { FormatLocale } from '../format/locale';
+import { withFuturePrefixes, withoutFuturePrefixes } from './future-names';
 
 /** Longer text is not a formula (Excel's limit is 8,192 characters) and is left alone. */
 const MAX_LENGTH = 32768;
@@ -235,6 +236,13 @@ const TURKISH_FUNCTIONS: [string, string][] = [
   ['DEVRİK_DÖNÜŞÜM', 'TRANSPOSE'],
   ['ÇAPRAZARA', 'XLOOKUP'],
   ['ÇAPRAZEŞLEŞTİR', 'XMATCH'],
+  // The functions of dynamic arrays. UNSURE, like the rest of this part of the list.
+  ['FİLTRE', 'FILTER'],
+  ['SIRALA', 'SORT'],
+  ['SIRALAÖLÇÜT', 'SORTBY'],
+  ['BENZERSİZ', 'UNIQUE'],
+  ['SIRALI', 'SEQUENCE'],
+  ['RASTGELEDİZİ', 'RANDARRAY'],
   ['KÖPRÜ', 'HYPERLINK'],
   ['FORMÜLMETNİ', 'FORMULATEXT'],
   ['ÇOKEĞER', 'IFS'],
@@ -575,8 +583,11 @@ function translate(text: string, toLocal: boolean, names: boolean, findings: Fin
  * Function names stay English. Unchanged for every other locale.
  */
 export function formulaToLocal(text: string, locale?: FormatLocale): string {
-  if (typeof text !== 'string' || text.length > MAX_LENGTH || !usesComma(locale)) return text;
-  return translate(text, true, false, { strayComma: false });
+  if (typeof text !== 'string' || text.length > MAX_LENGTH) return text;
+  // What files add to newer functions ("_xlfn.") is not shown; "A1#" and "@" are.
+  const shown = withoutFuturePrefixes(text);
+  if (!usesComma(locale)) return shown;
+  return translate(shown, true, false, { strayComma: false });
 }
 
 /**
@@ -592,9 +603,11 @@ export function formulaToLocal(text: string, locale?: FormatLocale): string {
  * formula and silently mean something else in the next. Unchanged for every other locale.
  */
 export function formulaFromLocal(text: string, locale?: FormatLocale, options?: FormulaLocaleOptions): string {
-  if (typeof text !== 'string' || text.length > MAX_LENGTH || !usesComma(locale)) return text;
+  if (typeof text !== 'string' || text.length > MAX_LENGTH) return text;
+  if (!usesComma(locale)) return withFuturePrefixes(text);
   const findings: Findings = { strayComma: false };
   const stored = translate(text, false, isTurkish(locale), findings, options);
   if (findings.strayComma) throw new RangeError('The formula cannot be read');
-  return stored;
+  // As files store it: "_xlfn." before the newer functions, "_xlpm." before the names of LET and LAMBDA.
+  return withFuturePrefixes(stored);
 }

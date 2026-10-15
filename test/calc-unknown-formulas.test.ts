@@ -181,6 +181,24 @@ test('a sheet that formulas read is deleted: everything is calculated, whatever 
   }
 });
 
+test('a sheet read through a defined name is deleted, while its own formulas read only it: everything is calculated', async () => {
+  const { workbook, history } = await blankBook();
+  history.apply(insertSheet(workbook, 1, { name: 'Two' }), undefined, undefined);
+  type(workbook, history, 1, 0, 0, '5');
+  // The formulas of the sheet that goes read that sheet only, a dynamic one (which watches its own cells) among them.
+  type(workbook, history, 1, 1, 0, '=A1*2');
+  type(workbook, history, 1, 2, 0, '=SEQUENCE(2)');
+  workbook.definedNames.push({ name: 'Far', value: 'Two!$A$1' });
+  type(workbook, history, 0, 0, 0, '=Far+1');
+  const engine = new CalcEngine(workbook);
+  engine.recalculate(undefined, { overwrite: true });
+  assert.equal(valueAt(workbook, 0, 0, 0), 6);
+  history.apply(deleteSheet(workbook, 1), undefined, undefined);
+  engine.recalculate([]);
+  assert.equal(engine.incomplete, false);
+  assert.notEqual(valueAt(workbook, 0, 0, 0), 6, 'the formula that read the sheet through the name is calculated again');
+});
+
 test('a sheet nothing reads is deleted: nothing is calculated, and the values of the file stay', async () => {
   const { workbook, history } = await blankBook();
   history.apply(insertSheet(workbook, 1, { name: 'Two' }), undefined, undefined);
