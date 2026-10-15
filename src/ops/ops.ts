@@ -7,7 +7,7 @@
 // operation keep the previous state for undo by reference, without copying it.
 
 import { touchModel } from '../model/edits';
-import type { PivotCacheState, PivotTableState } from '../model/sheet/pivot';
+import type { PivotCache, PivotCacheState, PivotTable, PivotTableState } from '../model/sheet/pivot';
 import { adjustFormula, adjustRange, adjustReferenceText, formulaNamesSheetsUnread, renameSheetsInFormula, shiftFormula, type StructuralEdit } from '../calc/refs';
 import { adjustDrawingAnchor, commentCellNow, commentEdits } from '../render/sheet-drawings';
 import { chartsFollow, chartsMoved, chartsRenamed } from './charts';
@@ -306,6 +306,47 @@ export type Op =
       cache: number;
       state: PivotCacheState | undefined;
       tables: { table: number; state: PivotTableState | undefined }[];
+    }
+  | {
+      /**
+       * Adds a pivot table made here and its cache (see pivot-create.ts) at the end of the lists of
+       * the workbook (Workbook.pivots, made for a workbook that has none). The objects are held by
+       * reference; what the table shows is set by the "setPivot" and "setCells" that follow it.
+       * Its inverse is "removePivot". `sheet` is the sheet of the table.
+       */
+      type: 'addPivot';
+      sheet: number;
+      cache: PivotCache;
+      table: PivotTable;
+    }
+  | {
+      /**
+       * Adds cell formats and number formats to the style sheet, at its end (`at`: the number of cell
+       * formats it has before): those a pivot table that is made or changed needs for its cells (see
+       * pivot-create.ts). Its inverse is "removeStyles", so that undone, the style sheet is as it was.
+       */
+      type: 'addStyles';
+      sheet: number;
+      at: number;
+      cellXfs: CellFormat[];
+      numFmts: [number, string][];
+    }
+  | {
+      /** Takes the formats "addStyles" added out again; `modified` is what the style sheet said of itself before. */
+      type: 'removeStyles';
+      sheet: number;
+      at: number;
+      cellXfs: CellFormat[];
+      numFmts: [number, string][];
+      modified: boolean;
+    }
+  | {
+      /** Takes the last pivot table and its cache out of the lists again: the inverse of "addPivot". `made`: the lists were made by it, and go with it. */
+      type: 'removePivot';
+      sheet: number;
+      cache: PivotCache;
+      table: PivotTable;
+      made?: boolean;
     }
   | {
       /**
@@ -924,6 +965,8 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
 
   // What is placed by cell position in other parts would stay behind while its cell moves.
   let stuck = (sheet.anchored || []).filter((part) => SORT_BLOCKERS.indexOf(part) >= 0);
+  // A pivot table made here stands in the cells of its sheet as well.
+  if (stuck.indexOf('pivotTable') < 0 && workbook.pivots && workbook.pivots.tables.some((table) => table.sheet === sheet)) stuck.push('pivotTable');
   // Notes go with their rows (see below). Comments are in the way only where the model does not hold all
   // of them, or cannot change them: the file has comments the reader could not show (a second one on a
   // cell, one too many), or its comment parts are not the sheet's alone.
@@ -1087,6 +1130,8 @@ const NAME_HOLDERS = ['chart', 'pivotTable'];
 const CONTROL_KINDS = ['formControl', 'ctrlProp', 'control'];
 
 function nameHolder(workbook: Workbook): string | undefined {
+  // A pivot table made here names the sheet of its source as well (the reader notes those of a file on the sheets).
+  if (workbook.pivots && workbook.pivots.tables.length > 0) return 'pivotTable';
   for (const sheet of workbook.sheets) {
     const anchored = sheet.anchored;
     if (!anchored) continue;
@@ -1795,6 +1840,52 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       workbook.pivotsModified = true;
       return { type: 'setPivot', sheet: op.sheet, cache: op.cache, state, tables };
     }
+    case 'addStyles': {
+      const styles = workbook.styles;
+      if (!Array.isArray(op.cellXfs) || !Array.isArray(op.numFmts) || styles.cellXfs.length !== op.at) throw new RangeError('The style sheet is not the one the formats were made for');
+      for (const [id] of op.numFmts) if (styles.numFmts.has(id)) throw new RangeError('The style sheet is not the one the formats were made for');
+      if (styles.cellXfs.length + op.cellXfs.length > MAX_CELL_FORMATS) throw new RangeError('The workbook has too many cell formats');
+      const modified = !!styles.modified;
+      for (const format of op.cellXfs) styles.cellXfs.push(format);
+      for (const [id, code] of op.numFmts) styles.numFmts.set(id, code);
+      styles.modified = true;
+      return { type: 'removeStyles', sheet: op.sheet, at: op.at, cellXfs: op.cellXfs, numFmts: op.numFmts, modified };
+    }
+    case 'removeStyles': {
+      const styles = workbook.styles;
+      const tail = styles.cellXfs.slice(op.at);
+      if (tail.length !== op.cellXfs.length || tail.some((format, i) => format !== op.cellXfs[i])) throw new RangeError('The formats to take out are not the last ones added');
+      styles.cellXfs.length = op.at;
+      for (const [id] of op.numFmts) styles.numFmts.delete(id);
+      if (op.modified) styles.modified = true;
+      else delete styles.modified;
+      return { type: 'addStyles', sheet: op.sheet, at: op.at, cellXfs: op.cellXfs, numFmts: op.numFmts };
+    }
+    case 'addPivot': {
+      const { cache, table } = op;
+      // Only a table made here, with the cache made for it, on a worksheet of the workbook.
+      if (!cache || !table || cache.created === undefined || table.created === undefined || table.cache !== cache) throw new RangeError('The pivot table to add was not made here');
+      if (workbook.sheets.indexOf(table.sheet) < 0 || table.sheet.kind !== 'worksheet') throw new RangeError('The sheet of the pivot table is not in the workbook');
+      const made = !workbook.pivots;
+      const pivots = workbook.pivots || { caches: [], tables: [] };
+      if (pivots.caches.indexOf(cache) >= 0 || pivots.tables.indexOf(table) >= 0) throw new RangeError('The pivot table is in the workbook already');
+      workbook.pivots = pivots;
+      pivots.caches.push(cache);
+      pivots.tables.push(table);
+      workbook.pivotsModified = true;
+      const undo: Op = { type: 'removePivot', sheet: op.sheet, cache, table };
+      if (made) undo.made = true;
+      return undo;
+    }
+    case 'removePivot': {
+      const pivots = workbook.pivots;
+      if (!pivots || pivots.tables[pivots.tables.length - 1] !== op.table || pivots.caches[pivots.caches.length - 1] !== op.cache) throw new RangeError('The pivot table to remove is not the last one made');
+      pivots.tables.pop();
+      pivots.caches.pop();
+      if (op.made && pivots.tables.length === 0 && pivots.caches.length === 0) delete workbook.pivots;
+      workbook.pivotsModified = true;
+      return { type: 'addPivot', sheet: op.sheet, cache: op.cache, table: op.table };
+    }
   }
 }
 
@@ -1834,8 +1925,18 @@ function weightOf(ops: Op[]): number {
     else if (op.type === 'setDrawings') weight += (op.drawings ? op.drawings.length : 0) / 16 + (op.weight || 0);
     else if (op.type === 'setDataValidations') weight += (op.validations ? op.validations.length : 0) / 16;
     else if (op.type === 'setConditionalFormats') weight += (op.formats ? op.formats.length : 0) / 16;
-    // The records of a cache a refresh replaced are kept for its undo.
-    else if (op.type === 'setPivot') weight += (op.state ? op.state.records.length : 0) / 16;
+    // The records of a cache a refresh replaced are kept for its undo, and the states of its tables: what they weigh is
+    // counted as rows are (roughly 400 bytes each; a record of a few fields some 100, an item with its attributes some 200).
+    else if (op.type === 'setPivot') {
+      if (op.state) weight += (op.state.records.length * ((op.state.fields.length || 1) + 1)) / 4;
+      for (const entry of op.tables) {
+        const state = entry.state;
+        if (!state) continue;
+        let items = 0;
+        for (const list of state.items) items += list ? list.length : 0;
+        weight += items / 2 + (state.rowItems.length + state.colItems.length) / 4;
+      }
+    }
   }
   return weight;
 }
@@ -1978,6 +2079,22 @@ export function ensureNumberFormat(styles: StyleSheet, code: string): number {
   styles.numFmts.set(highest + 1, code);
   styles.modified = true;
   return highest + 1;
+}
+
+/**
+ * Takes out of the style sheet what was added to it since `mark` (cell formats at its end, number
+ * formats), putting it back as it was, and returns the operation that adds them again; undefined
+ * when nothing was added. For commands that work out their operations with the formats they need
+ * in place, and leave the workbook as it was.
+ */
+export function takeAddedStyles(styles: StyleSheet, mark: StylesMark, sheet: number): Op | undefined {
+  // Only cell formats and number formats are asked for by these commands (ensureCellFormat(), ensureNumberFormat()).
+  if (styles.fonts.length !== mark.fonts || styles.fills.length !== mark.fills || styles.borders.length !== mark.borders) throw new Error('The style sheet got formats of another kind');
+  const cellXfs = styles.cellXfs.slice(mark.cellXfs);
+  // A map keeps its keys in the order they were added.
+  const numFmts = Array.from(styles.numFmts.entries()).slice(mark.numFmts);
+  resetStyles(styles, mark);
+  return cellXfs.length > 0 || numFmts.length > 0 ? { type: 'addStyles', sheet, at: mark.cellXfs, cellXfs, numFmts } : undefined;
 }
 
 /** Index of the cell format that is `base` with another number format, adding it when it is not there yet. */

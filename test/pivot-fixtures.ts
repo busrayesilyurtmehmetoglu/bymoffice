@@ -7,7 +7,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeXlsx } from '../src/formats/xlsx/write';
-import { open, ZipArchive, type OfficeFile, type Workbook } from '../src/index';
+import { createBlank, open, ZipArchive, type Cell, type OfficeFile, type Workbook } from '../src/index';
+import { ensureCellFormat } from '../src/ops/ops';
 import { History } from '../src/ops/ops';
 
 const XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
@@ -401,3 +402,37 @@ export function independentPivots(files: { [name: string]: Uint8Array }): string
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+/** A workbook made here with `data` from A1 of its first sheet, saved and opened again: the data is in the file. */
+export async function bookWith(data: Datum[][], names?: string): Promise<Loaded> {
+  let blank = await createBlank('xlsx');
+  if (names !== undefined) {
+    // Defined names are put into the workbook part of the file (the model writes none of its own).
+    const zip = ZipArchive.read(blank);
+    const book = new TextDecoder().decode(await zip.read('xl/workbook.xml')).replace('</sheets>', `</sheets><definedNames>${names}</definedNames>`);
+    zip.set('xl/workbook.xml', new TextEncoder().encode(book));
+    blank = await zip.write();
+  }
+  const doc = await load(blank);
+  const date = ensureCellFormat(doc.wb.styles, 0, 14);
+  const cells: { row: number; col: number; cell: Cell }[] = [];
+  data.forEach((row, r) =>
+    row.forEach((value, c) => {
+      if (value === null) return;
+      const cell: Cell =
+        typeof value === 'number'
+          ? { kind: 'number', value, style: 0 }
+          : typeof value === 'boolean'
+            ? { kind: 'boolean', value, style: 0 }
+            : typeof value === 'object'
+              ? { kind: 'number', value: value.date, style: date }
+              : value.charAt(0) === '#'
+                ? { kind: 'error', value, style: 0 }
+                : { kind: 'string', value, style: 0 };
+      cells.push({ row: r, col: c, cell });
+    }),
+  );
+  doc.history.apply([{ type: 'setCells', sheet: 0, cells }], undefined, undefined);
+  return load(await save(doc));
+}
+

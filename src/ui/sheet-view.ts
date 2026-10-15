@@ -74,6 +74,11 @@ import {
 import { History, markStyles, resetStyles, type Op } from '../ops/ops';
 import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps } from '../ops/notes';
 import { listPivots, lookThroughPivots, pivotAt, refreshAllPivots as refreshAllPivotsOps, refreshPivot as refreshPivotOps, type PivotInfo } from '../ops/pivots';
+import { createPivot, pivotSourceFields, type PivotCreateOptions } from '../ops/pivot-create';
+import { pivotFields as pivotFieldsOf, setPivotFields as setPivotFieldsOps, type PivotFieldsChange, type PivotFieldsInfo } from '../ops/pivot-fields';
+import { cacheFieldsNow, type PivotTable } from '../model/sheet/pivot';
+import { PIVOT_PANEL_STYLE, PivotPanel } from './pivot-panel';
+import { PivotDialog, pivotSourceText, readPivotCell, readPivotSource } from './pivot-dialog';
 import { hasDefinedName } from '../ops/commands';
 import {
   CONDITIONAL_TYPES,
@@ -587,7 +592,8 @@ const STYLE_TEXT =
   '.bym-preview-btn:hover:not(:disabled){background:#f1f3f4}' +
   '.bym-preview-btn:focus-visible,.bym-preview-sheets:focus-visible{outline:2px solid #1a73e8;outline-offset:1px}' +
   '.bym-preview-pages:focus-visible{box-shadow:inset 0 0 0 2px #1a73e8}' +
-  DIALOG_STYLE;
+  DIALOG_STYLE +
+  PIVOT_PANEL_STYLE;
 
 /** One style element per document or shadow root, shared by the views in it. */
 const styleUsers = new WeakMap<Node, { element: HTMLStyleElement; count: number }>();
@@ -1149,6 +1155,8 @@ export class WorkbookView {
   private findBar: FindBar | undefined;
   /** The dialog of the page setup, while it is open. */
   private pageDialog: PageSetupDialog | undefined;
+  /** The panel of the fields of a pivot table, with the table it is of; undefined while none is open. */
+  private pivotPanel: { panel: PivotPanel; table: PivotTable } | undefined;
   /** The print preview that is open, and what it shows. */
   private preview: PreviewSession | undefined;
   /** Counts the searches: one that was overtaken by another gives up. */
@@ -1469,6 +1477,8 @@ export class WorkbookView {
     // (in the dialog, in the live region and to onNotice) and thrown, so that whatever stands around the view - an
     // editor with labels of its own - does not go on to another language either.
     if (!this.destroyed && !this.settleDialog()) throw new RangeError(this.strings.rules.dialogOpen);
+    // The panel of the fields of a pivot table speaks the language it was opened in: closed (it holds nothing typed).
+    this.closePivotFields();
     this.locale = resolveLocale(locale);
     this.validation.forEach((rules) => rules.setLocale(this.locale));
     // The view's own words follow a language tag; a locale object only changes formats.
@@ -1516,6 +1526,7 @@ export class WorkbookView {
     if (this.mergeQuestion) this.mergeQuestion();
     this.mergeQuestion = undefined;
     if (this.pageDialog) this.pageDialog.close();
+    if (this.pivotPanel) this.pivotPanel.panel.close();
     if (this.preview) this.preview.overlay.close();
     this.closeFind(false);
     if (this.focusRetry) this.focusRetry.cancel();
@@ -5297,16 +5308,180 @@ export class WorkbookView {
     return { refreshed: all.refreshed, refused };
   }
 
+  /**
+   * Makes a pivot table (see createPivot() of the operations) as one undo step, shows it and opens
+   * the panel of its fields. What is being typed is applied first. Returns the index of the table
+   * (as pivots() lists it); -1 in a read-only view, while what is typed cannot be applied, and while
+   * the workbook is edited together (said). Throws RangeError with the reason when it is not made.
+   */
+  insertPivot(options: PivotCreateOptions, panel = true): number {
+    if (!this.beginRules()) return -1;
+    // Its operations are not sent (see encodeOp()): refused before anything is read.
+    if (this.collab) throw new CollabUnsupportedError('other', 'A pivot table cannot be made while the workbook is edited together');
+    this.settleCalculation();
+    const made = createPivot(this.workbook, { locale: this.languageTag, ...options });
+    if (made.ops.some((op) => op.type === 'copySheet')) this.applySheetOps('copy', made.ops, made.sheet);
+    else {
+      if (made.sheet !== this.sheetIndex) this.setActiveSheet(made.sheet);
+      if (!this.applyOps(made.ops)) return -1;
+    }
+    if (this.sheetIndex !== made.sheet) this.setActiveSheet(made.sheet);
+    this.select({ top: made.range.top, left: made.range.left, bottom: made.range.top, right: made.range.left });
+    this.live.textContent = this.strings.pivots.made;
+    if (panel) this.openPivotFields(made.index);
+    return made.index;
+  }
+
+  /**
+   * Opens the dialog that makes a pivot table from the selection (one cell stands for the block
+   * around it). Returns false when there is no dialog: a read-only view, a sheet that is not a
+   * worksheet, something typed that cannot be applied, the workbook edited together (said).
+   */
+  openPivotDialog(): boolean {
+    if (this.collab) {
+      this.notify(this.strings.collab.unsupported, 'error');
+      return false;
+    }
+    if (!this.beginDialog()) return false;
+    const state = this.state();
+    const strings = this.strings.pivots;
+    let source = '';
+    try {
+      const found = pivotSourceFields(this.workbook, { sheet: this.sheetIndex, range: state.range });
+      source = pivotSourceText(this.workbook, found.sheet, found.range, this.sheetIndex);
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      source = '';
+    }
+    const sheet = state.sheet;
+    const right = Math.min(state.range.right + 2, MAX_COLS - 1);
+    const dialog = new PivotDialog({
+      parent: this.options.focusScope || this.root,
+      strings,
+      source,
+      cell: cellName(state.range.top, right),
+      coarse: coarsePointer(),
+      onApply: (text, place) => {
+        if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
+        const spec = readPivotSource(text, this.workbook, this.sheetIndex);
+        if (!spec) throw new FieldError(strings.badSource, 'source');
+        const cell = 'cell' in place ? readPivotCell(place.cell) : undefined;
+        if ('cell' in place && !cell) throw new FieldError(strings.badCell, 'cell');
+        const target = cell ? { sheet: this.sheetIndex, row: cell.row, col: cell.col } : undefined;
+        const asked: PivotCreateOptions = target ? { source: spec, target, locale: this.languageTag } : { source: spec, locale: this.languageTag };
+        // What is refused is said in the dialog, which stays open; what is not is made once the dialog is gone (see onClose),
+        // and the panel of its fields takes its place.
+        createPivot(this.workbook, asked);
+        pending = asked;
+      },
+      explain: (error) => this.localizeError(error),
+      onClose: () => {
+        this.dialogClosed(sheet);
+        const run = pending;
+        pending = undefined;
+        if (run && !this.destroyed) this.attempt(() => void this.insertPivot(run));
+        else if (!this.destroyed) this.focusInput(true);
+      },
+    });
+    let pending: PivotCreateOptions | undefined;
+    this.rulesDialog = { sheet, submit: () => dialog.dialog.submit(), close: () => dialog.dialog.close(), changed: () => dialog.dialog.changed, say: (message) => dialog.dialog.showError(message) };
+    return true;
+  }
+
+  /** The fields of the pivot table at `index` (as pivots() lists it) and where they stand (see pivotFields() of the operations). */
+  pivotFields(index: number): PivotFieldsInfo {
+    return pivotFieldsOf(this.workbook, index);
+  }
+
+  /**
+   * Changes the fields of a pivot table (see setPivotFields() of the operations) as one undo step;
+   * the table is built again from its source. Returns false in a read-only view, while what is typed
+   * cannot be applied, and when nothing changes. Throws RangeError with the reason.
+   */
+  setPivotFields(index: number, change: PivotFieldsChange): boolean {
+    if (!this.beginRules()) return false;
+    this.settleCalculation();
+    const ops = setPivotFieldsOps(this.workbook, index, change);
+    const table = this.workbook.pivots ? this.workbook.pivots.tables[index] : undefined;
+    const sheet = table ? this.workbook.sheets.indexOf(table.sheet) : -1;
+    if (sheet >= 0 && sheet !== this.sheetIndex) this.setActiveSheet(sheet);
+    if (!this.applyOps(ops)) return false;
+    this.live.textContent = this.strings.pivots.changed;
+    return true;
+  }
+
+  /**
+   * Opens the panel of the fields of a pivot table: the one at `index`, by default the one of the
+   * active cell. Returns false when there is none (said), and in a read-only view.
+   */
+  openPivotFields(index?: number): boolean {
+    if (this.destroyed || this.locked) return false;
+    const at = index !== undefined ? index : pivotAt(this.workbook, this.sheetIndex, this.state().active.row, this.state().active.col);
+    const table = at !== undefined && this.workbook.pivots ? this.workbook.pivots.tables[at] : undefined;
+    if (!table) {
+      this.notify(this.strings.pivots.noTable, 'error');
+      return false;
+    }
+    this.closePivotFields();
+    // What refers to the caches is known once, as the panel opens.
+    lookThroughPivots(this.workbook);
+    const panel = new PivotPanel({
+      parent: this.options.focusScope || this.root,
+      strings: this.strings.pivots,
+      coarse: coarsePointer(),
+      info: () => {
+        const pivots = this.workbook.pivots;
+        const now = pivots ? pivots.tables.indexOf(table) : -1;
+        if (now < 0 || this.workbook.sheets.indexOf(table.sheet) < 0) return undefined;
+        // Shown again after every edit: the package was looked through when the panel opened, and is with every change made from it.
+        const info = pivotFieldsOf(this.workbook, now, { look: false });
+        if (this.collab && info.refusal === undefined) info.refusal = 'A pivot table cannot be changed while the workbook is edited together';
+        return info;
+      },
+      // A field whose values are numbers (and blanks) only goes into the values when it is ticked: what its cache holds says so.
+      numeric: (field) => {
+        const known = cacheFieldsNow(table.cache)[field];
+        const items = known ? known.items : undefined;
+        return !items || items.every((value) => value.t === 'n' || value.t === 'm');
+      },
+      onChange: (change) => {
+        const pivots = this.workbook.pivots;
+        const now = pivots ? pivots.tables.indexOf(table) : -1;
+        if (now < 0) throw new RangeError(this.strings.pivots.noTable);
+        this.setPivotFields(now, change);
+      },
+      explain: (error) => this.localizeError(error),
+      onClose: () => {
+        if (this.pivotPanel && this.pivotPanel.panel === panel) this.pivotPanel = undefined;
+        if (!this.destroyed) this.focusInput(true);
+      },
+    });
+    this.pivotPanel = { panel, table };
+    return true;
+  }
+
+  /** Closes the panel of the fields of a pivot table, when one is open. */
+  closePivotFields(): void {
+    if (this.pivotPanel) this.pivotPanel.panel.close();
+  }
+
   /** Finishes a calculation that is under way, so that what is read of the cells is what their formulas come to. */
   private settleCalculation(): void {
     if (this.engine && this.engine.incomplete) this.finishCalculation(this.engine);
   }
 
-  /** The commands of pivot tables for the menu of a cell in one; nothing for a cell in none. */
+  /** The commands of pivot tables for the menu of a cell: in a table, its refresh and its fields; elsewhere, making one. */
   private pivotItems(items: MenuItem[], row: number, col: number): void {
     const index = pivotAt(this.workbook, this.sheetIndex, row, col);
-    if (index === undefined) return;
     const strings = this.strings.pivots;
+    if (index === undefined) {
+      if (this.state().sheet.kind !== 'worksheet') return;
+      // While the workbook is edited together no table is made (see encodeOp()): shown, and says why.
+      const busy = this.collab ? this.strings.collab.unsupported : undefined;
+      items.push({ label: '', separator: true });
+      items.push({ label: strings.insert, disabled: busy !== undefined, title: busy, explain: busy ? () => this.notify(busy, 'error') : undefined, action: () => this.attempt(() => void this.openPivotDialog()) });
+      return;
+    }
     // The menu says what is known to be refused: once the package was looked through for what refers to the caches.
     lookThroughPivots(this.workbook);
     const known = listPivots(this.workbook)[index];
@@ -5321,6 +5496,8 @@ export class WorkbookView {
     items.push({ label: '', separator: true });
     items.push({ label: strings.refresh, disabled: reason !== undefined, title: reason, explain, action: () => this.attempt(() => this.menuRefreshPivot(index)) });
     if (listPivots(this.workbook).length > 1) items.push({ label: strings.refreshAll, disabled: !!this.collab, title: this.collab ? reason : undefined, explain: this.collab ? explain : undefined, action: () => this.attempt(() => this.menuRefreshAll()) });
+    // The panel opens whatever is refused: it says why its fields cannot be changed.
+    items.push({ label: strings.fields, action: () => this.attempt(() => void this.openPivotFields(index)) });
   }
 
   private menuRefreshPivot(index: number): void {
@@ -6623,7 +6800,8 @@ export class WorkbookView {
     if (error instanceof ValidationError) return error.display;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
     let match: RegExpExecArray | null;
-    if (/^Cannot refresh the pivot table/.test(message)) return strings.pivots.refused(message);
+    if (/^Cannot (refresh the pivot table|change the fields of the pivot table|make the pivot table)/.test(message)) return strings.pivots.refused(message);
+    if (message === 'A pivot table cannot be changed while the workbook is edited together') return strings.collab.unsupported;
     if (message === 'Too many cells to format at once') return strings.tooManyCells;
     if ((match = /^Too many rows to (format|resize|change) at once$/.exec(message))) return strings.tooManyRows(match[1] as 'format' | 'resize' | 'change');
     if (message === 'Whole rows or columns cannot be merged') return strings.cannotMergeWhole;
@@ -7494,6 +7672,8 @@ export class WorkbookView {
     if (this.destroyed || next === this.locked) return;
     if (next) {
       this.endTabDrag();
+      // Nor are the fields of a pivot table changed.
+      this.closePivotFields();
       // Nothing is dragged and no chart is selected in a view that changes nothing.
       this.endChartDrag(false, 0);
       this.chartPick = undefined;
@@ -7784,7 +7964,7 @@ export class WorkbookView {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
       // A note or a rule changes no size and no position.
-      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings' && op.type !== 'setPivot') structural = true;
+      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings' && op.type !== 'setPivot' && op.type !== 'addPivot' && op.type !== 'removePivot' && op.type !== 'addStyles' && op.type !== 'removeStyles') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
       if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }
@@ -7891,6 +8071,8 @@ export class WorkbookView {
     this.commitScroll();
     this.announce();
     this.schedule();
+    // The panel of the fields of a pivot table shows the table as it is now (undone, changed by a refresh, gone).
+    if (this.pivotPanel) this.pivotPanel.panel.refresh();
     if (this.options.onChange) this.options.onChange(this.remoteChange ? { sheets: sheets.slice(), remote: true } : { sheets: sheets.slice() });
   }
 

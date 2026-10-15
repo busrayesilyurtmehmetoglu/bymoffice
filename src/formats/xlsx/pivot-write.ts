@@ -9,7 +9,7 @@
 // wrote goes back to the bytes of the file.
 
 import { serialToDate } from '../../format/number-format';
-import type { PivotCache, PivotCacheState, PivotItem, PivotLine, PivotTable, PivotTableState, PivotValue } from '../../model/sheet/pivot';
+import type { PivotCache, PivotCacheState, PivotItem, PivotLine, PivotTable, PivotTableDef, PivotTableState, PivotValue } from '../../model/sheet/pivot';
 import { rangeName, type Workbook } from '../../model/sheet/types';
 import { childElements, decodeXmlBytes, localName, parseXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
@@ -72,6 +72,88 @@ function itemsElement(items: PivotItem[], prefix: string, original: XmlElement |
   return element(`${prefix}items`, attrs, items.map((item) => element(`${prefix}item`, item.attrs)));
 }
 
+/** The children of <pivotTableDefinition> in the order of the schema, up to those the fields are listed in. */
+const TABLE_ORDER = ['location', 'pivotFields', 'rowFields', 'rowItems', 'colFields', 'colItems', 'pageFields', 'dataFields'];
+
+/** Sets an attribute to a value, or takes it away for the value that is its default. */
+function setOrDrop(el: XmlElement, name: string, value: string | undefined): void {
+  if (value === undefined) el.attrs.delete(name);
+  else el.attrs.set(name, value);
+}
+
+/** Puts a list of fields (<rowFields>, <colFields>) in the place of the one the part has; none for an empty list. */
+function fieldList(root: XmlElement, local: string, list: number[], p: string): void {
+  const at = root.children.findIndex((node) => node.type === 'element' && localName(node.name) === local);
+  if (list.length === 0) {
+    if (at >= 0) root.children.splice(at, 1);
+    return;
+  }
+  const made = element(`${p}${local}`, [['count', String(list.length)]], list.map((x) => element(`${p}field`, [['x', String(x)]])));
+  replaceChild(root, local, made, TABLE_ORDER.slice(0, TABLE_ORDER.indexOf(local)));
+}
+
+/**
+ * Puts the fields of a table as they were changed (PivotTableDef) into its definition: where each
+ * field stands and how it is totalled and sorted, the lists of fields of rows, columns, page and
+ * values, the grand totals. Elements of the part that stand for the same thing (a field of the
+ * page, a value of the same field) keep their other attributes and their children.
+ */
+function writeDef(root: XmlElement, def: PivotTableDef, location: XmlElement, p: string): void {
+  setOrDrop(root, 'rowGrandTotals', def.rowGrandTotals ? undefined : '0');
+  setOrDrop(root, 'colGrandTotals', def.colGrandTotals ? undefined : '0');
+  // The values stand last in the columns (see the refresh): no other place is stated.
+  root.attrs.delete('dataPosition');
+  setOrDrop(location, 'rowPageCount', def.pages ? String(def.pages.rows) : undefined);
+  setOrDrop(location, 'colPageCount', def.pages ? String(def.pages.cols) : undefined);
+  const fieldsEl = child(root, 'pivotFields');
+  const list = fieldsEl ? childElements(fieldsEl, 'pivotField') : [];
+  const data = new Set(def.dataFields.map((value) => value.fld));
+  def.fields.forEach((field, f) => {
+    const el = list[f];
+    if (!el) return;
+    setOrDrop(el, 'axis', field.axis);
+    setOrDrop(el, 'dataField', data.has(f) ? '1' : undefined);
+    setOrDrop(el, 'defaultSubtotal', field.defaultSubtotal ? undefined : '0');
+    setOrDrop(el, 'sortType', field.sortType === 'manual' ? undefined : field.sortType);
+    setOrDrop(el, 'compact', field.compact ? undefined : '0');
+    setOrDrop(el, 'outline', field.outline ? undefined : '0');
+  });
+  fieldList(root, 'rowFields', def.rowFields, p);
+  fieldList(root, 'colFields', def.colFields, p);
+  // The fields of the page: the element of the part for the same field keeps what else it says (hier, name, cap).
+  const pagesWas = child(root, 'pageFields');
+  const oldPages = pagesWas ? childElements(pagesWas, 'pageField') : [];
+  if (def.pageFields.length === 0) {
+    if (pagesWas) root.children.splice(root.children.indexOf(pagesWas), 1);
+  } else {
+    const kids = def.pageFields.map((page) => {
+      const had = oldPages.find((el) => el.attrs.get('fld') === String(page.fld));
+      const el = had ? element(had.name, [...had.attrs], had.children) : element(`${p}pageField`, [['fld', String(page.fld)], ['hier', '-1']]);
+      return el;
+    });
+    replaceChild(root, 'pageFields', element(`${p}pageFields`, [['count', String(kids.length)]], kids), TABLE_ORDER.slice(0, TABLE_ORDER.indexOf('pageFields')));
+  }
+  // The values: the element of the part for a value of the same field keeps what else it says (base field and item, extensions).
+  const dataWas = child(root, 'dataFields');
+  const oldData = dataWas ? childElements(dataWas, 'dataField') : [];
+  const used = new Set<XmlElement>();
+  const values = def.dataFields.map((value) => {
+    const had = oldData.find((el) => !used.has(el) && el.attrs.get('fld') === String(value.fld));
+    let el: XmlElement;
+    if (had) {
+      used.add(had);
+      el = element(had.name, [...had.attrs], had.children);
+    } else el = element(`${p}dataField`, [['name', ''], ['fld', ''], ['baseField', '0'], ['baseItem', '0']]);
+    // A name of ST_Xstring, as the reader takes it.
+    el.attrs.set('name', encodeXstring(value.name));
+    el.attrs.set('fld', String(value.fld));
+    setOrDrop(el, 'subtotal', value.subtotal === 'sum' ? undefined : value.subtotal);
+    setOrDrop(el, 'numFmtId', value.numFmtId === undefined ? undefined : String(value.numFmtId));
+    return el;
+  });
+  replaceChild(root, 'dataFields', element(`${p}dataFields`, [['count', String(values.length)]], values), TABLE_ORDER.slice(0, TABLE_ORDER.indexOf('dataFields')));
+}
+
 /** The table definition with what the state says, from the part as the file has it. */
 export function writeTableDefinition(original: Uint8Array, table: PivotTable, state: PivotTableState): XmlDocument {
   const doc = parseXml(original);
@@ -80,6 +162,7 @@ export function writeTableDefinition(original: Uint8Array, table: PivotTable, st
   const p = prefixOf(root);
   const location = child(root, 'location');
   if (!location) throw new Error(`Cannot write the pivot table "${table.name}": its part does not say where it stands`);
+  if (state.def) writeDef(root, state.def, location, p);
   location.attrs.set('ref', rangeName(state.location.ref));
   location.attrs.set('firstHeaderRow', String(state.location.firstHeaderRow));
   location.attrs.set('firstDataRow', String(state.location.firstDataRow));
@@ -94,8 +177,8 @@ export function writeTableDefinition(original: Uint8Array, table: PivotTable, st
     if (was) field.children[field.children.indexOf(was)] = made;
     else field.children.unshift(made);
   });
-  replaceChild(root, 'rowItems', linesElement(`${p}rowItems`, state.rowItems, p), ['location', 'pivotFields', 'rowFields']);
-  replaceChild(root, 'colItems', linesElement(`${p}colItems`, state.colItems, p), ['location', 'pivotFields', 'rowFields', 'rowItems', 'colFields']);
+  replaceChild(root, 'rowItems', linesElement(`${p}rowItems`, state.rowItems, p), TABLE_ORDER.slice(0, 3));
+  replaceChild(root, 'colItems', linesElement(`${p}colItems`, state.colItems, p), TABLE_ORDER.slice(0, 5));
   const pages = child(root, 'pageFields');
   if (pages) {
     childElements(pages, 'pageField').forEach((page, i) => {
@@ -458,11 +541,13 @@ export function pivotPartsToRead(workbook: Workbook): string[] {
   const want = (part: string) => {
     if (!(saved && saved.originals.has(part)) && out.indexOf(part) < 0) out.push(part);
   };
+  // Tables made here are in no file: the writer makes their parts (see writeXlsx()).
   for (const cache of pivots.caches) {
+    if (cache.created !== undefined) continue;
     if (cache.now || cache.sourceRef !== undefined) want(cache.part);
     if (cache.now && cache.recordsPart !== undefined) want(cache.recordsPart);
   }
-  for (const table of pivots.tables) if (table.now || table.placed) want(table.part);
+  for (const table of pivots.tables) if (table.created === undefined && (table.now || table.placed)) want(table.part);
   return out;
 }
 
@@ -493,6 +578,8 @@ export function pivotWrites(workbook: Workbook, bytesOf: (part: string) => Uint8
   const writes: [string, Uint8Array | XmlDocument][] = [];
   const written = new Set<string>();
   for (const cache of pivots.caches) {
+    // Tables made here are in no file: the writer makes their parts (see writeXlsx()).
+    if (cache.created !== undefined) continue;
     if (!cache.now) {
       // Only the range of its source moved: its records stay as they are, as Excel keeps them.
       if (cache.sourceRef !== undefined) {
@@ -509,6 +596,7 @@ export function pivotWrites(workbook: Workbook, bytesOf: (part: string) => Uint8
     }
   }
   for (const table of pivots.tables) {
+    if (table.created !== undefined) continue;
     if (table.now) writes.push([table.part, writeTableDefinition(original(table.part), table, table.now)]);
     else if (table.placed) writes.push([table.part, patchedAttribute(original(table.part), LOCATION_PATH, 'ref', rangeName(table.placed))]);
     else continue;

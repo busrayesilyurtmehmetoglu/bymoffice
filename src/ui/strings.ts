@@ -643,6 +643,52 @@ export interface PivotStrings {
   refused(message: string): string;
   /** Said when the workbook has no pivot table to refresh. */
   none: string;
+  /** The command that makes a pivot table (cell menu), and the title of its dialog. */
+  insert: string;
+  createTitle: string;
+  /** The fields of the dialog: the cells the table is made from, where it goes. */
+  source: string;
+  place: string;
+  newSheet: string;
+  thisSheet: string;
+  cell: string;
+  ok: string;
+  cancel: string;
+  /** A range or a cell that cannot be read. */
+  badSource: string;
+  badCell: string;
+  /** Said once a table was made. */
+  made: string;
+  /** The command that opens the panel of the fields of a table (cell menu), and the title of the panel. */
+  fields: string;
+  panelTitle: string;
+  close: string;
+  fieldList: string;
+  boxes: { filters: string; cols: string; rows: string; values: string };
+  dropHere: string;
+  /** Labels of the controls of an entry, by what it shows. */
+  moveUp(name: string): string;
+  moveDown(name: string): string;
+  moveTo(name: string): string;
+  remove(name: string): string;
+  summarize(name: string): string;
+  numberFormat(name: string): string;
+  generalFormat: string;
+  aggregates: Record<string, string>;
+  subtotal: string;
+  subtotals(name: string): string;
+  sort(name: string): string;
+  sorts: { manual: string; ascending: string; descending: string };
+  shownItem(name: string): string;
+  allItems: string;
+  filterItems(name: string): string;
+  moreItems(count: number): string;
+  rowGrandTotals: string;
+  colGrandTotals: string;
+  /** Said once the fields of a table were changed. */
+  changed: string;
+  /** Said when the panel is asked for away from a pivot table. */
+  noTable: string;
 }
 
 /** What the commands and the dialog of charts say. */
@@ -1579,6 +1625,44 @@ export const STRINGS_EN: UiStrings = {
     refreshed: (count) => (count === 1 ? 'Pivot table refreshed' : `${count} pivot tables refreshed`),
     refused: (message) => message,
     none: 'The workbook has no pivot table to refresh',
+    insert: 'Insert pivot table…',
+    createTitle: 'Insert pivot table',
+    source: 'Data',
+    place: 'Place',
+    newSheet: 'New sheet',
+    thisSheet: 'This sheet, at a cell',
+    cell: 'Cell',
+    ok: 'OK',
+    cancel: 'Cancel',
+    badSource: 'Type a range such as A1:D20, or the name of one',
+    badCell: 'Type a cell such as F2',
+    made: 'Pivot table inserted',
+    fields: 'Pivot table fields…',
+    panelTitle: 'Pivot table fields',
+    close: 'Close',
+    fieldList: 'Fields',
+    boxes: { filters: 'Filters', cols: 'Columns', rows: 'Rows', values: 'Values' },
+    dropHere: 'Drag fields here',
+    moveUp: (name) => `Move ${name} up`,
+    moveDown: (name) => `Move ${name} down`,
+    moveTo: (name) => `Where ${name} stands`,
+    remove: (name) => `Remove ${name}`,
+    summarize: (name) => `Summarize ${name} by`,
+    numberFormat: (name) => `Number format of ${name}`,
+    generalFormat: 'General',
+    aggregates: { sum: 'Sum', count: 'Count', average: 'Average', max: 'Max', min: 'Min', product: 'Product', countNums: 'Count numbers', stdDev: 'StdDev', stdDevp: 'StdDevp', var: 'Var', varp: 'Varp' },
+    subtotal: 'Subtotals',
+    subtotals: (name) => `Subtotals of ${name}`,
+    sort: (name) => `Order of ${name}`,
+    sorts: { manual: 'As in the data', ascending: 'A to Z', descending: 'Z to A' },
+    shownItem: (name) => `Item of ${name} shown`,
+    allItems: '(All)',
+    filterItems: (name) => `Items of ${name}`,
+    moreItems: (count) => `${count} more items are not listed`,
+    rowGrandTotals: 'Grand totals of rows',
+    colGrandTotals: 'Grand totals of columns',
+    changed: 'Pivot table changed',
+    noTable: 'Select a cell of a pivot table',
   },
   find: {
     title: 'Find and replace',
@@ -2377,6 +2461,44 @@ export const STRINGS_TR: UiStrings = {
     refreshed: (count) => (count === 1 ? 'Pivot tablo yenilendi' : `${count} pivot tablo yenilendi`),
     refused: pivotRefusalTr,
     none: 'Çalışma kitabında yenilenecek pivot tablo yok',
+    insert: 'Pivot tablo ekle…',
+    createTitle: 'Pivot tablo ekle',
+    source: 'Veri',
+    place: 'Yeri',
+    newSheet: 'Yeni sayfa',
+    thisSheet: 'Bu sayfada, bir hücrede',
+    cell: 'Hücre',
+    ok: 'Tamam',
+    cancel: 'İptal',
+    badSource: 'A1:D20 gibi bir aralık ya da bir aralığın adını yazın',
+    badCell: 'F2 gibi bir hücre yazın',
+    made: 'Pivot tablo eklendi',
+    fields: 'Pivot tablo alanları…',
+    panelTitle: 'Pivot tablo alanları',
+    close: 'Kapat',
+    fieldList: 'Alanlar',
+    boxes: { filters: 'Süzgeçler', cols: 'Sütunlar', rows: 'Satırlar', values: 'Değerler' },
+    dropHere: 'Alanları buraya sürükleyin',
+    moveUp: (name) => `${name} yukarı`,
+    moveDown: (name) => `${name} aşağı`,
+    moveTo: (name) => `${name} nerede dursun`,
+    remove: (name) => `${name} çıkar`,
+    summarize: (name) => `${name} özetleme işlevi`,
+    numberFormat: (name) => `${name} sayı biçimi`,
+    generalFormat: 'Genel',
+    aggregates: { sum: 'Toplam', count: 'Say', average: 'Ortalama', max: 'En büyük', min: 'En küçük', product: 'Çarpım', countNums: 'Sayıları say', stdDev: 'Std sapma', stdDevp: 'Std sapma (popülasyon)', var: 'Varyans', varp: 'Varyans (popülasyon)' },
+    subtotal: 'Ara toplamlar',
+    subtotals: (name) => `${name} ara toplamları`,
+    sort: (name) => `${name} sırası`,
+    sorts: { manual: 'Verideki sırayla', ascending: 'A’dan Z’ye', descending: 'Z’den A’ya' },
+    shownItem: (name) => `${name} için gösterilen öğe`,
+    allItems: '(Tümü)',
+    filterItems: (name) => `${name} öğeleri`,
+    moreItems: (count) => `${count} öğe daha listelenmedi`,
+    rowGrandTotals: 'Satırların genel toplamları',
+    colGrandTotals: 'Sütunların genel toplamları',
+    changed: 'Pivot tablo değişti',
+    noTable: 'Bir pivot tablo hücresi seçin',
   },
   find: {
     title: 'Bul ve değiştir',
@@ -2587,6 +2709,49 @@ const PIVOT_REASONS_TR: [RegExp, (m: RegExpExecArray) => string][] = [
   [/^the labels of the field "(.*)" have a number format the style sheet has no style with$/, (m) => `"${m[1]}" alanının etiketlerinin sayı biçimi stil sayfasındaki hiçbir stilde yok`],
   [/^its sheet is not in the workbook$/, () => 'sayfası çalışma kitabında yok'],
   [/^it does not stand on a worksheet$/, () => 'bir çalışma sayfasında durmuyor'],
+  // Why the fields of a table are not changed, or a table is not made (see src/ops/pivot-fields.ts, pivot-create.ts).
+  [/^the fields are lists$/, () => 'alanlar liste olmalı'],
+  [/^it has too many fields$/, () => 'çok fazla alanı var'],
+  [/^there is no field (.*)$/, (m) => `${m[1]} numaralı alan yok`],
+  [/^a field stands in two places \(rows, columns, filters\)$/, () => 'bir alan iki yerde duruyor (satırlar, sütunlar, süzgeçler)'],
+  [/^it would have more than (\d+) fields in its rows and columns$/, (m) => `satır ve sütunlarında ${m[1]} alandan fazlası olurdu`],
+  [/^it needs a field in its rows here$/, () => 'burada satırlarında en az bir alan olmalı'],
+  [/^it needs a value here$/, () => 'burada en az bir değeri olmalı'],
+  [/^it would have more than (\d+) values$/, (m) => `${m[1]} değerden fazlası olurdu`],
+  [/^several values and fields in the columns together are not built here$/, () => 'birden çok değer ile sütun alanları burada birlikte kurulmuyor'],
+  [/^a value names a field the (?:table|source) does not have$/, () => 'bir değer olmayan bir alanı anıyor'],
+  [/^a value has no name$/, () => 'bir değerin adı yok'],
+  [/^the name of a value is longer than (\d+) characters$/, (m) => `bir değerin adı ${m[1]} karakterden uzun`],
+  [/^a value cannot have the name of a field \("(.*)"\)$/, (m) => `bir değer bir alanın adını alamaz ("${m[1]}")`],
+  [/^two values have the name "(.*)"$/, (m) => `iki değerin adı aynı: "${m[1]}"`],
+  [/^a number format is not one$/, () => 'sayı biçimi geçersiz'],
+  [/^hidden items name no field$/, () => 'gizlenen öğeler bir alan anmıyor'],
+  [/^a subtotal names no field$/, () => 'ara toplam bir alan anmıyor'],
+  [/^a sort names no field or no order$/, () => 'sıralama bir alan ya da sıra anmıyor'],
+  [/^the field "(.*)" lists no items yet: put it into the rows, columns or filters first$/, (m) => `"${m[1]}" alanının henüz öğe listesi yok: önce satırlara, sütunlara ya da süzgeçlere koyun`],
+  [/^the field "(.*)" has no item (\S+)(?: to show)?$/, (m) => `"${m[1]}" alanında ${m[2]} numaralı öğe yok`],
+  [/^the field "(.*)" has (\d+) different values: more than (\d+) cannot be laid out$/, (m) => `"${m[1]}" alanında ${m[2]} farklı değer var: ${m[3]} taneden fazlası yerleştirilemez`],
+  [/^its fields of the page stand in several columns$/, () => 'süzgeç alanları birden çok sütunda duruyor'],
+  [/^there is no room above it for its fields of the page$/, () => 'üstünde süzgeç alanlarına yer yok'],
+  [/^it has formats of parts of the table, which name its fields$/, () => 'tablonun parçalarına verilmiş biçimler var ve bunlar alanlarını anıyor'],
+  [/^its fields of the page are laid out in a way that is not built here$/, () => 'süzgeç alanları burada kurulmayan bir düzende'],
+  [/^it has an extension that names its fields$/, () => 'alanlarını anan bir uzantısı var'],
+  [/^nothing is given$/, () => 'hiçbir şey verilmedi'],
+  [/^its source is not given$/, () => 'kaynağı verilmedi'],
+  [/^there is no sheet (.*)$/, (m) => `${m[1]} numaralı sayfa yok`],
+  [/^its source is not a range of cells$/, () => 'kaynağı bir hücre aralığı değil'],
+  [/^its source is not on a worksheet$/, () => 'kaynağı bir çalışma sayfasında değil'],
+  [/^two columns of its source have the header "(.*)"$/, (m) => `kaynağında iki sütunun başlığı aynı: "${m[1]}"`],
+  [/^the pivot tables of the workbook cannot be read$/, () => 'çalışma kitabının pivot tabloları okunamıyor'],
+  [/^its name is not one$/, () => 'adı geçersiz'],
+  [/^a pivot table of the workbook is called "(.*)" already$/, (m) => `çalışma kitabında "${m[1]}" adlı bir pivot tablo zaten var`],
+  [/^a sheet cannot be put at (.*)$/, (m) => `${m[1]} konumuna sayfa eklenemez`],
+  [/^its place is not on a worksheet$/, () => 'yeri bir çalışma sayfasında değil'],
+  [/^its place is not a cell$/, () => 'yeri bir hücre değil'],
+  [/^its place holds something \((\S+)\)$/, (m) => `yerinde dolu bir hücre var (${m[1]})`],
+  [/^it would stand over its source$/, () => 'kaynağının üzerine gelirdi'],
+  [/^it would stand over the merged cells (\S+)$/, (m) => `${m[1]} birleştirilmiş hücrelerinin üzerine gelirdi`],
+  [/^it could not be built$/, () => 'kurulamadı'],
 ];
 
 /** A reason of the engine about pivot tables, in Turkish; as it is where no translation fits. */
@@ -2600,6 +2765,23 @@ function pivotReasonTr(reason: string): string {
 
 /** The reason a pivot table was not refreshed, in Turkish; the text of the engine where no translation fits. */
 function pivotRefusalTr(message: string): string {
+  // A table that is not made, or whose fields are not changed.
+  const made = /^Cannot make the pivot table: (.*)$/.exec(message);
+  if (made) {
+    for (const [pattern, say] of PIVOT_REASONS_TR) {
+      const found = pattern.exec(made[1]);
+      if (found) return `Pivot tablo eklenemiyor: ${say(found)}`;
+    }
+    return message;
+  }
+  const changed = /^Cannot change the fields of the pivot table "(.*?)": (.*)$/.exec(message);
+  if (changed) {
+    for (const [pattern, say] of PIVOT_REASONS_TR) {
+      const found = pattern.exec(changed[2]);
+      if (found) return `"${changed[1]}" pivot tablosunun alanları değiştirilemiyor: ${say(found)}`;
+    }
+    return message;
+  }
   const match = /^Cannot refresh the pivot table(?: "(.*?)")?: (.*)$/.exec(message);
   if (!match) return message;
   for (const [pattern, say] of PIVOT_REASONS_TR) {

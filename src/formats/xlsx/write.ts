@@ -67,7 +67,9 @@ import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { dynamicArrayMetadata, METADATA_CONTENT_TYPE, METADATA_RELATIONSHIP } from './metadata';
-import { pivotPartsToRead, pivotWrites } from './pivot-write';
+import { pivotPartsToRead, pivotWrites, writeCacheDefinition, writeCacheRecords, writeTableDefinition } from './pivot-write';
+import { madePartText } from './pivot-create';
+import type { PivotTable } from '../../model/sheet/pivot';
 import { parseColor } from './styles';
 import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, pageBreaksXml, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
 import { keptFor, keptNow, ownCellFormulaAt, ownCellSpelling, type CellSpelling } from '../../ops/rules';
@@ -4565,6 +4567,32 @@ interface SaveState {
    * longer needs one takes it out again; one that does writes it under the same name.
    */
   charts: Map<Sheet, string[]>;
+  /**
+   * Per pivot table made here (see src/ops/pivot-create.ts): the parts the last save wrote it and its
+   * cache to, and the number the workbook lists its cache by. A save that still has the table writes
+   * it there again; one that no longer has it (undone) takes the parts out again.
+   */
+  pivots: Map<PivotTable, MadePivotParts>;
+  /** Every part the last save made for such tables, the relationships of sheets made for them included. */
+  pivotParts: string[];
+}
+
+/** Where a pivot table made here and its cache are written. */
+interface MadePivotParts {
+  table: string;
+  cache: string;
+  records: string;
+  cacheId: number;
+}
+
+const PIVOT_TABLE_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml';
+const PIVOT_CACHE_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml';
+const PIVOT_RECORDS_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml';
+
+/** The pivot tables made here that a save writes: those whose sheet is in the workbook. */
+function madePivots(workbook: Workbook): PivotTable[] {
+  const pivots = workbook.pivots;
+  return pivots ? pivots.tables.filter((table) => table.created !== undefined && workbook.sheets.indexOf(table.sheet) >= 0) : [];
 }
 
 /** What a save does around a sheet for its charts and the drawings that hold them. */
@@ -4764,6 +4792,17 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   const sheetsModified = !!workbook.sheetsModified || sheets.some((sheet) => sheet.part === '');
   // The parts of refreshed pivot tables, and of those an earlier save wrote, are written from the bytes of the file.
   for (const part of pivotPartsToRead(workbook)) reads.bytes(part);
+  // Pivot tables made here (or by an earlier save) are listed by the workbook and named by the relationships of their sheets.
+  const madeSaved = SAVES.get(workbook);
+  const made = madePivots(workbook);
+  if (made.length > 0 || (madeSaved && madeSaved.pivotParts.length > 0)) {
+    const book = reads.mainPart();
+    if (book) {
+      reads.bytes(book);
+      reads.bytes(relsPartOf(book));
+    }
+    for (const table of made) if (table.sheet.part !== '') reads.bytes(relsPartOf(table.sheet.part));
+  }
   if (!workbook.styles.modified && !sheetsModified && !workbook.definedNamesModified && !sheets.some(flagged)) return;
   const saved = SAVES.get(workbook);
   const want = (part: string): Uint8Array | undefined => {
@@ -4888,10 +4927,11 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
 
   let saved = SAVES.get(workbook);
   if (!saved) {
-    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map(), notes: new Map(), charts: new Map() };
+    saved = { originals: new Map(), moved: new Map(), removed: new Map(), added: new Map(), notes: new Map(), charts: new Map(), pivots: new Map(), pivotParts: [] };
     SAVES.set(workbook, saved);
   }
-  const { originals, moved, removed, added, notes: noted, charts: charted } = saved;
+  const { originals, moved, removed, added, notes: noted, charts: charted, pivots: pivoted } = saved;
+  const pivotPartsBefore = saved.pivotParts;
   // The first time a part is about to be rewritten, the package still holds it as the file had it.
   const originalOf = (part: string): Uint8Array | undefined => {
     const kept = originals.get(part);
@@ -5012,6 +5052,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       for (const name of added.values()) taken.add(name.toLowerCase());
       for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined) taken.add(name.toLowerCase());
       for (const names of charted.values()) for (const name of names) taken.add(name.toLowerCase());
+      for (const name of pivotPartsBefore) taken.add(name.toLowerCase());
     }
     return taken;
   };
@@ -5672,6 +5713,57 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     return out;
   };
   /** The sheets whose drawings are not the ones they were read with. */
+  // --- pivot tables made here ----------------------------------------------------------------
+  // Each is written with its cache to parts of their own (the ones the last save gave them), the
+  // workbook lists the cache under a number no other cache has, and the sheet of the table names it.
+  const pivotsNow = new Map<PivotTable, MadePivotParts>();
+  /** Parts this save makes for such tables (their parts, and relationships of sheets that the file does not have). */
+  const pivotPartsNow = new Set<string>();
+  /** The tables made here on each sheet, with their parts. */
+  const pivotsOn = new Map<Sheet, MadePivotParts[]>();
+  const madeTables = madePivots(workbook);
+  if (madeTables.length > 0) {
+    const ids = new Set<number>();
+    const listedCaches = childNamed(book.root, 'pivotCaches');
+    for (const el of listedCaches ? childrenNamed(listedCaches, 'pivotCache') : []) {
+      const id = el.attrs.get('cacheId') || '';
+      if (/^\d{1,10}$/.test(id)) ids.add(Number(id));
+    }
+    for (const cache of workbook.pivots ? workbook.pivots.caches : []) if (cache.cacheId >= 0) ids.add(cache.cacheId);
+    for (const names of pivoted.values()) ids.add(names.cacheId);
+    let nextId = 0;
+    for (const id of ids) if (id >= nextId) nextId = id + 1;
+    const dir = main.slice(0, slash);
+    /** The first free name of a numbered part whose relationships part is free as well. */
+    const freshPart = (head: string): string => {
+      const names = takenNames();
+      for (let n = 1; ; n++) {
+        const candidate = `${head}${n}.xml`;
+        if (names.has(candidate.toLowerCase()) || names.has(relsPartOf(candidate).toLowerCase())) continue;
+        names.add(candidate.toLowerCase());
+        return candidate;
+      }
+    };
+    for (const table of madeTables) {
+      let names = pivoted.get(table);
+      if (!names) {
+        names = { table: freshPart(`${dir}/pivotTables/pivotTable`), cache: freshPart(`${dir}/pivotCache/pivotCacheDefinition`), records: freshPart(`${dir}/pivotCache/pivotCacheRecords`), cacheId: nextId++ };
+      }
+      pivotsNow.set(table, names);
+      for (const part of [names.table, relsPartOf(names.table), names.cache, relsPartOf(names.cache), names.records]) pivotPartsNow.add(part);
+      const list = pivotsOn.get(table.sheet) || [];
+      list.push(names);
+      pivotsOn.set(table.sheet, list);
+    }
+  }
+  /** Adds the relationships of a sheet to the pivot tables made here on it; whether there were any. */
+  const relatePivots = (doc: XmlDocument, sheet: Sheet, sheetPart: string): boolean => {
+    const list = pivotsOn.get(sheet);
+    if (!list) return false;
+    const newId = relationIds(sheetPart, childrenNamed(doc.root, 'Relationship'));
+    return relateNotes(doc, sheetPart, { relate: list.map((names) => ({ id: newId(), kind: 'pivotTable', part: names.table })), unrelate: new Set() });
+  };
+
   const charting = new Set<Sheet>();
   for (const sheet of workbook.sheets) {
     if (sheet.kind !== 'worksheet' || !sheet.drawingsModified) continue;
@@ -5863,7 +5955,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const pane = paned.has(sheet);
     const paging = paged.has(sheet);
     const rules = ruled.has(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !rules && !charting.has(sheet)) continue;
+    const pivotsHere = pivotsOn.has(sheet);
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !rules && !charting.has(sheet) && !pivotsHere) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
@@ -5947,8 +6040,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     // After rows or columns moved: the pictures and comments of the sheet follow, and the
     // relationships of links that are gone are removed. After rows or columns moved in another
     // sheet, or sheets were renamed or deleted: the shapes that show a cell of such a sheet follow.
-    const sheetRelsBytes = edits || others || notes || charts ? peek(sheetRelsPart) : undefined;
-    if (sheetRelsBytes || notes || charts) {
+    const sheetRelsBytes = edits || others || notes || charts || pivotsHere ? peek(sheetRelsPart) : undefined;
+    if (sheetRelsBytes || notes || charts || pivotsHere) {
       const sheetRels = sheetRelsBytes ? parseXml(sheetRelsBytes) : emptyRels();
       const linkIds = new Set<string>();
       for (const link of sheet.hyperlinks) if (link.rId !== undefined) linkIds.add(link.rId);
@@ -6044,6 +6137,15 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
         }
         chartsNow.set(sheet, charts.names);
       }
+      // The pivot tables made here on the sheet.
+      if (relatePivots(sheetRels, sheet, sheet.part)) {
+        dropped = true;
+        if (!sheetRelsBytes) {
+          // The file has no relationships for the sheet: the part made for them goes when it is no longer needed.
+          if (!originals.has(sheetRelsPart)) originals.set(sheetRelsPart, null);
+          pivotPartsNow.add(sheetRelsPart);
+        }
+      }
       if (dropped) {
         if (sheetRelsBytes) {
           keep(sheetRelsPart, sheetRelsBytes);
@@ -6093,11 +6195,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     if (charts && charts.element) bytes = setSheetDrawing(bytes, 'drawing', charts.element, sheet.name) || bytes;
     if (!originals.has(part)) originals.set(part, null);
     writes.push([part, bytes, WORKSHEET_CONTENT_TYPE]);
-    if (notes || charts) {
+    if (notes || charts || pivotsOn.has(sheet)) {
       const sheetRels = emptyRels();
       if (notes) relateNotes(sheetRels, part, notes);
       if (charts) relateNotes(sheetRels, part, charts);
       const sheetRelsPart = relsPartOf(part);
+      if (relatePivots(sheetRels, sheet, part)) pivotPartsNow.add(sheetRelsPart);
       const fresh: PartWrite[] = (notes ? notes.fresh : []).concat(charts ? charts.fresh : []);
       for (const [name, data, contentType] of fresh.concat([[sheetRelsPart, sheetRels]])) {
         if (!originals.has(name)) originals.set(name, null);
@@ -6124,6 +6227,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   for (const names of chartsNow.values()) for (const name of names) noteParts.add(name);
   for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined && !noteParts.has(name)) deletions.push(name);
   for (const names of charted.values()) for (const name of names) if (!noteParts.has(name) && deletions.indexOf(name) < 0) deletions.push(name);
+  // And for the parts made for pivot tables made here: what this save does not make again goes.
+  for (const name of pivotPartsBefore) if (!pivotPartsNow.has(name) && !noteParts.has(name) && deletions.indexOf(name) < 0) deletions.push(name);
+  for (const name of pivotPartsNow) {
+    const index = deletions.indexOf(name);
+    if (index >= 0) deletions.splice(index, 1);
+  }
 
   // Parts that leave the package with what this save takes out: the sheets of the file that are gone, and
   // the parts that charts which went led to (their own parts, styles and colours they share). One analysis
@@ -6223,11 +6332,52 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     removals.push([part, pkg.contentTypeOf(part)]);
   }
 
+  // The parts of the pivot tables made here and of their caches, made from what they were made with and what their refresh made.
+  const cachesListed: { cacheId: number; id: string }[] = [];
+  for (const [table, names] of pivotsNow) {
+    const cache = table.cache;
+    if (!table.now || !cache.now || table.created === undefined || cache.created === undefined) throw new Error(`Cannot write the pivot table "${table.name}": it was not built`);
+    const text = (xml: string) => encoder.encode(madePartText(xml, mainNamespace, relBase));
+    const tableDoc = writeTableDefinition(text(table.created), table, table.now);
+    tableDoc.root.attrs.set('cacheId', String(names.cacheId));
+    const relsOf = (target: string, kind: string, from: string): XmlDocument => {
+      const doc = emptyRels();
+      doc.root.children.push(element(`${prefixOf(doc.root)}Relationship`, [['Id', 'rId1'], ['Type', `${relBase}/${kind}`], ['Target', relativeTarget(from, target)]]));
+      return doc;
+    };
+    writes.push([names.table, tableDoc, PIVOT_TABLE_CONTENT_TYPE]);
+    writes.push([relsPartOf(names.table), relsOf(names.cache, 'pivotCacheDefinition', names.table)]);
+    writes.push([names.cache, writeCacheDefinition(text(cache.created.definition), cache, cache.now, workbook.date1904), PIVOT_CACHE_CONTENT_TYPE]);
+    writes.push([relsPartOf(names.cache), relsOf(names.records, 'pivotCacheRecords', names.cache)]);
+    writes.push([names.records, writeCacheRecords(text(cache.created.records), cache.now, workbook.date1904), PIVOT_RECORDS_CONTENT_TYPE]);
+    for (const part of [names.table, relsPartOf(names.table), names.cache, relsPartOf(names.cache), names.records]) if (!originals.has(part)) originals.set(part, null);
+    cachesListed.push({ cacheId: names.cacheId, id: relate('pivotCacheDefinition', names.cache) });
+  }
+  // The workbook lists their caches.
+  if (cachesListed.length > 0) {
+    let prefix = '';
+    for (const [name, value] of book.root.attrs) if (name.slice(0, 6) === 'xmlns:' && value === relBase) prefix = name.slice(6);
+    if (prefix === '') {
+      prefix = 'r';
+      for (let n = 1; book.root.attrs.has(`xmlns:${prefix}`); n++) prefix = `r${n}`;
+      book.root.attrs.set(`xmlns:${prefix}`, relBase);
+    }
+    let container = childNamed(book.root, 'pivotCaches');
+    if (!container) {
+      container = element(`${mainPrefix}pivotCaches`);
+      insertInOrder(book.root, container, WORKBOOK_ORDER);
+    }
+    for (const entry of cachesListed) container.children.push(element(`${mainPrefix}pivotCache`, [['cacheId', String(entry.cacheId)], [`${prefix}:id`, entry.id]]));
+  }
+
   const bookParts: string[] = [];
-  if (recalculate || renamed || activeMoved || restated || namesChanged) {
-    updateWorkbookXml(book, workbook, { file, renamed, restated, reordered, relIds, relNamespace: relBase, active, activeMoved, recalculate, hiddenWindows });
+  const bookWritten = recalculate || renamed || activeMoved || restated || namesChanged;
+  if (bookWritten || cachesListed.length > 0) {
     writes.push([main, book]);
     bookParts.push(main);
+  }
+  if (bookWritten) {
+    updateWorkbookXml(book, workbook, { file, renamed, restated, reordered, relIds, relNamespace: relBase, active, activeMoved, recalculate, hiddenWindows });
     if (reordered || renamed) {
       // The list of titles in the extended properties names the sheets as well.
       let appPart: string | undefined;
@@ -6282,5 +6432,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   for (const [sheet, names] of notesNow) noted.set(sheet, names);
   charted.clear();
   for (const [sheet, names] of chartsNow) charted.set(sheet, names);
+  pivoted.clear();
+  for (const [table, names] of pivotsNow) pivoted.set(table, names);
+  saved.pivotParts = [...pivotPartsNow];
   pivots.done();
 }

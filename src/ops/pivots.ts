@@ -23,6 +23,7 @@ import {
   cacheFieldsNow,
   cacheSourceNow,
   namedSourceRange,
+  tableNow,
   tableState,
   valueKey,
   type PivotAggregate,
@@ -33,6 +34,7 @@ import {
   type PivotLine,
   type PivotLocation,
   type PivotTable,
+  type PivotTableDef,
   type PivotTableState,
   type PivotValue,
 } from '../model/sheet/pivot';
@@ -45,8 +47,11 @@ import { applyOp, sameFormat, type CellChange, type Op } from './ops';
 /** Counts for the tests: keys of text made to sort items. */
 export const PIVOT_STATS = { textKeys: 0, scans: 0 };
 
+/** Rows (and columns) of different items one field may lay out when the fields of a table are changed or a table is made. */
+export const MAX_PIVOT_AXIS_ITEMS = 100000;
+
 /** Limits of a refresh that tests may lower to reach them with small files. */
-export const PIVOT_LIMITS = { work: MAX_PIVOT_WORK };
+export const PIVOT_LIMITS = { work: MAX_PIVOT_WORK, axisItems: MAX_PIVOT_AXIS_ITEMS };
 
 /** A pivot table as a list of the workbook shows it. */
 export interface PivotInfo {
@@ -203,6 +208,30 @@ function headerText(value: PivotValue): string {
   }
 }
 
+/**
+ * What the columns of a range of cells would make the fields of a cache: the text of each header
+ * (as a refresh compares it with the name of the field), and whether the values below it are
+ * numbers and dates only (blanks aside), and whether any is a date. The range is not checked here.
+ */
+export function sourceColumns(workbook: Workbook, sheet: Sheet, range: CellRange): { names: string[]; numeric: boolean[]; dates: boolean[] } {
+  const isDate = dateStyles(workbook);
+  const width = range.right - range.left + 1;
+  const names: string[] = [];
+  const numeric: boolean[] = new Array(width).fill(true);
+  const dates: boolean[] = new Array(width).fill(false);
+  for (let c = 0; c < width; c++) names.push(headerText(valueOf(workbook, getCell(sheet, range.top, range.left + c), isDate)));
+  for (let r = range.top + 1; r <= range.bottom; r++) {
+    const row = sheet.rows.get(r);
+    if (!row) continue;
+    for (let c = 0; c < width; c++) {
+      const value = valueOf(workbook, row.cells[range.left + c], isDate);
+      if (value.t === 'd') dates[c] = true;
+      else if (value.t !== 'n' && value.t !== 'm') numeric[c] = false;
+    }
+  }
+  return { names, numeric, dates };
+}
+
 /** The rows of the source below its header, after the header was checked against the fields of the cache. */
 function readSource(workbook: Workbook, cache: PivotCache, table: PivotTable): PivotValue[][] {
   const { sheet, range } = sourceRange(workbook, cache, table);
@@ -255,8 +284,13 @@ export function buildCache(cache: PivotCache, rows: PivotValue[][], tables: Pivo
       if (t === 's' || t === 'b' || t === 'e') plain = false;
     }
     const listed = old.items !== undefined || !plain || tables.some((table) => onAxis(table, f));
+    // The number format of the field is the file's: kept.
+    const named = (field: PivotCacheField): PivotCacheField => {
+      if (old.numFmtId !== undefined) field.numFmtId = old.numFmtId;
+      return field;
+    };
     if (!listed) {
-      fields.push({ name: old.name });
+      fields.push(named({ name: old.name }));
       for (let r = 0; r < rows.length; r++) records[r][f] = rows[r][f];
       continue;
     }
@@ -285,7 +319,7 @@ export function buildCache(cache: PivotCache, rows: PivotValue[][], tables: Pivo
       }
       records[r][f] = at;
     }
-    fields.push({ name: old.name, items });
+    fields.push(named({ name: old.name, items }));
   }
   return { fields, records };
 }
@@ -557,6 +591,8 @@ const WORDS = { rowHeader: 'Row Labels', colHeader: 'Column Labels', grand: 'Gra
 /** What the cells of a table as it was say of how the table is written: styles, captions in the language of the file. */
 interface Harvest {
   styles: Map<string, number>;
+  /** The styles of the labels of dates, by kind of cell: a date takes the style the dates of its kind had, whatever the other labels have. */
+  dates?: Map<string, number>;
   captions: { rowHeader?: string; colHeader?: string; grand?: string; blank?: string };
   /** The words around the label of an item in the label of its subtotal ("{item} Total"). */
   total?: { before: string; after: string };
@@ -579,6 +615,13 @@ function labelText(workbook: Workbook, value: PivotValue): string {
   }
 }
 
+/** The text an item of a field of a table shows: the name the table gives it, else its value ("(blank)" for none). */
+export function itemText(workbook: Workbook, item: PivotItem, value: PivotValue | undefined): string {
+  const named = itemCaption(item);
+  if (named !== undefined) return named;
+  return !value || value.t === 'm' ? WORDS.blank : labelText(workbook, value);
+}
+
 /** The caption an item is shown with: the name the table gives it (`n`), else its value. */
 function itemCaption(item: PivotItem | undefined): string | undefined {
   if (!item) return undefined;
@@ -597,6 +640,8 @@ function harvest(workbook: Workbook, table: PivotTable, shape: Shape, state: Piv
   if (state.location.firstDataRow + rowLines.length !== area.bottom - area.top + 1 || state.location.firstDataCol + colLines.length !== area.right - area.left + 1) return out;
   const old: Shape = { ...shape, labelCols: state.location.firstDataCol, firstDataRow: state.location.firstDataRow };
   const ref = state.location.ref;
+  /** Styles of the labels of dates, by kind of cell: those of a kind whose other labels say none. */
+  const dated = new Map<string, number>();
   place(table, old, rowLines, colLines, (cell) => {
     const row = ref.top + cell.row;
     const col = ref.left + cell.col;
@@ -604,17 +649,19 @@ function harvest(workbook: Workbook, table: PivotTable, shape: Shape, state: Piv
     const found = getCell(table.sheet, row, col);
     if (!found) return;
     const key = cell.d !== undefined && cell.role.indexOf('alue') >= 0 ? `${cell.role}:${cell.d}` : cell.role;
-    if (!out.styles.has(key)) out.styles.set(key, found.style);
+    const items = cell.field === undefined || cell.item === undefined ? undefined : state.items[cell.field];
+    const item = items ? items[cell.item as number] : undefined;
+    const value = item && item.x !== undefined && cell.field !== undefined && values[cell.field] && values[cell.field].items ? (values[cell.field].items as PivotValue[])[item.x] : undefined;
+    // The label of a date has a style of dates, which is not that of the labels of its field (a date is given one of its own).
+    if (value && value.t === 'd' && /Label/.test(cell.role)) {
+      if (!dated.has(key)) dated.set(key, found.style);
+    } else if (!out.styles.has(key)) out.styles.set(key, found.style);
     const text = found.kind === 'string' && typeof found.value === 'string' ? found.value : undefined;
     if (text === undefined) return;
     if (cell.caption === 'rowHeader' && out.captions.rowHeader === undefined) out.captions.rowHeader = text;
     if (cell.caption === 'colHeader' && out.captions.colHeader === undefined) out.captions.colHeader = text;
     if (cell.caption === 'grand' && out.captions.grand === undefined) out.captions.grand = text;
-    if (cell.field === undefined || cell.item === undefined) return;
-    const items = state.items[cell.field];
-    const item = items ? items[cell.item] : undefined;
-    const value = item && item.x !== undefined && values[cell.field] && values[cell.field].items ? (values[cell.field].items as PivotValue[])[item.x] : undefined;
-    if (!value) return;
+    if (!value || !item || cell.field === undefined) return;
     if (value.t === 'm' && /Label/.test(cell.role) && out.captions.blank === undefined && itemCaption(item) === undefined) out.captions.blank = text;
     if (/Sub/.test(cell.role) && out.total === undefined) {
       const label = itemCaption(item) ?? (value.t === 'm' ? out.captions.blank ?? WORDS.blank : labelText(workbook, value));
@@ -622,6 +669,8 @@ function harvest(workbook: Workbook, table: PivotTable, shape: Shape, state: Piv
       if (at >= 0) out.total = { before: text.slice(0, at), after: text.slice(at + label.length) };
     }
   });
+  for (const [key, style] of dated) if (!out.styles.has(key)) out.styles.set(key, style);
+  out.dates = dated;
   return out;
 }
 
@@ -786,7 +835,7 @@ function withX(item: PivotItem, x: number): PivotItem {
  * their order, their names and whether they are hidden, as long as their values are still
  * there; the new ones follow (or all are sorted, for a field that is sorted).
  */
-function itemsNow(table: PivotTable, state: PivotTableState, before: PivotCacheField[], after: PivotCacheField[]): (PivotItem[] | undefined)[] {
+function itemsNow(table: PivotTable, state: PivotTableState, before: PivotCacheField[], after: PivotCacheField[], edited: boolean): (PivotItem[] | undefined)[] {
   return table.fields.map((field, f) => {
     const old = state.items[f];
     const values = after[f] ? after[f].items : undefined;
@@ -832,7 +881,8 @@ function itemsNow(table: PivotTable, state: PivotTableState, before: PivotCacheF
       order.sort((a, b) => sign * compareSortKeys(a.key, b.key) || a.i - b.i);
       for (let i = 0; i < order.length; i++) data[i] = order[i].item;
     }
-    const rest = (old || []).filter((item) => item.t !== undefined);
+    // A field whose subtotal was turned off here loses the item of it (a table of the file keeps what it has).
+    const rest = (old || []).filter((item) => item.t !== undefined && !(edited && item.t === 'default' && !field.defaultSubtotal));
     if (axis && field.defaultSubtotal && !rest.some((item) => item.t === 'default')) rest.push({ t: 'default', attrs: [['t', 'default']] });
     return data.concat(rest);
   });
@@ -848,6 +898,38 @@ interface Built {
   state: PivotTableState;
   /** The cells of the body: row, column and the cell. */
   cells: { row: number; col: number; cell: Cell }[];
+  /**
+   * The fields of the page, for a table whose fields were changed here or that was made here (a
+   * table of the file leaves them as they are): the cells they take now and took before (absolute
+   * places), and what those cells show.
+   */
+  pages?: { area: CellRange | undefined; was: CellRange | undefined; cells: { row: number; col: number; cell: Cell }[] };
+}
+
+/**
+ * A change of the fields of a table (see src/ops/pivot-fields.ts): the table is built by `def` in
+ * the place of its fields, from the items given here (those of its state, with what is hidden or
+ * shown changed).
+ */
+export interface PivotEdit {
+  def: PivotTableDef;
+  /** The items of each field to start from, in the order of the fields. */
+  items: (PivotItem[] | undefined)[];
+  /** The item each page field of `def` shows (its place among the items of its field). */
+  pageItems: (number | undefined)[];
+  /** Where the body goes, when it moves (to make room above it for the fields of the page). */
+  at?: { top: number; left: number };
+  /** For each value of `def`, the value of the table as it was whose cells it takes the style of; -1 for none. */
+  valuesFrom: number[];
+}
+
+/** Excel's words for the item a field of the page shows when it is not one item. */
+const PAGE_WORDS = { all: '(All)', multiple: '(Multiple Items)' };
+
+/** The cells the fields of the page of a table take above its body: pairs of a caption and an item, one row each. */
+function pageArea(body: CellRange, pages: { rows: number; cols: number } | undefined): CellRange | undefined {
+  if (!pages) return undefined;
+  return { top: Math.max(0, body.top - pages.rows - 1), bottom: Math.max(0, body.top - 2), left: body.left, right: Math.min(MAX_COLS - 1, body.left + 3 * pages.cols - 2) };
 }
 
 /** The style a cell of a kind gets: what that kind had in the table as it was, else the plain one. */
@@ -894,13 +976,26 @@ function valueStyle(workbook: Workbook, base: number, numFmtId: number | undefin
   return found >= 0 ? found : base;
 }
 
-function build(workbook: Workbook, table: PivotTable, sheetIndex: number, after: PivotCacheState, before: PivotCacheField[]): Built {
+function build(workbook: Workbook, original: PivotTable, sheetIndex: number, after: PivotCacheState, before: PivotCacheField[], edit?: PivotEdit): Built {
+  // The table as its fields stand now, and as it is built: by the fields of the edit, when there is one.
+  const current = tableNow(original);
+  const table: PivotTable = edit ? { ...current, ...edit.def } : current;
+  if (edit && !edit.def.pages) delete table.pages;
   const shape = shapeOf(table);
-  const old = tableState(table);
+  const state = tableState(original);
+  const old: PivotTableState = edit ? { ...state, items: edit.items, pageItems: edit.pageItems } : state;
   const was = old.location.ref;
   if ((was.bottom - was.top + 1) * (was.right - was.left + 1) > MAX_PIVOT_OUTPUT_CELLS) refuse(table, `it has more than ${MAX_PIVOT_OUTPUT_CELLS} cells`);
-  const harvested = harvest(workbook, table, shape, old, before);
-  const items = itemsNow(table, old, before, after.fields);
+  const harvested = edit ? harvestEdited(workbook, current, state, before, edit) : harvest(workbook, table, shape, old, before);
+  const items = itemsNow(table, old, before, after.fields, !!edit || !!state.def);
+  // A field with more different items than can be laid out is refused when the fields are changed or a table is made (a refresh builds what the file had).
+  if (edit || (original.created !== undefined && !original.now)) {
+    for (const f of shape.rows.concat(shape.cols)) {
+      const list = items[f];
+      const count = list ? list.filter((item) => item.t === undefined).length : 0;
+      if (count > PIVOT_LIMITS.axisItems) refuse(table, `the field "${after.fields[f] ? after.fields[f].name.slice(0, 60) : f}" has ${count} different values: more than ${PIVOT_LIMITS.axisItems} cannot be laid out`);
+    }
+  }
   const fields = after.fields;
   // A field of the rows or columns that hides what is new to it, and so would hide every item: what Excel does then is not known.
   for (const f of shapeOfFields(table)) {
@@ -1077,8 +1172,8 @@ function build(workbook: Workbook, table: PivotTable, sheetIndex: number, after:
   const height = shape.firstDataRow + rowLines.length;
   const width = shape.labelCols + colLines.length;
   if (height * width > MAX_PIVOT_OUTPUT_CELLS) refuse(table, `it would have more than ${MAX_PIVOT_OUTPUT_CELLS} cells`);
-  const top = old.location.ref.top;
-  const left = old.location.ref.left;
+  const top = edit && edit.at ? edit.at.top : old.location.ref.top;
+  const left = edit && edit.at ? edit.at.left : old.location.ref.left;
   if (top + height > MAX_ROWS || left + width > MAX_COLS) refuse(table, 'it would reach past the end of the sheet');
 
   const cells: { row: number; col: number; cell: Cell }[] = [];
@@ -1095,7 +1190,7 @@ function build(workbook: Workbook, table: PivotTable, sheetIndex: number, after:
       case 'n':
         return { kind: 'number', value: value.v, style: labelStyle(f, style, false) };
       case 'd':
-        return { kind: 'number', value: value.v, style: labelStyle(f, style, true) };
+        return { kind: 'number', value: value.v, style: dateLabelStyle(f, role, style) };
       case 'b':
         return { kind: 'boolean', value: value.v, style };
       case 'e':
@@ -1113,6 +1208,30 @@ function build(workbook: Workbook, table: PivotTable, sheetIndex: number, after:
     const found = format ? workbook.styles.cellXfs.findIndex((other) => sameFormat(other, { ...format, numFmtId })) : -1;
     if (found < 0) refuse(table, `the labels of the field "${fields[f] ? fields[f].name : f}" have a number format the style sheet has no style with`);
     return found;
+  };
+  /**
+   * The style of the label of a date: the one the dates of its kind had in the table, else the one
+   * with the number format of its cache field (that of the source, for a table made here) when the
+   * style sheet has it, else the label's with a format of dates (see labelStyle()).
+   */
+  const dateLabelStyle = (f: number, role: string, style: number): number => {
+    const dates = harvested.dates;
+    const own = dates ? (dates.get(role) ?? dates.get(role.replace(/\d+$/, '0'))) : undefined;
+    if (own !== undefined && table.fields[f].numFmtId === undefined) return own;
+    const cached = fields[f] ? fields[f].numFmtId : undefined;
+    if (table.fields[f].numFmtId === undefined && cached !== undefined) {
+      const format = workbook.styles.cellXfs[style] || workbook.styles.cellXfs[0];
+      if (format && format.numFmtId === cached) return style;
+      const found = format ? workbook.styles.cellXfs.findIndex((other) => sameFormat(other, { ...format, numFmtId: cached })) : -1;
+      if (found >= 0) {
+        try {
+          if (isDateFormat(resolveCellStyle(workbook.styles, found).numFmt)) return found;
+        } catch (error) {
+          // The format of dates below.
+        }
+      }
+    }
+    return labelStyle(f, own !== undefined ? own : style, true);
   };
   const totalOf = (f: number, i: number, role: string): Cell => {
     const item = (items[f] as PivotItem[])[i];
@@ -1154,7 +1273,86 @@ function build(workbook: Workbook, table: PivotTable, sheetIndex: number, after:
     firstDataRow: shape.firstDataRow,
     firstDataCol: shape.labelCols,
   };
-  return { table, sheet: sheetIndex, state: { location, items, rowItems: fileLines(rowLines), colItems: fileLines(colLines), pageItems }, cells };
+  const made: PivotTableState = { location, items, rowItems: fileLines(rowLines), colItems: fileLines(colLines), pageItems };
+  // The fields as they were changed go on with every refresh; a change sets them.
+  const def = edit ? edit.def : state.def;
+  if (def) made.def = def;
+  const out: Built = { table: original, sheet: sheetIndex, state: made, cells };
+  // The fields of the page are written by a table whose fields were changed here or that was made here.
+  if (edit || state.def || original.created !== undefined) {
+    if ((table.pages && table.pages.cols !== 1) || (current.pages && current.pages.cols !== 1)) refuse(table, 'its fields of the page stand in several columns');
+    const area = pageArea(location.ref, table.pages);
+    const wasArea = pageArea(old.location.ref, current.pages);
+    if (area && area.top + (table.pages as { rows: number }).rows + 1 > location.ref.top) refuse(table, 'there is no room above it for its fields of the page');
+    const pageCells: { row: number; col: number; cell: Cell }[] = [];
+    const words = pageWords(current, state, before, wasArea);
+    table.pageFields.forEach((page, k) => {
+      if (!area) return;
+      const row = area.top + k;
+      const caption = table.fields[page.fld] ? table.fields[page.fld].name ?? fields[page.fld].name : fields[page.fld].name;
+      const styleAt = (col: number) => {
+        const cell = getCell(table.sheet, row, col);
+        return cell ? cell.style : 0;
+      };
+      pageCells.push({ row, col: area.left, cell: { kind: 'string', value: caption, style: styleAt(area.left) } });
+      const shown = pageItems[k];
+      const list = items[page.fld] || [];
+      let cell: Cell;
+      if (shown !== undefined) cell = { ...label(page.fld, shown, 'pageItem'), style: styleAt(area.left + 1) };
+      else cell = { kind: 'string', value: list.some((item) => item.t === undefined && item.h) ? words.multiple : words.all, style: styleAt(area.left + 1) };
+      pageCells.push({ row, col: area.left + 1, cell });
+    });
+    out.pages = { area, was: wasArea, cells: pageCells };
+  }
+  return out;
+}
+
+/**
+ * The words the fields of the page of a table showed for all items and for several, read from its
+ * cells as they stand (a Turkish Excel writes "(Tümü)"); Excel's English words where it showed none.
+ */
+function pageWords(table: PivotTable, state: PivotTableState, before: PivotCacheField[], area: CellRange | undefined): { all: string; multiple: string } {
+  const out = { all: PAGE_WORDS.all, multiple: PAGE_WORDS.multiple };
+  if (!area) return out;
+  table.pageFields.forEach((page, k) => {
+    const row = area.top + k;
+    if (row > area.bottom || state.pageItems[k] !== undefined) return;
+    const cell = getCell(table.sheet, row, area.left + 1);
+    if (!cell || cell.kind !== 'string' || typeof cell.value !== 'string') return;
+    const list = state.items[page.fld] || [];
+    if (list.some((item) => item.t === undefined && item.h)) out.multiple = cell.value;
+    else if (before[page.fld]) out.all = cell.value;
+  });
+  return out;
+}
+
+/**
+ * What the cells of a table say of how it is written, for the table built by an edit: read as the
+ * table stood (by its fields then), the styles of its values passed on to the values of the edit
+ * that come from them (a value whose format changed takes none).
+ */
+function harvestEdited(workbook: Workbook, current: PivotTable, state: PivotTableState, before: PivotCacheField[], edit: PivotEdit): Harvest {
+  let shape: Shape;
+  try {
+    shape = shapeOf(current);
+  } catch (error) {
+    if (error instanceof RangeError) return { styles: new Map(), captions: {} };
+    throw error;
+  }
+  const read = harvest(workbook, current, shape, state, before);
+  const styles = new Map<string, number>();
+  for (const [key, style] of read.styles) {
+    const colon = key.indexOf(':');
+    if (colon < 0) {
+      styles.set(key, style);
+      continue;
+    }
+    const d = Number(key.slice(colon + 1));
+    edit.valuesFrom.forEach((from, k) => {
+      if (from === d) styles.set(`${key.slice(0, colon)}:${k}`, style);
+    });
+  }
+  return { ...read, styles };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1196,8 +1394,12 @@ export function refreshPivot(workbook: Workbook, index: number): Op[] {
   return refreshOps(workbook, index, true);
 }
 
-/** refreshPivot(), without looking through the workbook when `look` is false (refreshAllPivots() looked through it already). */
-function refreshOps(workbook: Workbook, index: number, look: boolean): Op[] {
+/**
+ * refreshPivot(), without looking through the workbook when `look` is false (refreshAllPivots()
+ * looked through it already). With `edit`, the table at `index` is built by the fields of the edit
+ * (see src/ops/pivot-fields.ts); the other tables of its cache are refreshed as they are.
+ */
+export function refreshOps(workbook: Workbook, index: number, look: boolean, edit?: PivotEdit): Op[] {
   const { cache, cacheIndex, tables } = family(workbook, index, look);
   const pivots = workbook.pivots as NonNullable<Workbook['pivots']>;
   const first = pivots.tables[index];
@@ -1212,33 +1414,43 @@ function refreshOps(workbook: Workbook, index: number, look: boolean): Op[] {
   }
   const rows = readSource(workbook, cache, first);
   const before = cacheFieldsNow(cache);
-  const after = buildCache(cache, rows, tables.map((i) => pivots.tables[i]));
-  const built = tables.map((i) => build(workbook, pivots.tables[i], workbook.sheets.indexOf(pivots.tables[i].sheet), after, before));
+  // The tables as their fields stand now; the one that is edited as the edit has them (a field it puts in its rows lists its items).
+  const laid = tables.map((i) => (edit && i === index ? { ...tableNow(pivots.tables[i]), ...edit.def } : tableNow(pivots.tables[i])));
+  const after = buildCache(cache, rows, laid);
+  const built = tables.map((i) => build(workbook, pivots.tables[i], workbook.sheets.indexOf(pivots.tables[i].sheet), after, before, edit && i === index ? edit : undefined));
 
   const ops: Op[] = [];
   for (const one of built) {
     const sheet = one.table.sheet;
     const was = tableState(one.table).location.ref;
     const now = one.state.location.ref;
+    // The fields of the page above the body, where they are written: before and now.
+    const wasPages = one.pages ? one.pages.was : undefined;
+    const nowPages = one.pages ? one.pages.area : undefined;
+    const wasAreas = wasPages ? [was, wasPages] : [was];
+    const taken = nowPages ? [now, nowPages] : [now];
     // Other tables of the sheet, as they will stand.
     for (const other of pivots.tables) {
       if (other === one.table || other.sheet !== sheet) continue;
       const mate = built.find((b) => b.table === other);
       const area = mate ? mate.state.location.ref : tableState(other).location.ref;
-      if (intersects(area, now)) refuse(one.table, `it would grow over the pivot table "${other.name}"`);
+      if (taken.some((range) => intersects(area, range))) refuse(one.table, `it would grow over the pivot table "${other.name}"`);
     }
-    for (const merge of sheet.merges) if (intersects(merge, now)) refuse(one.table, `it would grow over the merged cells ${rangeName(merge)}`);
+    for (const merge of sheet.merges) if (taken.some((range) => intersects(merge, range))) refuse(one.table, `it would grow over the merged cells ${rangeName(merge)}`);
     // Cells beyond the table as it was must be empty, as in Excel.
-    for (let r = now.top; r <= now.bottom; r++) {
-      const row = sheet.rows.get(r);
-      if (!row) continue;
-      for (let c = now.left; c <= now.right; c++) {
-        if (inside(was, r, c)) continue;
-        if (holds(row.cells[c])) refuse(one.table, `it would grow over ${cellName(r, c)}, which is not empty`);
+    for (const range of taken) {
+      for (let r = range.top; r <= range.bottom; r++) {
+        const row = sheet.rows.get(r);
+        if (!row) continue;
+        for (let c = range.left; c <= range.right; c++) {
+          if (wasAreas.some((area) => inside(area, r, c))) continue;
+          if (holds(row.cells[c])) refuse(one.table, `it would grow over ${cellName(r, c)}, which is not empty`);
+        }
       }
     }
     const wanted = new Map<number, Cell>();
     for (const placed of one.cells) wanted.set((now.top + placed.row) * MAX_COLS + now.left + placed.col, placed.cell);
+    if (one.pages) for (const placed of one.pages.cells) wanted.set(placed.row * MAX_COLS + placed.col, placed.cell);
     const changes: CellChange[] = [];
     const visit = (r: number, c: number) => {
       const key = r * MAX_COLS + c;
@@ -1248,9 +1460,13 @@ function refreshOps(workbook: Workbook, index: number, look: boolean): Op[] {
         if (current !== undefined) changes.push({ row: r, col: c, cell: undefined });
       } else if (!sameCell(current, next)) changes.push({ row: r, col: c, cell: next });
     };
-    for (let r = Math.min(was.top, now.top); r <= Math.max(was.bottom, now.bottom); r++) {
-      for (let c = Math.min(was.left, now.left); c <= Math.max(was.right, now.right); c++) {
-        if (inside(was, r, c) || inside(now, r, c)) visit(r, c);
+    const areas = wasAreas.concat(taken);
+    for (const area of areas) {
+      for (let r = area.top; r <= area.bottom; r++) {
+        for (let c = area.left; c <= area.right; c++) {
+          // Each cell once: in the first of the areas that holds it.
+          if (areas.find((one) => inside(one, r, c)) === area) visit(r, c);
+        }
       }
     }
     if (changes.length > 0) ops.push({ type: 'setCells', sheet: one.sheet, cells: changes });

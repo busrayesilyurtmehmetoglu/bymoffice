@@ -231,6 +231,8 @@ export function copySheetLosses(workbook: Workbook, index: number): CopySheetLos
   add('externalLinks', sheet.hyperlinks.filter((link) => link.location === undefined).length);
   const setup = sheet.pageSetup;
   for (const kind of sheet.anchored || []) if (COUNTED_PARTS.indexOf(kind) < 0 && !out.some((loss) => loss.what === kind)) add(kind, 1);
+  // Pivot tables made here are not copied either (their cells are).
+  if (!out.some((loss) => loss.what === 'pivotTable') && workbook.pivots) add('pivotTable', workbook.pivots.tables.filter((table) => table.sheet === sheet).length);
   // What the sheet part holds beside the fields of the model, by the names the reader noted.
   const names = new Map<string, number>();
   for (const name of sheet.unmodelled || []) if (typeof name === 'string') names.set(name, (names.get(name) || 0) + 1);

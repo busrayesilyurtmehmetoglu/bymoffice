@@ -22,6 +22,7 @@ import { resolveUiStrings } from '../ui/strings';
 import { parsePrintArea, parseTitleBand, type PageSetupPatch } from '../ops/page-setup';
 import type { SectionPatch } from '../ops/doc/section';
 import { askOverwrite, editorRootIn } from '../ui/save-confirm';
+import { readPivotCell, readPivotSource } from '../ui/pivot-dialog';
 import { PasswordPrompt, type PasswordRequest } from '../ui/password-dialog';
 import { readCollabStamp, writeSharedFile, type CollabStamp } from '../formats/xlsx/collab-stamp';
 import { listPeople } from '../collab/people';
@@ -2072,6 +2073,99 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
+   * Makes a pivot table (insertPivot), changes the fields of one (setPivotFields), or lists them
+   * (pivotFields). What the message holds is copied field by field, as lists and numbers only; the
+   * commands check all of it. The answer is "done" with the table and its sheet (insertPivot),
+   * whether anything changed (setPivotFields), or the fields (pivotFields).
+   */
+  const pivotCommand = (type: 'insertPivot' | 'setPivotFields' | 'pivotFields', message: Message, id: string | undefined) => {
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const view = shown.view;
+    if (!view) return fail('no-sheet', 'The open file is a document: it has no pivot tables', id);
+    if (typeof view.insertPivot !== 'function' || typeof view.setPivotFields !== 'function' || typeof view.pivotFields !== 'function') return fail('pivot-refused', 'This view cannot change pivot tables', id);
+    const index = message.index;
+    const numberList = (value: unknown): number[] | undefined => (Array.isArray(value) && value.length <= 16384 ? value.map((one) => (typeof one === 'number' ? one : NaN)) : undefined);
+    const answer: Message = { type: 'done', id, command: type };
+    try {
+      if (type === 'pivotFields') {
+        if (typeof index !== 'number') return fail('pivot-refused', 'The message names no pivot table (index)', id);
+        // A plain copy: what the file names goes out as text.
+        answer.fields = JSON.parse(JSON.stringify(view.pivotFields(index)));
+        if (id !== undefined) send(answer);
+        return;
+      }
+      if (shown.locked || view.readOnly === true) return fail('read-only', 'The file is read-only', id);
+      if (!commitPendingOf(view)) return fail('pivot-refused', STILL_EDITING, id);
+      const lists: Record<string, unknown> = {};
+      for (const key of ['rows', 'cols']) if (message[key] !== undefined) lists[key] = numberList(message[key]);
+      // A filter is a field, or a field with the item it shows ({ field, item }).
+      if (Array.isArray(message.filters) && message.filters.length <= 16384) {
+        lists.filters = message.filters.map((one: unknown) => {
+          if (typeof one === 'number') return one;
+          if (!one || typeof one !== 'object') return NaN;
+          const entry = one as Record<string, unknown>;
+          const out: Record<string, unknown> = { field: typeof entry.field === 'number' ? entry.field : NaN };
+          if (entry.item !== undefined) out.item = typeof entry.item === 'number' ? entry.item : NaN;
+          return out;
+        });
+      } else if (message.filters !== undefined) lists.filters = numberList(message.filters);
+      if (Array.isArray(message.values) && message.values.length <= 256) {
+        lists.values = message.values.map((one: unknown) => {
+          const value = one && typeof one === 'object' ? (one as Record<string, unknown>) : {};
+          const out: Record<string, unknown> = { field: typeof value.field === 'number' ? value.field : NaN };
+          if (typeof value.subtotal === 'string') out.subtotal = value.subtotal;
+          if (typeof value.numFmt === 'string') out.numFmt = value.numFmt;
+          if (typeof value.name === 'string' && type === 'setPivotFields') out.name = value.name;
+          return out;
+        });
+      }
+      if (type === 'insertPivot') {
+        const selection = view.selection;
+        const sheet = view.activeSheet;
+        const source =
+          typeof message.source === 'string' ? readPivotSource(message.source, view.workbook, sheet) : selection ? { sheet, range: selection.range } : undefined;
+        if (!source) return fail('pivot-refused', 'The source of the pivot table is not a range or a name of the workbook', id);
+        const options: Record<string, unknown> = { ...lists, source };
+        if (typeof message.cell === 'string') {
+          const cell = readPivotCell(message.cell);
+          if (!cell) return fail('pivot-refused', 'The cell of the pivot table is not one', id);
+          options.target = { sheet, row: cell.row, col: cell.col };
+        }
+        const made = view.insertPivot(options as unknown as Parameters<WorkbookView['insertPivot']>[0], message.panel === true);
+        if (made < 0) return fail('pivot-refused', NOT_DONE, id);
+        answer.index = made;
+        answer.sheet = view.activeSheet;
+      } else {
+        if (typeof index !== 'number') return fail('pivot-refused', 'The message names no pivot table (index)', id);
+        const change: Record<string, unknown> = { ...lists };
+        if (typeof message.rowGrandTotals === 'boolean') change.rowGrandTotals = message.rowGrandTotals;
+        if (typeof message.colGrandTotals === 'boolean') change.colGrandTotals = message.colGrandTotals;
+        const pairs = (value: unknown, second: string, kind: 'boolean' | 'string' | 'list'): unknown[] | undefined =>
+          Array.isArray(value) && value.length <= 16384
+            ? value.map((one: unknown) => {
+                const entry = one && typeof one === 'object' ? (one as Record<string, unknown>) : {};
+                const other = entry[second];
+                return { field: typeof entry.field === 'number' ? entry.field : NaN, [second]: kind === 'list' ? numberList(other) : typeof other === kind ? other : undefined };
+              })
+            : undefined;
+        if (message.subtotals !== undefined) change.subtotals = pairs(message.subtotals, 'on', 'boolean');
+        if (message.sort !== undefined) change.sort = pairs(message.sort, 'order', 'string');
+        if (message.hidden !== undefined) change.hidden = pairs(message.hidden, 'items', 'list');
+        answer.changed = view.setPivotFields(index, change as Parameters<WorkbookView['setPivotFields']>[1]);
+      }
+    } catch (error) {
+      let text: string;
+      try {
+        text = typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
+      } catch {
+        text = errorText(error);
+      }
+      return fail('pivot-refused', text, id);
+    }
+    if (id !== undefined) send(answer);
+  };
+
+  /**
    * Moves, hides or shows, copies a sheet or colours its tab through the view, as one undo
    * step. Like changeSheets(): the list that results is told by `sheets`, and the answer says
    * that the command was done, or why it was not.
@@ -2525,6 +2619,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
       if (type === 'refreshPivots') return refreshPivots(id);
+      if (type === 'insertPivot' || type === 'setPivotFields' || type === 'pivotFields') return pivotCommand(type, fields, id);
       if (type === 'setTabStops' || type === 'setDefaultTabStop') return tabDocument(type, fields, id);
       if (type === 'setPageSetup' || type === 'insertPageBreak' || type === 'removePageBreak' || type === 'resetPageBreaks' || type === 'insertSectionBreak') return pageSetupCommand(type, fields, id);
       if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);

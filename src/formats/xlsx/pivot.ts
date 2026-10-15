@@ -28,6 +28,7 @@ import {
   type PivotTable,
   type PivotValue,
   type WorkbookPivots,
+  defaultValueName,
   sourceArea,
 } from '../../model/sheet/pivot';
 import { parseRange, type Sheet, type Workbook } from '../../model/sheet/types';
@@ -139,6 +140,8 @@ function parseCache(root: XmlElement, cacheId: number, part: string, recordsPart
   if (list.length > MAX_PIVOT_FIELDS) throw new Unreadable('the cache has too many fields');
   for (const element of list) {
     const field: PivotCacheField = { name: decodeXstring(element.attrs.get('name') || '') };
+    const format = int(element.attrs.get('numFmtId'), 0, 65535);
+    if (format !== undefined && format !== 0) field.numFmtId = format;
     if (element.attrs.get('formula') !== undefined || element.attrs.get('databaseField') === '0') refuse('it has a calculated field');
     if (child(element, 'fieldGroup')) refuse('it groups items (dates or numbers in ranges, or items put together by hand)');
     const shared = child(element, 'sharedItems');
@@ -309,21 +312,6 @@ function parseLines(el: XmlElement | undefined, budget: Budget, depth: number): 
   });
 }
 
-/** The words Excel uses for the function a value is summarized by, in its default names ("Sum of Sales"). */
-const AGGREGATE_WORDS: Record<PivotAggregate, string> = {
-  sum: 'Sum',
-  count: 'Count',
-  average: 'Average',
-  max: 'Max',
-  min: 'Min',
-  product: 'Product',
-  countNums: 'Count',
-  stdDev: 'StdDev',
-  stdDevp: 'StdDevp',
-  var: 'Var',
-  varp: 'Varp',
-};
-
 /** Reads a table definition. Throws Unreadable for a part whose content is not one. */
 function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCache, budget: Budget): PivotTable {
   if (localName(root.name) !== 'pivotTableDefinition') throw new Unreadable('the part is not a pivot table definition');
@@ -337,7 +325,8 @@ function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCa
     firstDataCol: int(locationEl.attrs.get('firstDataCol'), 0, 16384) || 0,
   };
   const table: PivotTable = {
-    name: root.attrs.get('name') || '',
+    // Names are of ST_Xstring, as those of the fields.
+    name: decodeXstring(root.attrs.get('name') || ''),
     part,
     sheet,
     cache,
@@ -481,7 +470,8 @@ function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCa
     if (showAs !== undefined && showAs !== 'normal') refuse('a value is shown as a calculation (a share, a difference, a running total, ...)');
     const aggregate = (known ? subtotal : 'sum') as PivotAggregate;
     const fieldName = cache.fields[fld] ? cache.fields[fld].name : '';
-    const data: PivotDataField = { name: el.attrs.get('name') || `${AGGREGATE_WORDS[aggregate]} of ${fieldName}`, fld, subtotal: aggregate };
+    const named = el.attrs.get('name');
+    const data: PivotDataField = { name: named ? decodeXstring(named) : defaultValueName(aggregate, fieldName), fld, subtotal: aggregate };
     const numFmtId = int(el.attrs.get('numFmtId'), 0, 65535);
     if (numFmtId !== undefined) data.numFmtId = numFmtId;
     table.dataFields.push(data);
@@ -489,6 +479,13 @@ function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCa
   for (const local of ['formats', 'conditionalFormats']) {
     const el = child(root, local);
     if (el && namesItems(el)) refuse('it formats some of its items');
+    // Formats name areas of the table by its fields and their places: they would name others once the fields move.
+    if (el && childElements(el).length > 0 && table.editRefusal === undefined) table.editRefusal = 'it has formats of parts of the table, which name its fields';
+  }
+  // The fields of the page are changed here only as Excel lays them out by default: one column of them, a row each.
+  if (table.pages && (table.pages.cols !== 1 || table.pages.rows !== table.pageFields.length) && table.editRefusal === undefined) table.editRefusal = 'its fields of the page are laid out in a way that is not built here';
+  if (child(root, 'extLst') && table.editRefusal === undefined && childElements(child(root, 'extLst') as XmlElement, 'ext').some((ext) => childElements(ext).some((kid) => ['pivotTableDefinition', 'pivotTableDefinition16'].indexOf(localName(kid.name)) < 0 && HARMLESS_EXTENSIONS.indexOf(localName(kid.name)) < 0))) {
+    table.editRefusal = 'it has an extension that names its fields';
   }
   if (child(root, 'chartFormats')) refuse('a pivot chart is made from it');
   if (child(root, 'filters')) refuse('it filters by labels or by values');
@@ -496,6 +493,27 @@ function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCa
   if (child(root, 'pivotHierarchies')) refuse('its data comes from an OLAP source');
   if (table.fields.length !== cache.fields.length) refuse('its fields are not those of its cache');
   return table;
+}
+
+/**
+ * Reads the definitions of a pivot table and its cache that were made here (see
+ * src/formats/xlsx/pivot-create.ts) the way the parts of a file are read: what a table made here
+ * is in the model is what the reader makes of it. Throws Error for a definition the reader does
+ * not take, or one it would refuse to refresh.
+ */
+export function readMadePivot(cacheXml: string, tableXml: string, sheet: Sheet, date1904: boolean): { cache: PivotCache; table: PivotTable } {
+  const encoder = new TextEncoder();
+  const budget: Budget = { items: 0 };
+  try {
+    const cache = parseCache(parseXml(encoder.encode(cacheXml)).root, -1, '', '', date1904, budget);
+    const table = parseTable(parseXml(encoder.encode(tableXml)).root, '', sheet, cache, budget);
+    const refusal = cache.refusal || table.refusal || table.editRefusal;
+    if (refusal !== undefined) throw new Error(`Cannot make the pivot table: ${refusal}`);
+    return { cache, table };
+  } catch (error) {
+    if (error instanceof Unreadable) throw new Error(`Cannot make the pivot table: ${error.message}`);
+    throw error;
+  }
 }
 
 /** The pivot tables a sheet shows, by the relationships of its part. */

@@ -2150,6 +2150,8 @@ function builtXlsx(workbook: Workbook, options: BuildXlsxOptions, pictures: Map<
   for (const [name, data] of files) put(name, data);
 
   notes.add('Text: a character XML cannot carry (in a formula, an error value, a name or another attribute) is written as U+FFFD', replacedCharacters);
+  // Pivot tables (made here in a workbook that is in no xlsx file) are not written by this writer: their cells are.
+  notes.add('Pivot table: a pivot table is not written; the cells it shows are', workbook.pivots ? workbook.pivots.tables.length : 0);
   if (options.report) {
     options.report.parts.push(...partNames);
     options.report.warnings.push(...notes.list());

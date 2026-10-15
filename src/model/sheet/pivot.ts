@@ -18,6 +18,26 @@ import { MAX_COLS, MAX_ROWS, foldSheetName, parseRange, type CellRange, type She
 export const PIVOT_AGGREGATES = ['sum', 'count', 'average', 'max', 'min', 'product', 'countNums', 'stdDev', 'stdDevp', 'var', 'varp'] as const;
 export type PivotAggregate = (typeof PIVOT_AGGREGATES)[number];
 
+/** The words Excel uses for the function a value is summarized by, in its default names ("Sum of Sales"). */
+const AGGREGATE_WORDS: Record<PivotAggregate, string> = {
+  sum: 'Sum',
+  count: 'Count',
+  average: 'Average',
+  max: 'Max',
+  min: 'Min',
+  product: 'Product',
+  countNums: 'Count',
+  stdDev: 'StdDev',
+  stdDevp: 'StdDevp',
+  var: 'Var',
+  varp: 'Varp',
+};
+
+/** The name Excel gives a value of a field summarized by a function: "Sum of Sales". */
+export function defaultValueName(subtotal: PivotAggregate, fieldName: string): string {
+  return `${AGGREGATE_WORDS[subtotal]} of ${fieldName}`;
+}
+
 /** Pivot tables one workbook holds at most; the rest are kept as the file has them, and are not refreshed. */
 export const MAX_PIVOT_TABLES = 1000;
 /** Fields of one cache at most (Excel's limit on columns). */
@@ -68,6 +88,8 @@ export interface PivotCacheField {
    * whose values the records hold themselves (a field of numbers that stands in no row or column).
    */
   items?: PivotValue[];
+  /** The number format the file gives the field (cacheField numFmtId: that of its source, for a field of dates), when it is not the general one. */
+  numFmtId?: number;
 }
 
 /** Where the cache is read from: a range of a sheet of the workbook, or a defined name that stands for one. */
@@ -108,6 +130,8 @@ export interface PivotCache {
   sourceRef?: string;
   /** Set by the reader: why the places its source names cannot follow rows and columns that move; undefined when they can. */
   placesFixed?: string;
+  /** For a cache made here and in no file: its definition and its records as they were made (see PivotTable.created). */
+  created?: { definition: string; records: string };
 }
 
 /** An item of a field of a pivot table (<item>). */
@@ -181,6 +205,23 @@ export interface PivotLocation {
   firstDataCol: number;
 }
 
+/**
+ * Which fields of a table stand where (rows, columns, page, values) and how they are totalled: what
+ * changing the fields of a table sets (src/ops/pivot-fields.ts). The table is built again from it.
+ */
+export interface PivotTableDef {
+  /** One per field of the cache, as PivotTable.fields; their items are those of the state (PivotTableState.items). */
+  fields: PivotField[];
+  rowFields: number[];
+  colFields: number[];
+  pageFields: PivotPageField[];
+  dataFields: PivotDataField[];
+  rowGrandTotals: boolean;
+  colGrandTotals: boolean;
+  /** As PivotTable.pages: the rows and columns the fields of the page take above the body. */
+  pages?: { rows: number; cols: number };
+}
+
 /** What a refresh made of a table. */
 export interface PivotTableState {
   location: PivotLocation;
@@ -188,8 +229,10 @@ export interface PivotTableState {
   items: (PivotItem[] | undefined)[];
   rowItems: PivotLine[];
   colItems: PivotLine[];
-  /** The item each page field shows, in the order of PivotTable.pageFields. */
+  /** The item each page field shows, in the order of the page fields (those of `def` when it is set). */
   pageItems: (number | undefined)[];
+  /** The fields as they were changed (see PivotTableDef); undefined while they are those of the file (or, for a table made here, those it was made with). */
+  def?: PivotTableDef;
 }
 
 /** Captions the file gives the table in place of the words of the application. */
@@ -237,9 +280,20 @@ export interface PivotTable {
   placed?: CellRange;
   /** The rows and the columns of fields of the page that stand above the body (location rowPageCount, colPageCount); undefined without such fields. */
   pages?: { rows: number; cols: number };
+  /** Set by the reader: why the fields of the table cannot be changed here although it can be refreshed; undefined when they can. */
+  editRefusal?: string;
+  /**
+   * For a table made here (src/ops/pivot-create.ts) and in no file: its definition as it was made,
+   * which the writer starts from in the place of the bytes of a file. Its part (`part`) is ''
+   * until a save gives it one, as for a sheet that is in no file.
+   */
+  created?: string;
 }
 
-/** The pivot tables of a workbook and their caches. Neither list changes after the file is read. */
+/**
+ * The pivot tables of a workbook and their caches. A table made here is added at the end of both
+ * lists, and taken out of them again by its undo ("addPivot"): the places of the others never change.
+ */
 export interface WorkbookPivots {
   caches: PivotCache[];
   tables: PivotTable[];
@@ -268,6 +322,32 @@ export function tableState(table: PivotTable): PivotTableState {
     colItems: table.colItems,
     pageItems: table.pageFields.map((page) => page.item),
   };
+}
+
+/** The fields of a table and where they stand: as they were last changed, else as the file has them. */
+export function tableDef(table: PivotTable): PivotTableDef {
+  const def = table.now ? table.now.def : undefined;
+  if (def) return def;
+  const out: PivotTableDef = {
+    fields: table.fields,
+    rowFields: table.rowFields,
+    colFields: table.colFields,
+    pageFields: table.pageFields,
+    dataFields: table.dataFields,
+    rowGrandTotals: table.rowGrandTotals,
+    colGrandTotals: table.colGrandTotals,
+  };
+  if (table.pages) out.pages = table.pages;
+  return out;
+}
+
+/** The table with its fields as they stand now (see tableDef()): what a table is built by. The table itself when they are those of the file. */
+export function tableNow(table: PivotTable): PivotTable {
+  const def = table.now ? table.now.def : undefined;
+  if (!def) return table;
+  const out: PivotTable = { ...table, ...def };
+  if (!def.pages) delete out.pages;
+  return out;
 }
 
 /** The fields of a cache: as the last refresh made them, else as the file has them. */

@@ -1037,6 +1037,12 @@ export function encodeOp(workbook: Workbook, op: Op): Encoded {
     case 'setPivot':
       // A refresh reads the source as this participant has it, and its cache is not sent: refused, before anything is changed.
       throw new CollabUnsupportedError('other', 'A pivot table cannot be refreshed while the workbook is edited together');
+    case 'addPivot':
+    case 'removePivot':
+    case 'addStyles':
+    case 'removeStyles':
+      // Nor is a table that is made: refused the same way.
+      throw new CollabUnsupportedError('other', 'A pivot table cannot be made while the workbook is edited together');
     default:
       throw new CollabUnsupportedError('other', `The operation "${op.type}" cannot be shared`);
   }

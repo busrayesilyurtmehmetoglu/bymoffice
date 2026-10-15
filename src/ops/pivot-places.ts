@@ -25,7 +25,7 @@
 // edit travels alone, nothing of the pivot tables goes with it.
 
 import { adjustRange, adjustReferenceText } from '../calc/refs';
-import { cacheSourceNow, fieldColumnsNow, namedSourceRange, sourceArea, tableState, type PivotCache, type PivotTable, type PivotTableState } from '../model/sheet/pivot';
+import { cacheSourceNow, fieldColumnsNow, namedSourceRange, sourceArea, tableDef, tableState, type PivotCache, type PivotTable, type PivotTableState } from '../model/sheet/pivot';
 import { MAX_COLS, MAX_ROWS, foldSheetName, type CellRange, type Sheet, type SheetStructuralEdit, type Workbook } from '../model/sheet/types';
 
 /** What an edit changes of the pivot tables of a workbook (or, applied, what it changed them from): see swapPivotPlaces(). */
@@ -58,8 +58,9 @@ export function pivotsFixedReason(workbook: Workbook): string | undefined {
 const span = (range: CellRange, edit: SheetStructuralEdit): [number, number] => (edit.axis === 'row' ? [range.top, range.bottom] : [range.left, range.right]);
 
 /** The cells a table takes on its sheet: its body, and the fields of the page above it with the blank row under them. */
-function tableArea(table: PivotTable, body: CellRange): CellRange {
-  const pages = table.pages;
+export function tableArea(table: PivotTable, body: CellRange): CellRange {
+  // The fields of the page as they stand now: changing the fields of a table may have added or taken some.
+  const pages = tableDef(table).pages;
   if (!pages) return body;
   // The fields stand in pairs of cells (caption, item) side by side, a blank column between the pairs.
   return { top: Math.max(0, body.top - pages.rows - 1), bottom: body.bottom, left: body.left, right: Math.min(MAX_COLS - 1, Math.max(body.right, body.left + 3 * pages.cols - 2)) };

@@ -140,7 +140,23 @@ export {
 } from './ops/sheets';
 export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
 export { PivotRefreshError, compareText, listPivots, lookThroughPivots, pivotAt, refreshAllPivots, refreshPivot, refreshPivotProblem, type PivotInfo, type RefreshAll } from './ops/pivots';
-export type { PivotAggregate, PivotCache, PivotCacheField, PivotCacheState, PivotDataField, PivotField, PivotItem, PivotLine, PivotLocation, PivotPageField, PivotSource, PivotTable, PivotTableState, PivotValue, WorkbookPivots } from './model/sheet/pivot';
+export { MAX_PIVOT_AXIS_ITEMS } from './ops/pivots';
+export { PivotCreateError, createPivot, createPivotProblem, pivotSourceFields, type PivotCreateOptions, type PivotCreation, type PivotSourceSpec, type PivotTargetSpec } from './ops/pivot-create';
+export {
+  PivotFieldsError,
+  pivotFields,
+  pivotFieldsProblem,
+  setPivotFields,
+  setPivotFieldsProblem,
+  type PivotFieldInfo,
+  type PivotFieldsChange,
+  type PivotFieldsInfo,
+  type PivotSort,
+  type PivotValueChange,
+  type PivotValueInfo,
+} from './ops/pivot-fields';
+export type { PivotAggregate, PivotCache, PivotCacheField, PivotCacheState, PivotDataField, PivotField, PivotItem, PivotLine, PivotLocation, PivotPageField, PivotSource, PivotTable, PivotTableDef, PivotTableState, PivotValue, WorkbookPivots } from './model/sheet/pivot';
+export { tableDef } from './model/sheet/pivot';
 export {
   CHART_COPY_OFFSET,
   CHART_PART_CHANGES,
