@@ -8,7 +8,7 @@
 import { resolveColor, type ResolvedCellStyle } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, type Alignment } from '../model/sheet/types';
 import type { BorderPreset } from '../ops/format';
-import { EDITOR_STRINGS_EN, EDITOR_STRINGS_TR, withShortcut, type EditorStrings } from './editor-strings';
+import { EDITOR_STRINGS_EN, EDITOR_STRINGS_TR, withCtrlKey, withShortcut, type EditorStrings } from './editor-strings';
 import { ICON_BAR_CLASS, createBorderIcon, createIcon, type IconName } from './icons';
 import { Popover, type PopoverCloseReason, type PopoverItem } from './popover';
 import { fontChoices } from './font-list';
@@ -151,6 +151,8 @@ export class Toolbar {
     this.addButton('redo', () => host.view.redo());
     // Works in a read-only view as well; what goes wrong is said by the view.
     this.addButton('print', () => void host.view.print().catch(() => undefined)).setAttribute('aria-busy', 'false');
+    // The print preview covers the editor and takes the focus; it gives it back when it closes.
+    this.addDialogButton('printPreview', () => void host.view.printPreview());
     // One file at a time: a press while one is being made does not ask for a second.
     this.addButton('pdf', () => {
       if (!host.view.exportingPdf) void host.view.downloadPdf().catch(() => undefined);
@@ -451,6 +453,7 @@ export class Toolbar {
       redo: withShortcut(s.redo, 'Y'),
       // The same label as the button of the document bar.
       print: s.print,
+      printPreview: withCtrlKey(s.printPreview, 'F2'),
       pdf: s.pdfDownload,
       pageSetup: s.pageSetup,
       bold: withShortcut(s.bold, 'B'),

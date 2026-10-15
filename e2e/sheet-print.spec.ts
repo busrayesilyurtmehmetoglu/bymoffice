@@ -645,11 +645,12 @@ test.describe('printing from the editor', () => {
     await expect(button).toHaveAttribute('aria-label', 'Print');
     await expect(button).toHaveAttribute('title', 'Print');
     await expect(button).toHaveAttribute('aria-busy', 'false');
-    // It stands after Undo and Redo; the PDF button and Page setup follow it, before the first separator.
-    expect(await page.evaluate(() => Array.from(document.querySelectorAll('#host .bym-toolbar > *')).slice(0, 6).map((element) => element.getAttribute('data-command') || element.className))).toEqual([
+    // It stands after Undo and Redo; Print preview, the PDF button and Page setup follow it, before the first separator.
+    expect(await page.evaluate(() => Array.from(document.querySelectorAll('#host .bym-toolbar > *')).slice(0, 7).map((element) => element.getAttribute('data-command') || element.className))).toEqual([
       'undo',
       'redo',
       'print',
+      'printPreview',
       'pdf',
       'pageSetup',
       'bym-tb-sep',

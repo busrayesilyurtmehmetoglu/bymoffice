@@ -16,7 +16,7 @@ import type { SaveCommand } from './save-command';
 import type { DocumentPrintResult } from './doc-print';
 import type { SheetPrintOptions } from './sheet-print';
 import type { PdfDownload } from '../pdf/export';
-import type { SheetPdfExportOptions } from './sheet-view';
+import type { SheetPdfExportOptions, SheetPreviewOptions } from './sheet-view';
 import { WorkbookView, type WorkbookViewOptions } from './sheet-view';
 import { StatusBar } from './status-bar';
 import type { CollabPeer, CollabState } from '../collab/session';
@@ -377,6 +377,16 @@ export class SpreadsheetEditor {
     bar.setAttribute('aria-label', `${words.state[info.state]}. ${words.peopleCount(people.count)}`);
   }
 
+  /** Opens the print preview: see WorkbookView.printPreview(). */
+  printPreview(options?: SheetPreviewOptions): boolean {
+    return this.view.printPreview(options);
+  }
+
+  /** Closes the print preview: see WorkbookView.closePrintPreview(). */
+  closePrintPreview(): boolean {
+    return this.view.closePrintPreview();
+  }
+
   /** Prints the workbook: see WorkbookView.print(). */
   print(options?: SheetPrintOptions): Promise<DocumentPrintResult> {
     return this.view.print(options);
@@ -488,6 +498,12 @@ export class SpreadsheetEditor {
     if ((key === 'f' || key === 'F' || key === 'h' || key === 'H') && !this.view.isEditing) {
       event.preventDefault();
       this.view.openFind(key === 'h' || key === 'H');
+      return;
+    }
+    // Ctrl+F2: the print preview, as from the grid.
+    if (key === 'F2' && event.ctrlKey && !event.metaKey && !this.view.isEditing) {
+      event.preventDefault();
+      this.view.printPreview();
       return;
     }
     if (key !== 'p' && key !== 'P') return;

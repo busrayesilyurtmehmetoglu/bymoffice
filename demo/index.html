@@ -127,6 +127,7 @@
           <label title="exportPdf({ links }): köprüler PDF bağlantısı olur (yalnız http, https, mailto ve dosya içi hedefler)."><input type="checkbox" id="pdf-links" checked /> bağlantılar</label>
           <label title="exportPdf({ outline }): belgenin başlıkları ya da tablonun sayfa adları PDF anahattı (yer imleri) olur."><input type="checkbox" id="pdf-outline" checked /> anahat</label>
           <button id="pdf-make" disabled>PDF üret</button>
+          <button id="print-preview" disabled title="view.printPreview(): tablonun baskı önizlemesi (araç çubuğunda da var; Ctrl+F2). Sayfalar yazdırmadakiyle aynı dizilir ve çizilir; yalnız görünenler çizilir. Belgede yok: belge zaten sayfalı gösterilir.">Baskı önizleme</button>
         </div>
         <p class="muted" id="pdf-state"></p>
         <div class="scroll" style="margin-top: 12px"><table id="parts"></table></div>
@@ -1024,6 +1025,14 @@
       setInterval(() => {
         pdfButton.disabled = !(docView || view) || pdfButton.dataset.busy === '1';
       }, 300);
+      // The print preview of the workbook that is shown (a document shows its pages already).
+      const previewButton = $('print-preview');
+      setInterval(() => {
+        previewButton.disabled = !view || !!docView || typeof view.printPreview !== 'function';
+      }, 300);
+      previewButton.addEventListener('click', () => {
+        if (view && !docView && typeof view.printPreview === 'function') view.printPreview();
+      });
       pdfButton.addEventListener('click', async () => {
         const target = docView || view;
         if (!target || typeof target.exportPdf !== 'function') return;

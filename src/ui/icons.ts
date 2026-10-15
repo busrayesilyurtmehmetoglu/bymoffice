@@ -9,6 +9,7 @@ export type IconName =
   | 'undo'
   | 'redo'
   | 'print'
+  | 'printPreview'
   | 'pdf'
   | 'pageSetup'
   | 'bold'
@@ -56,6 +57,8 @@ const ICONS: { [name in IconName]: Shape[] } = {
   redo: [path('m15 14 5-5-5-5'), path('M20 9H10a6 6 0 0 0 0 12h3')],
   // The printer of the document bar.
   print: [path('M7 8V4h10v4'), path('M7 17H5a1 1 0 0 1-1-1v-6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1h-2'), path('M7 14h10v6H7z')],
+  // A sheet of paper and a magnifying glass over its corner: the print preview.
+  printPreview: [path('M13 21H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h8l4 4v4'), path('M8 8h5 M8 12h3'), path('M16.5 18.5m-3 0a3 3 0 1 0 6 0a3 3 0 1 0 -6 0'), path('m18.7 20.7 2.3 2.3')],
   // The file of the document bar: a sheet of paper with its corner folded, and an arrow down.
   pdf: [path('M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z'), path('M14 3v4h4'), path('M12 10v7'), path('m9 14 3 3 3-3')],
   // A page with its margins drawn in, and a corner turned: the page setup.

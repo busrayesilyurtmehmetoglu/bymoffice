@@ -1608,6 +1608,8 @@ export function createBridge(host: BridgeHost): Bridge {
     if (sheet !== undefined) options.sheet = sheet;
     // Who the notes added to cells are by.
     if (author !== undefined) options.author = author;
+    // What "&F" of a header or footer stands for in what the view prints, previews and makes a PDF of; and the name of that PDF.
+    if (name !== undefined) options.fileName = name;
 
     const saver = userSaves === true && !locked ? userSaver(autoSave) : undefined;
     if (saver) options.saveCommand = saver;
@@ -2378,6 +2380,34 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
+   * Opens (or with `open: false` closes) the print preview of the workbook that is shown: a layer
+   * over it with the pages print() would print. A document has none: its view shows its pages.
+   */
+  const printPreviewCommand = (message: Message, id: string | undefined) => {
+    const open = field<boolean>(message, 'open', 'boolean', false);
+    const sheets = field<string>(message, 'sheets', 'string', false);
+    if (sheets !== undefined && sheets !== 'active' && sheets !== 'all') throw new BadMessage('"sheets" must be "active" or "all"');
+    const page = field<number>(message, 'page', 'number', false);
+    if (page !== undefined && !(Number.isInteger(page) && page >= 1)) throw new BadMessage('"page" must be a whole number of 1 or more');
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const view = shown.view;
+    if (shown.pages || !view || typeof (view as WorkbookView).printPreview !== 'function') return fail('no-sheet', 'The open file is a document: its pages are shown already', id);
+    const grid = view as WorkbookView;
+    let now: boolean;
+    if (open === false) {
+      grid.closePrintPreview();
+      now = false;
+    } else {
+      const options: { sheets?: 'active' | 'all'; page?: number } = {};
+      if (sheets !== undefined) options.sheets = sheets as 'active' | 'all';
+      if (page !== undefined) options.page = page;
+      now = grid.printPreview(options);
+    }
+    if (id === undefined) return;
+    send({ type: 'done', id, command: 'printPreview', open: now });
+  };
+
+  /**
    * Makes a PDF of the document or the workbook and answers with it: `pdf`,
    * with the file as base64, the number of its pages and how many of them
    * were written as text and drawings (`vector`; the others are pictures).
@@ -2490,6 +2520,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'save') return await save(id);
       if (type === 'print') return print(fields, id);
       if (type === 'exportPdf') return exportPdf(fields, id);
+      if (type === 'printPreview') return printPreviewCommand(fields, id);
       if (type === 'insertSheet' || type === 'renameSheet' || type === 'deleteSheet') return changeSheets(type, fields, id);
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);

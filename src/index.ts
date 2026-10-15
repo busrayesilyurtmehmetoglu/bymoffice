@@ -330,7 +330,8 @@ export {
 export { DocumentPrintError, planPrint, printCss, type DocumentPrintErrorCode, type DocumentPrintOptions, type DocumentPrintResult, type PrintPlan } from './ui/doc-print';
 export { PdfExportError, type PdfAbortSignal, type PdfDownload, type PdfExportErrorCode, type PdfExportOptions, type PdfPageInfo } from './pdf/export';
 export type { PdfLinkReport } from './pdf/links';
-export type { SheetPdfExportOptions } from './ui/sheet-view';
+export type { SheetPdfExportOptions, SheetPreviewOptions } from './ui/sheet-view';
+export type { PrintPreviewInfo } from './ui/print-preview';
 export { defaultPaperFor, headerFooterFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPagePaint, type SheetPlanOptions, type SheetPrintOptions } from './ui/sheet-print';
 export {
   DEFAULT_PAGE_MARGINS,

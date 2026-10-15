@@ -176,6 +176,18 @@ function fake(config: FakeOptions = {}): Fake {
       apply(sheets, at);
       return at;
     };
+    let previewing = false;
+    view.printPreview = (given: { sheets?: string; page?: number } = {}): boolean => {
+      state.calls.push(`printPreview ${JSON.stringify(given)}`);
+      previewing = true;
+      return true;
+    };
+    view.closePrintPreview = (): boolean => {
+      state.calls.push('closePrintPreview');
+      const was = previewing;
+      previewing = false;
+      return was;
+    };
     view.setTabColor = (index: number, color: string | undefined): boolean => {
       state.calls.push(`setTabColor ${index} ${color}`);
       if (state.readOnly) return false;
@@ -707,4 +719,45 @@ test('review 4 (B3): a view that is not read-only and still places no sheet is r
       command.type,
     );
   }
+});
+
+test('bridge sheets: printPreview opens and closes the print preview of the workbook; its fields are checked', async () => {
+  const f = await loaded();
+  await f.bridge.receive({ type: 'printPreview', id: 'p1' });
+  await f.bridge.receive({ type: 'printPreview', id: 'p2', sheets: 'all', page: 3 });
+  await f.bridge.receive({ type: 'printPreview', id: 'p3', open: false });
+  // Without an id nothing is answered, and the preview opens all the same.
+  await f.bridge.receive({ type: 'printPreview' });
+  assert.deepEqual(f.calls, ['printPreview {}', 'printPreview {"sheets":"all","page":3}', 'closePrintPreview', 'printPreview {}']);
+  assert.deepEqual(f.take(), [
+    { type: 'done', id: 'p1', command: 'printPreview', open: true },
+    { type: 'done', id: 'p2', command: 'printPreview', open: true },
+    { type: 'done', id: 'p3', command: 'printPreview', open: false },
+  ]);
+  for (const bad of [{ sheets: 'selection' }, { page: 0 }, { page: 1.5 }, { open: 'yes' }]) {
+    await f.bridge.receive({ type: 'printPreview', id: 'bad', ...bad });
+    const [answer] = f.take();
+    assert.equal(answer.type, 'error', JSON.stringify(bad));
+    assert.equal(answer.code, 'bad-message', JSON.stringify(bad));
+  }
+  assert.equal(f.calls.length, 4);
+});
+
+test('bridge sheets: printPreview without a view that has one is "no-sheet"; without a file "not-loaded"', async () => {
+  const bare = await loaded({ bare: true });
+  await bare.bridge.receive({ type: 'printPreview', id: 'p' });
+  const [answer] = bare.take();
+  assert.equal(answer.type, 'error');
+  assert.equal(answer.code, 'no-sheet');
+  const none = fake();
+  await none.bridge.receive({ type: 'printPreview', id: 'q' });
+  const sent = none.take();
+  assert.equal(sent[sent.length - 1].code, 'not-loaded');
+});
+
+test('bridge sheets: the name of the file reaches the view, for "&F" of what it prints, previews and makes a PDF of', async () => {
+  const f = await loaded({}, { name: 'Kitap.xlsx' });
+  assert.equal(f.options().fileName, 'Kitap.xlsx');
+  const g = await loaded();
+  assert.equal(g.options().fileName, undefined);
 });

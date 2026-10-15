@@ -662,7 +662,9 @@ test.describe('a workbook as a PDF', () => {
     await expect(button).toHaveAttribute('aria-label', 'Download as PDF');
     await expect(button).toHaveAttribute('aria-busy', 'false');
     const labels = await page.evaluate(() => Array.from(document.querySelectorAll('#host .bym-toolbar button')).map((element) => element.getAttribute('aria-label')));
-    expect(labels.indexOf('Download as PDF')).toBe(labels.indexOf('Print') + 1);
+    // Print, Print preview, then the PDF.
+    expect(labels.indexOf('Download as PDF')).toBe(labels.indexOf('Print') + 2);
+    expect(labels[labels.indexOf('Print') + 1]).toMatch(/^Print preview \((Ctrl\+|⌃)F2\)$/);
     await page.evaluate(() => {
       const w = window as any;
       w.__status = [];

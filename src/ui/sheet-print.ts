@@ -23,7 +23,7 @@ import { DocumentPrintError, type DocumentPrintOptions } from './doc-print';
 export interface SheetPrintOptions extends DocumentPrintOptions {
   /** 'active' (the default) prints the sheet that is shown; 'all' every visible worksheet and chart sheet, in the order of the tabs. */
   sheets?: 'active' | 'all';
-  /** What "&F" in a header or footer stands for; empty when it is not given. */
+  /** What "&F" in a header or footer stands for; WorkbookViewOptions.fileName when it is not given (empty without one). */
   fileName?: string;
 }
 
@@ -98,6 +98,41 @@ function chartSheetLayout(sheet: Sheet, defaultPaper: number | undefined): Sheet
   const layout: SheetPrintLayout = { paper: { width: paper.width, height: paper.height }, landscape: paper.landscape, margins, scale: 1, headings: false, headingWidth: 0, headingHeight: 0, gridLines: false, pages: [page] };
   if (stated && stated.useFirstPageNumber === true && typeof stated.firstPageNumber === 'number' && Number.isFinite(stated.firstPageNumber) && Math.abs(stated.firstPageNumber) <= 32767) layout.firstPageNumber = Math.floor(stated.firstPageNumber);
   return layout;
+}
+
+/**
+ * What "&F" in a header or footer stands for in a job: the name the call gives (an empty one too),
+ * else the name the view was given. Printing, the print preview and the PDF all go by it, so that
+ * what is printed is what is previewed.
+ */
+export function jobFileName(given: string | undefined, ofView: string | undefined): string | undefined {
+  return given !== undefined ? given : ofView;
+}
+
+/**
+ * The sheets a job is of, in order: the one shown ('active', the default),
+ * every visible one ('all'), or those of a list as far as the workbook still
+ * has them. What printing, a PDF and the print preview all go by.
+ */
+export function jobSheets(workbook: Workbook, which: 'active' | 'all' | readonly number[] | undefined, shown: number): number[] {
+  const sheets: number[] = [];
+  if (which === 'all') {
+    for (let i = 0; i < workbook.sheets.length; i++) if (workbook.sheets[i].state === 'visible') sheets.push(i);
+  } else if (which !== undefined && which !== 'active') {
+    for (let i = 0; i < which.length; i++) if (which[i] < workbook.sheets.length) sheets.push(which[i]);
+  } else sheets.push(shown);
+  return sheets;
+}
+
+/**
+ * The sheets the print preview shows, as a list its Print and PDF hand on as they are: 'active' is
+ * the sheet the preview was opened on (followed wherever it was moved; the sheet shown when it is
+ * gone), not the sheet that happens to be shown later; 'all' the visible ones.
+ */
+export function previewSheets(workbook: Workbook, which: 'active' | 'all', opened: Sheet | undefined, shown: number): number[] {
+  if (which === 'all') return jobSheets(workbook, 'all', shown);
+  const at = opened ? workbook.sheets.indexOf(opened) : -1;
+  return [at >= 0 ? at : shown];
 }
 
 /**

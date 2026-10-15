@@ -51,6 +51,7 @@ import {
 } from '../ops/page-setup';
 import { PageSetupDialog, formatTwips, parseInches, parseWhole, type PageDialogField, type PageDialogGroup } from './page-setup-dialog';
 import { askOverwrite, editorRootIn } from './save-confirm';
+import { PrintPreview, type PrintPreviewInfo } from './print-preview';
 import { FindBar, type FindBarQuery } from './find-bar';
 import { runSliced } from './sliced';
 import { checkReplacement } from '../edit/find';
@@ -197,7 +198,7 @@ import { PdfExportError, canvasPageImage, checkCancelled, downloadParts, pdfFile
 import { sheetPdfLinks, type SheetPdfLinks } from '../pdf/sheet-links';
 import { MAX_PAGE_RUNS, captureText, type PdfTextRun } from '../pdf/text';
 import { joinParts } from '../pdf/writer';
-import { defaultPaperFor, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
+import { defaultPaperFor, jobFileName, jobSheets, previewSheets, paintSheetPage, planSheetPages, type SheetJobPage, type SheetJobPlan, type SheetPrintOptions } from './sheet-print';
 import { viewEngineOptions } from './engine-options';
 import { mapPosition } from '../collab/rebase';
 import type { CollabNotice, CollabPeer, CollabSession, SessionChange } from '../collab/session';
@@ -581,6 +582,11 @@ const STYLE_TEXT =
   // Text smaller than 16 px makes iOS zoom the page when a field takes the focus.
   '@media (pointer:coarse){.bym-tab-input{min-height:40px;font-size:16px}}' +
   '.bym-note{color:#5f6368;font-size:14px}' +
+  // The print preview (print-preview.ts): its buttons say when they cannot be pressed, and where the focus is.
+  '.bym-preview-btn:disabled,.bym-preview-sheets:disabled{opacity:.38;cursor:default}' +
+  '.bym-preview-btn:hover:not(:disabled){background:#f1f3f4}' +
+  '.bym-preview-btn:focus-visible,.bym-preview-sheets:focus-visible{outline:2px solid #1a73e8;outline-offset:1px}' +
+  '.bym-preview-pages:focus-visible{box-shadow:inset 0 0 0 2px #1a73e8}' +
   DIALOG_STYLE;
 
 /** One style element per document or shadow root, shared by the views in it. */
@@ -653,6 +659,46 @@ interface PageJob {
   captureText?: boolean;
 }
 
+/** The pages of a job, and what painting them needs: see WorkbookView.layoutJob(). */
+interface JobLayout {
+  pages: SheetJobPlan;
+  /** Row and column sizes of a sheet, made once per job. */
+  metrics(sheet: Sheet): SheetMetrics;
+  /** The drawings of a sheet over its cells; undefined for a sheet without any. */
+  layerOf(sheet: Sheet): SheetDrawings | undefined;
+}
+
+/** What an open print preview holds: see WorkbookView.printPreview(). */
+interface PreviewSession {
+  overlay: PrintPreview;
+  sheets: 'active' | 'all';
+  /** The sheet that was shown when the preview opened: the one 'active' is, wherever it is moved to. */
+  opened: Sheet | undefined;
+  /** The sheets the pages it shows are of: what its Print and PDF hand on, so that they print what is shown. */
+  list: number[];
+  /** The page asked for when it opened (from 0), until the pages are there. */
+  page?: number;
+  /** Until when a new layout waits for a calculation under way to end. */
+  calcUntil?: number;
+  store: ImageStore;
+  /** The pages it shows; undefined while there are none. */
+  laid?: JobLayout;
+  /** The moment "&D" and "&T" show: when the pages were laid out. */
+  now: Date;
+  /** A new layout waits for the workbook to stop changing. */
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+export interface SheetPreviewOptions {
+  /** 'active' (the default) the sheet that is shown; 'all' every visible worksheet and chart sheet, as print() has them. */
+  sheets?: 'active' | 'all';
+  /** The page to show first, from 1. */
+  page?: number;
+}
+
+/** How long the preview waits for the workbook to stop changing before it lays the pages out anew. */
+const PREVIEW_REPLAN_MS = 150;
+
 /** One call of print(): what it holds while it runs. */
 interface PrintJob extends PageJob {
   promise: Promise<DocumentPrintResult>;
@@ -666,6 +712,9 @@ interface PageJobOptions {
   sheets?: 'active' | 'all' | readonly number[];
   fileName?: string;
 }
+
+/** The options of a print job inside the view: those of print(), with `sheets` a list as well. */
+type PrintJobOptions = Omit<SheetPrintOptions, 'sheets'> & { sheets?: 'active' | 'all' | readonly number[] };
 
 /** What is said when painting the pages ends early: of printing, or of making a PDF. */
 interface PageJobWords {
@@ -1100,6 +1149,8 @@ export class WorkbookView {
   private findBar: FindBar | undefined;
   /** The dialog of the page setup, while it is open. */
   private pageDialog: PageSetupDialog | undefined;
+  /** The print preview that is open, and what it shows. */
+  private preview: PreviewSession | undefined;
   /** Counts the searches: one that was overtaken by another gives up. */
   private findToken = 0;
   private countToken = 0;
@@ -1425,8 +1476,9 @@ export class WorkbookView {
       this.strings = resolveStrings(locale);
       this.languageTag = locale;
       if (this.findBar) this.findBar.setStrings(this.strings.find);
+      if (this.preview) this.preview.overlay.setStrings(this.strings.preview);
     }
-    this.printEpoch++;
+    this.printChanged();
     this.drawings.forEach((layer) => layer.setLabels(this.drawingLabels()));
     this.root.setAttribute('aria-label', this.strings.spreadsheet);
     this.input.setAttribute('aria-label', this.strings.cellEditor);
@@ -1464,6 +1516,7 @@ export class WorkbookView {
     if (this.mergeQuestion) this.mergeQuestion();
     this.mergeQuestion = undefined;
     if (this.pageDialog) this.pageDialog.close();
+    if (this.preview) this.preview.overlay.close();
     this.closeFind(false);
     if (this.focusRetry) this.focusRetry.cancel();
     if (this.unwatchFonts) this.unwatchFonts();
@@ -1591,6 +1644,12 @@ export class WorkbookView {
     } catch (error) {
       return Promise.reject(error);
     }
+    return this.startPrint(options);
+  }
+
+  /** print() once its options were checked; `sheets` may be a list here (that of the print preview). */
+  private startPrint(options: PrintJobOptions): Promise<DocumentPrintResult> {
+    if (this.destroyed) return Promise.reject(new DocumentPrintError('cancelled', 'The view was destroyed'));
     const previous = this.printJob;
     if (previous) {
       if (!previous.dialog) return previous.promise;
@@ -1601,7 +1660,8 @@ export class WorkbookView {
     const nothing = () => undefined;
     const turn: Promise<unknown> = previous ? previous.promise.then(nothing, nothing) : Promise.resolve();
     job.promise = turn
-      .then(() => this.runPrint(job, options))
+      // "&F" is the name of the file the view shows unless the call says otherwise: as in the preview and the PDF.
+      .then(() => this.runPrint(job, { ...options, fileName: jobFileName(options.fileName, this.options.fileName) }))
       .then(
         (result) => {
           this.endPrint(job);
@@ -1622,7 +1682,7 @@ export class WorkbookView {
     if ((this.printJob === job || this.pdfJobs.indexOf(job) >= 0) && !this.destroyed && job.report) job.report(progress ? { done: progress.done, total: progress.total } : undefined);
   }
 
-  private async runPrint(job: PrintJob, options: SheetPrintOptions): Promise<DocumentPrintResult> {
+  private async runPrint(job: PrintJob, options: PrintJobOptions): Promise<DocumentPrintResult> {
     if (this.destroyed) throw new DocumentPrintError('cancelled', PRINT_WORDS.destroyed);
     // The window of the document the view is in: inside a frame, the frame is what is printed.
     const doc = this.container.ownerDocument || document;
@@ -1688,51 +1748,19 @@ export class WorkbookView {
         if (job.check) job.check();
       }
       const epoch = this.printEpoch;
-      // Pictures of its own: those of the view are sized for the screen and come and go with it. Those of the file
-      // are read from the file, those added since from the model.
-      const store = new ImageStore(pictureSource(this.workbook), coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, () => undefined);
+      const store = this.jobImages(() => undefined);
       job.store = store;
-      const layers = new Map<Sheet, SheetDrawings | undefined>();
-      const metricsOf = new Map<Sheet, SheetMetrics>();
-      const layerOf = (sheet: Sheet): SheetDrawings | undefined => {
-        if (!layers.has(sheet)) {
-          // Comments are not printed, so their boxes are left out of the layer.
-          layers.set(sheet, sheet.drawings && sheet.drawings.length > 0 ? new SheetDrawings(sheet, { images: store, labels: this.drawingLabels(), notes: false, charts: this.chartSource() }) : undefined);
-        }
-        return layers.get(sheet);
-      };
-      const sheets: number[] = [];
-      if (options.sheets === 'all') {
-        for (let i = 0; i < this.workbook.sheets.length; i++) if (this.workbook.sheets[i].state === 'visible') sheets.push(i);
-      } else if (options.sheets !== undefined && options.sheets !== 'active') {
-        // A list: those sheets, as far as the workbook still has them.
-        for (let i = 0; i < options.sheets.length; i++) if (options.sheets[i] < this.workbook.sheets.length) sheets.push(options.sheets[i]);
-      } else sheets.push(this.sheetIndex);
-      const pages: SheetJobPlan = planSheetPages(this.workbook, sheets, {
-        defaultPaper: defaultPaperFor(this.languageTag),
-        maxPages: MAX_PRINT_PAGES,
-        metrics: (sheet) => {
-          let metrics = metricsOf.get(sheet);
-          if (!metrics) {
-            metrics = createSheetMetrics(sheet);
-            metricsOf.set(sheet, metrics);
-          }
-          return metrics;
-        },
-        drawings: (sheet, _index, metrics) => {
-          const layer = layerOf(sheet);
-          return layer ? layer.rects(metrics) : undefined;
-        },
-      });
+      const laid = this.layoutJob(options.sheets, store);
+      const pages = laid.pages;
       plan = planPrint(
         pages.pages.map((entry) => entry.layout.paper),
         options,
         limits,
       );
-      const sink = open(plan, pages, (sheet) => metricsOf.get(sheet) || createSheetMetrics(sheet));
+      const sink = open(plan, pages, laid.metrics);
       job.sink = sink;
       this.setPageProgress(job, { done: 0, total: plan.pages.length });
-      const complete = await this.paintPages(job, epoch, pages, plan, sink, store, doc, options, words, (sheet) => metricsOf.get(sheet) as SheetMetrics, layerOf);
+      const complete = await this.paintPages(job, epoch, laid, plan, sink, store, doc, options, words);
       if (store) store.destroy();
       job.store = undefined;
       if (this.destroyed) throw cancelled();
@@ -1745,20 +1773,71 @@ export class WorkbookView {
     return plan;
   }
 
+  /**
+   * Pictures of a job of its own: those of the view are sized for the screen and come and go with it. Those of
+   * the file are read from the file, those added since from the model.
+   */
+  private jobImages(onLoad: (part: string) => void): ImageStore {
+    return new ImageStore(pictureSource(this.workbook), coarsePointer() ? IMAGE_BUDGET_BYTES_COARSE : IMAGE_BUDGET_BYTES, onLoad);
+  }
+
+  /**
+   * Lays the sheets of a job out on pages: what printing, a PDF and the print preview all start from, so that
+   * what is previewed is what is printed. Throws a DocumentPrintError 'empty' or 'too-long' (planSheetPages).
+   */
+  private layoutJob(which: PageJobOptions['sheets'], store: ImageStore): JobLayout {
+    const layers = new Map<Sheet, SheetDrawings | undefined>();
+    const metricsOf = new Map<Sheet, SheetMetrics>();
+    const layerOf = (sheet: Sheet): SheetDrawings | undefined => {
+      if (!layers.has(sheet)) {
+        // Comments are not printed, so their boxes are left out of the layer.
+        layers.set(sheet, sheet.drawings && sheet.drawings.length > 0 ? new SheetDrawings(sheet, { images: store, labels: this.drawingLabels(), notes: false, charts: this.chartSource() }) : undefined);
+      }
+      return layers.get(sheet);
+    };
+    const metrics = (sheet: Sheet): SheetMetrics => {
+      let found = metricsOf.get(sheet);
+      if (!found) {
+        found = createSheetMetrics(sheet);
+        metricsOf.set(sheet, found);
+      }
+      return found;
+    };
+    const pages: SheetJobPlan = planSheetPages(this.workbook, jobSheets(this.workbook, which, this.sheetIndex), {
+      defaultPaper: defaultPaperFor(this.languageTag),
+      maxPages: MAX_PRINT_PAGES,
+      metrics,
+      drawings: (sheet, _index, sizes) => {
+        const layer = layerOf(sheet);
+        return layer ? layer.rects(sizes) : undefined;
+      },
+    });
+    return { pages, metrics, layerOf };
+  }
+
+  /** Paints one page of a job on a canvas `pixelWidth` pixels across: the one painting of printing, PDF and the preview. */
+  private paintJobPage(target: CanvasRenderingContext2D, laid: JobLayout, entry: SheetJobPage, pixelWidth: number, fileName: string | undefined, now: Date): void {
+    const sheet = this.workbook.sheets[entry.sheet];
+    paintSheetPage(target, {
+      workbook: this.workbook,
+      job: entry,
+      total: laid.pages.pages.length,
+      // The page of a chart sheet has no cells to size (as before the preview shared this painting).
+      metrics: entry.chart ? (undefined as unknown as SheetMetrics) : laid.metrics(sheet),
+      pixelWidth,
+      locale: this.locale,
+      conditional: this.conditionalOf(sheet),
+      // A chart sheet is its chart: it has no cells and no layer of drawings over them.
+      drawings: entry.chart ? undefined : laid.layerOf(sheet),
+      charts: entry.chart ? this.chartRenderer() : undefined,
+      fileName,
+      now,
+    });
+  }
+
   /** Paints the pages of a plan and hands them to the sink; false when the workbook was changed meanwhile. */
-  private async paintPages(
-    job: PageJob,
-    epoch: number,
-    pages: SheetJobPlan,
-    plan: PrintPlan,
-    sink: PageSink,
-    store: ImageStore | undefined,
-    doc: Document,
-    options: PageJobOptions,
-    words: PageJobWords,
-    metricsOf: (sheet: Sheet) => SheetMetrics,
-    layerOf: (sheet: Sheet) => SheetDrawings | undefined,
-  ): Promise<boolean> {
+  private async paintPages(job: PageJob, epoch: number, laid: JobLayout, plan: PrintPlan, sink: PageSink, store: ImageStore | undefined, doc: Document, options: PageJobOptions, words: PageJobWords): Promise<boolean> {
+    const pages = laid.pages;
     const stale = () => this.destroyed || this.printEpoch !== epoch;
     // One canvas for all pages: a page is held as pixels only while it is painted.
     const canvas = doc.createElement('canvas');
@@ -1799,21 +1878,7 @@ export class WorkbookView {
           }
         };
         // The same painting for the canvas of pixels and for the canvas a PDF is written through.
-        const paintOn = (target: CanvasRenderingContext2D) =>
-          paintSheetPage(target, {
-            workbook: this.workbook,
-            job: entry,
-            total: pages.pages.length,
-            metrics: metricsOf(sheet),
-            pixelWidth: planned.pixelWidth,
-            locale: this.locale,
-            conditional,
-            // A chart sheet is its chart: it has no cells and no layer of drawings over them.
-            drawings: entry.chart ? undefined : layerOf(sheet),
-            charts: entry.chart ? this.chartRenderer() : undefined,
-            fileName: options.fileName,
-            now,
-          });
+        const paintOn = (target: CanvasRenderingContext2D) => this.paintJobPage(target, laid, entry, planned.pixelWidth, options.fileName, now);
         // Pictures of the pages before this one may make room for those of this one.
         if (store) store.pass++;
         try {
@@ -1871,6 +1936,194 @@ export class WorkbookView {
       code === 'unavailable' ? strings.printNotAvailable : code === 'too-long' ? strings.printSheetTooLong : code === 'empty' ? strings.printNothing : strings.printSheetFailed,
       'error',
     );
+  }
+
+  // --------------------------------------------------------- print preview
+
+  /** Whether the print preview is open. */
+  get previewing(): boolean {
+    return this.preview !== undefined;
+  }
+
+  /**
+   * Opens the print preview over the view: the pages print() would print (the
+   * same layout and the same painting), one after the other, with buttons to
+   * go through them, to zoom (a whole page, 100 %, steps), to choose the
+   * active sheet or the whole workbook, to print, to download the PDF, to open
+   * the page setup of the sheet of the current page (the pages are laid out
+   * anew when it changes anything) and to close. Only the pages in view are
+   * painted. Works in a read-only view too (without the page setup). What is
+   * being typed is applied first, as printing does.
+   *
+   * Returns whether the preview is open; false when what is being typed
+   * cannot be applied or the view has no document. A preview that is open
+   * already shows what `options` asks for. Throws a RangeError for a `sheets`
+   * that is neither 'active' nor 'all', or a `page` that is no whole number of 1 or more.
+   */
+  printPreview(options: SheetPreviewOptions = {}): boolean {
+    if (options.sheets !== undefined && options.sheets !== 'active' && options.sheets !== 'all') throw new RangeError('"sheets" must be "active" or "all"');
+    if (options.page !== undefined && !(typeof options.page === 'number' && Number.isInteger(options.page) && options.page >= 1)) throw new RangeError('"page" must be a whole number of 1 or more');
+    if (this.destroyed || typeof document === 'undefined') return false;
+    const open = this.preview;
+    if (open) {
+      if (options.sheets !== undefined && options.sheets !== open.sheets) {
+        open.sheets = options.sheets;
+        open.overlay.setSheets(options.sheets);
+        this.planPreview(options.page !== undefined ? options.page - 1 : 0);
+      } else if (options.page !== undefined) {
+        // Pages that are not laid out yet open at that page when they are.
+        if (open.laid) open.overlay.goTo(options.page - 1);
+        else open.page = options.page - 1;
+      }
+      return true;
+    }
+    if (!this.commitPending()) return false;
+    const sheets = options.sheets || 'active';
+    let visible = 0;
+    for (let i = 0; i < this.workbook.sheets.length; i++) if (this.workbook.sheets[i].state === 'visible') visible++;
+    const session = {} as PreviewSession;
+    session.sheets = sheets;
+    session.opened = this.workbook.sheets[this.sheetIndex];
+    session.list = [this.sheetIndex];
+    session.now = new Date();
+    if (options.page !== undefined) session.page = options.page - 1;
+    // Pictures that come are painted in by the pages that wait for them (see PrintPreview): nothing is painted anew for them here.
+    session.store = this.jobImages(() => undefined);
+    this.preview = session;
+    session.overlay = new PrintPreview({
+      // The whole editor (toolbar, formula bar, grid, status bar), not the grid alone: all of it is behind the preview.
+      root: this.previewRoot(),
+      strings: this.strings.preview,
+      sheets,
+      canChooseSheets: visible > 1,
+      canPageSetup: !this.locked,
+      coarse: coarsePointer(),
+      onSheets: (which) => {
+        if (this.preview !== session) return;
+        session.sheets = which;
+        this.planPreview(0);
+      },
+      // The sheets the pages shown are of, as a list: not 'active', which is whatever sheet is shown by then.
+      onPrint: () => void this.startPrint({ sheets: session.list.slice() }).catch(() => undefined),
+      onPdf: () => {
+        if (!this.exportingPdf) void this.downloadPdf({ sheets: session.list.slice() }).catch(() => undefined);
+      },
+      onPageSetup: (page) => {
+        const entry = session.laid ? session.laid.pages.pages[page] : undefined;
+        if (!entry || entry.chart) return;
+        const sheet = entry.sheet;
+        // The page setup is that of the sheet of the page in view.
+        if (sheet !== this.sheetIndex && sheet < this.workbook.sheets.length) this.setActiveSheet(sheet);
+        this.openPageSetup();
+      },
+      // A chart sheet has no page setup to change here.
+      pageSetupFor: (page) => {
+        const entry = session.laid ? session.laid.pages.pages[page] : undefined;
+        const sheet = entry ? this.workbook.sheets[entry.sheet] : undefined;
+        return !!entry && !entry.chart && !!sheet && sheet.kind === 'worksheet';
+      },
+      onClose: () => this.endPreview(session),
+      paint: (page, context, pixelWidth) => this.paintPreviewPage(session, page, context, pixelWidth),
+      // Pictures of the pages of one turn are kept together; those of the turns before may make room for them.
+      beginPass: () => void session.store.pass++,
+    });
+    // The layout comes a turn later, so that "laying out" is seen when it takes long.
+    session.timer = setTimeout(() => {
+      session.timer = undefined;
+      this.planPreview();
+    }, 0);
+    return true;
+  }
+
+  /** What the print preview covers: the element the editor gives as the scope of its focus, else the root of the view in its container. */
+  private previewRoot(): HTMLElement {
+    const scope = this.options.focusScope;
+    return scope && scope.contains(this.root) ? scope : editorRootIn(this.container, this.root);
+  }
+
+  /** Closes the print preview; the focus goes back to where it was. Returns whether one was open. */
+  closePrintPreview(): boolean {
+    const session = this.preview;
+    if (!session) return false;
+    session.overlay.close();
+    return true;
+  }
+
+  /** What the print preview shows now, undefined when it is closed: for tests and for those who drive it. */
+  getPrintPreviewState(): PrintPreviewInfo | undefined {
+    return this.preview ? this.preview.overlay.info() : undefined;
+  }
+
+  /** The pages print() would print now, laid out for the preview; `page` the one to show (from 0). */
+  private planPreview(page?: number): void {
+    const session = this.preview;
+    if (!session || this.destroyed) return;
+    if (session.timer !== undefined) clearTimeout(session.timer);
+    session.timer = undefined;
+    session.now = new Date();
+    session.calcUntil = undefined;
+    // A page asked for before the pages were there is shown once they are: a change meanwhile does not lose it.
+    const shown = page !== undefined ? page : session.page;
+    session.page = undefined;
+    try {
+      session.list = previewSheets(this.workbook, session.sheets, session.opened, this.sheetIndex);
+      session.laid = this.layoutJob(session.list, session.store);
+      session.overlay.setPages(
+        session.laid.pages.pages.map((entry) => entry.layout.paper),
+        shown,
+      );
+    } catch (error) {
+      session.laid = undefined;
+      const code = error instanceof DocumentPrintError ? error.code : 'failed';
+      const s = this.strings;
+      session.overlay.setProblem(code === 'empty' ? 'empty' : 'failed', code === 'empty' ? s.printNothing : code === 'too-long' ? s.printSheetTooLong : s.printSheetFailed);
+    }
+  }
+
+  /** The workbook (or how it is shown) changed: the preview lays its pages out again once the changes stop. */
+  private printChanged(): void {
+    this.printEpoch++;
+    const session = this.preview;
+    if (!session || this.destroyed) return;
+    session.overlay.setPlanning();
+    this.schedulePreviewPlan(session);
+  }
+
+  /**
+   * Lays the pages of the preview out once the workbook stops changing. A calculation under way writes cells turn
+   * after turn: the layout waits for its end (at most PRINT_CALC_MS, as printing does) rather than start anew at each turn.
+   */
+  private schedulePreviewPlan(session: PreviewSession): void {
+    if (session.timer !== undefined) clearTimeout(session.timer);
+    session.timer = setTimeout(() => {
+      session.timer = undefined;
+      if (this.preview !== session || this.destroyed) return;
+      if (this.engine && this.engine.incomplete) {
+        if (session.calcUntil === undefined) session.calcUntil = Date.now() + PRINT_CALC_MS;
+        if (Date.now() < session.calcUntil) return this.schedulePreviewPlan(session);
+      }
+      this.planPreview();
+    }, PREVIEW_REPLAN_MS);
+  }
+
+  /** Paints a page of the preview; false while its pictures or its conditional formats are still to come. */
+  private paintPreviewPage(session: PreviewSession, page: number, context: CanvasRenderingContext2D, pixelWidth: number): boolean {
+    const laid = session.laid;
+    const entry = laid ? laid.pages.pages[page] : undefined;
+    const sheet = entry ? this.workbook.sheets[entry.sheet] : undefined;
+    if (!laid || !entry || !sheet || this.destroyed) return true;
+    this.paintJobPage(context, laid, entry, pixelWidth, jobFileName(undefined, this.options.fileName), session.now);
+    const conditional = this.conditionalOf(sheet);
+    return !(session.store.busy || (conditional && conditional.pending));
+  }
+
+  /** What the preview held goes; called once, when its overlay has closed. */
+  private endPreview(session: PreviewSession): void {
+    if (session.timer !== undefined) clearTimeout(session.timer);
+    session.timer = undefined;
+    session.store.destroy();
+    session.laid = undefined;
+    if (this.preview === session) this.preview = undefined;
   }
 
   // ------------------------------------------------------------------- PDF
@@ -1990,7 +2243,7 @@ export class WorkbookView {
     this.setPageProgress(job, { done: 0, total: 0 });
     let file: PdfDocument | undefined;
     let parts: Uint8Array[] = [];
-    const fileName = options.fileName !== undefined ? options.fileName : this.options.fileName;
+    const fileName = jobFileName(options.fileName, this.options.fileName);
     const tools = await pdfVectorTools(doc, settings);
     if (this.destroyed) throw new PdfExportError('cancelled', PDF_WORDS.destroyed);
     checkCancelled(options.signal);
@@ -5658,7 +5911,7 @@ export class WorkbookView {
         this.engine = engine;
         this.marksDirty = true;
         engine.recalculate(missing);
-        this.printEpoch++;
+        this.printChanged();
         if (engine.incomplete) this.continueCalculation();
         this.conditional.forEach((formats) => formats.invalidate());
         this.schedule();
@@ -5993,6 +6246,12 @@ export class WorkbookView {
     if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === 'p' || event.key === 'P')) {
       event.preventDefault();
       this.print().catch(() => undefined);
+      return;
+    }
+    // Ctrl+F2: the print preview, as in Excel (not while a cell is edited: F2 belongs to the edit there).
+    if (!this.edit && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && event.key === 'F2') {
+      event.preventDefault();
+      this.printPreview();
       return;
     }
     // Ctrl+F and Ctrl+H: Find, and Find and Replace (Cmd+F as well on Apple's; Cmd+H is the system's there).
@@ -6725,7 +6984,8 @@ export class WorkbookView {
     };
     const before = typeof document !== 'undefined' ? (document.activeElement as HTMLElement | null) : null;
     this.pageDialog = new PageSetupDialog({
-      root: editorRootIn(this.container, this.root),
+      // Over the print preview when it is open from there: the rest of the editor is inert behind the preview.
+      root: this.preview ? this.preview.overlay.root : editorRootIn(this.container, this.root),
       title: s.title,
       strings: { ok: s.ok, cancel: s.cancel, actions: s.actions },
       groups,
@@ -7245,6 +7505,7 @@ export class WorkbookView {
     this.locked = next;
     this.input.readOnly = next;
     if (this.findBar) this.findBar.refresh();
+    if (this.preview) this.preview.overlay.setCanPageSetup(!next);
     this.cellInfo = undefined;
     this.placeAddButton();
     this.schedule();
@@ -7471,7 +7732,7 @@ export class WorkbookView {
       }
       this.conditional.forEach((formats) => formats.invalidate());
       this.schedule();
-      if (sheets.length > 0) this.printEpoch++;
+      if (sheets.length > 0) this.printChanged();
       if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
     }, 0);
   }
@@ -7490,7 +7751,7 @@ export class WorkbookView {
     this.marksDirty = true;
     this.conditional.forEach((formats) => formats.invalidate());
     this.schedule();
-    if (sheets.length > 0) this.printEpoch++;
+    if (sheets.length > 0) this.printChanged();
     if (sheets.length > 0 && this.options.onChange) this.options.onChange({ sheets });
   }
 
@@ -7605,7 +7866,7 @@ export class WorkbookView {
 
   /** Everything that has to follow a change of the model. */
   private afterChange(sheets: number[], structural: boolean, selection?: { active: CellPos; range: CellRange }): void {
-    this.printEpoch++;
+    this.printChanged();
     this.changeEpoch++;
     // What the bar of Find counted may be other now.
     if (this.findBar) this.scheduleCount(300, false);

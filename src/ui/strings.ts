@@ -2,6 +2,7 @@
 // header menu, notes, the document view's bar. Content of files is never translated.
 
 import type { TabStopsStrings } from './doc-tabs-dialog';
+import type { PrintPreviewStrings } from './print-preview';
 
 export interface UiStrings {
   spreadsheet: string;
@@ -453,6 +454,8 @@ export interface UiStrings {
   find: FindStrings;
   /** The dialog of the page setup of both views. */
   pageSetup: PageSetupStrings;
+  /** The print preview of a workbook. */
+  preview: PrintPreviewStrings;
 }
 
 /** What is said about pictures of a sheet. */
@@ -1624,6 +1627,28 @@ export const STRINGS_EN: UiStrings = {
     shared: 'The page setup is not changed while the file is edited together',
     tracked: 'The page setup is not changed while changes are tracked: turn tracking off first',
   },
+  preview: {
+    title: 'Print preview',
+    pages: 'Pages',
+    page: (number, total) => `Page ${number} of ${total}`,
+    counter: (number, total) => `${number} / ${total}`,
+    previous: 'Previous page',
+    next: 'Next page',
+    zoomIn: 'Zoom in',
+    zoomOut: 'Zoom out',
+    fit: 'Fit page',
+    actualSize: 'Actual size (100%)',
+    zoom: (percent) => `Zoom ${percent}%`,
+    percent: (value) => `${value}%`,
+    print: 'Print',
+    pdf: 'Download as PDF',
+    pageSetup: 'Page setup…',
+    close: 'Close print preview',
+    which: 'What to print',
+    active: 'Active sheet',
+    all: 'Entire workbook',
+    planning: 'Laying out the pages…',
+  },
 };
 
 const satir = (count: number) => (count === 1 ? 'satır' : `${count} satır`);
@@ -2382,6 +2407,28 @@ export const STRINGS_TR: UiStrings = {
     noRoom: 'Kenar boşlukları kâğıtta yer bırakmıyor',
     shared: 'Dosya birlikte düzenlenirken sayfa yapısı değiştirilemez',
     tracked: 'Değişiklikler izlenirken sayfa yapısı değiştirilemez: önce izlemeyi kapatın',
+  },
+  preview: {
+    title: 'Baskı önizleme',
+    pages: 'Sayfalar',
+    page: (number, total) => `Sayfa ${number} / ${total}`,
+    counter: (number, total) => `${number} / ${total}`,
+    previous: 'Önceki sayfa',
+    next: 'Sonraki sayfa',
+    zoomIn: 'Yakınlaştır',
+    zoomOut: 'Uzaklaştır',
+    fit: 'Sayfaya sığdır',
+    actualSize: 'Gerçek boyut (%100)',
+    zoom: (percent) => `Yakınlaştırma %${percent}`,
+    percent: (value) => `%${value}`,
+    print: 'Yazdır',
+    pdf: 'PDF olarak indir',
+    pageSetup: 'Sayfa yapısı…',
+    close: 'Baskı önizlemeyi kapat',
+    which: 'Yazdırılacak',
+    active: 'Etkin sayfa',
+    all: 'Tüm çalışma kitabı',
+    planning: 'Sayfalar hazırlanıyor…',
   },
 };
 

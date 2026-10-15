@@ -11,6 +11,8 @@ export interface EditorStrings {
   print: string;
   /** Shown in the status bar while the pages are prepared: "Preparing to print… 3 / 12". */
   printProgress(done: number, total: number): string;
+  /** The button of the print preview. */
+  printPreview: string;
   /** The button that downloads the workbook as a PDF file. */
   pdfDownload: string;
   /** Shown in the status bar while the pages of the PDF are painted: "Making the PDF… 3 / 12". */
@@ -166,6 +168,7 @@ export const EDITOR_STRINGS_EN: EditorStrings = {
   redo: 'Redo',
   print: 'Print',
   printProgress: (done, total) => `Preparing to print\u2026 ${done} / ${total}`,
+  printPreview: 'Print preview',
   pdfDownload: 'Download as PDF',
   pdfProgress: (done, total) => `Making the PDF\u2026 ${done} / ${total}`,
   pageSetup: 'Page setup…',
@@ -283,6 +286,7 @@ export const EDITOR_STRINGS_TR: EditorStrings = {
   redo: 'Yinele',
   print: 'Yazdır',
   printProgress: (done, total) => `Yazdırmaya hazırlanıyor\u2026 ${done} / ${total}`,
+  printPreview: 'Baskı önizleme',
   pdfDownload: 'PDF olarak indir',
   pdfProgress: (done, total) => `PDF hazırlanıyor\u2026 ${done} / ${total}`,
   pageSetup: 'Sayfa yapısı…',
@@ -400,4 +404,10 @@ export function getEditorStrings(tag: string | undefined): EditorStrings {
 export function withShortcut(label: string, key: string, shift = false): string {
   const apple = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
   return apple ? `${label} (${shift ? '⇧' : ''}⌘${key})` : `${label} (Ctrl+${shift ? 'Shift+' : ''}${key})`;
+}
+
+/** A label with a shortcut of the Control key, which is Control on Apple's machines as well: "Print preview (Ctrl+F2)", "(⌃F2)". */
+export function withCtrlKey(label: string, key: string): string {
+  const apple = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform || '');
+  return apple ? `${label} (⌃${key})` : `${label} (Ctrl+${key})`;
 }
