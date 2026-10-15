@@ -1215,6 +1215,13 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * the notes added to the cells of a spreadsheet. Default "Author".
    */
   author?: string;
+  /**
+   * Documents only: the panel that lists the comments beside the pages. "open"
+   * shows it from the start, "auto" when the document has comments and the
+   * editor is wide enough (720 px), "closed" (the default) not until it is
+   * asked for (the Comments button, Ctrl+Alt+Shift+M, view.setCommentsPanel()).
+   */
+  commentsPanel?: 'auto' | 'open' | 'closed';
   /** Documents: the clock tracked changes take their date from (tests). Default: the system's. */
   now?(): Date;
 }
@@ -1735,6 +1742,7 @@ async function mountFile(container: HTMLElement, options: MountOptions, held: Of
       trackChanges: options.trackChanges,
       author: options.author,
       now: options.now,
+      commentsPanel: options.commentsPanel,
       // The name the PDF is downloaded under: the one the page states, or the one the file came with.
       fileName: options.fileName !== undefined ? options.fileName : fileName,
     });

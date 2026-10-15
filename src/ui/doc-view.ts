@@ -36,6 +36,7 @@ import { onFontsChanged } from '../render/fonts';
 import { onEmbeddedFontNotice } from '../render/embedded-fonts';
 import { DocLines, lineEnd, type Affinity, type CaretBox, type PageLine } from './doc-caret';
 import { COMMENT_STYLE_TEXT, CommentBalloon, DOCKED_BELOW, commentColor, commentFill, type BalloonPlace } from './doc-comments';
+import { COMMENTS_PANEL_STYLE_TEXT, CommentsPanel, PANEL_NARROW, commentDateText, commentQuote, coveredBelow, paragraphTexts, type CommentThread } from './doc-comments-panel';
 import { cutLoses, fragmentOfRange, setCopyMedia, sliceHtml, sliceOf, storeCopy, storedCopy, type DocSlice, type StoredCopy } from './doc-clipboard';
 import { DocInput, type InputChange, type InputContext } from './doc-input';
 import {
@@ -130,6 +131,13 @@ export interface DocumentViewOptions {
   now?(): Date;
   /** The name of the file that is shown: what the PDF the bar downloads is named after ("report.docx" gives "report.pdf"). */
   fileName?: string;
+  /**
+   * The panel that lists the comments beside the pages: "open" shows it from
+   * the start, "auto" when the document has comments and the view is wide
+   * enough for it (720 px), "closed" (the default) not until it is asked for
+   * (the Comments button of the bar, Ctrl+Alt+Shift+M, setCommentsPanel()).
+   */
+  commentsPanel?: 'auto' | 'open' | 'closed';
 }
 
 export interface DocumentViewState {
@@ -216,6 +224,11 @@ function chartLocaleOf(locale: string | object | undefined): FormatLocale {
   return getLocale(typeof locale === 'string' ? locale : typeof locale === 'undefined' && typeof navigator !== 'undefined' ? navigator.language : undefined);
 }
 
+/** The locale of the language of the view's words (see resolveUiStrings): what the dates of comments are written in. */
+function wordsLocaleOf(locale: string | object | undefined): FormatLocale {
+  return getLocale(typeof locale === 'string' ? locale : typeof navigator !== 'undefined' ? navigator.language : undefined);
+}
+
 /** How long one page waits for its pictures before it is printed with placeholders. */
 const PRINT_PICTURES_MS = 30000;
 
@@ -252,7 +265,8 @@ const STYLE_TEXT =
   '.bym-doc-handle{background:#1a73e8;border-radius:0 50% 50% 50%;touch-action:none}' +
   '.bym-doc-handle-start{border-radius:50% 0 50% 50%}' +
   '.bym-doc-bubble{background:#fff;border:1px solid #dadce0;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.2);color:#202124}' +
-  COMMENT_STYLE_TEXT;
+  COMMENT_STYLE_TEXT +
+  COMMENTS_PANEL_STYLE_TEXT;
 
 /** One style element per document or shadow root, shared by the views in it. */
 const styleUsers = new WeakMap<Node, { element: HTMLStyleElement; count: number }>();
@@ -883,12 +897,35 @@ export class DocumentView {
   private dismissedThread: number | undefined;
   /** The comments (commentsRevision) the pages were last painted for. */
   private paintedComments = -1;
+  /** What holds the pages and, beside them, the panel of comments. */
+  private readonly body: HTMLDivElement;
+  /** The panel that lists the comments; made when it is first shown. */
+  private panel: CommentsPanel | undefined;
+  /** The button of the bar that shows and hides the panel. */
+  private commentsButton: HTMLButtonElement | undefined;
+  /** The threads the panel was given, for the number of changes they were made at. */
+  private panelThreads: { at: number; list: CommentThread[] } | undefined;
+  /** The frame the panel is brought up to date in after typing. */
+  private panelFrame = 0;
+  /** Room below the pages for the drawer of the panel (sizeDrawerRoom()). */
+  private drawerRoom = 0;
+  /** The changes the panel was last brought up to date for. */
+  private panelAt = -1;
+  /** The texts of paragraphs the quotes of the panel were taken from, for the number of changes they were read at. */
+  private panelTexts: { at: number; read: (paragraph: Paragraph) => string } | undefined;
+  /** "auto" was asked for while the view had no width: decided once it has one. */
+  private autoPanel = false;
+  /** A thread picked in the panel is being shown: the caret that moves for it does not pick another. */
+  private revealing = false;
+  /** The locale dates of comments are written in: that of the language of the view's words. */
+  private dateLocale: FormatLocale;
 
   constructor(container: HTMLElement, doc: DocModel, options: DocumentViewOptions = {}) {
     this.container = container;
     this.document = doc;
     this.options = options;
     this.strings = resolveStrings(options.locale);
+    this.dateLocale = wordsLocaleOf(options.locale);
     this.pointerEvents = 'PointerEvent' in window;
     const coarse = coarsePointer();
     this.maxCanvasPixels = coarse ? MAX_CANVAS_PIXELS_COARSE : MAX_CANVAS_PIXELS;
@@ -948,6 +985,10 @@ export class DocumentView {
       this.printButton = this.button(bar, 'bym-doc-print', icon(['M7 8V4h10v4', 'M7 17H5a1 1 0 0 1-1-1v-6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1h-2', 'M7 14h10v6H7z']));
       // A sheet of paper with its corner folded and an arrow down: the document as a file.
       this.pdfButton = this.button(bar, 'bym-doc-pdf', icon(['M14 3H7a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7z', 'M14 3v4h4', 'M12 10v7', 'm9 14 3 3 3-3']));
+      // A speech balloon with lines in it: the list of comments. Shown where there is something to list or to write.
+      this.commentsButton = this.button(bar, 'bym-doc-comments', icon(['M5 5h14v11h-7l-4 3.5V16H5z', 'M8.5 9h7', 'M8.5 12h4.5']));
+      this.commentsButton.setAttribute('aria-pressed', 'false');
+      this.commentsButton.style.display = 'none';
       const pagesLabel = document.createElement('span');
       pagesLabel.className = 'bym-doc-pages';
       pagesLabel.style.cssText = 'flex:1 1 0;min-width:0;margin:0 4px 0 12px;overflow:hidden;text-overflow:ellipsis;text-align:right';
@@ -1047,9 +1088,16 @@ export class DocumentView {
     });
     this.applyInputMode();
 
+    // The pages, and beside them the panel of comments when it is shown.
+    const body = document.createElement('div');
+    body.className = 'bym-doc-body';
+    body.style.cssText = 'position:relative;display:flex;flex:1 1 0;flex-direction:row;min-height:0;min-width:0';
+    this.body = body;
+
     scroller.appendChild(strip);
     root.appendChild(input);
-    root.appendChild(scroller);
+    body.appendChild(scroller);
+    root.appendChild(body);
     root.appendChild(note);
     root.appendChild(live);
 
@@ -1074,6 +1122,13 @@ export class DocumentView {
     }
     // Editing was asked for and the protection of the document does not allow it.
     if (options.readOnly === false) this.tellLock();
+    const panel = options.commentsPanel;
+    if (panel === 'open') this.setCommentsPanel(true);
+    else if (panel === 'auto') {
+      // A view in a container that is hidden or not laid out yet has no width: it decides when it first has one.
+      if (this.root.clientWidth > 0) this.decideAutoPanel();
+      else this.autoPanel = true;
+    }
   }
 
   // ---------------------------------------------------------------- public
@@ -1208,6 +1263,7 @@ export class DocumentView {
   setLocale(locale: string | object): void {
     if (this.destroyed) return;
     this.strings = resolveStrings(locale);
+    this.dateLocale = wordsLocaleOf(locale);
     if (this.findBar) this.findBar.setStrings(this.strings.find);
     // Numbers and the made-up names of series of the charts are in the language of the view.
     this.chartLocale = chartLocaleOf(locale);
@@ -1215,6 +1271,8 @@ export class DocumentView {
     this.root.setAttribute('aria-label', this.strings.document);
     this.applyInputMode();
     this.syncBalloon();
+    this.panelThreads = undefined;
+    if (this.panel) this.panel.setStrings();
     this.slots.forEach((slot) => {
       slot.element.setAttribute('aria-label', this.strings.page(slot.index + 1));
       // Placeholders carry words.
@@ -1321,6 +1379,10 @@ export class DocumentView {
     this.charts.clear();
     if (this.balloon) this.balloon.destroy();
     this.balloon = undefined;
+    if (this.panelFrame) cancelAnimationFrame(this.panelFrame);
+    this.panelFrame = 0;
+    if (this.panel) this.panel.destroy();
+    this.panel = undefined;
     this.unlisten();
     this.unmountAll();
     this.images.destroy();
@@ -2070,7 +2132,7 @@ export class DocumentView {
 
   private totalHeight(): number {
     const count = this.pages.length;
-    const height = PAD * 2 + this.offsets[count] * this.scale + Math.max(0, count - 1) * GAP;
+    const height = PAD * 2 + this.offsets[count] * this.scale + Math.max(0, count - 1) * GAP + this.drawerRoom;
     return !this.done && this.hold > height ? this.hold : height;
   }
 
@@ -2317,6 +2379,20 @@ export class DocumentView {
       }
       const busy = file ? 'true' : 'false';
       if (this.pdfButton.getAttribute('aria-busy') !== busy) this.pdfButton.setAttribute('aria-busy', busy);
+    }
+    const comments = this.commentsButton;
+    if (comments) {
+      const text = `${strings.commentsPanel} (${isApple() ? '\u2325\u21e7\u2318M' : 'Ctrl+Alt+Shift+M'})`;
+      if (comments.getAttribute('aria-label') !== text) {
+        comments.setAttribute('aria-label', text);
+        comments.title = text;
+      }
+      const open = this.commentsPanelOpen;
+      const pressed = open ? 'true' : 'false';
+      if (comments.getAttribute('aria-pressed') !== pressed) comments.setAttribute('aria-pressed', pressed);
+      // Where there is nothing to list and nothing can be written, the button is not there.
+      const display = open || this.canComment || this.commentState().roots.length > 0 ? '' : 'none';
+      if (comments.style.display !== display) comments.style.display = display;
     }
     if (this.pagesLabel) {
       const count = this.pages.length;
@@ -3012,6 +3088,12 @@ export class DocumentView {
       if (key === 'Escape') this.focusInput(true);
       return;
     }
+    // Ctrl+Alt+Shift+M (Cmd+Option+Shift+M): the panel of comments, with the focus in it.
+    if (command && event.altKey && event.shiftKey && (event.code === 'KeyM' || key === 'm' || key === 'M')) {
+      event.preventDefault();
+      this.setCommentsPanel(!this.commentsPanelOpen, true);
+      return;
+    }
     // Ctrl+Alt+M (Cmd+Option+M): a new comment for the selection, as in Word.
     if (command && event.altKey && !event.shiftKey && (event.code === 'KeyM' || key === 'm' || key === 'M')) {
       event.preventDefault();
@@ -3186,6 +3268,13 @@ export class DocumentView {
     else if (button === this.printButton) this.print().catch(() => undefined);
     // One file at a time: a press while one is being made does not ask for a second.
     else if (button === this.pdfButton && this.pdfJobs.length === 0) this.downloadPdf().catch(() => undefined);
+    else if (button === this.commentsButton) {
+      // Opened with a key, the panel takes the focus; closed with a key, the focus stays on the button; with a
+      // pointer the keys go back to the document.
+      const opening = !this.commentsPanelOpen;
+      this.setCommentsPanel(opening, opening && event.detail === 0);
+      if (event.detail === 0) return;
+    }
     // After a press with a pointer the keys belong to the document again; a key press leaves the focus on the button.
     if (event.detail > 0) this.focusInput(true);
   };
@@ -3198,7 +3287,14 @@ export class DocumentView {
 
   private onResize = (): void => {
     const ratio = this.dpr;
-    if (this.destroyed || !this.measure()) return;
+    if (this.destroyed) return;
+    if (this.autoPanel && this.root.clientWidth > 0) {
+      this.autoPanel = false;
+      this.decideAutoPanel();
+    }
+    this.placePanel();
+    this.sizeDrawerRoom();
+    if (!this.measure()) return;
     if (this.mode !== 'manual') {
       const zoom = this.fitZoom();
       if (zoom !== this.scale) {
@@ -3747,9 +3843,15 @@ export class DocumentView {
     return this.commentState().list.length;
   }
 
-  /** The first comment of the thread the balloon shows; undefined when none is shown. */
+  /**
+   * The first comment of the thread that is shown: the one of the balloon,
+   * else the one selected in the panel of comments while it is open;
+   * undefined when none is.
+   */
   get shownComment(): number | undefined {
-    return this.balloon ? this.balloon.threadId : undefined;
+    const balloon = this.balloon ? this.balloon.threadId : undefined;
+    if (balloon !== undefined) return balloon;
+    return this.panel && this.panel.isOpen ? this.panel.selectedThread : undefined;
   }
 
   /** Applies an edit of comments as one step of the history. Undefined when nothing was changed; the reason was said. */
@@ -3790,10 +3892,16 @@ export class DocumentView {
   /** Paints the pages anew and brings the balloon up to date when the comments are not the ones that were painted. */
   private commentsFollow(): void {
     const version = this.commentsRevision;
-    if (version === this.paintedComments) return;
+    if (version === this.paintedComments) {
+      // The comments are the same; the text they are about may not be (the panel quotes it).
+      this.schedulePanel();
+      return;
+    }
     this.paintedComments = version;
     this.repaintAll();
     this.syncBalloon();
+    this.refreshPanel();
+    this.updateBar();
   }
 
   /**
@@ -3971,6 +4079,234 @@ export class DocumentView {
     return true;
   }
 
+  // ------------------------------------------------------- panel of comments
+
+  /** Whether the panel that lists the comments beside the pages is shown. */
+  get commentsPanelOpen(): boolean {
+    return this.panel !== undefined && this.panel.isOpen;
+  }
+
+  /**
+   * Shows (true) or hides (false) the panel beside the pages that lists the
+   * comments: every thread in the order of its text, with its answers. A
+   * thread picked there is shown in the document, and a thread the caret goes
+   * into (or whose text or mark is pressed) is picked there; while the panel
+   * is shown no balloon comes by itself. On a narrow view (under 600 px) it
+   * lies over the bottom of the pages. `focus`: the focus goes into the panel
+   * when it opens, and back to the document when it closes. Returns whether
+   * the panel is shown afterwards.
+   */
+  setCommentsPanel(open: boolean, focus = false): boolean {
+    if (this.destroyed) return false;
+    // Asked for in so many words: "auto" has nothing left to decide.
+    this.autoPanel = false;
+    if (open !== true) {
+      const panel = this.panel;
+      if (panel && panel.isOpen) {
+        const had = panel.hasFocus;
+        panel.hide();
+        this.panelClosed(focus || had);
+      }
+      return false;
+    }
+    const panel = this.ensurePanel();
+    if (!panel.isOpen) {
+      // The thread of the balloon is the one the panel selects; the balloon goes, unless something is written in it.
+      const balloon = this.balloon;
+      const shown = balloon && balloon.isOpen ? balloon.threadId : undefined;
+      if (balloon && balloon.isOpen && !balloon.composing) this.closeBalloon(false);
+      this.placePanel();
+      panel.show(false);
+      this.panelAt = this.changes;
+      if (shown !== undefined) panel.select(shown, { scroll: true });
+      this.panelResized();
+    }
+    if (focus) panel.show(true);
+    this.updateBar();
+    return true;
+  }
+
+  /** "auto": the panel is shown when the document has comments and the view is wide enough for it beside the pages. */
+  private decideAutoPanel(): void {
+    if (this.commentState().roots.length > 0 && this.root.clientWidth >= 720) this.setCommentsPanel(true);
+  }
+
+  /** Shows the panel of comments when it is hidden and hides it when it is shown; see setCommentsPanel(). */
+  toggleCommentsPanel(focus = false): boolean {
+    return this.setCommentsPanel(!this.commentsPanelOpen, focus);
+  }
+
+  private ensurePanel(): CommentsPanel {
+    if (!this.panel) {
+      this.panel = new CommentsPanel({
+        root: this.body,
+        strings: () => this.strings,
+        threads: () => this.threadsForPanel(),
+        // Comments do not travel where the document is edited together: there the panel only lists them.
+        canChange: () => this.canComment && this.collab === undefined,
+        quote: (comment) => commentQuote(this.document, comment, this.quoteTexts()),
+        date: (date) => commentDateText(date, this.dateLocale),
+        reveal: (id, toDocument) => this.revealThread(id, toDocument),
+        selectionChanged: () => this.repaintAll(),
+        submit: (mode, id, text) => this.submitFromPanel(mode, id, text),
+        resolve: (id, done) => {
+          this.resolveComment(id, done);
+        },
+        remove: (id) => {
+          this.removeComment(id);
+        },
+        closed: (refocus) => this.panelClosed(refocus),
+      });
+    }
+    return this.panel;
+  }
+
+  /** The panel went: the pages take the room again, the thread it selected is marked no more. */
+  private panelClosed(refocus: boolean): void {
+    if (this.panelFrame) cancelAnimationFrame(this.panelFrame);
+    this.panelFrame = 0;
+    this.updateBar();
+    this.panelResized();
+    if (refocus && !this.destroyed) this.focusInput(false);
+  }
+
+  /** The room of the pages changed with the panel: what a ResizeObserver would say, at once. */
+  private panelResized(): void {
+    this.onResize();
+    this.repaintAll();
+  }
+
+  /**
+   * Below the last page, room as tall as the drawer of a narrow view: without it the end of the document could not be
+   * scrolled above the drawer, and a thread there would stay under it.
+   */
+  private sizeDrawerRoom(): void {
+    const panel = this.panel;
+    let room = 0;
+    if (panel && panel.isOpen && panel.isNarrow) {
+      const rect = this.scroller.getBoundingClientRect();
+      room = Math.round(coveredBelow({ bottom: rect.bottom, height: rect.height }, panel.element.getBoundingClientRect().top, this.scroller.offsetHeight));
+    }
+    if (room === this.drawerRoom) return;
+    this.drawerRoom = room;
+    this.sizeStrip();
+  }
+
+  /** Beside the pages, or over the bottom of a narrow view. */
+  private placePanel(): void {
+    const panel = this.panel;
+    if (!panel) return;
+    const width = this.root.clientWidth;
+    panel.setNarrow(width > 0 && width < PANEL_NARROW);
+  }
+
+  /** Brings the panel up to date now. */
+  private refreshPanel(): void {
+    if (this.panelFrame) cancelAnimationFrame(this.panelFrame);
+    this.panelFrame = 0;
+    const panel = this.panel;
+    if (!panel || !panel.isOpen || this.destroyed) return;
+    this.panelAt = this.changes;
+    panel.refresh();
+  }
+
+  /** Brings the panel up to date in the next frame: typing changes the quotes of many threads, once a frame is enough. */
+  private schedulePanel(): void {
+    const panel = this.panel;
+    if (!panel || !panel.isOpen || this.panelFrame || this.panelAt === this.changes || this.destroyed) return;
+    this.panelFrame = requestAnimationFrame(() => {
+      this.panelFrame = 0;
+      this.refreshPanel();
+    });
+  }
+
+  /** The threads of the document as the panel lists them. */
+  private threadsForPanel(): CommentThread[] {
+    const state = this.commentState();
+    const cached = this.panelThreads;
+    if (cached && cached.at === this.changes) return cached.list;
+    const list: CommentThread[] = [];
+    for (let i = 0; i < state.roots.length; i++) {
+      const root = state.roots[i];
+      const thread = state.threads.get(root.id);
+      list.push({ root, replies: thread ? thread.slice(1) : [] });
+    }
+    this.panelThreads = { at: this.changes, list };
+    return list;
+  }
+
+  /** The text of paragraphs quoted by the panel, each read once while the document stays as it is. */
+  private quoteTexts(): (paragraph: Paragraph) => string {
+    const cached = this.panelTexts;
+    if (cached && cached.at === this.changes) return cached.read;
+    const read = paragraphTexts();
+    this.panelTexts = { at: this.changes, read };
+    return read;
+  }
+
+  /** Shows the text of a thread picked in the panel: selected in an editor, scrolled into sight (and marked) in any view. */
+  private revealThread(id: number, toDocument: boolean): void {
+    if (this.destroyed) return;
+    const thread = this.commentState().threads.get(id);
+    const comment = thread ? thread[0] : undefined;
+    if (comment && comment.start && comment.end) {
+      const range = { anchor: copyPosition(comment.start), focus: copyPosition(comment.end) };
+      this.revealing = true;
+      try {
+        if (this.editable) {
+          try {
+            this.setSelection(range);
+          } catch {
+            // The text of the comment is in a place no caret goes to: it is marked, not selected.
+          }
+        } else {
+          this.selection = range;
+          this.scrollToText(comment.start);
+        }
+      } finally {
+        this.revealing = false;
+      }
+    }
+    this.repaintAll();
+    if (toDocument) this.focusInput(false);
+  }
+
+  /** Scrolls the pages so that the line of a place of the text is seen, when it is not. */
+  private scrollToText(position: DocPosition): void {
+    const pages = this.pages;
+    for (let p = 0; p < pages.length; p++) {
+      const items = pages[p].items;
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type !== 'text' || !item.source || item.repeat || item.source.story !== position.story) continue;
+        if (comparePaths(item.source.path, position.path) !== 0) continue;
+        if (position.offset < item.source.offset || position.offset > item.source.offset + item.text.length) continue;
+        this.sizeStrip();
+        const box = this.measurer.metrics(item.font);
+        const top = this.pageTop(p) + (item.y - box.ascent) * this.scale;
+        const bottom = this.pageTop(p) + (item.y + box.descent) * this.scale;
+        const y = this.virtualY();
+        const visible = Math.max(40, this.height - this.hiddenBelow());
+        if (top < y + CARET_MARGIN || bottom > y + visible - CARET_MARGIN) this.setVirtualY(top - Math.round(visible / 3));
+        this.update();
+        return;
+      }
+    }
+  }
+
+  /** What the field of the panel was saved with. */
+  private submitFromPanel(mode: 'reply' | 'edit', id: number, text: string): boolean {
+    if (typeof text !== 'string' || text.trim() === '') {
+      this.notify(this.strings.commentTextNeeded, 'info');
+      return false;
+    }
+    if (mode === 'reply') return this.replyToComment(id, text) !== undefined;
+    // Saved as it was: nothing to change, and the field goes all the same.
+    const now = this.commentState().list.filter((comment) => comment.id === id)[0];
+    if (now && now.plain && now.text === text) return true;
+    return this.editComment(id, text);
+  }
+
   private ensureBalloon(): CommentBalloon {
     if (!this.balloon) {
       this.balloon = new CommentBalloon({
@@ -4035,6 +4371,17 @@ export class DocumentView {
       for (let i = 0; i < state.list.length && !thread; i++) if (state.list[i].id === id && state.list[i].parent !== undefined) thread = state.threads.get(state.list[i].parent as number);
     }
     if (!thread) return false;
+    const panel = this.panel;
+    if (panel && panel.isOpen) {
+      // The panel shows the thread: no balloon beside it (one that was there for a new comment goes).
+      if (this.balloon && this.balloon.isOpen) this.balloon.hide();
+      this.balloonPassive = false;
+      this.balloonOpener = undefined;
+      this.composeRange = undefined;
+      panel.select(thread[0].id, { scroll: true, focus });
+      this.repaintAll();
+      return true;
+    }
     this.balloonPassive = passive;
     this.balloonOpener = undefined;
     this.composeRange = undefined;
@@ -4088,6 +4435,17 @@ export class DocumentView {
   private followComment(): void {
     const balloon = this.balloon;
     if (balloon && balloon.isOpen && (balloon.composing || balloon.hasFocus)) return;
+    const panel = this.panel;
+    if (panel && panel.isOpen) {
+      // The panel picks the thread the caret goes into, and keeps its pick when the caret leaves; not while a
+      // thread picked in the panel is being shown, nor while something is written in it.
+      if (this.revealing || panel.composing) return;
+      const range = this.range();
+      const roots = this.commentState().roots;
+      const found = roots.length > 0 && range && ops.samePosition(range.anchor, range.focus) ? ops.commentAtPosition(roots, range.focus) : undefined;
+      if (found && found.id !== panel.selectedThread) panel.select(found.id, { scroll: true });
+      return;
+    }
     const roots = this.commentState().roots;
     let found: DocComment | undefined;
     // Beside the text only: a balloon along the bottom edge would come and go under the hands of who types.
@@ -4360,6 +4718,8 @@ export class DocumentView {
       this.commenting = !readOnly;
       if (readOnly && this.balloon && this.balloon.composing) this.closeBalloon(false);
       this.syncBalloon();
+      this.refreshPanel();
+      this.updateBar();
       return;
     }
     if (!readOnly && this.lock !== undefined) {
@@ -4382,6 +4742,9 @@ export class DocumentView {
       this.relayout();
     } else this.schedule();
     this.typing.sync();
+    // What the panel offers follows (answering, editing…).
+    this.refreshPanel();
+    this.updateBar();
   }
 
   /** Whether the document was changed in the view since it was made or markSaved() was called. */
@@ -5187,6 +5550,8 @@ export class DocumentView {
     if (session) this.history = new CollabDocHistory<DocRange | undefined>(session);
     this.collabPeersChanged(session ? session.peers : []);
     this.sayPresence();
+    // Comments do not travel: in a room the panel only lists them.
+    this.refreshPanel();
   }
 
   /** The others, as the session lists them now. */
@@ -5721,6 +6086,21 @@ export class DocumentView {
   }
 
   /** Part of the visible area a keyboard on screen covers, px of the view. */
+  /**
+   * How much of the bottom of the pages is covered: by an on-screen keyboard, and by the panel of comments where it
+   * lies over the pages as a drawer (a narrow view). What is brought into sight is kept above both.
+   */
+  private hiddenBelow(): number {
+    let covered = this.keyboardOverlap();
+    const panel = this.panel;
+    if (panel && panel.isOpen && panel.isNarrow) {
+      const rect = this.scroller.getBoundingClientRect();
+      const drawer = panel.element.getBoundingClientRect();
+      covered = Math.max(covered, coveredBelow({ bottom: rect.bottom, height: rect.height }, drawer.top, this.scroller.offsetHeight));
+    }
+    return Math.min(Math.max(0, this.height - 40), covered);
+  }
+
   private keyboardOverlap(): number {
     const viewport = this.viewport as { offsetTop?: number; height?: number } | undefined;
     if (!viewport || typeof viewport.height !== 'number') return 0;
@@ -5740,7 +6120,7 @@ export class DocumentView {
     this.sizeStrip();
     const top = this.pageTop(box.page) + box.top * this.scale;
     const bottom = top + box.height * this.scale;
-    const visible = Math.max(40, this.height - this.keyboardOverlap());
+    const visible = Math.max(40, this.height - this.hiddenBelow());
     const y = this.virtualY();
     if (top - CARET_MARGIN < y) this.setVirtualY(top - CARET_MARGIN);
     else if (bottom + CARET_MARGIN > y + visible) this.setVirtualY(bottom + CARET_MARGIN - visible);

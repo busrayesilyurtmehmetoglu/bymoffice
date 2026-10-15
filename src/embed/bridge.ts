@@ -137,6 +137,10 @@ export interface BridgeDocumentView {
   replyToComment?(id: number, text: string): number | undefined;
   resolveComment?(id: number, done?: boolean): boolean;
   removeComment?(id: number): boolean;
+  /** Whether the panel that lists the comments beside the pages is shown. */
+  readonly commentsPanelOpen?: boolean;
+  /** Shows or hides that panel; whether it is shown afterwards. */
+  setCommentsPanel?(open: boolean, focus?: boolean): boolean;
   /** Says something to the user: that the document was saved, or why it was not. */
   showNotice?(message: string, kind?: 'error' | 'info'): void;
   /** Whether an input method composes or something is dragged: auto-save waits meanwhile. */
@@ -1219,6 +1223,8 @@ export function createBridge(host: BridgeHost): Bridge {
     const toolbar = field<boolean>(message, 'toolbar', 'boolean', false);
     const author = field<string>(message, 'author', 'string', false);
     const trackChanges = field<boolean>(message, 'trackChanges', 'boolean', false);
+    const commentsPanel = field<string>(message, 'commentsPanel', 'string', false);
+    if (commentsPanel !== undefined && commentsPanel !== 'auto' && commentsPanel !== 'open' && commentsPanel !== 'closed') throw new BadMessage('"commentsPanel" must be "auto", "open" or "closed"');
     const password = field<string>(message, 'password', 'string', false);
     const passwordPrompt = field<boolean>(message, 'passwordPrompt', 'boolean', false);
     if (password !== undefined && password.length > MAX_PASSWORD_FIELD) throw new BadMessage('"password" is too long');
@@ -1525,6 +1531,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (locale !== undefined) documentOptions.locale = locale;
       if (author !== undefined) documentOptions.author = author;
       if (trackChanges === true) documentOptions.trackChanges = true;
+      if (commentsPanel !== undefined) documentOptions.commentsPanel = commentsPanel as 'auto' | 'open' | 'closed';
       const saver = userSaves === true && !locked ? userSaver(autoSave) : undefined;
       if (saver) documentOptions.saveCommand = saver;
       const create = (toolbar === true && host.createDocumentEditor) || (host.createDocumentView as NonNullable<BridgeHost['createDocumentView']>);
@@ -1850,6 +1857,21 @@ export function createBridge(host: BridgeHost): Bridge {
     const out: Message = { type: 'done', id, command: type };
     if (made !== undefined) out.commentId = made;
     send(out);
+  };
+
+  /**
+   * Shows or hides the panel that lists the comments of the document that is shown (`open`;
+   * without it the panel is shown when it is hidden and hidden when it is shown). Only looks:
+   * a read-only document has the panel too. The answer says whether it is shown afterwards.
+   */
+  const commentsPanelCommand = (message: Message, id: string | undefined) => {
+    const open = field<boolean>(message, 'open', 'boolean', false);
+    if (!shown) return fail('not-loaded', 'No file is open', id);
+    const pages = shown.pages;
+    if (!pages) return fail('no-document', 'The open file is not a document', id);
+    const now = pages.setCommentsPanel ? pages.setCommentsPanel(open === undefined ? pages.commentsPanelOpen !== true : open) === true : false;
+    if (id === undefined) return;
+    send({ type: 'done', id, command: 'commentsPanel', open: now });
   };
 
   /**
@@ -2475,6 +2497,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'setTabStops' || type === 'setDefaultTabStop') return tabDocument(type, fields, id);
       if (type === 'setPageSetup' || type === 'insertPageBreak' || type === 'removePageBreak' || type === 'resetPageBreaks' || type === 'insertSectionBreak') return pageSetupCommand(type, fields, id);
       if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);
+      if (type === 'commentsPanel') return commentsPanelCommand(fields, id);
       if (type !== 'setReadOnly' && type !== 'setLocale' && type !== 'undo' && type !== 'redo') {
         throw new BadMessage(`Unknown message type "${type.slice(0, 40)}"`);
       }

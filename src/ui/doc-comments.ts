@@ -366,7 +366,8 @@ export class CommentBalloon {
     if (!button || this.destroyed) return;
     const action = button.getAttribute('data-action');
     const raw = button.getAttribute('data-comment');
-    const id = raw !== null && /^\d+$/.test(raw) ? Number(raw) : undefined;
+    // The ids of a file may be negative (w:id is a signed number).
+    const id = raw !== null && /^-?\d+$/.test(raw) ? Number(raw) : undefined;
     const first = this.thread[0];
     switch (action) {
       case 'close':

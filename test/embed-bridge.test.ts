@@ -2413,3 +2413,51 @@ test('bridge: setTabStops and setDefaultTabStop reach the document; the answer s
   }
   bridge.destroy();
 });
+
+test('bridge: `commentsPanel` shows, hides and toggles the panel of comments, also of a read-only document; `load.commentsPanel` reaches the view', async () => {
+  const f = fake();
+  const { d } = withComments(f, [{ id: 1, author: 'Ann', text: 'Why?', done: false }]);
+  const panel = { open: false, calls: [] as unknown[][] };
+  for (const name of ['createDocumentView', 'createDocumentEditor'] as const) {
+    const inner = f.host[name] as NonNullable<BridgeHost['createDocumentView']>;
+    f.host[name] = ((container: HTMLElement, doc: never, options: never) => {
+      const view = inner(container, doc, options) as unknown as Record<string, unknown>;
+      Object.defineProperty(view, 'commentsPanelOpen', { get: () => panel.open });
+      view.setCommentsPanel = (open: boolean) => {
+        panel.calls.push([open]);
+        panel.open = open;
+        return open;
+      };
+      return view as never;
+    }) as never;
+  }
+  const bridge = createBridge(f.host);
+  await bridge.receive({ type: 'load', data: DATA, readOnly: true, commentsPanel: 'open' });
+  assert.equal((d.views[0].options as { commentsPanel?: string }).commentsPanel, 'open');
+  await bridge.receive({ type: 'commentsPanel', id: 't' });
+  assert.deepEqual(last(f), { type: 'done', id: 't', command: 'commentsPanel', open: true });
+  await bridge.receive({ type: 'commentsPanel', id: 'u' });
+  assert.deepEqual(last(f), { type: 'done', id: 'u', command: 'commentsPanel', open: false });
+  await bridge.receive({ type: 'commentsPanel', id: 'v', open: false });
+  assert.deepEqual(last(f), { type: 'done', id: 'v', command: 'commentsPanel', open: false });
+  const before = f.sent.length;
+  await bridge.receive({ type: 'commentsPanel', open: true });
+  assert.equal(f.sent.length, before, 'a command without an id was answered');
+  assert.deepEqual(panel.calls, [[true], [false], [false], [true]]);
+  // What is not a boolean, or not a known mode, is refused before the view hears of it.
+  await bridge.receive({ type: 'commentsPanel', id: 'b', open: 'yes' });
+  assert.deepEqual([last(f).code, last(f).id], ['bad-message', 'b']);
+  await bridge.receive({ type: 'load', id: 'l', data: DATA, commentsPanel: 'wide' });
+  assert.deepEqual([last(f).code, last(f).id], ['bad-message', 'l']);
+  assert.equal(panel.calls.length, 4);
+  bridge.destroy();
+  // Without a file, and with a workbook.
+  const g = fake();
+  const second = createBridge(g.host);
+  await second.receive({ type: 'commentsPanel', id: 'n' });
+  assert.deepEqual([last(g).code, last(g).id], ['not-loaded', 'n']);
+  await second.receive({ type: 'load', data: DATA });
+  await second.receive({ type: 'commentsPanel', id: 'w' });
+  assert.deepEqual([last(g).code, last(g).id], ['no-document', 'w']);
+  second.destroy();
+});

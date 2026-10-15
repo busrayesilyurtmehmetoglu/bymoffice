@@ -168,7 +168,14 @@
           <label title="İzlenen değişikliklerde (w:ins / w:del) ve eklenen yorumlarda (w:comment) yazar adı olarak yazılır. Belge izleme istiyorsa (ayarı açık ya da 'yalnız izlenen değişiklik' korumalı) düzenlemeler bu adla izlenir.">Yazar adı (izlenen değişiklikler ve yorumlar için)
             <input type="text" id="doc-author" value="Deneme Kullanıcısı" maxlength="255" />
           </label>
-          <span class="muted">Ad, bir sonraki dosya açılışında geçerli olur. Araç çubuğunun sonundaki değişiklikler grubu izlemeyi açıp kapatır, izlenen değişiklikler arasında gezer, seçileni ya da tümünü kabul eder ya da reddeder. Yorum düğmeleri (Yorum: Ctrl+Alt+M, Önceki/Sonraki yorum) seçime yorum ekler ve yorumlar arasında gezer; yorumlu metin vurguludur, kenar boşluğundaki işaret yorum balonunu açar (Düzenle, Yanıtla, Çöz, Sil).</span>
+          <label title="Sayfaların yanındaki yorum paneli: bütün yorum zincirleri metin sırasıyla; görünüm çubuğundaki Yorumlar düğmesi ve Ctrl+Alt+Shift+M (⌥⇧⌘M) açıp kapatır.">Yorum paneli
+            <select id="doc-comments-panel">
+              <option value="closed">kapalı başlar</option>
+              <option value="open">açık başlar</option>
+              <option value="auto">yorum varsa açık</option>
+            </select>
+          </label>
+          <span class="muted">Ad, bir sonraki dosya açılışında geçerli olur. Araç çubuğunun sonundaki değişiklikler grubu izlemeyi açıp kapatır, izlenen değişiklikler arasında gezer, seçileni ya da tümünü kabul eder ya da reddeder. Yorum düğmeleri (Yorum: Ctrl+Alt+M, Önceki/Sonraki yorum) seçime yorum ekler ve yorumlar arasında gezer; yorumlu metin vurguludur, kenar boşluğundaki işaret yorum balonunu açar (Düzenle, Yanıtla, Çöz, Sil). Görünüm çubuğundaki <strong>Yorumlar</strong> düğmesi (Ctrl+Alt+Shift+M) yorum panelini açar: zincirler metin sırasıyla; zincire basınca metni seçilir, oklar zincirler arasında gezer, Enter belgeye döner, Esc paneli kapatır; çözülenler kutuyla gizlenir.</span>
         </div>
         <p class="muted" id="doc-note"></p>
         <p class="muted" id="doc-state"></p>
@@ -401,6 +408,7 @@
             locale: 'tr',
             readOnly: false,
             author: $('doc-author').value,
+            commentsPanel: $('doc-comments-panel').value,
             // What the PDF the bar downloads is named after.
             fileName: record.name,
             onPageChange: (page, count) => {

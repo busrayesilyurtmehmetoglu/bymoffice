@@ -202,6 +202,22 @@ export interface UiStrings {
   commentGone: string;
   /** The text of a comment is too long or is not there. */
   commentTextNeeded: string;
+  /** The panel beside the pages that lists the comments of a document, and the button that shows and hides it. */
+  commentsPanel: string;
+  /** Label of the box that shows the resolved threads in the panel too. */
+  commentsShowResolved: string;
+  /** What the head of the panel says: how many threads it lists, and how many resolved ones it hides. */
+  commentsPanelCount(shown: number, hidden: number): string;
+  /** The panel has nothing to list: there are no comments, or every one is resolved and hidden. */
+  commentsPanelEmpty(hidden: number): string;
+  /** The button at the end of the list that shows the threads after the ones listed. */
+  commentsShowMore(count: number): string;
+  /** Said in the panel of a comment no text refers to. */
+  commentNotAnchored: string;
+  /** Spoken before the text a thread is about. */
+  commentAbout: string;
+  /** What a thread of the panel is read out as; every value but the counts comes from the file. */
+  commentThreadLabel(author: string, date: string, text: string, replies: number, done: boolean): string;
   /** Said after a copy was pasted as text alone because changes are tracked. */
   cannotCutObjects: string;
   cannotWriteClipboard: string;
@@ -1035,6 +1051,15 @@ export const STRINGS_EN: UiStrings = {
   commentFixed: 'This comment cannot be changed here: its marks sit in a part of the document that is kept as it is',
   commentGone: 'The comment is no longer in the document',
   commentTextNeeded: 'A comment needs text, of at most 32,767 characters',
+  commentsPanel: 'Comments',
+  commentsShowResolved: 'Show resolved',
+  commentsPanelCount: (shown, hidden) => `${shown === 1 ? '1 thread' : `${shown} threads`}${hidden > 0 ? `, ${hidden} resolved hidden` : ''}`,
+  commentsPanelEmpty: (hidden) => (hidden > 0 ? `Every comment is resolved (${hidden} hidden)` : 'The document has no comments'),
+  commentsShowMore: (count) => `Show ${count} more`,
+  commentNotAnchored: 'Not tied to any text',
+  commentAbout: 'About',
+  commentThreadLabel: (author, date, text, replies, done) =>
+    `${author !== '' ? `Comment by ${author}` : 'Comment'}${date !== '' ? `, ${date}` : ''}${done ? ', resolved' : ''}${replies > 0 ? `, ${replies === 1 ? '1 reply' : `${replies} replies`}` : ''}${text !== '' ? `: ${text}` : ''}`,
   cannotCutObjects: 'The selection holds something that cannot be cut (a note, an equation, a text box, a content control, a tracked change); it was left in place',
   cannotWriteClipboard: 'The clipboard cannot be written here; nothing was cut',
   cannotPasteHere: 'What was copied cannot be pasted here',
@@ -1789,6 +1814,15 @@ export const STRINGS_TR: UiStrings = {
   commentFixed: 'Bu yorum burada değiştirilemez: işaretleri belgenin olduğu gibi korunan bir bölümünde',
   commentGone: 'Yorum artık belgede yok',
   commentTextNeeded: 'Yorum için en çok 32.767 karakterlik bir metin gerekir',
+  commentsPanel: 'Yorumlar',
+  commentsShowResolved: 'Çözülenleri göster',
+  commentsPanelCount: (shown, hidden) => `${shown} yorum${hidden > 0 ? `, ${hidden} çözülmüş gizli` : ''}`,
+  commentsPanelEmpty: (hidden) => (hidden > 0 ? `Bütün yorumlar çözüldü (${hidden} gizli)` : 'Belgede yorum yok'),
+  commentsShowMore: (count) => `${count} tane daha göster`,
+  commentNotAnchored: 'Hiçbir metne bağlı değil',
+  commentAbout: 'İlgili metin',
+  commentThreadLabel: (author, date, text, replies, done) =>
+    `${author !== '' ? `Yorum: ${author}` : 'Yorum'}${date !== '' ? `, ${date}` : ''}${done ? ', çözüldü' : ''}${replies > 0 ? `, ${replies} yanıt` : ''}${text !== '' ? `: ${text}` : ''}`,
   cannotCutObjects: 'Seçimde kesilemeyen bir öğe var (dipnot, denklem, metin kutusu, içerik denetimi, izlenen değişiklik); yerinde bırakıldı',
   cannotWriteClipboard: 'Pano buradan yazılamıyor; hiçbir şey kesilmedi',
   cannotPasteHere: 'Kopyalanan içerik buraya yapıştırılamıyor',
