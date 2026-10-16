@@ -264,12 +264,43 @@ export function mapPos(pos: WirePos, mark: Mark, right: boolean): { pos: WirePos
   return at(mark.r1, mark.o1, true);
 }
 
-/** -1, 0, 1 for two places of one list of blocks; undefined for places that are not in the same list. */
+/**
+ * -1, 0, 1 for two places of one list of blocks; undefined for places that are not in the same list. At one offset the
+ * place before what shows without width there (`b`) comes first: from it to the place without `b` is a range that holds
+ * that alone (a drawing that is selected), not a caret.
+ */
 export function orderOf(a: WirePos, b: WirePos): number | undefined {
   if (a.s !== b.s || a.p.length !== b.p.length || !samePath(a.p, b.p, a.p.length - 1)) return undefined;
   const ra = a.p[a.p.length - 1];
   const rb = b.p[b.p.length - 1];
-  return ra !== rb ? (ra < rb ? -1 : 1) : a.o !== b.o ? (a.o < b.o ? -1 : 1) : 0;
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  if (a.o !== b.o) return a.o < b.o ? -1 : 1;
+  return a.b === b.b ? 0 : a.b ? -1 : 1;
+}
+
+/** orderOf() of where two places are in the text alone: what shows without width between them is no text that two ranges share. */
+const textOrderOf = (a: WirePos, b: WirePos): number | undefined => orderOf({ s: a.s, p: a.p, o: a.o }, { s: b.s, p: b.p, o: b.o });
+
+/** Whether a range holds only what shows without width at one place: from before it (`b`) to behind it. */
+const widthless = (a: WirePos, b: WirePos): boolean => a.s === b.s && a.o === b.o && a.b === true && !b.b && a.p.length === b.p.length && samePath(a.p, b.p, a.p.length);
+
+/**
+ * Whether a mark may have changed what shows without width at a place before it (`b`): a mark says where text came and
+ * went, not on which side of a drawing. Text that came in at that very offset may stand before the drawing or behind it,
+ * a range that went and reaches the offset may have taken the drawing or not (unless it is known to have left every
+ * drawing of the paragraph as it was), a paragraph that may have lost drawings
+ * may have lost that one: what the place is before is not known, and what is about it gives way.
+ */
+export function widthlessShaken(pos: WirePos, mark: Mark): boolean {
+  if (!pos.b || mark.k === 'opq' || mark.k === 'blk') return false;
+  if (mark.s !== pos.s) return false;
+  const depth = mark.c.length;
+  if (pos.p.length !== depth + 1 || !samePath(pos.p, mark.c, depth)) return false;
+  const row = pos.p[depth];
+  if (mark.k === 'ins') return row === mark.row && pos.o === mark.off;
+  if (mark.k === 'tch') return row >= mark.r1 && row <= mark.r2 && !keepsAll(mark, row);
+  if (row < mark.r1 || row > mark.r2 || keepsAll(mark, row)) return false;
+  return (row > mark.r1 || pos.o >= mark.o1) && (row < mark.r2 || pos.o <= mark.o2);
 }
 
 /** The place of a mark that put text in, and the place its text ends at. */
@@ -539,6 +570,8 @@ export function rebaseWire(wire: DocWire, effect: readonly Mark[], arrivedMarks:
     let gone = false;
     for (const mark of carry) {
       if (clash([at], own, mark)) return dropped();
+      // A command before what has no width (deleting a drawing by a key): that may be another thing now, or nothing.
+      if (wire.t === 'cmd' && widthlessShaken(at, mark)) return dropped();
       const next = mapPos(at, mark, false);
       at = next.pos;
       if (next.gone) gone = true;
@@ -571,6 +604,10 @@ export function rebaseWire(wire: DocWire, effect: readonly Mark[], arrivedMarks:
     const places: WirePos[] = [start];
     for (const [a, b] of ranges) places.push(a, b);
     if (clash(places, own, mark)) return dropped();
+    // A range that holds only what has no width at one place (a drawing that is selected): that may be another thing now.
+    // One that begins before it and goes on into text, through text that came in at that offset: that text may stand
+    // before the drawing (outside the range) or behind it (inside), and a split would say behind it.
+    for (const [a, b] of ranges) if ((widthless(a, b) || (a.b === true && mark.k === 'ins')) && widthlessShaken(a, mark)) return dropped();
     // Blocks that were replaced between the two ends of a range: what the range was about is no longer there to be told apart.
     if (mark.k === 'blk') {
       for (const [a, b] of ranges) {
@@ -600,7 +637,7 @@ export function rebaseWire(wire: DocWire, effect: readonly Mark[], arrivedMarks:
         // The two ranges share text: what the other one took away is not this one's to take away, or to format, any more.
         const first: WirePos = { s: mark.s, p: mark.c.concat([mark.r1]), o: mark.o1 };
         const last: WirePos = { s: mark.s, p: mark.c.concat([mark.r2]), o: mark.o2 };
-        if (orderOf(a, last) === -1 && orderOf(first, b) === -1) cut = true;
+        if (textOrderOf(a, last) === -1 && textOrderOf(first, b) === -1) cut = true;
       }
       const mapped = mapRange(a, b, mark, split);
       if (mapped.joined) joined = true;
@@ -658,6 +695,7 @@ function rebaseComment(wire: CommentWire, carry: readonly Mark[], moved: Mark[],
   let cut = false;
   for (const mark of carry) {
     if (clash(b ? [a, b] : [a], own(), mark)) return dropped();
+    if (b && (widthless(a, b) || (a.b === true && mark.k === 'ins')) && widthlessShaken(a, mark)) return dropped();
     if (b && mark.k === 'blk') {
       // Blocks between the two ends were replaced: what the range covered is not known any more.
       const depth = a.p.length - 1;
@@ -672,7 +710,7 @@ function rebaseComment(wire: CommentWire, carry: readonly Mark[], moved: Mark[],
         // Text of the range went: the comment is about what is left of it.
         const first: WirePos = { s: mark.s, p: mark.c.concat([mark.r1]), o: mark.o1 };
         const last: WirePos = { s: mark.s, p: mark.c.concat([mark.r2]), o: mark.o2 };
-        if (orderOf(a, last) === -1 && orderOf(first, b) === -1) cut = true;
+        if (textOrderOf(a, last) === -1 && textOrderOf(first, b) === -1) cut = true;
       }
       const mapped = mapRange(a, b, mark, false);
       if (mapped.gone) cut = true;

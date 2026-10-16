@@ -278,6 +278,43 @@ test('typing in the paragraph that anchors a box, and formatting it, moves no bo
   for (const member of members) member.session.leave();
 });
 
+test('a comment added to the paragraph that anchors a box moves no box: the waiting change of the box stays, and so does its undo', async () => {
+  // `first`: the box's own participant typed in the anchoring paragraph before typing in the box (what is known of its
+  // drawings must stay known through the comment: see keepsAll in rebase.ts); otherwise only the change of the box waits.
+  for (const first of [false, true]) {
+    const { net, members } = await room(['a', 'b']);
+    const [a, b] = members;
+    a.transport.suspend();
+    if (first) {
+      assert.ok(actDoc(a, [{ t: 'text', at: wp([1], 0), x: 'T ' }]));
+      a.session.seal();
+    }
+    assert.ok(actDoc(a, [{ t: 'text', at: wp(BOX1.concat([0]), 0), x: 'B ' }]));
+    a.session.seal();
+    const edit = ops.addComment(b.doc, { anchor: { story: 'body', path: [1], offset: 0 }, focus: { story: 'body', path: [1], offset: 6 } }, 'on the anchor', { author: 'B', date: '2026-10-15T10:00:00Z' });
+    const wires = wiresOf(edit.ops) as DocWire[];
+    assert.ok(wires && wires.length === 1 && wires[0].t === 'cmt');
+    assert.ok(actDoc(b, wires));
+    net.drain();
+    a.transport.resume();
+    net.drain();
+    net.drain();
+    const label = `typed in the paragraph first: ${first}`;
+    assert.deepEqual(codes(a), [], label);
+    assert.equal(boxText(a.doc, BOX1), 'B Box one text\nSecond line', label);
+    assert.equal(paragraphText(a.doc.body.blocks[1] as never), (first ? 'T ' : '') + 'Anchor  tail', label);
+    assert.equal(a.doc.comments ? a.doc.comments.items.size : 0, 1, label);
+    assertSameDoc([a, b], label);
+    // The change of the box is taken back, at everybody.
+    assert.ok(a.session.undo(), label);
+    net.drain();
+    assert.deepEqual(codes(a), [], label);
+    assert.equal(boxText(b.doc, BOX1), 'Box one text\nSecond line', label);
+    assertSameDoc([a, b], label + ', after the undo');
+    for (const member of members) member.session.leave();
+  }
+});
+
 test('what may move the box itself - a paragraph end before its drawing, a drawing that went, its paragraph joined to the one before - makes a waiting change of the box give way, and that is said', async () => {
   // "Anchor " is 7 characters; the drawing stands at 7, " tail" follows.
   const changes: DocWire[] = [
@@ -612,6 +649,14 @@ test('a key that replaces the paragraph that anchors boxes but leaves its drawin
   }
 });
 
+// The rule "this moved something" is asked of what an undo or a redo did as well (session.ts, travel(): the entry it
+// makes on the other stack). It is not asked of drawings there, and no test can make it be: what an undo or a redo
+// does is a deletion of text it took back (`del` over text that has width: it moves text), a put of paragraphs (`blk`:
+// it moves blocks), text typed again (`ins`) or a command of comments (`tch` that keeps every drawing, or `blk`). None
+// of them is "nothing moved, but a drawing changed": a drawing does not travel in a put (putOf takes no drawing, so
+// the undo of a step that took a drawing away is none - the test below), and no command that travels brings a drawing
+// in, so no undo takes one away. Written as `mark.k !== 'tch'` there, the rule decides the same everywhere (checked:
+// every test of documents edited together, 200 rooms at random, passes; no undo or redo there made such a mark).
 test('a drawing that went moved the boxes behind it for undo too: alone in a room, the undo of a box behind it is not made', async () => {
   const r = (text: string): string => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
   const bytes = await buildDocx({ body: p('Zero') + `<w:p>${r('AA ')}${wpsBox(p('box zero'), 1)}${r(' BB ')}${wpsBox(p('box one'), 2)}${r(' CC ')}${wpsBox(p('box two'), 3)}${r(' DD')}</w:p>` + p('End') + SECT });
@@ -678,6 +723,214 @@ test('typing that arrives in the paragraph of a drawing that went here meanwhile
   for (const member of [a, b]) member.session.leave();
 });
 
+test('a drawing that is selected and deleted (a range from before it to behind it) while someone types before it in its paragraph goes, and the box typed in behind it is the one meant', async () => {
+  const bytes = await twoBoxFile();
+  for (const deletion of [{ t: 'cmd', name: 'deleteBackward', at: wp([1], 3), a: ['char'] } as DocWire, { t: 'del', at: { s: 'body', p: [1], o: 3, b: true }, to: wp([1], 3) } as DocWire]) {
+    for (const typeToo of [false, true]) {
+      const net = new DocNet();
+      const a = await joinDoc(net, 'a', bytes);
+      const b = await joinDoc(net, 'b', bytes);
+      net.drain();
+      a.transport.suspend();
+      assert.ok(actDoc(a, [deletion]));
+      a.session.seal();
+      if (typeToo) assert.ok(actDoc(a, [{ t: 'text', at: wp([1, -1, 0, 0, 0], 0), x: 'X' }]));
+      assert.ok(actDoc(b, [{ t: 'text', at: wp([1], 0), x: 'q' }]));
+      net.drain();
+      a.transport.resume();
+      net.drain();
+      net.drain();
+      const label = `${JSON.stringify(deletion)} typed ${typeToo}`;
+      assert.deepEqual(codes(a), [], label);
+      assert.deepEqual(allBoxes(a.doc), [typeToo ? 'Xbox one' : 'box one'], label);
+      assertSameDoc([a, b], label);
+      for (const member of [a, b]) member.session.leave();
+    }
+  }
+});
+
+/** Paragraph 1: "AA ", a shape (a drawing without a box), " BB": the drawing stands at offset 3. */
+function shapeFile(): Promise<Uint8Array> {
+  const r = (text: string): string => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
+  const shape = `<w:r><w:drawing>${ANCHOR_HEAD}<wp:docPr id="7" name="Shape 7"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>`;
+  return buildDocx({ body: p('Zero') + `<w:p>${r('AA ')}${shape}${r(' BB')}</w:p>` + p('End') + SECT });
+}
+
+function drawingsOf(doc: DocModel, row: number): number {
+  let count = 0;
+  const block = doc.body.blocks[row];
+  if (block.type === 'paragraph') raw.eachGraphic(block, () => void count++);
+  return count;
+}
+
+test('in the body: a drawing that is selected and deleted or written over goes where someone typed before it meanwhile; where what the other did may be beside it, the change gives way, and that is said', async () => {
+  const selected = (x?: string): DocWire => (x === undefined ? { t: 'del', at: { s: 'body', p: [1], o: 3, b: true }, to: wp([1], 3) } : { t: 'text', at: { s: 'body', p: [1], o: 3, b: true }, to: wp([1], 3), x });
+  const wider = (x?: string): DocWire => (x === undefined ? { t: 'del', at: { s: 'body', p: [1], o: 3, b: true }, to: wp([1], 5) } : { t: 'text', at: { s: 'body', p: [1], o: 3, b: true }, to: wp([1], 5), x });
+  const cases: { mine: DocWire; theirs: DocWire; text: string; drawings: number; dropped: boolean }[] = [
+    // Text that came in before the drawing: it is where it was, behind that text.
+    { mine: selected(), theirs: { t: 'text', at: wp([1], 0), x: 'q' }, text: 'qAA  BB', drawings: 0, dropped: false },
+    { mine: selected('Z'), theirs: { t: 'text', at: wp([1], 1), x: 'q' }, text: 'AqA Z BB', drawings: 0, dropped: false },
+    { mine: selected(), theirs: { t: 'del', at: wp([1], 0), to: wp([1], 2) }, text: '  BB', drawings: 0, dropped: false },
+    { mine: selected(), theirs: { t: 'split', at: wp([1], 1) }, text: 'A  BB', drawings: 0, dropped: false },
+    // Behind it: nothing moved.
+    { mine: selected(), theirs: { t: 'text', at: wp([1], 5), x: 'q' }, text: 'AA  BqB', drawings: 0, dropped: false },
+    // Text that came in at the offset of the drawing: before it or behind it is not known.
+    { mine: selected(), theirs: { t: 'text', at: wp([1], 3), x: 'q' }, text: 'AA q BB', drawings: 1, dropped: true },
+    { mine: selected('Z'), theirs: { t: 'text', at: wp([1], 3), x: 'q' }, text: 'AA q BB', drawings: 1, dropped: true },
+    // A range that went and reaches it: whether it took the drawing is not known where it arrives (this one did).
+    { mine: selected(), theirs: { t: 'del', at: wp([1], 1), to: wp([1], 3) }, text: 'A BB', drawings: 0, dropped: true },
+    // The drawing that went by a key: what stands at its place now is another thing, or nothing.
+    { mine: selected(), theirs: { t: 'cmd', name: 'deleteBackward', at: wp([1], 3), a: ['char'] }, text: 'AA  BB', drawings: 0, dropped: true },
+    // A key before the drawing, through text typed at its offset: the key would take what stands there now.
+    { mine: { t: 'cmd', name: 'deleteForward', at: { s: 'body', p: [1], o: 3, b: true }, a: ['char'] }, theirs: { t: 'text', at: wp([1], 3), x: 'q' }, text: 'AA q BB', drawings: 1, dropped: true },
+    // A range from before the drawing on into text (the drawing and " B"), through text that came in at its offset: whether
+    // that text stands before the drawing (outside the range) or behind it (inside) is not known either.
+    { mine: wider(), theirs: { t: 'text', at: wp([1], 3), x: 'q' }, text: 'AA q BB', drawings: 1, dropped: true },
+    { mine: wider(), theirs: { t: 'text', at: { s: 'body', p: [1], o: 3, b: true }, x: 'q' }, text: 'AA q BB', drawings: 1, dropped: true },
+    { mine: wider('Z'), theirs: { t: 'text', at: wp([1], 3), x: 'q' }, text: 'AA q BB', drawings: 1, dropped: true },
+    // Through text that came in before it, it goes as it was.
+    { mine: wider(), theirs: { t: 'text', at: wp([1], 0), x: 'q' }, text: 'qAA B', drawings: 0, dropped: false },
+    // A deletion beside the drawing that is known to leave it where it was: nothing gives way, nothing is said.
+    { mine: selected(), theirs: { t: 'del', at: wp([1], 3), to: wp([1], 4) }, text: 'AA BB', drawings: 0, dropped: false },
+    { mine: selected(), theirs: { t: 'del', at: wp([1], 2), to: { s: 'body', p: [1], o: 3, b: true } }, text: 'AA BB', drawings: 0, dropped: false },
+    { mine: wider(), theirs: { t: 'del', at: wp([1], 2), to: { s: 'body', p: [1], o: 3, b: true } }, text: 'AAB', drawings: 0, dropped: false },
+    { mine: { t: 'cmd', name: 'deleteForward', at: { s: 'body', p: [1], o: 3, b: true }, a: ['char'] }, theirs: { t: 'del', at: wp([1], 3), to: wp([1], 4) }, text: 'AA BB', drawings: 0, dropped: false },
+  ];
+  for (const one of cases) {
+    const net = new DocNet();
+    const a = await joinDoc(net, 'a', await shapeFile());
+    const b = await joinDoc(net, 'b', await shapeFile());
+    net.drain();
+    a.transport.suspend();
+    assert.ok(actDoc(a, [one.mine]));
+    assert.ok(actDoc(b, [one.theirs]));
+    net.drain();
+    a.transport.resume();
+    net.drain();
+    net.drain();
+    const label = `${JSON.stringify(one.mine)} through ${JSON.stringify(one.theirs)}`;
+    assert.deepEqual(a.notices, one.dropped ? [{ code: 'dropped', count: 1 }] : [], label);
+    const row = one.theirs.t === 'split' ? 2 : 1;
+    assert.equal(paragraphText(a.doc.body.blocks[row] as never), one.text, label);
+    assert.equal(drawingsOf(a.doc, row), one.drawings, label);
+    assertSameDoc([a, b], label);
+    for (const member of [a, b]) member.session.leave();
+  }
+});
+
+test('a range from before a drawing on into text, and typing in a box behind it, through text that came in at the offset of the drawing: both give way, nothing lands in another box', async () => {
+  const bytes = await twoBoxFile();
+  for (const theirs of [wp([1], 3), { s: 'body', p: [1], o: 3, b: true } as WirePos]) {
+    const net = new DocNet();
+    const a = await joinDoc(net, 'a', bytes);
+    const b = await joinDoc(net, 'b', bytes);
+    net.drain();
+    a.transport.suspend();
+    // The first drawing and " B" go; the box that is the first one now (box one) is typed in.
+    assert.ok(actDoc(a, [{ t: 'del', at: { s: 'body', p: [1], o: 3, b: true }, to: wp([1], 5) }]));
+    a.session.seal();
+    assert.ok(actDoc(a, [{ t: 'text', at: wp([1, -1, 0, 0, 0], 0), x: 'X' }]));
+    assert.ok(actDoc(b, [{ t: 'text', at: theirs, x: 'q' }]));
+    net.drain();
+    a.transport.resume();
+    net.drain();
+    net.drain();
+    const label = JSON.stringify(theirs);
+    assert.deepEqual(a.notices, [{ code: 'dropped', count: 2 }], label);
+    assert.deepEqual(allBoxes(a.doc), ['box zero', 'box one'], label);
+    assertSameDoc([a, b], label);
+    for (const member of [a, b]) member.session.leave();
+  }
+});
+
+/** The kinds of the inlines of paragraph 1 and of what their runs hold, text left out. */
+function shapeOf(doc: DocModel): string[] {
+  const block = doc.body.blocks[1] as { children: { type: string; content?: { type: string }[] }[] };
+  return block.children.map((inline) => inline.type + (inline.content ? ':' + inline.content.map((item) => item.type).join('/') : ''));
+}
+
+test('a comment on a range from before a drawing gives way to text that came in at the offset of the drawing; through text before it, it still holds the drawing', async () => {
+  for (const [offset, dropped] of [[3, true], [0, false]] as [number, boolean][]) {
+    const net = new DocNet();
+    const a = await joinDoc(net, 'a', await shapeFile());
+    const b = await joinDoc(net, 'b', await shapeFile());
+    net.drain();
+    a.transport.suspend();
+    const edit = ops.addComment(a.doc, { anchor: { story: 'body', path: [1], offset: 3, before: true }, focus: { story: 'body', path: [1], offset: 5 } }, 'on the drawing', { author: 'A', date: '2026-10-15T10:00:00Z' });
+    const wires = wiresOf(edit.ops) as DocWire[];
+    assert.ok(wires && wires.length === 1 && wires[0].t === 'cmt');
+    assert.ok(actDoc(a, wires));
+    const here = shapeOf(a.doc);
+    assert.ok(actDoc(b, [{ t: 'text', at: wp([1], offset), x: 'q' }]));
+    net.drain();
+    a.transport.resume();
+    net.drain();
+    net.drain();
+    const label = `typed at ${offset}`;
+    assert.deepEqual(a.notices, dropped ? [{ code: 'dropped', count: 1 }] : [], label);
+    assert.equal(a.doc.comments ? a.doc.comments.items.size : 0, dropped ? 0 : 1, label);
+    // Where the comment stands beside the drawing is where it stood at its author before the other's text came in
+    // (the command of comments puts its start behind a drawing at the start of the range, there as here).
+    if (!dropped) assert.deepEqual(shapeOf(a.doc), here, label);
+    assertSameDoc([a, b], label);
+    for (const member of [a, b]) member.session.leave();
+  }
+});
+
+test('in the body at random: what is about a drawing (selected, from before it on into text, a key before it) and what someone else did beside it meanwhile - the drawing goes, or what was about it gives way and that is said; never kept in silence', async () => {
+  const r = (text: string): string => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
+  const shape = `<w:r><w:drawing>${ANCHOR_HEAD}<wp:docPr id="7" name="Shape 7"/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>`;
+  // "AAAA " is 5 characters: the drawing stands at 5, " BBBB" follows (5..10).
+  const bytes = await buildDocx({ body: p('Zero') + `<w:p>${r('AAAA ')}${shape}${r(' BBBB')}</w:p>` + p('End') + SECT });
+  const at = (o: number, b = false): WirePos => (b ? { s: 'body', p: [1], o, b: true } : { s: 'body', p: [1], o });
+  const mine: DocWire[] = [{ t: 'del', at: at(5, true), to: at(5) }, { t: 'del', at: at(5, true), to: at(7) }, { t: 'cmd', name: 'deleteForward', at: at(5, true), a: ['char'] }, { t: 'text', at: at(5, true), to: at(7), x: 'Z' }];
+  const random = seeded(4099);
+  let silent = 0;
+  let rooms = 0;
+  for (let i = 0; i < Math.max(SEEDS, 30) * 5; i++) {
+    const which = mine[i % mine.length];
+    const kind = int(random, 0, 3);
+    let theirs: DocWire;
+    if (kind === 0) {
+      const o = int(random, 0, 10);
+      theirs = { t: 'text', at: at(o, o === 5 && random() < 0.5), x: 'q' };
+    } else if (kind === 1) {
+      const o = int(random, 1, 10);
+      theirs = { t: 'cmd', name: 'deleteBackward', at: at(o, o === 5 && random() < 0.5), a: ['char'] };
+    } else if (kind === 2) {
+      const o1 = int(random, 0, 9);
+      const o2 = int(random, o1 + 1, 10);
+      theirs = { t: 'del', at: at(o1, o1 === 5 && random() < 0.5), to: at(o2, o2 === 5 && random() < 0.5) };
+    } else {
+      const o = int(random, 0, 10);
+      theirs = { t: 'run', at: at(o), to: at(Math.min(10, o + 2)), f: { bold: true } };
+    }
+    const net = new DocNet();
+    const a = await joinDoc(net, 'a', bytes);
+    const b = await joinDoc(net, 'b', bytes);
+    net.drain();
+    a.transport.suspend();
+    assert.ok(actDoc(a, [which]));
+    if (!actDoc(b, [theirs])) {
+      for (const member of [a, b]) member.session.leave();
+      continue;
+    }
+    rooms++;
+    net.drain();
+    a.transport.resume();
+    net.drain();
+    net.drain();
+    const label = `${JSON.stringify(which)} through ${JSON.stringify(theirs)}`;
+    // What a meant to delete went, or a was told that its change gave way.
+    if (a.notices.length === 0 && drawingsOf(a.doc, 1) > 0) silent++;
+    assert.ok(a.notices.length > 0 || drawingsOf(a.doc, 1) === 0, `${label}: the drawing stayed and nothing was said`);
+    assertSameDoc([a, b], label);
+    for (const member of [a, b]) member.session.leave();
+  }
+  assert.equal(silent, 0);
+  assert.ok(rooms > 0);
+});
+
 test('ids only the other branch of a box holds: everybody counts the names alike before an edit, after it, after a save and after the undo', async () => {
   const bytes = await buildDocx({ body: p('Before') + `<w:p><w:r><w:t xml:space="preserve">Anchor </w:t></w:r>${wordBox(p('Box text') + p('Two'), 1, `<w:p w14:paraId="22222221"><w:r w:rsidR="00BB0002"><w:t xml:space="preserve">Box text</w:t></w:r></w:p>` + `<w:p w14:paraId="22222222"><w:r><w:t xml:space="preserve">Two</w:t></w:r></w:p>`)}</w:p>` + p('After') + SECT });
   const net = new DocNet();
@@ -732,24 +985,33 @@ test('a box whose other branch does not stand element for element with the branc
 test('at random, alone and in a pair: typing in a box behind drawings, a drawing that goes, undo twice - no other box changes', async () => {
   const r = (text: string): string => `<w:r><w:t xml:space="preserve">${text}</w:t></w:r>`;
   const bytes = await buildDocx({ body: p('Zero') + `<w:p>${r('AA ')}${wpsBox(p('box zero'), 1)}${r(' BB ')}${wpsBox(p('box one'), 2)}${r(' CC ')}${wpsBox(p('box two'), 3)}${r(' DD')}</w:p>` + p('End') + SECT });
-  const at = [3, 8, 13];
+  // Where the drawings stand: "AA " is 3 characters, " BB " and " CC " 4 each (a drawing has no width).
+  const at = [3, 7, 11];
+  const names = ['box zero', 'box one', 'box two'];
+  // Rooms where the deletion of a drawing went first, gave way to someone else's key, and typing in a box behind it waited.
+  let behind = 0;
   for (let seed = 1; seed <= Math.min(SEEDS, 60); seed++) {
     const random = seeded(seed * 7907);
     const alone = seed % 2 === 1;
+    // Every other pair: the drawing goes first and the box is typed in afterwards (the box typed in is then counted
+    // among the boxes that are left): what waits behind a deletion that gives way goes with it.
+    const deletionFirst = !alone && seed % 4 === 0;
     const net = new DocNet();
     const a = await joinDoc(net, 'a', bytes);
     const b = alone ? undefined : await joinDoc(net, 'b', bytes);
     net.drain();
-    const typed = int(random, 0, 2);
     const gone = int(random, 0, 2);
-    const offline = !alone && random() < 0.5;
+    const typed = deletionFirst ? int(random, 0, 1) : int(random, 0, 2);
+    // The name of the box typed in, as the file held it.
+    const typedName = deletionFirst ? names.filter((_, i) => i !== gone)[typed] : names[typed];
+    const offline = !alone && (deletionFirst || random() < 0.5);
     if (offline) a.transport.suspend();
-    assert.ok(actDoc(a, [{ t: 'text', at: wp([1, -1, typed, 0, 0], 0), x: 'X' }]));
-    a.session.seal();
-    if (!offline) net.drain();
     const deletion: DocWire = random() < 0.5 ? { t: 'cmd', name: 'deleteBackward', at: wp([1], at[gone]), a: ['char'] } : { t: 'del', at: { s: 'body', p: [1], o: at[gone], b: true }, to: wp([1], at[gone]) };
-    assert.ok(actDoc(a, [deletion]));
-    a.session.seal();
+    const typing: DocWire = { t: 'text', at: wp([1, -1, typed, 0, 0], 0), x: 'X' };
+    for (const wire of deletionFirst ? [deletion, typing] : [typing, deletion]) {
+      assert.ok(actDoc(a, [wire]));
+      a.session.seal();
+      if (wire === typing && !offline) net.drain();    }
     // Someone else meanwhile: a key beside the drawings, or typing in the paragraph.
     if (b) assert.ok(actDoc(b, [random() < 0.5 ? { t: 'cmd', name: 'deleteForward', at: wp([1], 4), a: ['char'] } : { t: 'text', at: wp([1], 0), x: 'q' }]));
     if (offline) {
@@ -758,16 +1020,19 @@ test('at random, alone and in a pair: typing in a box behind drawings, a drawing
     }
     net.drain();
     net.drain();
+    if (deletionFirst && a.session.stats.dropped > 0) behind++;
+    // Before the undo too: the X is in the box it was typed in, or in none (the steps gave way).
+    for (const text of allBoxes(a.doc)) assert.ok(names.indexOf(text) >= 0 || text === 'X' + typedName, `seed ${seed}, before the undo: "${text}" in ${JSON.stringify(allBoxes(a.doc))}`);
     a.session.undo();
     net.drain();
     a.session.undo();
     net.drain();
     // The boxes that stand: each holds its own text, or its own text with the X where it was typed.
-    const names = ['box zero', 'box one', 'box two'];
-    for (const text of allBoxes(a.doc)) assert.ok(names.indexOf(text) >= 0 || text === 'X' + names[typed], `seed ${seed}: "${text}" in ${JSON.stringify(allBoxes(a.doc))}`);
+    for (const text of allBoxes(a.doc)) assert.ok(names.indexOf(text) >= 0 || text === 'X' + typedName, `seed ${seed}: "${text}" in ${JSON.stringify(allBoxes(a.doc))}`);
     if (b) assertSameDoc([a, b], `seed ${seed}`);
     for (const member of b ? [a, b] : [a]) member.session.leave();
   }
+  if (SEEDS >= 30) assert.ok(behind > 0, 'a deletion of a drawing gave way with typing in a box behind it waiting');
 });
 
 // ------------------------------------------------------------------- refused
