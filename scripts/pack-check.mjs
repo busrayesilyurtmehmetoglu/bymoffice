@@ -35,6 +35,13 @@ for (const wanted of ['package.json', 'README.md', 'CHANGELOG.md', 'dist/bymoffi
 const stray = names.filter((name) => !/^(package\.json|README\.md|CHANGELOG\.md|THIRD-PARTY-NOTICES\.md|LICENSE[^/]*|dist\/.+|server\/collab-server\.(mjs|d\.mts))$/.test(name));
 if (stray.length) fail(`the archive holds files that are not part of the package: ${stray.slice(0, 5).join(', ')}`);
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+// No source maps: neither as files nor named by the scripts (a CDN would answer that name with a 404).
+const maps = names.filter((name) => /\.map$/.test(name));
+if (maps.length) fail(`the archive holds source maps: ${maps.join(', ')}`);
+for (const file of ['dist/bymoffice.min.js', 'dist/bymoffice.esm.js', 'dist/bymoffice.webview.html']) {
+  if (/sourceMappingURL=/.test(readFileSync(join(root, file), 'utf8').slice(-4096))) fail(`${file} names a source map`);
+}
+if (manifest.private) fail('package.json is private: it cannot be published');
 
 // The font of the package: its four files and their licence, each as large as its source, and the notice that
 // names them. (That they are the same bytes is looked at below, in the installed copy.)

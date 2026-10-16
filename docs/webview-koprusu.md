@@ -255,7 +255,7 @@ Kendiliğinden kaydetme (`load.save: { "auto": … }`, `saved` + `by: "auto"`):
 `sheets[].state`: `visible`, `hidden`, `veryHidden`. `sheets[].kind`: `worksheet`, `chartsheet`. `sheets[].tabColor`: sekme rengi olan sayfada CSS rengi (`"#RRGGBB"`; tema ve indeks renkleri çözülmüş olarak); rengi olmayan sayfada alan yoktur. (`loaded.sheets` de aynı alanı taşır.)
 
 ```json
-{ "type": "ready", "version": "0.0.1" }
+{ "type": "ready", "version": "0.1.0" }
 { "type": "loaded", "id": "1", "format": "xlsx", "sheets": [{ "name": "Veri", "state": "visible", "kind": "worksheet" }], "activeSheet": 0 }
 { "type": "changed", "sheets": [0], "canUndo": true, "canRedo": false }
 { "type": "saved", "id": "2", "data": "UEsDBBQ…", "name": "rapor.xlsx" }

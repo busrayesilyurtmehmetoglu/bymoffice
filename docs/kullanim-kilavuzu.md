@@ -3,7 +3,7 @@
 Bu kılavuz, BYM Office'i kendi uygulamasına ekleyecek geliştiriciler içindir. Her kod değişikliğinde güncellenir;
 burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılmamış olanlar "Henüz olmayanlar" başlığında açıkça listelenir.
 
-**Kılavuzun karşılık geldiği sürüm:** 0.0.1 (2026-10-01) — xlsx görüntüleme, düzenleme, biçimlendirme, formül hesaplama ve kayıpsız kaydetme; editör arayüzü; WebView köprüsü.
+**Kılavuzun karşılık geldiği sürüm:** 0.1.0 (2026-10-16) — ilk sürüm. Neyin yapılıp neyin henüz yapılmadığı Bölüm 1'de ve "Henüz olmayanlar" tablosunda; değişiklikler [`CHANGELOG.md`](../CHANGELOG.md)'de.
 
 ## 1. Bu sürüm ne yapar
 
@@ -105,36 +105,43 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 
 ## 2. Kurulum
 
-Paket henüz npm'de yayımlanmadığı için depodan derlenir:
-
-```sh
-pnpm install
-pnpm build
-```
-
-Çıktılar:
-
-| Dosya | Kullanım |
-|---|---|
-| `dist/bymoffice.min.js` | `<script>` ile; global `BymOffice` nesnesini tanımlar |
-| `dist/bymoffice.esm.js` | ES modülü (`import`) |
-| `dist/types/index.d.ts` | TypeScript tipleri (`moduleResolution` `bundler`, `node16` ve `nodenext` ile çözülür) |
-| `dist/bymoffice.webview.html` | WebView'ler için tek dosyalık köprü sayfası (pakette `bymoffice/webview.html`) |
-| `dist/fonts/tex-gyre-bonum/` | Paketle gelen font (TeX Gyre Bonum, dört `.otf`) ve lisansı; betikle **birlikte** sunulur (pakette `bymoffice/fonts/…`). Bkz. "Fontlar" |
-
-Paket yalnız ES modülü ve `<script>` olarak dağıtılır; ayrı bir CommonJS çıktısı yoktur (`require()` yalnız ES modülünü yükleyebilen Node sürümlerinde çalışır). Çalışma zamanı bağımlılığı yoktur.
-
-`pnpm pack:check` (derlemeden sonra) paketi yayımlanacağı haliyle sınar: arşivi üretir, boş bir projeye kurar, oradan ES modülü olarak kullanır, tipleri üç çözümleme kipiyle derler ve `<script>` dosyasının global `BymOffice`'i tanımladığına bakar. `pnpm verify` bunu da çalıştırır.
-
-Yayımlandığında kurulum şöyle olacak (şimdilik çalışmaz):
+**CDN'den, tek satır** (derleme aracı gerekmez; global `BymOffice` nesnesi tanımlanır):
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>
+<!-- ya da: https://unpkg.com/bymoffice@0.1.0/dist/bymoffice.min.js -->
 ```
+
+Adreste sürümü yazın (`@0.1.0`): sürümsüz adres her yeni sürümde kendiliğinden değişir, 0.x'te küçük sürümler kırıcı değişiklik içerebilir. Paketle gelen font betiğin yanındaki `fonts/` klasöründen kendiliğinden yüklenir (CDN'de de; bkz. "Fontlar").
+
+**npm ile** (paketleyici ya da Node):
 
 ```sh
 npm i bymoffice
 ```
+
+```js
+import { mount, open } from 'bymoffice';
+// Paketleyicide gömülü fontun adresini verin (betiğin yeri bilinmez):
+// mount(el, { file, fontsUrl: '/assets/bymoffice-fonts/' })  — node_modules/bymoffice/dist/fonts/ klasörünü sunucunuza kopyalayın.
+```
+
+**Kendi sunucunuzdan:** `node_modules/bymoffice/dist/` klasörünü (ya da depodan `pnpm install && pnpm build` ile üretilenini) olduğu gibi sunun; `bymoffice.min.js` ile `fonts/` yan yana kalmalı.
+
+Paketin dosyaları:
+
+| Dosya | Kullanım |
+|---|---|
+| `dist/bymoffice.min.js` | `<script>` ile; global `BymOffice` nesnesini tanımlar |
+| `dist/bymoffice.esm.js` | ES modülü (`import 'bymoffice'`) |
+| `dist/types/index.d.ts` | TypeScript tipleri (`moduleResolution` `bundler`, `node16` ve `nodenext` ile çözülür) |
+| `dist/bymoffice.webview.html` | WebView'ler için tek dosyalık köprü sayfası (`bymoffice/webview.html`) |
+| `dist/fonts/tex-gyre-bonum/` | Paketle gelen font (TeX Gyre Bonum, dört `.otf`) ve lisansı; betikle **birlikte** sunulur (`bymoffice/fonts/…`). Bkz. "Fontlar" |
+| `server/collab-server.mjs` | Eşzamanlı düzenleme için bağımlılıksız örnek aktarıcı (Node); bkz. "Birlikte düzenleme" |
+
+Paket yalnız ES modülü ve `<script>` olarak dağıtılır; ayrı bir CommonJS çıktısı yoktur (`require()` yalnız ES modülünü yükleyebilen Node sürümlerinde çalışır). Çalışma zamanı bağımlılığı yoktur. Kaynak haritası (`.map`) pakete girmez.
+
+Depodan geliştirirken: `pnpm install && pnpm build` (`BYM_SOURCEMAP=1 pnpm build` kaynak haritalarını da üretir). `pnpm pack:check` paketi yayımlanacağı haliyle sınar: arşivi üretir (kaynak haritası ve `private` olmamalı), boş bir projeye kurar, oradan ES modülü olarak kullanır, tipleri üç çözümleme kipiyle derler ve `<script>` dosyasının global `BymOffice`'i tanımladığına bakar. `pnpm verify` bunu da çalıştırır.
 
 ## 3. Hızlı başlangıç
 
@@ -828,7 +835,7 @@ const xlsxBytes = await file.saveAsXlsx();        // yeni bir xlsx; file.save() 
 
 Yazılanlar: sayfa adları, sırası ve durumu (gizli, çok gizli), etkin sayfa, 1904 tarih sistemi; hücre değerleri ve türleri; formül metinleri ile dosyadaki sonuçları (paylaşılan ve dizi formülleri, veri tabloları öyle kalır); stiller (yazı tipi, dolgu, kenarlık, hizalama, sayı biçimi, koruma, hücre stilleri, renk paleti, tema renkleri); zengin metin; birleştirmeler; sütun genişlikleri, satır yükseklikleri, gizli/özetlenmiş satır ve sütunlar; görünüm (dondurulmuş bölmeler, etkin hücre, yakınlaştırma, kılavuz çizgileri, sağdan sola, sekme rengi); köprüler; tanımlı adlar; yorumlar (yazar, zengin metin, kutunun yeri, hep görünür olması); görseller, şekiller ve metin kutuları, gruplar; sayfa yapısı (`sheet.pageSetup`: kenar boşlukları, kâğıt, yön, ölçek/sığdırma, ilk sayfa numarası, sayfa sırası, üstbilgi/altbilgi, ortalama, kılavuz çizgisi/başlık yazdırma, sayfa sonları; yazdırma alanı ve yinelenen başlıklar tanımlı ad olarak). Model bir xlsx'ten okunmuşsa koşullu biçimler, veri doğrulamaları ve otomatik süzgeç de yazılır.
 
-**Modelde bulunup** yeni dosyaya yazılamayan ya da değiştirilerek yazılan içerik `report.warnings` içinde türüne göre, kaç kez olduğuyla birlikte listelenir (aşağıdaki maddeler). Modelde **hiç bulunmayan** şeyler için uyarı çıkmaz: xls okuyucusunun okumadığı içerik ("Henüz olmayanlar" tablosu) ve bir xlsx'in modele alınmayan parçaları (yazıcı ayarı parçası, sayfa koruması, belge özellikleri) sessizce yoktur; tek istisna, modelin varlığını bildiği tablo/pivot/form denetimi gibi sayfaya bağlı parçalardır, onlar uyarılır. Kodla kurulmuş geçersiz bir modelde biçimsel düzeltmeler (yinelenen sayfa kimliği, sınır dışı yakınlaştırma ya da özet düzeyi) uyarısız yapılır.
+**Modelde bulunup** yeni dosyaya yazılamayan ya da değiştirilerek yazılan içerik `report.warnings` içinde türüne göre, kaç kez olduğuyla birlikte listelenir (aşağıdaki maddeler). Modelde **hiç bulunmayan** şeyler için uyarı çıkmaz: xls okuyucusunun okumadığı içerik ("Henüz olmayanlar" tablosu) ve bir xlsx'in modele alınmayan parçaları (yazıcı ayarı parçası, belge özellikleri) sessizce yoktur; tek istisna, modelin varlığını bildiği tablo/pivot/form denetimi gibi sayfaya bağlı parçalardır, onlar uyarılır. Kodla kurulmuş geçersiz bir modelde biçimsel düzeltmeler (yinelenen sayfa kimliği, sınır dışı yakınlaştırma ya da özet düzeyi) uyarısız yapılır.
 
 ```js
 const report = { parts: [], warnings: [] };

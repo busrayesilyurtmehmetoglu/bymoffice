@@ -2,9 +2,9 @@
 
 Bu dosya [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) düzenini izler; sürümler [anlamsal sürümleme](https://semver.org/lang/tr/) ile numaralanır. 1.0'dan önce (0.x) küçük sürümler kırıcı değişiklik içerebilir; bunlar "Kırıcı" başlığı altında yazılır.
 
-## Yayımlanmadı
+## 0.1.0 — 2026-10-16
 
-İlk sürüm için hazırlanan içerik. Paket henüz npm'de yayımlanmadı.
+İlk sürüm. Paket `bymoffice` adıyla npm'de; `<script>` için jsDelivr/unpkg adresleri npm'den kendiliğinden gelir. Paket kaynak haritası (`.map`) taşımaz; betiklerde harita başvurusu yoktur (geliştirirken `BYM_SOURCEMAP=1 pnpm build` ile üretilir).
 
 ### Güvenlik
 

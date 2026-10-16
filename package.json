@@ -1,7 +1,6 @@
 {
   "name": "bymoffice",
-  "version": "0.0.1",
-  "private": true,
+  "version": "0.1.0",
   "license": "MIT",
   "description": "Word and Excel viewer/editor engine, embeddable from a CDN",
   "type": "module",

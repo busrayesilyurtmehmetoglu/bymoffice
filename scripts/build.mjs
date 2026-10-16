@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { Script } from 'node:vm';
 import { build } from 'esbuild';
 
@@ -8,11 +8,15 @@ const shared = {
   bundle: true,
   // Old WebViews (iOS before 16.4, Android 8-era) must parse the bundle; newer syntax is lowered.
   target: 'es2019',
-  sourcemap: true,
+  // The package ships no source maps (they were most of its size); BYM_SOURCEMAP=1 makes them for debugging here.
+  sourcemap: process.env.BYM_SOURCEMAP === '1',
 };
 
 // BYM_OUT_DIR: where the scripts, the bridge page and the fonts go instead of dist/ (the tests of the build use it).
 const OUT = process.env.BYM_OUT_DIR || 'dist';
+
+// Maps an earlier build made do not stay beside scripts that no longer name them.
+if (process.env.BYM_SOURCEMAP !== '1') await Promise.all(['bymoffice.min.js.map', 'bymoffice.esm.js.map'].map((name) => rm(`${OUT}/${name}`, { force: true })));
 
 await Promise.all([
   // <script src=".../bymoffice.min.js"> exposes a global `BymOffice`.

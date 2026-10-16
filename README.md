@@ -6,7 +6,7 @@ Tek bir `.js` dosyası olarak dağıtılır, çalışma zamanı bağımlılığ�
 ## Kullanım
 
 ```html
-<script src="https://cdn.example.com/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>
 <script>
   const file = await BymOffice.open(blobOrBytes); // biçim içerikten algılanır
   file.format;            // 'docx' | 'xlsx' | 'doc' | 'xls'
@@ -18,7 +18,7 @@ Tek bir `.js` dosyası olarak dağıtılır, çalışma zamanı bağımlılığ�
 </script>
 ```
 
-ES modülü olarak: `import { open } from './bymoffice.esm.js'`.
+npm ile: `npm i bymoffice`, ardından `import { open, mount } from 'bymoffice'`.
 
 Ayrıntılı anlatım, API ve test arayüzü: [geliştirici kullanım kılavuzu](docs/kullanim-kilavuzu.md). Sürüm notları: [CHANGELOG.md](CHANGELOG.md).
 
