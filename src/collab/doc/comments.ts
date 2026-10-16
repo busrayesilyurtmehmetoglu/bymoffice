@@ -34,6 +34,7 @@ import type { Block, Comment, DocModel, Inline } from '../../model/doc/types';
 import { WireError } from '../types';
 import { stable, xmlText } from '../wire';
 import type { CommentRef, CommentWire, DocWire, Mark, WirePos } from './rebase';
+import { ALL_DRAWINGS } from './rebase';
 import { hashOf, namesOfDocument, readPos, toPosition, toWirePos } from './wire';
 
 /** Most commands of comments in one step: each reads the whole document for what it names. */
@@ -420,7 +421,8 @@ export function commentMarks(ops: readonly DocOp[]): Mark[] {
   for (const op of ops) {
     if (op.type !== 'replaceBlocks') continue;
     if (op.remove === op.insert.length) {
-      if (op.remove > 0) out.push({ k: 'tch', s: op.story, c: op.path.slice(), r1: op.at, r2: op.at + op.remove - 1 });
+      // A command of comments puts marks of comments in and takes them out: never a drawing (no box moves).
+      if (op.remove > 0) out.push({ k: 'tch', s: op.story, c: op.path.slice(), r1: op.at, r2: op.at + op.remove - 1, gks: new Array<number>(op.remove).fill(ALL_DRAWINGS) });
     } else out.push({ k: 'blk', s: op.story, c: op.path.slice(), at: op.at, n: op.remove, m: op.insert.length });
   }
   return out;

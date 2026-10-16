@@ -92,12 +92,20 @@ export type PutInline = { p?: Record<string, unknown>; a?: [string, string][]; c
 
 /** What a change did to the places around it. */
 export type Mark =
-  /** Text came in at (row, off) of the list of blocks `c` of story `s`: `rows` paragraph ends, and `last` characters after the last of them (all of the text when there is none). */
-  | { k: 'ins'; s: string; c: number[]; row: number; off: number; rows: number; last: number }
-  /** The text from (r1, o1) up to (r2, o2) went. */
-  | { k: 'del'; s: string; c: number[]; r1: number; o1: number; r2: number; o2: number }
-  /** Formatting changed in the blocks r1..r2 of a list; nothing moved. */
-  | { k: 'tch'; s: string; c: number[]; r1: number; r2: number }
+  /**
+   * Text came in at (row, off) of the list of blocks `c` of story `s`: `rows` paragraph ends, and `last` characters after
+   * the last of them (all of the text when there is none). `gk` (read off the document when the command was applied,
+   * and kept while nothing else touched that paragraph): the first `gk` drawings of the paragraph `row` are the very
+   * drawings they were, at the same numbers (see boxShaken). Without it, any drawing of the paragraph may have moved.
+   */
+  | { k: 'ins'; s: string; c: number[]; row: number; off: number; rows: number; last: number; gk?: number }
+  /** The text from (r1, o1) up to (r2, o2) went. `gk`: as for 'ins', of the paragraph r1. */
+  | { k: 'del'; s: string; c: number[]; r1: number; o1: number; r2: number; o2: number; gk?: number }
+  /**
+   * Nothing moved in the text of the blocks r1..r2 of a list: formatting changed, or what has no width there (a drawing
+   * that went). `gks[i]`: as `gk` of 'ins', of the block r1 + i.
+   */
+  | { k: 'tch'; s: string; c: number[]; r1: number; r2: number; gks?: number[] }
   /** The `n` blocks from `at` of a list were replaced by `m` blocks, and what happened in them is not known place by place. */
   | {
       k: 'blk';
@@ -109,6 +117,8 @@ export type Mark =
       /** Where known: the plain text of the blocks before (`was`) and after (`now`), "" for one that is no paragraph. Carets in them follow the text (see the view). */
       was?: string[];
       now?: string[];
+      /** One paragraph that became one (`n` = `m` = 1): its first `gk` drawings are the very ones they were (see boxShaken). */
+      gk?: number;
     }
   /** Something changed in the story that is not known place by place. "*": in the document. */
   | { k: 'opq'; s: string };
@@ -142,6 +152,83 @@ function pathThrough(path: readonly number[], mark: Moving): number[] | undefine
 
 const through = (s: string, path: readonly number[], mark: Moving): boolean => s === mark.s && path.length > mark.c.length && samePath(path, mark.c, mark.c.length);
 
+/** Most text boxes in text boxes a path goes through (as editInTextBox follows them). */
+export const MAX_BOX_DEPTH = 16;
+
+/** The value of `gk` (and of an entry of `gks`) for a paragraph that kept every drawing it had, and no more: no box of it moved. */
+export const ALL_DRAWINGS = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Whether a mark moves places: text that came or went, blocks that were replaced, something unknown - and what changed
+ * no text but may have changed the drawings of a paragraph (a drawing has no width), and so the places of the text
+ * boxes of that paragraph. The one rule of "this moved something" for what waits behind a change, for what lies under
+ * it in a stack of undo and for those it is read through (see session.ts); boxShaken() says which boxes.
+ */
+export function movesPlaces(mark: Mark): boolean {
+  if (mark.k !== 'tch') return true;
+  return mark.gks === undefined || mark.gks.length !== mark.r2 - mark.r1 + 1 || mark.gks.some((kept) => kept !== ALL_DRAWINGS);
+}
+
+/** Whether a mark is known to leave every drawing of the paragraph `row` of its list as it was. */
+function keepsAll(mark: Mark, row: number): boolean {
+  if (mark.k === 'ins') return mark.row === row && mark.gk === ALL_DRAWINGS;
+  if (mark.k === 'del') return mark.r1 === row && mark.r2 === row && mark.gk === ALL_DRAWINGS;
+  if (mark.k === 'tch') return mark.gks !== undefined && row >= mark.r1 && row <= mark.r2 && mark.gks[row - mark.r1] === ALL_DRAWINGS;
+  return false;
+}
+
+/**
+ * Whether a mark may have changed which text box a path (of a place, or of a list of blocks)
+ * goes into. A text box is named by the paragraph that anchors it, the number of its drawing
+ * among the drawings of that paragraph and its number in the drawing (`[..., row, -1, g, b, ...]`).
+ * Text that came into that paragraph without a paragraph end moves no drawing, and neither does
+ * formatting; a paragraph end that came in (the drawing may stand behind it, in a paragraph of
+ * its own), text that went from it (a drawing may have gone, or one before it), and blocks that
+ * replaced it may: the box is then not known to be the one meant, and what is about it gives way.
+ * Something unknown in the story may have done anything.
+ */
+export function boxShaken(s: string, path: readonly number[], mark: Mark): boolean {
+  if (mark.s !== s && mark.s !== '*') return false;
+  if (path.indexOf(-1) < 0) return false;
+  if (mark.k === 'opq') return true;
+  const depth = mark.c.length;
+  // Only the list the mark is about, and what stands in it, can be moved by it.
+  if (depth >= path.length || !samePath(path, mark.c, depth) || path.indexOf(-1, depth) < 0) return false;
+  const row = path[depth];
+  // A block of the list holds the box (a table, or a box with boxes in it): only whether that block went.
+  if (path[depth + 1] !== -1) return mark.k !== 'tch' && rowThrough(row, mark) === undefined;
+  // The paragraph that anchors the box stands in the list. Whatever the mark is about there may have changed its drawings
+  // (a drawing has no width: deleting it, or writing over it, moves no text); only the first ones the mark is known to
+  // have left as they were keep their boxes.
+  const g = path[depth + 2];
+  const keeps = (gk: number | undefined): boolean => gk !== undefined && g < gk;
+  if (mark.k === 'ins') return row === mark.row && !keeps(mark.gk);
+  if (mark.k === 'del') return row >= mark.r1 && row <= mark.r2 && !(row === mark.r1 && keeps(mark.gk));
+  if (mark.k === 'tch') return row >= mark.r1 && row <= mark.r2 && !(mark.gks !== undefined && keeps(mark.gks[row - mark.r1]));
+  return row >= mark.at && row < mark.at + mark.n && !keepsBox(path, mark);
+}
+
+/**
+ * Whether a paragraph that a mark replaced as a whole is known to hold the text box a path goes into as it was: one
+ * paragraph became one and the drawing of the box is among the first ones it kept, the very same drawing (whose boxes
+ * are the same blocks). What is about the box is then not about the paragraph that was replaced.
+ */
+function keepsBox(path: readonly number[], mark: Mark): boolean {
+  if (mark.k !== 'blk' || mark.gk === undefined || mark.n !== 1 || mark.m !== 1) return false;
+  const depth = mark.c.length;
+  return path.length > depth + 4 && samePath(path, mark.c, depth) && path[depth] === mark.at && path[depth + 1] === -1 && path[depth + 2] < mark.gk;
+}
+
+/** Whether a mark is about the block `row` of the list `c` of story `s` and may have changed the drawings it holds. */
+function hitsRow(over: Mark, s: string, c: readonly number[], row: number): boolean {
+  if (over.k === 'opq') return over.s === '*' || over.s === s;
+  if (over.s !== s || over.c.length !== c.length || !samePath(over.c, c, c.length)) return false;
+  if (keepsAll(over, row)) return false;
+  if (over.k === 'ins') return over.row === row;
+  if (over.k === 'blk') return row >= over.at && row < over.at + over.n;
+  return row >= over.r1 && row <= over.r2;
+}
+
 /**
  * A place read through a mark. `right`: text that came in exactly at the place stands before
  * it (the place moves); otherwise the place stays where it is, before that text. `gone`: the
@@ -151,6 +238,8 @@ export function mapPos(pos: WirePos, mark: Mark, right: boolean): { pos: WirePos
   if (mark.k === 'tch' || mark.k === 'opq') return { pos, gone: false };
   if (!through(pos.s, pos.p, mark)) return { pos, gone: false };
   const depth = mark.c.length;
+  // In a text box of a paragraph that was replaced and kept the box as it was.
+  if (keepsBox(pos.p, mark)) return { pos, gone: false };
   if (pos.p.length > depth + 1 || mark.k === 'blk') {
     // In a block that stands in the list (a table), or beside blocks that were replaced: only the block moves.
     const path = pathThrough(pos.p, mark);
@@ -238,6 +327,8 @@ function touches(mark: Mark, blk: Extract<Mark, { k: 'blk' }>): boolean {
   const depth = blk.c.length;
   if (rows.c.length >= depth) {
     if (!samePath(rows.c, blk.c, depth)) return false;
+    // In a text box of a paragraph the blocks replaced, which kept the box as it was.
+    if (rows.c.length > depth + 1 && rows.c[depth + 1] === -1 && keepsBox(rows.c, blk)) return false;
     // In the same list: the same blocks. Deeper: inside one of them.
     if (rows.c.length === depth) return rows.lo < blk.at + Math.max(blk.n, 1) && rows.hi >= blk.at && (blk.n > 0 || mark.k !== 'ins');
     return rows.c[depth] >= blk.at && rows.c[depth] < blk.at + blk.n;
@@ -245,6 +336,8 @@ function touches(mark: Mark, blk: Extract<Mark, { k: 'blk' }>): boolean {
   // The blocks stand inside a block of the list the mark is about: text there holds paragraphs only; formatting and replaced blocks may be over it.
   if (!samePath(blk.c, rows.c, rows.c.length)) return false;
   const row = blk.c[rows.c.length];
+  // The blocks are in a text box of a paragraph of the list: formatting of that paragraph is not over the text of its boxes.
+  if ((mark.k === 'tch' || mark.k === 'blk') && blk.c[rows.c.length + 1] === -1) return boxShaken(blk.s, blk.c, mark);
   return (mark.k === 'tch' || mark.k === 'blk') && row >= rows.lo && row <= rows.hi;
 }
 
@@ -261,10 +354,12 @@ function placesOf(wire: DocWire): WirePos[] {
  * about the same story (or blocks). `effect`: what the waiting change did when it was applied.
  */
 function clash(places: readonly WirePos[], effect: readonly Mark[], mark: Mark): boolean {
+  // A place in a text box that may not be the box it was.
+  if (places.some((pos) => boxShaken(pos.s, pos.p, mark))) return true;
   if (mark.k === 'opq') {
     if (mark.s === '*' || places.some((pos) => pos.s === mark.s)) return true;
   } else if (mark.k === 'blk') {
-    for (const pos of places) if (through(pos.s, pos.p, mark) && rowThrough(pos.p[mark.c.length], mark) === undefined) return true;
+    for (const pos of places) if (through(pos.s, pos.p, mark) && rowThrough(pos.p[mark.c.length], mark) === undefined && !keepsBox(pos.p, mark)) return true;
   }
   for (const own of effect) {
     if (own.k === 'opq' && (own.s === '*' || mark.s === '*' || own.s === mark.s)) return true;
@@ -273,17 +368,40 @@ function clash(places: readonly WirePos[], effect: readonly Mark[], mark: Mark):
   return false;
 }
 
+/**
+ * A mark as it is read through another one that does not move it: what it is known to leave of the drawings of a
+ * paragraph stays known while the other one is not about that paragraph (it is the same paragraph, holding the same).
+ */
+function keptOf(mark: Mark, over: Mark): Mark {
+  // Text that came in and took no drawing with it (ALL_DRAWINGS) takes none wherever it comes in: what is known stays.
+  if (mark.k === 'ins' && mark.gk !== undefined && mark.gk !== ALL_DRAWINGS && hitsRow(over, mark.s, mark.c, mark.row)) return withoutKept(mark);
+  if (mark.k === 'del' && mark.gk !== undefined && hitsRow(over, mark.s, mark.c, mark.r1)) return withoutKept(mark);
+  if (mark.k === 'tch' && mark.gks !== undefined) for (let row = mark.r1; row <= mark.r2; row++) if (hitsRow(over, mark.s, mark.c, row)) return withoutKept(mark);
+  return mark;
+}
+
+function withoutKept(mark: Mark): Mark {
+  const out = { ...mark } as Mark & { gk?: number; gks?: number[] };
+  delete out.gk;
+  delete out.gks;
+  return out;
+}
+
 /** A mark read through a mark that the other side made: `pending` says this mark is of the waiting change (it stays first at a place both put text in). */
 function markThrough(mark: Mark, over: Mark, pending: boolean): Mark[] {
-  if (over.k === 'tch' || over.k === 'opq' || mark.k === 'opq' || mark.s !== over.s) return [mark];
+  // A mark in a text box that may not be the box it was in: where it went is not known.
+  if (mark.k !== 'opq' && boxShaken(mark.s, mark.c, over)) return [{ k: 'opq', s: mark.s }];
+  if (over.k === 'tch' || over.k === 'opq' || mark.k === 'opq' || mark.s !== over.s) return [keptOf(mark, over)];
   const lost: Mark[] = [{ k: 'opq', s: mark.s }];
   // The list of blocks the mark is about may itself stand in a block of the list the other is about.
   let c = mark.c;
+  // In a text box of a paragraph the other replaced and that kept the box as it was: where it was.
+  if (keepsBox(c, over)) return [mark];
   if (c.length > over.c.length && samePath(c, over.c, over.c.length)) {
     const moved = pathThrough(c, over);
     if (!moved) return lost;
     c = moved;
-  } else if (c.length !== over.c.length || !samePath(c, over.c, c.length)) return [mark];
+  } else if (c.length !== over.c.length || !samePath(c, over.c, c.length)) return [keptOf(mark, over)];
   else if (over.k === 'blk' && touches(mark, over)) return lost;
   const same = c.length === over.c.length;
   if (mark.k === 'blk') {
@@ -299,16 +417,20 @@ function markThrough(mark: Mark, over: Mark, pending: boolean): Mark[] {
     return [out];
   }
   if (mark.k === 'tch') {
-    if (!same) return [{ k: 'tch', s: mark.s, c, r1: mark.r1, r2: mark.r2 }];
+    if (!same) return [mark.gks ? { k: 'tch', s: mark.s, c, r1: mark.r1, r2: mark.r2, gks: mark.gks } : { k: 'tch', s: mark.s, c, r1: mark.r1, r2: mark.r2 }];
     const first = mapPos({ s: mark.s, p: c.concat([mark.r1]), o: 0 }, over, false).pos;
     const last = mapPos({ s: mark.s, p: c.concat([mark.r2]), o: Number.MAX_SAFE_INTEGER }, over, true).pos;
-    return [{ k: 'tch', s: mark.s, c, r1: first.p[c.length], r2: Math.max(first.p[c.length], last.p[c.length]) }];
+    const out: Mark = { k: 'tch', s: mark.s, c, r1: first.p[c.length], r2: Math.max(first.p[c.length], last.p[c.length]) };
+    if (mark.gks && out.r2 - out.r1 === mark.r2 - mark.r1 && keptOf(mark, over) === mark) out.gks = mark.gks;
+    return [out];
   }
   if (mark.k === 'ins') {
     if (!same) return [{ ...mark, c }];
     const at = mapPos({ s: mark.s, p: c.concat([mark.row]), o: mark.off }, over, !pending);
     if (at.gone && over.k === 'blk') return lost;
-    return [{ k: 'ins', s: mark.s, c, row: at.pos.p[c.length], off: at.pos.o, rows: mark.rows, last: mark.last }];
+    const out: Mark = { k: 'ins', s: mark.s, c, row: at.pos.p[c.length], off: at.pos.o, rows: mark.rows, last: mark.last };
+    if (mark.gk !== undefined && keptOf(mark, over) === mark) out.gk = mark.gk;
+    return [out];
   }
   if (!same) return [{ ...mark, c }];
   const out: Mark[] = [];
@@ -320,6 +442,7 @@ function markThrough(mark: Mark, over: Mark, pending: boolean): Mark[] {
     if (orderOf(from, to) === 0) continue;
     out.push({ k: 'del', s: mark.s, c, r1: from.p[c.length], o1: from.o, r2: to.p[c.length], o2: to.o });
   }
+  if (out.length === 1 && mark.gk !== undefined && keptOf(mark, over) === mark) (out[0] as { gk?: number }).gk = mark.gk;
   return out;
 }
 
@@ -606,7 +729,12 @@ export function arrived(marks: readonly Mark[]): Mark[] {
       } else row += before.r2 - before.r1;
       at--;
     }
-    out.splice(at, 0, { ...mark, row, off });
+    const placed: Mark = { ...mark, row, off };
+    // What is known of the drawings of the paragraph is known of the change as it was applied. In the same paragraph,
+    // behind the range that goes after it, the text leaves the first drawings (those before the range) where they were;
+    // in another paragraph that is not known.
+    if (row !== mark.row) delete placed.gk;
+    out.splice(at, 0, placed);
   }
   return out;
 }

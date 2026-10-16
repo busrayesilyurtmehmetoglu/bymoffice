@@ -46,7 +46,7 @@ import type {
   Wrapper,
 } from '../../model/doc/types';
 import { parseXml, type XmlComment, type XmlElement, type XmlNode, type XmlPI } from '../../xml';
-import { findSelected, graphicTextBoxContents, readBlock, selectBranch } from './body';
+import { READ_TEXT_BOXES, findSelected, graphicTextBoxContents, readBlock, selectBranch } from './body';
 import { kindOf, parseOnOff } from './common';
 import {
   cellPropsElement,
@@ -729,7 +729,9 @@ function writeRunItem(ctx: BodyContext, item: RunItem, out: string[], depth: num
         for (const sub of again.items) writeRunItem(plain, sub, parts, depth + 1);
         was = parts.join('');
       }
-      if (was === text) writeTree(ctx, item.xml, out);
+      // As read only while its boxes are the very boxes read: a box edited back to its text is written from the model in
+      // every branch (alternateWithBoxes), so that it is written alike whichever file it was read from.
+      if (was === text && boxesAsRead(item)) writeTree(ctx, item.xml, out);
       else if (again && again.type === 'alternate' && onlyBoxesChanged(ctx, item, again, depth)) {
         // Only the text in text boxes changed: every branch gets it (textBoxesWritable() let the edit through). Should
         // the branches not take it after all, the element is written as it was read: nothing of the file is lost.
@@ -856,13 +858,13 @@ export function canonicalBoxText(text: string): string {
  * The tree with the <w:txbxContent> elements `contents` holding the blocks of `boxes` (one to one), where those were
  * edited. `same`: whether a box counts as unchanged (by default when it is written as it was read).
  */
-function putBoxes(ctx: BodyContext, xml: XmlElement, contents: XmlElement[], boxes: Block[][], depth: number, same = (was: string, text: string) => was === text): XmlElement {
+function putBoxes(ctx: BodyContext, xml: XmlElement, contents: XmlElement[], boxes: Block[][], depth: number, same = (was: string, text: string, _box: number) => was === text): XmlElement {
   let out = xml;
   for (let i = 0; i < boxes.length && i < contents.length; i++) {
     const text = boxText(ctx, boxes[i], depth);
     const was = rereadTextBox(ctx, contents[i]);
     // Unreadable: textBoxesWritable() refuses to edit such a box, so this one is as it was read.
-    if (was === undefined || same(was, text)) continue;
+    if (was === undefined || same(was, text, i)) continue;
     // Namespace prefixes are not resolved by the parser, so the text parses without the declarations of the part.
     const parsed = parseXml(`<x>${text}</x>`).root.children;
     out = replaceNode(out, contents[i], { type: 'element', name: contents[i].name, attrs: contents[i].attrs, children: parsed });
@@ -950,6 +952,12 @@ function workOutPlan(ctx: BodyContext, item: AlternateItem): AlternatePlan | und
   }
 }
 
+/** Whether the text boxes of alternate content are the very boxes the reader made (no edit replaced one). */
+function boxesAsRead(item: AlternateItem): boolean {
+  for (const sub of item.items) if (isGraphic(sub) && sub.textBoxes) for (const box of sub.textBoxes) if (!READ_TEXT_BOXES.has(box)) return false;
+  return true;
+}
+
 /** Whether what the model holds of alternate content differs from what was read only in the text of text boxes. */
 function onlyBoxesChanged(ctx: BodyContext, item: AlternateItem, again: AlternateItem, depth: number): boolean {
   if (item.items.length !== again.items.length) return false;
@@ -983,9 +991,12 @@ function alternateWithBoxes(ctx: BodyContext, item: AlternateItem, plan: Alterna
     // Namespace prefixes are not resolved by the parser, so the text parses without the declarations of the part.
     if (node === plan.branch) return { type: 'element', name: node.name, attrs: node.attrs, children: parseXml(`<x>${text}</x>`).root.children };
     const contents = plan.others.get(node);
-    // A box of the other branch that holds the same text as the model keeps its own ids; an edited one takes those of the
-    // branch read, as Word writes them (one paragraph, the same ids in both branches).
-    return contents ? putBoxes(ctx, node, contents, boxes, depth, (was, now) => canonicalBoxText(was) === canonicalBoxText(now)) : node;
+    // A box of the other branch keeps its own bytes while the model holds the very box read; an edited one gets the text of
+    // the model, with the ids of the branch read (as Word writes them: the same ids in both branches). So the other branch
+    // is a function of the model alone: the same model is written the same whichever file it was read from - one this
+    // writer saved too - and an edit taken back as a command (where documents are edited together) is not the file's
+    // other branch coming back at one participant and not at another.
+    return contents ? putBoxes(ctx, node, contents, boxes, depth, (_was, _now, i) => READ_TEXT_BOXES.has(boxes[i])) : node;
   });
   return { type: 'element', name: item.xml.name, attrs: item.xml.attrs, children };
 }

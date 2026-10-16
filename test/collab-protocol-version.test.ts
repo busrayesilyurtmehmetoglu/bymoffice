@@ -17,7 +17,7 @@ import { versionProblem, wireFingerprint } from './collab-wire-fingerprint';
  * test below fails: raise PROTOCOL_VERSION, and put the lines it prints here with the new version.
  */
 const PINNED = {
-  pv: 6,
+  pv: 7,
   lines: [
     'doc commands: deleteBackward deleteColumn deleteForward deleteRow indentList insertColumn insertHyperlink insertPageBreak insertRow insertTable toggleList',
     'doc kinds: cmd cmt del para put run split text unrun',

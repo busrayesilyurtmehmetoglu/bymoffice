@@ -21,7 +21,7 @@ import type { DocLayoutOptions, FontMetrics, ImageItem, LayoutFont, LayoutPage, 
 import * as ops from '../collab/doc/commands';
 import { CollabDocHistory, NOT_SHARED, type DocHistoryLike } from '../collab/doc/history';
 import type { DocChange, DocCollabSession, DocPeer } from '../collab/doc/session';
-import { tracing } from '../collab/doc/trace';
+import { sharedInTextBox, tracing } from '../collab/doc/trace';
 import type { CollabNotice } from '../collab/room';
 import { CompositionHold, PeerCarets, movedSelection, peerFill, peerPlaces, placeNear, type PeerPlace } from './doc-collab';
 import type { DocComment, DocEdit, DocPosition, DocRange, DocRevision, ParaFormatPatch, RangeFormat, RunFormatPatch, SectionSetup, TabStopsPatch, ToggleKey } from '../ops/doc/index';
@@ -202,7 +202,6 @@ const CLICK_MS = 500;
 type BoxMode = 'edit' | 'anchor' | 'raw' | 'refuse';
 /** Messages of the RangeErrors a command in a text box is refused with (said by refuse()). */
 const BOX_COMMAND = 'bym:text-box:command';
-const BOX_SHARED = 'bym:text-box:shared';
 const BOX_TRACKED = 'bym:text-box:tracked';
 const BOX_LOCKED = 'bym:text-box:locked';
 const BOX_UNWRITABLE = 'bym:text-box:unwritable';
@@ -5203,7 +5202,7 @@ export class DocumentView {
   }
 
   insertPageBreak(): boolean {
-    return this.perform((range, doc) => ops.insertPageBreak(doc, this.caretOf(range)), true, 'refuse');
+    return this.perform((range, doc) => ops.insertPageBreak(doc, this.caretOf(range)), true, ops.commandInTextBox('insertPageBreak') ? 'edit' : 'refuse');
   }
 
   /**
@@ -5217,7 +5216,7 @@ export class DocumentView {
       this.notify(this.strings.linkNotAllowed, 'error');
       return false;
     }
-    return this.perform((range, doc) => ops.insertHyperlink(doc, range, safe), true, 'refuse');
+    return this.perform((range, doc) => ops.insertHyperlink(doc, range, safe), true, ops.commandInTextBox('insertHyperlink') ? 'edit' : 'refuse');
   }
 
   /**
@@ -5517,13 +5516,21 @@ export class DocumentView {
     this.typing.commit();
     const match = this.selectedMatch(find, options && options.stories);
     let changed = false;
-    // A match in a text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
-    // In a room the command that travels (insertText); elsewhere the replacement in the place of the match. A match in a
-    // text box is replaced by a command that does not travel: in a room the history refuses it, and says so.
+    // In a room the command that travels (insertText; in a text box as it runs there); elsewhere the replacement in the
+    // place of the match.
     if (match && ops.commentOfStory(match.range.anchor.story) !== undefined) changed = this.replaceFoundComment(match, replacement);
     else if (match && !this.editable) this.notify(this.replacedText({ replaced: 0, skipped: 1, outsideComments: 1 }), 'info');
     else if (match && match.replaceable)
-      changed = this.perform(() => (this.collab && !ops.inTextBox(match.range.anchor.path) ? ops.insertText(this.document, match.range, replacement) : ops.replaceMatchEdit(this.document, match.range, replacement)), true, 'raw');
+      changed = this.perform(
+        () =>
+          this.collab
+            ? ops.inTextBox(match.range.anchor.path)
+              ? this.boxed(match.range, () => sharedInTextBox(this.document, match.range, (doc, range) => ops.insertText(doc, range, replacement)))
+              : ops.insertText(this.document, match.range, replacement)
+            : ops.replaceMatchEdit(this.document, match.range, replacement),
+        true,
+        'raw',
+      );
     else if (match) this.notify(this.replacedText({ replaced: 0, skipped: 1, textBoxesKept: match.fixed === 'textBox' ? 1 : 0 }), 'info');
     return this.findNext(text, options).then(() => changed);
   }
@@ -5895,8 +5902,6 @@ export class DocumentView {
     this.notify(
       message === BOX_COMMAND
         ? s.textBoxRefused('command')
-        : message === BOX_SHARED
-        ? s.textBoxRefused('shared')
         : message === BOX_TRACKED
         ? s.textBoxRefused('tracked')
         : message === BOX_LOCKED
@@ -6002,10 +6007,19 @@ export class DocumentView {
     if (!boxed || inBox === 'raw') return make(range, this.document);
     if (inBox === 'anchor') return make(ops.collapsed(ops.textBoxExit(this.document, range.focus)), this.document);
     if (inBox === 'refuse') throw new RangeError(BOX_COMMAND);
-    // The paths of text boxes do not travel: a change there would be this participant's alone.
-    if (this.collab) throw new RangeError(BOX_SHARED);
     try {
+      // In a room the command travels with its places in the box (see the text boxes of collab/doc/wire.ts).
+      if (this.collab) return sharedInTextBox(this.document, range, (doc, lowered) => make(lowered, doc));
       return ops.editInTextBox(this.document, range, (doc, lowered) => make(lowered, doc));
+    } catch (error) {
+      throw this.boxError(error, range);
+    }
+  }
+
+  /** Runs a command in a text box, with the reason the user is told when it is refused. */
+  private boxed(range: DocRange, run: () => DocEdit): DocEdit {
+    try {
+      return run();
     } catch (error) {
       throw this.boxError(error, range);
     }

@@ -40,8 +40,10 @@ export type CollabState = 'connecting' | 'online' | 'offline' | 'detached' | 'cl
  * 5: VSTACK, HSTACK, TAKE, DROP, CHOOSEROWS, CHOOSECOLS, EXPAND, TOCOL, TOROW, WRAPROWS, WRAPCOLS and
  *    TEXTSPLIT calculated; TEXTBEFORE and TEXTAFTER take an array of delimiters as one list.
  * 6: commands of comments of a document (`cmt`).
+ * 7: places in text boxes of a document (`-1` in a path), and the text of text boxes counted with the text of
+ *    their story (and their tables with its cells) in the budgets of a document.
  */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /** A participant of a room as the others see it; `P` is how it says where it is. */
 export interface RoomPeer<P> {

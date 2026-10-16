@@ -6,6 +6,7 @@ import * as raw from '../../ops/doc/index';
 import { traced } from './trace';
 
 export * from '../../ops/doc/index';
+export { commandInTextBox } from './wire';
 
 const shared = traced(raw, false);
 

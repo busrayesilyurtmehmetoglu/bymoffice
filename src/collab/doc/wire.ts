@@ -13,7 +13,9 @@ import { EMPTY_PARA_PROPS, EMPTY_RUN_PROPS, paragraphText, type AttrList, type B
 import type { DocEdit } from '../../ops/doc/draft';
 import { indentList, patchParaProps, patchRunProps, rangeFormat, setParaFormat, setRunFormat, toggleList, toggleRunFormat, type ParaFormatPatch, type RunFormatPatch, type ToggleKey } from '../../ops/doc/format';
 import type { DocOp } from '../../ops/doc/ops';
-import { containerBlocks, storyIds, storyOf, type DocPosition, type DocRange } from '../../ops/doc/position';
+import { containerBlocks, eachGraphic, storyIds, storyOf, textBoxRootLength, type DocPosition, type DocRange } from '../../ops/doc/position';
+import { editInTextBox, readInTextBox } from '../../ops/doc/text-box';
+import { applyDocOp } from '../../ops/doc/ops';
 import { deleteColumn, deleteRow, insertColumn, insertHyperlink, insertRow, insertTable } from '../../ops/doc/structure';
 import { deleteBackward, deleteForward, deleteRange, insertPageBreak, insertText, splitParagraph } from '../../ops/doc/text';
 import { WireError } from '../types';
@@ -23,7 +25,7 @@ import { commentsForWriting } from '../../formats/docx/comments';
 import { bodyText, collectionText, createBodyContext, storyText } from '../../formats/docx/write-package';
 import { treeText, writeBlocks, type BodyContext } from '../../formats/docx/write-body';
 import { plainCopy, stable, xmlText } from '../wire';
-import type { DocWire, Mark, PutInline, PutItem, PutParagraph, WirePos } from './rebase';
+import { ALL_DRAWINGS, MAX_BOX_DEPTH, type DocWire, type Mark, type PutInline, type PutItem, type PutParagraph, type WirePos } from './rebase';
 import { MAX_STEP_COMMENTS, commentEdit, readComment, writeComment } from './comments';
 
 /** Most commands of one step. */
@@ -57,7 +59,20 @@ export function readPos(value: unknown): WirePos {
   if (typeof s !== 'string' || s.length === 0 || s.length > 120 || !xmlText(s) || !/^(body|(header|footer|footnote|endnote):[^\s]{1,110})$/.test(s)) return fail('story');
   if (!Array.isArray(p) || p.length === 0 || p.length > MAX_PATH) return fail('path');
   const path: number[] = [];
-  for (const index of p) path.push(isInt(index, 0, MAX_INDEX) ? index : fail('path'));
+  let boxes = 0;
+  let last = -3;
+  for (let i = 0; i < p.length; i++) {
+    const index = p[i];
+    // A text box: the paragraph that anchors it (in the story, or in the box before), -1, its drawing and its number
+    // there, and a path in it (see boxBase).
+    if (index === -1) {
+      if (i < last + 4 || i + 3 >= p.length || ++boxes > MAX_BOX_DEPTH || !isInt(p[i + 1], 0, MAX_INDEX) || !isInt(p[i + 2], 0, MAX_INDEX)) return fail('path');
+      last = i;
+      path.push(-1);
+      continue;
+    }
+    path.push(isInt(index, 0, MAX_INDEX) ? index : fail('path'));
+  }
   if (!isInt(o, 0, MAX_INDEX)) return fail('offset');
   if (value.length === 4 && b !== 1) return fail('place');
   return value.length === 4 ? { s, p: path, o, b: true } : { s, p: path, o };
@@ -82,6 +97,8 @@ interface Command {
   run(doc: DocModel, at: DocPosition, range: DocRange, a: unknown[]): DocEdit;
   /** `text`: it puts text in or takes text away at its place; `touch`: it changes paragraphs without moving text; `table`: it changes the table its place is in. */
   does: 'text' | 'touch' | 'table';
+  /** False: not run in a text box (the editor refuses it there, and so does everybody; see commandInTextBox). */
+  box?: false;
 }
 
 const one = <T>(a: unknown[], allowed: readonly T[]): T[] => (a.length === 1 && allowed.indexOf(a[0] as T) >= 0 ? [a[0] as T] : fail('command'));
@@ -90,7 +107,7 @@ const none = (a: unknown[]): unknown[] => (a.length === 0 ? [] : fail('command')
 export const COMMANDS: { [name: string]: Command } = {
   toggleList: { args: (a) => one(a, ['bullet', 'number']), range: true, run: (doc, _at, range, a) => toggleList(doc, range, a[0] as 'bullet' | 'number'), does: 'touch' },
   indentList: { args: (a) => (a.length === 1 && isInt(a[0], -8, 8) ? [a[0]] : fail('command')), range: true, run: (doc, _at, range, a) => indentList(doc, range, a[0] as number), does: 'touch' },
-  insertPageBreak: { args: none, run: (doc, at) => insertPageBreak(doc, at), does: 'text' },
+  insertPageBreak: { args: none, run: (doc, at) => insertPageBreak(doc, at), does: 'text', box: false },
   insertTable: { args: (a) => (a.length === 2 && isInt(a[0], 1, MAX_NEW_ROWS) && isInt(a[1], 1, MAX_NEW_COLUMNS) ? [a[0], a[1]] : fail('command')), run: (doc, at, _range, a) => insertTable(doc, at, a[0] as number, a[1] as number), does: 'text' },
   insertRow: { args: (a) => one(a, ['above', 'below']), run: (doc, at, _range, a) => insertRow(doc, at, a[0] as 'above' | 'below'), does: 'table' },
   deleteRow: { args: none, run: (doc, at) => deleteRow(doc, at), does: 'table' },
@@ -106,8 +123,18 @@ export const COMMANDS: { [name: string]: Command } = {
     range: true,
     run: (doc, at, range, a) => insertHyperlink(doc, range, a[0] as string, { relationshipId: typeof a[1] === 'string' ? a[1] : 'rIdL' + hashOf(stable([at, range.focus, a[0]])) }),
     does: 'text',
+    box: false,
   },
 };
+
+/**
+ * Whether a named command runs in a text box: the one rule of the editor (which refuses the others there before they
+ * run) and of everybody in a room (who refuse a step that brings one). A page break and a link are not put into boxes.
+ */
+export function commandInTextBox(name: string): boolean {
+  const command = Object.prototype.hasOwnProperty.call(COMMANDS, name) ? COMMANDS[name] : undefined;
+  return command !== undefined && command.box !== false;
+}
 
 /**
  * Every kind of command of a document that travels: with COMMANDS, what the fingerprint of the
@@ -959,56 +986,120 @@ class Tally {
  */
 function checkNames(doc: DocModel, wire: Extract<DocWire, { t: 'put' }>, list: number[], row: number): void {
   const replaced = containerBlocks(doc, wire.at.s, list).slice(row, row + wire.n);
-  const before = new Tally();
-  const after = new Tally();
-  const carried = new Set<string>();
-  const keys = (thing: Named): string[] => (thing.kind === 'para' ? [`p:${thing.id}`] : thing.kind === 'end' ? [`e:${bookmarkKey(thing.id)}`] : thing.kind === 'cmt' ? [] : thing.name !== undefined ? [`s:${bookmarkKey(thing.id)}`, `n:${thing.name.toLowerCase()}`] : [`s:${bookmarkKey(thing.id)}`]);
-  const brought = namedIn(wire.x);
-  /** The bookmarks in document order, before the put and after it. */
-  const orderBefore: string[] = [];
-  const orderAfter: string[] = [];
-  const held = new Set<string>();
-  namesOfDocument(
-    doc,
-    replaced,
-    (thing, where) => {
-      if (where !== 'put') for (const key of keys(thing)) before.add(key);
-      if (where !== 'replaced') for (const key of keys(thing)) after.add(key);
-      if (thing.kind !== 'para') {
-        const key = `${thing.kind === 'start' ? 's' : 'e'}:${bookmarkKey(thing.id)}`;
-        if (where !== 'put') orderBefore.push(key);
-        if (where !== 'replaced') orderAfter.push(key);
-      }
-      if (where === 'replaced' && thing.kind !== 'para') held.add(bookmarkKey(thing.id));
-    },
-    brought.things,
-    wire.at.s,
-  );
-  // The attributes of runs the replaced blocks carry, too (the walker gives those of paragraphs).
-  const runs = (blocks: readonly Block[], depth: number): void => {
-    if (depth > 32) return;
+  const names = new PutNames(wire.x);
+  namesOfDocument(doc, replaced, (thing, where) => names.see(thing, where !== 'put', where !== 'replaced', where === 'replaced'), names.brought.things, wire.at.s);
+  names.judge(replaced);
+}
+
+/**
+ * checkNames() for a put in a text box: the paragraphs of the box it replaces are in a drawing of
+ * a paragraph, which is one block of its story; the document is read as it is and as it would be
+ * after the operations of the put (`ops`, of `story`), and what each holds is what stands before
+ * and after it. The same rule.
+ */
+function checkNamesAcross(doc: DocModel, ops: readonly DocOp[], story: string, x: readonly PutParagraph[], replaced: readonly Block[]): void {
+  const after = withOps(doc, ops, story);
+  const names = new PutNames(x);
+  // The bookmarks of the replaced paragraphs: these are plain paragraphs, which hold their bookmarks as marks of the model.
+  const walk = (blocks: readonly Block[], depth: number): void => {
     for (const block of blocks) {
       if (block.type === 'paragraph') {
-        for (const [name, value] of block.attrs || []) carried.add(`${name}=${value}`);
-        for (const inline of block.children) if (inline.type === 'run') for (const [name, value] of inline.attrs || []) carried.add(`${name}=${value}`);
-      } else if (block.type === 'table') for (const r of block.rows) for (const cell of r.cells) runs(cell.blocks, depth + 1);
+        for (const inline of block.children) if (inline.type === 'bookmarkStart' || inline.type === 'bookmarkEnd') names.held.add(bookmarkKey(inline.id));
+      } else if (block.type === 'table' && depth < 32) for (const r of block.rows) for (const cell of r.cells) walk(cell.blocks, depth + 1);
     }
   };
-  runs(replaced, 0);
-  for (const [name, value] of brought.attrs) if (!carried.has(`${name}=${value}`) && !validAttr(name, value)) throw new RangeError('A paragraph or a run carries an id that is no value of a file');
-  // What was there twice already may stay so; nothing comes to be there twice.
-  const check = (key: string): void => {
-    if (after.of(key) > Math.max(1, before.of(key))) throw new RangeError(key.charAt(0) === 'p' ? 'The document has a paragraph of this id' : key.charAt(0) === 'n' ? 'The document has a bookmark of this name' : 'The document has a bookmark of this number');
-  };
-  for (const thing of brought.things) for (const key of keys(thing)) check(key);
-  // The bookmarks the put touches - those it brings, and those the replaced blocks held - start once and end once
-  // after it, the start first; or stand as they stood before it.
-  const touched = new Set<string>(held);
-  for (const thing of brought.things) if (thing.kind !== 'para') touched.add(bookmarkKey(thing.id));
-  const shape = (order: string[], id: string): string => order.filter((key) => key === `s:${id}` || key === `e:${id}`).join(' ');
-  for (const id of touched) {
-    const now = shape(orderAfter, id);
-    if (now !== `s:${id} e:${id}` && now !== shape(orderBefore, id)) throw new RangeError('A bookmark would not start once and end once after its start');
+  walk(replaced, 0);
+  namesOfDocument(doc, [], (thing) => names.see(thing, true, false, false), undefined, story);
+  namesOfDocument(after, [], (thing) => names.see(thing, false, true, false), undefined, story);
+  names.judge(replaced);
+}
+
+/** The document as it would be after operations of one story, the document itself unchanged: its story is a copy the operations change. */
+function withOps(doc: DocModel, ops: readonly DocOp[], story: string): DocModel {
+  const out: DocModel = { ...doc };
+  const [kind, id] = story.indexOf(':') < 0 ? [story, ''] : [story.slice(0, story.indexOf(':')), story.slice(story.indexOf(':') + 1)];
+  if (kind === 'body') out.body = { ...doc.body, blocks: doc.body.blocks.slice() };
+  else if (kind === 'header' || kind === 'footer') {
+    const stories = new Map(kind === 'header' ? doc.headers : doc.footers);
+    const one = stories.get(id);
+    if (one) stories.set(id, { ...one, blocks: one.blocks.slice() });
+    if (kind === 'header') out.headers = stories;
+    else out.footers = stories;
+  } else if (kind === 'footnote' || kind === 'endnote') {
+    const collection = kind === 'footnote' ? doc.footnotes : doc.endnotes;
+    if (collection) {
+      const copy = { ...collection, items: new Map(collection.items) };
+      if (kind === 'footnote') out.footnotes = copy;
+      else out.endnotes = copy;
+    }
+  } else throw new RangeError('The story cannot be read for what it names');
+  for (const op of ops) {
+    if (op.type !== 'replaceBlocks' && op.type !== 'setNote') throw new RangeError('The change cannot be read for what it names');
+    applyDocOp(out, op);
+  }
+  return out;
+}
+
+/** What is counted for a put: each thing that names itself before and after it, the order of the bookmarks, the bookmarks it touches. */
+class PutNames {
+  readonly before = new Tally();
+  readonly after = new Tally();
+  readonly brought: { things: Named[]; attrs: [string, string][] };
+  /** The bookmarks in document order, before the put and after it. */
+  readonly orderBefore: string[] = [];
+  readonly orderAfter: string[] = [];
+  /** The bookmarks the replaced blocks hold. */
+  readonly held = new Set<string>();
+
+  constructor(x: readonly PutParagraph[]) {
+    this.brought = namedIn(x);
+  }
+
+  static keys(thing: Named): string[] {
+    return thing.kind === 'para' ? [`p:${thing.id}`] : thing.kind === 'end' ? [`e:${bookmarkKey(thing.id)}`] : thing.kind === 'cmt' ? [] : thing.name !== undefined ? [`s:${bookmarkKey(thing.id)}`, `n:${thing.name.toLowerCase()}`] : [`s:${bookmarkKey(thing.id)}`];
+  }
+
+  /** A thing that stands in the document before the put (`before`), after it (`after`), in what it replaces (`replaced`). */
+  see(thing: Named, before: boolean, after: boolean, replaced: boolean): void {
+    if (before) for (const key of PutNames.keys(thing)) this.before.add(key);
+    if (after) for (const key of PutNames.keys(thing)) this.after.add(key);
+    if (thing.kind !== 'para') {
+      const key = `${thing.kind === 'start' ? 's' : 'e'}:${bookmarkKey(thing.id)}`;
+      if (before) this.orderBefore.push(key);
+      if (after) this.orderAfter.push(key);
+    }
+    if (replaced && thing.kind !== 'para') this.held.add(bookmarkKey(thing.id));
+  }
+
+  /** Throws RangeError where the put names a thing more often than it stood, brings an id no file holds, or leaves a bookmark that does not start once and end once. */
+  judge(replaced: readonly Block[]): void {
+    const carried = new Set<string>();
+    // The attributes of runs the replaced blocks carry, too (the walker gives those of paragraphs).
+    const runs = (blocks: readonly Block[], depth: number): void => {
+      if (depth > 32) return;
+      for (const block of blocks) {
+        if (block.type === 'paragraph') {
+          for (const [name, value] of block.attrs || []) carried.add(`${name}=${value}`);
+          for (const inline of block.children) if (inline.type === 'run') for (const [name, value] of inline.attrs || []) carried.add(`${name}=${value}`);
+        } else if (block.type === 'table') for (const r of block.rows) for (const cell of r.cells) runs(cell.blocks, depth + 1);
+      }
+    };
+    runs(replaced, 0);
+    for (const [name, value] of this.brought.attrs) if (!carried.has(`${name}=${value}`) && !validAttr(name, value)) throw new RangeError('A paragraph or a run carries an id that is no value of a file');
+    // What was there twice already may stay so; nothing comes to be there twice.
+    const check = (key: string): void => {
+      if (this.after.of(key) > Math.max(1, this.before.of(key))) throw new RangeError(key.charAt(0) === 'p' ? 'The document has a paragraph of this id' : key.charAt(0) === 'n' ? 'The document has a bookmark of this name' : 'The document has a bookmark of this number');
+    };
+    for (const thing of this.brought.things) for (const key of PutNames.keys(thing)) check(key);
+    // The bookmarks the put touches - those it brings, and those the replaced blocks held - start once and end once
+    // after it, the start first; or stand as they stood before it.
+    const touched = new Set<string>(this.held);
+    for (const thing of this.brought.things) if (thing.kind !== 'para') touched.add(bookmarkKey(thing.id));
+    const shape = (order: string[], id: string): string => order.filter((key) => key === `s:${id}` || key === `e:${id}`).join(' ');
+    for (const id of touched) {
+      const now = shape(this.orderAfter, id);
+      if (now !== `s:${id} e:${id}` && now !== shape(this.orderBefore, id)) throw new RangeError('A bookmark would not start once and end once after its start');
+    }
   }
 }
 
@@ -1039,13 +1130,21 @@ function storyChars(blocks: readonly Block[], most: number, depth = 0): number {
   return count;
 }
 
-function countCells(blocks: readonly Block[], budget: { left: number }, depth = 0): void {
+/** The cells of the tables of a list of blocks, those of its text boxes too, taken from `budget` until there are none left. */
+function countCells(blocks: readonly Block[], budget: { left: number }, depth = 0, boxes = 0): void {
   for (const block of blocks) {
+    if (budget.left < 0) return;
+    if (block.type === 'paragraph' && boxes < MAX_BOX_DEPTH) {
+      eachGraphic(block, (item) => {
+        for (const box of item.textBoxes || []) countCells(box, budget, depth, boxes + 1);
+        return budget.left < 0;
+      });
+    }
     if (block.type !== 'table' || depth > 32) continue;
     for (const row of block.rows) {
       budget.left -= row.cells.length;
       if (budget.left < 0) return;
-      for (const cell of row.cells) countCells(cell.blocks, budget, depth + 1);
+      for (const cell of row.cells) countCells(cell.blocks, budget, depth + 1, boxes);
     }
   }
 }
@@ -1082,7 +1181,10 @@ function withinBudget(doc: DocModel, wire: Exclude<DocWire, { t: 'cmt' }>): void
       const longest = wire.x.split('\n').reduce((most, line) => Math.max(most, line.length), 0);
       if (here + longest > MAX_PARAGRAPH_CHARS) throw new RangeError('A paragraph would be too long to be edited together');
     } else if (wire.t === 'put') for (const item of wire.x) if (putLength(item) > MAX_PARAGRAPH_CHARS) throw new RangeError('A paragraph would be too long to be edited together');
-    if (storyChars(story, MAX_STORY_CHARS - adds) > MAX_STORY_CHARS - adds) throw new RangeError('The document would be too long to be edited together');
+    // The text of its text boxes is text of the story as well.
+    const most = MAX_STORY_CHARS - adds;
+    const chars = storyChars(story, most);
+    if (chars > most || chars + boxChars(story, most - chars) > most) throw new RangeError('The document would be too long to be edited together');
   }
   if (wire.t === 'cmd' && (wire.name === 'insertTable' || wire.name === 'insertRow' || wire.name === 'insertColumn')) {
     const budget = { left: MAX_STORY_CELLS - (wire.name === 'insertTable' ? (wire.a[0] as number) * (wire.a[1] as number) : 0) };
@@ -1097,7 +1199,7 @@ function withinBudget(doc: DocModel, wire: Exclude<DocWire, { t: 'cmt' }>): void
 }
 
 /** The operations that put paragraphs in the place of plain paragraphs. Throws RangeError where the document does not have such paragraphs there, or does not know what the new ones name. */
-function putEdit(doc: DocModel, wire: Extract<DocWire, { t: 'put' }>): DocEdit {
+function putEdit(doc: DocModel, wire: Extract<DocWire, { t: 'put' }>, names = true): DocEdit {
   const c = wire.at.p.slice(0, -1);
   const row = wire.at.p[wire.at.p.length - 1];
   const story = storyOf(doc, wire.at.s);
@@ -1110,8 +1212,8 @@ function putEdit(doc: DocModel, wire: Extract<DocWire, { t: 'put' }>): DocEdit {
   // What is replaced is what the author replaced: should it be anything else (a step read wrongly through what others did),
   // nothing is written over it.
   if (putDigest(blocks.slice(row, row + wire.n)) !== wire.h) throw new RangeError('The paragraphs to replace are not the ones the step was made for');
-  // What names one thing names it once in the document.
-  checkNames(doc, wire, c, row);
+  // What names one thing names it once in the document (in a text box: in the whole document, see runInBox).
+  if (names) checkNames(doc, wire, c, row);
   // The marks of comments a put brings are the very marks of the blocks it replaces, in the same order: no comment gets a mark it
   // did not have, none loses one, none comes to stand before another it stood behind (a range that ends before it begins, two
   // ranges that cross, two comments that swap their numbers). Which paragraph a mark stands in is not asked: undoing an Enter
@@ -1182,11 +1284,136 @@ export function encodeStep(wires: readonly DocWire[]): unknown[] {
 export const toPosition = (pos: WirePos): DocPosition => (pos.b ? { story: pos.s, path: pos.p.slice(), offset: pos.o, before: true } : { story: pos.s, path: pos.p.slice(), offset: pos.o });
 export const toWirePos = (pos: DocPosition): WirePos => (pos.before ? { s: pos.story, p: pos.path.slice(), o: pos.offset, b: true } : { s: pos.story, p: pos.path.slice(), o: pos.offset });
 
+// ---------------------------------------------------------------- text boxes
+//
+// A command in a text box travels like any other: its places are places of the box
+// ([..., paragraph, -1, drawing, box, ...path in the box], as positions of the model name them).
+// Everybody runs it the way the editor of one runs a command there (editInTextBox): on a
+// stand-in document whose body is the box, with the places lowered into it, and what it changed
+// goes back into the box as one replacement of the paragraph that anchors it. So the box gets
+// what the body would get, by the same rules, and where the box may not be changed (its other
+// branch could not take it, its shape or a control locks its text) everybody refuses it alike:
+// that is read off the document. What it did is read off the box the same way and said in the
+// places of the document (the list of blocks of the box is the paths that lead into it); what
+// moves the box itself - text that went from the paragraph that anchors it, a paragraph end that
+// came into it - makes what is about the box give way (see boxShaken in rebase.ts).
+
+/** The path of the list of blocks of the innermost text box a command is in (`[..., paragraph, -1, drawing, box]`); undefined outside text boxes. Throws RangeError for ends in different boxes. */
+export function boxBase(wire: Exclude<DocWire, { t: 'cmt' }>): number[] | undefined {
+  const root = textBoxRootLength(wire.at.p);
+  const to = 'to' in wire && wire.to !== undefined ? wire.to : undefined;
+  if (to && (to.s !== wire.at.s || textBoxRootLength(to.p) !== root || !wire.at.p.slice(0, root).every((value, i) => to.p[i] === value))) throw new RangeError('The positions are in different text boxes');
+  return root === 0 ? undefined : wire.at.p.slice(0, root);
+}
+
+const moved = (pos: WirePos, s: string, p: number[]): WirePos => (pos.b ? { s, p, o: pos.o, b: true } : { s, p, o: pos.o });
+
+/** A command of a text box as it runs on the stand-in whose body is the box. */
+function lowerWire<W extends Exclude<DocWire, { t: 'cmt' }>>(wire: W, base: number[]): W {
+  const out = { ...wire, at: moved(wire.at, 'body', wire.at.p.slice(base.length)) };
+  if ('to' in wire && wire.to !== undefined) (out as { to?: WirePos }).to = moved(wire.to, 'body', wire.to.p.slice(base.length));
+  return out;
+}
+
+/** A command made on the stand-in of a text box, in the places of the document; undefined for one that names no place. */
+export function liftWire(wire: DocWire, story: string, base: number[]): DocWire | undefined {
+  if (wire.t === 'cmt') return undefined;
+  const out = { ...wire, at: moved(wire.at, story, base.concat(wire.at.p)) };
+  if ('to' in wire && wire.to !== undefined) (out as { to?: WirePos }).to = moved(wire.to, story, base.concat(wire.to.p));
+  return out;
+}
+
+/** The paragraph that anchors the outermost text box of a path, as a block of its list. */
+function outerAnchor(base: number[]): { c: number[]; row: number } {
+  const at = base.indexOf(-1);
+  return { c: base.slice(0, at - 1), row: base[at - 1] };
+}
+
+/** What a command did in a text box (marks of the stand-in), in the places of the document. Something unknown in the box: the paragraph that anchors it was replaced. */
+function liftMarks(marks: readonly Mark[], story: string, base: number[]): Mark[] {
+  const anchor = outerAnchor(base);
+  return marks.map((mark): Mark => (mark.k === 'opq' ? { k: 'blk', s: story, c: anchor.c, at: anchor.row, n: 1, m: 1 } : { ...mark, s: story, c: base.concat(mark.c) }));
+}
+
+const boxRange = (wire: Exclude<DocWire, { t: 'cmt' }>): DocRange => {
+  const at = toPosition(wire.at);
+  return { anchor: at, focus: 'to' in wire && wire.to !== undefined ? toPosition(wire.to) : at };
+};
+
+/** The operations of the stand-in a command of a text box came to, by the operations of the document it came to (for undo: inverseOf). */
+const BOX_OPS = new WeakMap<DocOp[], DocOp[]>();
+
+/** Runs a command of a text box (see the head of this section). */
+function runInBox(doc: DocModel, wire: Exclude<DocWire, { t: 'cmt' }>, base: number[]): DocEdit {
+  if (wire.t === 'cmd' && !commandInTextBox(wire.name)) throw new RangeError('This command is not run in a text box');
+  const lowered = lowerWire(wire, base);
+  let inner: DocEdit | undefined;
+  let replaced: Block[] = [];
+  const edit = editInTextBox(doc, boxRange(wire), (inside) => {
+    if (lowered.t === 'put') {
+      replaced = containerBlocks(inside, 'body', lowered.at.p.slice(0, -1)).slice(lowered.at.p[lowered.at.p.length - 1], lowered.at.p[lowered.at.p.length - 1] + lowered.n);
+      inner = putEdit(inside, lowered, false);
+    } else inner = runCommand(inside, lowered);
+    return inner;
+  });
+  if (!inner) throw new RangeError('The command did not run in the text box');
+  // What the paragraphs a put brings into a box name is counted in the whole document, as everywhere else.
+  if (wire.t === 'put' && edit.ops.length > 0) checkNamesAcross(doc, edit.ops, wire.at.s, wire.x, replaced);
+  BOX_OPS.set(edit.ops, inner.ops);
+  return edit;
+}
+
+/** The characters of the text boxes of a list of blocks (in its paragraphs and tables, and in boxes in boxes), counted until there are more than `most`. */
+function boxChars(blocks: readonly Block[], most: number, depth = 0, boxes = 0): number {
+  let count = 0;
+  for (const block of blocks) {
+    if (count > most) return count;
+    if (block.type === 'table' && depth < 32) {
+      for (const row of block.rows) for (const cell of row.cells) count += boxChars(cell.blocks, most - count, depth + 1, boxes);
+    } else if (block.type === 'paragraph' && boxes < MAX_BOX_DEPTH) {
+      eachGraphic(block, (item) => {
+        for (const box of item.textBoxes || []) {
+          count += storyChars(box, most - count) + boxChars(box, most - count, depth, boxes + 1);
+          if (count > most) return true;
+        }
+        return false;
+      });
+    }
+  }
+  return count;
+}
+
+/**
+ * How many of the first drawings of a paragraph are, after a change, the very same drawings at the same numbers;
+ * ALL_DRAWINGS where it holds the very drawings it held, and no other (none of its boxes moved).
+ */
+function keptGraphics(was: Paragraph, now: Paragraph): number {
+  const before: unknown[] = [];
+  eachGraphic(was, (item) => void before.push(item));
+  let kept = 0;
+  let count = 0;
+  let same = true;
+  eachGraphic(now, (item, index) => {
+    count++;
+    if (same && index < before.length && before[index] === item) kept++;
+    else same = false;
+    return false;
+  });
+  return kept === before.length && count === before.length ? ALL_DRAWINGS : kept;
+}
+
 /** What a command would do to the document: its operations. Throws RangeError for a command the document does not take. */
 export function runWire(doc: DocModel, wire: DocWire): DocEdit {
   if (wire.t === 'cmt') return commentEdit(doc, wire);
   withinBudget(doc, wire);
+  const base = boxBase(wire);
+  if (base) return runInBox(doc, wire, base);
   if (wire.t === 'put') return putEdit(doc, wire);
+  return runCommand(doc, wire);
+}
+
+/** A command that is no put, on the document (or the stand-in of a text box) its places are in. */
+function runCommand(doc: DocModel, wire: Exclude<DocWire, { t: 'cmt' | 'put' }>): DocEdit {
   const at = toPosition(wire.at);
   const range: DocRange = { anchor: at, focus: 'to' in wire && wire.to !== undefined ? toPosition(wire.to) : at };
   switch (wire.t) {
@@ -1233,12 +1460,34 @@ export interface Before {
   does: 'text' | 'touch' | 'table';
   /** A named command: where it leaves the text as it was, it changed how the text looks (a link over a selection). */
   named: boolean;
+  /**
+   * A command in a text box: the rest is about the stand-in whose body is the box (`base`: the path of the box in
+   * story `s`, see boxBase); `marks`: what it did there, once marksAfter() read it.
+   */
+  box?: { s: string; base: number[]; marks?: Mark[] };
 }
 
 /** Looks at the document before a command is applied. Undefined for a command about a place the document does not have (applying it will say so). */
 export function lookBefore(doc: DocModel, wire: DocWire): Before | undefined {
   // A command of comments says what it did itself (see commentMarks).
   if (wire.t === 'cmt') return undefined;
+  let base: number[] | undefined;
+  try {
+    base = boxBase(wire);
+  } catch {
+    return undefined;
+  }
+  if (base) {
+    // In a text box: the box, as the body of its stand-in.
+    const inner = base;
+    let found: Before | undefined;
+    try {
+      found = readInTextBox(doc, boxRange(wire), (inside) => lookBefore(inside, lowerWire(wire, inner)));
+    } catch {
+      return undefined;
+    }
+    return found ? { ...found, box: { s: wire.at.s, base: inner } } : undefined;
+  }
   let a = wire.at;
   let b = 'to' in wire && wire.to !== undefined ? wire.to : wire.at;
   // The blocks a `put` replaces: the last of them is its other end.
@@ -1291,6 +1540,21 @@ export function lookBefore(doc: DocModel, wire: DocWire): Before | undefined {
 export function marksAfter(doc: DocModel, before: Before | undefined, story: string): Mark[] {
   const unknown: Mark[] = [{ k: 'opq', s: story }];
   if (!before) return unknown;
+  const box = before.box;
+  if (box) {
+    // Read off the box as it is now (the command moved no box), in the places of the document.
+    const inner: Before = { ...before };
+    delete inner.box;
+    let marks: Mark[];
+    try {
+      const place: DocRange = { anchor: { story: box.s, path: box.base.concat([0]), offset: 0 }, focus: { story: box.s, path: box.base.concat([0]), offset: 0 } };
+      marks = readInTextBox(doc, place, (inside) => marksAfter(inside, inner, 'body'));
+    } catch {
+      marks = [{ k: 'opq', s: 'body' }];
+    }
+    box.marks = marks;
+    return liftMarks(marks, box.s, box.base);
+  }
   const { s, c, r1, o1, r2, o2 } = before;
   let blocks: Block[];
   try {
@@ -1303,6 +1567,9 @@ export function marksAfter(doc: DocModel, before: Before | undefined, story: str
   // What stood beside the blocks stands beside what they became.
   if ((r1 > 0 ? blocks[r1 - 1] : undefined) !== before.prev || (r1 + rows + 1 < blocks.length ? blocks[r1 + rows + 1] : undefined) !== before.next) return unknown;
   const replaced: Mark[] = [{ k: 'blk', s, c, at: r1, n: r2 - r1 + 1, m: rows + 1 }];
+  // One paragraph that became one: what it kept of its drawings (their boxes are where they were; see boxShaken).
+  const one = before.old[0];
+  if (r1 === r2 && rows === 0 && one && one.type === 'paragraph' && blocks[r1] && blocks[r1].type === 'paragraph') (replaced[0] as Extract<Mark, { k: 'blk' }>).gk = keptGraphics(one, blocks[r1] as Paragraph);
   // The text of the blocks before and after, for the carets in them (not for a large text: they then stay where they were in their block).
   const was = before.old.map(plainOf);
   const now = blocks.slice(r1, r1 + rows + 1).map(plainOf);
@@ -1310,22 +1577,35 @@ export function marksAfter(doc: DocModel, before: Before | undefined, story: str
     (replaced[0] as Extract<Mark, { k: 'blk' }>).was = was;
     (replaced[0] as Extract<Mark, { k: 'blk' }>).now = now;
   }
-  if (before.does === 'touch') return rows === r2 - r1 ? [{ k: 'tch', s, c, r1, r2 }] : replaced;
+  if (before.does === 'touch') {
+    if (rows !== r2 - r1) return replaced;
+    // What each paragraph keeps of its drawings (formatting keeps them all; see boxShaken).
+    const gks: number[] = [];
+    for (let i = 0; i <= r2 - r1; i++) {
+      const was = before.old[i];
+      const now = blocks[r1 + i];
+      gks.push(was && now && was.type === 'paragraph' && now.type === 'paragraph' ? keptGraphics(was, now) : 0);
+    }
+    return [{ k: 'tch', s, c, r1, r2, gks }];
+  }
   if (before.does === 'table' || !before.text) return replaced;
   for (let i = r1; i <= r1 + rows; i++) if (blocks[i].type !== 'paragraph') return replaced;
   const head = paragraphText(before.first as Paragraph).slice(0, o1);
   const tail = paragraphText(before.last as Paragraph).slice(o2);
   const start = paragraphText(blocks[r1] as Paragraph);
   const end = paragraphText(blocks[r1 + rows] as Paragraph);
+  // The drawings that are still the first ones of the paragraph where the command began: their boxes did not move (see
+  // boxShaken). A drawing has no width: one that went (deleted, or written over) shows in no text.
+  const kept = keptGraphics(before.first as Paragraph, blocks[r1] as Paragraph);
   // The very same text in the same paragraph: the command changed how it looks, and every place in it is where it was.
-  if (before.named && rows === 0 && r1 === r2 && start === paragraphText(before.first as Paragraph)) return [{ k: 'tch', s, c, r1, r2 }];
+  if (before.named && rows === 0 && r1 === r2 && start === paragraphText(before.first as Paragraph)) return [{ k: 'tch', s, c, r1, r2, gks: [kept] }];
   const last = end.length - tail.length - (rows === 0 ? o1 : 0);
   if (last < 0 || start.slice(0, o1) !== head || end.slice(end.length - tail.length) !== tail || (rows > 0 && start.length < o1)) return replaced;
   const out: Mark[] = [];
-  if (r1 !== r2 || o1 !== o2) out.push({ k: 'del', s, c, r1, o1, r2, o2 });
-  if (rows > 0 || last > 0) out.push({ k: 'ins', s, c, row: r1, off: o1, rows, last });
-  // Nothing came and nothing went: what the command changed is how the paragraph looks.
-  return out.length > 0 ? out : [{ k: 'tch', s, c, r1, r2 }];
+  if (r1 !== r2 || o1 !== o2) out.push({ k: 'del', s, c, r1, o1, r2, o2, gk: kept });
+  if (rows > 0 || last > 0) out.push({ k: 'ins', s, c, row: r1, off: o1, rows, last, gk: kept });
+  // Nothing came and nothing went in the text: what the command changed is how the paragraph looks, or what has no width in it.
+  return out.length > 0 ? out : [{ k: 'tch', s, c, r1, r2, gks: [kept] }];
 }
 
 /**
@@ -1338,6 +1618,30 @@ export function marksAfter(doc: DocModel, before: Before | undefined, story: str
 export function inverseOf(doc: DocModel, wire: DocWire, before: Before | undefined, marks: readonly Mark[], ops: readonly DocOp[]): DocWire[] | null {
   if (ops.length === 0) return [];
   if (!before || wire.t === 'cmt') return null;
+  const box = before.box;
+  if (box) {
+    // What takes it back in the box, made on its stand-in as it is now, in the places of the document.
+    const done = BOX_OPS.get(ops as DocOp[]);
+    const did = box.marks;
+    if (!done || !did) return null;
+    const inner: Before = { ...before };
+    delete inner.box;
+    let back: DocWire[] | null;
+    try {
+      const place: DocRange = { anchor: { story: box.s, path: box.base.concat([0]), offset: 0 }, focus: { story: box.s, path: box.base.concat([0]), offset: 0 } };
+      back = readInTextBox(doc, place, (inside) => inverseOf(inside, lowerWire(wire, box.base), inner, did, done));
+    } catch {
+      return null;
+    }
+    if (!back) return null;
+    const out: DocWire[] = [];
+    for (const one of back) {
+      const lifted = liftWire(one, box.s, box.base);
+      if (!lifted) return null;
+      out.push(lifted);
+    }
+    return out;
+  }
   for (const op of ops) if (op.type !== 'replaceBlocks' || op.story !== before.s) return null;
   const { s, c, r1, r2 } = before;
   const first = marks[0];

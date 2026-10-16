@@ -25,7 +25,7 @@ import { MAX_STEP_BYTES, utf8Length } from '../protocol';
 import { RoomSession, type CollabNoticeCode, type RoomHost, type RoomOptions, type RoomPeer } from '../room';
 import { CollabUnsupportedError, WireError } from '../types';
 import { stable } from '../wire';
-import { arrived, mapPos, orderOf, rebaseWire, type DocWire, type Mark, type WirePos } from './rebase';
+import { arrived, mapPos, movesPlaces, orderOf, rebaseWire, type DocWire, type Mark, type WirePos } from './rebase';
 import { commentBack, commentMarks, commentPrior } from './comments';
 import { MAX_STEP_WIRES, decodeStep, encodeStep, inverseOf, lookBefore, marksAfter, runWire } from './wire';
 
@@ -336,7 +336,7 @@ export class DocCollabSession extends RoomSession<Step, DocPresence> {
       (last as Entry).after = meta.after;
       return { marks, joined: true };
     }
-    const part: Part = { wires: done.back, moves: marks.some((mark) => mark.k !== 'tch') };
+    const part: Part = { wires: done.back, moves: marks.some(movesPlaces) };
     let entry: Entry;
     if (merges) {
       entry = last as Entry;
@@ -499,7 +499,7 @@ export class DocCollabSession extends RoomSession<Step, DocPresence> {
     const marks = flat(done.effects);
     // What takes the undoing back is there to be made again at once, as in the history of one user: what is done
     // next lies above it.
-    const part: Part = { wires: done.back, moves: marks.some((mark) => mark.k !== 'tch') };
+    const part: Part = { wires: done.back, moves: marks.some(movesPlaces) };
     const made: Entry = { parts: [part], before: entry.before, after: entry.after };
     (kind === 'undo' ? this.redoStack : this.undoStack).push(made);
     const step: Step = { id: '', wires: read, effects: done.effects, inverse: done.inverse, kind, part, entry: made, from: entry };
@@ -740,7 +740,7 @@ export class DocCollabSession extends RoomSession<Step, DocPresence> {
       if (step.from && step.from.parts.some((part) => part.moves)) for (const entry of step.kind === 'undo' ? this.undoStack : this.redoStack) entry.gone = true;
       // What was made after it was made on a document that had it: where that belongs now is not known, and it goes
       // with it. Unless the step moved nothing (it changed how text looks): then every place is where it was.
-      if (flat(step.effects).some((mark) => mark.k !== 'tch')) rest = true;
+      if (flat(step.effects).some(movesPlaces)) rest = true;
     }
     this.pendingSteps = kept;
     // (An undoing that was dropped took what lies under it with it, when it moved anything; when it moved nothing, every place is where it was.)

@@ -686,7 +686,7 @@ test('steps that arrive out of turn make the session ask again from where it is,
 test('a relay of another version of the contract ends the session; a room that says no name, or another room than the one this side was in, is not trusted', async () => {
   const s = await alone();
   assert.deepEqual([s.sent[0].pv, typeof s.sent[0].key, (s.sent[0] as { since?: number }).since], [PROTOCOL_VERSION, 'string', undefined], '"join" names the version; a first join names no step');
-  assert.equal(PROTOCOL_VERSION, 6);
+  assert.equal(PROTOCOL_VERSION, 7);
   assert.equal(s.session.reason, undefined, 'an open session has no reason');
   s.tell({ t: 'error', code: 'version' });
   assert.deepEqual([s.session.state, s.notices, s.session.reason], ['closed', ['version'], 'version'], 'a room of another version is told apart from a refusal');

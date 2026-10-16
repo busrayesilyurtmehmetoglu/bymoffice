@@ -250,6 +250,103 @@ test('what cannot be shared is refused and said, and changes nothing', async ({ 
   clean(b);
 });
 
+/** A document whose second paragraph anchors a text box Word writes (a DrawingML Choice and its VML Fallback) of two paragraphs. */
+const boxSample = (): Promise<Uint8Array> => {
+  const inner = paragraph('Box first line.') + paragraph('Box second line.');
+  const head =
+    '<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">' +
+    '<wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:posOffset>2540000</wp:posOffset></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+    '<wp:extent cx="2286000" cy="914400"/><wp:wrapNone/><wp:docPr id="7" name="Box"/>';
+  const box =
+    '<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>' +
+    head +
+    '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>' +
+    `<wps:txbx><w:txbxContent>${inner}</w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice>` +
+    `<mc:Fallback><w:pict><v:shape style="width:180pt;height:72pt"><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>`;
+  return buildDocx({ body: paragraph('First paragraph.') + `<w:p><w:r><w:t xml:space="preserve">Anchor </w:t></w:r>${box}</w:p>` + paragraph('Third paragraph.'), styles: STYLES });
+};
+
+/** The text of the text box of boxSample(), a line a paragraph. */
+const boxText = (page: Page): Promise<string> =>
+  page.evaluate(() => {
+    const api = (window as any).BymOffice;
+    const doc = (window as any).__mounted.document;
+    return api.docOps.containerBlocks(doc, 'body', [1, -1, 0, 0]).map((block: any) => api.paragraphText(block)).join('\n');
+  });
+
+/** Puts the caret at a place of the text box of boxSample() and types there. */
+const typeInBox = (page: Page, row: number, offset: number, typed: string): Promise<boolean> =>
+  page.evaluate(
+    ([r, o, t]) => {
+      const view = (window as any).__mounted.view;
+      view.setSelection({ story: 'body', path: [1, -1, 0, 0, r], offset: o });
+      return view.insertText(t);
+    },
+    [row, offset, typed] as [number, number, string],
+  );
+
+test('what one page types in a text box, the other one shows; both type in it at once and both texts stay; undo takes back the own', async ({ page, context, request }) => {
+  const { a, b } = await pair(context, page, request, { bytes: await boxSample() });
+  expect(await typeInBox(a, 0, 3, ' typed')).toBe(true);
+  await expect.poll(() => boxText(b), { message: 'the second page has the text in the box' }).toBe('Box typed first line.\nBox second line.');
+  // Both at once, in the same box.
+  await Promise.all([typeInBox(a, 1, 0, 'A: '), typeInBox(b, 0, 0, 'B: ')]);
+  await settled(a);
+  await settled(b);
+  await expect.poll(async () => (await boxText(a)) === (await boxText(b)), { message: 'the pages agree' }).toBe(true);
+  expect(await boxText(a)).toBe('B: Box typed first line.\nA: Box second line.');
+  // The text around the box is as it was.
+  expect((await text(a)).split('\n')[0]).toBe('First paragraph.');
+  // Undo takes back what this page typed, in the box, and leaves what the other one typed.
+  expect(await b.evaluate(() => (window as any).__mounted.view.undo())).toBe(true);
+  await expect.poll(() => boxText(a), { message: 'the first page lost what the second undid' }).toBe('Box typed first line.\nA: Box second line.');
+  expect(await notices(a), 'nothing was said to the first page').toEqual([]);
+  expect(await notices(b), 'nothing was said to the second page').toEqual([]);
+  clean(b);
+});
+
+test('keys typed in a text box arrive in the other page, Enter and Backspace too; the caret of the other one in the box moves with what was deleted before it', async ({ page, context, request }) => {
+  const { a, b } = await pair(context, page, request, { bytes: await boxSample() });
+  await b.evaluate(() => (window as any).__mounted.view.setSelection({ story: 'body', path: [1, -1, 0, 0, 1], offset: 10 }));
+  await a.evaluate(() => {
+    const view = (window as any).__mounted.view;
+    view.setSelection({ story: 'body', path: [1, -1, 0, 0, 1], offset: 0 });
+    view.focus();
+  });
+  await a.keyboard.type('xy');
+  await a.keyboard.press('Enter');
+  await a.keyboard.press('Backspace');
+  await a.keyboard.press('Backspace');
+  await expect.poll(() => boxText(b), { message: 'the second page has what was typed in the box' }).toBe('Box first line.\nxBox second line.');
+  await settled(a);
+  // The caret of the second page stood right after "second" in the box: it still does.
+  const focus = await b.evaluate(() => (window as any).__mounted.view.getSelection().focus);
+  expect(focus).toEqual({ story: 'body', path: [1, -1, 0, 0, 1], offset: 11 });
+  expect(await boxText(a)).toBe(await boxText(b));
+  clean(b);
+});
+
+test('saved to the same place after both typed in a text box: the file holds the box in both of its branches, and who opens it holds the same', async ({ page, context, request }) => {
+  const { a, b, url, room } = await pair(context, page, request, { saveTo: true, bytes: await boxSample() });
+  expect(await typeInBox(a, 0, 0, 'A ')).toBe(true);
+  expect(await typeInBox(b, 1, 0, 'B ')).toBe(true);
+  await settled(a);
+  await settled(b);
+  await expect.poll(async () => (await boxText(a)) === (await boxText(b))).toBe(true);
+  expect(await a.evaluate(() => (window as any).__mounted.saveNow())).toBe(true);
+  const stored = new Uint8Array(await (await request.get(url)).body());
+  const xml = Buffer.from(await (await open(stored)).package!.readPart('/word/document.xml')).toString('utf8');
+  expect(xml.split('A Box first line.').length - 1, 'the Choice and the Fallback').toBe(2);
+  const c = await context.newPage();
+  await c.goto(PAGE);
+  expect(await mount(c, { file: url, room, via: 'tab', name: 'Cem' })).toBe('document');
+  await online(c);
+  expect(await boxText(c)).toBe(await boxText(a));
+  expect(await typeInBox(c, 0, 0, 'C ')).toBe(true);
+  await expect.poll(() => boxText(a), { message: 'the first page has what the third typed in the box' }).toBe('C A Box first line.\nB Box second line.');
+  clean(b);
+});
+
 /** The comments a page lists: id, author, text, the comment answered, resolved. */
 const commentsOf = (page: Page): Promise<[number, string, string, number | null, boolean][]> =>
   page.evaluate(() => (window as any).__mounted.view.comments().map((c: any) => [c.id, c.author, c.text, c.parent === undefined ? null : c.parent, c.done]));

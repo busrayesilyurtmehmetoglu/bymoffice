@@ -144,6 +144,10 @@ test('a Fallback that differs only in paragraph ids, rsids, the order of attribu
     assert.equal(count(saved.xml, 'cat'), 0, what);
     assert.equal(count(saved.xml, 'dog'), 2, what);
     assert.equal(count(saved.xml, '<mc:AlternateContent>'), 1, what);
+    // The edited box gets the ids of the branch read in the other branch too (as Word writes them): the other branch is
+    // written from the model alone.
+    const ids = (text: string) => (text.match(/(paraId|textId|rsidR)="[^"]*"/g) || []).sort().join(' ');
+    assert.equal(ids(saved.xml.slice(saved.xml.indexOf('<mc:Fallback>'))), ids(choice), what);
   }
   // Other text is still other text.
   const other = await openBody(p(r('a ') + alt(drawing(P('', 'cat')), pict(P('', 'cat!')))));

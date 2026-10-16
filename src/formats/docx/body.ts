@@ -472,6 +472,12 @@ export function graphicTextBoxContents(ctx: PartContext, type: 'drawing' | 'pict
   return data ? findSelected(ctx, data, 'txbxContent') : [];
 }
 
+/**
+ * The lists of blocks of text boxes as the reader made them (an edit makes a new list): the writer writes a box Word
+ * wrote in two branches as it was read only while its blocks are these (see writeRunItem, 'alternate').
+ */
+export const READ_TEXT_BOXES = new WeakSet<Block[]>();
+
 function textBoxes(ctx: PartContext, contents: XmlElement[], depth: number): Block[][] | undefined {
   if (!contents.length) return undefined;
   const inner = nested(depth);
@@ -479,6 +485,7 @@ function textBoxes(ctx: PartContext, contents: XmlElement[], depth: number): Blo
     const blocks: Block[] = [];
     readBlocks(ctx, content.children, blocks, undefined, inner);
     linkFields(blocks);
+    READ_TEXT_BOXES.add(blocks);
     return blocks;
   });
 }

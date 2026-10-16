@@ -3,7 +3,7 @@
 // and where, and the carets of the others over the pages. Names are text of other people:
 // they are only ever set as textContent.
 
-import { mapPos, type Mark, type WirePos } from '../collab/doc/rebase';
+import { boxShaken, mapPos, type Mark, type WirePos } from '../collab/doc/rebase';
 import type { DocPeer } from '../collab/doc/session';
 import type { DocModel } from '../model/doc/types';
 import { containerBlocks, paragraphLength, resolvePosition, storyStart, type DocPosition, type DocRange } from '../ops/doc/position';
@@ -26,11 +26,25 @@ export function movedSelection(selection: DocRange, marks: readonly Mark[]): Doc
       if (mark.s === '*' || mark.s === anchor.s || mark.s === focus.s) return undefined;
       continue;
     }
+    // A caret in a text box that may not be the box it was in any more leaves it, for the paragraph that anchored the box
+    // (a drawing that went says nothing moved in the text: that too).
+    if (boxShaken(anchor.s, anchor.p, mark) || boxShaken(focus.s, focus.p, mark)) {
+      const out = outOfBoxes(boxShaken(focus.s, focus.p, mark) ? focus : anchor, mark);
+      anchor = out;
+      focus = out;
+    }
     if (mark.k === 'tch') continue;
     anchor = through(anchor, mark);
     focus = through(focus, mark);
   }
   return { anchor: fromWire(anchor), focus: fromWire(focus) };
+}
+
+/** The place at the start of the paragraph that anchors the outermost text box of a place which the mark may have moved. */
+function outOfBoxes(pos: WirePos, mark: Mark): WirePos {
+  const depth = mark.k === 'opq' ? 0 : mark.c.length;
+  const at = pos.p.indexOf(-1, depth);
+  return { s: pos.s, p: pos.p.slice(0, at), o: 0 };
 }
 
 /** How long what the others do is held back for an input method that composes. */

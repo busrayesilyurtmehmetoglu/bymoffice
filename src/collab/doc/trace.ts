@@ -15,7 +15,9 @@ import type { DocOp } from '../../ops/doc/ops';
 import { asRange, comparePositions, nextCharOffset, nextWordOffset, resolvePosition, samePosition, type DocPosition, type DocRange } from '../../ops/doc/position';
 import { deleteRange } from '../../ops/doc/text';
 import type { DocWire, WirePos } from './rebase';
-import { runWire, toWirePos } from './wire';
+import { liftWire, runWire, toWirePos } from './wire';
+import { editInTextBox } from '../../ops/doc/text-box';
+import { textBoxRootLength } from '../../ops/doc/position';
 import { COMMENT_COMMANDS, commentWireOf } from './comments';
 
 const MADE = new WeakMap<DocOp[], DocWire[]>();
@@ -202,4 +204,33 @@ export function traced<T extends object>(api: T, always = true): T {
     };
   }
   return out as T;
+}
+
+/**
+ * editInTextBox() for a document that is edited together: the command runs in the box as it does
+ * there, and what it travels as - the command, as it was noted on the stand-in of the box - is
+ * noted under what comes back, with its places in the box (see the text boxes of wire.ts). A
+ * command that cannot be shared stays unnoted (the history refuses it). Outside text boxes it is
+ * command(doc, range).
+ */
+export function sharedInTextBox(doc: DocModel, at: DocPosition | DocRange, command: (doc: DocModel, range: DocRange) => DocEdit): DocEdit {
+  const range = asRange(at);
+  const root = textBoxRootLength(range.anchor.path);
+  if (root === 0 && textBoxRootLength(range.focus.path) === 0) return command(doc, range);
+  let inner: DocWire[] | undefined;
+  const edit = editInTextBox(doc, range, (inside, lowered) => {
+    const made = command(inside, lowered);
+    inner = made && Array.isArray(made.ops) ? wiresOf(made.ops) : undefined;
+    return made;
+  });
+  if (edit.ops.length === 0 || !inner) return edit;
+  const base = range.anchor.path.slice(0, root);
+  const wires: DocWire[] = [];
+  for (const wire of inner) {
+    const lifted = liftWire(wire, range.anchor.story, base);
+    if (!lifted) return edit;
+    wires.push(lifted);
+  }
+  MADE.set(edit.ops, wires);
+  return edit;
 }
