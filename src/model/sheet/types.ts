@@ -1346,13 +1346,21 @@ export interface Sheet {
   paneRead?: PaneState;
   /**
    * How the sheet is protected (<sheetProtection>), and the ranges that are open in a
-   * protected sheet (<protectedRanges>), as the file states them. Not applied and not changed
-   * by edits: a save of the file copies the source elements (and moves the ranges with the
-   * rows and columns inserted and deleted since, see structuralEdits); a copy of the sheet
-   * and a sheet written from the model get them from here with the ranges moved the same
-   * way (protectionNow() of the xlsx builder).
+   * protected sheet (<protectedRanges>), as the file states them. Applied by the view through
+   * src/ops/protection.ts. Changed only by "setProtection" (protecting the sheet, removing its
+   * protection), which puts another object here; a save of the file copies the source elements
+   * otherwise (and moves the ranges with the rows and columns inserted and deleted since, see
+   * structuralEdits); a copy of the sheet and a sheet written from the model get them from
+   * here with the ranges moved the same way (protectionNow() of the xlsx builder).
    */
   protection?: SheetProtection;
+  /**
+   * The protection was changed ("setProtection"); the writer brings <sheetProtection> of the
+   * part in line with the model. Set on its own, without `modified`: no cell changed.
+   */
+  protectionModified?: boolean;
+  /** The protection the sheet had before it was first changed. Set with `protectionModified`. */
+  protectionRead?: { protection: SheetProtection | undefined };
   /**
    * Local names of what the sheet part holds beside what the model has a field for, one entry
    * per element (or attribute) found: "sortState", "customSheetViews", "ignoredErrors",
@@ -1512,11 +1520,22 @@ export interface DefinedName {
   hidden: boolean;
 }
 
+/** <workbookProtection> of a workbook: its attributes as the file has them (lockStructure, lockWindows, the hash of a password). */
+export interface WorkbookProtection {
+  attrs: [name: string, value: string][];
+}
+
 export interface Workbook {
   sheets: Sheet[];
   styles: StyleSheet;
   sharedStrings: SharedString[];
   definedNames: DefinedName[];
+  /**
+   * How the workbook is protected, as the file states it: with lockStructure no sheet is
+   * added, deleted, renamed, moved, copied, hidden or shown (see src/ops/protection.ts).
+   * Read only; the writer leaves the workbook part's element as it is.
+   */
+  protection?: WorkbookProtection;
   /** Dates count from 1904-01-01 instead of 1899-12-30. */
   date1904: boolean;
   /** Index of the sheet shown when the workbook opens. */

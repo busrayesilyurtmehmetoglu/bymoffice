@@ -3,6 +3,7 @@
 
 import type { TabStopsStrings } from './doc-tabs-dialog';
 import type { PrintPreviewStrings } from './print-preview';
+import type { ProtectionReason } from '../ops/protection';
 
 export interface UiStrings {
   spreadsheet: string;
@@ -469,6 +470,31 @@ export interface UiStrings {
   pageSetup: PageSetupStrings;
   /** The print preview of a workbook. */
   preview: PrintPreviewStrings;
+  /** Protected sheets and a workbook with a locked structure: what is said when something is refused, and the commands. */
+  protection: ProtectionStrings;
+}
+
+/** What is said about the protection of sheets and of the structure of a workbook. */
+export interface ProtectionStrings {
+  /** Why a change is refused, by the reason of src/ops/protection.ts. */
+  refused: { readonly [reason in ProtectionReason]: string };
+  /** The command of the menu of a tab that protects the sheet. */
+  protect: string;
+  /** The command of the menu of a tab that removes the protection of the sheet. */
+  unprotect: string;
+  protected(sheet: string): string;
+  unprotected(sheet: string): string;
+  /** The question for the password that removes the protection of a sheet. */
+  passwordTitle: string;
+  passwordQuestion(sheet: string): string;
+  passwordLabel: string;
+  passwordWrong: string;
+  passwordOk: string;
+  passwordCancel: string;
+  /** The protection is hashed in a way that cannot be checked here. */
+  passwordUnsupported: string;
+  /** Protecting and unprotecting are not shared while the workbook is edited together. */
+  collab: string;
 }
 
 /** What is said about shapes of a sheet. */
@@ -1711,6 +1737,38 @@ export const STRINGS_EN: UiStrings = {
     textFixed: 'The text of this shape cannot be changed here: the file gives it more than one look, a field or the text of a cell',
     noText: 'A line has no text',
   },
+  protection: {
+    refused: {
+      cells: 'The cell or range is on a protected sheet. To change it, remove the protection of the sheet (a password may be asked for)',
+      formatCells: 'The sheet is protected: its cells cannot be formatted',
+      formatColumns: 'The sheet is protected: its columns cannot be resized, hidden or shown',
+      formatRows: 'The sheet is protected: its rows cannot be resized, hidden or shown',
+      insertColumns: 'The sheet is protected: columns cannot be inserted',
+      insertRows: 'The sheet is protected: rows cannot be inserted',
+      deleteColumns: 'The sheet is protected: these columns cannot be deleted',
+      deleteRows: 'The sheet is protected: these rows cannot be deleted',
+      sort: 'The sheet is protected: this range cannot be sorted',
+      autoFilter: 'The sheet is protected: its filter cannot be changed',
+      pivotTables: 'The sheet is protected: its pivot tables cannot be changed',
+      objects: 'The sheet is protected: its notes, pictures, shapes and charts cannot be changed',
+      rules: 'The sheet is protected: its data validations and conditional formats cannot be changed',
+      merge: 'The sheet is protected: cells cannot be merged or unmerged',
+      lock: 'The sheet is protected: cells cannot be locked or unlocked',
+      structure: 'The structure of the workbook is protected: sheets cannot be added, deleted, renamed, moved, copied, hidden or shown',
+    },
+    protect: 'Protect sheet',
+    unprotect: 'Unprotect sheet',
+    protected: (sheet) => `Sheet ${sheet} is protected`,
+    unprotected: (sheet) => `Sheet ${sheet} is no longer protected`,
+    passwordTitle: 'Unprotect sheet',
+    passwordQuestion: (sheet) => `Enter the password that removes the protection of sheet ${sheet}.`,
+    passwordLabel: 'Password',
+    passwordWrong: 'The password is not correct.',
+    passwordOk: 'OK',
+    passwordCancel: 'Cancel',
+    passwordUnsupported: 'The password of this protection cannot be checked here',
+    collab: 'The protection of a sheet cannot be changed while the workbook is edited together',
+  },
   pictures: {
     insert: 'Insert picture',
     added: 'Picture inserted',
@@ -2603,6 +2661,38 @@ export const STRINGS_TR: UiStrings = {
     notCopyable: 'Bu şekil kopyalanamaz: dosya onun bir kopyada korunamayacak bilgilerini de tutuyor',
     textFixed: 'Bu şeklin metni burada değiştirilemez: dosya metne birden çok görünüm, bir alan ya da bir hücrenin metnini veriyor',
     noText: 'Çizginin metni olmaz',
+  },
+  protection: {
+    refused: {
+      cells: 'Hücre ya da aralık korumalı bir sayfada. Değiştirmek için sayfanın korumasını kaldırın (parola sorulabilir)',
+      formatCells: 'Sayfa korumalı: hücreleri biçimlendirilemez',
+      formatColumns: 'Sayfa korumalı: sütunları boyutlandırılamaz, gizlenemez ya da gösterilemez',
+      formatRows: 'Sayfa korumalı: satırları boyutlandırılamaz, gizlenemez ya da gösterilemez',
+      insertColumns: 'Sayfa korumalı: sütun eklenemez',
+      insertRows: 'Sayfa korumalı: satır eklenemez',
+      deleteColumns: 'Sayfa korumalı: bu sütunlar silinemez',
+      deleteRows: 'Sayfa korumalı: bu satırlar silinemez',
+      sort: 'Sayfa korumalı: bu aralık sıralanamaz',
+      autoFilter: 'Sayfa korumalı: süzgeci değiştirilemez',
+      pivotTables: 'Sayfa korumalı: özet tabloları değiştirilemez',
+      objects: 'Sayfa korumalı: notları, görselleri, şekilleri ve grafikleri değiştirilemez',
+      rules: 'Sayfa korumalı: veri doğrulamaları ve koşullu biçimleri değiştirilemez',
+      merge: 'Sayfa korumalı: hücreler birleştirilemez ya da ayrılamaz',
+      lock: 'Sayfa korumalı: hücrelerin kilidi değiştirilemez',
+      structure: 'Çalışma kitabının yapısı korumalı: sayfa eklenemez, silinemez, adlandırılamaz, taşınamaz, kopyalanamaz, gizlenemez ya da gösterilemez',
+    },
+    protect: 'Sayfayı koru',
+    unprotect: 'Sayfa korumasını kaldır',
+    protected: (sheet) => `${sheet} sayfası korundu`,
+    unprotected: (sheet) => `${sheet} sayfasının koruması kaldırıldı`,
+    passwordTitle: 'Sayfa korumasını kaldır',
+    passwordQuestion: (sheet) => `${sheet} sayfasının korumasını kaldıran parolayı girin.`,
+    passwordLabel: 'Parola',
+    passwordWrong: 'Parola doğru değil.',
+    passwordOk: 'Tamam',
+    passwordCancel: 'İptal',
+    passwordUnsupported: 'Bu korumanın parolası burada denetlenemiyor',
+    collab: 'Birlikte düzenlenirken sayfa koruması değiştirilemez',
   },
   pictures: {
     insert: 'Görsel ekle',

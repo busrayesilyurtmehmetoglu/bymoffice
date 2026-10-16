@@ -44,6 +44,7 @@ import {
   type SheetNameMap,
   type SheetNeighbours,
   type SheetPageSetup,
+  type SheetProtection,
   type SheetState,
   type SheetStructuralEdit,
   type StyleSheet,
@@ -286,6 +287,16 @@ export type Op =
       type: 'setDefinedNames';
       sheet: number;
       names: DefinedName[];
+    }
+  | {
+      /**
+       * Sets how a worksheet is protected (Sheet.protection; undefined: not at all): protecting it,
+       * removing its protection (see protection.ts). The object is held by reference and never
+       * altered. Its own inverse. Not `modified`: no cell changed.
+       */
+      type: 'setProtection';
+      sheet: number;
+      protection: SheetProtection | undefined;
     }
   | {
       /** Sets the colour of the tab of a sheet; undefined removes it. Its own inverse. */
@@ -1819,6 +1830,18 @@ export function applyOp(workbook: Workbook, op: Op): Op {
     }
     case 'setPane':
       return setPaneOp(workbook, op.sheet, op.pane);
+    case 'setProtection': {
+      const sheet = sheetAt(workbook, op.sheet);
+      if (sheet.kind !== 'worksheet') throw new RangeError('Only a worksheet has a protection that can be changed');
+      if (op.protection !== undefined && (op.protection === null || typeof op.protection !== 'object')) throw new RangeError('A protection is an object');
+      const previous = sheet.protection;
+      // What the sheet came with, noted once: the writer leaves the part alone while the protection is that one.
+      if (!sheet.protectionRead) sheet.protectionRead = { protection: previous };
+      if (op.protection) sheet.protection = op.protection;
+      else delete sheet.protection;
+      sheet.protectionModified = true;
+      return { type: 'setProtection', sheet: op.sheet, protection: previous };
+    }
     case 'setPageSetup': {
       const sheet = sheetAt(workbook, op.sheet);
       if (sheet.kind !== 'worksheet') throw new RangeError('Only a worksheet has a page setup that can be changed');

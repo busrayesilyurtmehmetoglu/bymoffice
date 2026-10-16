@@ -225,6 +225,8 @@ interface Globals {
   pictures: XlsPictures;
   /** What the charts are read with, and what all of them together may still cost. */
   charts: XlsChartContext;
+  /** <workbookProtection> from PROTECT, WINDOWPROTECT and PASSWORD of the globals; empty when none says anything. */
+  bookProtection: [string, string][];
 }
 
 function count(map: Map<number, number>, id: number): void {
@@ -317,6 +319,7 @@ function readGlobals(stream: RecordStream, streamName: string, decrypted = false
   const xti: XlsXti[] = [];
   let externalBooks = 0;
   const pictures = new XlsPictures();
+  const bookProtection: [string, string][] = [];
 
   let p = 4 + bofLength;
   let depth = 0;
@@ -424,6 +427,16 @@ function readGlobals(stream: RecordStream, streamName: string, decrypted = false
           book.externNames.push(name);
           break;
         }
+        case XLS_PROTECT:
+          // The structure of the workbook is locked (its sheets), WINDOWPROTECT its windows; PASSWORD the hash of the password.
+          if (length >= 2 && view.getUint16(data, true) === 1) setAttr(bookProtection, 'lockStructure', '1');
+          break;
+        case XLS_WINDOWPROTECT:
+          if (length >= 2 && view.getUint16(data, true) === 1) setAttr(bookProtection, 'lockWindows', '1');
+          break;
+        case XLS_PASSWORD:
+          if (length >= 2 && view.getUint16(data, true) !== 0) setAttr(bookProtection, 'workbookPassword', hex4(view.getUint16(data, true)));
+          break;
         case REC_NAME:
           rawNames.push(readName(stream, p, biff8, codepage));
           break;
@@ -460,7 +473,7 @@ function readGlobals(stream: RecordStream, streamName: string, decrypted = false
   const sharedBudget = Math.max(SHARED_FORMULA_FLOOR, size * SHARED_FORMULA_FACTOR);
   // The references of charts are turned into text like formulas; one that cannot be is no formula of a cell that was left out.
   const charts: XlsChartContext = { styles: built.styles, fontOf, formula: { ...ctx, failures: new Map() }, date1904, budget: { charts: MAX_WORKBOOK_CHARTS, points: MAX_WORKBOOK_CHART_POINTS, bytes: XLS_MAX_CHART_CACHE_BYTES } };
-  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget, pictures, charts };
+  return { biff8, codepage: ctx.codepage, date1904, activeTab, sheets, styles: built.styles, xfMap: built.xfMap, sharedStrings, rawNames, fontOf, ctx, report, sharedBudget, pictures, charts, bookProtection };
 }
 
 /** The defined names of the workbook; a name whose formula cannot be turned into text is left out. */
@@ -637,6 +650,8 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   const art = biff8 ? new XlsSheetArt(stream) : undefined;
   /** Tooltips by the range of the link they belong to; a later one for the same range replaces the earlier. */
   const tooltips = new Map<string, string>();
+  /** The records of the protection of the sheet: PROTECT, OBJPROTECT, SCENPROTECT, PASSWORD, and the flags of FEATHEADR. */
+  const guard: { locked: boolean; objects: boolean; scenarios: boolean; password: number; flags?: number } = { locked: false, objects: false, scenarios: false, password: 0 };
   const rangeKey = (range: CellRange): string => range.top + ',' + range.left + ',' + range.bottom + ',' + range.right;
   const page = new XlsPageSetup(stream, biff8, codepage);
   /** Inside the records of a custom view, which has page settings of its own; they are not the sheet's. */
@@ -1030,6 +1045,26 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
         // How the sheet is printed. One that says nothing the reader can use is counted with the records not read.
         if (customView || !page.read(id, d - 4, length)) count(report.skippedRecords, id);
         continue;
+      case XLS_PROTECT:
+      case XLS_OBJPROTECT:
+      case XLS_SCENPROTECT:
+        // A custom view has no protection of its own: these are the sheet's.
+        if (length >= 2) {
+          const on = view.getUint16(d, true) === 1;
+          if (id === XLS_PROTECT) guard.locked = on;
+          else if (id === XLS_OBJPROTECT) guard.objects = on;
+          else guard.scenarios = on;
+        }
+        continue;
+      case XLS_PASSWORD:
+        if (length >= 2) guard.password = view.getUint16(d, true);
+        continue;
+      case XLS_FEATHEADR:
+        // The shared feature header of enhanced protection (isf 2): four bytes of what the protected sheet allows. Its size
+        // (cbHdrData) is 4, or -1 (0xFFFFFFFF) as Excel and LibreOffice write it: the four bytes follow either way.
+        if (length >= 23 && view.getUint16(d + 12, true) === 2 && (view.getUint32(d + 15, true) === 4 || view.getUint32(d + 15, true) === 0xffffffff)) guard.flags = view.getUint32(d + 19, true);
+        else count(report.skippedRecords, id);
+        continue;
       case REC_SHEETEXT:
         if (length >= 20) {
           const color = view.getUint32(d + 16, true) & 0x7f;
@@ -1083,6 +1118,7 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
 
   const pageSetup = page.finish();
   if (pageSetup) sheet.pageSetup = pageSetup;
+  if (guard.locked) sheet.protection = { attrs: xlsSheetProtection(guard) };
 
   // Formulas that belong to a group.
   for (let i = 0; i < linkedCells.length; i++) {
@@ -1151,6 +1187,72 @@ function readSheet(stream: RecordStream, start: number, sheet: Sheet, globals: G
   if (!standardWidth && defaultWidthChars > 0 && defaultWidthChars !== 8 && defaultWidthChars <= 255) {
     sheet.defaultColWidth = Math.floor(((Math.ceil((defaultWidthChars * 7 + 5) / 8) * 8) / 7) * 256) / 256;
   }
+}
+
+const XLS_PROTECT = 0x0012;
+const XLS_PASSWORD = 0x0013;
+const XLS_WINDOWPROTECT = 0x0019;
+const XLS_OBJPROTECT = 0x0063;
+const XLS_SCENPROTECT = 0x00dd;
+const XLS_FEATHEADR = 0x0867;
+
+const hex4 = (value: number) => value.toString(16).toUpperCase().padStart(4, '0');
+
+function setAttr(attrs: [string, string][], name: string, value: string): void {
+  for (const pair of attrs) {
+    if (pair[0] === name) {
+      pair[1] = value;
+      return;
+    }
+  }
+  attrs.push([name, value]);
+}
+
+/**
+ * The bits of EnhancedProtection (MS-XLS 2.5.104) in their order, each set when the protected sheet
+ * ALLOWS what it names: the attributes of <sheetProtection> say the opposite (set: forbidden).
+ * objects and scenarios come from their own records. UNSURE: no xls file with these records was at hand.
+ */
+const ENHANCED_FLAGS = [
+  'objects',
+  'scenarios',
+  'formatCells',
+  'formatColumns',
+  'formatRows',
+  'insertColumns',
+  'insertRows',
+  'insertHyperlinks',
+  'deleteColumns',
+  'deleteRows',
+  'selectLockedCells',
+  'sort',
+  'autoFilter',
+  'pivotTables',
+  'selectUnlockedCells',
+];
+
+/**
+ * <sheetProtection> as an xls sheet states it. Without enhanced protection (an Excel 97 file) every
+ * attribute but those of the records is left out: their defaults forbid what Excel 97 forbade
+ * (formats, rows and columns, sorting, filters) and allow selecting cells.
+ */
+function xlsSheetProtection(guard: { objects: boolean; scenarios: boolean; password: number; flags?: number }): [string, string][] {
+  const attrs: [string, string][] = [];
+  if (guard.password !== 0) attrs.push(['password', hex4(guard.password)]);
+  attrs.push(['sheet', '1']);
+  if (guard.objects) attrs.push(['objects', '1']);
+  if (guard.scenarios) attrs.push(['scenarios', '1']);
+  const flags = guard.flags;
+  if (flags !== undefined) {
+    for (let bit = 2; bit < ENHANCED_FLAGS.length; bit++) {
+      const allowed = (flags & (1 << bit)) !== 0;
+      const name = ENHANCED_FLAGS[bit];
+      // As Excel writes them: only what differs from the default of the attribute.
+      const forbiddenByDefault = name !== 'selectLockedCells' && name !== 'selectUnlockedCells';
+      if (allowed === forbiddenByDefault) attrs.push([name, allowed ? '0' : '1']);
+    }
+  }
+  return attrs;
 }
 
 /** Do the relative references of a text stay on a sheet of the file's format when the text is moved by (dRow, dCol). */
@@ -1237,6 +1339,8 @@ export function readXlsStream(bytes: Uint8Array, streamName = 'Workbook', decryp
       date1904: globals.date1904,
       activeSheet: globals.activeTab < sheets.length ? globals.activeTab : 0,
     };
+    // A password without a lock protects nothing: only a locked structure or windows are written.
+    if (globals.bookProtection.some(([name]) => name === 'lockStructure' || name === 'lockWindows')) workbook.protection = { attrs: globals.bookProtection };
     const media = globals.pictures.media();
     if (media) workbook.media = media;
     return { workbook, report: globals.report };

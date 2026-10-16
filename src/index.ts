@@ -146,6 +146,28 @@ export {
   type CopySheetOptions,
   type InsertSheetOptions,
 } from './ops/sheets';
+export {
+  FLAG_DEFAULTS,
+  PROTECTION_FLAGS,
+  PasswordMismatch,
+  ProtectedError,
+  actionProblem,
+  cellProtected,
+  checkProtectionPassword,
+  formulaHidden,
+  legacyPasswordHash,
+  protectedCellIn,
+  protectionForbids,
+  protectionHasPassword,
+  protectionProblem,
+  setProtectionOps,
+  sheetProtected,
+  structureLocked,
+  unprotectSheetOps,
+  type ProtectionAction,
+  type ProtectionFlag,
+  type ProtectionReason,
+} from './ops/protection';
 export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveComments, noteProblem, setComment, type NoteOptions } from './ops/notes';
 export { PivotRefreshError, compareText, listPivots, lookThroughPivots, pivotAt, refreshAllPivots, refreshPivot, refreshPivotProblem, type PivotInfo, type RefreshAll } from './ops/pivots';
 export { MAX_PIVOT_AXIS_ITEMS } from './ops/pivots';

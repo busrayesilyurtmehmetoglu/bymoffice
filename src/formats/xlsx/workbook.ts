@@ -334,6 +334,13 @@ export async function readXlsx(pkg: OpcPackage): Promise<Workbook> {
     date1904: isTrue(properties?.attrs.get('date1904')),
     activeSheet: activeTab < sheets.length ? activeTab : 0,
   };
+  const protection = child(root, 'workbookProtection');
+  if (protection) {
+    // As the file has them, never more than a handful: the attributes of no namespace.
+    const attrs: [string, string][] = [];
+    for (const [name, value] of protection.attrs) if (name.indexOf(':') < 0 && name !== 'xmlns' && attrs.length < 64) attrs.push([name, value]);
+    workbook.protection = { attrs };
+  }
   if (chartParts > 0 && follow) workbook.chartsFollow = true;
   if (pivotParts.length > 0) {
     // The caches the workbook lists, by the part each is in: a table names its cache by that number.

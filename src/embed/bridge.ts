@@ -54,7 +54,9 @@ export type BridgeErrorCode =
   | 'no-document'
   | 'comment-refused'
   | 'pivot-refused'
-  | 'page-setup-refused';
+  | 'page-setup-refused'
+  /** The protection of a sheet, or of the structure of the workbook, refuses the command. */
+  | 'protected';
 
 /**
  * What the page shows around the editor: nothing open, a file on its way, a file open, a file that failed;
@@ -561,6 +563,11 @@ function sectionPatch(message: Message): SectionPatch {
 }
 
 /** What a view says of an error, in its language; the error's own text where it says nothing. */
+/** The code of a refusal: "protected" for what the protection of a sheet or of the workbook refuses, the command's own code otherwise. */
+function refusalCode(error: unknown, code: BridgeErrorCode): BridgeErrorCode {
+  return error !== null && typeof error === 'object' && (error as { code?: unknown }).code === 'protected' ? 'protected' : code;
+}
+
 function refusalText(view: WorkbookView, error: unknown): string {
   try {
     return typeof view.localizeError === 'function' ? view.localizeError(error) : errorText(error);
@@ -1975,7 +1982,7 @@ export function createBridge(host: BridgeHost): Bridge {
         else answer.changed = view.resetPageBreaks(sheet);
         answer.pageSetup = view.pageSetup(sheet);
       } catch (error) {
-        return fail('page-setup-refused', refusalText(view, error), id);
+        return fail(refusalCode(error, 'page-setup-refused'), refusalText(view, error), id);
       }
     } else if (pages) {
       if (type === 'insertPageBreak' || type === 'removePageBreak' || type === 'resetPageBreaks') return fail('no-sheet', 'The open file is a document: it has no sheets', id);
@@ -2038,7 +2045,7 @@ export function createBridge(host: BridgeHost): Bridge {
       } catch {
         text = errorText(error);
       }
-      return fail('sheet-refused', text, id);
+      return fail(refusalCode(error, 'sheet-refused'), text, id);
     }
     if (id !== undefined) send(answer);
   };
@@ -2067,7 +2074,7 @@ export function createBridge(host: BridgeHost): Bridge {
       } catch {
         text = errorText(error);
       }
-      return fail('pivot-refused', text, id);
+      return fail(refusalCode(error, 'pivot-refused'), text, id);
     }
     if (id !== undefined) send(answer);
   };
@@ -2169,7 +2176,7 @@ export function createBridge(host: BridgeHost): Bridge {
       } catch {
         text = errorText(error);
       }
-      return fail('pivot-refused', text, id);
+      return fail(refusalCode(error, 'pivot-refused'), text, id);
     }
     if (id !== undefined) send(answer);
   };
@@ -2226,7 +2233,7 @@ export function createBridge(host: BridgeHost): Bridge {
       } catch {
         text = errorText(error);
       }
-      return fail('sheet-refused', text, id);
+      return fail(refusalCode(error, 'sheet-refused'), text, id);
     }
     // A command that changed nothing a message tells of (a colour) still has its list looked at.
     if (id !== undefined) send(answer);

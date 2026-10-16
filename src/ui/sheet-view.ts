@@ -71,7 +71,7 @@ import {
   setAutoFilter,
   setFilterColumn,
 } from '../ops/filter';
-import { History, markStyles, resetStyles, type Op } from '../ops/ops';
+import { History, markStyles, resetStyles, type Op, type StylesMark } from '../ops/ops';
 import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps } from '../ops/notes';
 import { listPivots, lookThroughPivots, pivotAt, refreshAllPivots as refreshAllPivotsOps, refreshPivot as refreshPivotOps, type PivotInfo } from '../ops/pivots';
 import { createPivot, pivotSourceFields, type PivotCreateOptions } from '../ops/pivot-create';
@@ -219,6 +219,27 @@ import { onFontsChanged } from '../render/fonts';
 import { onEmbeddedFontNotice } from '../render/embedded-fonts';
 import { cssFont } from '../render/text';
 import { ContextMenu, type MenuItem } from './context-menu';
+import { PasswordPrompt } from './password-dialog';
+import {
+  PROTECTION_MESSAGES,
+  PasswordMismatch,
+  ProtectedError,
+  actionReason,
+  cellProtected,
+  defaultProtectionAttrs,
+  formulaHidden,
+  passwordAttrs,
+  protectedCellIn,
+  protectionHasPassword,
+  protectionProblem,
+  setProtectionOps,
+  sheetProtected,
+  structureLocked,
+  unprotectSheetOps,
+  type ProtectionAction,
+  type ProtectionFlag,
+  type ProtectionReason,
+} from '../ops/protection';
 import {
   DocumentPrintError,
   MAX_PRINT_PAGES,
@@ -2560,7 +2581,10 @@ export class WorkbookView {
     button.style.display = this.locked ? 'none' : 'block';
     button.style.width = `${width}px`;
     button.setAttribute('aria-label', this.strings.addSheet);
-    button.title = this.strings.addSheet;
+    // A workbook whose structure is protected takes no sheet: the button is off and says why.
+    const why = structureLocked(this.workbook) ? this.strings.protection.refused.structure : undefined;
+    button.disabled = why !== undefined;
+    button.title = why !== undefined ? why : this.strings.addSheet;
     // The tabs begin where the button ends, so that none is ever under it.
     this.tabs.style.marginLeft = `${width}px`;
     button.style.height = `${this.tabs.offsetHeight}px`;
@@ -2670,6 +2694,7 @@ export class WorkbookView {
    * workbook and the view as they were.
    */
   private applySheetOps(kind: SheetOpKind, ops: Op[], index: number): void {
+    this.refuseProtected(ops);
     this.closeMenu();
     this.finishNote(true, true);
     this.endDrag();
@@ -3108,6 +3133,8 @@ export class WorkbookView {
     const deleteProblem = canDeleteSheet(this.workbook, index);
     const copyProblem = canCopySheet(this.workbook, index);
     const hideProblem = canHideSheet(this.workbook, index);
+    // A workbook whose structure is protected: no sheet is added, moved, shown or given a tab colour either.
+    const structure = structureLocked(this.workbook) ? PROTECTION_MESSAGES.structure : undefined;
     // The menu closes before an item acts, but the list of sheets is looked at again all the same.
     const at = () => this.workbook.sheets.indexOf(sheet);
     const blocked = (problem: string | undefined) =>
@@ -3135,7 +3162,8 @@ export class WorkbookView {
       { label: '', separator: true },
       {
         label: strings.moveSheetLeft,
-        disabled: beside(-1) < 0,
+        ...blocked(structure),
+        disabled: beside(-1) < 0 || structure !== undefined,
         action: () =>
           this.attempt(() => {
             if (beside(-1) >= 0) this.moveSheet(at(), beside(-1));
@@ -3143,7 +3171,8 @@ export class WorkbookView {
       },
       {
         label: strings.moveSheetRight,
-        disabled: beside(1) < 0,
+        ...blocked(structure),
+        disabled: beside(1) < 0 || structure !== undefined,
         action: () =>
           this.attempt(() => {
             if (beside(1) >= 0) this.moveSheet(at(), beside(1));
@@ -3159,11 +3188,23 @@ export class WorkbookView {
           }),
       },
     ];
-    if (this.hiddenSheets.length > 0) more.push({ label: strings.unhideSheet, action: () => this.openHiddenSheets(x, y, backToTab) });
-    if (sheet.kind === 'worksheet') more.push({ label: strings.tabColor, action: () => this.openTabColors(sheet, backToTab) });
+    if (this.hiddenSheets.length > 0) more.push({ label: strings.unhideSheet, ...blocked(structure), action: () => this.openHiddenSheets(x, y, backToTab) });
+    if (sheet.kind === 'worksheet') {
+      const protectedNow = sheetProtected(sheet);
+      const why = this.collab ? strings.protection.collab : undefined;
+      more.push({
+        label: protectedNow ? strings.protection.unprotect : strings.protection.protect,
+        disabled: why !== undefined,
+        title: why,
+        explain: why === undefined ? undefined : () => this.notify(why, 'error'),
+        action: () => this.toggleProtection(sheet),
+      });
+      more.push({ label: strings.tabColor, ...blocked(structure), action: () => this.openTabColors(sheet, backToTab) });
+    }
     const items: MenuItem[] = [
       {
         label: strings.insertSheet,
+        ...blocked(structure),
         action: () =>
           this.attempt(() => {
             if (at() >= 0) this.insertSheet(at() + 1);
@@ -3374,7 +3415,8 @@ export class WorkbookView {
   private startTabDrag(drag: NonNullable<WorkbookView['tabDrag']>): void {
     // The menu a long press opened gives way: the finger went on to drag the tab.
     if (drag.touch) this.closeMenu();
-    if (this.destroyed || this.locked || this.formulaEdit() || this.workbook.sheets.indexOf(drag.sheet) < 0 || !this.tryCommit()) {
+    // Nor is a sheet moved in a workbook whose structure is protected.
+    if (this.destroyed || this.locked || this.formulaEdit() || this.workbook.sheets.indexOf(drag.sheet) < 0 || structureLocked(this.workbook) || !this.tryCommit()) {
       this.endTabDrag();
       return;
     }
@@ -3842,7 +3884,7 @@ export class WorkbookView {
       const range = state.range;
       made.range = range.top === range.bottom && range.left === range.right ? currentRegion(state.sheet, range.top, range.left) : { ...range };
     }
-    if (!this.applyOps(addChartOps(this.workbook, this.sheetIndex, made))) return -1;
+    if (!this.applyOps(() => addChartOps(this.workbook, this.sheetIndex, made))) return -1;
     const id = (state.sheet.drawings || []).length - 1;
     this.setChartPick(id, false);
     this.live.textContent = this.strings.charts.added;
@@ -3852,20 +3894,20 @@ export class WorkbookView {
   /** Changes a chart of the shown sheet: see ChartPatch. Throws RangeError for what cannot be done. */
   updateChart(id: number, patch: ChartPatch): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(updateChartOps(this.workbook, this.sheetIndex, id, patch))) this.live.textContent = this.strings.charts.changed;
+    if (this.applyOps(() => updateChartOps(this.workbook, this.sheetIndex, id, patch))) this.live.textContent = this.strings.charts.changed;
   }
 
   /** Moves or sizes a chart of the shown sheet: `anchor` is where it stands from now on (an anchor, or the cells it covers). */
   moveChart(id: number, anchor: DrawingAnchor | CellRange): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(moveChartOps(this.workbook, this.sheetIndex, id, anchor))) this.live.textContent = this.strings.charts.moved;
+    if (this.applyOps(() => moveChartOps(this.workbook, this.sheetIndex, id, anchor))) this.live.textContent = this.strings.charts.moved;
   }
 
   /** Deletes a chart of the shown sheet. */
   removeChart(id: number): void {
     if (!this.beginRules()) return;
     const picked = this.pickedDrawing();
-    if (!this.applyOps(removeChartOps(this.workbook, this.sheetIndex, id))) return;
+    if (!this.applyOps(() => removeChartOps(this.workbook, this.sheetIndex, id))) return;
     // The charts behind it moved up by one place.
     if (picked !== undefined) this.setChartPick(picked === id ? undefined : picked > id ? picked - 1 : picked, false);
     this.live.textContent = this.strings.charts.removed;
@@ -3977,6 +4019,7 @@ export class WorkbookView {
    */
   openChartDialog(id?: number): boolean {
     if (!this.beginDialog()) return false;
+    if (this.saidProtected('objects')) return false;
     const index = id === undefined ? this.pickedChart() : id;
     const strings = this.strings.charts;
     const info = index === undefined ? undefined : this.charts().find((chart) => chart.id === index);
@@ -4610,7 +4653,7 @@ export class WorkbookView {
     const size = defaultPictureSize(facts.width, facts.height);
     const at = options && options.at ? options.at : state.active;
     const anchor = pictureAnchorAt(state.sheet, at.row, at.col, size.width, size.height);
-    if (!this.applyOps(addPictureOps(this.workbook, this.sheetIndex, bytes, facts.type, anchor, { description: options ? options.description : undefined }))) return -1;
+    if (!this.applyOps(() => addPictureOps(this.workbook, this.sheetIndex, bytes, facts.type, anchor, { description: options ? options.description : undefined }))) return -1;
     const id = (state.sheet.drawings || []).length - 1;
     this.setChartPick(id, false);
     this.live.textContent = this.strings.pictures.added;
@@ -4623,14 +4666,14 @@ export class WorkbookView {
    */
   movePicture(id: number, anchor: DrawingAnchor | CellRange): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(movePictureOps(this.workbook, this.sheetIndex, id, anchor))) this.live.textContent = this.strings.pictures.moved;
+    if (this.applyOps(() => movePictureOps(this.workbook, this.sheetIndex, id, anchor))) this.live.textContent = this.strings.pictures.moved;
   }
 
   /** Deletes a picture of the shown sheet. */
   removePicture(id: number): void {
     if (!this.beginRules()) return;
     const picked = this.pickedDrawing();
-    if (!this.applyOps(removePictureOps(this.workbook, this.sheetIndex, id))) return;
+    if (!this.applyOps(() => removePictureOps(this.workbook, this.sheetIndex, id))) return;
     // The drawings behind it moved up by one place.
     if (picked !== undefined) this.setChartPick(picked === id ? undefined : picked > id ? picked - 1 : picked, false);
     this.live.textContent = this.strings.pictures.removed;
@@ -4644,7 +4687,7 @@ export class WorkbookView {
     if (!this.beginRules()) return;
     const metrics = this.state().metrics;
     const box = turnedBox(rect, this.pictureRotationAt(id));
-    if (this.applyOps(movePictureTo(this.workbook, this.sheetIndex, id, box, metrics))) this.live.textContent = this.strings.pictures.moved;
+    if (this.applyOps(() => movePictureTo(this.workbook, this.sheetIndex, id, box, metrics))) this.live.textContent = this.strings.pictures.moved;
   }
 
   /** The picture a command is about: the one that is named, or the selected one. Throws RangeError when there is none. */
@@ -4660,7 +4703,7 @@ export class WorkbookView {
    */
   rotatePicture(id: number, degrees: number): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(rotatePictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), degrees))) this.live.textContent = this.strings.pictures.rotated;
+    if (this.applyOps(() => rotatePictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), degrees))) this.live.textContent = this.strings.pictures.rotated;
   }
 
   /**
@@ -4669,13 +4712,13 @@ export class WorkbookView {
    */
   cropPicture(id: number, crop: PictureCrop | undefined): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(cropPictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), crop))) this.live.textContent = this.strings.pictures.cropped;
+    if (this.applyOps(() => cropPictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), crop))) this.live.textContent = this.strings.pictures.cropped;
   }
 
   /** Gives a picture of the shown sheet another alternative text (empty or undefined takes it away), as one undo step. */
   setPictureDescription(id: number, text: string | undefined): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(describePictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), text))) this.live.textContent = this.strings.pictures.described;
+    if (this.applyOps(() => describePictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), text))) this.live.textContent = this.strings.pictures.described;
   }
 
   /**
@@ -4808,7 +4851,7 @@ export class WorkbookView {
           return;
         }
         const picked = this.pickedDrawing();
-        if (!this.applyOps(removePictureOps(this.workbook, this.sheetIndex, removed))) return;
+        if (!this.applyOps(() => removePictureOps(this.workbook, this.sheetIndex, removed))) return;
         // The drawings behind it moved up by one place.
         if (picked !== undefined) this.setChartPick(picked === removed ? undefined : picked > removed ? picked - 1 : picked, false);
         this.live.textContent = this.strings.pictures.cutOut;
@@ -5046,7 +5089,7 @@ export class WorkbookView {
     const at = options && options.at ? options.at : state.active;
     const size = defaultShapeSize(kind);
     const anchor = shapeAnchorAt(state.sheet, at.row, at.col, size.width, size.height, size.height === 0 ? 0 : undefined);
-    if (!this.applyOps(addShapeOps(this.workbook, this.sheetIndex, kind, anchor, { text: options ? options.text : undefined }))) return -1;
+    if (!this.applyOps(() => addShapeOps(this.workbook, this.sheetIndex, kind, anchor, { text: options ? options.text : undefined }))) return -1;
     const id = (state.sheet.drawings || []).length - 1;
     this.setChartPick(id, false);
     this.live.textContent = this.strings.shapes.added;
@@ -5056,7 +5099,7 @@ export class WorkbookView {
   /** Moves or sizes a shape of the shown sheet: `anchor` is an anchor of the kind it has, or the cells it covers. */
   moveShape(id: number, anchor: DrawingAnchor | CellRange): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(moveShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), anchor))) this.live.textContent = this.strings.shapes.moved;
+    if (this.applyOps(() => moveShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), anchor))) this.live.textContent = this.strings.shapes.moved;
   }
 
   /** Deletes a shape of the shown sheet. */
@@ -5064,7 +5107,7 @@ export class WorkbookView {
     if (!this.beginRules()) return;
     const index = this.shapeNamed(id);
     const picked = this.pickedDrawing();
-    if (!this.applyOps(removeShapeOps(this.workbook, this.sheetIndex, index))) return;
+    if (!this.applyOps(() => removeShapeOps(this.workbook, this.sheetIndex, index))) return;
     // The drawings behind it moved up by one place.
     if (picked !== undefined) this.setChartPick(picked === index ? undefined : picked > index ? picked - 1 : picked, false);
     this.live.textContent = this.strings.shapes.removed;
@@ -5073,13 +5116,13 @@ export class WorkbookView {
   /** Turns a shape of the shown sheet to `degrees` (clockwise, about the middle of its box), as one undo step. */
   rotateShape(id: number, degrees: number): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(rotateShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), degrees))) this.live.textContent = this.strings.shapes.rotated;
+    if (this.applyOps(() => rotateShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), degrees))) this.live.textContent = this.strings.shapes.rotated;
   }
 
   /** Gives a shape of the shown sheet another text (lines broken by "\n"; empty takes it away), as one undo step. */
   setShapeText(id: number, text: string | undefined): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(setShapeTextOps(this.workbook, this.sheetIndex, this.shapeNamed(id), text))) this.live.textContent = this.strings.shapes.textChanged;
+    if (this.applyOps(() => setShapeTextOps(this.workbook, this.sheetIndex, this.shapeNamed(id), text))) this.live.textContent = this.strings.shapes.textChanged;
   }
 
   /**
@@ -5089,7 +5132,7 @@ export class WorkbookView {
    */
   formatShape(id: number | undefined, format: ShapeFormat): void {
     if (!this.beginRules()) return;
-    if (this.applyOps(formatShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), format))) this.live.textContent = this.strings.shapes.formatted;
+    if (this.applyOps(() => formatShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), format))) this.live.textContent = this.strings.shapes.formatted;
   }
 
   /** Puts a shape over a box of the sheet (pixels) with the kind of anchor it has; near a quarter turn its anchor is that box turned. */
@@ -5097,7 +5140,7 @@ export class WorkbookView {
     if (!this.beginRules()) return;
     const metrics = this.state().metrics;
     const box = turnedBox(rect, this.pictureRotationAt(id));
-    if (this.applyOps(moveShapeTo(this.workbook, this.sheetIndex, id, box, metrics))) this.live.textContent = this.strings.shapes.moved;
+    if (this.applyOps(() => moveShapeTo(this.workbook, this.sheetIndex, id, box, metrics))) this.live.textContent = this.strings.shapes.moved;
   }
 
   /** Whether a shape that was copied or cut in a view of this page is held for pasteShape(). */
@@ -5344,7 +5387,7 @@ export class WorkbookView {
     if (apply && index >= 0 && !this.locked && edit.input.value !== edit.original) {
       edit.busy = true;
       try {
-        if (this.applyOps(setShapeTextOps(this.workbook, this.sheetIndex, index, edit.input.value))) this.live.textContent = this.strings.shapes.textChanged;
+        if (this.applyOps(() => setShapeTextOps(this.workbook, this.sheetIndex, index, edit.input.value))) this.live.textContent = this.strings.shapes.textChanged;
       } catch (error) {
         edit.busy = false;
         const message = this.localizeError(error);
@@ -5795,7 +5838,7 @@ export class WorkbookView {
   private applyNote(row: number, col: number, text: string | undefined): void {
     const sheet = this.state().sheet;
     const had = commentAtCell(sheet, row, col) !== undefined;
-    const done = this.applyOps(setCommentOps(this.workbook, this.sheetIndex, row, col, text, { author: this.options.author }));
+    const done = this.applyOps(() => setCommentOps(this.workbook, this.sheetIndex, row, col, text, { author: this.options.author }));
     // Nothing is left on the cell to be read out: that the note went is said in its place.
     if (done && had && !commentAtCell(sheet, row, col)) this.live.textContent = this.strings.noteDeleted;
   }
@@ -6041,7 +6084,7 @@ export class WorkbookView {
       onChoose: (index) =>
         this.attempt(() => {
           // The list belongs to the sheet it was opened on, wherever that sheet is by now.
-          if (this.state().sheet === sheet) this.applyOps(setCellInput(this.workbook, this.sheetIndex, row, col, list.items[index], { locale: this.locale }));
+          if (this.state().sheet === sheet) this.applyOps(() => setCellInput(this.workbook, this.sheetIndex, row, col, list.items[index], { locale: this.locale }));
         }),
       onClose: () => this.panelClosed(),
     });
@@ -6074,7 +6117,7 @@ export class WorkbookView {
   setValidation(range: CellRange, rule: ValidationSettings | undefined): void {
     if (this.destroyed || this.locked) return;
     if (!this.commitPending()) return;
-    this.applyOps(setValidationOps(this.workbook, this.sheetIndex, range, rule));
+    this.applyOps(() => setValidationOps(this.workbook, this.sheetIndex, range, rule));
   }
 
   /**
@@ -6093,6 +6136,8 @@ export class WorkbookView {
       this.notify(this.strings.rules.formulaBeingTyped, 'error');
       return false;
     }
+    // A protected sheet keeps its rules: the dialog would only end in a refusal.
+    if (this.saidProtected('rules')) return false;
     // A tab that is being dragged is let go where it was: the dialog takes every pointer from here on.
     this.endTabDrag();
     this.closeMenu();
@@ -6185,7 +6230,7 @@ export class WorkbookView {
    */
   addConditionalRule(range: CellRange | CellRange[], rule: ConditionalSettings): void {
     if (!this.beginRules()) return;
-    this.applyOps(addConditionalRuleOps(this.workbook, this.sheetIndex, range, rule));
+    this.applyOps(() => addConditionalRuleOps(this.workbook, this.sheetIndex, range, rule));
   }
 
   /**
@@ -6195,25 +6240,25 @@ export class WorkbookView {
    */
   updateConditionalRule(index: number, patch: ConditionalPatch): void {
     if (!this.beginRules()) return;
-    this.applyOps(updateConditionalRuleOps(this.workbook, this.sheetIndex, index, patch));
+    this.applyOps(() => updateConditionalRuleOps(this.workbook, this.sheetIndex, index, patch));
   }
 
   /** Deletes the rule at `index`. Throws RangeError for an index that names no rule and for a rule that is kept as it is. */
   removeConditionalRule(index: number): void {
     if (!this.beginRules()) return;
-    this.applyOps(removeConditionalRuleOps(this.workbook, this.sheetIndex, index));
+    this.applyOps(() => removeConditionalRuleOps(this.workbook, this.sheetIndex, index));
   }
 
   /** Moves the rule at `index` so that it is applied as number `to` (0: first). */
   moveConditionalRule(index: number, to: number): void {
     if (!this.beginRules()) return;
-    this.applyOps(moveConditionalRuleOps(this.workbook, this.sheetIndex, index, to));
+    this.applyOps(() => moveConditionalRuleOps(this.workbook, this.sheetIndex, index, to));
   }
 
   /** Takes the cells of a range out of every conditional rule of the shown sheet; without a range, deletes all its rules. */
   clearConditionalRules(range?: CellRange): void {
     if (!this.beginRules()) return;
-    this.applyOps(clearConditionalRulesOps(this.workbook, this.sheetIndex, range));
+    this.applyOps(() => clearConditionalRulesOps(this.workbook, this.sheetIndex, range));
   }
 
   /**
@@ -6537,6 +6582,7 @@ export class WorkbookView {
    */
   openConditionalDialog(what?: string | number): boolean {
     if (!this.beginDialog()) return false;
+    if (this.saidProtected('rules')) return false;
     if (what === 'manage') return this.openRulesManager('selection');
     return this.openRuleDialog(what, undefined);
   }
@@ -7209,7 +7255,7 @@ export class WorkbookView {
     if (!this.settleDialog()) return;
     this.closeMenu();
     if (sheet.autoFilter) {
-      this.applyOps(setAutoFilter(this.workbook, this.sheetIndex, undefined));
+      this.applyOps(() => setAutoFilter(this.workbook, this.sheetIndex, undefined));
       return;
     }
     const range = this.singleCell() ? currentRegion(sheet, state.active.row, state.active.col) : state.range;
@@ -7217,7 +7263,7 @@ export class WorkbookView {
     if (range.top === range.bottom && range.left === range.right && (!first || first.value === null || first.value === '')) {
       throw new RangeError('There is no data to filter');
     }
-    this.applyOps(setAutoFilter(this.workbook, this.sheetIndex, range));
+    this.applyOps(() => setAutoFilter(this.workbook, this.sheetIndex, range));
   }
 
   /**
@@ -7248,7 +7294,7 @@ export class WorkbookView {
       range = state.range;
       header = false;
     }
-    this.applyOps(sortRange(this.workbook, this.sheetIndex, range, [{ col: active.col, descending: descending === true }], { locale: this.locale, header }));
+    this.applyOps(() => sortRange(this.workbook, this.sheetIndex, range, [{ col: active.col, descending: descending === true }], { locale: this.locale, header }));
   }
 
   /**
@@ -7262,7 +7308,7 @@ export class WorkbookView {
     const filter = sheet.autoFilter;
     if (!filter) throw new RangeError('The sheet has no filter');
     const criterion = choice ? { kind: 'values' as const, values: choice.values.map(String), ...(choice.blank ? { blank: true } : {}) } : undefined;
-    this.applyOps(setFilterColumn(this.workbook, this.sheetIndex, toIndex(col, MAX_COLS) - filter.range.left, criterion, { locale: this.locale }));
+    this.applyOps(() => setFilterColumn(this.workbook, this.sheetIndex, toIndex(col, MAX_COLS) - filter.range.left, criterion, { locale: this.locale }));
     const summary = filterSummary(sheet);
     if (summary) this.notify(this.strings.recordsShown(summary.shown, summary.total), 'info');
   }
@@ -7306,7 +7352,7 @@ export class WorkbookView {
       onSort: (descending) =>
         this.attempt(() => {
           const current = this.state().sheet.autoFilter;
-          if (current) this.applyOps(sortRange(this.workbook, this.sheetIndex, current.range, [{ col, descending }], { locale: this.locale, header: true }));
+          if (current) this.applyOps(() => sortRange(this.workbook, this.sheetIndex, current.range, [{ col, descending }], { locale: this.locale, header: true }));
         }),
       onApply: (choice) =>
         this.attempt(() => {
@@ -7715,6 +7761,8 @@ export class WorkbookView {
     if (!this.settleDialog()) return;
     const state = this.state();
     if (state.sheet.kind !== 'worksheet') return;
+    // A locked cell of a protected sheet is not edited: that is said instead.
+    if (this.refuseLockedCell()) return;
     this.closeMenu();
     // Asked for by the application or by a press on the cell: the chart that was selected is let go of.
     if (this.pickedDrawing() !== undefined) this.setChartPick(undefined, false);
@@ -7743,7 +7791,9 @@ export class WorkbookView {
     const state = this.state();
     const spill = this.spillOfActive();
     if (!spill || (spill.row === state.active.row && spill.col === state.active.col)) return undefined;
-    return { row: spill.row, col: spill.col, range: spill.range, text: editTextAt(this.workbook, state.sheet, spill.row, spill.col, { locale: this.locale }) };
+    // A formula the protection of the sheet hides is not shown through the cells it fills either.
+    if (formulaHidden(this.workbook, state.sheet, spill.row, spill.col)) return undefined;
+    return { row: spill.row, col: spill.col, range: spill.range, text: this.cellEditText(state.sheet, spill.row, spill.col) };
   }
 
   /** The spill the active cell is part of, its formula's own cell included. */
@@ -7762,7 +7812,16 @@ export class WorkbookView {
     if (this.edit) return this.input.value;
     const state = this.state();
     if (state.sheet.kind !== 'worksheet') return '';
-    return editTextAt(this.workbook, state.sheet, state.active.row, state.active.col, { locale: this.locale });
+    return this.cellEditText(state.sheet, state.active.row, state.active.col);
+  }
+
+  /**
+   * The text a cell is edited with, as the formula bar shows it: nothing for a formula the
+   * protection of its sheet hides (the cell still shows its value).
+   */
+  private cellEditText(sheet: Sheet, row: number, col: number): string {
+    if (formulaHidden(this.workbook, sheet, row, col)) return '';
+    return editTextAt(this.workbook, sheet, row, col, { locale: this.locale });
   }
 
   /** Replaces the text being edited; starts editing the active cell when nothing is being edited. Does not move focus. */
@@ -7772,6 +7831,7 @@ export class WorkbookView {
       // A dialog of rules with changes is not given up for this: the call is refused (see settleDialog()).
       if (!this.settleDialog()) return;
       if (this.state().sheet.kind !== 'worksheet') return;
+      if (this.refuseLockedCell()) return;
       this.closeMenu();
       this.beginEdit();
     }
@@ -7807,7 +7867,10 @@ export class WorkbookView {
     }
     // A data validation speaks for itself: the words are those of the file.
     if (error instanceof ValidationError) return error.display;
+    if (error instanceof ProtectedError) return strings.protection.refused[error.reason];
+    if (error instanceof PasswordMismatch) return strings.protection.passwordWrong;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+    for (const reason of Object.keys(PROTECTION_MESSAGES) as ProtectionReason[]) if (message === PROTECTION_MESSAGES[reason]) return strings.protection.refused[reason];
     let match: RegExpExecArray | null;
     if (/^Cannot (refresh the pivot table|change the fields of the pivot table|make the pivot table|delete the pivot table)/.test(message)) return strings.pivots.refused(message);
     if (message === 'A pivot table cannot be changed while the workbook is edited together' || message === 'A pivot table cannot be deleted while the workbook is edited together') return strings.collab.unsupported;
@@ -7950,19 +8013,23 @@ export class WorkbookView {
   format(patch: StylePatch): void {
     if (this.destroyed || this.locked) return;
     this.commitEditing();
+    // Refused before the formats are made: a protected sheet that forbids formats gets none.
+    this.refuseAction('formatCells');
     const state = this.state();
     const range = state.range;
     const filtered = fullHeight(range) ? [] : rowsHiddenByFilter(state.sheet, range.top, range.bottom);
     if (filtered.length === 0) {
-      this.applyOps(formatRange(this.workbook, this.sheetIndex, range, patch));
+      this.applyOps(() => formatRange(this.workbook, this.sheetIndex, range, patch));
       return;
     }
-    const ops: Op[] = [];
-    for (const run of rowRunsWithout(range.top, range.bottom, filtered)) {
-      const part = formatRange(this.workbook, this.sheetIndex, { top: run.top, left: range.left, bottom: run.bottom, right: range.right }, patch);
-      for (let i = 0; i < part.length; i++) ops.push(part[i]);
-    }
-    this.applyOps(ops);
+    this.applyOps(() => {
+      const ops: Op[] = [];
+      for (const run of rowRunsWithout(range.top, range.bottom, filtered)) {
+        const part = formatRange(this.workbook, this.sheetIndex, { top: run.top, left: range.left, bottom: run.bottom, right: range.right }, patch);
+        for (let i = 0; i < part.length; i++) ops.push(part[i]);
+      }
+      return ops;
+    });
   }
 
   /**
@@ -7977,7 +8044,7 @@ export class WorkbookView {
     this.commitEditing();
     const range = { ...this.state().range };
     const report = mergeReport(this.workbook, this.sheetIndex, range);
-    const done = this.applyOps(mergeRange(this.workbook, this.sheetIndex, range, { center: !!(options && options.center) }), { active: { row: range.top, col: range.left }, range });
+    const done = this.applyOps(() => mergeRange(this.workbook, this.sheetIndex, range, { center: !!(options && options.center) }), { active: { row: range.top, col: range.left }, range });
     return done ? report : undefined;
   }
 
@@ -7992,6 +8059,7 @@ export class WorkbookView {
     const range = { ...this.state().range };
     const sheet = this.state().sheet;
     // Refused before anything is asked: the question would be about a merge that cannot be made.
+    this.refuseAction('merge');
     const problem = range.top === range.bottom && range.left === range.right ? undefined : mergeProblem(this.workbook, this.sheetIndex, range);
     if (problem) throw new RangeError(problem);
     const report = mergeReport(this.workbook, this.sheetIndex, range);
@@ -8037,7 +8105,7 @@ export class WorkbookView {
   unmerge(): void {
     if (this.destroyed || this.locked) return;
     this.commitEditing();
-    this.applyOps(unmergeRange(this.workbook, this.sheetIndex, this.state().range));
+    this.applyOps(() => unmergeRange(this.workbook, this.sheetIndex, this.state().range));
   }
 
   /** The rows at the top and the columns at the left of the shown sheet that stay in place while it scrolls. */
@@ -8058,7 +8126,7 @@ export class WorkbookView {
     const r = rows === undefined && cols === undefined ? state.active.row : rows === undefined ? 0 : rows;
     const c = rows === undefined && cols === undefined ? state.active.col : cols === undefined ? 0 : cols;
     this.commitEditing();
-    if (!this.applyOps(freezePaneOps(this.workbook, this.sheetIndex, r, c))) return;
+    if (!this.applyOps(() => freezePaneOps(this.workbook, this.sheetIndex, r, c))) return;
     const now = this.state();
     if (r > 0 || c > 0) {
       // The part that scrolls starts where it starts.
@@ -8090,7 +8158,7 @@ export class WorkbookView {
   setPageSetup(patch: PageSetupPatch, sheet: number = this.sheetIndex): boolean {
     if (this.destroyed || this.locked) return false;
     if (!this.commitPending()) return false;
-    return this.applyOps(setPageSetupOps(this.workbook, sheet, patch));
+    return this.applyOps(() => setPageSetupOps(this.workbook, sheet, patch));
   }
 
   /**
@@ -8103,7 +8171,7 @@ export class WorkbookView {
     if (this.destroyed || this.locked) return false;
     if (!this.commitPending()) return false;
     const active = this.state().active;
-    return this.applyOps(insertPageBreakOps(this.workbook, sheet, at || { row: active.row, col: active.col }));
+    return this.applyOps(() => insertPageBreakOps(this.workbook, sheet, at || { row: active.row, col: active.col }));
   }
 
   /** Takes away the page breaks above the active cell and left of it (or at the row and the column given): one undo step. */
@@ -8111,14 +8179,14 @@ export class WorkbookView {
     if (this.destroyed || this.locked) return false;
     if (!this.commitPending()) return false;
     const active = this.state().active;
-    return this.applyOps(removePageBreakOps(this.workbook, sheet, at || { row: active.row, col: active.col }));
+    return this.applyOps(() => removePageBreakOps(this.workbook, sheet, at || { row: active.row, col: active.col }));
   }
 
   /** Takes away every manual page break of a sheet (the shown one unless given): one undo step. */
   resetPageBreaks(sheet: number = this.sheetIndex): boolean {
     if (this.destroyed || this.locked) return false;
     if (!this.commitPending()) return false;
-    return this.applyOps(resetPageBreaksOps(this.workbook, sheet));
+    return this.applyOps(() => resetPageBreaksOps(this.workbook, sheet));
   }
 
   /**
@@ -8353,11 +8421,15 @@ export class WorkbookView {
     }
     if (!this.tryCommit()) return Promise.resolve(false);
     const state = this.state();
-    const result = replaceInCell(this.workbook, this.sheetIndex, state.active.row, state.active.col, find, replacement, this.locale);
     let changed = false;
+    let result: ReturnType<typeof replaceInCell>;
     try {
-      if (result && 'change' in result) changed = this.applyOps([{ type: 'setCells', sheet: this.sheetIndex, cells: [result.change] }]);
-      else if (result) this.notify(this.strings.find.replaced(0, result.count), 'info');
+      // Built through applyOps(): the format the new text may bring goes again with a refusal.
+      changed = this.applyOps(() => {
+        result = replaceInCell(this.workbook, this.sheetIndex, state.active.row, state.active.col, find, replacement, this.locale);
+        return result && 'change' in result ? [{ type: 'setCells', sheet: this.sheetIndex, cells: [result.change] }] : [];
+      });
+      if (result && !('change' in result)) this.notify(this.strings.find.replaced(0, result.count), 'info');
     } catch (error) {
       return Promise.reject(error);
     }
@@ -8392,6 +8464,8 @@ export class WorkbookView {
     if (!this.tryCommit()) return Promise.resolve(none);
     const token = ++this.findToken;
     const epoch = this.changeEpoch;
+    // The job reads the replaced texts as it goes, and may add formats for them: taken back when its step is refused.
+    const styles = markStyles(this.workbook.styles);
     const job = new ReplaceAll(this.workbook, find, replacement, this.findOptions(options), searchStart(this.sheetIndex));
     const words = this.strings.find;
     return runSliced(
@@ -8410,6 +8484,8 @@ export class WorkbookView {
       }
       if (result.ops.length > 0) {
         try {
+          // Nothing changed while the job ran (the epoch says so): what the style sheet grew by is the job's.
+          this.refuseProtected(result.ops, styles);
           if (!this.applyOps(result.ops)) return none;
         } catch (error) {
           this.notify(this.localizeError(error), 'error');
@@ -8532,7 +8608,7 @@ export class WorkbookView {
     const b = toIndex(last, MAX_COLS);
     if (width !== undefined && (typeof width !== 'number' || Number.isNaN(width))) throw new RangeError('Invalid column width');
     this.commitEditing();
-    this.applyOps(columnWidthOps(this.workbook, this.sheetIndex, Math.min(a, b), Math.max(a, b), width));
+    this.applyOps(() => columnWidthOps(this.workbook, this.sheetIndex, Math.min(a, b), Math.max(a, b), width));
   }
 
   setRowHeight(first: number, last: number, height: number | undefined): void {
@@ -8541,7 +8617,7 @@ export class WorkbookView {
     const b = toIndex(last, MAX_ROWS);
     if (height !== undefined && (typeof height !== 'number' || Number.isNaN(height))) throw new RangeError('Invalid row height');
     this.commitEditing();
-    this.applyOps(rowHeightOps(this.sheetIndex, Math.min(a, b), Math.max(a, b), height));
+    this.applyOps(() => rowHeightOps(this.sheetIndex, Math.min(a, b), Math.max(a, b), height));
   }
 
   /** Writes the editor's text to the cell and closes the editor. Returns whether a cell was being edited. */
@@ -8574,6 +8650,8 @@ export class WorkbookView {
         let ops: Op[];
         try {
           ops = setCellInput(this.workbook, home, edit.row, edit.col, text, { locale: this.locale });
+          // A cell of a protected sheet that is locked is not written (typing into one is refused before it starts).
+          this.refuseProtected(ops, styles);
           // A value the cell's data validation refuses is not written, and the editor stays open with it.
           warning = this.validateInput(home, edit.row, edit.col, text, ops);
         } catch (error) {
@@ -8726,14 +8804,14 @@ export class WorkbookView {
     const r = toIndex(row, MAX_ROWS);
     const c = toIndex(col, MAX_COLS);
     this.commitEditing();
-    this.applyOps(setCellInput(this.workbook, this.sheetIndex, r, c, String(text), { locale: this.locale }));
+    this.applyOps(() => setCellInput(this.workbook, this.sheetIndex, r, c, String(text), { locale: this.locale }));
   }
 
   /** Empties the selected cells and keeps their formatting, like the Delete key. */
   clearSelection(): void {
     if (this.destroyed || this.locked) return;
     this.commitEditing();
-    this.applyOps(clearRange(this.workbook, this.sheetIndex, this.state().range));
+    this.applyOps(() => clearRange(this.workbook, this.sheetIndex, this.state().range));
   }
 
   /**
@@ -8770,11 +8848,12 @@ export class WorkbookView {
   /** Copies the selection and empties it, as one undo step. Read-only views only copy. */
   cut(): CopiedRange {
     if (!this.destroyed && !this.locked) this.commitEditing();
+    // A cut that the protection of the sheet refuses copies nothing either.
+    const ops = !this.destroyed && !this.locked ? cutRange(this.workbook, this.sheetIndex, this.state().range) : undefined;
+    if (ops) this.refuseProtected(ops);
     const copied = this.copy();
-    if (!this.destroyed && !this.locked) {
-      // The notes of the cells go with them, as one step: a paste of this copy puts them where the cells go.
-      this.applyOps(cutRange(this.workbook, this.sheetIndex, this.state().range));
-    }
+    // The notes of the cells go with them, as one step: a paste of this copy puts them where the cells go.
+    if (ops) this.applyOps(ops);
     return copied;
   }
 
@@ -8848,7 +8927,16 @@ export class WorkbookView {
     if (value === '' && !(own && this.copied && (this.copied.rules !== undefined || this.copied.notes !== undefined))) return;
     const state = this.state();
     if (state.sheet.kind !== 'worksheet') return;
-    const result = pasteAt(this.workbook, this.sheetIndex, state.range, value, own ? this.copied : undefined, { locale: this.locale });
+    // Reading the cells may add formats before they are known to be written: a refused paste leaves none behind.
+    const styles = markStyles(this.workbook.styles);
+    let result: ReturnType<typeof pasteAt>;
+    try {
+      result = pasteAt(this.workbook, this.sheetIndex, state.range, value, own ? this.copied : undefined, { locale: this.locale });
+    } catch (error) {
+      resetStyles(this.workbook.styles, styles);
+      throw error;
+    }
+    this.refuseProtected(result.ops, styles);
     const after = { active: { row: result.range.top, col: result.range.left }, range: result.range };
     if (!this.applyOps(result.ops, after)) this.restoreSelection(after);
     // The cells were pasted; notes and rules that could not go with them are said, not refused.
@@ -8998,13 +9086,37 @@ export class WorkbookView {
    * dialog of rules with changes is open (see settleDialog()). An operation
    * that throws leaves the workbook and the view as they were.
    */
-  private applyOps(ops: Op[], after?: { active: CellPos; range: CellRange }): boolean {
-    if (ops.length === 0) return false;
+  /**
+   * Applies a step. Given as the function that builds it, the step is built here: formats its
+   * building added to the style sheet (a date format for typed text, the formats of a paste) are
+   * taken back when it is not applied after all (see refuseProtected()).
+   */
+  private applyOps(step: Op[] | (() => Op[]), after?: { active: CellPos; range: CellRange }): boolean {
+    let mark: StylesMark | undefined;
+    let ops: Op[];
+    if (typeof step === 'function') {
+      mark = markStyles(this.workbook.styles);
+      try {
+        ops = step();
+      } catch (error) {
+        resetStyles(this.workbook.styles, mark);
+        throw error;
+      }
+    } else ops = step;
+    if (ops.length === 0) {
+      if (mark) resetStyles(this.workbook.styles, mark);
+      return false;
+    }
+    // What the protection of a sheet (or of the structure of the workbook) forbids is refused before anything changes.
+    this.refuseProtected(ops, mark);
     // A chart that is being dragged is let go where it was: the change may be about it.
     this.endChartDrag(false, 0);
     // A dialog of rules that is open shows the workbook as it was when it was opened (the range it is for, the place
     // of its rule): a change from outside it closes it when nothing was changed in it, and is refused otherwise.
-    if (this.rulesDialog && !this.applyingRules && !this.settleDialog()) return false;
+    if (this.rulesDialog && !this.applyingRules && !this.settleDialog()) {
+      if (mark) resetStyles(this.workbook.styles, mark);
+      return false;
+    }
     // A note that is being typed is a step of its own, before this one.
     this.finishNote(true, true);
     const sheets: number[] = [];
@@ -9369,6 +9481,189 @@ export class WorkbookView {
   }
 
   /** Runs a command from a key, the clipboard or the menu; a failure is announced instead of thrown. */
+  // ------------------------------------------------------- protection
+
+  /**
+   * Throws what the protection of the workbook says against a step (see protectionProblem());
+   * nothing when it allows it. Every step the view takes is judged here. `mark` is how far the
+   * style sheet reached before the step was built: a refused step leaves no format it made behind,
+   * and the file is saved as it was.
+   */
+  private refuseProtected(ops: Op[], mark?: StylesMark): void {
+    const refusal = protectionProblem(this.workbook, ops);
+    if (!refusal) return;
+    if (mark) resetStyles(this.workbook.styles, mark);
+    throw refusal;
+  }
+
+  /** Throws when the protection of the shown sheet forbids a kind of command. */
+  private refuseAction(action: ProtectionAction, range?: CellRange): void {
+    const reason = actionReason(this.workbook, this.sheetIndex, action, range);
+    if (reason !== undefined) throw new ProtectedError(reason, this.sheetIndex);
+  }
+
+  /** Whether the protection of the shown sheet forbids a kind of command; when it does, that is said. */
+  private saidProtected(action: ProtectionAction): boolean {
+    const why = this.protectionReason(action);
+    if (why === undefined) return false;
+    this.notify(why, 'error');
+    return true;
+  }
+
+  /** Whether the active cell is a locked cell of a protected sheet; when it is, that is said. */
+  private refuseLockedCell(): boolean {
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet' || !cellProtected(this.workbook, state.sheet, state.active.row, state.active.col)) return false;
+    this.notify(this.strings.protection.refused.cells, 'error');
+    return true;
+  }
+
+  /**
+   * Why the protection of the shown sheet (or of the structure of the workbook) forbids a kind of
+   * command, in the words of the view; undefined when it allows it. "cells" asks about the cells of
+   * the selection (typing, paste, Delete, cut), deletions about the rows or columns of the selection;
+   * "structure" about the list of sheets. For the controls around the view: a command that is off
+   * says why. A sort is asked about its flag alone here: the cells it moves are known when it runs.
+   */
+  protectionReason(action: ProtectionAction | 'cells' | 'structure'): string | undefined {
+    if (this.destroyed) return undefined;
+    if (action === 'structure') return structureLocked(this.workbook) ? this.strings.protection.refused.structure : undefined;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet' || !sheetProtected(state.sheet)) return undefined;
+    if (action === 'cells') return protectedCellIn(this.workbook, state.sheet, state.range) ? this.strings.protection.refused.cells : undefined;
+    const reason = actionReason(this.workbook, this.sheetIndex, action, action === 'deleteRows' || action === 'deleteColumns' ? state.range : undefined);
+    return reason === undefined ? undefined : this.strings.protection.refused[reason];
+  }
+
+  /** Whether a sheet (the shown one by default) is protected. */
+  isSheetProtected(index: number = this.sheetIndex): boolean {
+    return sheetProtected(this.workbook.sheets[index]);
+  }
+
+  /** Why the protection of a sheet cannot be changed through the view now; undefined when it can. */
+  private protectionChangeProblem(index: number): string | undefined {
+    const sheet = this.workbook.sheets[index];
+    if (!sheet) throw new RangeError(`No sheet at index ${index}`);
+    if (sheet.kind !== 'worksheet') return this.strings.actionFailed;
+    // Not shared with others: each would apply the rules of another protection to the same steps.
+    if (this.collab) return this.strings.protection.collab;
+    return undefined;
+  }
+
+  /**
+   * Protects a sheet (the shown one by default) as Excel does with the boxes it ticks by default:
+   * locked cells cannot be changed, nothing can be formatted, inserted, deleted, sorted or filtered,
+   * and notes, pictures, shapes and charts cannot be changed. `allow` lets things through (true:
+   * allowed), by the attributes of <sheetProtection>. With a password, removing the protection asks
+   * for it (hashed with SHA-512, 100,000 rounds). One undo step. Resolves to false when nothing was
+   * done (a read-only view, a sheet that is protected already); rejects with RangeError when the
+   * protection cannot be changed (edited together, not a worksheet).
+   */
+  async protectSheet(index: number = this.sheetIndex, options: { password?: string; allow?: Partial<{ [flag in ProtectionFlag]: boolean }> } = {}): Promise<boolean> {
+    if (this.destroyed || this.locked) return false;
+    const problem = this.protectionChangeProblem(index);
+    if (problem) throw new RangeError(problem);
+    const sheet = this.workbook.sheets[index];
+    if (sheetProtected(sheet)) return false;
+    if (!this.commitPending()) return false;
+    const attrs = defaultProtectionAttrs(options.allow || {});
+    if (options.password !== undefined && options.password !== '') {
+      const password = String(options.password);
+      if (password.length > 255) throw new RangeError('A password has at most 255 characters');
+      const hashed = await passwordAttrs(password);
+      if (this.destroyed || this.locked || sheetProtected(sheet) || this.workbook.sheets.indexOf(sheet) < 0) return false;
+      attrs.unshift(...hashed);
+    }
+    const at = this.workbook.sheets.indexOf(sheet);
+    this.applyOps(() => setProtectionOps(this.workbook, at, attrs));
+    this.notifyLater(this.strings.protection.protected(sheet.name));
+    return true;
+  }
+
+  /**
+   * Removes the protection of a sheet (the shown one by default): one undo step. A protection with
+   * a password needs that password; a wrong one rejects with an error whose `code` is
+   * "wrong-password". Resolves to false when nothing was done (a read-only view, a sheet that is
+   * not protected).
+   */
+  async unprotectSheet(index: number = this.sheetIndex, password?: string): Promise<boolean> {
+    if (this.destroyed || this.locked) return false;
+    const problem = this.protectionChangeProblem(index);
+    if (problem) throw new RangeError(problem);
+    const sheet = this.workbook.sheets[index];
+    if (!sheetProtected(sheet)) return false;
+    if (!this.commitPending()) return false;
+    let ops: Op[];
+    try {
+      ops = await unprotectSheetOps(this.workbook, index, password === undefined ? '' : String(password));
+    } catch (error) {
+      if (error instanceof RangeError && !(error instanceof PasswordMismatch)) throw new RangeError(this.strings.protection.passwordUnsupported);
+      throw error;
+    }
+    // The sheet may have gone, or moved, while the password was checked.
+    const at = this.workbook.sheets.indexOf(sheet);
+    if (this.destroyed || this.locked || at < 0 || !sheetProtected(sheet) || ops.length === 0) return false;
+    this.applyOps(() => setProtectionOps(this.workbook, at, undefined));
+    this.notifyLater(this.strings.protection.unprotected(sheet.name));
+    return true;
+  }
+
+  /** The command of the menu of a tab: protects the sheet, or removes its protection - asking for its password when it has one. */
+  private toggleProtection(sheet: Sheet): void {
+    const index = this.workbook.sheets.indexOf(sheet);
+    if (index < 0) return;
+    const failed = (error: unknown) => {
+      if (!this.destroyed) this.notify(this.localizeError(error), 'error');
+    };
+    if (!sheetProtected(sheet)) {
+      this.protectSheet(index).then(undefined, failed);
+      return;
+    }
+    if (!protectionHasPassword(sheet) || typeof document === 'undefined') {
+      this.unprotectSheet(index).then(undefined, failed);
+      return;
+    }
+    const s = this.strings.protection;
+    const prompt = new PasswordPrompt({
+      container: editorRootIn(this.container, this.root),
+      strings: {
+        passwordTitle: s.passwordTitle,
+        passwordQuestion: s.passwordQuestion(sheet.name),
+        passwordLabel: s.passwordLabel,
+        passwordWrong: () => s.passwordWrong,
+        passwordChecking: this.strings.passwordChecking,
+        passwordOpen: s.passwordOk,
+        passwordCancel: s.passwordCancel,
+      },
+    });
+    let attempts = 0;
+    const ask = (wrong: boolean): void => {
+      prompt.ask({ attempts, wrong }).then((answer) => {
+        if (answer === null || this.destroyed) {
+          prompt.close();
+          if (!this.destroyed) this.focusInput(true);
+          return;
+        }
+        this.unprotectSheet(this.workbook.sheets.indexOf(sheet), answer).then(
+          () => {
+            prompt.close();
+            if (!this.destroyed) this.focusInput(true);
+          },
+          (error: unknown) => {
+            if (error instanceof PasswordMismatch) {
+              attempts++;
+              ask(true);
+              return;
+            }
+            prompt.close();
+            failed(error);
+          },
+        );
+      });
+    };
+    ask(false);
+  }
+
   private attempt(run: () => void): void {
     try {
       run();
@@ -9389,7 +9684,7 @@ export class WorkbookView {
       keys,
       pointed: false,
       // As the input will hold it: a text field turns every kind of line break into "\n".
-      original: editTextAt(this.workbook, state.sheet, row, col, { locale: this.locale }).replace(/\r\n?/g, '\n'),
+      original: this.cellEditText(state.sheet, row, col).replace(/\r\n?/g, '\n'),
       idle,
       font: cssFont(style.font),
       wrap: style.alignment.wrapText === true,
@@ -9486,7 +9781,8 @@ export class WorkbookView {
   private syncInput(): void {
     if (this.edit) return;
     const state = this.state();
-    const text = state.sheet.kind === 'worksheet' ? editTextAt(this.workbook, state.sheet, state.active.row, state.active.col, { locale: this.locale }) : '';
+    // As the formula bar shows it: a formula the protection hides is not in the input either.
+    const text = state.sheet.kind === 'worksheet' ? this.cellEditText(state.sheet, state.active.row, state.active.col) : '';
     const value = text === '' ? ' ' : text;
     if (this.input.value !== value) this.input.value = value;
     if (this.hasFocus()) this.selectIdleText();
@@ -9565,6 +9861,11 @@ export class WorkbookView {
         this.syncInput();
         return;
       }
+      // Typed into a locked cell of a protected sheet: nothing is written, and that is said.
+      if (this.refuseLockedCell()) {
+        this.syncInput();
+        return;
+      }
       this.closeMenu();
       // Begun by typing: the arrow keys point at cells where the formula takes a reference.
       this.beginEdit(undefined, true);
@@ -9581,6 +9882,7 @@ export class WorkbookView {
     if (this.destroyed || this.edit || this.locked || this.state().sheet.kind !== 'worksheet') return;
     // With a chart selected no cell is edited (see chartKey()).
     if (this.pickedDrawing() !== undefined) return;
+    if (this.refuseLockedCell()) return;
     // An input method composes in place; the editor has to be there from its first key.
     this.selectIdleText();
     this.beginEdit(this.input.value, true);
@@ -10050,10 +10352,12 @@ export class WorkbookView {
     const count = (rows ? range.bottom : range.right) - first + 1;
     const axis = rows ? 'row' : 'col';
     const strings = this.strings;
+    const insertWhy = this.protectionReason(rows ? 'insertRows' : 'insertColumns');
+    const deleteWhy = this.protectionReason(rows ? 'deleteRows' : 'deleteColumns');
     const items: MenuItem[] = [
-      { label: rows ? strings.insertRowsAbove(count) : strings.insertColumnsLeft(count), action: () => this.attempt(() => this.structural('insert', axis, first, count)) },
-      { label: rows ? strings.insertRowsBelow(count) : strings.insertColumnsRight(count), action: () => this.attempt(() => this.structural('insert', axis, first + count, count)) },
-      { label: rows ? strings.deleteRows(count) : strings.deleteColumns(count), action: () => this.attempt(() => this.structural('delete', axis, first, count)) },
+      { label: rows ? strings.insertRowsAbove(count) : strings.insertColumnsLeft(count), ...this.blockedBy(insertWhy), action: () => this.attempt(() => this.structural('insert', axis, first, count)) },
+      { label: rows ? strings.insertRowsBelow(count) : strings.insertColumnsRight(count), ...this.blockedBy(insertWhy), action: () => this.attempt(() => this.structural('insert', axis, first + count, count)) },
+      { label: rows ? strings.deleteRows(count) : strings.deleteColumns(count), ...this.blockedBy(deleteWhy), action: () => this.attempt(() => this.structural('delete', axis, first, count)) },
     ];
     this.showMenu(items, x, y);
     return true;
@@ -10088,28 +10392,35 @@ export class WorkbookView {
     const strings = this.strings;
     const canCopy = typeof document.execCommand === 'function' || (navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function');
     const items: MenuItem[] = [];
-    if (!this.locked) items.push({ label: strings.cut, disabled: !canCopy, action: () => this.menuCopy(true) });
+    // What the protection of the sheet forbids is shown all the same, and says why.
+    const cellsWhy = this.locked ? undefined : this.protectionReason('cells');
+    if (!this.locked) items.push({ label: strings.cut, disabled: !canCopy || cellsWhy !== undefined, title: cellsWhy, explain: cellsWhy === undefined ? undefined : () => this.notify(cellsWhy, 'error'), action: () => this.menuCopy(true) });
     items.push({ label: strings.copy, disabled: !canCopy, action: () => this.menuCopy(false) });
     if (!this.locked) {
-      items.push({ label: strings.paste, action: () => this.menuPaste() });
-      items.push({ label: strings.clearContents, action: () => this.attempt(() => this.clearSelection()) });
+      items.push({ label: strings.paste, ...this.blockedBy(cellsWhy), action: () => this.menuPaste() });
+      items.push({ label: strings.clearContents, ...this.blockedBy(cellsWhy), action: () => this.attempt(() => this.clearSelection()) });
       // Whole columns have no rows to speak of, and whole rows no columns.
       const rows = fullHeight(range) ? 0 : range.bottom - range.top + 1;
       const cols = fullWidth(range) ? 0 : range.right - range.left + 1;
       if (rows > 0 || cols > 0) items.push({ label: '', separator: true });
-      if (rows > 0) items.push({ label: strings.insertRowsAbove(rows), action: () => this.attempt(() => this.structural('insert', 'row', range.top, rows)) });
-      if (cols > 0) items.push({ label: strings.insertColumnsLeft(cols), action: () => this.attempt(() => this.structural('insert', 'col', range.left, cols)) });
-      if (rows > 0) items.push({ label: strings.deleteRows(rows), action: () => this.attempt(() => this.structural('delete', 'row', range.top, rows)) });
-      if (cols > 0) items.push({ label: strings.deleteColumns(cols), action: () => this.attempt(() => this.structural('delete', 'col', range.left, cols)) });
+      if (rows > 0) items.push({ label: strings.insertRowsAbove(rows), ...this.blockedBy(this.protectionReason('insertRows')), action: () => this.attempt(() => this.structural('insert', 'row', range.top, rows)) });
+      if (cols > 0) items.push({ label: strings.insertColumnsLeft(cols), ...this.blockedBy(this.protectionReason('insertColumns')), action: () => this.attempt(() => this.structural('insert', 'col', range.left, cols)) });
+      if (rows > 0) items.push({ label: strings.deleteRows(rows), ...this.blockedBy(this.protectionReason('deleteRows')), action: () => this.attempt(() => this.structural('delete', 'row', range.top, rows)) });
+      if (cols > 0) items.push({ label: strings.deleteColumns(cols), ...this.blockedBy(this.protectionReason('deleteColumns')), action: () => this.attempt(() => this.structural('delete', 'col', range.left, cols)) });
       this.noteItems(items);
       this.pivotItems(items, row, col);
       if (this.state().sheet.kind === 'worksheet') {
         items.push({ label: '', separator: true });
-        items.push({ label: strings.rules.validationCommand, action: () => void this.openValidationDialog() });
+        items.push({ label: strings.rules.validationCommand, ...this.blockedBy(this.protectionReason('rules')), action: () => void this.openValidationDialog() });
       }
     }
     this.showMenu(items, x, y);
     return true;
+  }
+
+  /** What a menu item that a reason turns off has: off, the reason as its title, and said when it is chosen all the same. */
+  private blockedBy(why: string | undefined): Pick<MenuItem, 'disabled' | 'title' | 'explain'> {
+    return why === undefined ? {} : { disabled: true, title: why, explain: () => this.notify(why, 'error') };
   }
 
   /** The note commands of the active cell for its menu: a note is added, or the one it has is edited or deleted. */
@@ -10125,7 +10436,7 @@ export class WorkbookView {
       return;
     }
     // What cannot be done is shown all the same, and says why.
-    const reason = problem === undefined ? undefined : this.localizeError(problem);
+    const reason = problem === undefined ? this.protectionReason('objects') : this.localizeError(problem);
     const explain = reason === undefined ? undefined : () => this.notify(reason, 'error');
     const edit = () => this.attempt(() => void this.editComment(row, col));
     items.push({ label: '', separator: true });

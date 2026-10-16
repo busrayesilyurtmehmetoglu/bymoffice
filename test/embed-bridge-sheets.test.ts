@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { base64Encode, createBridge, type Bridge, type BridgeHost } from '../src/embed/bridge';
 import type { OfficeFile } from '../src/index';
 import type { WorkbookViewOptions } from '../src/ui/sheet-view';
+import { PROTECTION_MESSAGES, ProtectedError } from '../src/ops/protection';
 
 interface FakeSheet {
   name: string;
@@ -760,4 +761,15 @@ test('bridge sheets: the name of the file reaches the view, for "&F" of what it 
   assert.equal(f.options().fileName, 'Kitap.xlsx');
   const g = await loaded();
   assert.equal(g.options().fileName, undefined);
+});
+
+test('bridge sheets: what the protection of the workbook refuses is answered with "protected"', async () => {
+  const f = await loaded();
+  f.commitError = new ProtectedError('structure');
+  await f.bridge.receive({ type: 'insertSheet', id: 'p' });
+  await f.bridge.receive({ type: 'renameSheet', id: 'q', index: 0, name: 'Other' });
+  assert.deepEqual(f.take(), [
+    { type: 'error', id: 'p', code: 'protected', message: `Localized: ${PROTECTION_MESSAGES.structure}` },
+    { type: 'error', id: 'q', code: 'protected', message: `Localized: ${PROTECTION_MESSAGES.structure}` },
+  ]);
 });

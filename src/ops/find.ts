@@ -28,6 +28,7 @@ import { resolveCellStyle } from '../model/sheet/color';
 import { MAX_COLS, MAX_ROWS, fillsRange, parseRange, type Cell, type CellRange, type RichRun, type Sheet, type Workbook } from '../model/sheet/types';
 import { setCellInput } from './commands';
 import { rowsHiddenByFilter } from './filter';
+import { formulaHidden } from './protection';
 import { explicitFormula, sharedMasters, type CellChange, type Op, type SharedMasters } from './ops';
 
 export interface SheetFindOptions {
@@ -83,6 +84,9 @@ export function cellSearchText(workbook: Workbook, sheet: Sheet, row: number, co
   if (!cell) return '';
   if (lookIn === 'values') return cellDisplayText(workbook, cell, locale);
   const formula = cell.formula;
+  // A formula the protection of the sheet hides is no text of the formula bar (which shows nothing): it is not
+  // searched, and so not replaced either. Its value is still found among the values.
+  if (formula && formulaHidden(workbook, sheet, row, col)) return '';
   if (formula) {
     let text = formula.text;
     if (text === '' && formula.type === 'shared') {

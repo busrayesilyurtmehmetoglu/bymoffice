@@ -9,6 +9,7 @@ import { renameSheetsInFormula } from '../calc/refs';
 import { editsSince } from '../layout/sheet-pages';
 import { movedBreaks } from './page-setup';
 import { protectionNow } from '../formats/xlsx/build';
+import { structureProblem } from './protection';
 import { commentCellNow } from '../render/sheet-drawings';
 import { conditionalFormatNow, dataValidationNow, extensionRuleCount, fittedConditional, fittedRule, keptOver, mainPartRule, ruleContentLosses, ruleSpace, ruleWithFormulas } from './rules';
 import { MAX_COLS, MAX_ROWS, checkSheetName, createSheet, foldSheetName, type Cell, type Color, type ConditionalFormat, type ConditionalRule, type DataValidation, type DefinedName, type Hyperlink, type Row, type Sheet, type SheetComment, type SheetNameMap, type SheetState, type Workbook } from '../model/sheet/types';
@@ -46,17 +47,17 @@ export function defaultSheetName(workbook: Workbook, locale?: string): string {
  * when the operation is applied.
  */
 export function canRenameSheet(workbook: Workbook, index: number, name?: string): string | undefined {
-  return renameSheetProblem(workbook, index, name);
+  return structureProblem(workbook) || renameSheetProblem(workbook, index, name);
 }
 
 /** Why the sheet at `index` cannot be deleted, as a message; undefined when it can. Cheap, like canRenameSheet(). */
 export function canDeleteSheet(workbook: Workbook, index: number): string | undefined {
-  return deleteSheetProblem(workbook, index);
+  return structureProblem(workbook) || deleteSheetProblem(workbook, index);
 }
 
 /** Why no sheet can be inserted at `at` under `name` (or under the default name), as a message; undefined when one can. */
 export function canInsertSheet(workbook: Workbook, at: number, name?: string): string | undefined {
-  return insertSheetProblem(workbook, at, name === undefined ? defaultSheetName(workbook) : name);
+  return structureProblem(workbook) || insertSheetProblem(workbook, at, name === undefined ? defaultSheetName(workbook) : name);
 }
 
 /**
@@ -92,7 +93,7 @@ export function insertSheet(workbook: Workbook, at: number, options: InsertSheet
 
 /** Why the sheet at `from` cannot be moved to be sheet number `to`, as a message; undefined when it can. */
 export function canMoveSheet(workbook: Workbook, from: number, to: number): string | undefined {
-  return moveSheetProblem(workbook, from, to);
+  return structureProblem(workbook) || moveSheetProblem(workbook, from, to);
 }
 
 /**
@@ -108,7 +109,7 @@ export function moveSheet(workbook: Workbook, from: number, to: number): Op[] {
 
 /** Why the sheet at `index` cannot be hidden, as a message; undefined when it can (the last visible sheet cannot). */
 export function canHideSheet(workbook: Workbook, index: number): string | undefined {
-  return sheetStateProblem(workbook, index, 'hidden');
+  return structureProblem(workbook) || sheetStateProblem(workbook, index, 'hidden');
 }
 
 /**
@@ -182,7 +183,7 @@ export function copySheetName(workbook: Workbook, index: number): string {
 
 /** Why the sheet at `index` cannot be copied, as a message; undefined when it can. */
 export function canCopySheet(workbook: Workbook, index: number, options: CopySheetOptions = {}): string | undefined {
-  return copySheetProblem(workbook, index, options.at, options.name);
+  return structureProblem(workbook) || copySheetProblem(workbook, index, options.at, options.name);
 }
 
 /** What a copy of a sheet does not get: the kind of content and how much of it. */

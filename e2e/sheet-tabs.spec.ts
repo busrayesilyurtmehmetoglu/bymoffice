@@ -508,7 +508,7 @@ test.describe('deleting a sheet', () => {
     await clearLog(page);
 
     await openTabMenu(page, 'Data', hasTouch);
-    await expect(menu(page).locator('button')).toHaveText(['Insert sheet', 'Rename', 'Delete', 'Duplicate', 'Move left', 'Move right', 'Hide', 'Tab colour\u2026']);
+    await expect(menu(page).locator('button')).toHaveText(['Insert sheet', 'Rename', 'Delete', 'Duplicate', 'Move left', 'Move right', 'Hide', 'Protect sheet', 'Tab colour\u2026']);
     // The first tab cannot go further left; everything else is available.
     await expect(menu(page).locator('button:disabled')).toHaveText(['Move left']);
     await chooseItem(page, 'Delete', hasTouch);

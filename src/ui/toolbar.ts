@@ -126,6 +126,8 @@ export class Toolbar {
   private sizeKey = '';
   private customShown = false;
   private popover: Popover | undefined;
+  /** The label of each button, which is its title too unless the button is off for a reason it then shows. */
+  private labels: { [key in ButtonKey]?: string } = {};
   /** Where the toolbar was scrolled to when the popover opened; it closes when the toolbar moves on. */
   private openedAt = 0;
   /** The one control that is a Tab stop. */
@@ -268,6 +270,26 @@ export class Toolbar {
     this.updateSave(typing);
     const others: ButtonKey[] = ['pageSetup', 'bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'alignTop', 'alignMiddle', 'alignBottom', 'wrapText', 'merge', 'mergeOptions', 'sortAscending', 'sortDescending', 'filter', 'conditionalFormat', 'validation', 'chart', 'rowsColumns'];
     for (let i = 0; i < others.length; i++) this.setDisabled(others[i], !editable);
+    // What the protection of the sheet forbids is off as well, and its title says why.
+    const guarded: [ButtonKey[], 'formatCells' | 'merge' | 'sort' | 'filterOnOff' | 'rules' | 'objects'][] = [
+      [['bold', 'italic', 'underline', 'strikethrough', 'textColor', 'fillColor', 'borders', 'alignLeft', 'alignCenter', 'alignRight', 'alignTop', 'alignMiddle', 'alignBottom', 'wrapText'], 'formatCells'],
+      [['merge', 'mergeOptions'], 'merge'],
+      [['sortAscending', 'sortDescending'], 'sort'],
+      [['filter'], 'filterOnOff'],
+      [['conditionalFormat', 'validation'], 'rules'],
+      [['chart'], 'objects'],
+    ];
+    for (const [keys, action] of guarded) {
+      const why = editable ? view.protectionReason(action) : undefined;
+      for (const key of keys) {
+        const button = this.buttons[key];
+        if (!button) continue;
+        if (why !== undefined) this.setDisabled(key, true);
+        const title = why !== undefined ? why : key === 'chart' ? insert : this.labels[key];
+        if (title !== undefined && title !== '' && button.title !== title) button.title = title;
+      }
+    }
+    const formatWhy = editable ? view.protectionReason('formatCells') : undefined;
     // The picture button says why it is off where pictures cannot be changed (edited together, a protected sheet).
     const picture = this.buttons.insertPicture;
     if (picture) {
@@ -286,9 +308,18 @@ export class Toolbar {
       const title = why !== undefined ? why : label;
       if (shapeButton.title !== title) shapeButton.title = title;
     }
-    this.fontSelect.disabled = !editable;
-    this.sizeSelect.disabled = !editable;
-    this.formatSelect.disabled = !editable;
+    this.fontSelect.disabled = !editable || formatWhy !== undefined;
+    this.sizeSelect.disabled = !editable || formatWhy !== undefined;
+    this.formatSelect.disabled = !editable || formatWhy !== undefined;
+    const selects: [HTMLSelectElement, string][] = [
+      [this.fontSelect, this.strings.fontName],
+      [this.sizeSelect, this.strings.fontSize],
+      [this.formatSelect, this.strings.numberFormat],
+    ];
+    for (const [select, label] of selects) {
+      const title = formatWhy !== undefined ? formatWhy : label;
+      if (select.title !== title) select.title = title;
+    }
     if (!editable) this.closePopover();
 
     this.setPressed('bold', font.bold === true);
@@ -503,6 +534,7 @@ export class Toolbar {
       rowsColumns: s.rowsAndColumns,
       find: withShortcut(s.findReplace, 'F'),
     };
+    this.labels = labels;
     for (const key of Object.keys(labels) as ButtonKey[]) {
       const button = this.buttons[key];
       if (!button || labels[key] === '') continue;

@@ -3757,6 +3757,60 @@ function setPageSetupIn(original: Uint8Array, sheet: Sheet, own: SheetStructural
   return sameBytes(out, original) ? undefined : out;
 }
 
+/** Whether the protection of a sheet of the file is another one than it came with ("setProtection"). */
+function protectionChanged(sheet: Sheet): boolean {
+  if (!sheet.protectionModified || sheet.kind !== 'worksheet' || sheet.part === '') return false;
+  const read = sheet.protectionRead ? sheet.protectionRead.protection : sheet.protection;
+  return !sameAttrList(read && read.attrs, sheet.protection && sheet.protection.attrs);
+}
+
+function sameAttrList(a: readonly [string, string][] | undefined, b: readonly [string, string][] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i][0] !== b[i][0] || a[i][1] !== b[i][1]) return false;
+  return true;
+}
+
+/**
+ * A sheet part with its <sheetProtection> as the model has it: the element is replaced by one with
+ * the attributes of the model, taken out when the sheet is no longer protected, or put where the
+ * schema has it. <protectedRanges> and every other byte of the part stay. Undefined when nothing changes.
+ */
+function setProtectionIn(original: Uint8Array, sheet: Sheet): Uint8Array | undefined {
+  const s = decodeSource(original);
+  const root = rawElement(s);
+  const rootLocal = localName(root.name);
+  if (rootLocal !== 'worksheet' && rootLocal !== 'dialogsheet' && rootLocal !== 'macrosheet') {
+    throw new Error(`Cannot write sheet "${sheet.name}": its part has the root element <${root.name}>, not a worksheet`);
+  }
+  if (root.selfClosing) throw new Error(`Cannot write sheet "${sheet.name}": its part has no <sheetData>`);
+  const prefix = root.name.slice(0, root.name.length - rootLocal.length);
+  const attrs = sheet.protection && sheet.protection.attrs;
+  let text = '';
+  if (attrs) {
+    text = `<${prefix}sheetProtection`;
+    const seen = new Set<string>();
+    for (const [name, value] of attrs) {
+      // Each once, under a name that is one: the model may have been given anything.
+      if (typeof name !== 'string' || typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name) || name === 'xmlns' || seen.has(name)) continue;
+      seen.add(name);
+      text += ` ${name}="${escapeAttr(value)}"`;
+    }
+    text += '/>';
+  }
+  const present = root.children.find((child) => child.local === 'sheetProtection');
+  if (present) {
+    if (s.slice(present.start, present.end) === text) return undefined;
+    const out = spliceExact(original, [{ start: present.start, end: present.end, text }]);
+    return sameBytes(out, original) ? undefined : out;
+  }
+  if (text === '') return undefined;
+  const rank = WORKSHEET_ORDER.indexOf('sheetProtection');
+  const behind = root.children.find((child) => worksheetRank(s, child.start, child.local) > rank);
+  const at = behind ? behind.start : root.closeStart;
+  return spliceExact(original, [{ start: at, end: at, text }]);
+}
+
 /** Whether the panes of a sheet of the file are other ones than it came with ("setPane"). */
 function panesChanged(sheet: Sheet): boolean {
   return !!sheet.paneModified && sheet.kind === 'worksheet' && sheet.part !== '' && !(sheet.paneRead && samePane(sheet.paneRead, paneOf(sheet)));
@@ -4922,9 +4976,10 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     (!!sheet.drawingsModified && (!sheet.drawingsRead || sheet.drawingsRead.list !== sheet.drawings)) ||
     (!!sheet.tabColorModified && !(sheet.tabColorRead && sameColor(sheet.tabColorRead.color, sheet.tabColor))) ||
     panesChanged(sheet) ||
-    pageSetupChanged(sheet);
+    pageSetupChanged(sheet) ||
+    protectionChanged(sheet);
   const flagged = (sheet: Sheet): boolean =>
-    !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified || sheet.paneModified || sheet.pageSetupModified);
+    !!(sheet.modified || sheet.commentsModified || sheet.validationsModified || sheet.conditionalModified || sheet.drawingsModified || sheet.paneModified || sheet.pageSetupModified || sheet.protectionModified);
   const sheetsModified = !!workbook.sheetsModified || sheets.some((sheet) => sheet.part === '');
   // The parts of refreshed pivot tables, and of those an earlier save wrote, are written from the bytes of the file.
   for (const part of pivotPartsToRead(workbook)) reads.bytes(part);
@@ -5074,7 +5129,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   const panesModified = workbook.sheets.some((sheet) => !!sheet.paneModified);
   // So do a page setup and defined names set back to those of the file.
   const pagesModified = workbook.sheets.some((sheet) => !!sheet.pageSetupModified) || !!workbook.definedNamesModified;
-  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !panesModified && !pagesModified && !workbook.pivotsModified) return;
+  // And a protection set back to that of the file.
+  const protectionsModified = workbook.sheets.some((sheet) => !!sheet.protectionModified);
+  if (modifiedSheets.length === 0 && !stylesModified && !sheetsModified && !notesModified && !rulesModified && !chartsModified && !panesModified && !pagesModified && !protectionsModified && !workbook.pivotsModified) return;
 
   let saved = SAVES.get(workbook);
   if (!saved) {
@@ -6024,6 +6081,9 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   // The page setup, the same way.
   const paged = new Set<Sheet>();
   for (const sheet of workbook.sheets) if (pageSetupChanged(sheet)) paged.add(sheet);
+  // The protection, the same way.
+  const protectedSheets = new Set<Sheet>();
+  for (const sheet of workbook.sheets) if (protectionChanged(sheet)) protectedSheets.add(sheet);
 
   // Rules that were added, changed or deleted: a list that is the one the sheet came with again (undone) is no change.
   const ruled = new Set<Sheet>();
@@ -6045,6 +6105,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     tabbed.size > 0 ||
     paned.size > 0 ||
     paged.size > 0 ||
+    protectedSheets.size > 0 ||
     ruled.size > 0 ||
     dxfs.added.length > 0 ||
     charting.size > 0 ||
@@ -6167,10 +6228,11 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const tab = tabbed.has(sheet);
     const pane = paned.has(sheet);
     const paging = paged.has(sheet);
+    const guarded = protectedSheets.has(sheet);
     const rules = ruled.has(sheet);
     const pivotsHere = pivotsOn.has(sheet);
     const pivotsGone = pivotsGoneOn.get(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !rules && !charting.has(sheet) && !pivotsHere && !pivotsGone) continue;
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !guarded && !rules && !charting.has(sheet) && !pivotsHere && !pivotsGone) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
     // The relationships of deleted pivot tables of the file that the sheet drops, and the selection of a view that names one of
@@ -6250,6 +6312,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       if (bytes && pane) next = setPaneIn(next || bytes, sheet) || next;
       // How the sheet is printed, likewise.
       if (bytes && paging) next = setPageSetupIn(next || bytes, sheet, sheet.structuralEdits || []) || next;
+      // And how it is protected.
+      if (bytes && guarded) next = setProtectionIn(next || bytes, sheet) || next;
       if (bytes && goneIds.size > 0) next = withoutSelections(next || bytes) || next;
       if (bytes && next) {
         // From here on the package no longer holds the part as the file had it.
@@ -6265,11 +6329,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       const coloured = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
       const viewed = (pane && setPaneIn(coloured, sheet)) || coloured;
       const paged = (paging && setPageSetupIn(viewed, sheet, sheet.structuralEdits || [])) || viewed;
-      const next = withoutSelections(paged) || paged;
+      const guardedNow = (guarded && setProtectionIn(paged, sheet)) || paged;
+      const next = withoutSelections(guardedNow) || guardedNow;
       // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation. Frozen
-      // panes and the page setup are of the view and the printer only: a part that differs from the file by them alone
-      // asks for none either.
-      if (sameBytes(next, bytes) || ((pane || paging) && sameBytes(coloured, bytes))) asInFile.add(sheet);
+      // panes, the page setup and the protection are of the view, the printer and the user only: a part that differs
+      // from the file by them alone asks for none either.
+      if (sameBytes(next, bytes) || ((pane || paging || guarded) && sameBytes(coloured, bytes))) asInFile.add(sheet);
       writes.push([sheet.part, next]);
       rewritten.push(sheet.part);
     }

@@ -172,7 +172,7 @@ test.describe('the menu of a tab', () => {
   test('lists what can be done to the sheet, and moves it left and right', async ({ page, hasTouch }) => {
     await mount(page, await book());
     await openTabMenu(page, 'Calc', hasTouch);
-    await expect(menu(page).locator('button')).toHaveText(['Insert sheet', 'Rename', 'Delete', 'Duplicate', 'Move left', 'Move right', 'Hide', 'Unhide…', 'Tab colour…']);
+    await expect(menu(page).locator('button')).toHaveText(['Insert sheet', 'Rename', 'Delete', 'Duplicate', 'Move left', 'Move right', 'Hide', 'Unhide…', 'Protect sheet', 'Tab colour…']);
     await chooseItem(page, 'Move right', hasTouch);
     await expect(tabs(page)).toHaveText(['Data', 'Notes', 'Calc']);
     expect(await names(page)).toEqual(['Data', 'Notes', 'Calc', 'Unseen', 'Deep']);

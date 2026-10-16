@@ -1993,6 +1993,8 @@ function builtXlsx(workbook: Workbook, options: BuildXlsxOptions, pictures: Map<
   const bookRels = new Rels();
   const ids = sheetIdsOf(sheets);
   let book = `${XML_DECLARATION}<workbook xmlns="${NS_MAIN}" xmlns:r="${NS_REL}"><workbookPr${workbook.date1904 ? ' date1904="1"' : ''}/>`;
+  // How the workbook is protected, as it was read (an xls file's PROTECT and WINDOWPROTECT of its globals, say).
+  if (workbook.protection && workbook.protection.attrs.length > 0) book += `<workbookProtection${keptAttrs(workbook.protection.attrs)}/>`;
   if (activeHidden) notes.add('Workbook: the active sheet is hidden; the first visible one is made the active sheet');
   book += `<bookViews><workbookView${active > 0 ? ` activeTab="${active}"` : ''}/></bookViews><sheets>`;
   sheets.forEach((sheet, index) => {
