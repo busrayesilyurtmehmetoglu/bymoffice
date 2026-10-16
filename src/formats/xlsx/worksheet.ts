@@ -1198,6 +1198,8 @@ function parseConditionalFormatting(sc: XmlScanner, extension: boolean, index = 
   const format: ConditionalFormat = { ranges: parseSqref(sqref ? elementText(sqref) : el.attrs.get('sqref')), rules: [] };
   // Where the element and its rules are in the part: how the writer finds them again.
   if (index >= 0) format.src = index;
+  const pivot = el.attrs.get('pivot');
+  if (pivot === '1' || pivot === 'true') format.pivot = true;
   childElements(el, 'cfRule').forEach((child, at) => {
     const rule = parseConditionalRule(child, extension, spaces, block);
     if (index >= 0) rule.src = [index, at];

@@ -2073,16 +2073,19 @@ export function createBridge(host: BridgeHost): Bridge {
   };
 
   /**
-   * Makes a pivot table (insertPivot), changes the fields of one (setPivotFields), or lists them
-   * (pivotFields). What the message holds is copied field by field, as lists and numbers only; the
-   * commands check all of it. The answer is "done" with the table and its sheet (insertPivot),
-   * whether anything changed (setPivotFields), or the fields (pivotFields).
+   * Makes a pivot table (insertPivot), changes the fields of one (setPivotFields), lists them
+   * (pivotFields) or deletes one (deletePivot). What the message holds is copied field by field, as
+   * lists and numbers only; the commands check all of it. The answer is "done" with the table and its
+   * sheet (insertPivot), whether anything changed (setPivotFields, deletePivot), or the fields
+   * (pivotFields).
    */
-  const pivotCommand = (type: 'insertPivot' | 'setPivotFields' | 'pivotFields', message: Message, id: string | undefined) => {
+  const pivotCommand = (type: 'insertPivot' | 'setPivotFields' | 'pivotFields' | 'deletePivot', message: Message, id: string | undefined) => {
     if (!shown) return fail('not-loaded', 'No file is open', id);
     const view = shown.view;
     if (!view) return fail('no-sheet', 'The open file is a document: it has no pivot tables', id);
-    if (typeof view.insertPivot !== 'function' || typeof view.setPivotFields !== 'function' || typeof view.pivotFields !== 'function') return fail('pivot-refused', 'This view cannot change pivot tables', id);
+    if (typeof view.insertPivot !== 'function' || typeof view.setPivotFields !== 'function' || typeof view.pivotFields !== 'function' || (type === 'deletePivot' && typeof view.deletePivot !== 'function')) {
+      return fail('pivot-refused', 'This view cannot change pivot tables', id);
+    }
     const index = message.index;
     const numberList = (value: unknown): number[] | undefined => (Array.isArray(value) && value.length <= 16384 ? value.map((one) => (typeof one === 'number' ? one : NaN)) : undefined);
     const answer: Message = { type: 'done', id, command: type };
@@ -2096,6 +2099,12 @@ export function createBridge(host: BridgeHost): Bridge {
       }
       if (shown.locked || view.readOnly === true) return fail('read-only', 'The file is read-only', id);
       if (!commitPendingOf(view)) return fail('pivot-refused', STILL_EDITING, id);
+      if (type === 'deletePivot') {
+        if (typeof index !== 'number') return fail('pivot-refused', 'The message names no pivot table (index)', id);
+        answer.changed = view.deletePivot(index);
+        if (id !== undefined) send(answer);
+        return;
+      }
       const lists: Record<string, unknown> = {};
       for (const key of ['rows', 'cols']) if (message[key] !== undefined) lists[key] = numberList(message[key]);
       // A filter is a field, or a field with the item it shows ({ field, item }).
@@ -2619,7 +2628,7 @@ export function createBridge(host: BridgeHost): Bridge {
       if (type === 'moveSheet' || type === 'setSheetState' || type === 'copySheet' || type === 'setTabColor') return arrangeSheets(type, fields, id);
       if (type === 'acceptAllRevisions' || type === 'rejectAllRevisions' || type === 'setTrackChanges') return reviseDocument(type, fields, id);
       if (type === 'refreshPivots') return refreshPivots(id);
-      if (type === 'insertPivot' || type === 'setPivotFields' || type === 'pivotFields') return pivotCommand(type, fields, id);
+      if (type === 'insertPivot' || type === 'setPivotFields' || type === 'pivotFields' || type === 'deletePivot') return pivotCommand(type, fields, id);
       if (type === 'setTabStops' || type === 'setDefaultTabStop') return tabDocument(type, fields, id);
       if (type === 'setPageSetup' || type === 'insertPageBreak' || type === 'removePageBreak' || type === 'resetPageBreaks' || type === 'insertSectionBreak') return pageSetupCommand(type, fields, id);
       if (type === 'addComment' || type === 'editComment' || type === 'replyComment' || type === 'resolveComment' || type === 'removeComment') return commentDocument(type, fields, id);

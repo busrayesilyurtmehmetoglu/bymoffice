@@ -132,6 +132,10 @@ export interface PivotPanelOptions {
   onChange(change: PivotFieldsChange): void;
   /** Puts an error into the words of the view. */
   explain(error: unknown): string;
+  /** Deletes the table (the panel closes once it is gone); what it throws is shown in the panel. Without it the panel has no button for it. */
+  onDelete?(): void;
+  /** Why the table cannot be deleted, in the words of the view; undefined when it can. */
+  deleteRefusal?(): string | undefined;
   onClose(): void;
 }
 
@@ -354,6 +358,39 @@ export class PivotPanel {
     check(strings.rowGrandTotals, info.rowGrandTotals, 'rowGrandTotals', (on) => this.change({ rowGrandTotals: on }));
     check(strings.colGrandTotals, info.colGrandTotals, 'colGrandTotals', (on) => this.change({ colGrandTotals: on }));
     this.content.appendChild(totals);
+
+    // Deleting the table: whatever its fields allow, and undone like any other step (no question is asked).
+    const remove = this.options.onDelete;
+    if (remove) {
+      const reason = this.options.deleteRefusal ? this.options.deleteRefusal() : undefined;
+      const footer = document.createElement('div');
+      footer.className = 'bym-pivot-footer';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'bym-dialog-button bym-pivot-delete';
+      button.textContent = strings.deleteButton;
+      button.setAttribute('data-bym-action', 'delete');
+      button.setAttribute('data-bym-key', 'delete');
+      button.disabled = reason !== undefined;
+      if (reason !== undefined) button.title = reason;
+      button.addEventListener('click', () => {
+        this.showError('');
+        try {
+          remove();
+        } catch (error) {
+          this.showError(this.options.explain(error));
+        }
+        this.refresh();
+      });
+      footer.appendChild(button);
+      if (reason !== undefined) {
+        const why = document.createElement('div');
+        why.className = 'bym-dialog-hint';
+        why.textContent = reason;
+        footer.appendChild(why);
+      }
+      this.content.appendChild(footer);
+    }
   }
 
   /** The items of a field, each with a box: unticked items are hidden. */
@@ -590,6 +627,7 @@ export const PIVOT_PANEL_STYLE =
   '.bym-pivot-more{display:flex;flex-wrap:wrap;align-items:center;flex:1 1 100%;gap:4px;margin-top:2px}' +
   '.bym-pivot-more .bym-dialog-check{margin:0}' +
   '.bym-pivot-totals{margin:4px 0 8px}' +
+  '.bym-pivot-footer{margin:4px 0 8px;padding-top:8px;border-top:1px solid #dadce0}' +
   // A finger needs more to hit than a mouse pointer.
   '.bym-pivot-coarse .bym-pivot-button,.bym-pivot-coarse .bym-pivot-close,.bym-pivot-coarse .bym-pivot-select{height:40px;min-width:40px}' +
   '@media (pointer:coarse){.bym-pivot-button,.bym-pivot-close,.bym-pivot-select{height:40px;min-width:40px}}';

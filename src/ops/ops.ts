@@ -350,6 +350,29 @@ export type Op =
     }
   | {
       /**
+       * Takes the pivot table at `table` (an index into Workbook.pivots.tables) out of the workbook,
+       * and its cache with it when no other table is made from it (see pivot-delete.ts). A table of
+       * the file is noted in Workbook.pivots.deleted, for the writer to take its parts out of the
+       * package. The cells of the table are not changed here: the deletion clears them with
+       * "setCells". Its inverse is "restorePivot". `sheet` is the sheet of the table.
+       */
+      type: 'deletePivot';
+      sheet: number;
+      table: number;
+    }
+  | {
+      /**
+       * Puts a deleted pivot table back at its place in the list (`at`), and its cache at its own
+       * (`cacheAt`) when the cache went with it: the inverse of "deletePivot".
+       */
+      type: 'restorePivot';
+      sheet: number;
+      at: number;
+      table: PivotTable;
+      cacheAt?: number;
+    }
+  | {
+      /**
        * Puts the list of sheets back the way a snapshot recorded it; the inverse of the
        * operations on sheets, and its own inverse. `sheet` is the index the operation it undoes
        * was about (where a sheet comes back, goes away or changes its name).
@@ -965,6 +988,10 @@ function sortRows(workbook: Workbook, index: number, range: CellRange, order: nu
 
   // What is placed by cell position in other parts would stay behind while its cell moves.
   let stuck = (sheet.anchored || []).filter((part) => SORT_BLOCKERS.indexOf(part) >= 0);
+  // The reader notes pivot parts of the package on every sheet; where the model holds every table and cache of them and no table
+  // is left (the last one was deleted, see pivot-delete.ts), nothing of them is in the way. (While one is, the sheets keep as they were.)
+  const pivots = workbook.pivots;
+  if (pivots && pivots.fixed === undefined && pivots.tables.length === 0) stuck = stuck.filter((part) => part !== 'pivotTable');
   // A pivot table made here stands in the cells of its sheet as well.
   if (stuck.indexOf('pivotTable') < 0 && workbook.pivots && workbook.pivots.tables.some((table) => table.sheet === sheet)) stuck.push('pivotTable');
   // Notes go with their rows (see below). Comments are in the way only where the model does not hold all
@@ -1131,11 +1158,15 @@ const CONTROL_KINDS = ['formControl', 'ctrlProp', 'control'];
 
 function nameHolder(workbook: Workbook): string | undefined {
   // A pivot table made here names the sheet of its source as well (the reader notes those of a file on the sheets).
-  if (workbook.pivots && workbook.pivots.tables.length > 0) return 'pivotTable';
+  const pivots = workbook.pivots;
+  if (pivots && pivots.tables.length > 0) return 'pivotTable';
+  // The reader notes pivot parts of the package on every sheet; where the model holds every table and cache of them,
+  // the model says whether any is left (the last one may have been deleted, see pivot-delete.ts).
+  const pivotsHeld = !!pivots && pivots.fixed === undefined;
   for (const sheet of workbook.sheets) {
     const anchored = sheet.anchored;
     if (!anchored) continue;
-    for (const kind of NAME_HOLDERS) if (anchored.indexOf(kind) >= 0 && !(kind === 'chart' && chartsFollow(workbook))) return kind;
+    for (const kind of NAME_HOLDERS) if (anchored.indexOf(kind) >= 0 && !(kind === 'chart' && chartsFollow(workbook)) && !(kind === 'pivotTable' && pivotsHeld)) return kind;
     for (const kind of CONTROL_KINDS) if (anchored.indexOf(kind) >= 0) return 'form controls';
   }
   return undefined;
@@ -1885,6 +1916,46 @@ export function applyOp(workbook: Workbook, op: Op): Op {
       if (op.made && pivots.tables.length === 0 && pivots.caches.length === 0) delete workbook.pivots;
       workbook.pivotsModified = true;
       return { type: 'addPivot', sheet: op.sheet, cache: op.cache, table: op.table };
+    }
+    case 'deletePivot': {
+      const pivots = workbook.pivots;
+      const at = op.table;
+      const table = pivots && typeof at === 'number' && Math.floor(at) === at && at >= 0 ? pivots.tables[at] : undefined;
+      if (!pivots || !table) throw new RangeError(`No pivot table at index ${at}`);
+      const cacheAt = pivots.caches.indexOf(table.cache);
+      if (cacheAt < 0) throw new RangeError('The cache of the pivot table is not in the workbook');
+      // The cache goes with the last table made from it.
+      const shared = pivots.tables.some((other) => other !== table && other.cache === table.cache);
+      pivots.tables.splice(at, 1);
+      if (!shared) pivots.caches.splice(cacheAt, 1);
+      if (table.created === undefined) {
+        const entry: { table: PivotTable; cache?: PivotCache } = { table };
+        if (!shared) entry.cache = table.cache;
+        (pivots.deleted || (pivots.deleted = [])).push(entry);
+      }
+      workbook.pivotsModified = true;
+      const undo: Op = { type: 'restorePivot', sheet: op.sheet, at, table };
+      if (!shared) undo.cacheAt = cacheAt;
+      return undo;
+    }
+    case 'restorePivot': {
+      const pivots = workbook.pivots;
+      const { table, at, cacheAt } = op;
+      if (!pivots || !table || pivots.tables.indexOf(table) >= 0) throw new RangeError('The pivot table to put back is in the workbook already');
+      if (!(typeof at === 'number' && at >= 0 && at <= pivots.tables.length && Math.floor(at) === at)) throw new RangeError(`A pivot table cannot be put at ${at}`);
+      if (cacheAt !== undefined) {
+        if (!(typeof cacheAt === 'number' && cacheAt >= 0 && cacheAt <= pivots.caches.length && Math.floor(cacheAt) === cacheAt) || pivots.caches.indexOf(table.cache) >= 0) throw new RangeError('The cache of the pivot table cannot be put back');
+      } else if (pivots.caches.indexOf(table.cache) < 0) throw new RangeError('The cache of the pivot table is not in the workbook');
+      if (workbook.sheets.indexOf(table.sheet) < 0) throw new RangeError('The sheet of the pivot table is not in the workbook');
+      pivots.tables.splice(at, 0, table);
+      if (cacheAt !== undefined) pivots.caches.splice(cacheAt, 0, table.cache);
+      if (pivots.deleted) {
+        const i = pivots.deleted.findIndex((entry) => entry.table === table);
+        if (i >= 0) pivots.deleted.splice(i, 1);
+        if (pivots.deleted.length === 0) delete pivots.deleted;
+      }
+      workbook.pivotsModified = true;
+      return { type: 'deletePivot', sheet: op.sheet, table: at };
     }
   }
 }

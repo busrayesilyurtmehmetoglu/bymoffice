@@ -226,3 +226,73 @@ test.describe('making pivot tables and changing their fields', () => {
     await expect(item(page, 'Insert pivot table…')).toHaveCount(0);
   });
 });
+
+test.describe('deleting pivot tables', () => {
+  test('the menu of a cell of a table deletes it with its cells, without a question; undone, it is back', async ({ page }) => {
+    await mount(page, await bytes());
+    await makeOne(page);
+    await page.keyboard.press('Escape');
+    await expect(panel(page)).toHaveCount(0);
+    await openCellMenu(page, 0, 3);
+    // The commands of a cell of a table: refresh, fields, delete.
+    await expect(item(page, 'Delete pivot table')).toBeVisible();
+    await item(page, 'Delete pivot table').click();
+    await expect(page.locator('.bym-menu')).toHaveCount(0);
+    await expect(page.locator('[role="dialog"]')).toHaveCount(0);
+    await expect(live(page)).toHaveText('Pivot table deleted');
+    expect(await view(page, 'view.pivots().length')).toBe(0);
+    expect(await cells(page, 1, 2, 0, 5, 1)).toEqual([
+      [null, null],
+      [null, null],
+      [null, null],
+      [null, null],
+    ]);
+    // A cell where the table stood is a cell like any other: its menu makes a table.
+    await openCellMenu(page, 0, 3);
+    await expect(item(page, 'Delete pivot table')).toHaveCount(0);
+    await expect(item(page, 'Insert pivot table…')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await view(page, 'view.undo()');
+    expect(await view(page, 'view.pivots().length')).toBe(1);
+    expect(await cells(page, 1, 2, 0, 5, 1)).toEqual([
+      ['Row Labels', 'Sum of Sales'],
+      ['East', 15],
+      ['West', 27],
+      ['Grand Total', 42],
+    ]);
+  });
+
+  test('the button of the panel deletes the table, and the panel closes', async ({ page }) => {
+    await mount(page, await bytes());
+    await makeOne(page);
+    await panel(page).locator('[data-bym-action="delete"]').click();
+    await expect(panel(page)).toHaveCount(0);
+    expect(await view(page, 'view.pivots().length')).toBe(0);
+    expect(await cells(page, 1, 2, 0, 2, 1)).toEqual([[null, null]]);
+    // The sheet the table stood on stays.
+    await expect(page.locator('.bym-tab')).toHaveText(['Sheet1', 'Sheet2']);
+  });
+
+  test('in Turkish the command and the button are Turkish', async ({ page }) => {
+    await mount(page, await bytes(), { locale: 'tr' });
+    await openCellMenu(page, 1, 2);
+    await item(page, 'Pivot tablo ekle…').click();
+    await dialog(page).locator('[data-bym-action="ok"]').click();
+    await expect(panel(page).locator('[data-bym-action="delete"]')).toHaveText('Tabloyu sil');
+    await page.keyboard.press('Escape');
+    await openCellMenu(page, 0, 3);
+    await item(page, 'Pivot tabloyu sil').click();
+    await expect(live(page)).toHaveText('Pivot tablo silindi');
+  });
+
+  test('a read-only view offers no deletion', async ({ page }) => {
+    await mount(page, await bytes());
+    await makeOne(page);
+    await page.keyboard.press('Escape');
+    await view(page, 'view.setReadOnly(true)');
+    await openCellMenu(page, 0, 3);
+    await expect(item(page, 'Delete pivot table')).toHaveCount(0);
+    expect(await view(page, 'view.deletePivot(0)')).toBe(false);
+    expect(await view(page, 'view.pivots().length')).toBe(1);
+  });
+});

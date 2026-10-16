@@ -142,6 +142,7 @@ export { DEFAULT_NOTE_AUTHOR, MAX_NOTE_TEXT, clearNotes, commentAtCell, hasLiveC
 export { PivotRefreshError, compareText, listPivots, lookThroughPivots, pivotAt, refreshAllPivots, refreshPivot, refreshPivotProblem, type PivotInfo, type RefreshAll } from './ops/pivots';
 export { MAX_PIVOT_AXIS_ITEMS } from './ops/pivots';
 export { PivotCreateError, createPivot, createPivotProblem, pivotSourceFields, type PivotCreateOptions, type PivotCreation, type PivotSourceSpec, type PivotTargetSpec } from './ops/pivot-create';
+export { PivotDeleteError, deletePivot, deletePivotProblem, pivotTableArea } from './ops/pivot-delete';
 export {
   PivotFieldsError,
   pivotFields,
@@ -232,6 +233,7 @@ export {
   keptFor,
   moveConditionalRule,
   removeConditionalRule,
+  deletePivotFormats,
   ruleFormatOf,
   ruleKeptNow,
   ruleSpace,

@@ -532,6 +532,12 @@ interface PivotSaves {
 
 const SAVES = new WeakMap<Workbook, PivotSaves>();
 
+/** The bytes the file had for a pivot part that an earlier save of the workbook rewrote; undefined for a part no save rewrote. */
+export function pivotFileBytes(workbook: Workbook, part: string): Uint8Array | undefined {
+  const saved = SAVES.get(workbook);
+  return saved ? saved.originals.get(part) : undefined;
+}
+
 /** The parts of the pivot tables and caches a save of the workbook writes from the file's bytes: those refreshed, and those an earlier save wrote. */
 export function pivotPartsToRead(workbook: Workbook): string[] {
   const pivots = workbook.pivots;

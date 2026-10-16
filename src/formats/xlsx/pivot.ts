@@ -37,6 +37,8 @@ import { relationshipsOf } from '../../opc';
 import { inflateRaw } from '../../deflate';
 import { childElements, localName, parseXml, type XmlElement } from '../../xml';
 import { XmlScanner } from '../../xml-scan';
+import { editsOf, readingsOf } from '../../model/edits';
+import { elementsNaming, localOf } from './rel-names';
 import { decodeXstring } from './shared-strings';
 
 const child = (parent: XmlElement, local: string): XmlElement | undefined => childElements(parent, local)[0];
@@ -476,6 +478,16 @@ function parseTable(root: XmlElement, part: string, sheet: Sheet, cache: PivotCa
     if (numFmtId !== undefined) data.numFmtId = numFmtId;
     table.dataFields.push(data);
   }
+  // The priorities of its conditional formats: the rules of the sheet that are the table's.
+  const conditional = child(root, 'conditionalFormats');
+  if (conditional) {
+    const priorities: number[] = [];
+    for (const one of childElements(conditional, 'conditionalFormat').slice(0, 10000)) {
+      const priority = int(one.attrs.get('priority'), 0, 2147483647);
+      if (priority !== undefined) priorities.push(priority);
+    }
+    if (priorities.length > 0) table.conditionalPriorities = priorities;
+  }
   for (const local of ['formats', 'conditionalFormats']) {
     const el = child(root, local);
     if (el && namesItems(el)) refuse('it formats some of its items');
@@ -625,6 +637,7 @@ export async function readPivots(
   if (fixed !== undefined) out.fixed = fixed;
   // What else refers to the caches is looked through when a refresh is asked for: opening costs nothing more.
   out.lookThrough = (workbook: Workbook) => lookThrough(pkg, out, main, slicers, workbook);
+  out.deleteProblem = (workbook: Workbook, table: PivotTable, cacheGoes: boolean) => deleteProblem(pkg, main, workbook, table, cacheGoes);
   return out;
 }
 
@@ -764,6 +777,15 @@ function lookThrough(pkg: OpcPackage, pivots: WorkbookPivots, main: string, slic
     const names = new Map<string, string>();
     for (const name of pkg.partNames()) if (!names.has(nameKey(name))) names.set(nameKey(name), name);
     const tables = new Set(pivots.tables.map((table) => nameKey(table.part)));
+    // The parts of tables and caches that were deleted leave the package with the next save: what they refer to does not count.
+    const gone = new Set<string>();
+    for (const entry of pivots.deleted || []) {
+      gone.add(nameKey(entry.table.part));
+      if (entry.cache) {
+        gone.add(nameKey(entry.cache.part));
+        if (entry.cache.recordsPart !== undefined) gone.add(nameKey(entry.cache.recordsPart));
+      }
+    }
     const byPart = new Map<string, PivotCache>();
     const byRecords = new Map<string, PivotCache>();
     for (const cache of pivots.caches) {
@@ -793,6 +815,7 @@ function lookThrough(pkg: OpcPackage, pivots: WorkbookPivots, main: string, slic
         throw new CannotTell(`the relationships of ${source} cannot be read`);
       }
       const from = nameKey(source);
+      if (gone.has(from)) continue;
       for (const rel of list) {
         // A link (to a place of the workbook, "#Sheet2!A1", or elsewhere) leads to no part.
         if (rel.external || !rel.part || /\/hyperlink$/.test(rel.type)) continue;
@@ -836,4 +859,100 @@ function lookThrough(pkg: OpcPackage, pivots: WorkbookPivots, main: string, slic
     if (!(error instanceof CannotTell) && !(error instanceof Error)) throw error;
     markAll(UNKNOWN);
   }
+}
+
+/** Bytes of a sheet part looked through for what names the relationship of a table that is deleted, at most. */
+const MAX_NAMING_SHEET_BYTES = 256 * 1024 * 1024;
+/** And of the workbook part, for what names the relationship of a cache. */
+const MAX_NAMING_BOOK_BYTES = 16 * 1024 * 1024;
+
+/** What deleteProblem() found for a table, by the workbook as it was (the count of its edits and of the files written from it). */
+const NAMED = new WeakMap<PivotTable, { stamp: string; problem: string | undefined }>();
+
+/** The text of a part that is UTF-8; undefined for any other. */
+function utf8Of(bytes: Uint8Array): string | undefined {
+  if (bytes.length >= 2 && ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))) return undefined;
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (error) {
+    return undefined;
+  }
+}
+
+/**
+ * Why the relationships the deletion of a table drops would be left named by something the writer
+ * does not change (see WorkbookPivots.deleteProblem): in its sheet, anything but <pivotSelection>
+ * of a view (which the writer takes out with the table); in the workbook part, anything but
+ * <pivotCache> of its list of caches (the extension list of Excel 2010 lists caches again, as
+ * x14:pivotCaches: not changed here, the deletion is refused). Looked through once for each state
+ * of the workbook.
+ */
+function deleteProblem(pkg: OpcPackage, main: string, workbook: Workbook, table: PivotTable, cacheGoes: boolean): string | undefined {
+  const stamp = `${editsOf(workbook)}:${readingsOf(workbook)}:${cacheGoes ? 1 : 0}`;
+  const known = NAMED.get(table);
+  if (known && known.stamp === stamp) return known.problem;
+  let problem: string | undefined;
+  try {
+    problem = namingProblem(pkg, main, table, cacheGoes);
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    problem = `it cannot tell what names its parts (${error.message.slice(0, 80)})`;
+  }
+  NAMED.set(table, { stamp, problem });
+  return problem;
+}
+
+function namingProblem(pkg: OpcPackage, main: string, table: PivotTable, cacheGoes: boolean): string | undefined {
+  const names = new Map<string, string>();
+  for (const name of pkg.partNames()) if (!names.has(nameKey(name))) names.set(nameKey(name), name);
+  /** The ids of the relationships of `source` of a kind that lead to `target`. */
+  const idsTo = (source: string, kind: string, target: string): string[] => {
+    const slash = source.lastIndexOf('/');
+    const data = partNow(pkg, names, `${source.slice(0, slash)}/_rels/${source.slice(slash + 1)}.rels`, PIVOT_SCAN_LIMITS.relsPartBytes);
+    if (!data) return [];
+    const key = nameKey(target);
+    return relationshipsOf(source, parseXml(data))
+      .filter((rel) => !rel.external && !!rel.part && rel.type.slice(rel.type.lastIndexOf('/') + 1) === kind && nameKey(rel.part) === key)
+      .map((rel) => rel.id);
+  };
+  const sheetPart = table.sheet.part;
+  if (sheetPart !== '') {
+    const ids = idsTo(sheetPart, 'pivotTable', table.part);
+    if (ids.length > 0) {
+      const bytes = partNow(pkg, names, sheetPart, MAX_NAMING_SHEET_BYTES);
+      if (bytes) {
+        const text = utf8Of(bytes);
+        if (text === undefined) return 'its sheet is not written in UTF-8, and cannot be looked through for what names it';
+        for (const id of ids) {
+          const found = elementsNaming(text, id);
+          if (found.length >= 10000) return 'its sheet names it too often';
+          const other = found.find((el) => localOf(el.name) !== 'pivotSelection');
+          if (other) return `an element of its sheet names it (${other.name.slice(0, 60)})`;
+        }
+      }
+    }
+  }
+  if (cacheGoes) {
+    const ids = idsTo(main, 'pivotCacheDefinition', table.cache.part);
+    if (ids.length > 0) {
+      const bytes = partNow(pkg, names, main, MAX_NAMING_BOOK_BYTES);
+      if (bytes) {
+        const root = parseXml(bytes).root;
+        const wanted = new Set(ids);
+        // Every element of the workbook part, its parent known: only <pivotCache> of the <pivotCaches> of the root may name the cache.
+        const stack: { el: XmlElement; parent: XmlElement | undefined }[] = [{ el: root, parent: undefined }];
+        for (let n = 0; stack.length > 0; n++) {
+          if (n > 1000000) return 'it cannot tell what names its cache (the workbook part is too large)';
+          const { el, parent } = stack.pop() as { el: XmlElement; parent: XmlElement | undefined };
+          for (const [name, value] of el.attrs) {
+            if (name.indexOf(':') <= 0 || localName(name) !== 'id' || name.slice(0, 6) === 'xmlns:' || !wanted.has(value)) continue;
+            const listed = localName(el.name) === 'pivotCache' && parent !== undefined && localName(parent.name) === 'pivotCaches' && root.children.indexOf(parent) >= 0;
+            if (!listed) return `an element of the workbook names its cache (${parent ? `${parent.name.slice(0, 40)}/` : ''}${el.name.slice(0, 40)})`;
+          }
+          for (const kid of el.children) if (kid.type === 'element') stack.push({ el: kid, parent: el });
+        }
+      }
+    }
+  }
+  return undefined;
 }

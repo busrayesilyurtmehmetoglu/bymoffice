@@ -76,6 +76,7 @@ import { MAX_NOTE_TEXT, commentAtCell, noteProblem, setComment as setCommentOps 
 import { listPivots, lookThroughPivots, pivotAt, refreshAllPivots as refreshAllPivotsOps, refreshPivot as refreshPivotOps, type PivotInfo } from '../ops/pivots';
 import { createPivot, pivotSourceFields, type PivotCreateOptions } from '../ops/pivot-create';
 import { pivotFields as pivotFieldsOf, setPivotFields as setPivotFieldsOps, type PivotFieldsChange, type PivotFieldsInfo } from '../ops/pivot-fields';
+import { deletePivot as deletePivotOps, deletePivotProblem } from '../ops/pivot-delete';
 import { cacheFieldsNow, type PivotTable } from '../model/sheet/pivot';
 import { PIVOT_PANEL_STYLE, PivotPanel } from './pivot-panel';
 import { PivotDialog, pivotSourceText, readPivotCell, readPivotSource } from './pivot-dialog';
@@ -5411,6 +5412,28 @@ export class WorkbookView {
   }
 
   /**
+   * Deletes the pivot table at `index` (as pivots() lists it) as one undo step: the table goes with
+   * its cells (values and formats) and, when no other table is made from it, its cache (see
+   * deletePivot() of the operations). No question is asked: the step is undone like any other. What
+   * is being typed is applied first. Returns false in a read-only view and while what is typed
+   * cannot be applied. Throws RangeError with the reason when it is not deleted (said in the words
+   * of the view by localizeError()), and while the workbook is edited together.
+   */
+  deletePivot(index: number): boolean {
+    if (!this.beginRules()) return false;
+    // Its operations are not sent (see encodeOp()): refused before anything is changed.
+    if (this.collab) throw new CollabUnsupportedError('other', 'A pivot table cannot be deleted while the workbook is edited together');
+    const ops = deletePivotOps(this.workbook, index);
+    const table = (this.workbook.pivots as NonNullable<Workbook['pivots']>).tables[index];
+    const sheet = this.workbook.sheets.indexOf(table.sheet);
+    if (sheet >= 0 && sheet !== this.sheetIndex) this.setActiveSheet(sheet);
+    if (!this.applyOps(ops)) return false;
+    // The panel of its fields closes with it (see refresh() of the panel).
+    this.live.textContent = this.strings.pivots.deleted;
+    return true;
+  }
+
+  /**
    * Opens the panel of the fields of a pivot table: the one at `index`, by default the one of the
    * active cell. Returns false when there is none (said), and in a read-only view.
    */
@@ -5449,6 +5472,20 @@ export class WorkbookView {
         const now = pivots ? pivots.tables.indexOf(table) : -1;
         if (now < 0) throw new RangeError(this.strings.pivots.noTable);
         this.setPivotFields(now, change);
+      },
+      onDelete: () => {
+        const pivots = this.workbook.pivots;
+        const now = pivots ? pivots.tables.indexOf(table) : -1;
+        if (now < 0) throw new RangeError(this.strings.pivots.noTable);
+        this.deletePivot(now);
+      },
+      deleteRefusal: () => {
+        if (this.collab) return this.strings.collab.unsupported;
+        const pivots = this.workbook.pivots;
+        const now = pivots ? pivots.tables.indexOf(table) : -1;
+        // As the package was looked through when the panel opened (see info above).
+        const reason = now < 0 ? undefined : deletePivotProblem(this.workbook, now, false);
+        return reason === undefined ? undefined : this.localizeError(new RangeError(reason));
       },
       explain: (error) => this.localizeError(error),
       onClose: () => {
@@ -5498,6 +5535,16 @@ export class WorkbookView {
     if (listPivots(this.workbook).length > 1) items.push({ label: strings.refreshAll, disabled: !!this.collab, title: this.collab ? reason : undefined, explain: this.collab ? explain : undefined, action: () => this.attempt(() => this.menuRefreshAll()) });
     // The panel opens whatever is refused: it says why its fields cannot be changed.
     items.push({ label: strings.fields, action: () => this.attempt(() => void this.openPivotFields(index)) });
+    // Deleted without a question (it is undone like any other step); what is known to be refused is shown and says why.
+    const problem = deletePivotProblem(this.workbook, index, false);
+    const refusal = this.collab ? this.strings.collab.unsupported : problem !== undefined ? strings.refused(problem) : undefined;
+    items.push({
+      label: strings.deleteTable,
+      disabled: refusal !== undefined,
+      title: refusal,
+      explain: refusal === undefined ? undefined : () => this.notify(refusal, 'error'),
+      action: () => this.attempt(() => void this.deletePivot(index)),
+    });
   }
 
   private menuRefreshPivot(index: number): void {
@@ -6800,8 +6847,8 @@ export class WorkbookView {
     if (error instanceof ValidationError) return error.display;
     const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
     let match: RegExpExecArray | null;
-    if (/^Cannot (refresh the pivot table|change the fields of the pivot table|make the pivot table)/.test(message)) return strings.pivots.refused(message);
-    if (message === 'A pivot table cannot be changed while the workbook is edited together') return strings.collab.unsupported;
+    if (/^Cannot (refresh the pivot table|change the fields of the pivot table|make the pivot table|delete the pivot table)/.test(message)) return strings.pivots.refused(message);
+    if (message === 'A pivot table cannot be changed while the workbook is edited together' || message === 'A pivot table cannot be deleted while the workbook is edited together') return strings.collab.unsupported;
     if (message === 'Too many cells to format at once') return strings.tooManyCells;
     if ((match = /^Too many rows to (format|resize|change) at once$/.exec(message))) return strings.tooManyRows(match[1] as 'format' | 'resize' | 'change');
     if (message === 'Whole rows or columns cannot be merged') return strings.cannotMergeWhole;
@@ -7964,7 +8011,7 @@ export class WorkbookView {
       const op = ops[i];
       if (sheets.indexOf(op.sheet) < 0) sheets.push(op.sheet);
       // A note or a rule changes no size and no position.
-      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings' && op.type !== 'setPivot' && op.type !== 'addPivot' && op.type !== 'removePivot' && op.type !== 'addStyles' && op.type !== 'removeStyles') structural = true;
+      if (op.type !== 'setCells' && op.type !== 'setComments' && op.type !== 'setDataValidations' && op.type !== 'setConditionalFormats' && op.type !== 'setDrawings' && op.type !== 'setPivot' && op.type !== 'addPivot' && op.type !== 'removePivot' && op.type !== 'addStyles' && op.type !== 'removeStyles' && op.type !== 'deletePivot' && op.type !== 'restorePivot') structural = true;
       if (op.type === 'insert' || op.type === 'delete') moves = true;
       if ((op.type === 'setRows' || op.type === 'setAutoFilter') && (!rows || rows.indexOf(op.sheet) < 0)) (rows || (rows = [])).push(op.sheet);
     }

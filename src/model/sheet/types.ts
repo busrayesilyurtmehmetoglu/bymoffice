@@ -508,6 +508,8 @@ export interface ConditionalFormat {
   rules: ConditionalRule[];
   /** Set by the reader: the index of the <conditionalFormatting> element among the children of the worksheet. */
   src?: number;
+  /** Set by the reader: the element says its rules are those of a pivot table (pivot="1"); they go with the table when it is deleted. */
+  pivot?: boolean;
   /**
    * Set on a format that was added or changed since the sheet was read: its ranges, and the
    * formulas of its rules, are those of the sheet as it is now, under the names the sheets

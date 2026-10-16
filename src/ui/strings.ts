@@ -689,6 +689,10 @@ export interface PivotStrings {
   changed: string;
   /** Said when the panel is asked for away from a pivot table. */
   noTable: string;
+  /** The command that deletes a table (cell menu), the button of the panel that does, and what is said once it is done. */
+  deleteTable: string;
+  deleteButton: string;
+  deleted: string;
 }
 
 /** What the commands and the dialog of charts say. */
@@ -1663,6 +1667,9 @@ export const STRINGS_EN: UiStrings = {
     colGrandTotals: 'Grand totals of columns',
     changed: 'Pivot table changed',
     noTable: 'Select a cell of a pivot table',
+    deleteTable: 'Delete pivot table',
+    deleteButton: 'Delete table',
+    deleted: 'Pivot table deleted',
   },
   find: {
     title: 'Find and replace',
@@ -2499,6 +2506,9 @@ export const STRINGS_TR: UiStrings = {
     colGrandTotals: 'Sütunların genel toplamları',
     changed: 'Pivot tablo değişti',
     noTable: 'Bir pivot tablo hücresi seçin',
+    deleteTable: 'Pivot tabloyu sil',
+    deleteButton: 'Tabloyu sil',
+    deleted: 'Pivot tablo silindi',
   },
   find: {
     title: 'Bul ve değiştir',
@@ -2752,6 +2762,10 @@ const PIVOT_REASONS_TR: [RegExp, (m: RegExpExecArray) => string][] = [
   [/^it would stand over its source$/, () => 'kaynağının üzerine gelirdi'],
   [/^it would stand over the merged cells (\S+)$/, (m) => `${m[1]} birleştirilmiş hücrelerinin üzerine gelirdi`],
   [/^it could not be built$/, () => 'kurulamadı'],
+  // Why a table is not deleted (see src/ops/pivot-delete.ts).
+  [/^its parts are not known$/, () => 'parçaları bilinmiyor'],
+  [/^it stands over the pivot table "(.*)"$/, (m) => `"${m[1]}" pivot tablosunun üzerinde duruyor`],
+  [/^it takes more than (\d+) cells$/, (m) => `${m[1]} hücreden fazlasını kaplıyor`],
 ];
 
 /** A reason of the engine about pivot tables, in Turkish; as it is where no translation fits. */
@@ -2771,6 +2785,14 @@ function pivotRefusalTr(message: string): string {
     for (const [pattern, say] of PIVOT_REASONS_TR) {
       const found = pattern.exec(made[1]);
       if (found) return `Pivot tablo eklenemiyor: ${say(found)}`;
+    }
+    return message;
+  }
+  const deleted = /^Cannot delete the pivot table "(.*?)": (.*)$/.exec(message);
+  if (deleted) {
+    for (const [pattern, say] of PIVOT_REASONS_TR) {
+      const found = pattern.exec(deleted[2]);
+      if (found) return `"${deleted[1]}" pivot tablosu silinemiyor: ${say(found)}`;
     }
     return message;
   }

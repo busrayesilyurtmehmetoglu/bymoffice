@@ -1043,6 +1043,10 @@ export function encodeOp(workbook: Workbook, op: Op): Encoded {
     case 'removeStyles':
       // Nor is a table that is made: refused the same way.
       throw new CollabUnsupportedError('other', 'A pivot table cannot be made while the workbook is edited together');
+    case 'deletePivot':
+    case 'restorePivot':
+      // Nor one that is deleted: what the writer takes out of the package is known to this participant only.
+      throw new CollabUnsupportedError('other', 'A pivot table cannot be deleted while the workbook is edited together');
     default:
       throw new CollabUnsupportedError('other', `The operation "${op.type}" cannot be shared`);
   }

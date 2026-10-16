@@ -288,6 +288,8 @@ export interface PivotTable {
    * until a save gives it one, as for a sheet that is in no file.
    */
   created?: string;
+  /** The priorities its definition gives its conditional formats (<conditionalFormats>): the rules of its sheet (marked pivot) that go with it when it is deleted. */
+  conditionalPriorities?: number[];
 }
 
 /**
@@ -310,6 +312,21 @@ export interface WorkbookPivots {
    * places would not follow); undefined when the model holds every one of them.
    */
   fixed?: string;
+  /**
+   * Tables of the file that were deleted (see src/ops/pivot-delete.ts), each with its cache when the
+   * cache went with it (no other table was made from it): the writer takes their parts out of the
+   * package, and what refers to them is not looked at any more. A deletion that is undone takes its
+   * entry out again. Tables made here are not listed: they are in no file.
+   */
+  deleted?: { table: PivotTable; cache?: PivotCache }[];
+  /**
+   * Set by the reader: why the parts of a table of the file (and of its cache, with `cacheGoes`)
+   * cannot be taken out of the package because something the writer does not change names their
+   * relationships (an element of its sheet other than the selection of a view; an element of the
+   * workbook other than its list of caches); undefined when nothing does. Reads the package as it
+   * is now.
+   */
+  deleteProblem?: (workbook: Workbook, table: PivotTable, cacheGoes: boolean) => string | undefined;
 }
 
 /** The state of a table: what the last refresh made of it, else what the file has. */

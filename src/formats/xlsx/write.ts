@@ -67,9 +67,10 @@ import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
 import { MAX_SHEET_COMMENTS, readText, vmlRoot } from './comments';
 import { decodeXstring } from './shared-strings';
 import { dynamicArrayMetadata, METADATA_CONTENT_TYPE, METADATA_RELATIONSHIP } from './metadata';
-import { pivotPartsToRead, pivotWrites, writeCacheDefinition, writeCacheRecords, writeTableDefinition } from './pivot-write';
+import { withoutPivotSelections } from './rel-names';
+import { pivotFileBytes, pivotPartsToRead, pivotWrites, writeCacheDefinition, writeCacheRecords, writeTableDefinition } from './pivot-write';
 import { madePartText } from './pivot-create';
-import type { PivotTable } from '../../model/sheet/pivot';
+import type { PivotCache, PivotTable } from '../../model/sheet/pivot';
 import { parseColor } from './styles';
 import { conditionalRuleXml, dataValidationXml, freshSheetParts, keptRuleExtra, pageBreaksXml, keptTarget, keptValidationExtra, type KeptTarget, type RuleExtra } from './build';
 import { keptFor, keptNow, ownCellFormulaAt, ownCellSpelling, type CellSpelling } from '../../ops/rules';
@@ -4585,9 +4586,18 @@ interface MadePivotParts {
   cacheId: number;
 }
 
+/** Tables made here that are gone for now whose names a save keeps for them (see SaveState.pivots). */
+const MAX_PIVOTS_AWAY = 64;
+
 const PIVOT_TABLE_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml';
 const PIVOT_CACHE_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml';
 const PIVOT_RECORDS_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml';
+
+/** The pivot tables of the file that were deleted, with the caches that went with them. */
+function deletedPivots(workbook: Workbook): { table: PivotTable; cache?: PivotCache }[] {
+  const pivots = workbook.pivots;
+  return pivots && pivots.deleted ? pivots.deleted.filter((entry) => entry.table.created === undefined && entry.table.part !== '') : [];
+}
 
 /** The pivot tables made here that a save writes: those whose sheet is in the workbook. */
 function madePivots(workbook: Workbook): PivotTable[] {
@@ -4802,6 +4812,21 @@ function foreseeXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       reads.bytes(relsPartOf(book));
     }
     for (const table of made) if (table.sheet.part !== '') reads.bytes(relsPartOf(table.sheet.part));
+  }
+  // Pivot tables of the file that were deleted: the workbook and the sheets drop what names them, and their parts are kept as they go.
+  const gonePivots = deletedPivots(workbook);
+  if (gonePivots.length > 0) {
+    const book = reads.mainPart();
+    if (book) {
+      reads.bytes(book);
+      reads.bytes(relsPartOf(book));
+    }
+    for (const entry of gonePivots) {
+      if (entry.table.sheet.part !== '') reads.bytes(relsPartOf(entry.table.sheet.part));
+      const parts = [entry.table.part];
+      if (entry.cache) parts.push(entry.cache.part, ...(entry.cache.recordsPart !== undefined ? [entry.cache.recordsPart] : []));
+      for (const part of parts) if (pkg.hasPart(part)) for (const name of [part, relsPartOf(part)]) reads.bytes(name);
+    }
   }
   if (!workbook.styles.modified && !sheetsModified && !workbook.definedNamesModified && !sheets.some(flagged)) return;
   const saved = SAVES.get(workbook);
@@ -5053,6 +5078,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       for (const names of noted.values()) for (const name of [names.comments, names.vml, names.rels]) if (name !== undefined) taken.add(name.toLowerCase());
       for (const names of charted.values()) for (const name of names) taken.add(name.toLowerCase());
       for (const name of pivotPartsBefore) taken.add(name.toLowerCase());
+      // The names of tables made here that are gone for now (deleted, undone) stay theirs, should they come back.
+      for (const names of pivoted.values()) for (const name of [names.table, names.cache, names.records]) for (const one of [name, relsPartOf(name)]) taken.add(one.toLowerCase());
     }
     return taken;
   };
@@ -5763,6 +5790,15 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const newId = relationIds(sheetPart, childrenNamed(doc.root, 'Relationship'));
     return relateNotes(doc, sheetPart, { relate: list.map((names) => ({ id: newId(), kind: 'pivotTable', part: names.table })), unrelate: new Set() });
   };
+  /** Per sheet of the file: the parts of the pivot tables of the file on it that were deleted (in lower case), whose relationships it drops. */
+  const pivotsGoneOn = new Map<Sheet, Set<string>>();
+  for (const entry of deletedPivots(workbook)) {
+    const sheet = entry.table.sheet;
+    if (sheet.part === '' || workbook.sheets.indexOf(sheet) < 0) continue;
+    const set = pivotsGoneOn.get(sheet) || new Set<string>();
+    set.add(entry.table.part.toLowerCase());
+    pivotsGoneOn.set(sheet, set);
+  }
 
   const charting = new Set<Sheet>();
   for (const sheet of workbook.sheets) {
@@ -5956,9 +5992,31 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     const paging = paged.has(sheet);
     const rules = ruled.has(sheet);
     const pivotsHere = pivotsOn.has(sheet);
-    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !rules && !charting.has(sheet) && !pivotsHere) continue;
+    const pivotsGone = pivotsGoneOn.get(sheet);
+    if (!sheet.modified && foreign.length === 0 && !rename && tabSelected === undefined && before.length === 0 && !notes && !tab && !pane && !paging && !rules && !charting.has(sheet) && !pivotsHere && !pivotsGone) continue;
     const rewritten: string[] = [];
     const sheetRelsPart = relsPartOf(sheet.part);
+    // The relationships of deleted pivot tables of the file that the sheet drops, and the selection of a view that names one of
+    // them, which goes with it (the reader refuses a deletion that anything else of the sheet names).
+    const goneIds = new Set<string>();
+    if (pivotsGone) {
+      const relsOfSheet = peek(sheetRelsPart);
+      for (const rel of relsOfSheet ? childrenNamed(parseXml(relsOfSheet).root, 'Relationship') : []) {
+        const type = typeOf(rel);
+        if (type.slice(type.lastIndexOf('/') + 1) === 'pivotTable' && internal(rel) && pivotsGone.has(resolveTarget(sheet.part, rel.attrs.get('Target') || '').toLowerCase())) goneIds.add(rel.attrs.get('Id') || '');
+      }
+    }
+    const withoutSelections = (bytes: Uint8Array): Uint8Array | undefined => {
+      if (goneIds.size === 0) return undefined;
+      let text: string;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      } catch (error) {
+        return undefined;
+      }
+      const out = withoutPivotSelections(text, goneIds);
+      return out === undefined ? undefined : encoder.encode(out);
+    };
     const others: OtherSheets | undefined = foreign.length > 0 || rename ? { foreign, rename: rename ? rename.map : undefined } : undefined;
     // Charts that were added, moved, changed or deleted: the drawing and chart parts of the sheet follow the model.
     let charts: ChartWrites | undefined;
@@ -6015,6 +6073,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       if (bytes && pane) next = setPaneIn(next || bytes, sheet) || next;
       // How the sheet is printed, likewise.
       if (bytes && paging) next = setPageSetupIn(next || bytes, sheet, sheet.structuralEdits || []) || next;
+      if (bytes && goneIds.size > 0) next = withoutSelections(next || bytes) || next;
       if (bytes && next) {
         // From here on the package no longer holds the part as the file had it.
         keep(sheet.part, bytes);
@@ -6028,7 +6087,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       if (charts && charts.element !== undefined) written = setSheetDrawing(written, 'drawing', charts.element, sheet.name) || written;
       const coloured = (tab && setTabColorIn(written, sheet.tabColor, sheet.name)) || written;
       const viewed = (pane && setPaneIn(coloured, sheet)) || coloured;
-      const next = (paging && setPageSetupIn(viewed, sheet, sheet.structuralEdits || [])) || viewed;
+      const paged = (paging && setPageSetupIn(viewed, sheet, sheet.structuralEdits || [])) || viewed;
+      const next = withoutSelections(paged) || paged;
       // Edits that were all undone leave the part as the file has it: nothing in it asks for a new calculation. Frozen
       // panes and the page setup are of the view and the printer only: a part that differs from the file by them alone
       // asks for none either.
@@ -6040,7 +6100,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     // After rows or columns moved: the pictures and comments of the sheet follow, and the
     // relationships of links that are gone are removed. After rows or columns moved in another
     // sheet, or sheets were renamed or deleted: the shapes that show a cell of such a sheet follow.
-    const sheetRelsBytes = edits || others || notes || charts || pivotsHere ? peek(sheetRelsPart) : undefined;
+    const sheetRelsBytes = edits || others || notes || charts || pivotsHere || pivotsGone ? peek(sheetRelsPart) : undefined;
     if (sheetRelsBytes || notes || charts || pivotsHere) {
       const sheetRels = sheetRelsBytes ? parseXml(sheetRelsBytes) : emptyRels();
       const linkIds = new Set<string>();
@@ -6051,6 +6111,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       for (const rel of childrenNamed(sheetRels.root, 'Relationship')) {
         const type = typeOf(rel);
         const kind = type.slice(type.lastIndexOf('/') + 1);
+        // A pivot table of the file that was deleted: the sheet names it no more (its part leaves the package below).
+        if (kind === 'pivotTable' && pivotsGone && internal(rel) && pivotsGone.has(resolveTarget(sheet.part, rel.attrs.get('Target') || '').toLowerCase())) {
+          sheetRels.root.children = sheetRels.root.children.filter((node) => node !== rel);
+          dropped = true;
+          continue;
+        }
         if (kind === 'hyperlink') {
           if (edits && !linkIds.has(rel.attrs.get('Id') || '')) {
             sheetRels.root.children = sheetRels.root.children.filter((node) => node !== rel);
@@ -6309,6 +6375,48 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     if (!needed && (pkg.hasPart(chain) || removed.has(chain))) wanted.add(chain);
   }
 
+  // Pivot tables of the file that were deleted (see src/ops/pivot-delete.ts): their parts leave the package, and so do those of
+  // the caches that went with them, with the relationships and the entries the workbook lists those caches by. What the file
+  // had is kept, for a deletion that is undone: a part an earlier refresh rewrote is kept as the file had it.
+  let pivotCachesDropped = false;
+  const droppedCacheIds = new Set<string>();
+  for (const entry of deletedPivots(workbook)) {
+    const parts = [entry.table.part];
+    const cache = entry.cache;
+    if (cache) {
+      parts.push(cache.part);
+      if (cache.recordsPart !== undefined) parts.push(cache.recordsPart);
+      const lower = actualOf(cache.part).toLowerCase();
+      for (const rel of relationships) {
+        if (!endsWith(typeOf(rel), '/pivotCacheDefinition') || !internal(rel)) continue;
+        if (actualOf(resolveTarget(main, rel.attrs.get('Target') || '')).toLowerCase() !== lower) continue;
+        droppedCacheIds.add(rel.attrs.get('Id') || '');
+        rels.root.children = rels.root.children.filter((node) => node !== rel);
+        relsChanged = true;
+      }
+    }
+    for (const part of parts) {
+      const name = actualOf(part);
+      if (!pkg.hasPart(name) && !removed.has(name)) continue;
+      const fileBytes = pivotFileBytes(workbook, part);
+      if (fileBytes) keep(name, fileBytes);
+      wanted.add(name);
+    }
+  }
+  if (droppedCacheIds.size > 0) {
+    const listedCaches = childNamed(book.root, 'pivotCaches');
+    if (listedCaches) {
+      const isDropped = (node: XmlNode) => node.type === 'element' && localName(node.name) === 'pivotCache' && [...node.attrs].some(([name, value]) => name.indexOf(':') > 0 && localName(name) === 'id' && droppedCacheIds.has(value));
+      const kept = listedCaches.children.filter((node) => !isDropped(node));
+      if (kept.length !== listedCaches.children.length) {
+        pivotCachesDropped = true;
+        // A list of caches without a cache is not one: it goes.
+        if (kept.some((node) => node.type === 'element')) listedCaches.children = kept;
+        else book.root.children = book.root.children.filter((node) => node !== listedCaches);
+      }
+    }
+  }
+
   // Parts that were taken out and belong to the workbook again go back in first, as the file had them.
   const restores: PartWrite[] = [];
   const restored: string[] = [];
@@ -6372,7 +6480,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
 
   const bookParts: string[] = [];
   const bookWritten = recalculate || renamed || activeMoved || restated || namesChanged;
-  if (bookWritten || cachesListed.length > 0) {
+  if (bookWritten || cachesListed.length > 0 || pivotCachesDropped) {
     writes.push([main, book]);
     bookParts.push(main);
   }
@@ -6415,7 +6523,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   movedNow.set(BOOK, bookParts);
 
   // The parts of pivot tables that were refreshed, or go back to what the file had.
-  const pivots = pivotWrites(workbook, (part) => reads.bytes(part));
+  // A part an earlier save took out (a deletion that was undone) is read from what was kept of it.
+  const pivots = pivotWrites(workbook, (part) => {
+    const name = actualOf(part);
+    const kept = removed.has(name) ? originals.get(name) : undefined;
+    return kept || reads.bytes(part);
+  });
   for (const [part, data] of pivots.writes) writes.push([part, data]);
 
   for (const [part, data, contentType] of restores) pkg.writePart(part, data, contentType);
@@ -6432,7 +6545,11 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
   for (const [sheet, names] of notesNow) noted.set(sheet, names);
   charted.clear();
   for (const [sheet, names] of chartsNow) charted.set(sheet, names);
+  // A table made here that is gone for now (deleted, or its making undone) keeps the names and the number of its cache, so that
+  // one that comes back is written as it was; a few of them at most.
+  const away = [...pivoted].filter(([table]) => !pivotsNow.has(table)).slice(-MAX_PIVOTS_AWAY);
   pivoted.clear();
+  for (const [table, names] of away) pivoted.set(table, names);
   for (const [table, names] of pivotsNow) pivoted.set(table, names);
   saved.pivotParts = [...pivotPartsNow];
   pivots.done();

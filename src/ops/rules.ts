@@ -1615,6 +1615,31 @@ function removeConditionalRulePlain(workbook: Workbook, sheetIndex: number, inde
 }
 
 /**
+ * Deletes the conditional formats of a pivot table from its sheet: the elements marked as a
+ * table's (pivot="1") that have a rule whose priority is one of `priorities` (those the table
+ * definition gives its formats), as Excel deletes them with the table. The others keep their
+ * numbers, so that another table's formats still find theirs. Returns no operation when there is
+ * none; throws RangeError for one the extension list has more to say about.
+ */
+export function deletePivotFormats(workbook: Workbook, sheetIndex: number, priorities: readonly number[]): Op[] {
+  const sheet = worksheetAt(workbook, sheetIndex, 'conditional formats');
+  const formats = sheet.conditionalFormats;
+  if (!formats || formats.length === 0 || priorities.length === 0) return [];
+  const wanted = new Set(priorities);
+  const gone = new Set<number>();
+  formats.forEach((format, f) => {
+    if (format.pivot && format.rules.some((rule) => !!rule && wanted.has(rule.priority))) gone.add(f);
+  });
+  if (gone.size === 0) return [];
+  const slots = slotsInOrder(workbook, sheet);
+  const removed = slots.filter((slot) => gone.has(slot.f));
+  for (const slot of removed) refuseExtension(slot.rule, 'delete');
+  if (removed.length === 0) return [];
+  const placed = slots.filter((slot) => !gone.has(slot.f)).map((slot) => stay(slot, sheet));
+  return conditionalOp(sheetIndex, workbook, sheet, placed, false, removed);
+}
+
+/**
  * Moves the rule at `index` so that it is applied as number `to` (0: first). Throws RangeError
  * for an index that names no rule, and in a sheet with a rule only the extension list has:
  * the number of that rule is kept as it is, and with it the order of all.
