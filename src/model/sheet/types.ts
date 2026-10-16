@@ -1054,6 +1054,20 @@ export interface SheetDrawing {
    * (the wrapper cannot go with one of the drawings it holds).
    */
   wrapped?: boolean;
+  /**
+   * Set by a reader on a drawing whose object the file holds in a wrapper of alternatives
+   * (mc:AlternateContent, inside its anchor or around it): another form of it stands beside the one
+   * that is read. It is moved and deleted like any other; what changes the object itself (the turn,
+   * the crop or the text of a picture) is refused, since the other form would be left as it was.
+   */
+  alternative?: boolean;
+  /**
+   * Set by the command that turns a picture across a quarter turn (ops/pictures.ts): the anchor
+   * it had (`from`), the one it got (`to`; kept on the sheet, which may have moved it) and how many
+   * structural edits the sheet had then. A turn back that finds the picture where it was put, with
+   * no row or column moved since, gives it `from` again. Never written to a file.
+   */
+  turned?: { from: DrawingAnchor; to: DrawingAnchor; edits: number };
 }
 
 /** A comment (note) on a cell. A view for reading, like SheetDrawing. */

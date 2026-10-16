@@ -24,6 +24,7 @@ import {
 } from '../../model/sheet/types';
 import { localName, parseXml, xmlEncodingRead, type XmlElement } from '../../xml';
 import { PIVOT_SCAN_LIMITS } from '../../model/sheet/pivot';
+import { MAX_DRAWING_TEXT, textUpTo } from '../../model/sheet/pictures';
 import { MAX_PATCH_DEPTH, chartKnown, chartLoose, nestedBeyond, type ChartPartFacts } from './chart-write';
 
 /** Anchors read from one drawing; a sheet with more shows the first ones. */
@@ -427,7 +428,7 @@ function readNames(holder: XmlElement | undefined, base: DrawingObjectBase): voi
   const name = props.attrs.get('name');
   if (name !== undefined && name !== '') base.name = name.slice(0, 255);
   const description = props.attrs.get('descr');
-  if (description !== undefined && description !== '') base.description = description.slice(0, 2000);
+  if (description !== undefined && description !== '') base.description = textUpTo(description, MAX_DRAWING_TEXT);
   if (isTrue(props.attrs.get('hidden'))) base.hidden = true;
 }
 
@@ -728,7 +729,11 @@ export function parseDrawing(root: XmlElement, context: DrawingReadContext): She
       const content: XmlElement[] = [];
       objectElements(anchors[i], 0, content, state);
       const object = anchor && content.length > 0 ? readObject(state, content[0], 0) : undefined;
-      if (anchor && object) drawing = (held.get(tops[i]) || 0) > 1 ? { anchor, object, wrapped: true } : { anchor, object };
+      if (anchor && object) {
+        drawing = (held.get(tops[i]) || 0) > 1 ? { anchor, object, wrapped: true } : { anchor, object };
+        // The object in a wrapper of alternatives (inside its anchor, or its anchor inside one): the file holds another form of it.
+        if (tops[i] !== anchors[i] || anchors[i].children.indexOf(content[0]) < 0) drawing.alternative = true;
+      }
     } catch (error) {
       // One object that cannot be read does not take the others with it.
       drawing = undefined;

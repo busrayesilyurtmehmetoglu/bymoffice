@@ -149,7 +149,7 @@
         <div class="row" style="margin: 0 0 10px">
           <span class="muted" id="edit-state"></span>
           <span class="muted" id="chart-state" title="Araç çubuğundaki Grafik ekle düğmesi seçili aralıktan grafik ekler (Alt+F1: sütun grafiği). Grafiğe tıklayınca seçilir: sürükleyerek taşınır, tutamaçlarından boyutlandırılır, ok tuşlarıyla kaydırılır, Delete ile silinir, Ctrl/Cmd+C, X, V ile kopyalanır, kesilir, yapıştırılır, Ctrl/Cmd+D ile çoğaltılır (sağ tık menüsünde de); çift tık ya da sağ tık menüsü Grafiği düzenle kutusunu açar. view.charts() listesi burada özetlenir."></span>
-          <span class="muted" id="picture-state" title="Araç çubuğundaki Görsel ekle düğmesi PNG, JPEG, GIF ya da BMP dosyasını etkin hücreye ekler; görsel panodan yapıştırılarak ya da ızgaraya sürüklenip bırakılarak da eklenir. Görsele tıklayınca seçilir: sürükleyerek taşınır, tutamaçlarından boyutlandırılır (köşede Shift oranı korur), ok tuşlarıyla kaydırılır, Delete ya da sağ tık menüsüyle silinir. view.pictures() listesi burada özetlenir."></span>
+          <span class="muted" id="picture-state" title="Araç çubuğundaki Görsel ekle düğmesi PNG, JPEG, GIF ya da BMP dosyasını etkin hücreye ekler; görsel panodan yapıştırılarak ya da ızgaraya sürüklenip bırakılarak da eklenir. Görsele tıklayınca seçilir: sürükleyerek taşınır, tutamaçlarından boyutlandırılır (köşede Shift oranı korur), ok tuşlarıyla kaydırılır, Delete ya da sağ tık menüsüyle silinir; Ctrl/Cmd+C, X, V ile kopyalanır, kesilir, yapıştırılır; çerçevenin üstündeki yuvarlak tutamaçla döndürülür (Shift: 15 derece), sağ tık menüsünden 90 derece döndürülür, kırpılır (Enter bitirir) ve alternatif metni değiştirilir. view.pictures() listesi burada özetlenir."></span>
         </div>
         <div id="grid"></div>
         <p class="muted" id="cell-info" style="margin: 10px 0 0"></p>
@@ -456,7 +456,9 @@
           pictures = [];
         }
         const ofFile = pictures.filter((picture) => picture.ofFile).length;
-        $('picture-state').textContent = pictures.length === 0 ? '' : `Görseller: ${pictures.length} (${ofFile} dosyadan, ${pictures.length - ofFile} eklenen).`;
+        const turned = pictures.filter((picture) => picture.rotation).length;
+        const cropped = pictures.filter((picture) => picture.crop).length;
+        $('picture-state').textContent = pictures.length === 0 ? '' : `Görseller: ${pictures.length} (${ofFile} dosyadan, ${pictures.length - ofFile} eklenen; ${turned} döndürülmüş, ${cropped} kırpılmış).`;
       }
 
       function describeSheet(workbook, index) {

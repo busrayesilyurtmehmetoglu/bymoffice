@@ -581,7 +581,7 @@ function readRows(value: unknown, what: string): number[] {
 }
 
 /** The commands of pictures (see ops/pictures.ts): refused in a room. */
-const PICTURE_COMMANDS = ['addPicture', 'movePicture', 'removePicture'];
+const PICTURE_COMMANDS = ['addPicture', 'movePicture', 'removePicture', 'rotatePicture', 'cropPicture', 'describePicture', 'pastePicture'];
 
 /** The names of the commands that travel, and how many arguments each takes at most. */
 const COMMANDS: { [name: string]: { family: 'validation' | 'conditional' | 'chart'; run: (workbook: Workbook, sheet: number, args: unknown[]) => Op[] } } = {

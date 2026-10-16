@@ -103,6 +103,7 @@ import {
   ConditionalDialog,
   ConditionalManager,
   DIALOG_STYLE,
+  Dialog,
   FieldError,
   isContextPress,
   managerPage,
@@ -143,22 +144,33 @@ import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridPeer, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
 import { ChartRenderer, type ChartRendererOptions } from '../render/chart';
-import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, ratioRect, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
+import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
+import { ROTATE_HANDLE_GAP, ROTATE_HANDLE_GAP_COARSE, croppedBox, draggedCrop, localPoint, rotateHandlePoint, rotationAt, sizedFrame, turnedBox, uncroppedBox, type PictureCrop } from '../render/picture-frame';
 import { pictureSource } from '../model/sheet/pictures';
 import {
   MAX_PICTURE_BYTES,
+  MAX_PICTURE_TEXT,
   MIN_PICTURE_SIZE,
   addPicture as addPictureOps,
   checkPicture,
+  copyPicture as copyPictureOps,
+  cropPicture as cropPictureOps,
   defaultPictureSize,
+  describePicture as describePictureOps,
   movePicture as movePictureOps,
   movePictureTo,
+  pastePicture as pastePictureOps,
   pictureAnchorAt,
+  pictureCopyProblem,
+  pictureEditProblem,
   picturesProblem,
   removePicture as removePictureOps,
+  rotatePicture as rotatePictureOps,
   sheetPictures,
+  type PictureCopy,
   type PictureInfo,
 } from '../ops/pictures';
+import { clipboardMovedOn, heldPictureCopy, holdPicture, picturePasteKind, holdsPicture, releasePicture, writeSystemClipboard } from './picture-clip';
 import {
   MIN_CHART_SIZE,
   addChart as addChartOps,
@@ -1055,7 +1067,32 @@ export class WorkbookView {
   /** The chart that is selected: the sheet it is on and its place in the drawings of that sheet. */
   private chartPick: { sheet: Sheet; index: number } | undefined;
   /** The selected chart is being moved, or sized by one of its handles: where the pointer came down (sheet pixels), the box it had and the box it would get. */
-  private chartDrag: { pointerId: number; sheet: Sheet; drawing: SheetDrawing; index: number; handle: DrawingHandle | 'move'; x: number; y: number; originX: number; originY: number; start: Rect; now: Rect; moved: boolean; touch: boolean } | undefined;
+  private chartDrag:
+    | {
+        pointerId: number;
+        sheet: Sheet;
+        drawing: SheetDrawing;
+        index: number;
+        handle: DrawingHandle | 'move' | 'turn';
+        x: number;
+        y: number;
+        originX: number;
+        originY: number;
+        start: Rect;
+        now: Rect;
+        moved: boolean;
+        touch: boolean;
+        /** The handle that turns a picture: the rotation it would get. */
+        turn?: number;
+        /** A handle of a picture that is cropped: the crop it would get. */
+        crop?: PictureCrop;
+        cropping?: boolean;
+      }
+    | undefined;
+  /** The picture of the shown sheet that is being cropped (its handles crop it): see startPictureCrop(). */
+  private pictureCrop: { sheet: Sheet; index: number } | undefined;
+  /** The picture the menu asked to be copied, for the copy event it then asks for: see chartClipboard(). */
+  private pictureAsked: number | undefined;
   /** When the selected chart was last tapped: a second tap opens its dialog. */
   private lastChartTap = 0;
   /**
@@ -3688,7 +3725,14 @@ export class WorkbookView {
     const picked = this.pickedDrawing();
     if (floating) {
       floating.selected = picked;
-      floating.ghost = picked !== undefined && this.chartDrag && this.chartDrag.moved ? this.chartDrag.now : undefined;
+      const drag = picked !== undefined && this.chartDrag && this.chartDrag.moved ? this.chartDrag : undefined;
+      floating.ghost = drag ? drag.now : undefined;
+      floating.ghostTurn = drag ? drag.turn : undefined;
+      // A picture that is selected is turned by a handle of its own; one that is cropped shows the whole of it.
+      const picture = picked !== undefined && this.isPictureAt(picked);
+      floating.turnable = picture && this.pictureEditable(picked as number);
+      floating.turnGap = this.turnGap();
+      floating.cropping = picture && picked !== undefined ? this.croppingFrame(picked) : undefined;
     }
     // A picture asked for in this frame is never dropped to make room for another.
     if (this.images) this.images.pass++;
@@ -3955,6 +3999,11 @@ export class WorkbookView {
     return !!drawing && !!drawing.object && drawing.object.type === 'picture' && this.picturesEditable();
   }
 
+  /** Whether a picture of the shown sheet can be turned, cropped and described: see pictureEditProblem(). */
+  private pictureEditable(index: number): boolean {
+    return !this.collab && pictureEditProblem(this.workbook, this.sheetIndex, index) === undefined;
+  }
+
   /** Whether the pictures of the shown sheet can be changed: see isPictureAt(). */
   private picturesEditable(): boolean {
     return !this.collab && picturesProblem(this.workbook, this.sheetIndex) === undefined;
@@ -3986,6 +4035,8 @@ export class WorkbookView {
   private setChartPick(index: number | undefined, say = true): void {
     const before = this.pickedDrawing();
     this.chartPick = index === undefined ? undefined : { sheet: this.state().sheet, index };
+    // Cropping belongs to the picture that is selected.
+    if (this.pictureCrop && (index === undefined || this.pictureCrop.index !== index || this.pictureCrop.sheet !== this.state().sheet)) this.pictureCrop = undefined;
     if (index === before) return;
     this.schedule();
     if (index === undefined || !say) return;
@@ -4018,14 +4069,22 @@ export class WorkbookView {
   }
 
   /** What a pointer at a point of the canvas would take of the selected chart: one of its handles, or the chart itself ("move"). */
-  private chartGrab(x: number, y: number, coarse: boolean): DrawingHandle | 'move' | undefined {
+  private chartGrab(x: number, y: number, coarse: boolean): DrawingHandle | 'move' | 'turn' | undefined {
     const index = this.pickedDrawing();
     const state = this.state();
     const layer = index === undefined ? undefined : this.drawingsOf(state.sheet);
     const box = layer && index !== undefined ? layer.boxOf(state.metrics, index) : undefined;
-    const at = this.sheetPoint(x, y);
-    if (!box || !at) return undefined;
-    const handle = drawingHandleAt(box, at.x, at.y, coarse ? HANDLE_SIZE * 2 : HANDLE_SIZE - 2);
+    const sheetAt = this.sheetPoint(x, y);
+    if (!box || !sheetAt || index === undefined) return undefined;
+    const reach = coarse ? HANDLE_SIZE * 2 : HANDLE_SIZE - 2;
+    // The frame of a picture is turned with it: the point is taken into the frame of its box.
+    const rotation = this.isPictureAt(index) ? this.pictureRotationAt(index) : 0;
+    if (this.isPictureAt(index) && this.pictureEditable(index) && !this.croppingPicture(index)) {
+      const knob = rotateHandlePoint(box, rotation, this.turnGap());
+      if (Math.abs(sheetAt.x - knob.x) <= reach && Math.abs(sheetAt.y - knob.y) <= reach) return 'turn';
+    }
+    const at = rotation ? localPoint(box, rotation, sheetAt.x, sheetAt.y) : sheetAt;
+    const handle = drawingHandleAt(box, at.x, at.y, reach);
     if (handle) return handle;
     return at.x >= box.x && at.x <= box.x + box.width && at.y >= box.y && at.y <= box.y + box.height ? 'move' : undefined;
   }
@@ -4035,6 +4094,7 @@ export class WorkbookView {
     if (this.locked || this.typingFormula() || this.state().sheet.kind !== 'worksheet') return '';
     const grab = this.chartGrab(x, y, false);
     if (grab === 'move') return 'move';
+    if (grab === 'turn') return 'grab';
     if (grab === 'n' || grab === 's') return 'ns-resize';
     if (grab === 'e' || grab === 'w') return 'ew-resize';
     if (grab === 'nw' || grab === 'se') return 'nwse-resize';
@@ -4073,7 +4133,7 @@ export class WorkbookView {
     return true;
   }
 
-  private beginChartDrag(pointerId: number, index: number, handle: DrawingHandle | 'move', point: { x: number; y: number }, touch: boolean): void {
+  private beginChartDrag(pointerId: number, index: number, handle: DrawingHandle | 'move' | 'turn', point: { x: number; y: number }, touch: boolean): void {
     const state = this.state();
     const layer = this.drawingsOf(state.sheet);
     const box = layer ? layer.boxOf(state.metrics, index) : undefined;
@@ -4081,8 +4141,12 @@ export class WorkbookView {
     if (!box || !at) return;
     const drawing = (state.sheet.drawings || [])[index];
     if (!drawing) return;
+    // Only a picture is turned; a chart taken by where that handle would be is moved.
+    if (handle === 'turn' && drawing.object.type !== 'picture') handle = 'move';
     this.endDrag();
     this.chartDrag = { pointerId, sheet: state.sheet, drawing, index, handle, x: at.x, y: at.y, originX: point.x, originY: point.y, start: box, now: box, moved: false, touch };
+    // The handles of a picture that is being cropped crop it.
+    if (handle !== 'move' && handle !== 'turn' && this.croppingPicture(index)) this.chartDrag.cropping = true;
     this.capturePointer(pointerId);
     // A drag whose end the page never hears of (the window lost the focus) is over.
     window.addEventListener('blur', this.onChartDragLost);
@@ -4100,11 +4164,61 @@ export class WorkbookView {
     this.readScroll();
     const at = this.sheetPoint(Math.max(point.x, state.metrics.headerWidth), Math.max(point.y, state.metrics.headerHeight));
     if (!at) return;
-    const picture = drag.drawing.object.type === 'picture';
-    const sized = resizedRect(drag.start, drag.handle, at.x - drag.x, at.y - drag.y, picture ? MIN_PICTURE_SIZE : MIN_CHART_SIZE);
-    // A picture sized by a corner with Shift down keeps its proportions.
-    drag.now = picture && keepRatio ? ratioRect(drag.start, sized, drag.handle, MIN_PICTURE_SIZE) : sized;
+    const object = drag.drawing.object;
+    if (object.type !== 'picture') {
+      drag.now = resizedRect(drag.start, drag.handle === 'turn' ? 'move' : drag.handle, at.x - drag.x, at.y - drag.y, MIN_CHART_SIZE);
+      this.schedule();
+      return;
+    }
+    const rotation = object.rotation || 0;
+    if (drag.handle === 'turn') {
+      // The picture turns about the middle of its box toward the pointer; with Shift in steps of 15 degrees.
+      drag.turn = rotationAt(drag.start, at.x, at.y, keepRatio);
+      drag.now = drag.start;
+    } else if (drag.cropping && drag.handle !== 'move') {
+      drag.crop = draggedCrop(drag.start, rotation, object.crop, drag.handle, at.x - drag.x, at.y - drag.y, MIN_PICTURE_SIZE, object.flipH === true, object.flipV === true);
+      drag.now = croppedBox(drag.start, rotation, object.crop, drag.crop, object.flipH === true, object.flipV === true);
+    } else {
+      // A picture is sized in the frame it is turned by; by a corner with Shift down it keeps its proportions.
+      drag.now = sizedFrame(drag.start, rotation, drag.handle, at.x - drag.x, at.y - drag.y, MIN_PICTURE_SIZE, keepRatio);
+    }
     this.schedule();
+  }
+
+  /** How far above its frame the handle that turns a picture stands: further on a touch screen, clear of the handle of the top side. */
+  private turnGap(): number {
+    return coarsePointer() ? ROTATE_HANDLE_GAP_COARSE : ROTATE_HANDLE_GAP;
+  }
+
+  /** How a picture of the shown sheet is turned, in degrees. */
+  private pictureRotationAt(index: number): number {
+    const drawing = (this.state().sheet.drawings || [])[index];
+    const object = drawing ? drawing.object : undefined;
+    return object && object.type === 'picture' && typeof object.rotation === 'number' && isFinite(object.rotation) ? object.rotation : 0;
+  }
+
+  /** Whether the picture at a place of the shown sheet is being cropped. */
+  private croppingPicture(index: number): boolean {
+    const crop = this.pictureCrop;
+    if (!crop) return false;
+    // A step undone or another sheet shown may have taken the picture away: cropping ends with its selection.
+    if (crop.sheet !== this.state().sheet || this.pickedDrawing() !== crop.index || !this.isPictureAt(crop.index)) {
+      this.pictureCrop = undefined;
+      return false;
+    }
+    return crop.index === index;
+  }
+
+  /** While a picture is cropped: the box the whole of it takes up, in the frame of its box (for the layer to draw); undefined otherwise. */
+  private croppingFrame(index: number): Rect | undefined {
+    if (!this.croppingPicture(index)) return undefined;
+    const drawing = (this.state().sheet.drawings || [])[index];
+    const object = drawing ? drawing.object : undefined;
+    const layer = this.drawingsOf(this.state().sheet);
+    // The whole picture stays where it is while a handle crops it: it is worked out from the box the picture has.
+    const box = layer ? layer.boxOf(this.state().metrics, index) : undefined;
+    if (!box || !object || object.type !== 'picture') return undefined;
+    return uncroppedBox(box, object.crop, object.flipH === true, object.flipV === true);
   }
 
   /**
@@ -4115,17 +4229,31 @@ export class WorkbookView {
   private chartClipboard(event: ClipboardEvent, cut: boolean): boolean {
     const asked = this.chartAsked;
     this.chartAsked = undefined;
-    if (asked === undefined && this.pickedPicture() !== undefined) {
-      // A picture is selected: the cells under it are not what is copied or cut, and the picture is not copied yet.
+    const askedPicture = this.pictureAsked;
+    this.pictureAsked = undefined;
+    const picture = askedPicture !== undefined ? askedPicture : asked === undefined ? this.pickedPicture() : undefined;
+    if (picture !== undefined) {
+      // A picture is selected: it is what is copied or cut, not the cells under it.
       event.preventDefault();
       this.clipboardHandled = true;
-      this.notify(this.strings.pictures.noCopy, 'info');
+      const data = event.clipboardData;
+      this.attempt(() => {
+        const put = this.pictureMarkup(picture, cut);
+        if (!put) return;
+        if (data) {
+          data.setData('text/plain', put.text);
+          data.setData('text/html', put.html);
+        }
+        // Where the browser lets the page, the picture itself goes to the clipboard as well, for other applications.
+        writeSystemClipboard(put, put.copy);
+      });
       return true;
     }
     const index = asked !== undefined && this.isChartAt(asked) ? asked : this.pickedChart();
     if (index === undefined) return false;
     event.preventDefault();
     this.clipboardHandled = true;
+    clipboardMovedOn();
     const data = event.clipboardData;
     this.attempt(() => {
       const put = cut ? this.cutChart(index) : this.copyChart(index);
@@ -4162,8 +4290,17 @@ export class WorkbookView {
     const state = this.state();
     if (state.sheet !== drag.sheet || (state.sheet.drawings || [])[drag.index] !== drag.drawing) return;
     if (drag.drawing.object.type === 'picture') {
+      if (!drag.moved) return;
+      const id = drag.index;
+      if (drag.handle === 'turn') {
+        const turn = drag.turn;
+        if (turn !== undefined) this.attempt(() => this.rotatePicture(id, turn));
+      } else if (drag.cropping) {
+        const crop = drag.crop;
+        this.attempt(() => this.cropPicture(id, crop));
+      }
       // A picture keeps the kind of its anchor: it is put where it was dragged to by that kind.
-      if (drag.moved) this.attempt(() => this.applyPictureRect(drag.index, drag.now));
+      else this.attempt(() => this.applyPictureRect(id, drag.now));
       return;
     }
     if (!drag.moved) {
@@ -4391,11 +4528,225 @@ export class WorkbookView {
     this.live.textContent = this.strings.pictures.removed;
   }
 
-  /** Puts a picture over a box of the sheet (pixels), with the kind of anchor it has. */
+  /**
+   * Puts a picture over a box of the sheet (pixels), with the kind of anchor it has. `rect` is the box it is drawn in
+   * (see boxOf() of the layer); near a quarter turn its anchor is that box turned.
+   */
   private applyPictureRect(id: number, rect: Rect): void {
     if (!this.beginRules()) return;
     const metrics = this.state().metrics;
-    if (this.applyOps(movePictureTo(this.workbook, this.sheetIndex, id, rect, metrics))) this.live.textContent = this.strings.pictures.moved;
+    const box = turnedBox(rect, this.pictureRotationAt(id));
+    if (this.applyOps(movePictureTo(this.workbook, this.sheetIndex, id, box, metrics))) this.live.textContent = this.strings.pictures.moved;
+  }
+
+  /** The picture a command is about: the one that is named, or the selected one. Throws RangeError when there is none. */
+  private pictureNamed(id: number | undefined): number {
+    const index = this.destroyed ? undefined : id === undefined ? this.pickedPicture() : id;
+    if (index === undefined || !this.isPictureAt(index)) throw new RangeError(`No picture at index ${index}`);
+    return index;
+  }
+
+  /**
+   * Turns a picture of the shown sheet to `degrees` (clockwise, about the middle of its box), as one
+   * undo step; see rotatePicture() of the operations.
+   */
+  rotatePicture(id: number, degrees: number): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(rotatePictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), degrees))) this.live.textContent = this.strings.pictures.rotated;
+  }
+
+  /**
+   * Crops a picture of the shown sheet: `crop` gives the shares (0..1) cut off each side, undefined for none; the
+   * picture keeps its scale and what is still shown stays where it is. One undo step; see cropPicture() of the operations.
+   */
+  cropPicture(id: number, crop: PictureCrop | undefined): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(cropPictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), crop))) this.live.textContent = this.strings.pictures.cropped;
+  }
+
+  /** Gives a picture of the shown sheet another alternative text (empty or undefined takes it away), as one undo step. */
+  setPictureDescription(id: number, text: string | undefined): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(describePictureOps(this.workbook, this.sheetIndex, this.pictureNamed(id), text))) this.live.textContent = this.strings.pictures.described;
+  }
+
+  /**
+   * Starts cropping a picture of the shown sheet (the selected one without an argument) and selects it: its handles
+   * crop it from then on, the whole of the picture is shown dashed, and every drag of a handle is one undo step.
+   * Escape, Enter, endPictureCrop() or selecting anything else ends it. Returns false in a read-only view.
+   */
+  startPictureCrop(id?: number): boolean {
+    if (this.destroyed || this.locked) return false;
+    const index = this.pictureNamed(id);
+    const problem = pictureEditProblem(this.workbook, this.sheetIndex, index);
+    if (problem) throw new RangeError(problem);
+    this.setChartPick(index, false);
+    this.pictureCrop = { sheet: this.state().sheet, index };
+    this.schedule();
+    this.live.textContent = this.strings.pictures.cropping;
+    return true;
+  }
+
+  /** Ends cropping: the handles of the picture size it again. */
+  endPictureCrop(): void {
+    if (!this.pictureCrop) return;
+    this.pictureCrop = undefined;
+    this.schedule();
+  }
+
+  /** The id of the picture that is being cropped; undefined when none is. */
+  get pictureCropping(): number | undefined {
+    const crop = this.pictureCrop;
+    return crop && !this.destroyed && this.croppingPicture(crop.index) ? crop.index : undefined;
+  }
+
+  /**
+   * Opens the dialog of the alternative text of a picture of the shown sheet (the selected one without an argument).
+   * The text of the file is shown in a text field, never as HTML. Returns false when no dialog is opened.
+   */
+  openPictureTextDialog(id?: number): boolean {
+    if (!this.beginDialog()) return false;
+    const index = this.pictureNamed(id);
+    const problem = pictureEditProblem(this.workbook, this.sheetIndex, index);
+    if (problem) throw new RangeError(problem);
+    const sheet = this.state().sheet;
+    const strings = this.strings.pictures;
+    const info = this.pictures().find((picture) => picture.id === index);
+    const dialog = new Dialog({ parent: this.options.focusScope || this.root, title: strings.textTitle, name: 'picture-text', coarse: coarsePointer(), onClose: () => {
+      this.dialogClosed(sheet);
+      if (!this.destroyed) this.focusInput(true);
+    } });
+    const field = dialog.textarea(MAX_PICTURE_TEXT);
+    field.rows = 4;
+    // The text of the file goes in as the value of a field: never as markup.
+    field.value = info && info.description !== undefined ? info.description : '';
+    dialog.addField(dialog.body, strings.textLabel, field, 'description');
+    dialog.addAction(strings.cancel, () => dialog.close()).setAttribute('data-bym-action', 'cancel');
+    dialog
+      .addAction(
+        strings.ok,
+        () => {
+          dialog.showError('');
+          try {
+            if (this.locked || this.workbook.sheets[this.sheetIndex] !== sheet) throw new RangeError('The sheet of the dialog is not shown');
+            if (dialog.changed && this.applyFromDialog(describePictureOps(this.workbook, this.sheetIndex, index, field.value))) this.live.textContent = strings.described;
+          } catch (error) {
+            dialog.showError(this.localizeError(error), field);
+            return;
+          }
+          dialog.close();
+        },
+        'primary',
+      )
+      .setAttribute('data-bym-action', 'ok');
+    dialog.markPristine();
+    dialog.focusFirst();
+    this.rulesDialog = { sheet, submit: () => dialog.submit(), close: () => dialog.close(), changed: () => dialog.changed, say: (message) => dialog.showError(message) };
+    return true;
+  }
+
+  /** Whether a picture that was copied or cut in a view of this page is held for pastePicture(). */
+  get hasPictureCopy(): boolean {
+    return !this.destroyed && holdsPicture();
+  }
+
+  /**
+   * Copies a picture of the shown sheet (the selected one without an argument): it is held, for every view of the
+   * page, for pastePicture() (its bytes are read meanwhile), and what belongs on the clipboard is returned (a word in
+   * place of the picture, and HTML with a mark; paste() knows the picture by that mark). Throws RangeError for a
+   * picture that cannot be copied (see pictureCopyProblem()).
+   */
+  copyPicture(id?: number): { text: string; html: string } {
+    const put = this.pictureMarkup(this.pictureNamed(id), false);
+    return put ? { text: put.text, html: put.html } : { text: '', html: '' };
+  }
+
+  /**
+   * Copies a picture of the shown sheet and, once its copy is made (its bytes are read), deletes it as one undo
+   * step (the paste is another one). A picture whose copy cannot be made is not deleted: that is said to onNotice.
+   */
+  cutPicture(id?: number): { text: string; html: string } {
+    const put = this.pictureMarkup(this.pictureNamed(id), true);
+    return put ? { text: put.text, html: put.html } : { text: '', html: '' };
+  }
+
+  /** Holds a copy of a picture (and deletes it, for a cut), and gives what the clipboard gets for it. */
+  private pictureMarkup(index: number, cut: boolean): { text: string; html: string; mark: string; copy: Promise<PictureCopy> } | undefined {
+    const problem = pictureCopyProblem(this.workbook, this.sheetIndex, index);
+    if (problem) throw new RangeError(problem);
+    const word = this.strings.placeholder('picture');
+    if (!cut || this.destroyed || this.locked || !this.commitPending()) {
+      const copy = copyPictureOps(this.workbook, this.sheetIndex, index);
+      this.notifyCopyFailure(copy);
+      const put = holdPicture(copy, word);
+      this.live.textContent = this.strings.pictures.copied;
+      return { ...put, copy };
+    }
+    // The picture is deleted once its copy is made, and only then: a copy that cannot be made deletes nothing.
+    const sheet = this.state().sheet;
+    const drawing = (sheet.drawings || [])[index];
+    // What refuses the deletion (a picture that shares its wrapper) is said now, before anything is read.
+    removePictureOps(this.workbook, this.sheetIndex, index);
+    const copy = copyPictureOps(this.workbook, this.sheetIndex, index);
+    this.notifyCopyFailure(copy);
+    const put = holdPicture(copy, word);
+    copy.then(
+      () => {
+        // A view that went away or became read-only, another sheet shown meanwhile: the picture is copied, and stays.
+        if (this.destroyed || this.locked || this.state().sheet !== sheet || !this.beginRules()) return;
+        const removed = (sheet.drawings || []).indexOf(drawing);
+        if (removed < 0) {
+          this.notify(this.strings.pictures.cutGone, 'info');
+          return;
+        }
+        const picked = this.pickedDrawing();
+        if (!this.applyOps(removePictureOps(this.workbook, this.sheetIndex, removed))) return;
+        // The drawings behind it moved up by one place.
+        if (picked !== undefined) this.setChartPick(picked === removed ? undefined : picked > removed ? picked - 1 : picked, false);
+        this.live.textContent = this.strings.pictures.cutOut;
+      },
+      () => undefined,
+    );
+    this.live.textContent = this.strings.pictures.copied;
+    return { ...put, copy };
+  }
+
+  /** Says, once its bytes are read, that a copy could not be made of them. */
+  private notifyCopyFailure(copy: Promise<PictureCopy>): void {
+    copy.then(undefined, (error: unknown) => {
+      if (!this.destroyed) this.notify(this.localizeError(error), 'error');
+    });
+  }
+
+  /**
+   * Pastes the picture that was last copied or cut in a view of this page onto the shown sheet and selects it; the
+   * promise gives its id, or -1 when nothing was pasted (no picture is held, a read-only view, another sheet shown
+   * meanwhile). With `at` its top left corner is the corner of that cell; without, it stands where the picture stood,
+   * moved right and down while a picture stands there. It has the size, turn, crop and alternative text of the
+   * picture, in whatever workbook it is pasted. The promise is refused (RangeError) for a sheet that takes no more
+   * pictures, and when the copy could not be read.
+   */
+  pastePicture(at?: { row: number; col: number }): Promise<number> {
+    const held = heldPictureCopy();
+    return held ? this.putPicture(held, at) : Promise.resolve(-1);
+  }
+
+  private putPicture(copy: Promise<PictureCopy>, at: { row: number; col: number } | undefined): Promise<number> {
+    if (this.destroyed || this.locked || this.state().sheet.kind !== 'worksheet') return Promise.resolve(-1);
+    if (this.collab) {
+      this.notify(this.strings.collab.pictures, 'info');
+      return Promise.resolve(-1);
+    }
+    const sheet = this.state().sheet;
+    return copy.then((made) => {
+      // A view that went away, or another sheet shown meanwhile: the picture is not put somewhere else.
+      if (this.destroyed || this.state().sheet !== sheet || !this.beginRules()) return -1;
+      const pasted = pastePictureOps(this.workbook, this.sheetIndex, made, at);
+      if (!this.applyOps(pasted.ops)) return -1;
+      this.setChartPick(pasted.id, false);
+      this.live.textContent = this.strings.pictures.pasted;
+      return pasted.id;
+    });
   }
 
   /** The menu of a picture: opened by the press that asks for a menu on it. A read-only view has none (the menu of the cell opens). */
@@ -4407,7 +4758,28 @@ export class WorkbookView {
     const strings = this.strings.pictures;
     const info = this.pictures().find((picture) => picture.id === index);
     const removable = !!info && info.removable;
+    const canCopy = typeof document.execCommand === 'function' || (navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function');
+    // What cannot be copied is shown all the same, and says why.
+    const problem = pictureCopyProblem(this.workbook, this.sheetIndex, index);
+    const reason = problem === undefined ? undefined : this.localizeError(new RangeError(problem));
+    const explain = reason === undefined ? undefined : () => this.notify(reason, 'error');
+    const cutReason = reason !== undefined ? reason : removable ? undefined : strings.wrapped;
+    const turn = (by: number) => () => this.attempt(() => this.rotatePicture(index, this.pictureRotationAt(index) + by));
+    const cropping = this.croppingPicture(index);
+    // A picture the file holds in another form as well is moved and deleted, not turned, cropped or described: the commands say why.
+    const editProblem = pictureEditProblem(this.workbook, this.sheetIndex, index);
+    const fixed = editProblem === undefined ? undefined : this.localizeError(new RangeError(editProblem));
+    const fixedSaid = fixed === undefined ? undefined : () => this.notify(fixed, 'error');
     const items: MenuItem[] = [
+      { label: this.strings.cut, disabled: !canCopy || cutReason !== undefined, title: cutReason, explain: cutReason === undefined ? undefined : () => this.notify(cutReason, 'error'), action: () => this.menuCopyPicture(index, true) },
+      { label: this.strings.copy, disabled: !canCopy || reason !== undefined, title: reason, explain, action: () => this.menuCopyPicture(index, false) },
+      { label: this.strings.paste, action: () => this.menuPaste() },
+      { label: '', separator: true },
+      { label: strings.rotateRight, disabled: fixed !== undefined, title: fixed, explain: fixedSaid, action: turn(90) },
+      { label: strings.rotateLeft, disabled: fixed !== undefined, title: fixed, explain: fixedSaid, action: turn(-90) },
+      { label: cropping ? strings.cropDone : strings.crop, disabled: fixed !== undefined, title: fixed, explain: fixedSaid, action: () => this.attempt(() => (cropping ? this.endPictureCrop() : void this.startPictureCrop(index))) },
+      { label: strings.text, disabled: fixed !== undefined, title: fixed, explain: fixedSaid, action: () => this.attempt(() => void this.openPictureTextDialog(index)) },
+      { label: '', separator: true },
       {
         label: strings.remove,
         disabled: !removable,
@@ -4420,16 +4792,38 @@ export class WorkbookView {
     return true;
   }
 
+  /** Copy or cut of a picture from its menu: as menuCopyChart(), with the picture named for the event that is asked for. */
+  private menuCopyPicture(index: number, cut: boolean): void {
+    this.focusInput(true);
+    this.selectIdleText();
+    this.clipboardHandled = false;
+    this.pictureAsked = index;
+    try {
+      document.execCommand(cut ? 'cut' : 'copy');
+    } catch {
+      // Not available; the fallback below takes over.
+    }
+    this.pictureAsked = undefined;
+    if (this.clipboardHandled) return;
+    this.attempt(() => {
+      const put = this.pictureMarkup(index, cut);
+      if (!put) return;
+      writeSystemClipboard(put, put.copy);
+    });
+  }
+
   /**
    * The keys of a selected picture: the arrows move it (by ten pixels, by one with Shift; with Alt
-   * they size it, from its bottom right corner), Delete deletes it and Escape lets go of it. The
-   * other keys are taken as they are for a chart (see chartKey()); Enter and Ctrl+D do nothing.
+   * they size it, from its bottom right corner), Delete deletes it and Escape lets go of it (while
+   * it is cropped, Escape and Enter end cropping). The other keys are taken as they are for a chart
+   * (see chartKey()); Ctrl+D does nothing. Copy, cut and paste come as events of the clipboard.
    */
   private pictureKey(event: KeyboardEvent, picked: number, box: Rect | undefined): boolean {
     const ctrl = event.ctrlKey || event.metaKey;
     switch (event.key) {
       case 'Escape':
-        this.setChartPick(undefined);
+        if (this.croppingPicture(picked)) this.endPictureCrop();
+        else this.setChartPick(undefined);
         return true;
       case 'Delete':
       case 'Backspace':
@@ -4437,6 +4831,7 @@ export class WorkbookView {
         if (!ctrl && !event.altKey) this.attempt(() => this.removePicture(picked));
         return true;
       case 'Enter':
+        if (!(ctrl || event.altKey) && this.croppingPicture(picked)) this.endPictureCrop();
         return !(ctrl || event.altKey);
       case 'ArrowUp':
       case 'ArrowDown':
@@ -4446,8 +4841,10 @@ export class WorkbookView {
         const step = event.shiftKey ? 1 : 10;
         const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
         const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0;
-        const next = resizedRect(box, event.altKey ? 'se' : 'move', dx, dy, MIN_PICTURE_SIZE);
-        this.attempt(() => this.applyPictureRect(picked, next));
+        // Moved and sized on the screen: the box the picture takes up (its anchor, near a quarter turn the drawn box turned), from its bottom right corner.
+        const rotation = this.pictureRotationAt(picked);
+        const next = resizedRect(turnedBox(box, rotation), event.altKey ? 'se' : 'move', dx, dy, MIN_PICTURE_SIZE);
+        this.attempt(() => this.applyPictureRect(picked, turnedBox(next, rotation)));
         return true;
       }
       case 'F2':
@@ -6907,6 +7304,12 @@ export class WorkbookView {
     if (message === 'Cannot change the pictures of this sheet: it is protected') return pictures.protectedSheet;
     if (/^Cannot change the pictures of this sheet:/.test(message)) return pictures.placesFixed;
     if (/^Cannot delete this picture: it shares/.test(message)) return pictures.wrapped;
+    if (/^Cannot copy this picture: (its bytes are not in the file|only PNG)/.test(message)) return pictures.notCopyable;
+    if (/^Cannot change this picture: the file holds it in another form/.test(message)) return pictures.alternative;
+    if (/^A crop cannot leave/.test(message)) return pictures.cropTooSmall;
+    if (message === 'The picture was changed or deleted before it was cut') return pictures.cutGone;
+    if (/^Cannot copy this picture: a picture cannot be larger/.test(message)) return pictures.tooLarge;
+    if (/^Cannot copy this picture:/.test(message)) return pictures.notSupported;
     const charts = strings.charts;
     if (/is not a range of cells of this workbook$|^The range of a chart is a range of cells/.test(message)) return charts.badRange;
     if (message === 'A series needs a range of values' || message === 'A chart has at least one series') return charts.needValues;
@@ -7818,6 +8221,22 @@ export class WorkbookView {
   paste(text: string, html?: string): void {
     if (this.destroyed || this.locked) return;
     const picked = this.pickedDrawing();
+    // A picture copied in a view of this page: with a drawing selected it goes beside the picture it was taken from; with cells selected, to the active cell.
+    const picture = picturePasteKind(html);
+    if (picture.kind === 'picture') {
+      const at = picked === undefined ? { ...this.state().active } : undefined;
+      this.putPicture(picture.copy, at).then(undefined, (error: unknown) => {
+        if (!this.destroyed) this.notify(this.localizeError(error), 'error');
+      });
+      return;
+    }
+    if (picture.kind === 'stale') {
+      if (html !== undefined) releasePicture();
+      // The word that stands for the picture on the clipboard is not text to put into a cell.
+      this.notify(this.strings.pictures.copyGone, 'info');
+      return;
+    }
+    if (html !== undefined) releasePicture();
     const kind = chartPasteKind(html, this.chartHeld ? this.chartHeld.mark : undefined);
     if (kind === 'chart') {
       // With a chart selected the copy goes beside the chart it was taken from; with cells selected, to the active cell.
@@ -8974,6 +9393,8 @@ export class WorkbookView {
     const data = event.clipboardData;
     if (this.destroyed || this.edit || !data) return;
     if (this.chartClipboard(event, cut)) return;
+    // Cells go to the clipboard: a picture copied before, still on its way there, is not put over them.
+    clipboardMovedOn();
     event.preventDefault();
     this.clipboardHandled = true;
     this.attempt(() => {
@@ -8997,6 +9418,13 @@ export class WorkbookView {
     }
     // What the clipboard holds is all here: no HTML is HTML that is about nothing.
     const html = data.getData('text/html') || '';
+    // The mark of a picture copied elsewhere, with the picture itself beside it (put there for other applications): the picture is inserted.
+    const file = !this.locked && picturePasteKind(html).kind === 'stale' ? this.pictureFile(data) : undefined;
+    if (file) {
+      releasePicture();
+      this.readPictureFile(file);
+      return;
+    }
     this.attempt(() => this.paste(text, html));
   };
 

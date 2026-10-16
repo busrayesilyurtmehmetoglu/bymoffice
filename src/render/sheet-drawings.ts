@@ -176,7 +176,7 @@ export function anchorRect(anchor: DrawingAnchor, metrics: SheetMetrics): Rect {
 }
 
 /** Rotations near a quarter turn: the file gives the box the object takes up turned, not the box that is turned. */
-function quarterTurned(rotation: number | undefined): boolean {
+export function quarterTurned(rotation: number | undefined): boolean {
   if (rotation === undefined) return false;
   const angle = ((rotation % 360) + 360) % 360;
   return (angle >= 45 && angle < 135) || (angle >= 225 && angle < 315);
@@ -359,6 +359,13 @@ interface TextLayout {
 
 /** The side of the squares a selected drawing is sized by, in pixels. */
 export const HANDLE_SIZE = 8;
+/** How far above the middle of its top side the handle that turns a picture stands, in pixels. */
+export const ROTATE_HANDLE_GAP = 20;
+/**
+ * The same on a touch screen, where a finger takes a handle within 16 pixels: far enough up that
+ * the handle that turns and the handle of the top side never take the same press.
+ */
+export const ROTATE_HANDLE_GAP_COARSE = 40;
 /** The handles of a selected drawing: its corners and the middles of its sides. */
 export type DrawingHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 const HANDLES: DrawingHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
@@ -452,6 +459,17 @@ export class SheetDrawings {
   selected: number | undefined;
   /** Where the selected drawing would stand if the drag that is under way ended now (sheet pixels): drawn as a dashed frame. */
   ghost: Rect | undefined;
+  /** How the ghost is turned while the handle that turns a picture is dragged; otherwise it is turned as the picture is. */
+  ghostTurn: number | undefined;
+  /** The selected drawing is a picture that can be turned: a handle above its frame turns it. */
+  turnable = false;
+  /** How far above the frame that handle stands (see ROTATE_HANDLE_GAP and ROTATE_HANDLE_GAP_COARSE of render/picture-frame.ts). */
+  turnGap = ROTATE_HANDLE_GAP;
+  /**
+   * The selected picture is being cropped: the box the whole picture would take up, in the frame of
+   * its box (see uncroppedBox()), drawn dashed; its handles are those that crop it (dark).
+   */
+  cropping: Rect | undefined;
 
   constructor(sheet: Sheet, options: SheetDrawingsOptions = {}) {
     this.sheet = sheet;
@@ -516,7 +534,18 @@ export class SheetDrawings {
     let found = -1;
     for (const item of this.placed) {
       if (item.order >= count || item.order < found) continue;
-      if (x >= item.x && x <= item.x + item.width && y >= item.y && y <= item.y + item.height && wanted(item.object)) found = item.order;
+      // A turned picture is found where it is drawn: the point is taken into the frame of its box.
+      let px = x;
+      let py = y;
+      const turn = item.object.type === 'picture' && typeof item.object.rotation === 'number' && Number.isFinite(item.object.rotation) ? item.object.rotation : 0;
+      if (turn) {
+        const cx = item.x + item.width / 2;
+        const cy = item.y + item.height / 2;
+        const angle = (-turn * Math.PI) / 180;
+        px = cx + (x - cx) * Math.cos(angle) - (y - cy) * Math.sin(angle);
+        py = cy + (x - cx) * Math.sin(angle) + (y - cy) * Math.cos(angle);
+      }
+      if (px >= item.x && px <= item.x + item.width && py >= item.y && py <= item.y + item.height && wanted(item.object)) found = item.order;
     }
     return found;
   }
@@ -661,29 +690,91 @@ export class SheetDrawings {
         frame.painter.invalidate();
       }
     }
-    if (marked) paintSelection(ctx, marked, this.ghost, originX, originY);
+    if (marked) {
+      // The frame of a picture is turned with it; that of a chart is not (a chart is not drawn turned by its frame in Excel).
+      const object = this.selected !== undefined ? ((this.sheet.drawings || [])[this.selected] || ({} as SheetDrawing)).object : undefined;
+      const turn = object && object.type === 'picture' && typeof object.rotation === 'number' && Number.isFinite(object.rotation) ? object.rotation : 0;
+      paintSelection(ctx, marked, this.ghost, originX, originY, {
+        rotation: turn,
+        ghostRotation: this.ghostTurn !== undefined && Number.isFinite(this.ghostTurn) ? this.ghostTurn : turn,
+        turnable: this.turnable && !this.cropping,
+        turnGap: this.turnGap > 0 && this.turnGap < 1000 ? this.turnGap : ROTATE_HANDLE_GAP,
+        cropping: this.cropping,
+      });
+    }
     ctx.restore();
   }
 }
 
+/** How the frame of the selected drawing is drawn. */
+interface SelectionLook {
+  /** Degrees the frame is turned about the middle of its box. */
+  rotation: number;
+  ghostRotation: number;
+  /** A handle above the frame turns it, so many pixels above it. */
+  turnable: boolean;
+  turnGap: number;
+  /** The picture is being cropped: the box the whole picture takes up, in the frame of the box. */
+  cropping: Rect | undefined;
+}
+
+const CROP_COLOR = '#202124';
+
+/** Turns the context by `degrees` about the middle of a box drawn at (originX + box.x, originY + box.y). */
+function turnAbout(ctx: CanvasRenderingContext2D, box: Rect, originX: number, originY: number, degrees: number): void {
+  if (!degrees) return;
+  const cx = originX + box.x + box.width / 2;
+  const cy = originY + box.y + box.height / 2;
+  ctx.translate(cx, cy);
+  ctx.rotate((degrees * Math.PI) / 180);
+  ctx.translate(-cx, -cy);
+}
+
 /** The frame and the handles of the selected drawing, and the dashed frame of where a drag would put it. */
-function paintSelection(ctx: CanvasRenderingContext2D, box: Rect, ghost: Rect | undefined, originX: number, originY: number): void {
+function paintSelection(ctx: CanvasRenderingContext2D, box: Rect, ghost: Rect | undefined, originX: number, originY: number, look?: SelectionLook): void {
+  const rotation = look ? look.rotation : 0;
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.lineWidth = 1;
   ctx.strokeStyle = SELECTION_COLOR;
   ctx.setLineDash([]);
+  ctx.save();
+  turnAbout(ctx, box, originX, originY, rotation);
+  const cropping = look && look.cropping && look.cropping.width > 0 && look.cropping.height > 0 ? look.cropping : undefined;
+  if (cropping) {
+    // The whole picture, of which the box shows a part.
+    ctx.setLineDash([2, 2]);
+    ctx.strokeRect(Math.round(originX + cropping.x) + 0.5, Math.round(originY + cropping.y) + 0.5, Math.round(cropping.width) - 1, Math.round(cropping.height) - 1);
+    ctx.setLineDash([]);
+  }
   ctx.strokeRect(Math.round(originX + box.x) + 0.5, Math.round(originY + box.y) + 0.5, Math.round(box.width) - 1, Math.round(box.height) - 1);
   const half = HANDLE_SIZE / 2;
+  if (look && look.turnable) {
+    // The handle that turns the picture: a round knob on a stalk above the middle of the top side.
+    const mx = Math.round(originX + box.x + box.width / 2) + 0.5;
+    const top = Math.round(originY + box.y);
+    ctx.beginPath();
+    ctx.moveTo(mx, top);
+    ctx.lineTo(mx, top - look.turnGap + half);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(mx, top - look.turnGap, half, 0, Math.PI * 2);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fill();
+    ctx.stroke();
+  }
   for (const handle of HANDLES) {
     const at = handlePoint(box, handle);
     const x = Math.round(originX + at.x - half);
     const y = Math.round(originY + at.y - half);
-    ctx.fillStyle = '#FFFFFF';
+    // The handles that crop are dark: they cut, they do not size.
+    ctx.fillStyle = cropping ? CROP_COLOR : '#FFFFFF';
     ctx.fillRect(x, y, HANDLE_SIZE, HANDLE_SIZE);
     ctx.strokeRect(x + 0.5, y + 0.5, HANDLE_SIZE - 1, HANDLE_SIZE - 1);
   }
+  ctx.restore();
   if (ghost && ghost.width > 0 && ghost.height > 0) {
+    turnAbout(ctx, ghost, originX, originY, look ? look.ghostRotation : 0);
     ctx.setLineDash([4, 3]);
     ctx.strokeRect(Math.round(originX + ghost.x) + 0.5, Math.round(originY + ghost.y) + 0.5, Math.round(ghost.width) - 1, Math.round(ghost.height) - 1);
   }

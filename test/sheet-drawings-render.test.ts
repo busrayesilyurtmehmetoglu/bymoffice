@@ -32,7 +32,7 @@ class FakeContext {
   calls: string[] = [];
   images: { image: unknown; args: number[]; clips: Box[]; transforms: string[] }[] = [];
   rects: (Box & { fill: string; clips: Box[] })[] = [];
-  strokeRects: (Box & { style: string })[] = [];
+  strokeRects: (Box & { style: string; transforms: string[]; dash: number[] })[] = [];
   texts: { text: string; x: number; y: number; font: string; fill: string; clips: Box[]; transforms: string[] }[] = [];
   fills: { fill: string; path: string[] }[] = [];
   strokes: { style: string; width: number; dash: number[]; path: string[] }[] = [];
@@ -110,7 +110,10 @@ class FakeContext {
     this.rects.push({ x, y, width, height, fill: this.fillStyle, clips: this.clips });
   }
   strokeRect(x: number, y: number, width: number, height: number): void {
-    this.strokeRects.push({ x, y, width, height, style: this.strokeStyle });
+    this.strokeRects.push({ x, y, width, height, style: this.strokeStyle, transforms: this.transforms.slice(), dash: this.dash.slice() });
+  }
+  arc(x: number, y: number, radius: number): void {
+    this.path.push(`arc(${x},${y},${radius})`);
   }
   fillText(text: string, x: number, y: number): void {
     this.texts.push({ text, x, y, font: this.font, fill: this.fillStyle, clips: this.clips, transforms: this.transforms.slice() });
@@ -225,6 +228,57 @@ test('layer: rotation and flips are transforms around the centre of the box', ()
   assert.deepEqual(ctx.images[0].transforms, ['translate(64,40)', 'rotate(30)', 'translate(-64,-40)']);
   assert.deepEqual(ctx.images[1].transforms, ['translate(64,40)', 'scale(-1,1)', 'translate(-64,-40)']);
   assert.deepEqual(ctx.images[2].transforms, ['translate(64,40)', 'rotate(180)', 'translate(-64,-40)', 'translate(64,40)', 'scale(1,-1)', 'translate(-64,-40)']);
+});
+
+test('layer: the frame of a selected picture is turned with it, with the handle that turns it; that of a chart is not turned', () => {
+  const sheet = withDrawings(
+    { anchor: cells(0, 0, 2, 4), object: picture('p', { rotation: 30 }) },
+    { anchor: cells(4, 0, 6, 4), object: { type: 'chart', rotation: 30 } as unknown as DrawingObject },
+  );
+  const layer = new SheetDrawings(sheet, { images: readyImages() });
+  layer.selected = 0;
+  layer.turnable = true;
+  let ctx = paint(sheet, { layer });
+  const frame = ctx.strokeRects.filter((rect) => rect.width === 127 && rect.height === 79 && rect.style === '#1A73E8').pop()!;
+  assert.deepEqual(frame.transforms, ['translate(64,40)', 'rotate(30)', 'translate(-64,-40)']);
+  // The knob above the middle of the top side, in the same frame.
+  assert.ok(ctx.strokes.some((stroke) => stroke.path.some((step) => step === 'arc(64.5,-20,4)')));
+  // A ghost while it is turned is turned as the handle says.
+  layer.ghost = { x: 0, y: 0, width: 128, height: 80 };
+  layer.ghostTurn = 90;
+  ctx = paint(sheet, { layer });
+  const ghost = ctx.strokeRects.find((rect) => rect.dash.length > 0)!;
+  assert.deepEqual(ghost.transforms, ['translate(64,40)', 'rotate(90)', 'translate(-64,-40)']);
+  // Cropping: the whole picture is drawn dashed, the handles are dark and nothing turns it.
+  layer.ghost = undefined;
+  layer.ghostTurn = undefined;
+  layer.cropping = { x: -64, y: 0, width: 256, height: 80 };
+  ctx = paint(sheet, { layer });
+  assert.ok(ctx.strokeRects.some((rect) => rect.width === 255 && rect.dash.length === 2));
+  assert.ok(ctx.rects.filter((rect) => rect.fill === '#202124').length === 8);
+  assert.ok(!ctx.strokes.some((stroke) => stroke.path.some((step) => step.startsWith('arc('))));
+  // A chart turned in its file: its frame is not turned.
+  layer.cropping = undefined;
+  layer.turnable = false;
+  layer.selected = 1;
+  ctx = paint(sheet, { layer });
+  const chartFrame = ctx.strokeRects.filter((rect) => rect.width === 127 && rect.height === 79 && rect.style === '#1A73E8').pop()!;
+  assert.deepEqual(chartFrame.transforms, []);
+});
+
+test('layer: a turned picture is found where it is drawn', () => {
+  // 200 wide and 20 high at (100, 200), turned a quarter: it is drawn from (190, 110) to (210, 310).
+  const sheet = withDrawings({ anchor: { kind: 'absolute', x: 190 * PX, y: 110 * PX, width: 20 * PX, height: 200 * PX }, object: picture('p', { rotation: 90 }) });
+  const layer = new SheetDrawings(sheet);
+  const metrics = createSheetMetrics(sheet);
+  assert.equal(layer.hit(metrics, 200, 120), 0);
+  assert.equal(layer.hit(metrics, 200, 300), 0);
+  assert.equal(layer.hit(metrics, 120, 210), -1);
+  // Turned by 45 degrees, a corner of its unturned box is outside of it.
+  sheet.drawings = [{ anchor: { kind: 'absolute', x: 100 * PX, y: 100 * PX, width: 100 * PX, height: 100 * PX }, object: picture('p', { rotation: 45 }) }];
+  const turned = new SheetDrawings(sheet);
+  assert.equal(turned.hit(metrics, 102, 102), -1);
+  assert.equal(turned.hit(metrics, 150, 85), 0);
 });
 
 test('layer: a picture that is on its way is a light rectangle; one that will not come is a placeholder with its words', () => {

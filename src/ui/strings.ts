@@ -488,10 +488,38 @@ export interface PictureStrings {
   placesFixed: string;
   /** A picture that shares its place in the drawing with another object. */
   wrapped: string;
-  /** Copy and cut while a picture is selected. */
-  noCopy: string;
   /** Paste of cells while a picture is selected. */
   noCellPaste: string;
+  /** Said once a picture was copied, cut, pasted, turned, cropped, or given another alternative text. */
+  copied: string;
+  cutOut: string;
+  pasted: string;
+  rotated: string;
+  cropped: string;
+  described: string;
+  /** Said when cropping starts: the handles crop the picture now. */
+  cropping: string;
+  /** Commands of the menu of a picture. */
+  rotateRight: string;
+  rotateLeft: string;
+  crop: string;
+  cropDone: string;
+  text: string;
+  /** The dialog of the alternative text: its title, the label of its field, its buttons. */
+  textTitle: string;
+  textLabel: string;
+  ok: string;
+  cancel: string;
+  /** The clipboard carries the mark of a picture copied elsewhere (another page, this page before it was loaded again). */
+  copyGone: string;
+  /** A picture that cannot be copied: its bytes are not in the file, or it is of a kind no picture is added as. */
+  notCopyable: string;
+  /** A picture the file holds in another form as well (a wrapper of alternatives): it is not turned, cropped or described. */
+  alternative: string;
+  /** A crop that would leave less than the least size of the picture. */
+  cropTooSmall: string;
+  /** A picture that was changed or deleted while its bytes were read for a cut. */
+  cutGone: string;
   /** A file dropped on the grid while nothing can be inserted (a read-only view, a cell being edited). */
   dropRefused: string;
 }
@@ -1619,8 +1647,28 @@ export const STRINGS_EN: UiStrings = {
     protectedSheet: 'The sheet is protected: its pictures cannot be changed',
     placesFixed: 'Pictures cannot be added, moved or deleted on this sheet: its drawing in the file cannot be changed',
     wrapped: 'This picture cannot be deleted: it shares its place in the file with another object',
-    noCopy: 'Pictures cannot be copied yet',
     noCellPaste: 'A picture is selected: select a cell to paste cells',
+    copied: 'Picture copied',
+    cutOut: 'Picture cut',
+    pasted: 'Picture pasted',
+    rotated: 'Picture rotated',
+    cropped: 'Picture cropped',
+    described: 'Alternative text changed',
+    cropping: 'Cropping: drag the handles to cut the picture; press Enter when done',
+    rotateRight: 'Rotate right 90°',
+    rotateLeft: 'Rotate left 90°',
+    crop: 'Crop',
+    cropDone: 'Done cropping',
+    text: 'Alternative text…',
+    textTitle: 'Alternative text',
+    textLabel: 'Description of the picture',
+    ok: 'OK',
+    cancel: 'Cancel',
+    copyGone: 'The picture on the clipboard was copied elsewhere and cannot be pasted here: copy the picture again',
+    notCopyable: 'This picture cannot be copied: only PNG, JPEG, GIF and BMP pictures kept in the file can',
+    alternative: 'This picture cannot be rotated, cropped or described: the file holds it in another form as well, which would be left as it was',
+    cropTooSmall: 'So much cannot be cropped: at least 4 pixels of the picture are left each way',
+    cutGone: 'The picture was changed or deleted before it could be cut: it was copied, and stays',
     dropRefused: 'A picture cannot be dropped here now',
   },
   pivots: {
@@ -2458,8 +2506,28 @@ export const STRINGS_TR: UiStrings = {
     protectedSheet: 'Sayfa korumalı: görselleri değiştirilemez',
     placesFixed: 'Bu sayfada görsel eklenemez, taşınamaz ve silinemez: dosyadaki çizimi değiştirilemiyor',
     wrapped: 'Bu görsel silinemez: dosyada yerini başka bir nesneyle paylaşıyor',
-    noCopy: 'Görseller henüz kopyalanamıyor',
     noCellPaste: 'Bir görsel seçili: hücre yapıştırmak için bir hücre seçin',
+    copied: 'Görsel kopyalandı',
+    cutOut: 'Görsel kesildi',
+    pasted: 'Görsel yapıştırıldı',
+    rotated: 'Görsel döndürüldü',
+    cropped: 'Görsel kırpıldı',
+    described: 'Alternatif metin değişti',
+    cropping: 'Kırpma: görseli kesmek için tutamaçları sürükleyin; bitince Enter’a basın',
+    rotateRight: 'Sağa 90° döndür',
+    rotateLeft: 'Sola 90° döndür',
+    crop: 'Kırp',
+    cropDone: 'Kırpmayı bitir',
+    text: 'Alternatif metin…',
+    textTitle: 'Alternatif metin',
+    textLabel: 'Görselin açıklaması',
+    ok: 'Tamam',
+    cancel: 'İptal',
+    copyGone: 'Panodaki görsel başka bir yerde kopyalanmış, buraya yapıştırılamıyor: görseli yeniden kopyalayın',
+    notCopyable: 'Bu görsel kopyalanamıyor: yalnız dosyada saklanan PNG, JPEG, GIF ve BMP görseller kopyalanabilir',
+    alternative: 'Bu görsel döndürülemez, kırpılamaz ve açıklaması değiştirilemez: dosya onu başka bir biçimde de tutuyor, o biçim eski haliyle kalırdı',
+    cropTooSmall: 'Bu kadar kırpılamaz: görselin her yönde en az 4 pikseli kalır',
+    cutGone: 'Görsel kesilmeden önce değişti ya da silindi: kopyalandı, yerinde kalıyor',
     dropRefused: 'Görsel şu anda buraya bırakılamaz',
   },
   pivots: {

@@ -60,7 +60,8 @@ import { adjustDrawingAnchor, anchorRect, commentCellNow, commentEdits, drawingA
 import { createSheetMetrics, type SheetMetrics } from '../../layout/sheet-metrics';
 import { isAddedPicture, PICTURE_EXTENSIONS } from '../../model/sheet/pictures';
 import { breakSpanOf, movePageBreak } from '../../model/sheet/page-breaks';
-import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, pictureAnchorXml, stripChartPart, type DrawingPartEdit } from './chart-write';
+import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, pictureAnchorXml, stripChartPart, type DrawingPartEdit, type PictureLook, type PicturePatch } from './chart-write';
+import { turnedBox } from '../../render/picture-frame';
 import { drawingSource } from './drawings';
 import type { Chart } from '../../model/sheet/chart';
 import type { DrawingObject, SheetDrawing } from '../../model/sheet/types';
@@ -489,6 +490,28 @@ export function rowXml(writer: CellWriter, index: number, row: Row | undefined):
 }
 
 /** Every row of the model, in order. */
+/** The fields of a picture of the file that a save writes when they change (see PicturePatch): its turn, its crop, its alternative text. */
+const PATCHED_PICTURE_FIELDS = ['rotation', 'crop', 'description'];
+
+/**
+ * What is to be changed in the part of a picture of the file that the model holds as `is`, read
+ * as `was`: undefined when nothing is, null when something else of it changed (which is not
+ * written: no command changes it).
+ */
+function picturePatch(was: Extract<DrawingObject, { type: 'picture' }>, is: Extract<DrawingObject, { type: 'picture' }>): PicturePatch | undefined | null {
+  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+  const keys = new Set<string>(Object.keys(was).concat(Object.keys(is)));
+  for (const key of keys) {
+    if (PATCHED_PICTURE_FIELDS.indexOf(key) >= 0) continue;
+    if (!same((was as unknown as Record<string, unknown>)[key], (is as unknown as Record<string, unknown>)[key])) return null;
+  }
+  const patch: PicturePatch = {};
+  if (!same(was.rotation || 0, is.rotation || 0)) patch.rotation = is.rotation ? is.rotation : null;
+  if (!same(was.crop, is.crop)) patch.crop = is.crop ? is.crop : null;
+  if (!same(was.description, is.description)) patch.description = is.description !== undefined && is.description !== '' ? is.description : null;
+  return Object.keys(patch).length > 0 ? patch : undefined;
+}
+
 /** FNV-1a of every byte: what tells the bytes of pictures apart before they are compared. */
 function bytesHash(bytes: Uint8Array): number {
   let hash = 0x811c9dc5;
@@ -5503,6 +5526,17 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       const was = drawing.object;
       const is = next.object;
       if (is === was) continue;
+      if (was.type === 'picture' && is.type === 'picture') {
+        // A picture of the file that was turned, cropped or described anew: only those change in its part.
+        const patch = picturePatch(was, is);
+        if (patch === null) throw new Error(`Cannot write sheet "${sheet.name}": a picture was changed in what is not written`);
+        if (patch) {
+          const edit = editOf(drawingPart);
+          if (!edit.patched) edit.patched = new Map();
+          edit.patched.set(source.index, patch);
+        }
+        continue;
+      }
       if (was.type !== 'chart' || is.type !== 'chart' || was.part === undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing that is not a chart was changed`);
       if (is.chart === was.chart) continue;
       const chartPart = actualOf(was.part);
@@ -5610,9 +5644,15 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       }
       const anchor = anchorOf(drawing);
       if (!metrics) metrics = createSheetMetrics(sheet);
-      const rect = anchorRect(anchor, metrics);
+      // The box the picture is drawn in: near a quarter turn the anchor gives it turned.
+      const rect = turnedBox(anchorRect(anchor, metrics), object.rotation);
       const box = { x: rect.x * 9525, y: rect.y * 9525, width: rect.width * 9525, height: rect.height * 9525 };
-      return { item: { anchor, relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Picture', description: object.description, picture: { box } }, rel };
+      const look: PictureLook = {};
+      if (object.rotation) look.rotation = object.rotation;
+      if (object.flipH) look.flipH = true;
+      if (object.flipV) look.flipV = true;
+      if (object.crop) look.crop = object.crop;
+      return { item: { anchor, relId, name: object.name !== undefined && object.name !== '' ? object.name : 'Picture', description: object.description, picture: { box, look } }, rel };
     };
     if (added.length > 0 && home && !partEdits.has(home.part)) editOf(home.part);
 
@@ -5717,7 +5757,7 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
             partRels.root.children.push(made.rel);
           }
           const item = made.item;
-          anchors.push(pictureAnchorXml(item.anchor, item.relId, i + 2, item.name, item.description, relBase === NS_REL_STRICT, item.picture && item.picture.box));
+          anchors.push(pictureAnchorXml(item.anchor, item.relId, i + 2, item.name, item.description, relBase === NS_REL_STRICT, item.picture && item.picture.box, item.picture && item.picture.look));
           framed.push(item);
           return;
         }

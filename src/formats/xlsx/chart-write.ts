@@ -1302,21 +1302,146 @@ export function chartAnchorXml(anchor: DrawingAnchor, relId: string, shapeId: nu
  * The anchor of a picture in a drawing part: the picture names its bytes by a relationship of the
  * part (`relId`). Its aspect is locked, as Excel locks it for a picture it adds. `box` is where it
  * stands on the sheet in EMU, for the transform of the picture (an application places it by the
- * anchor). `strict`: for a part of the strict flavour of the format.
+ * anchor; for a picture turned near a quarter it is the box turned back, as the picture is drawn
+ * in it). `look` is how it is turned (`a:xfrm rot`, in 60,000ths of a degree), flipped and
+ * cropped (`a:srcRect`, in 1,000ths of a percent). `strict`: for a part of the strict flavour of
+ * the format.
  */
-export function pictureAnchorXml(anchor: DrawingAnchor, relId: string, shapeId: number, name: string, description?: string, strict = false, box?: { x: number; y: number; width: number; height: number }): string {
+export function pictureAnchorXml(
+  anchor: DrawingAnchor,
+  relId: string,
+  shapeId: number,
+  name: string,
+  description?: string,
+  strict = false,
+  box?: { x: number; y: number; width: number; height: number },
+  look: PictureLook = {},
+): string {
   const place = placeXml(anchor);
   const editAs = place.name === 'twoCellAnchor' && anchor.editAs && anchor.editAs !== 'twoCell' ? ` editAs="${anchor.editAs}"` : '';
   const described = description !== undefined && description !== '' ? ` descr="${attr(description)}"` : '';
   const emu = (value: number | undefined): number => (typeof value === 'number' && value > 0 && value < 2e12 ? Math.round(value) : 0);
   const at = box || { x: 0, y: 0, width: 0, height: 0 };
+  const rot = rotationValue(look.rotation);
+  const transform = `${rot !== undefined ? ` rot="${rot}"` : ''}${look.flipH ? ' flipH="1"' : ''}${look.flipV ? ' flipV="1"' : ''}`;
   return (
     `<xdr:${place.name}${editAs}>${place.inner}` +
     `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${shapeId}" name="${attr(name)}"${described}/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>` +
-    `<xdr:blipFill><a:blip xmlns:r="${strict ? STRICT_R : NS_R}" r:embed="${attr(relId)}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
-    `<xdr:spPr><a:xfrm><a:off x="${emu(at.x)}" y="${emu(at.y)}"/><a:ext cx="${emu(at.width)}" cy="${emu(at.height)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>` +
+    `<xdr:blipFill><a:blip xmlns:r="${strict ? STRICT_R : NS_R}" r:embed="${attr(relId)}"/>${cropXml(look.crop)}<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
+    `<xdr:spPr><a:xfrm${transform}><a:off x="${emu(at.x)}" y="${emu(at.y)}"/><a:ext cx="${emu(at.width)}" cy="${emu(at.height)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>` +
     `</xdr:pic><xdr:clientData/></xdr:${place.name}>`
   );
+}
+
+/** How a picture is turned, flipped and cropped, as its anchor in a drawing part says. */
+export interface PictureLook {
+  /** Degrees, clockwise. */
+  rotation?: number;
+  flipH?: boolean;
+  flipV?: boolean;
+  /** Shares (0..1) cut off each side. */
+  crop?: { left: number; top: number; right: number; bottom: number };
+}
+
+/** `rot` of `a:xfrm` for a rotation in degrees: 60,000ths of a degree from 0 to 21,599,999; undefined for none. */
+function rotationValue(degrees: number | undefined): number | undefined {
+  if (typeof degrees !== 'number' || !isFinite(degrees)) return undefined;
+  const steps = Math.round((((degrees % 360) + 360) % 360) * 60000);
+  return steps <= 0 || steps >= 21600000 ? undefined : steps;
+}
+
+/** The sides of `a:srcRect` for a crop: each share in 1,000ths of a percent (100,000 is all of it); undefined for a side that cuts nothing. */
+function cropSides(crop: PictureLook['crop']): [name: string, value: string][] {
+  if (!crop) return [];
+  const out: [string, string][] = [];
+  const side = (name: string, share: number) => {
+    const value = typeof share === 'number' && isFinite(share) ? Math.round(Math.min(Math.max(share, 0), 1) * 100000) : 0;
+    if (value > 0) out.push([name, String(value)]);
+  };
+  side('l', crop.left);
+  side('t', crop.top);
+  side('r', crop.right);
+  side('b', crop.bottom);
+  return out;
+}
+
+const cropXml = (crop: PictureLook['crop']): string => {
+  const sides = cropSides(crop);
+  return sides.length === 0 ? '' : `<a:srcRect ${sides.map(([name, value]) => `${name}="${value}"`).join(' ')}/>`;
+};
+
+/**
+ * What a save changes of a picture of the file besides its anchor: each field that is there is
+ * set (null takes it away). Everything else of the picture stays as the file has it.
+ */
+export interface PicturePatch {
+  rotation?: number | null;
+  crop?: PictureLook['crop'] | null;
+  description?: string | null;
+}
+
+/** Applies a patch to the picture of an anchor of a drawing part that is being changed (see editDrawingPart()). */
+function patchPicture(anchor: XmlElement, patch: PicturePatch): void {
+  const context = part as PartContext;
+  const pic = child(anchor, 'pic');
+  if (!pic) throw new Error('Cannot write the drawing: the picture of the model is not a picture in its part');
+  const link = (node: XmlElement, parent: XmlElement): XmlElement => {
+    context.parents.set(node, parent);
+    for (const kid of elements(node)) link(kid, node);
+    return node;
+  };
+  if (patch.description !== undefined) {
+    const props = child(child(pic, 'nvPicPr'), 'cNvPr');
+    if (!props) throw new Error('Cannot write the drawing: a picture of its part has no properties');
+    if (patch.description === null || patch.description === '') props.attrs.delete('descr');
+    else props.attrs.set('descr', clean(patch.description));
+  }
+  if (patch.crop !== undefined) {
+    const fill = child(pic, 'blipFill');
+    if (!fill) throw new Error('Cannot write the drawing: a picture of its part has no fill');
+    const sides = cropSides(patch.crop === null ? undefined : patch.crop);
+    const rect = child(fill, 'srcRect');
+    if (sides.length === 0) {
+      if (rect) fill.children = fill.children.filter((node) => node !== rect);
+    } else if (rect) {
+      // The sides that are given; whatever else the element says stays.
+      for (const name of ['l', 't', 'r', 'b']) rect.attrs.delete(name);
+      const attrs = new Map<string, string>(sides);
+      for (const [name, value] of rect.attrs) attrs.set(name, value);
+      rect.attrs = attrs;
+    } else {
+      // After the blip, where the schema has it.
+      const made_ = link(made(fill, cropXml(patch.crop as PictureLook['crop'])), fill);
+      const blip = child(fill, 'blip');
+      const at = blip ? fill.children.indexOf(blip) + 1 : 0;
+      fill.children = fill.children.slice(0, at).concat([made_ as XmlNode], fill.children.slice(at));
+    }
+  }
+  if (patch.rotation !== undefined) {
+    const rot = rotationValue(patch.rotation === null ? undefined : patch.rotation);
+    let props = child(pic, 'spPr');
+    if (!props) {
+      if (rot === undefined) return;
+      props = link(made(pic, '<xdr:spPr/>'), pic);
+      const fill = child(pic, 'blipFill');
+      const at = fill ? pic.children.indexOf(fill) + 1 : pic.children.length;
+      pic.children = pic.children.slice(0, at).concat([props as XmlNode], pic.children.slice(at));
+    }
+    const transform = child(props, 'xfrm');
+    if (transform) {
+      if (rot === undefined) transform.attrs.delete('rot');
+      else {
+        // `rot` first, where applications write it; whatever else the element says stays.
+        const attrs = new Map<string, string>([['rot', String(rot)]]);
+        for (const [name, value] of transform.attrs) if (name !== 'rot') attrs.set(name, value);
+        transform.attrs = attrs;
+      }
+    } else if (rot !== undefined) {
+      // A transform of the turn alone (off and ext may be left out): first of the properties, where the schema has it.
+      const made_ = link(made(props, `<a:xfrm rot="${rot}"/>`), props);
+      props.children = [made_ as XmlNode].concat(props.children);
+    }
+  }
 }
 
 /** A drawing part that holds the given anchors and nothing else. */
@@ -1374,7 +1499,9 @@ export interface DrawingPartEdit {
    * that one, and keeps everything of it but its place, its id, its name, its relationship and
    * the macro it is assigned.
    */
-  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string; picture?: { box?: { x: number; y: number; width: number; height: number } } }[];
+  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string; picture?: { box?: { x: number; y: number; width: number; height: number }; look?: PictureLook } }[];
+  /** Pictures of the part, by their place among the anchors the reader takes, that are turned, cropped or described anew. */
+  patched?: Map<number, PicturePatch>;
 }
 
 /** The <c:chart r:id> of a frame: the element that names the chart part, and the name of the attribute that does. */
@@ -1535,6 +1662,13 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
       el.name = el.name.slice(0, el.name.length - localName(el.name).length) + place.name;
       if (place.name !== 'twoCellAnchor') el.attrs.delete('editAs');
     }
+    if (edit.patched) {
+      for (const [index, patch] of edit.patched) {
+        const item = found[index];
+        if (!item) throw new Error('Cannot write the drawing: an anchor of the model is not in its part');
+        patchPicture(item.el, patch);
+      }
+    }
     const removed = new Set<XmlNode>();
     for (const index of edit.removed) {
       const item = found[index];
@@ -1558,7 +1692,7 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
       ids(root, 0);
       const added: XmlNode[] = edit.added.map((item) => {
         const id = ++top;
-        if (item.picture) return made(root, pictureAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict, item.picture.box));
+        if (item.picture) return made(root, pictureAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict, item.picture.box, item.picture.look));
         return (item.from !== undefined ? copiedAnchor(root, item, id) : undefined) || made(root, chartAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict));
       });
       root.children = root.children.concat(added);

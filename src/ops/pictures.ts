@@ -13,15 +13,25 @@
 //   columns inserted or deleted later move it by those rules (see
 //   drawingAnchorNow()).
 //
+// - A picture is turned (DrawingObject.rotation), cropped (DrawingPicture.crop)
+//   and given another alternative text; of a picture of the file the writer
+//   changes only those (`a:xfrm rot`, `a:srcRect`, `descr`) besides its anchor.
+//   Near a quarter turn the anchor of a picture is the box it takes up turned
+//   (see turnedBox()): a turn across that line changes the anchor too.
+// - A picture is copied with its bytes, its size, its turn, its crop and its
+//   alternative text (copyPicture()), and pasted (pastePicture()) on any sheet
+//   of any workbook: what a copy holds names nothing of the workbook it came from.
+//
 // What kind of picture bytes are is read from the bytes, never from a name or
 // from what a caller says they are; what is not a PNG, JPEG, GIF or BMP
 // picture with a readable size is refused, as is one too large to be shown.
 
 import type { SheetMetrics } from '../layout/sheet-metrics';
 import { createSheetMetrics } from '../layout/sheet-metrics';
-import { isAddedPicture, newPictureKey, PICTURE_EXTENSIONS } from '../model/sheet/pictures';
+import { isAddedPicture, MAX_DRAWING_TEXT, newPictureKey, pictureSource, PICTURE_EXTENSIONS, textUpTo } from '../model/sheet/pictures';
 import { MAX_COLS, MAX_ROWS, type CellRange, type DrawingAnchor, type DrawingMarker, type DrawingPicture, type PictureData, type Sheet, type SheetDrawing, type Workbook } from '../model/sheet/types';
 import { anchorRect, drawingAnchorNow } from '../render/sheet-drawings';
+import { croppedBox, normalCrop, turnedBox, type PictureCrop } from '../render/picture-frame';
 import { declaredImageSize, sniffImageType } from '../render/images';
 import { checkedAnchor, MAX_SHEET_DRAWINGS } from './charts';
 import { withCommand, type Op } from './ops';
@@ -35,8 +45,8 @@ export const MAX_PICTURE_SIDE = 16384;
 export const MAX_PICTURE_PIXELS = 50000000;
 /** What the pictures added to one workbook hold together, in bytes. */
 export const MAX_WORKBOOK_PICTURE_BYTES = 256 * 1024 * 1024;
-/** Longest name and alternative text of a picture. */
-export const MAX_PICTURE_TEXT = 1024;
+/** Longest name and alternative text of a picture: the alternative text a reader keeps of a file (see MAX_DRAWING_TEXT). */
+export const MAX_PICTURE_TEXT = MAX_DRAWING_TEXT;
 /** The largest a picture is shown when it is added without a place, in pixels: a larger one is made smaller, its sides in proportion. UNSURE: Excel adds a picture at the size its own resolution gives it. */
 export const DEFAULT_PICTURE_WIDTH = 800;
 export const DEFAULT_PICTURE_HEIGHT = 600;
@@ -54,6 +64,10 @@ export interface PictureInfo {
   name?: string;
   /** Alternative text. */
   description?: string;
+  /** Degrees it is turned, clockwise; absent when it is not. */
+  rotation?: number;
+  /** Shares cut off its sides; absent when nothing is. */
+  crop?: PictureCrop;
   /** The picture is in the file the workbook was read from. */
   ofFile: boolean;
   /** Whether it can be deleted (a picture that shares its place in the drawing with another object cannot). */
@@ -172,8 +186,8 @@ function checkedText(text: unknown, what: string): string | undefined {
   return value;
 }
 
-/** What the pictures that were added to a workbook hold, each set of bytes counted once. */
-function addedBytes(workbook: Workbook): number {
+/** What the pictures that were added to a workbook hold, each set of bytes counted once; `also`, when the workbook holds it already, is taken off (it would add nothing). */
+function addedBytes(workbook: Workbook, also?: Uint8Array): number {
   const seen = new Set<Uint8Array>();
   let total = 0;
   for (const sheet of workbook.sheets) {
@@ -184,7 +198,7 @@ function addedBytes(workbook: Workbook): number {
       total += object.data.bytes.length;
     }
   }
-  return total;
+  return also !== undefined && seen.has(also) ? total - also.length : total;
 }
 
 /** The name a picture that is added to a sheet gets: "Picture" and one more than the pictures the sheet has. */
@@ -368,7 +382,340 @@ export function sheetPictures(workbook: Workbook, sheetIndex: number): PictureIn
     const info: PictureInfo = { id, anchor: drawingAnchorNow(drawing, sheet.structuralEdits), ofFile: inFile !== undefined, removable: !(inFile && inFile.wrapped) };
     if (drawing.object.name !== undefined) info.name = drawing.object.name;
     if (drawing.object.description !== undefined) info.description = drawing.object.description;
+    if (drawing.object.rotation) info.rotation = drawing.object.rotation;
+    if (drawing.object.crop) info.crop = { ...drawing.object.crop };
     out.push(info);
   });
   return out;
+}
+
+// ------------------------------------------------------------------ turn, crop, text
+
+/**
+ * Why a picture cannot be turned, cropped or given another alternative text, as a message;
+ * undefined when it can. Besides what keeps every picture of the sheet as it is
+ * (picturesProblem()): a picture the file holds in a wrapper of alternatives (inside its anchor, or
+ * its anchor inside one: SheetDrawing.alternative), whose other form would be left as it was. It
+ * is moved and deleted all the same.
+ */
+export function pictureEditProblem(workbook: Workbook, sheetIndex: number, id: number): string | undefined {
+  const problem = picturesProblem(workbook, sheetIndex);
+  if (problem) return problem;
+  const sheet = workbook.sheets[sheetIndex];
+  const drawing = sheet.drawings && typeof id === 'number' && Math.floor(id) === id ? sheet.drawings[id] : undefined;
+  if (!drawing || !drawing.object || drawing.object.type !== 'picture') return `No picture at index ${id}`;
+  const inFile = fileDrawing(drawing);
+  if (inFile && inFile.alternative) return 'Cannot change this picture: the file holds it in another form as well, which would be left as it was';
+  return undefined;
+}
+
+/** The picture of a sheet a command changes, with where it stands now and its drawn box (pixels; see turnedBox()). */
+function pictureNow(workbook: Workbook, sheetIndex: number, id: number) {
+  const sheet = placedSheetOf(workbook, sheetIndex);
+  const { drawing, object } = pictureAt(sheet, id);
+  const problem = pictureEditProblem(workbook, sheetIndex, id);
+  if (problem) throw new RangeError(problem);
+  const now = drawingAnchorNow(drawing, sheet.structuralEdits);
+  const metrics = createSheetMetrics(sheet);
+  return { sheet, drawing, object, now, metrics, drawn: turnedBox(anchorRect(now, metrics), object.rotation) };
+}
+
+/** The list of drawings with the picture at `id` holding another object and, when given, standing at another anchor. */
+function changedPicture(sheetIndex: number, sheet: Sheet, id: number, drawing: SheetDrawing, object: DrawingPicture, now: DrawingAnchor, anchor: DrawingAnchor | undefined): Op[] {
+  const moved = anchor !== undefined && JSON.stringify(anchor) !== JSON.stringify(now);
+  // A picture that moves is put where it is from the structural edits made so far on (as movePicture() does); one that stays keeps its place as it is.
+  const next: SheetDrawing = moved ? { anchor: anchor as DrawingAnchor, object, since: sheet.structuralEdits ? sheet.structuralEdits.length : 0 } : { ...drawing, object };
+  const from = fileDrawing(drawing);
+  if (from) next.from = from;
+  else delete next.from;
+  const list = (sheet.drawings as SheetDrawing[]).slice();
+  list[id] = next;
+  return setDrawings(sheetIndex, list);
+}
+
+/** An angle in degrees as a picture holds it: 0 <= angle < 360, in the steps of the file (1/60,000 of a degree). Throws RangeError for what is not a number. */
+export function pictureRotation(degrees: unknown): number {
+  if (typeof degrees !== 'number' || !isFinite(degrees) || Math.abs(degrees) > 1e7) throw new RangeError('The rotation of a picture is a number of degrees');
+  const steps = Math.round((((degrees % 360) + 360) % 360) * 60000);
+  return steps >= 360 * 60000 ? 0 : steps / 60000;
+}
+
+/** Whether a box is given turned by a quarter at one rotation and not at the other (see turnedBox()). */
+const crossesQuarter = (a: number, b: number): boolean => turnedBox({ x: 0, y: 0, width: 2, height: 1 }, a).width !== turnedBox({ x: 0, y: 0, width: 2, height: 1 }, b).width;
+
+/**
+ * Turns a picture to `degrees` (clockwise; 90 is a quarter turn to the right) about the middle
+ * of its box. Its box keeps its size and its middle; near a quarter turn its anchor is the box
+ * turned (as the file gives such a picture), so a turn across 45 degrees changes its anchor.
+ * Returns no operation when the picture is turned so already. Throws RangeError for an angle that
+ * is not a number.
+ */
+export function rotatePicture(workbook: Workbook, sheetIndex: number, id: number, degrees: number): Op[] {
+  return withCommand(rotatePicturePlain(workbook, sheetIndex, id, degrees), 'rotatePicture', []);
+}
+
+function rotatePicturePlain(workbook: Workbook, sheetIndex: number, id: number, degrees: number): Op[] {
+  const rotation = pictureRotation(degrees);
+  const { sheet, drawing, object, now, metrics, drawn } = pictureNow(workbook, sheetIndex, id);
+  const before = object.rotation || 0;
+  if (before === rotation) return [];
+  const next: DrawingPicture = { ...object };
+  if (rotation === 0) delete next.rotation;
+  else next.rotation = rotation;
+  // Unless a quarter turn is crossed the anchor is left as it is.
+  if (!crossesQuarter(before, rotation)) return changedPicture(sheetIndex, sheet, id, drawing, next, now, undefined);
+  const edits = sheet.structuralEdits ? sheet.structuralEdits.length : 0;
+  // Turned back across the line, where the last turn put it and with no row or column moved since: the anchor it had.
+  const back = drawing.turned;
+  if (back && back.edits === edits && JSON.stringify(back.to) === JSON.stringify(now)) {
+    const ops = changedPicture(sheetIndex, sheet, id, drawing, next, now, back.from);
+    const list = (ops[0] as Extract<Op, { type: 'setDrawings' }>).drawings as SheetDrawing[];
+    delete list[id].turned;
+    return ops;
+  }
+  // The turned box is kept on the sheet, which may move it; the anchor it had is kept for the turn back.
+  const anchor = anchorLike(now, metrics, turnedBox(drawn, rotation));
+  const ops = changedPicture(sheetIndex, sheet, id, drawing, next, now, anchor);
+  const list = (ops[0] as Extract<Op, { type: 'setDrawings' }>).drawings as SheetDrawing[];
+  list[id].turned = { from: now, to: drawingAnchorNow(list[id], sheet.structuralEdits), edits };
+  return ops;
+}
+
+/** A crop as a command takes it: shares from 0 to 1 that leave something of the picture each way, in the steps of the file; undefined for none. Throws RangeError otherwise. */
+export function checkedCrop(crop: unknown): PictureCrop | undefined {
+  if (crop === undefined || crop === null) return undefined;
+  const given = crop as PictureCrop;
+  if (typeof given !== 'object' || Array.isArray(given)) throw new RangeError('The crop of a picture gives the shares cut off its sides');
+  for (const side of ['left', 'top', 'right', 'bottom'] as const) {
+    const value = given[side] === undefined ? 0 : given[side];
+    if (typeof value !== 'number' || !isFinite(value) || value < 0 || value >= 1) throw new RangeError('The crop of a picture gives the shares cut off its sides, each from 0 to 1');
+  }
+  const made = normalCrop({ left: given.left || 0, top: given.top || 0, right: given.right || 0, bottom: given.bottom || 0 });
+  if (made && (made.left + made.right > 0.999 || made.top + made.bottom > 0.999)) throw new RangeError('A crop cannot leave nothing of the picture');
+  return made;
+}
+
+/**
+ * Crops a picture: `crop` gives the shares (0..1) of the picture cut off each side, undefined
+ * (or nothing each way) for none. The picture keeps its scale, and what is still shown of it
+ * stays where it is: the sides of its box move (see croppedBox()). Shares are kept in the steps of
+ * the file (1/100,000). Returns no operation when the picture is cropped so already. Throws
+ * RangeError for a share that is not a number from 0 to 1, and for a crop that leaves nothing.
+ */
+export function cropPicture(workbook: Workbook, sheetIndex: number, id: number, crop: PictureCrop | undefined): Op[] {
+  return withCommand(cropPicturePlain(workbook, sheetIndex, id, crop), 'cropPicture', []);
+}
+
+function cropPicturePlain(workbook: Workbook, sheetIndex: number, id: number, crop: PictureCrop | undefined): Op[] {
+  const wanted = checkedCrop(crop);
+  const { sheet, drawing, object, now, metrics, drawn } = pictureNow(workbook, sheetIndex, id);
+  if (JSON.stringify(object.crop || null) === JSON.stringify(wanted || null)) return [];
+  const next: DrawingPicture = { ...object };
+  if (wanted) next.crop = wanted;
+  else delete next.crop;
+  const box = croppedBox(drawn, object.rotation, object.crop, wanted, object.flipH === true, object.flipV === true);
+  // As the handles do (see draggedCrop()): no less than the least size of a picture is left of it each way.
+  if (box.width < MIN_PICTURE_SIZE - 1e-6 || box.height < MIN_PICTURE_SIZE - 1e-6) throw new RangeError(`A crop cannot leave less than ${MIN_PICTURE_SIZE} pixels of the picture`);
+  return changedPicture(sheetIndex, sheet, id, drawing, next, now, anchorLike(now, metrics, turnedBox(box, object.rotation)));
+}
+
+/**
+ * Gives a picture another alternative text (`descr` of the file): at most MAX_PICTURE_TEXT
+ * characters, line breaks kept; empty or undefined takes it away. Returns no operation when the
+ * picture has that text already. Throws RangeError for a text too long, or with a character a
+ * file cannot hold.
+ */
+export function describePicture(workbook: Workbook, sheetIndex: number, id: number, text: string | undefined): Op[] {
+  return withCommand(describePicturePlain(workbook, sheetIndex, id, text), 'describePicture', []);
+}
+
+function describePicturePlain(workbook: Workbook, sheetIndex: number, id: number, text: string | undefined): Op[] {
+  const description = checkedText(text, 'alternative text');
+  const { sheet, drawing, object, now } = pictureNow(workbook, sheetIndex, id);
+  if (object.description === description) return [];
+  const next: DrawingPicture = { ...object };
+  if (description === undefined) delete next.description;
+  else next.description = description;
+  return changedPicture(sheetIndex, sheet, id, drawing, next, now, undefined);
+}
+
+// ------------------------------------------------------------------ copies
+
+/** How far a copy is put from a picture that stands where it would stand: so many pixels to the right and down. */
+export const PICTURE_COPY_OFFSET = 24;
+
+/**
+ * A picture taken off a sheet to be put down again: what copyPicture() and cutPicture() give and
+ * pastePicture() takes. It holds the bytes of the picture and nothing of the workbook it came
+ * from: it is put down on any sheet of any workbook. Not to be altered.
+ */
+export interface PictureCopy {
+  readonly bytes: Uint8Array;
+  /** What the bytes are: "image/png", "image/jpeg", "image/gif" or "image/bmp" (read from them). */
+  readonly type: string;
+  /** Its box as its anchor gives it, pixels from the corner of cell A1: where it stood, and its size. */
+  readonly rect: { x: number; y: number; width: number; height: number };
+  /** The kind of anchor it had: the copy gets the same. */
+  readonly anchor: { kind: DrawingAnchor['kind']; editAs?: DrawingAnchor['editAs'] };
+  readonly rotation?: number;
+  readonly flipH?: boolean;
+  readonly flipV?: boolean;
+  readonly crop?: PictureCrop;
+  readonly description?: string;
+}
+
+/** What pastePicture() gives. */
+export interface PastedPicture {
+  /** The operations that add the picture: one undo step. */
+  ops: Op[];
+  /** The id the picture has on its sheet once they are applied. */
+  id: number;
+}
+
+/** Copies this module made: their bytes were checked, and are no caller's. */
+const MADE = new WeakSet<object>();
+
+/** The parts a copy can be made of, by the extension of their names; the bytes say at last. */
+const COPIED_EXTENSIONS = /\.(png|jpe?g|jfif|gif|bmp|dib)$/i;
+
+/**
+ * Why a picture cannot be copied (or cut), as a message; undefined when it can: no picture there,
+ * one whose bytes are kept outside the file or are missing, one of a kind no picture is added as
+ * (a metafile, SVG, TIFF, WebP: told by the name of its part; the bytes are checked once read).
+ */
+export function pictureCopyProblem(workbook: Workbook, sheetIndex: number, id: number): string | undefined {
+  const sheet = workbook.sheets[sheetIndex];
+  if (!sheet) return `No sheet at index ${sheetIndex}`;
+  if (sheet.kind !== 'worksheet') return `Cannot copy the pictures of a ${sheet.kind}`;
+  const drawing = sheet.drawings && typeof id === 'number' && Math.floor(id) === id ? sheet.drawings[id] : undefined;
+  if (!drawing || !drawing.object || drawing.object.type !== 'picture') return `No picture at index ${id}`;
+  const object = drawing.object;
+  if (isAddedPicture(object)) return undefined;
+  if (object.external || object.media === undefined) return 'Cannot copy this picture: its bytes are not in the file';
+  if (!COPIED_EXTENSIONS.test(object.media)) return 'Cannot copy this picture: only PNG, JPEG, GIF and BMP pictures are copied';
+  return undefined;
+}
+
+/**
+ * Takes a copy of a picture; nothing of the workbook is changed. What the copy holds is taken
+ * now (its place, size, turn, crop and alternative text); its bytes are those of the model (a
+ * picture that was added) or are read from the file. The promise is refused (RangeError) when the
+ * bytes are not a picture that can be added (see checkPicture()). Throws RangeError at once for a
+ * picture that cannot be copied: pictureCopyProblem() says why.
+ */
+export function copyPicture(workbook: Workbook, sheetIndex: number, id: number): Promise<PictureCopy> {
+  const problem = pictureCopyProblem(workbook, sheetIndex, id);
+  if (problem) throw new RangeError(problem);
+  const sheet = workbook.sheets[sheetIndex];
+  const { drawing, object } = pictureAt(sheet, id);
+  const anchor = drawingAnchorNow(drawing, sheet.structuralEdits);
+  const box = anchorRect(anchor, createSheetMetrics(sheet));
+  const held: { -readonly [key in keyof PictureCopy]?: PictureCopy[key] } = {
+    rect: { x: box.x, y: box.y, width: box.width, height: box.height },
+    anchor: anchor.kind === 'twoCell' && anchor.editAs !== undefined ? { kind: anchor.kind, editAs: anchor.editAs } : { kind: anchor.kind },
+  };
+  if (object.rotation) held.rotation = object.rotation;
+  if (object.flipH) held.flipH = true;
+  if (object.flipV) held.flipV = true;
+  const crop = normalCrop(object.crop);
+  if (crop) held.crop = crop;
+  if (object.description !== undefined && object.description !== '') held.description = textUpTo(object.description, MAX_PICTURE_TEXT);
+  // The bytes of a picture that was added are those of the model (never altered); those of the file are read, and kept as a copy of their own.
+  const read: Promise<Uint8Array> = isAddedPicture(object)
+    ? Promise.resolve(object.data.bytes)
+    : pictureSource(workbook)
+        .readPart(object.media as string)
+        .then((bytes) => (bytes instanceof Uint8Array ? bytes.slice() : bytes));
+  return read.then((bytes) => {
+    const facts = checkPicture(bytes);
+    if (typeof facts === 'string') throw new RangeError(`Cannot copy this picture: ${facts.charAt(0).toLowerCase()}${facts.slice(1)}`);
+    held.bytes = bytes;
+    held.type = facts.type;
+    MADE.add(held);
+    return held as PictureCopy;
+  });
+}
+
+/**
+ * Takes a copy of a picture and, once the copy is made, the operations that delete it (one undo
+ * step; the paste is another). Nothing is deleted before the copy is there: the promise is refused
+ * for a picture whose copy cannot be made, and for one that was changed or deleted while its bytes
+ * were read. Throws RangeError at once for a picture that cannot be copied or cannot be deleted.
+ */
+export function cutPicture(workbook: Workbook, sheetIndex: number, id: number): Promise<{ copy: PictureCopy; ops: Op[] }> {
+  // What refuses the deletion is said now, before anything is read.
+  removePicture(workbook, sheetIndex, id);
+  const copy = copyPicture(workbook, sheetIndex, id);
+  const sheet = workbook.sheets[sheetIndex];
+  const drawing = (sheet.drawings || [])[id];
+  return copy.then((made) => {
+    const home = workbook.sheets.indexOf(sheet);
+    const at = home >= 0 ? (sheet.drawings || []).indexOf(drawing) : -1;
+    if (at < 0) throw new RangeError('The picture was changed or deleted before it was cut');
+    return { copy: made, ops: removePicture(workbook, home, at) };
+  });
+}
+
+/**
+ * Puts a copy of a picture on a sheet, above its other drawings, with the size, kind of anchor,
+ * turn, flips, crop and alternative text of the picture it was taken from, and a name of its own.
+ * With `at` its box has its top left corner at the corner of that cell; without, it stands where
+ * the picture stood, moved right and down (PICTURE_COPY_OFFSET) for as long as a picture stands
+ * there already. A copy that does not come from copyPicture() is checked as any picture that is
+ * added. Throws RangeError for what is not a copy of a picture, and for a sheet or a workbook that
+ * takes no more pictures.
+ */
+export function pastePicture(workbook: Workbook, sheetIndex: number, copy: PictureCopy, at?: { row: number; col: number }): PastedPicture {
+  const sheet = placedSheetOf(workbook, sheetIndex);
+  if (!copy || typeof copy !== 'object' || !(copy.bytes instanceof Uint8Array)) throw new RangeError('What is pasted is not a picture that was copied');
+  const own = MADE.has(copy);
+  const facts = own ? { type: copy.type } : checkPicture(copy.bytes);
+  if (typeof facts === 'string') throw new RangeError(facts);
+  // The bytes of a copy made elsewhere are taken as a copy of their own: its array may change afterwards.
+  const bytes = own ? copy.bytes : copy.bytes.slice();
+  const drawings = sheet.drawings || [];
+  if (drawings.length >= MAX_SHEET_DRAWINGS) throw new RangeError('The sheet has too many drawings');
+  if (addedBytes(workbook, bytes) + bytes.length > MAX_WORKBOOK_PICTURE_BYTES) throw new RangeError(`The pictures added to a workbook cannot hold more than ${MAX_WORKBOOK_PICTURE_BYTES / 1024 / 1024} MB`);
+  const number = (n: unknown, fallback: number): number => (typeof n === 'number' && isFinite(n) ? n : fallback);
+  const rect = copy.rect && typeof copy.rect === 'object' ? copy.rect : { x: 0, y: 0, width: DEFAULT_PICTURE_WIDTH, height: DEFAULT_PICTURE_HEIGHT };
+  const width = Math.max(number(rect.width, DEFAULT_PICTURE_WIDTH), MIN_PICTURE_SIZE);
+  const height = Math.max(number(rect.height, DEFAULT_PICTURE_HEIGHT), MIN_PICTURE_SIZE);
+  const metrics = createSheetMetrics(sheet);
+  let x = Math.max(0, number(rect.x, 0));
+  let y = Math.max(0, number(rect.y, 0));
+  if (at !== undefined) {
+    const whole = (n: unknown, limit: number) => typeof n === 'number' && n >= 0 && n < limit && Math.floor(n) === n;
+    if (!at || !whole(at.row, MAX_ROWS) || !whole(at.col, MAX_COLS)) throw new RangeError('The place of a picture is a cell of the sheet');
+    x = metrics.cols.offset(at.col);
+    y = metrics.rows.offset(at.row);
+  } else {
+    const taken: { x: number; y: number }[] = [];
+    for (const drawing of drawings) {
+      if (!drawing || !drawing.object || drawing.object.type !== 'picture') continue;
+      const box = anchorRect(drawingAnchorNow(drawing, sheet.structuralEdits), metrics);
+      taken.push({ x: box.x, y: box.y });
+    }
+    for (let n = 0; n < 64 && taken.some((box) => Math.abs(box.x - x) < 1 && Math.abs(box.y - y) < 1); n++) {
+      x += PICTURE_COPY_OFFSET;
+      y += PICTURE_COPY_OFFSET;
+    }
+  }
+  const kind = copy.anchor && (copy.anchor.kind === 'oneCell' || copy.anchor.kind === 'absolute') ? copy.anchor.kind : 'twoCell';
+  const like: DrawingAnchor = { kind };
+  if (kind === 'twoCell' && copy.anchor && (copy.anchor.editAs === 'oneCell' || copy.anchor.editAs === 'absolute')) like.editAs = copy.anchor.editAs;
+  const anchor = anchorLike(like, metrics, { x, y, width, height });
+  const object: DrawingPicture = { type: 'picture', media: newPictureKey(), data: { bytes, type: facts.type }, name: nextName(sheet) };
+  const description = checkedText(copy.description, 'alternative text');
+  if (description !== undefined) object.description = description;
+  if (copy.rotation !== undefined) {
+    const rotation = pictureRotation(copy.rotation);
+    if (rotation !== 0) object.rotation = rotation;
+  }
+  if (copy.flipH === true) object.flipH = true;
+  if (copy.flipV === true) object.flipV = true;
+  const crop = checkedCrop(copy.crop);
+  if (crop) object.crop = crop;
+  const added: SheetDrawing = { anchor, object, since: sheet.structuralEdits ? sheet.structuralEdits.length : 0 };
+  // The bytes are not what a collaborator would be sent: the command is named, the list is not shared (see collab/wire.ts).
+  return { ops: withCommand(setDrawings(sheetIndex, drawings.concat([added])), 'pastePicture', []), id: drawings.length };
 }

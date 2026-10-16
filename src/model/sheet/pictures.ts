@@ -12,6 +12,20 @@ export const ADDED_PICTURE_KEY = 'added:';
 /** File name extension of each kind of picture that can be added, by its media type. */
 export const PICTURE_EXTENSIONS: { [type: string]: string } = { 'image/png': 'png', 'image/jpeg': 'jpeg', 'image/gif': 'gif', 'image/bmp': 'bmp' };
 
+/**
+ * The longest alternative text of a drawing, in UTF-16 code units: what a reader keeps of the file
+ * (`descr`) and what a command gives a picture. One limit, so that a text read from a file is
+ * always one a command takes again.
+ */
+export const MAX_DRAWING_TEXT = 2000;
+
+/** A text cut to at most `limit` code units, never between the two halves of a character. */
+export function textUpTo(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const code = text.charCodeAt(limit - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit);
+}
+
 let lastKey = 0;
 
 /** A key for a picture that is added: one no other picture of any workbook has. */
