@@ -410,6 +410,8 @@ export interface UiStrings {
     unsupported: string;
     /** Pictures are refused while the workbook is edited together. */
     pictures: string;
+    /** Shapes are refused while the workbook is edited together. */
+    shapes: string;
     sheetDeleted(name: string): string;
     editGone: string;
     formulaGone(text: string): string;
@@ -459,12 +461,53 @@ export interface UiStrings {
   pivots: PivotStrings;
   /** Pictures of a sheet: the button that adds one, the menu of one, and what is said about them. */
   pictures: PictureStrings;
+  /** Shapes of a sheet: the menu that adds one, the menu of one, and what is said about them. */
+  shapes: ShapeStrings;
   /** The bar of Find and Replace of both views. */
   find: FindStrings;
   /** The dialog of the page setup of both views. */
   pageSetup: PageSetupStrings;
   /** The print preview of a workbook. */
   preview: PrintPreviewStrings;
+}
+
+/** What is said about shapes of a sheet. */
+export interface ShapeStrings {
+  /** The menu button that adds a shape, and its kinds. */
+  insert: string;
+  kinds: { rect: string; roundRect: string; ellipse: string; line: string; arrow: string; doubleArrow: string; textBox: string };
+  /** The items of the menu of the toolbar that change the selected shape. */
+  lineColor: string;
+  lineWidth: string;
+  noLine: string;
+  points(n: number): string;
+  added: string;
+  moved: string;
+  removed: string;
+  rotated: string;
+  formatted: string;
+  textChanged: string;
+  selected(name: string): string;
+  /** The word that stands for a shape on the clipboard. */
+  word: string;
+  copied: string;
+  cutOut: string;
+  pasted: string;
+  editText: string;
+  remove: string;
+  /** The label of the field the text of a shape is typed in. */
+  textField(name: string): string;
+  textHint: string;
+  wrapped: string;
+  noCellPaste: string;
+  copyGone: string;
+  protectedSheet: string;
+  placesFixed: string;
+  alternative: string;
+  notFormattable: string;
+  notCopyable: string;
+  textFixed: string;
+  noText: string;
 }
 
 /** What is said about pictures of a sheet. */
@@ -1316,6 +1359,7 @@ export const STRINGS_EN: UiStrings = {
     tooLarge: 'This change is too large to be shared in one step.',
     unsupported: 'This cannot be done while the workbook is edited together.',
     pictures: 'Pictures cannot be added, moved or deleted while the workbook is edited together.',
+    shapes: 'Shapes cannot be added, changed or deleted while the workbook is edited together.',
     sheetDeleted: (name) => `Sheet ${name} was deleted. This cannot be undone while the workbook is edited together.`,
     editGone: 'The cell you were typing in was deleted by someone else.',
     formulaGone: (text) => `Someone else moved cells or renamed a sheet while you were typing a formula: what you typed may have meant other cells, and was not applied. You typed: ${text}`,
@@ -1633,6 +1677,39 @@ export const STRINGS_EN: UiStrings = {
     copyUnbound: (count) => (count === 1 ? 'One reference of the copy still names no sheet' : `${count} references of the copy still name no sheet`),
     noCellPaste: 'A chart is selected: select a cell to paste cells',
     copyGone: 'The chart on the clipboard was copied elsewhere and cannot be pasted here: copy the chart again',
+  },
+  shapes: {
+    insert: 'Insert shape',
+    kinds: { rect: 'Rectangle', roundRect: 'Rounded rectangle', ellipse: 'Oval', line: 'Line', arrow: 'Arrow', doubleArrow: 'Double arrow', textBox: 'Text box' },
+    lineColor: 'Line color…',
+    lineWidth: 'Line weight…',
+    noLine: 'No line',
+    points: (n) => `${n} pt`,
+    added: 'Shape inserted',
+    moved: 'Shape moved',
+    removed: 'Shape deleted',
+    rotated: 'Shape rotated',
+    formatted: 'Shape formatted',
+    textChanged: 'Text of the shape changed',
+    selected: (name) => (name ? `Shape selected: ${name}` : 'Shape selected'),
+    word: '[Shape]',
+    copied: 'Shape copied',
+    cutOut: 'Shape cut',
+    pasted: 'Shape pasted',
+    editText: 'Edit text',
+    remove: 'Delete shape',
+    textField: (name) => (name ? `Text of ${name}` : 'Text of the shape'),
+    textHint: 'Enter starts a new line; Ctrl+Enter or leaving the field applies the text, Escape gives it up',
+    wrapped: 'This shape cannot be deleted: it shares its place in the file with another object',
+    noCellPaste: 'A shape is selected: select a cell to paste cells',
+    copyGone: 'The shape on the clipboard was copied elsewhere and cannot be pasted here: copy the shape again',
+    protectedSheet: 'The sheet is protected: its shapes cannot be changed',
+    placesFixed: 'Shapes cannot be added, moved or deleted on this sheet: its drawing in the file cannot be changed',
+    alternative: 'This shape cannot be rotated or given another text: the file holds it in another form as well, which would be left as it was',
+    notFormattable: 'The look of this shape cannot be changed: the file holds more of it than can be kept. It can be moved, sized, rotated and deleted',
+    notCopyable: 'This shape cannot be copied: the file holds more of it than a copy keeps',
+    textFixed: 'The text of this shape cannot be changed here: the file gives it more than one look, a field or the text of a cell',
+    noText: 'A line has no text',
   },
   pictures: {
     insert: 'Insert picture',
@@ -2175,6 +2252,7 @@ export const STRINGS_TR: UiStrings = {
     tooLarge: 'Bu değişiklik tek adımda paylaşılamayacak kadar büyük.',
     unsupported: 'Bu, kitap birlikte düzenlenirken yapılamaz.',
     pictures: 'Kitap birlikte düzenlenirken görsel eklenemez, taşınamaz ve silinemez.',
+    shapes: 'Kitap birlikte düzenlenirken şekil eklenemez, değiştirilemez ve silinemez.',
     sheetDeleted: (name) => `${name} sayfası silindi. Kitap birlikte düzenlenirken bu geri alınamaz.`,
     editGone: 'Yazdığınız hücreyi başkası sildi.',
     formulaGone: (text) => `Siz formül yazarken başkası hücreleri kaydırdı ya da bir sayfayı yeniden adlandırdı: yazdığınız başka hücreleri kastediyor olabilirdi, uygulanmadı. Yazdığınız: ${text}`,
@@ -2492,6 +2570,39 @@ export const STRINGS_TR: UiStrings = {
     copyUnbound: (count) => `Kopyanın ${count} başvurusu hâlâ sayfa adı taşımıyor`,
     noCellPaste: 'Bir grafik seçili: hücre yapıştırmak için bir hücre seçin',
     copyGone: 'Panodaki grafik başka bir yerde kopyalanmış, buraya yapıştırılamıyor: grafiği yeniden kopyalayın',
+  },
+  shapes: {
+    insert: 'Şekil ekle',
+    kinds: { rect: 'Dikdörtgen', roundRect: 'Yuvarlak köşeli dikdörtgen', ellipse: 'Oval', line: 'Çizgi', arrow: 'Ok', doubleArrow: 'Çift uçlu ok', textBox: 'Metin kutusu' },
+    lineColor: 'Çizgi rengi…',
+    lineWidth: 'Çizgi kalınlığı…',
+    noLine: 'Çizgi yok',
+    points: (n) => `${String(n).replace('.', ',')} nk`,
+    added: 'Şekil eklendi',
+    moved: 'Şekil taşındı',
+    removed: 'Şekil silindi',
+    rotated: 'Şekil döndürüldü',
+    formatted: 'Şekil biçimlendirildi',
+    textChanged: 'Şeklin metni değişti',
+    selected: (name) => (name ? `Şekil seçildi: ${name}` : 'Şekil seçildi'),
+    word: '[Şekil]',
+    copied: 'Şekil kopyalandı',
+    cutOut: 'Şekil kesildi',
+    pasted: 'Şekil yapıştırıldı',
+    editText: 'Metni düzenle',
+    remove: 'Şekli sil',
+    textField: (name) => (name ? `${name} metni` : 'Şeklin metni'),
+    textHint: 'Enter yeni satır başlatır; Ctrl+Enter ya da alandan çıkmak metni uygular, Escape vazgeçer',
+    wrapped: 'Bu şekil silinemez: dosyada yerini başka bir nesneyle paylaşıyor',
+    noCellPaste: 'Bir şekil seçili: hücre yapıştırmak için bir hücre seçin',
+    copyGone: 'Panodaki şekil başka bir yerde kopyalanmış, buraya yapıştırılamıyor: şekli yeniden kopyalayın',
+    protectedSheet: 'Sayfa korumalı: şekilleri değiştirilemez',
+    placesFixed: 'Bu sayfada şekil eklenemez, taşınamaz ve silinemez: dosyadaki çizimi değiştirilemiyor',
+    alternative: 'Bu şekil döndürülemez ve metni değiştirilemez: dosya onu başka bir biçimde de tutuyor, o biçim olduğu gibi kalırdı',
+    notFormattable: 'Bu şeklin görünümü değiştirilemez: dosya onun korunamayacak bilgilerini de tutuyor. Taşınabilir, boyutlandırılabilir, döndürülebilir ve silinebilir',
+    notCopyable: 'Bu şekil kopyalanamaz: dosya onun bir kopyada korunamayacak bilgilerini de tutuyor',
+    textFixed: 'Bu şeklin metni burada değiştirilemez: dosya metne birden çok görünüm, bir alan ya da bir hücrenin metnini veriyor',
+    noText: 'Çizginin metni olmaz',
   },
   pictures: {
     insert: 'Görsel ekle',

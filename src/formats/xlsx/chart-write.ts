@@ -34,7 +34,8 @@ import {
   type ChartTitle,
 } from '../../model/sheet/chart';
 import { resolveCellStyle } from '../../model/sheet/color';
-import type { Cell, ChartOrigin, DrawingAnchor, DrawingMarker, Workbook } from '../../model/sheet/types';
+import type { Cell, ChartOrigin, DrawingAnchor, DrawingMarker, DrawingShape, Workbook } from '../../model/sheet/types';
+import { shapeElementXml, type ShapeBox } from './shape-write';
 import { localName, parseXml, serializeXml, type XmlDocument, type XmlElement, type XmlNode } from '../../xml';
 
 export const CHART_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.drawingml.chart+xml';
@@ -1417,31 +1418,143 @@ function patchPicture(anchor: XmlElement, patch: PicturePatch): void {
       fill.children = fill.children.slice(0, at).concat([made_ as XmlNode], fill.children.slice(at));
     }
   }
-  if (patch.rotation !== undefined) {
-    const rot = rotationValue(patch.rotation === null ? undefined : patch.rotation);
-    let props = child(pic, 'spPr');
-    if (!props) {
-      if (rot === undefined) return;
-      props = link(made(pic, '<xdr:spPr/>'), pic);
-      const fill = child(pic, 'blipFill');
-      const at = fill ? pic.children.indexOf(fill) + 1 : pic.children.length;
-      pic.children = pic.children.slice(0, at).concat([props as XmlNode], pic.children.slice(at));
+  if (patch.rotation !== undefined) setTurn(pic, patch.rotation, 'blipFill');
+}
+
+/**
+ * Sets the turn of the object of an anchor (`a:xfrm rot` of its `spPr`; null takes it away). An
+ * object without properties gets them after its child `after` (where the schema has them).
+ */
+function setTurn(object: XmlElement, degrees: number | null, after: string): void {
+  const context = part as PartContext;
+  const link = (node: XmlElement, parent: XmlElement): XmlElement => {
+    context.parents.set(node, parent);
+    for (const kid of elements(node)) link(kid, node);
+    return node;
+  };
+  const rot = rotationValue(degrees === null ? undefined : degrees);
+  let props = child(object, 'spPr');
+  if (!props) {
+    if (rot === undefined) return;
+    props = link(made(object, '<xdr:spPr/>'), object);
+    const before = child(object, after);
+    const at = before ? object.children.indexOf(before) + 1 : object.children.length;
+    object.children = object.children.slice(0, at).concat([props as XmlNode], object.children.slice(at));
+  }
+  const transform = child(props, 'xfrm');
+  if (transform) {
+    if (rot === undefined) transform.attrs.delete('rot');
+    else {
+      // `rot` first, where applications write it; whatever else the element says stays.
+      const attrs = new Map<string, string>([['rot', String(rot)]]);
+      for (const [name, value] of transform.attrs) if (name !== 'rot') attrs.set(name, value);
+      transform.attrs = attrs;
     }
-    const transform = child(props, 'xfrm');
-    if (transform) {
-      if (rot === undefined) transform.attrs.delete('rot');
-      else {
-        // `rot` first, where applications write it; whatever else the element says stays.
-        const attrs = new Map<string, string>([['rot', String(rot)]]);
-        for (const [name, value] of transform.attrs) if (name !== 'rot') attrs.set(name, value);
-        transform.attrs = attrs;
-      }
-    } else if (rot !== undefined) {
-      // A transform of the turn alone (off and ext may be left out): first of the properties, where the schema has it.
-      const made_ = link(made(props, `<a:xfrm rot="${rot}"/>`), props);
-      props.children = [made_ as XmlNode].concat(props.children);
+  } else if (rot !== undefined) {
+    // A transform of the turn alone (off and ext may be left out): first of the properties, where the schema has it.
+    const made_ = link(made(props, `<a:xfrm rot="${rot}"/>`), props);
+    props.children = [made_ as XmlNode].concat(props.children);
+  }
+}
+
+/**
+ * What a save changes of a shape of the file that is not written anew from its model: its turn
+ * (null takes it away) and the text of its body (DrawingShape.plainText), each when it is there.
+ */
+export interface ShapePatch {
+  rotation?: number | null;
+  /** The text the body gets, paragraphs one to a line. */
+  text?: string;
+}
+
+/** The shape (`xdr:sp` or `xdr:cxnSp`) of an anchor of a part that is being changed. */
+function shapeIn(anchor: XmlElement): XmlElement {
+  const found = elements(anchor).find((el) => localName(el.name) === 'sp' || localName(el.name) === 'cxnSp');
+  if (!found) throw new Error('Cannot write the drawing: the shape of the model is not a shape in its part');
+  return found;
+}
+
+/** A copy of an element of the part that is being changed, for another place of it (see PartContext). */
+function copied(el: XmlElement, parent: XmlElement, depth = 0): XmlElement {
+  const context = part as PartContext;
+  const out: XmlElement = { type: 'element', name: el.name, attrs: new Map(el.attrs), children: [] };
+  context.parents.set(out, parent);
+  if (depth > MAX_PATCH_DEPTH) throw new Error('Cannot write the drawing: the text of a shape is nested too deeply');
+  out.children = el.children.map((node) => (node.type === 'element' ? copied(node, out, depth + 1) : { ...node }));
+  return out;
+}
+
+/**
+ * Applies a patch to the shape of an anchor of a drawing part that is being changed. Text is put
+ * into the body the way the body has it: each line a paragraph with the properties of the first
+ * paragraph and the mark that ends it, and a run in the look of the first run (or line break, or,
+ * of a body without either, of the mark that ends the first paragraph). The body properties and
+ * the list style stay; so does everything else of the shape.
+ */
+function patchDrawingShape(anchor: XmlElement, patch: ShapePatch): void {
+  const shape = shapeIn(anchor);
+  if (patch.rotation !== undefined) setTurn(shape, patch.rotation, localName(shape.name) === 'sp' ? 'nvSpPr' : 'nvCxnSpPr');
+  if (patch.text === undefined) return;
+  const body = child(shape, 'txBody');
+  if (!body) throw new Error('Cannot write the drawing: a shape whose text changed has no text in its part');
+  const paragraphs = elements(body, 'p');
+  const first = paragraphs[0];
+  if (!first) throw new Error('Cannot write the drawing: a shape whose text changed has no paragraph in its part');
+  const props = child(first, 'pPr');
+  const end = child(first, 'endParaRPr');
+  let look: XmlElement | undefined;
+  for (const paragraph of paragraphs) {
+    for (const item of elements(paragraph)) {
+      const kind = localName(item.name);
+      if ((kind === 'r' || kind === 'br') && !look) look = child(item, 'rPr');
     }
   }
+  const fresh_: XmlNode[] = [];
+  for (const line of patch.text.split('\n')) {
+    const p = made(body, '<a:p/>');
+    const kids: XmlNode[] = [];
+    if (props) kids.push(copied(props, p));
+    if (line !== '') {
+      const run = made(p, `<a:r><a:t>${escapeText(clean(line))}</a:t></a:r>`);
+      if (look) run.children = [copied(look, run) as XmlNode].concat(run.children);
+      else if (end) {
+        // The look of the mark that ends the paragraph, as the look of a run.
+        const own = copied(end, run);
+        own.name = own.name.slice(0, own.name.length - localName(own.name).length) + 'rPr';
+        run.children = [own as XmlNode].concat(run.children);
+      }
+      kids.push(run);
+    }
+    if (end) kids.push(copied(end, p));
+    p.children = kids;
+    fresh_.push(p);
+  }
+  // The paragraphs go where the first one was; the body properties and the list style stay before them.
+  const at = body.children.indexOf(first);
+  const before: XmlNode[] = [];
+  const after: XmlNode[] = [];
+  body.children.forEach((node, i) => {
+    if (node.type === 'element' && localName(node.name) === 'p') return;
+    (i < at ? before : after).push(node);
+  });
+  body.children = before.concat(fresh_, after);
+}
+
+/** Puts the element the writer makes of a shape's model in place of the shape of an anchor: its id stays. */
+function rewriteShape(anchor: XmlElement, object: DrawingShape, box: ShapeBox): void {
+  const shape = shapeIn(anchor);
+  const props = child(child(shape, localName(shape.name) === 'sp' ? 'nvSpPr' : 'nvCxnSpPr'), 'cNvPr');
+  const id = props ? Number(props.attrs.get('id')) : NaN;
+  if (!(id >= 1 && id < 4294967295 && Math.floor(id) === id)) throw new Error('Cannot write the drawing: a shape of its part has no id');
+  const el = made(anchor, shapeElementXml(object, id, box));
+  anchor.children = anchor.children.map((node) => (node === shape ? el : node));
+}
+
+/** The anchor of a shape in a drawing part, drawn in `box` (EMU) with the id `shapeId`. */
+export function shapeAnchorXml(anchor: DrawingAnchor, object: DrawingShape, shapeId: number, box: ShapeBox): string {
+  const place = placeXml(anchor);
+  const editAs = place.name === 'twoCellAnchor' && anchor.editAs && anchor.editAs !== 'twoCell' ? ` editAs="${anchor.editAs}"` : '';
+  return `<xdr:${place.name}${editAs}>${place.inner}${shapeElementXml(object, shapeId, box)}<xdr:clientData/></xdr:${place.name}>`;
 }
 
 /** A drawing part that holds the given anchors and nothing else. */
@@ -1499,9 +1612,13 @@ export interface DrawingPartEdit {
    * that one, and keeps everything of it but its place, its id, its name, its relationship and
    * the macro it is assigned.
    */
-  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string; picture?: { box?: { x: number; y: number; width: number; height: number }; look?: PictureLook } }[];
+  added: { anchor: DrawingAnchor; relId: string; name: string; description?: string; from?: string; picture?: { box?: { x: number; y: number; width: number; height: number }; look?: PictureLook }; shape?: { object: DrawingShape; box: ShapeBox } }[];
   /** Pictures of the part, by their place among the anchors the reader takes, that are turned, cropped or described anew. */
   patched?: Map<number, PicturePatch>;
+  /** Shapes of the part, by the same places, whose turn or text changes (see ShapePatch). */
+  shaped?: Map<number, ShapePatch>;
+  /** Shapes of the part, by the same places, that are written anew from their models (DrawingShape.known), drawn in a box (EMU). */
+  rewritten?: Map<number, { object: DrawingShape; box: ShapeBox }>;
 }
 
 /** The <c:chart r:id> of a frame: the element that names the chart part, and the name of the attribute that does. */
@@ -1633,6 +1750,38 @@ function copiedAnchor(root: XmlElement, item: DrawingPartEdit['added'][number], 
 }
 
 /**
+ * Takes out of the connectors that stay the ends bound to an object that went (`a:stCxn`,
+ * `a:endCxn` of `xdr:cNvCxnSpPr` naming its `cNvPr id`) and to no object that stays: an end that
+ * names an id the part no longer has is a dangling binding. The connector itself stays where it is
+ * drawn. (Cheaper than refusing the deletion, and what an application does when the shape a
+ * connector is glued to is deleted: the connector stays, unglued.)
+ */
+function unbindConnectors(root: XmlElement, gone: Set<XmlNode>): void {
+  const idsIn = (el: XmlElement, into: Set<string>, depth: number): void => {
+    if (localName(el.name) === 'cNvPr') {
+      const id = el.attrs.get('id');
+      if (id !== undefined) into.add(id);
+    }
+    if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') idsIn(node, into, depth + 1);
+  };
+  const went = new Set<string>();
+  for (const node of gone) if (node.type === 'element') idsIn(node, went, 0);
+  const stay = new Set<string>();
+  idsIn(root, stay, 0);
+  for (const id of stay) went.delete(id);
+  if (went.size === 0) return;
+  const walk = (el: XmlElement, depth: number): void => {
+    if (localName(el.name) === 'cNvCxnSpPr') {
+      const kept = el.children.filter((node) => !(node.type === 'element' && (localName(node.name) === 'stCxn' || localName(node.name) === 'endCxn') && went.has(node.attrs.get('id') || '')));
+      if (kept.length !== el.children.length) el.children = kept;
+      return;
+    }
+    if (depth <= MAX_PATCH_DEPTH) for (const node of el.children) if (node.type === 'element') walk(node, depth + 1);
+  };
+  walk(root, 0);
+}
+
+/**
  * A drawing part with anchors moved, taken out and added; every other node of it stays. Also
  * says which relationships the anchors that went named and nothing that stays names (`unrelated`),
  * and whether anything is left to draw (`empty`: no anchor is). Throws when the part does not
@@ -1669,6 +1818,20 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
         patchPicture(item.el, patch);
       }
     }
+    if (edit.shaped) {
+      for (const [index, patch] of edit.shaped) {
+        const item = found[index];
+        if (!item) throw new Error('Cannot write the drawing: an anchor of the model is not in its part');
+        patchDrawingShape(item.el, patch);
+      }
+    }
+    if (edit.rewritten) {
+      for (const [index, shape] of edit.rewritten) {
+        const item = found[index];
+        if (!item) throw new Error('Cannot write the drawing: an anchor of the model is not in its part');
+        rewriteShape(item.el, shape.object, shape.box);
+      }
+    }
     const removed = new Set<XmlNode>();
     for (const index of edit.removed) {
       const item = found[index];
@@ -1679,7 +1842,10 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
       relIds(item.top, gone);
       removed.add(item.top);
     }
-    if (removed.size > 0) root.children = root.children.filter((node) => !removed.has(node));
+    if (removed.size > 0) {
+      root.children = root.children.filter((node) => !removed.has(node));
+      unbindConnectors(root, removed);
+    }
     if (edit.added.length > 0) {
       let top = 1;
       const ids = (el: XmlElement, depth: number): void => {
@@ -1693,6 +1859,7 @@ export function editDrawingPart(bytes: Uint8Array, edit: DrawingPartEdit): { byt
       const added: XmlNode[] = edit.added.map((item) => {
         const id = ++top;
         if (item.picture) return made(root, pictureAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict, item.picture.box, item.picture.look));
+        if (item.shape) return made(root, shapeAnchorXml(item.anchor, item.shape.object, id, item.shape.box));
         return (item.from !== undefined ? copiedAnchor(root, item, id) : undefined) || made(root, chartAnchorXml(item.anchor, item.relId, id, item.name, item.description, strict));
       });
       root.children = root.children.concat(added);

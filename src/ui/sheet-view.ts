@@ -144,7 +144,31 @@ import { currentRegion, hasHeaderRow, sortRange } from '../ops/sort';
 import { DEFAULT_GRID_THEME, cellButtonRect, renderGrid, type GridFilter, type GridPeer, type GridSelection } from '../render/grid';
 import { IMAGE_BUDGET_BYTES, IMAGE_BUDGET_BYTES_COARSE, ImageStore } from '../render/images';
 import { ChartRenderer, type ChartRendererOptions } from '../render/chart';
-import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, resizedRect, type DrawingHandle } from '../render/sheet-drawings';
+import { HANDLE_SIZE, SheetDrawings, drawingHandleAt, isHollow, isLine, resizedRect, turnOf, type DrawingHandle } from '../render/sheet-drawings';
+import {
+  addShape as addShapeOps,
+  copyShape as copyShapeOps,
+  cutShape as cutShapeOps,
+  defaultShapeSize,
+  formatShape as formatShapeOps,
+  MAX_SHAPE_TEXT,
+  moveShape as moveShapeOps,
+  moveShapeTo,
+  pasteShape as pasteShapeOps,
+  removeShape as removeShapeOps,
+  rotateShape as rotateShapeOps,
+  setShapeText as setShapeTextOps,
+  shapeAnchorAt,
+  shapeCopyProblem,
+  shapeEditProblem,
+  shapeFormatProblem,
+  shapesProblem,
+  sheetShapes,
+  type ShapeFormat,
+  type ShapeInfo,
+  type ShapeKind,
+} from '../ops/shapes';
+import { heldShapeCopy, holdShape, releaseShape, shapePasteKind } from './shape-clip';
 import { ROTATE_HANDLE_GAP, ROTATE_HANDLE_GAP_COARSE, croppedBox, draggedCrop, localPoint, rotateHandlePoint, rotationAt, sizedFrame, turnedBox, uncroppedBox, type PictureCrop } from '../render/picture-frame';
 import { pictureSource } from '../model/sheet/pictures';
 import {
@@ -250,6 +274,8 @@ export interface WorkbookViewOptions {
   onNotice?(notice: { message: string; kind: 'error' | 'info' }): void;
   /** Called when cell editing starts, on every change of the text being edited, and when it ends. */
   onEditingChange?(state: { editing: boolean; text: string }): void;
+  /** Called when another chart, picture or shape is selected, or none (`id`: its place among the drawings of the shown sheet). */
+  onDrawingSelectionChange?(id: number | undefined): void;
   /**
    * An element around the view (an editor shell with a formula bar, say).
    * While the focus is inside it, an open edit is not written just because
@@ -771,6 +797,9 @@ const NOTE_FIELD_WIDTH = 220;
 const NOTE_FIELD_HEIGHT = 96;
 const NOTE_FIELD_WIDTH_COARSE = 260;
 const NOTE_FIELD_HEIGHT_COARSE = 132;
+/** Least size of the field the text of a shape is typed in, in pixels: a small shape still has room for a word. */
+const SHAPE_FIELD_WIDTH = 140;
+const SHAPE_FIELD_HEIGHT = 48;
 const COMMENT_MAX_WIDTH = 280;
 const COMMENT_MAX_HEIGHT = 240;
 /** Runs of a comment that keep their own weight in the box; the rest follows as plain text of the last one. */
@@ -1093,6 +1122,10 @@ export class WorkbookView {
   private pictureCrop: { sheet: Sheet; index: number } | undefined;
   /** The picture the menu asked to be copied, for the copy event it then asks for: see chartClipboard(). */
   private pictureAsked: number | undefined;
+  /** The shape the menu asked to be copied, for the copy event it then asks for: see chartClipboard(). */
+  private shapeAsked: number | undefined;
+  /** The text of a shape being typed: a field over the shape (see editShapeText()). */
+  private shapeEdit: { sheet: Sheet; drawing: SheetDrawing; box: HTMLDivElement; input: HTMLTextAreaElement; original: string; busy: boolean } | undefined;
   /** When the selected chart was last tapped: a second tap opens its dialog. */
   private lastChartTap = 0;
   /**
@@ -1586,6 +1619,7 @@ export class WorkbookView {
     this.point = undefined;
     this.renaming = undefined;
     this.closeNote(false);
+    this.closeShapeText(false);
     this.closeMenu();
     const input = this.input;
     input.removeEventListener('keydown', this.onKeyDown);
@@ -3730,7 +3764,7 @@ export class WorkbookView {
       floating.ghostTurn = drag ? drag.turn : undefined;
       // A picture that is selected is turned by a handle of its own; one that is cropped shows the whole of it.
       const picture = picked !== undefined && this.isPictureAt(picked);
-      floating.turnable = picture && this.pictureEditable(picked as number);
+      floating.turnable = picked !== undefined && this.frameTurnable(picked);
       floating.turnGap = this.turnGap();
       floating.cropping = picture && picked !== undefined ? this.croppingFrame(picked) : undefined;
     }
@@ -3764,6 +3798,7 @@ export class WorkbookView {
     this.placeTip();
     this.placeComment();
     this.placeNote();
+    this.placeShapeText();
   }
 
   // ------------------------------------------------------------------ charts
@@ -4009,6 +4044,29 @@ export class WorkbookView {
     return !this.collab && picturesProblem(this.workbook, this.sheetIndex) === undefined;
   }
 
+  /** Whether a shape of the shown sheet stands at a place of its drawings, and can be changed there (as isPictureAt() says of a picture). */
+  private isShapeAt(index: number): boolean {
+    const sheet = this.state().sheet;
+    const drawing = sheet.drawings && Math.floor(index) === index ? sheet.drawings[index] : undefined;
+    return !!drawing && !!drawing.object && drawing.object.type === 'shape' && this.shapesEditable();
+  }
+
+  /** Whether the shapes of the shown sheet can be changed: not while the workbook is edited together, nor on a sheet whose drawings are fixed. */
+  private shapesEditable(): boolean {
+    return !this.collab && shapesProblem(this.workbook, this.sheetIndex) === undefined;
+  }
+
+  /** Whether a picture or a shape stands at a place: what is drawn turned in its frame, sized in it and turned by its handle. */
+  private isFrameAt(index: number): boolean {
+    return this.isPictureAt(index) || this.isShapeAt(index);
+  }
+
+  /** Whether the picture or the shape at a place can be turned by its handle. */
+  private frameTurnable(index: number): boolean {
+    if (this.isPictureAt(index)) return this.pictureEditable(index);
+    return this.isShapeAt(index) && shapeEditProblem(this.workbook, this.sheetIndex, index) === undefined;
+  }
+
   /** The place of the selected chart in the drawings of the shown sheet; undefined when no chart of it is selected (any more). */
   private pickedChart(): number | undefined {
     const index = this.pickedDrawing();
@@ -4025,7 +4083,7 @@ export class WorkbookView {
   private pickedDrawing(): number | undefined {
     const pick = this.chartPick;
     if (!pick) return undefined;
-    if (pick.sheet !== this.state().sheet || !(this.isChartAt(pick.index) || this.isPictureAt(pick.index))) {
+    if (pick.sheet !== this.state().sheet || !(this.isChartAt(pick.index) || this.isFrameAt(pick.index))) {
       this.chartPick = undefined;
       return undefined;
     }
@@ -4039,11 +4097,17 @@ export class WorkbookView {
     if (this.pictureCrop && (index === undefined || this.pictureCrop.index !== index || this.pictureCrop.sheet !== this.state().sheet)) this.pictureCrop = undefined;
     if (index === before) return;
     this.schedule();
+    if (this.options.onDrawingSelectionChange) this.options.onDrawingSelectionChange(index);
     if (index === undefined || !say) return;
     if (this.isPictureAt(index)) {
       // The name the file gives it is said as text, and no longer than a line.
       const picture = this.pictures().find((item) => item.id === index);
       this.live.textContent = this.strings.pictures.selected(picture && picture.name ? picture.name.replace(/\s+/g, ' ').slice(0, 100) : '');
+      return;
+    }
+    if (this.isShapeAt(index)) {
+      const shape = this.shapes().find((item) => item.id === index);
+      this.live.textContent = this.strings.shapes.selected(shape && shape.name ? shape.name.replace(/\s+/g, ' ').slice(0, 100) : '');
       return;
     }
     const info = this.charts().find((chart) => chart.id === index);
@@ -4065,7 +4129,8 @@ export class WorkbookView {
     const layer = this.drawingsOf(state.sheet);
     const at = this.sheetPoint(x, y);
     const pictures = this.picturesEditable();
-    return layer && at ? layer.hit(state.metrics, at.x, at.y, (object) => object.type === 'chart' || (pictures && object.type === 'picture')) : -1;
+    const shapes = this.shapesEditable();
+    return layer && at ? layer.hit(state.metrics, at.x, at.y, (object) => object.type === 'chart' || (pictures && object.type === 'picture') || (shapes && object.type === 'shape')) : -1;
   }
 
   /** What a pointer at a point of the canvas would take of the selected chart: one of its handles, or the chart itself ("move"). */
@@ -4077,15 +4142,18 @@ export class WorkbookView {
     const sheetAt = this.sheetPoint(x, y);
     if (!box || !sheetAt || index === undefined) return undefined;
     const reach = coarse ? HANDLE_SIZE * 2 : HANDLE_SIZE - 2;
-    // The frame of a picture is turned with it: the point is taken into the frame of its box.
-    const rotation = this.isPictureAt(index) ? this.pictureRotationAt(index) : 0;
-    if (this.isPictureAt(index) && this.pictureEditable(index) && !this.croppingPicture(index)) {
+    // The frame of a picture or a shape is turned with it: the point is taken into the frame of its box.
+    const rotation = this.isFrameAt(index) ? this.pictureRotationAt(index) : 0;
+    if (this.frameTurnable(index) && !this.croppingPicture(index)) {
       const knob = rotateHandlePoint(box, rotation, this.turnGap());
       if (Math.abs(sheetAt.x - knob.x) <= reach && Math.abs(sheetAt.y - knob.y) <= reach) return 'turn';
     }
     const at = rotation ? localPoint(box, rotation, sheetAt.x, sheetAt.y) : sheetAt;
     const handle = drawingHandleAt(box, at.x, at.y, reach);
     if (handle) return handle;
+    // A line is taken near it (its box may be flat), a shape without a fill near its outline and in its text: the cells inside it stay the cells.
+    const drawing = (state.sheet.drawings || [])[index];
+    if (drawing && (isLine(drawing.object) || isHollow(drawing.object))) return layer && layer.hit(state.metrics, sheetAt.x, sheetAt.y) === index ? 'move' : undefined;
     return at.x >= box.x && at.x <= box.x + box.width && at.y >= box.y && at.y <= box.y + box.height ? 'move' : undefined;
   }
 
@@ -4141,8 +4209,8 @@ export class WorkbookView {
     if (!box || !at) return;
     const drawing = (state.sheet.drawings || [])[index];
     if (!drawing) return;
-    // Only a picture is turned; a chart taken by where that handle would be is moved.
-    if (handle === 'turn' && drawing.object.type !== 'picture') handle = 'move';
+    // Only a picture or a shape is turned; a chart taken by where that handle would be is moved.
+    if (handle === 'turn' && drawing.object.type !== 'picture' && drawing.object.type !== 'shape') handle = 'move';
     this.endDrag();
     this.chartDrag = { pointerId, sheet: state.sheet, drawing, index, handle, x: at.x, y: at.y, originX: point.x, originY: point.y, start: box, now: box, moved: false, touch };
     // The handles of a picture that is being cropped crop it.
@@ -4165,16 +4233,19 @@ export class WorkbookView {
     const at = this.sheetPoint(Math.max(point.x, state.metrics.headerWidth), Math.max(point.y, state.metrics.headerHeight));
     if (!at) return;
     const object = drag.drawing.object;
-    if (object.type !== 'picture') {
+    if (object.type !== 'picture' && object.type !== 'shape') {
       drag.now = resizedRect(drag.start, drag.handle === 'turn' ? 'move' : drag.handle, at.x - drag.x, at.y - drag.y, MIN_CHART_SIZE);
       this.schedule();
       return;
     }
     const rotation = object.rotation || 0;
     if (drag.handle === 'turn') {
-      // The picture turns about the middle of its box toward the pointer; with Shift in steps of 15 degrees.
+      // The picture or shape turns about the middle of its box toward the pointer; with Shift in steps of 15 degrees.
       drag.turn = rotationAt(drag.start, at.x, at.y, keepRatio);
       drag.now = drag.start;
+    } else if (object.type === 'shape') {
+      // A shape is sized as a picture is; a line may be made flat, and keeps no proportions.
+      drag.now = sizedFrame(drag.start, rotation, drag.handle, at.x - drag.x, at.y - drag.y, object.connector ? 0 : MIN_PICTURE_SIZE, keepRatio && !object.connector);
     } else if (drag.cropping && drag.handle !== 'move') {
       drag.crop = draggedCrop(drag.start, rotation, object.crop, drag.handle, at.x - drag.x, at.y - drag.y, MIN_PICTURE_SIZE, object.flipH === true, object.flipV === true);
       drag.now = croppedBox(drag.start, rotation, object.crop, drag.crop, object.flipH === true, object.flipV === true);
@@ -4190,11 +4261,10 @@ export class WorkbookView {
     return coarsePointer() ? ROTATE_HANDLE_GAP_COARSE : ROTATE_HANDLE_GAP;
   }
 
-  /** How a picture of the shown sheet is turned, in degrees. */
+  /** How a picture or a shape of the shown sheet is turned, in degrees. */
   private pictureRotationAt(index: number): number {
     const drawing = (this.state().sheet.drawings || [])[index];
-    const object = drawing ? drawing.object : undefined;
-    return object && object.type === 'picture' && typeof object.rotation === 'number' && isFinite(object.rotation) ? object.rotation : 0;
+    return turnOf(drawing ? drawing.object : undefined);
   }
 
   /** Whether the picture at a place of the shown sheet is being cropped. */
@@ -4231,6 +4301,24 @@ export class WorkbookView {
     this.chartAsked = undefined;
     const askedPicture = this.pictureAsked;
     this.pictureAsked = undefined;
+    const askedShape = this.shapeAsked;
+    this.shapeAsked = undefined;
+    const shape = askedShape !== undefined ? askedShape : asked === undefined && askedPicture === undefined ? this.pickedShape() : undefined;
+    if (shape !== undefined) {
+      // A shape is selected: it is what is copied or cut, not the cells under it.
+      event.preventDefault();
+      this.clipboardHandled = true;
+      clipboardMovedOn();
+      const data = event.clipboardData;
+      this.attempt(() => {
+        const put = cut ? this.cutShape(shape) : this.copyShape(shape);
+        if (data) {
+          data.setData('text/plain', put.text);
+          data.setData('text/html', put.html);
+        }
+      });
+      return true;
+    }
     const picture = askedPicture !== undefined ? askedPicture : asked === undefined ? this.pickedPicture() : undefined;
     if (picture !== undefined) {
       // A picture is selected: it is what is copied or cut, not the cells under it.
@@ -4303,6 +4391,23 @@ export class WorkbookView {
       else this.attempt(() => this.applyPictureRect(id, drag.now));
       return;
     }
+    if (drag.drawing.object.type === 'shape') {
+      const id = drag.index;
+      if (!drag.moved) {
+        // A second tap on the selected shape types its text, as a double click does.
+        if (drag.touch) {
+          const second = time - this.lastChartTap < DOUBLE_TAP_MS;
+          this.lastChartTap = second ? 0 : time;
+          if (second && !isLine(drag.drawing.object)) this.attempt(() => void this.editShapeText(id));
+        }
+        return;
+      }
+      if (drag.handle === 'turn') {
+        const turn = drag.turn;
+        if (turn !== undefined) this.attempt(() => this.rotateShape(id, turn));
+      } else this.attempt(() => this.applyShapeRect(id, drag.now));
+      return;
+    }
     if (!drag.moved) {
       // A second tap on the selected chart opens its dialog, as a double click does.
       if (drag.touch) {
@@ -4322,6 +4427,7 @@ export class WorkbookView {
     const index = this.chartUnder(x, y);
     if (index < 0) return false;
     if (this.isPictureAt(index)) return this.openPictureMenu(index, x, y);
+    if (this.isShapeAt(index)) return this.openShapeMenu(index, x, y);
     this.closeMenu();
     if (!this.tryCommit()) return false;
     // A view that changes nothing selects no chart; it copies one all the same.
@@ -4376,6 +4482,7 @@ export class WorkbookView {
       this.charts()
         .map((chart) => chart.id)
         .concat(this.picturesEditable() ? this.pictures().map((picture) => picture.id) : [])
+        .concat(this.shapesEditable() ? this.shapes().map((shape) => shape.id) : [])
         .sort((a, b) => a - b);
     if (event.altKey && event.ctrlKey && event.code === 'Digit5') {
       // The first chart, then the next one with every press; after the last one none is selected.
@@ -4395,6 +4502,7 @@ export class WorkbookView {
     const layer = this.drawingsOf(state.sheet);
     const box = layer ? layer.boxOf(state.metrics, picked) : undefined;
     if (this.isPictureAt(picked)) return this.pictureKey(event, picked, box);
+    if (this.isShapeAt(picked)) return this.shapeKey(event, picked, box);
     switch (event.key) {
       case 'Escape':
         this.setChartPick(undefined);
@@ -4863,6 +4971,461 @@ export class WorkbookView {
     }
   }
 
+  // ------------------------------------------------------------------ shapes
+
+  /** The shapes of the shown sheet, the one on top last; `id` is what the methods below name a shape by (its place among the drawings of the sheet). */
+  shapes(): ShapeInfo[] {
+    if (this.destroyed) return [];
+    return sheetShapes(this.workbook, this.sheetIndex);
+  }
+
+  /** The words of the menu of shapes, in the language of the view: for a shell that offers their commands. */
+  get shapeStrings(): UiStrings['shapes'] {
+    return this.strings.shapes;
+  }
+
+  /**
+   * Why no shape can be inserted into the shown sheet, moved or deleted on it, in the language of the view: the
+   * workbook is edited together, the sheet is protected, its drawing cannot be changed. Undefined when they can.
+   */
+  get shapeProblem(): string | undefined {
+    if (this.destroyed) return undefined;
+    if (this.collab) return this.strings.collab.shapes;
+    const problem = shapesProblem(this.workbook, this.sheetIndex);
+    return problem === undefined ? undefined : this.localizeError(new RangeError(problem));
+  }
+
+  /** The id of the shape that is selected; undefined when none is. */
+  get selectedShape(): number | undefined {
+    return this.destroyed ? undefined : this.pickedShape();
+  }
+
+  /** What is known of the shape that is selected (see sheetShapes() of the operations); undefined when none is. */
+  get selectedShapeInfo(): ShapeInfo | undefined {
+    const id = this.selectedShape;
+    return id === undefined ? undefined : this.shapes().find((shape) => shape.id === id);
+  }
+
+  /** Selects a shape of the shown sheet (a frame with handles is drawn around it), or none. Throws RangeError for an id that names no shape that can be changed. A read-only view selects none. */
+  selectShape(id: number | undefined): void {
+    if (this.destroyed) return;
+    if (id !== undefined && !this.isShapeAt(id)) throw new RangeError(`No shape at index ${id}`);
+    if (this.locked && id !== undefined) return;
+    this.setChartPick(id, false);
+  }
+
+  /** The place of the selected shape; undefined when no shape is selected. */
+  private pickedShape(): number | undefined {
+    const index = this.pickedDrawing();
+    return index !== undefined && this.isShapeAt(index) ? index : undefined;
+  }
+
+  /** Whether the drawing at a place of the shown sheet is a line. */
+  private isLineAt(index: number): boolean {
+    const drawing = (this.state().sheet.drawings || [])[index];
+    return !!drawing && isLine(drawing.object);
+  }
+
+  /** The shape a command is about: the one that is named, or the selected one. Throws RangeError when there is none. */
+  private shapeNamed(id: number | undefined): number {
+    const index = this.destroyed ? undefined : id === undefined ? this.pickedShape() : id;
+    if (index === undefined || !this.isShapeAt(index)) throw new RangeError(`No shape at index ${index}`);
+    return index;
+  }
+
+  /**
+   * Inserts a shape of a kind (a rectangle "rect", "roundRect", an oval "ellipse", a "line", an "arrow", a
+   * "doubleArrow" or a "textBox") into the shown sheet and selects it; returns its id, or -1 when nothing was
+   * inserted (a read-only view, what is typed cannot be applied). It stands at `at` (default the active cell) in the
+   * default size of its kind, and moves and sizes with its cells. Throws RangeError for a sheet that takes no shape.
+   */
+  insertShape(kind: ShapeKind, options: { at?: { row: number; col: number }; text?: string } = {}): number {
+    if (!this.beginRules()) return -1;
+    const state = this.state();
+    if (state.sheet.kind !== 'worksheet') return -1;
+    const at = options && options.at ? options.at : state.active;
+    const size = defaultShapeSize(kind);
+    const anchor = shapeAnchorAt(state.sheet, at.row, at.col, size.width, size.height, size.height === 0 ? 0 : undefined);
+    if (!this.applyOps(addShapeOps(this.workbook, this.sheetIndex, kind, anchor, { text: options ? options.text : undefined }))) return -1;
+    const id = (state.sheet.drawings || []).length - 1;
+    this.setChartPick(id, false);
+    this.live.textContent = this.strings.shapes.added;
+    return id;
+  }
+
+  /** Moves or sizes a shape of the shown sheet: `anchor` is an anchor of the kind it has, or the cells it covers. */
+  moveShape(id: number, anchor: DrawingAnchor | CellRange): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(moveShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), anchor))) this.live.textContent = this.strings.shapes.moved;
+  }
+
+  /** Deletes a shape of the shown sheet. */
+  removeShape(id: number): void {
+    if (!this.beginRules()) return;
+    const index = this.shapeNamed(id);
+    const picked = this.pickedDrawing();
+    if (!this.applyOps(removeShapeOps(this.workbook, this.sheetIndex, index))) return;
+    // The drawings behind it moved up by one place.
+    if (picked !== undefined) this.setChartPick(picked === index ? undefined : picked > index ? picked - 1 : picked, false);
+    this.live.textContent = this.strings.shapes.removed;
+  }
+
+  /** Turns a shape of the shown sheet to `degrees` (clockwise, about the middle of its box), as one undo step. */
+  rotateShape(id: number, degrees: number): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(rotateShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), degrees))) this.live.textContent = this.strings.shapes.rotated;
+  }
+
+  /** Gives a shape of the shown sheet another text (lines broken by "\n"; empty takes it away), as one undo step. */
+  setShapeText(id: number, text: string | undefined): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(setShapeTextOps(this.workbook, this.sheetIndex, this.shapeNamed(id), text))) this.live.textContent = this.strings.shapes.textChanged;
+  }
+
+  /**
+   * Changes the fill, the outline or the look of the text of a shape of the shown sheet (the selected one without an
+   * id), as one undo step: see formatShape() of the operations. Throws RangeError for a shape of the file whose look
+   * is not changed here (see shapeFormatProblem()).
+   */
+  formatShape(id: number | undefined, format: ShapeFormat): void {
+    if (!this.beginRules()) return;
+    if (this.applyOps(formatShapeOps(this.workbook, this.sheetIndex, this.shapeNamed(id), format))) this.live.textContent = this.strings.shapes.formatted;
+  }
+
+  /** Puts a shape over a box of the sheet (pixels) with the kind of anchor it has; near a quarter turn its anchor is that box turned. */
+  private applyShapeRect(id: number, rect: Rect): void {
+    if (!this.beginRules()) return;
+    const metrics = this.state().metrics;
+    const box = turnedBox(rect, this.pictureRotationAt(id));
+    if (this.applyOps(moveShapeTo(this.workbook, this.sheetIndex, id, box, metrics))) this.live.textContent = this.strings.shapes.moved;
+  }
+
+  /** Whether a shape that was copied or cut in a view of this page is held for pasteShape(). */
+  get hasShapeCopy(): boolean {
+    return !this.destroyed && heldShapeCopy() !== undefined;
+  }
+
+  /**
+   * Copies a shape of the shown sheet (the selected one without an argument): it is held, for every view of the page,
+   * for pasteShape(), and what belongs on the clipboard is returned (a word in place of the shape, and HTML with a
+   * mark; paste() knows the shape by that mark). Throws RangeError for a shape that cannot be copied (see
+   * shapeCopyProblem()).
+   */
+  copyShape(id?: number): { text: string; html: string } {
+    const index = this.shapeNamed(id);
+    const copy = copyShapeOps(this.workbook, this.sheetIndex, index);
+    const put = holdShape(copy, this.strings.shapes.word);
+    this.live.textContent = this.strings.shapes.copied;
+    return { text: put.text, html: put.html };
+  }
+
+  /** Copies a shape of the shown sheet and deletes it, as one undo step (the paste is another one). */
+  cutShape(id?: number): { text: string; html: string } {
+    const index = this.shapeNamed(id);
+    if (this.destroyed || this.locked || !this.commitPending()) return this.copyShape(index);
+    const { copy, ops } = cutShapeOps(this.workbook, this.sheetIndex, index);
+    const put = holdShape(copy, this.strings.shapes.word);
+    const picked = this.pickedDrawing();
+    if (this.applyOps(ops)) {
+      if (picked !== undefined) this.setChartPick(picked === index ? undefined : picked > index ? picked - 1 : picked, false);
+      this.live.textContent = this.strings.shapes.cutOut;
+    }
+    return { text: put.text, html: put.html };
+  }
+
+  /**
+   * Pastes the shape that was last copied or cut in a view of this page onto the shown sheet and selects it; returns
+   * its id, or -1 when nothing was pasted (no shape is held, a read-only view). With `at` its top left corner is the
+   * corner of that cell; without, it stands where the shape stood, moved right and down while a shape stands there.
+   */
+  pasteShape(at?: { row: number; col: number }): number {
+    const held = heldShapeCopy();
+    return held ? this.putShape(held, at) : -1;
+  }
+
+  private putShape(copy: ReturnType<typeof copyShapeOps>, at: { row: number; col: number } | undefined): number {
+    if (this.destroyed || this.locked || this.state().sheet.kind !== 'worksheet') return -1;
+    if (this.collab) {
+      this.notify(this.strings.collab.shapes, 'info');
+      return -1;
+    }
+    if (!this.beginRules()) return -1;
+    const pasted = pasteShapeOps(this.workbook, this.sheetIndex, copy, at);
+    if (!this.applyOps(pasted.ops)) return -1;
+    this.setChartPick(pasted.id, false);
+    this.live.textContent = this.strings.shapes.pasted;
+    return pasted.id;
+  }
+
+  /** The menu of a shape: opened by the press that asks for a menu on it. A read-only view has none (the menu of the cell opens). */
+  private openShapeMenu(index: number, x: number, y: number): boolean {
+    if (this.locked) return false;
+    this.closeMenu();
+    if (!this.tryCommit()) return false;
+    this.setChartPick(index);
+    const strings = this.strings.shapes;
+    const info = this.shapes().find((shape) => shape.id === index);
+    const removable = !!info && info.removable;
+    const canCopy = typeof document.execCommand === 'function' || (navigator.clipboard !== undefined && typeof navigator.clipboard.writeText === 'function');
+    // What cannot be done is shown all the same, and says why.
+    const said = (problem: string | undefined): { reason?: string; explain?: () => void } => {
+      if (problem === undefined) return {};
+      const reason = this.localizeError(new RangeError(problem));
+      return { reason, explain: () => this.notify(reason, 'error') };
+    };
+    const copying = said(shapeCopyProblem(this.workbook, this.sheetIndex, index));
+    const cutting = copying.reason !== undefined ? copying : removable ? {} : { reason: strings.wrapped, explain: () => this.notify(strings.wrapped, 'error') };
+    const turning = said(shapeEditProblem(this.workbook, this.sheetIndex, index));
+    const texting = said(shapeEditProblem(this.workbook, this.sheetIndex, index, 'text'));
+    const turn = (by: number) => () => this.attempt(() => this.rotateShape(index, this.pictureRotationAt(index) + by));
+    const items: MenuItem[] = [
+      { label: this.strings.cut, disabled: !canCopy || cutting.reason !== undefined, title: cutting.reason, explain: cutting.explain, action: () => this.menuCopyShape(index, true) },
+      { label: this.strings.copy, disabled: !canCopy || copying.reason !== undefined, title: copying.reason, explain: copying.explain, action: () => this.menuCopyShape(index, false) },
+      { label: this.strings.paste, action: () => this.menuPaste() },
+      { label: '', separator: true },
+    ];
+    if (!this.isLineAt(index)) items.push({ label: strings.editText, disabled: texting.reason !== undefined, title: texting.reason, explain: texting.explain, action: () => this.attempt(() => void this.editShapeText(index)) });
+    items.push(
+      { label: this.strings.pictures.rotateRight, disabled: turning.reason !== undefined, title: turning.reason, explain: turning.explain, action: turn(90) },
+      { label: this.strings.pictures.rotateLeft, disabled: turning.reason !== undefined, title: turning.reason, explain: turning.explain, action: turn(-90) },
+      { label: '', separator: true },
+      { label: strings.remove, disabled: !removable, title: removable ? undefined : strings.wrapped, explain: removable ? undefined : () => this.notify(strings.wrapped, 'error'), action: () => this.attempt(() => this.removeShape(index)) },
+    );
+    this.showMenu(items, x, y);
+    return true;
+  }
+
+  /** Copy or cut of a shape from its menu: as menuCopyPicture(), with the shape named for the event that is asked for. */
+  private menuCopyShape(index: number, cut: boolean): void {
+    this.focusInput(true);
+    this.selectIdleText();
+    this.clipboardHandled = false;
+    this.shapeAsked = index;
+    try {
+      document.execCommand(cut ? 'cut' : 'copy');
+    } catch {
+      // Not available; the fallback below takes over.
+    }
+    this.shapeAsked = undefined;
+    if (this.clipboardHandled) return;
+    this.attempt(() => {
+      const put = cut ? this.cutShape(index) : this.copyShape(index);
+      // The mark goes to the clipboard with the word, where the browser lets the page write HTML: a paste knows the shape by it.
+      const clipboard = navigator.clipboard;
+      const Item = typeof window !== 'undefined' ? (window as unknown as { ClipboardItem?: typeof ClipboardItem }).ClipboardItem : undefined;
+      try {
+        if (clipboard && typeof clipboard.write === 'function' && typeof Item === 'function') {
+          clipboard.write([new Item({ 'text/html': new Blob([put.html], { type: 'text/html' }), 'text/plain': new Blob([put.text], { type: 'text/plain' }) })]).then(undefined, () => undefined);
+        }
+      } catch {
+        // Not written: the shape is held all the same, for pasteShape().
+      }
+    });
+  }
+
+  /**
+   * The keys of a selected shape: as those of a picture (see pictureKey()), and Enter or F2 types its text (not of a
+   * line). Copy, cut and paste come as events of the clipboard.
+   */
+  private shapeKey(event: KeyboardEvent, picked: number, box: Rect | undefined): boolean {
+    const ctrl = event.ctrlKey || event.metaKey;
+    switch (event.key) {
+      case 'Escape':
+        this.setChartPick(undefined);
+        return true;
+      case 'Delete':
+      case 'Backspace':
+        if (event.shiftKey) return false;
+        if (!ctrl && !event.altKey) this.attempt(() => this.removeShape(picked));
+        return true;
+      case 'Enter':
+      case 'F2':
+        if (ctrl || event.altKey) return event.key === 'F2';
+        if (!this.isLineAt(picked)) this.attempt(() => void this.editShapeText(picked));
+        return true;
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight': {
+        if (ctrl || !box) return true;
+        const step = event.shiftKey ? 1 : 10;
+        const dx = event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
+        const dy = event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0;
+        const rotation = this.pictureRotationAt(picked);
+        const next = resizedRect(turnedBox(box, rotation), event.altKey ? 'se' : 'move', dx, dy, this.isLineAt(picked) ? 0 : MIN_PICTURE_SIZE);
+        this.attempt(() => this.applyShapeRect(picked, turnedBox(next, rotation)));
+        return true;
+      }
+      case 'Home':
+      case 'End':
+        return true;
+      case 'PageUp':
+      case 'PageDown':
+        return !ctrl && !event.altKey;
+      default: {
+        if (event.key.length !== 1) return false;
+        if (!ctrl && !event.altKey) return true;
+        if (ctrl && !event.altKey && !event.shiftKey && (event.key === 'd' || event.key === 'D')) return true;
+        return ctrl && !event.altKey && 'biuaBIUA'.indexOf(event.key) >= 0;
+      }
+    }
+  }
+
+  /**
+   * Opens the field the text of a shape is typed in, over the shape (the selected one without an argument), with the
+   * text it has. Enter starts a new line; Ctrl+Enter, or leaving the field, applies what was typed as one undo step;
+   * Escape gives it up. Returns false when no field is opened (a read-only view). Throws RangeError for a line and a
+   * shape whose text is not changed here (see shapeEditProblem()).
+   */
+  editShapeText(id?: number): boolean {
+    if (this.destroyed || this.locked) return false;
+    if (!this.settleDialog()) return false;
+    const index = this.shapeNamed(id);
+    const problem = shapeEditProblem(this.workbook, this.sheetIndex, index, 'text');
+    if (problem) throw new RangeError(problem);
+    if (!this.tryCommit()) return false;
+    this.finishRename(true, true);
+    this.finishNote(true, true);
+    this.closeMenu();
+    if (this.edit || this.renaming || this.noteEdit || this.shapeEdit) return false;
+    const state = this.state();
+    const drawing = (state.sheet.drawings || [])[index];
+    const info = this.shapes().find((shape) => shape.id === index);
+    if (!drawing || !info) return false;
+    this.setChartPick(index, false);
+    const box = document.createElement('div');
+    box.className = 'bym-shape-edit';
+    box.style.cssText = 'position:absolute;z-index:2;left:0;top:0;box-sizing:border-box';
+    const input = document.createElement('textarea');
+    input.className = 'bym-shape-input';
+    input.setAttribute('aria-label', this.strings.shapes.textField(info.name ? info.name.replace(/\s+/g, ' ').slice(0, 100) : ''));
+    input.title = this.strings.shapes.textHint;
+    input.maxLength = MAX_SHAPE_TEXT;
+    input.setAttribute('autocomplete', 'off');
+    input.style.cssText = 'width:100%;height:100%;box-sizing:border-box;resize:none;margin:0';
+    // A field with smaller text makes a phone zoom into the page.
+    if (coarsePointer()) input.style.fontSize = '16px';
+    // The text of a shape comes from the file: it is only ever the value of the field.
+    input.value = info.text;
+    box.appendChild(input);
+    this.root.appendChild(box);
+    input.addEventListener('keydown', this.onShapeTextKey);
+    input.addEventListener('blur', this.onShapeTextBlur);
+    input.addEventListener('compositionstart', this.onFieldComposition);
+    input.addEventListener('compositionend', this.onFieldComposition);
+    this.shapeEdit = { sheet: state.sheet, drawing, box, input, original: input.value, busy: false };
+    this.placeShapeText();
+    this.emitEditing();
+    input.focus({ preventScroll: true });
+    try {
+      input.setSelectionRange(input.value.length, input.value.length);
+    } catch {
+      // Not rendered; the caret is wherever the browser put it.
+    }
+    this.schedule();
+    return true;
+  }
+
+  /** Whether the text of a shape is being typed in its field. */
+  get isEditingShapeText(): boolean {
+    return this.shapeEdit !== undefined;
+  }
+
+  /**
+   * Ends typing the text of a shape. With `apply` the shape gets the text of the field; a text it cannot take is said,
+   * and the field stays open with it - unless the field is being left (`leaving`).
+   */
+  private finishShapeText(apply: boolean, leaving = false): void {
+    const edit = this.shapeEdit;
+    if (!edit || edit.busy) return;
+    const focused = (edit.input.getRootNode() as Document | ShadowRoot).activeElement === edit.input;
+    // The shape may have gone meanwhile (a step undone, its sheet deleted): there is nothing to write the text to.
+    const index = this.workbook.sheets[this.sheetIndex] === edit.sheet ? (edit.sheet.drawings || []).indexOf(edit.drawing) : -1;
+    if (apply && index >= 0 && !this.locked && edit.input.value !== edit.original) {
+      edit.busy = true;
+      try {
+        if (this.applyOps(setShapeTextOps(this.workbook, this.sheetIndex, index, edit.input.value))) this.live.textContent = this.strings.shapes.textChanged;
+      } catch (error) {
+        edit.busy = false;
+        const message = this.localizeError(error);
+        if (!leaving) {
+          edit.input.setAttribute('aria-invalid', 'true');
+          this.notify(message, 'error');
+          return;
+        }
+        this.closeShapeText(false);
+        this.notifyLater(message, 'error');
+        return;
+      }
+      edit.busy = false;
+    }
+    this.closeShapeText(!leaving && focused);
+  }
+
+  /** Takes the field of the text of a shape away, and gives the focus back to the cells when asked to. */
+  private closeShapeText(focusGrid: boolean): void {
+    const edit = this.shapeEdit;
+    if (!edit) return;
+    // Forgotten first: taking the field away may report that it lost the focus.
+    this.shapeEdit = undefined;
+    const { input, box } = edit;
+    input.removeEventListener('keydown', this.onShapeTextKey);
+    input.removeEventListener('blur', this.onShapeTextBlur);
+    input.removeEventListener('compositionstart', this.onFieldComposition);
+    input.removeEventListener('compositionend', this.onFieldComposition);
+    if (box.parentNode) box.parentNode.removeChild(box);
+    if (this.destroyed) return;
+    if (focusGrid) this.focusInput(false);
+    this.schedule();
+    this.emitEditing();
+  }
+
+  /** Keeps the field of the text of a shape over the shape (its box as it is not turned), inside the view, through scrolling and resizing. */
+  private placeShapeText(): void {
+    const edit = this.shapeEdit;
+    if (!edit) return;
+    const state = this.state();
+    if (state.sheet !== edit.sheet) return;
+    const index = (edit.sheet.drawings || []).indexOf(edit.drawing);
+    const layer = index >= 0 ? this.drawingsOf(state.sheet) : undefined;
+    const rect = layer ? layer.boxOf(state.metrics, index) : undefined;
+    if (!rect) return;
+    const layout = this.layout(state);
+    const left = layout.metrics.headerWidth + (rect.x < layout.frozenWidth ? rect.x : rect.x - layout.scrollX);
+    const top = layout.metrics.headerHeight + (rect.y < layout.frozenHeight ? rect.y : rect.y - layout.scrollY);
+    const width = Math.max(Math.min(Math.max(rect.width, SHAPE_FIELD_WIDTH), this.width - 8), 0);
+    const height = Math.max(Math.min(Math.max(rect.height, SHAPE_FIELD_HEIGHT), this.height - 8), 0);
+    const style = edit.box.style;
+    style.width = `${Math.round(width)}px`;
+    style.height = `${Math.round(height)}px`;
+    style.left = `${Math.round(clamp(left, 4, Math.max(this.width - width - 4, 4)))}px`;
+    style.top = `${Math.round(clamp(top, 4, Math.max(this.height - height - 4, 4)))}px`;
+  }
+
+  private onShapeTextKey = (event: KeyboardEvent): void => {
+    // Saving is the business of whoever holds the view: the key goes up to it (mount() applies the text first).
+    if (isSaveKey(event)) return;
+    // The other keys of the field are its own (Enter is a new line): none reaches the grid.
+    event.stopPropagation();
+    if (this.destroyed || event.isComposing || event.keyCode === 229) return;
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.altKey) {
+      event.preventDefault();
+      this.finishShapeText(true);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      this.finishShapeText(false);
+    }
+  };
+
+  private onShapeTextBlur = (event: FocusEvent): void => {
+    const edit = this.shapeEdit;
+    if (this.destroyed || !edit || edit.input !== event.target) return;
+    // The focus only left the page: the field is still there when it comes back.
+    const root = edit.input.getRootNode() as Document | ShadowRoot;
+    if (root.activeElement === edit.input) return;
+    this.finishShapeText(true, true);
+  };
+
   /** The first file of a transfer (a drop, a paste) that says it is a picture that can be inserted; undefined when there is none. */
   private pictureFile(data: DataTransfer | null): File | undefined {
     if (!data) return undefined;
@@ -5243,6 +5806,8 @@ export class WorkbookView {
    * (`leaving`: the focus went elsewhere, another sheet is shown, another change is made).
    */
   private finishNote(apply: boolean, leaving = false): void {
+    // The text of a shape that is being typed is ended the same way, wherever a note would be: it is a field of the view as well.
+    this.finishShapeText(apply, leaving);
     const note = this.noteEdit;
     if (!note || note.busy) return;
     const focused = (note.input.getRootNode() as Document | ShadowRoot).activeElement === note.input;
@@ -5534,7 +6099,7 @@ export class WorkbookView {
     if (!this.tryCommit()) return false;
     this.finishRename(true);
     this.finishNote(true);
-    if (this.edit || this.renaming || this.noteEdit) return false;
+    if (this.edit || this.renaming || this.noteEdit || this.shapeEdit) return false;
     const state = this.state();
     const sheet = state.sheet;
     const range = { ...state.range };
@@ -5992,7 +6557,7 @@ export class WorkbookView {
     if (!this.tryCommit()) return false;
     this.finishRename(true);
     this.finishNote(true);
-    return !this.edit && !this.renaming && !this.noteEdit;
+    return !this.edit && !this.renaming && !this.noteEdit && !this.shapeEdit;
   }
 
   /** Applies operations on rules for a dialog that stays open, and says what happened. */
@@ -7310,6 +7875,15 @@ export class WorkbookView {
     if (message === 'The picture was changed or deleted before it was cut') return pictures.cutGone;
     if (/^Cannot copy this picture: a picture cannot be larger/.test(message)) return pictures.tooLarge;
     if (/^Cannot copy this picture:/.test(message)) return pictures.notSupported;
+    const shapes = strings.shapes;
+    if (message === 'Cannot change the shapes of this sheet: it is protected') return shapes.protectedSheet;
+    if (/^Cannot change the shapes of this sheet:/.test(message)) return shapes.placesFixed;
+    if (/^Cannot delete this shape: it shares/.test(message)) return shapes.wrapped;
+    if (/^Cannot change this shape: the file holds it in another form/.test(message)) return shapes.alternative;
+    if (/^Cannot change the look of this shape:/.test(message)) return shapes.notFormattable;
+    if (/^Cannot copy this shape:/.test(message)) return shapes.notCopyable;
+    if (/^Cannot change the text of this shape:/.test(message)) return shapes.textFixed;
+    if (message === 'A line has no text') return shapes.noText;
     const charts = strings.charts;
     if (/is not a range of cells of this workbook$|^The range of a chart is a range of cells/.test(message)) return charts.badRange;
     if (message === 'A series needs a range of values' || message === 'A chart has at least one series') return charts.needValues;
@@ -8042,9 +8616,9 @@ export class WorkbookView {
     if (this.destroyed) return true;
     if (this.edit) this.commitEditing();
     if (this.renaming) this.finishRename(true);
-    if (this.noteEdit) this.finishNote(true);
+    if (this.noteEdit || this.shapeEdit) this.finishNote(true);
     const settled = this.settleDialog();
-    return settled && !this.edit && !this.renaming && !this.noteEdit;
+    return settled && !this.edit && !this.renaming && !this.noteEdit && !this.shapeEdit;
   }
 
   /**
@@ -8055,7 +8629,7 @@ export class WorkbookView {
    */
   hasPendingInput(): boolean {
     if (this.destroyed) return false;
-    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || this.rulesDialog !== undefined || this.composing || this.drag !== undefined || this.chartDrag !== undefined;
+    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || this.shapeEdit !== undefined || this.rulesDialog !== undefined || this.composing || this.drag !== undefined || this.chartDrag !== undefined;
   }
 
   /**
@@ -8078,7 +8652,7 @@ export class WorkbookView {
 
   hasUnappliedText(): boolean {
     if (this.destroyed) return false;
-    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || (this.rulesDialog !== undefined && this.rulesDialog.changed());
+    return this.edit !== undefined || this.renaming !== undefined || this.noteEdit !== undefined || this.shapeEdit !== undefined || (this.rulesDialog !== undefined && this.rulesDialog.changed());
   }
 
   /**
@@ -8221,6 +8795,18 @@ export class WorkbookView {
   paste(text: string, html?: string): void {
     if (this.destroyed || this.locked) return;
     const picked = this.pickedDrawing();
+    // A shape copied in a view of this page: as a picture, beside the shape it was taken from or at the active cell.
+    const shape = shapePasteKind(html);
+    if (shape.kind === 'shape') {
+      this.putShape(shape.copy, picked === undefined ? { ...this.state().active } : undefined);
+      return;
+    }
+    if (shape.kind === 'stale') {
+      if (html !== undefined) releaseShape();
+      this.notify(this.strings.shapes.copyGone, 'info');
+      return;
+    }
+    if (html !== undefined) releaseShape();
     // A picture copied in a view of this page: with a drawing selected it goes beside the picture it was taken from; with cells selected, to the active cell.
     const picture = picturePasteKind(html);
     if (picture.kind === 'picture') {
@@ -8251,7 +8837,7 @@ export class WorkbookView {
     }
     if (picked !== undefined) {
       // Cells are not pasted under a chart that is selected: the selection of cells is not what the user is looking at.
-      this.notify(this.isPictureAt(picked) ? this.strings.pictures.noCellPaste : this.strings.charts.noCellPaste, 'info');
+      this.notify(this.isPictureAt(picked) ? this.strings.pictures.noCellPaste : this.isShapeAt(picked) ? this.strings.shapes.noCellPaste : this.strings.charts.noCellPaste, 'info');
       return;
     }
     this.commitEditing();
@@ -8476,10 +9062,10 @@ export class WorkbookView {
     // A name being typed for a sheet, or a note, is not dropped (the keys of its field undo within
     // it; this is a button or a call from outside): it is applied, as leaving the field would, and
     // that is all this call does - the next one undoes it. What cannot be applied stays in its field.
-    if (this.renaming || this.noteEdit) {
+    if (this.renaming || this.noteEdit || this.shapeEdit) {
       this.finishRename(true);
       this.finishNote(true);
-      return !this.renaming && !this.noteEdit;
+      return !this.renaming && !this.noteEdit && !this.shapeEdit;
     }
     this.closeMenu();
     if (this.collab) {
@@ -9835,9 +10421,10 @@ export class WorkbookView {
     const resize = this.resizeAt(point.x, point.y, RESIZE_REACH_MOUSE);
     const chart = resize || this.locked || this.typingFormula() ? -1 : this.chartUnder(point.x, point.y);
     if (chart >= 0) {
-      // A second click on a chart opens its dialog; a picture has none, and stays selected.
+      // A second click on a chart opens its dialog, on a shape types its text; a picture has none, and stays selected.
       this.setChartPick(chart);
       if (this.isChartAt(chart)) this.attempt(() => void this.openChartDialog(chart));
+      else if (this.isShapeAt(chart) && !this.isLineAt(chart)) this.attempt(() => void this.editShapeText(chart));
       return;
     }
     if (resize) {

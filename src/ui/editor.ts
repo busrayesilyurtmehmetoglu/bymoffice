@@ -254,6 +254,11 @@ export class SpreadsheetEditor {
         this.refresh();
         if (options.onChange) options.onChange(change);
       },
+      onDrawingSelectionChange: (id) => {
+        // The toolbar shows the look of a shape that is selected.
+        this.refresh();
+        if (options.onDrawingSelectionChange) options.onDrawingSelectionChange(id);
+      },
       onEditingChange: (state) => {
         if (this.formulaBar && this.view) this.formulaBar.editingChanged(state);
         // Undo and redo are off while a cell is edited.

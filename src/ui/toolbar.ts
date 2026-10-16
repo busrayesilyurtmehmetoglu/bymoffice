@@ -16,6 +16,10 @@ import type { SaveCommand } from './save-command';
 import { onFontsChanged } from '../render/fonts';
 import type { WorkbookView } from './sheet-view';
 import { MAX_PICTURE_BYTES } from '../ops/pictures';
+import type { ShapeInfo, ShapeKind } from '../ops/shapes';
+
+/** The weights a line of a shape is given from the toolbar, in points. */
+const SHAPE_LINE_WEIGHTS = [0.25, 0.5, 0.75, 1, 1.5, 2.25, 3, 4.5, 6];
 
 /** What the parts of the shell need from the editor that holds them. */
 export interface ShellHost {
@@ -196,6 +200,8 @@ export class Toolbar {
     this.addMenuButton('chart', 'menu', () => this.openCharts());
     // The picture button only opens the browser's own file dialog: it has nothing that stays open.
     this.addDialogButton('insertPicture', () => this.fileInput.click());
+    // The kinds of shape that are added, and what changes the shape that is selected.
+    this.addMenuButton('insertShape', 'menu', () => this.openShapes());
     this.addSeparator();
     this.addMenuButton('rowsColumns', 'menu', () => this.openRowsColumns());
     this.addSeparator();
@@ -249,7 +255,7 @@ export class Toolbar {
 
     // Not during an edit either: the view would answer by dropping what was typed. Nor while a note
     // or the name of a sheet is typed in its field, whose own Ctrl+Z undoes within it.
-    const typing = view.isEditing || view.isEditingComment || view.isRenaming;
+    const typing = view.isEditing || view.isEditingComment || view.isEditingShapeText || view.isRenaming;
     // The button of charts is named in the words of the view, which may have changed its language.
     const chart = this.buttons.chart;
     const insert = view.chartStrings.insert;
@@ -269,6 +275,16 @@ export class Toolbar {
       this.setDisabled('insertPicture', !editable || why !== undefined);
       const title = why !== undefined ? why : this.strings.insertPicture;
       if (picture.title !== title) picture.title = title;
+    }
+    // So does the button of shapes; it is named in the words of the view.
+    const shapeButton = this.buttons.insertShape;
+    if (shapeButton) {
+      const why = editable ? view.shapeProblem : undefined;
+      this.setDisabled('insertShape', !editable || why !== undefined);
+      const label = view.shapeStrings.insert;
+      if (shapeButton.getAttribute('aria-label') !== label) shapeButton.setAttribute('aria-label', label);
+      const title = why !== undefined ? why : label;
+      if (shapeButton.title !== title) shapeButton.title = title;
     }
     this.fontSelect.disabled = !editable;
     this.sizeSelect.disabled = !editable;
@@ -292,10 +308,12 @@ export class Toolbar {
     this.setPressed('filter', view.hasFilter);
 
     this.showFont(typeof font.name === 'string' ? font.name : undefined);
-    this.showFontSize(fontSizeOf(format));
+    // A shape whose look can be changed is selected: the colours and the size of its text are shown, and are what the controls change.
+    const shape = this.formattableShape();
+    this.showFontSize(shape && shape.textSize !== undefined ? shape.textSize : fontSizeOf(format));
     this.showFormat(formatKindOf(format.numFmt, this.strings));
-    this.paintBar(this.bars.textColor, this.textColorOf(format) || '#000000');
-    this.paintBar(this.bars.fillColor, this.fillColorOf(format));
+    this.paintBar(this.bars.textColor, shape ? shape.textColor || '#000000' : this.textColorOf(format) || '#000000');
+    this.paintBar(this.bars.fillColor, shape ? shape.fill : this.fillColorOf(format));
     this.keepTabStop();
   }
 
@@ -480,6 +498,8 @@ export class Toolbar {
       // The words of charts are the view's (its menu and its dialog use the same): set once there is a view, see update().
       chart: '',
       insertPicture: s.insertPicture,
+      // The words of shapes are the view's: set once there is a view, see update().
+      insertShape: '',
       rowsColumns: s.rowsAndColumns,
       find: withShortcut(s.findReplace, 'F'),
     };
@@ -627,13 +647,25 @@ export class Toolbar {
     view.format({ vertical: vertical === 'bottom' || now === vertical ? null : vertical });
   }
 
+  /** The shape that is selected, while its look can be changed: the colours and the size of text of the toolbar are its own then. */
+  private formattableShape(): ShapeInfo | undefined {
+    const info = this.host.view.selectedShapeInfo;
+    return info && info.formattable ? info : undefined;
+  }
+
   private openPalette(key: 'textColor' | 'fillColor'): void {
     const view = this.host.view;
     const text = key === 'textColor';
     const format = view.selectionFormat;
-    const current = text ? this.textColorOf(format) : this.fillColorOf(format);
+    const shape = this.formattableShape();
+    const current = shape ? (text ? shape.textColor : shape.fill) : text ? this.textColorOf(format) : this.fillColorOf(format);
     const apply = (rgb: string | null) => () =>
       this.host.run(() => {
+        // A shape that is selected gets the colour; a line has neither a fill nor text of its own.
+        if (shape) {
+          if (!shape.line) view.formatShape(shape.id, text ? { textColor: rgb === null ? '#000000' : `#${rgb}` } : { fill: rgb === null ? null : `#${rgb}` });
+          return;
+        }
         const color = rgb === null ? null : { rgb: `FF${rgb}` };
         view.format(text ? { color } : { fill: color });
       });
@@ -713,6 +745,52 @@ export class Toolbar {
     // A dialog takes the focus itself: its item is not followed by a command's way back to the grid.
     if (view.selectedChart !== undefined) items.push({ label: charts.edit, action: () => void view.openChartDialog() });
     this.open('chart', charts.insert, items);
+  }
+
+  /**
+   * The kinds of shape that can be inserted at the active cell, and, for a shape that is selected whose look can be
+   * changed, its line: a colour from the palette (or none) and a weight from a list. Its fill and the colour and size
+   * of its text are those of the fill and text colour buttons and the list of sizes.
+   */
+  private openShapes(): void {
+    const view = this.host.view;
+    const strings = view.shapeStrings;
+    const add = (kind: ShapeKind): PopoverItem => ({ label: strings.kinds[kind], action: () => this.host.run(() => void view.insertShape(kind)) });
+    const items: PopoverItem[] = (['rect', 'roundRect', 'ellipse', 'line', 'arrow', 'doubleArrow', 'textBox'] as ShapeKind[]).map(add);
+    const shape = this.formattableShape();
+    if (shape) {
+      // The popover of the line takes the place of this one, under the same button.
+      items.push({ label: strings.lineColor, action: () => this.openShapeLine(shape, 'color') });
+      items.push({ label: strings.lineWidth, action: () => this.openShapeLine(shape, 'width') });
+    }
+    this.open('insertShape', strings.insert, items);
+  }
+
+  /** The colours (a palette, and none) or the weights (a list) of the line of the selected shape. */
+  private openShapeLine(shape: ShapeInfo, what: 'color' | 'width'): void {
+    const view = this.host.view;
+    const strings = view.shapeStrings;
+    // Opened from an item of the menu, which is closing: the new popover comes once it has.
+    setTimeout(() => {
+      if (this.destroyed) return;
+      if (what === 'width') {
+        const items = SHAPE_LINE_WEIGHTS.map(
+          (points): PopoverItem => ({ label: strings.points(points), action: () => this.host.run(() => view.formatShape(shape.id, shape.outline ? { lineWidth: points } : { lineWidth: points, lineColor: '#000000' })) }),
+        );
+        this.open('insertShape', strings.lineWidth, items);
+        return;
+      }
+      const current = shape.outline ? shape.outline.color : undefined;
+      const swatches: PopoverItem[] = [];
+      for (let i = 0; i < PALETTE.length; i++) {
+        const hex = `#${PALETTE[i]}`;
+        const name = this.strings.colorName(Math.floor(i / PALETTE_COLUMNS), i % PALETTE_COLUMNS);
+        swatches.push({ label: `${name} (${hex})`, swatch: hex, value: hex, selected: current === hex, action: () => this.host.run(() => view.formatShape(shape.id, { lineColor: hex })) });
+      }
+      // A line keeps a line: it has nothing else to show.
+      const reset: PopoverItem[] = shape.line ? [] : [{ label: strings.noLine, action: () => this.host.run(() => view.formatShape(shape.id, { lineColor: null })) }];
+      this.open('insertShape', strings.lineColor, reset, swatches);
+    }, 0);
   }
 
   /** The ways of merging the selection, and of splitting it again. */
@@ -873,6 +951,11 @@ export class Toolbar {
   private onSizeChange = (): void => {
     const size = Number(this.sizeSelect.value);
     if (!(size > 0)) return;
+    const shape = this.formattableShape();
+    if (shape) {
+      if (!shape.line) this.host.run(() => this.host.view.formatShape(shape.id, { textSize: size }), this.listByKey);
+      return;
+    }
     // A value chosen with the keyboard may be one step on the way to another: the focus stays in the list.
     this.host.run(() => this.host.view.format({ fontSize: size }), this.listByKey);
   };

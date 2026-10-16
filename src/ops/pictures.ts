@@ -29,7 +29,7 @@
 import type { SheetMetrics } from '../layout/sheet-metrics';
 import { createSheetMetrics } from '../layout/sheet-metrics';
 import { isAddedPicture, MAX_DRAWING_TEXT, newPictureKey, pictureSource, PICTURE_EXTENSIONS, textUpTo } from '../model/sheet/pictures';
-import { MAX_COLS, MAX_ROWS, type CellRange, type DrawingAnchor, type DrawingMarker, type DrawingPicture, type PictureData, type Sheet, type SheetDrawing, type Workbook } from '../model/sheet/types';
+import { MAX_COLS, MAX_ROWS, type CellRange, type DrawingAnchor, type DrawingMarker, type DrawingObject, type DrawingPicture, type PictureData, type Sheet, type SheetDrawing, type Workbook } from '../model/sheet/types';
 import { anchorRect, drawingAnchorNow } from '../render/sheet-drawings';
 import { croppedBox, normalCrop, turnedBox, type PictureCrop } from '../render/picture-frame';
 import { declaredImageSize, sniffImageType } from '../render/images';
@@ -168,7 +168,7 @@ function pictureAt(sheet: Sheet, id: number): { drawing: SheetDrawing; object: D
 }
 
 /** A drawing of the file as it was read, for one that was moved since; the drawing itself for one of the file that was not; undefined for one that is in no file. */
-function fileDrawing(drawing: SheetDrawing): SheetDrawing | undefined {
+export function fileDrawing(drawing: SheetDrawing): SheetDrawing | undefined {
   if (drawing.from) return drawing.from;
   return drawing.since === undefined ? drawing : undefined;
 }
@@ -222,14 +222,15 @@ function markerAt(metrics: SheetMetrics, x: number, y: number): DrawingMarker {
 /**
  * The anchor of the kind `like` is (with what it says of rows and columns that move: editAs)
  * that covers a rectangle of the sheet, in pixels from the corner of cell A1. The rectangle is
- * kept on the sheet and at least MIN_PICTURE_SIZE pixels each way.
+ * kept on the sheet and at least `min` pixels each way (MIN_PICTURE_SIZE; a line may be flat: 0).
  */
-export function anchorLike(like: DrawingAnchor, metrics: SheetMetrics, rect: { x: number; y: number; width: number; height: number }): DrawingAnchor {
+export function anchorLike(like: DrawingAnchor, metrics: SheetMetrics, rect: { x: number; y: number; width: number; height: number }, min: number = MIN_PICTURE_SIZE): DrawingAnchor {
   const finite = (n: number, fallback: number): number => (typeof n === 'number' && isFinite(n) ? n : fallback);
   const limitX = metrics.cols.total;
   const limitY = metrics.rows.total;
-  const width = Math.max(Math.min(finite(rect.width, MIN_PICTURE_SIZE), limitX), MIN_PICTURE_SIZE);
-  const height = Math.max(Math.min(finite(rect.height, MIN_PICTURE_SIZE), limitY), MIN_PICTURE_SIZE);
+  const least = typeof min === 'number' && min >= 0 && min <= MIN_PICTURE_SIZE ? min : MIN_PICTURE_SIZE;
+  const width = Math.max(Math.min(finite(rect.width, least), limitX), least);
+  const height = Math.max(Math.min(finite(rect.height, least), limitY), least);
   const x = Math.max(0, Math.min(finite(rect.x, 0), limitX - width));
   const y = Math.max(0, Math.min(finite(rect.y, 0), limitY - height));
   if (like.kind === 'absolute') return { kind: 'absolute', x: clampEmu(x), y: clampEmu(y), width: clampEmu(width), height: clampEmu(height) };
@@ -321,15 +322,24 @@ export function movePicture(workbook: Workbook, sheetIndex: number, id: number, 
 function movePicturePlain(workbook: Workbook, sheetIndex: number, id: number, anchor: DrawingAnchor | CellRange): Op[] {
   const sheet = placedSheetOf(workbook, sheetIndex);
   const { drawing } = pictureAt(sheet, id);
+  return movedDrawing(sheetIndex, sheet, id, drawing, anchor, 'a picture');
+}
+
+/**
+ * The operations that put a drawing of a sheet (a picture, a shape) at another anchor: one of the
+ * kind it has, or the cells it covers. What movePicture() does once the drawing is found; `what`
+ * names it in a message. `min` is the least size the cells it covers are made into (see anchorLike()).
+ */
+export function movedDrawing(sheetIndex: number, sheet: Sheet, id: number, drawing: SheetDrawing, anchor: DrawingAnchor | CellRange, what: string, min: number = MIN_PICTURE_SIZE): Op[] {
   const now = drawingAnchorNow(drawing, sheet.structuralEdits);
   let wanted: DrawingAnchor;
   if (isRange(anchor)) {
-    const cells = checkedAnchor(anchor, 'a picture');
+    const cells = checkedAnchor(anchor, what);
     const metrics = createSheetMetrics(sheet);
-    wanted = anchorLike(now, metrics, anchorRect(cells, metrics));
+    wanted = anchorLike(now, metrics, anchorRect(cells, metrics), min);
   } else {
-    wanted = checkedAnchor(anchor, 'a picture');
-    if (wanted.kind !== now.kind) throw new RangeError('A picture keeps the kind of its anchor');
+    wanted = checkedAnchor(anchor, what);
+    if (wanted.kind !== now.kind) throw new RangeError(`${what.charAt(0).toUpperCase()}${what.slice(1)} keeps the kind of its anchor`);
     if (wanted.kind === 'twoCell' && (anchor as DrawingAnchor).editAs === undefined && (now.editAs === 'oneCell' || now.editAs === 'absolute')) wanted.editAs = now.editAs;
   }
   if (JSON.stringify(wanted) === JSON.stringify(now)) return [];
@@ -364,8 +374,13 @@ export function removePicture(workbook: Workbook, sheetIndex: number, id: number
 function removePicturePlain(workbook: Workbook, sheetIndex: number, id: number): Op[] {
   const sheet = placedSheetOf(workbook, sheetIndex);
   const { drawing } = pictureAt(sheet, id);
+  return removedDrawing(sheetIndex, sheet, id, drawing, 'picture');
+}
+
+/** The operations that take a drawing off a sheet; one of the file that shares a wrapper of alternatives with another drawing is refused. `what` names it in the message. */
+export function removedDrawing(sheetIndex: number, sheet: Sheet, id: number, drawing: SheetDrawing, what: string): Op[] {
   const inFile = fileDrawing(drawing);
-  if (inFile && inFile.wrapped) throw new RangeError('Cannot delete this picture: it shares its place in the drawing with another object');
+  if (inFile && inFile.wrapped) throw new RangeError(`Cannot delete this ${what}: it shares its place in the drawing with another object`);
   const list = (sheet.drawings as SheetDrawing[]).slice();
   list.splice(id, 1);
   return setDrawings(sheetIndex, list);
@@ -420,8 +435,8 @@ function pictureNow(workbook: Workbook, sheetIndex: number, id: number) {
   return { sheet, drawing, object, now, metrics, drawn: turnedBox(anchorRect(now, metrics), object.rotation) };
 }
 
-/** The list of drawings with the picture at `id` holding another object and, when given, standing at another anchor. */
-function changedPicture(sheetIndex: number, sheet: Sheet, id: number, drawing: SheetDrawing, object: DrawingPicture, now: DrawingAnchor, anchor: DrawingAnchor | undefined): Op[] {
+/** The list of drawings with the drawing at `id` holding another object and, when given, standing at another anchor. */
+export function changedDrawing(sheetIndex: number, sheet: Sheet, id: number, drawing: SheetDrawing, object: DrawingObject, now: DrawingAnchor, anchor: DrawingAnchor | undefined): Op[] {
   const moved = anchor !== undefined && JSON.stringify(anchor) !== JSON.stringify(now);
   // A picture that moves is put where it is from the structural edits made so far on (as movePicture() does); one that stays keeps its place as it is.
   const next: SheetDrawing = moved ? { anchor: anchor as DrawingAnchor, object, since: sheet.structuralEdits ? sheet.structuralEdits.length : 0 } : { ...drawing, object };
@@ -456,26 +471,36 @@ export function rotatePicture(workbook: Workbook, sheetIndex: number, id: number
 
 function rotatePicturePlain(workbook: Workbook, sheetIndex: number, id: number, degrees: number): Op[] {
   const rotation = pictureRotation(degrees);
-  const { sheet, drawing, object, now, metrics, drawn } = pictureNow(workbook, sheetIndex, id);
+  const { sheet, drawing, object, now, metrics } = pictureNow(workbook, sheetIndex, id);
+  return turnedDrawing(sheetIndex, sheet, id, drawing, object, now, metrics, rotation);
+}
+
+/**
+ * The operations that turn a drawing of a sheet (a picture, a shape) to `rotation` degrees (as
+ * pictureRotation() gives them) about the middle of its box: see rotatePicture(). `min` is the
+ * least size its anchor is kept at (see anchorLike()).
+ */
+export function turnedDrawing(sheetIndex: number, sheet: Sheet, id: number, drawing: SheetDrawing, object: DrawingObject, now: DrawingAnchor, metrics: SheetMetrics, rotation: number, min: number = MIN_PICTURE_SIZE): Op[] {
   const before = object.rotation || 0;
   if (before === rotation) return [];
-  const next: DrawingPicture = { ...object };
+  const drawn = turnedBox(anchorRect(now, metrics), object.rotation);
+  const next: DrawingObject = { ...object };
   if (rotation === 0) delete next.rotation;
   else next.rotation = rotation;
   // Unless a quarter turn is crossed the anchor is left as it is.
-  if (!crossesQuarter(before, rotation)) return changedPicture(sheetIndex, sheet, id, drawing, next, now, undefined);
+  if (!crossesQuarter(before, rotation)) return changedDrawing(sheetIndex, sheet, id, drawing, next, now, undefined);
   const edits = sheet.structuralEdits ? sheet.structuralEdits.length : 0;
   // Turned back across the line, where the last turn put it and with no row or column moved since: the anchor it had.
   const back = drawing.turned;
   if (back && back.edits === edits && JSON.stringify(back.to) === JSON.stringify(now)) {
-    const ops = changedPicture(sheetIndex, sheet, id, drawing, next, now, back.from);
+    const ops = changedDrawing(sheetIndex, sheet, id, drawing, next, now, back.from);
     const list = (ops[0] as Extract<Op, { type: 'setDrawings' }>).drawings as SheetDrawing[];
     delete list[id].turned;
     return ops;
   }
   // The turned box is kept on the sheet, which may move it; the anchor it had is kept for the turn back.
-  const anchor = anchorLike(now, metrics, turnedBox(drawn, rotation));
-  const ops = changedPicture(sheetIndex, sheet, id, drawing, next, now, anchor);
+  const anchor = anchorLike(now, metrics, turnedBox(drawn, rotation), min);
+  const ops = changedDrawing(sheetIndex, sheet, id, drawing, next, now, anchor);
   const list = (ops[0] as Extract<Op, { type: 'setDrawings' }>).drawings as SheetDrawing[];
   list[id].turned = { from: now, to: drawingAnchorNow(list[id], sheet.structuralEdits), edits };
   return ops;
@@ -516,7 +541,7 @@ function cropPicturePlain(workbook: Workbook, sheetIndex: number, id: number, cr
   const box = croppedBox(drawn, object.rotation, object.crop, wanted, object.flipH === true, object.flipV === true);
   // As the handles do (see draggedCrop()): no less than the least size of a picture is left of it each way.
   if (box.width < MIN_PICTURE_SIZE - 1e-6 || box.height < MIN_PICTURE_SIZE - 1e-6) throw new RangeError(`A crop cannot leave less than ${MIN_PICTURE_SIZE} pixels of the picture`);
-  return changedPicture(sheetIndex, sheet, id, drawing, next, now, anchorLike(now, metrics, turnedBox(box, object.rotation)));
+  return changedDrawing(sheetIndex, sheet, id, drawing, next, now, anchorLike(now, metrics, turnedBox(box, object.rotation)));
 }
 
 /**
@@ -536,7 +561,7 @@ function describePicturePlain(workbook: Workbook, sheetIndex: number, id: number
   const next: DrawingPicture = { ...object };
   if (description === undefined) delete next.description;
   else next.description = description;
-  return changedPicture(sheetIndex, sheet, id, drawing, next, now, undefined);
+  return changedDrawing(sheetIndex, sheet, id, drawing, next, now, undefined);
 }
 
 // ------------------------------------------------------------------ copies

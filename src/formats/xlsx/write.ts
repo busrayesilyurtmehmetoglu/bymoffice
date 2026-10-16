@@ -60,7 +60,8 @@ import { adjustDrawingAnchor, anchorRect, commentCellNow, commentEdits, drawingA
 import { createSheetMetrics, type SheetMetrics } from '../../layout/sheet-metrics';
 import { isAddedPicture, PICTURE_EXTENSIONS } from '../../model/sheet/pictures';
 import { breakSpanOf, movePageBreak } from '../../model/sheet/page-breaks';
-import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, pictureAnchorXml, stripChartPart, type DrawingPartEdit, type PictureLook, type PicturePatch } from './chart-write';
+import { CHART_CONTENT_TYPE, DRAWING_CONTENT_TYPE, chartAnchorXml, chartCellsOf, chartSpaceXml, drawingPartXml, editDrawingPart, framedAnchorXml, patchChartPart, pictureAnchorXml, shapeAnchorXml, stripChartPart, type DrawingPartEdit, type PictureLook, type PicturePatch, type ShapePatch } from './chart-write';
+import { shapeTextOf, type ShapeBox } from './shape-write';
 import { turnedBox } from '../../render/picture-frame';
 import { drawingSource } from './drawings';
 import type { Chart } from '../../model/sheet/chart';
@@ -510,6 +511,34 @@ function picturePatch(was: Extract<DrawingObject, { type: 'picture' }>, is: Extr
   if (!same(was.crop, is.crop)) patch.crop = is.crop ? is.crop : null;
   if (!same(was.description, is.description)) patch.description = is.description !== undefined && is.description !== '' ? is.description : null;
   return Object.keys(patch).length > 0 ? patch : undefined;
+}
+
+/** The fields of a shape of the file that a save writes when they change and the shape is not written anew (see ShapePatch). */
+const PATCHED_SHAPE_FIELDS = ['rotation', 'text'];
+
+/**
+ * What is to be done to the part of a shape of the file that the model holds as `is`, read as
+ * `was`: undefined when nothing is, "rewrite" when its element is written anew from the model (a
+ * shape the reader knew in full: DrawingShape.known), a patch of its turn and its text otherwise,
+ * and null when something else of it changed (which is not written: no command changes it).
+ */
+function shapeChange(was: Extract<DrawingObject, { type: 'shape' }>, is: Extract<DrawingObject, { type: 'shape' }>): ShapePatch | 'rewrite' | undefined | null {
+  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b);
+  const keys = new Set<string>(Object.keys(was).concat(Object.keys(is)));
+  let other = false;
+  for (const key of keys) {
+    if (PATCHED_SHAPE_FIELDS.indexOf(key) >= 0) continue;
+    if (!same((was as unknown as Record<string, unknown>)[key], (is as unknown as Record<string, unknown>)[key])) other = true;
+  }
+  const turned = !same(was.rotation || 0, is.rotation || 0);
+  const texted = !same(was.text, is.text);
+  if (!other && !turned && !texted) return undefined;
+  if (was.known === true) return 'rewrite';
+  if (other || (texted && was.plainText !== true)) return null;
+  const patch: ShapePatch = {};
+  if (turned) patch.rotation = is.rotation ? is.rotation : null;
+  if (texted) patch.text = shapeTextOf(is.text);
+  return patch;
 }
 
 /** FNV-1a of every byte: what tells the bytes of pictures apart before they are compared. */
@@ -5499,8 +5528,10 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
     for (const drawing of now) {
       const from = drawing.from || drawing;
       if (places.has(from)) became.set(from, drawing);
-      else if ((drawing.object.type === 'chart' && drawing.object.part === undefined) || isAddedPicture(drawing.object)) added.push(drawing);
-      else if (sheetXml !== undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing of the model is neither in the file nor a chart or a picture that was added`);
+      // A shape that a command added (or pasted) is written from its model: one that says it was added (`since`) and comes from no drawing of the file.
+      // Any other shape that is in no drawing the sheet was read with would lose what its part holds beside the model: refused below.
+      else if ((drawing.object.type === 'chart' && drawing.object.part === undefined) || isAddedPicture(drawing.object) || (drawing.object.type === 'shape' && drawing.from === undefined && drawing.since !== undefined)) added.push(drawing);
+      else if (sheetXml !== undefined) throw new Error(`Cannot write sheet "${sheet.name}": a drawing of the model is neither in the file nor a chart, a picture or a shape that was added`);
     }
     const partEdits = new Map<string, DrawingPartEdit>();
     const editOf = (part: string): DrawingPartEdit => {
@@ -5510,6 +5541,13 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
         partEdits.set(part, edit);
       }
       return edit;
+    };
+    // The box a shape is drawn in, EMU: near a quarter turn its anchor gives it turned (as for a picture).
+    let shapeMetrics: SheetMetrics | undefined;
+    const shapeBox = (drawing: SheetDrawing): ShapeBox => {
+      if (!shapeMetrics) shapeMetrics = createSheetMetrics(sheet);
+      const rect = turnedBox(anchorRect(anchorOf(drawing), shapeMetrics), drawing.object.rotation);
+      return { x: rect.x * 9525, y: rect.y * 9525, width: rect.width * 9525, height: rect.height * 9525 };
     };
     for (const drawing of read) {
       const next = became.get(drawing);
@@ -5534,6 +5572,21 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
           const edit = editOf(drawingPart);
           if (!edit.patched) edit.patched = new Map();
           edit.patched.set(source.index, patch);
+        }
+        continue;
+      }
+      if (was.type === 'shape' && is.type === 'shape') {
+        // A shape of the file: written anew from its model when the reader knew it in full, else only its turn and its text change.
+        const change = shapeChange(was, is);
+        if (change === null) throw new Error(`Cannot write sheet "${sheet.name}": a shape was changed in what is not written`);
+        if (change === 'rewrite') {
+          const edit = editOf(drawingPart);
+          if (!edit.rewritten) edit.rewritten = new Map();
+          edit.rewritten.set(source.index, { object: is, box: shapeBox(next) });
+        } else if (change) {
+          const edit = editOf(drawingPart);
+          if (!edit.shaped) edit.shaped = new Map();
+          edit.shaped.set(source.index, change);
         }
         continue;
       }
@@ -5676,6 +5729,10 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       const newPartId = relationIds(drawingPart, childrenNamed(partRels.root, 'Relationship'));
       if (home && drawingPart === home.part) {
         for (const drawing of added) {
+          if (drawing.object.type === 'shape') {
+            edit.added.push({ anchor: anchorOf(drawing), relId: '', name: drawing.object.name || 'Shape', shape: { object: drawing.object, box: shapeBox(drawing) } });
+            continue;
+          }
           if (drawing.object.type === 'picture') {
             const made = pictureFor(drawing, drawingPart, () => {
               const id = newPartId();
@@ -5750,6 +5807,12 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
       const newPartId = relationIds(drawingPart, []);
       const framed: DrawingPartEdit['added'] = [];
       added.forEach((drawing, i) => {
+        if (drawing.object.type === 'shape') {
+          const item = { anchor: anchorOf(drawing), relId: '', name: drawing.object.name || 'Shape', shape: { object: drawing.object, box: shapeBox(drawing) } };
+          anchors.push(shapeAnchorXml(item.anchor, item.shape.object, i + 2, item.shape.box));
+          framed.push(item);
+          return;
+        }
         if (drawing.object.type === 'picture') {
           const made = pictureFor(drawing, drawingPart, newPartId);
           if (made.rel) {

@@ -35,6 +35,7 @@ export type IconName =
   | 'conditionalFormat'
   | 'chart'
   | 'insertPicture'
+  | 'insertShape'
   | 'rowsColumns'
   | 'find';
 
@@ -101,6 +102,8 @@ const ICONS: { [name in IconName]: Shape[] } = {
   // Three columns on a base line.
   chart: [path('M4 20h16'), path('M6.5 20v-6h3v6 M10.5 20V7h3v13 M14.5 20v-9h3v9')],
   insertPicture: PICTURE,
+  // A square and a circle over it: shapes.
+  insertShape: [path('M4 4h10v10H4z'), path('M15 10a5 5 0 1 1 0 10 5 5 0 0 1 0-10z')],
   rowsColumns: [path('M4 5h16v14H4z M4 10h16 M10 5v14')],
   // A magnifying glass: find and replace.
   find: [path('M10.5 4a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13z'), path('m15.3 15.3 4.7 4.7')],

@@ -927,9 +927,43 @@ export interface DrawingShape extends DrawingObjectBase {
   connector?: boolean;
   /** "#RRGGBB"; missing for a shape without a fill (or with one that is not drawn: gradients, patterns). */
   fill?: string;
-  /** Outline: colour ("#RRGGBB") and width in pixels. */
-  line?: { color: string; width: number; dash?: boolean };
+  /**
+   * Outline: colour ("#RRGGBB") and width in pixels. `head` and `tail` are the ends of a line
+   * that are drawn (the `type` of `a:headEnd` and `a:tailEnd`: "triangle", "arrow", "stealth",
+   * "diamond", "oval"); the head is at the corner a line starts from, the tail where it ends.
+   */
+  line?: { color: string; width: number; dash?: boolean; head?: string; tail?: string };
   text?: DrawingText;
+  /** The shape is a text box (`xdr:cNvSpPr txBox="1"`). */
+  textBox?: boolean;
+  /**
+   * How text typed into the shape looks: the look of its first run, or of the mark that ends its
+   * first paragraph when it has no text. Set by the reader on a shape whose text can be replaced
+   * (see `plainText`), and by the commands on a shape they make.
+   */
+  textLook?: ShapeTextLook;
+  /**
+   * Set by the reader on a shape of the file whose element is exactly what the writer makes of
+   * this model (one the engine wrote, say): it is changed in every way, copied, and written anew
+   * from the model. A shape of the file without it is moved, sized, turned and deleted, and its
+   * text replaced when `plainText` says so; nothing else of it is changed.
+   */
+  known?: boolean;
+  /**
+   * Set by the reader on a shape of the file whose text is plain: its text body holds paragraphs of
+   * runs and line breaks that all look the same, and nothing else (no field, no link to a cell).
+   * Its text can be replaced: the new text gets that look, and everything else of the body stays.
+   */
+  plainText?: boolean;
+}
+
+/** How the text of a shape looks: what a run has but its text, the alignment of its paragraphs and where the text stands. */
+export interface ShapeTextLook {
+  run: Omit<DrawingTextRun, 'text'>;
+  align?: DrawingParagraph['align'];
+  anchor?: DrawingText['anchor'];
+  insets?: [number, number, number, number];
+  wrap?: boolean;
 }
 
 export interface DrawingGroup extends DrawingObjectBase {

@@ -43,8 +43,6 @@ import {
   type DrawingAnchor,
   type DrawingMarker,
   type DrawingObject,
-  type DrawingShape,
-  type DrawingText,
   type Fill,
   type PageBreak,
   type RichRun,
@@ -63,6 +61,7 @@ import { KEPT_MAIN, MAX_KEPT_DEPTH, unpackKept, type KeptAttr, type KeptNode, ty
 import { keptFor, keptNow, ruleHolder } from '../../ops/rules';
 import { adjustCommentCell, adjustDrawingAnchor, commentEdits, drawingAnchorNow } from '../../render/sheet-drawings';
 import { CHART_CONTENT_TYPE, chartCellsOf, chartSpaceXml, chartWritable } from './chart-write';
+import { shapeElementXml, writtenAsConnector } from './shape-write';
 import { pictureSource } from '../../model/sheet/pictures';
 import { METADATA_CONTENT_TYPE, METADATA_RELATIONSHIP, newMetadataXml } from './metadata';
 import { serializeXml, type XmlElement, type XmlNode } from '../../xml';
@@ -1335,10 +1334,6 @@ interface DrawingContext {
   workbook: Workbook;
 }
 
-const HEX_COLOR = /^#[0-9A-Fa-f]{6}$/;
-
-const solidFill = (color: string | undefined) => (color !== undefined && HEX_COLOR.test(color) ? `<a:solidFill><a:srgbClr val="${color.slice(1).toUpperCase()}"/></a:solidFill>` : '');
-
 function transformXml(object: DrawingObject, box: Box, group: boolean): string {
   let out = '<a:xfrm';
   if (typeof object.rotation === 'number' && isFinite(object.rotation) && object.rotation !== 0) out += ` rot="${Math.round((((object.rotation % 360) + 360) % 360) * 60000)}"`;
@@ -1354,57 +1349,6 @@ function namesXml(object: DrawingObject, id: number, fallback: string): string {
   if (object.description !== undefined && object.description !== '') out += ` descr="${escapeAttr(object.description)}"`;
   if (object.hidden) out += ' hidden="1"';
   return `${out}/>`;
-}
-
-const TEXT_ALIGN: { [align: string]: string } = { center: 'ctr', right: 'r', justify: 'just' };
-const TEXT_ANCHOR: { [anchor: string]: string } = { top: 't', middle: 'ctr', bottom: 'b' };
-
-function textBodyXml(text: DrawingText): string {
-  let body = '<a:bodyPr';
-  if (text.wrap === false) body += ' wrap="none"';
-  if (text.insets) {
-    const names = ['lIns', 'tIns', 'rIns', 'bIns'];
-    for (let i = 0; i < 4; i++) {
-      const inset = text.insets[i];
-      if (typeof inset === 'number' && inset >= 0 && inset < Infinity) body += ` ${names[i]}="${emu(inset * EMU_PER_PIXEL)}"`;
-    }
-  }
-  body += ` anchor="${TEXT_ANCHOR[text.anchor || 'top'] || 't'}"/>`;
-  let out = `<xdr:txBody>${body}<a:lstStyle/>`;
-  for (const paragraph of text.paragraphs) {
-    out += '<a:p>';
-    const align = paragraph.align === undefined ? undefined : TEXT_ALIGN[paragraph.align];
-    if (align) out += `<a:pPr algn="${align}"/>`;
-    for (const run of paragraph.runs) {
-      let props = '<a:rPr lang="en-US"';
-      if (typeof run.size === 'number' && run.size >= 1 && run.size <= 4000) props += ` sz="${Math.round(run.size * 100)}"`;
-      if (run.bold !== undefined) props += ` b="${run.bold ? 1 : 0}"`;
-      if (run.italic !== undefined) props += ` i="${run.italic ? 1 : 0}"`;
-      if (run.underline !== undefined) props += ` u="${run.underline ? 'sng' : 'none'}"`;
-      if (run.strike !== undefined) props += ` strike="${run.strike ? 'sngStrike' : 'noStrike'}"`;
-      let inner = solidFill(run.color);
-      if (run.font !== undefined && run.font !== '' && run.font.charAt(0) !== '+') inner += `<a:latin typeface="${escapeAttr(run.font)}"/>`;
-      props += inner === '' ? '/>' : `>${inner}</a:rPr>`;
-      // A line break inside a run is an element of its own in a drawing.
-      const lines = String(run.text).split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) out += `<a:br>${props}</a:br>`;
-        if (lines[i] !== '') out += `<a:r>${props}<a:t>${escapeText(lines[i])}</a:t></a:r>`;
-      }
-    }
-    out += '</a:p>';
-  }
-  return `${out}</xdr:txBody>`;
-}
-
-function shapePropsXml(shape: DrawingShape, box: Box): string {
-  let out = `<xdr:spPr>${transformXml(shape, box, false)}<a:prstGeom prst="${/^[A-Za-z0-9]{1,64}$/.test(shape.geometry) ? shape.geometry : 'rect'}"><a:avLst/></a:prstGeom>`;
-  out += solidFill(shape.fill) || '<a:noFill/>';
-  const line = shape.line;
-  const stroke = line ? solidFill(line.color) : '';
-  if (line && stroke !== '') out += `<a:ln w="${emu((line.width > 0 && line.width < Infinity ? line.width : 1) * EMU_PER_PIXEL)}">${stroke}${line.dash ? '<a:prstDash val="dash"/>' : ''}</a:ln>`;
-  else out += '<a:ln><a:noFill/></a:ln>';
-  return `${out}</xdr:spPr>`;
 }
 
 /** One object of a drawing in the box it takes up on the sheet (pixels); '' for what cannot be written. */
@@ -1454,11 +1398,14 @@ function objectXml(context: DrawingContext, object: DrawingObject, box: Box, dep
     );
   }
   if (object.type === 'shape') {
-    // A connector has no text of its own; one that the model gives a text is written as a shape of the same geometry.
-    if (object.connector && !object.text) {
-      return `<xdr:cxnSp macro=""><xdr:nvCxnSpPr>${namesXml(object, id, 'Connector')}<xdr:cNvCxnSpPr/></xdr:nvCxnSpPr>${shapePropsXml(object, box)}</xdr:cxnSp>`;
-    }
-    return `<xdr:sp macro="" textlink=""><xdr:nvSpPr>${namesXml(object, id, 'Shape')}<xdr:cNvSpPr/></xdr:nvSpPr>${shapePropsXml(object, box)}${object.text && object.text.paragraphs.length > 0 ? textBodyXml(object.text) : ''}</xdr:sp>`;
+    // One writer of shapes for every file (see shape-write.ts). A connector has no text of its own; one that the model gives a text is written as a shape of the same geometry.
+    const emuBox = { x: box.x * EMU_PER_PIXEL, y: box.y * EMU_PER_PIXEL, width: box.width * EMU_PER_PIXEL, height: box.height * EMU_PER_PIXEL };
+    const text = object.text && object.text.paragraphs.length > 0 ? object.text : undefined;
+    // What a file cannot hold is written as U+FFFD and counted, as for every other text of the workbook; a name too long is cut and said.
+    return shapeElementXml(text === object.text ? object : { ...object, text }, id, emuBox, `${writtenAsConnector({ ...object, text }) ? 'Connector' : 'Shape'} ${id - 1}`, {
+      clean: counted,
+      onNameCut: () => context.notes.add('Drawing: the name of a shape longer than 255 characters was cut'),
+    });
   }
   let members = '';
   if (depth < MAX_GROUP_DEPTH) {

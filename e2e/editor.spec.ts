@@ -215,7 +215,7 @@ test.describe('layout', () => {
         viewport: document.documentElement.clientWidth,
       };
     });
-    expect(facts.buttons).toBe(31);
+    expect(facts.buttons).toBe(32);
     expect(facts.sizes).toEqual([facts.coarse ? '40x40' : '32x32']);
     expect(facts.scrolls).toBe(true);
     expect(facts.scrolled).toBe(true);
@@ -681,6 +681,8 @@ test.describe('keyboard and focus', () => {
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('rowsColumns');
     await page.keyboard.press('ArrowLeft');
+    expect(await focused()).toBe('insertShape');
+    await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('insertPicture');
     await page.keyboard.press('ArrowLeft');
     expect(await focused()).toBe('chart');
@@ -1082,7 +1084,7 @@ test.describe('read-only', () => {
   test('disables every editing control, locks the formula bar and says so', async ({ page }) => {
     await mount(page, await editorWorkbook(), { readOnly: true });
     const controls = page.locator('#host .bym-toolbar button, #host .bym-toolbar select');
-    await expect(controls).toHaveCount(34);
+    await expect(controls).toHaveCount(35);
     // Printing, the print preview, making a PDF and finding change nothing: their buttons are the controls that stay on (the page setup would change the file).
     expect(await controls.evaluateAll((all) => all.filter((control) => !(control as HTMLButtonElement).disabled).map((control) => control.getAttribute('data-command')))).toEqual(['print', 'printPreview', 'pdf', 'find']);
     await expect(page.locator('#host .bym-formula-input')).toHaveAttribute('readonly', '');

@@ -21,11 +21,13 @@ import {
   type DrawingText,
   type DrawingTextRun,
   type SheetDrawing,
+  type ShapeTextLook,
 } from '../../model/sheet/types';
 import { localName, parseXml, xmlEncodingRead, type XmlElement } from '../../xml';
 import { PIVOT_SCAN_LIMITS } from '../../model/sheet/pivot';
 import { MAX_DRAWING_TEXT, textUpTo } from '../../model/sheet/pictures';
 import { MAX_PATCH_DEPTH, chartKnown, chartLoose, nestedBeyond, type ChartPartFacts } from './chart-write';
+import { LINE_ENDS, sameShapeElement, shapeElementXml } from './shape-write';
 
 /** Anchors read from one drawing; a sheet with more shows the first ones. */
 export const MAX_SHEET_DRAWINGS = 20000;
@@ -378,6 +380,141 @@ function readText(state: ReadState, body: XmlElement | undefined, defaults: Draw
   return out;
 }
 
+/**
+ * How text typed into a shape looks (DrawingShape.textLook): the mark that ends its first
+ * paragraph, or its first run when that has none, with what the body and the shape's style give
+ * every run; the alignment of the first paragraph and where the body puts its text. Undefined for
+ * a body without a paragraph.
+ */
+function readTextLook(state: ReadState, body: XmlElement, defaults: DrawingTextRun): ShapeTextLook | undefined {
+  const themeColors = state.context.themeColors;
+  const first = child(body, 'p');
+  if (!first) return undefined;
+  const level = child(child(body, 'lstStyle'), 'lvl1pPr');
+  const run: DrawingTextRun = { ...defaults };
+  runProps(themeColors, child(level, 'defRPr'), run);
+  const props = child(first, 'pPr');
+  runProps(themeColors, child(props, 'defRPr'), run);
+  let mark = child(first, 'endParaRPr');
+  if (!mark) {
+    for (const item of first.children) {
+      if (item.type !== 'element' || (localName(item.name) !== 'r' && localName(item.name) !== 'br')) continue;
+      mark = child(item, 'rPr');
+      break;
+    }
+  }
+  runProps(themeColors, mark, run);
+  const { text: _text, ...ownLook } = run;
+  void _text;
+  const look: ShapeTextLook = { run: ownLook };
+  const align = (props && props.attrs.get('algn')) || (level ? level.attrs.get('algn') : undefined);
+  if (align !== undefined && Object.prototype.hasOwnProperty.call(ALIGN, align) && ALIGN[align] !== 'left') look.align = ALIGN[align];
+  const bodyProps = child(body, 'bodyPr');
+  const anchor = bodyProps ? bodyProps.attrs.get('anchor') : undefined;
+  if (anchor !== undefined && Object.prototype.hasOwnProperty.call(ANCHOR, anchor) && ANCHOR[anchor] !== 'top') look.anchor = ANCHOR[anchor];
+  if (bodyProps && bodyProps.attrs.get('wrap') === 'none') look.wrap = false;
+  const names = ['lIns', 'tIns', 'rIns', 'bIns'];
+  const insets: [number, number, number, number] = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i++) {
+    const stated = bodyProps ? int(bodyProps.attrs.get(names[i])) : undefined;
+    insets[i] = clamp(stated === undefined ? DEFAULT_INSETS[i] : stated, 0, MAX_INSET) / EMU_PER_PIXEL;
+  }
+  look.insets = insets;
+  return look;
+}
+
+/** The text of an element as XML says it, attributes in order: what tells two looks apart. */
+function elementKey(el: XmlElement | undefined, depth = 0): string {
+  if (!el) return '';
+  let out = `<${localName(el.name)}`;
+  for (const [name, value] of el.attrs) out += ` ${name}="${value}"`;
+  out += '>';
+  if (depth < 16) for (const node of el.children) out += node.type === 'element' ? elementKey(node, depth + 1) : node.type === 'text' ? node.value.trim() : '?';
+  return out;
+}
+
+/**
+ * Whether the text body of a shape is plain (DrawingShape.plainText): its children are the body
+ * properties, a list style and paragraphs; each paragraph holds its properties, runs and the mark
+ * that ends it, and nothing else; every run is a look and a text; every paragraph has the same
+ * properties and the same mark, and every run the same look; and the reader keeps all of it (no
+ * more than MAX_SHAPE_PARAGRAPHS paragraphs and MAX_SHAPE_TEXT characters). A new text is written
+ * in that look, paragraph by paragraph: a line break, another mark or text the model does not
+ * hold would be lost to it.
+ */
+function plainBody(body: XmlElement): boolean {
+  let paragraphs = 0;
+  let length = 0;
+  let props: string | undefined;
+  let mark: string | undefined;
+  let look: string | undefined;
+  const same = (held: string | undefined, key: string): boolean => held === undefined || held === key;
+  for (const node of body.children) {
+    if (node.type === 'text') {
+      if (node.value.trim() !== '') return false;
+      continue;
+    }
+    if (node.type !== 'element') return false;
+    const local = localName(node.name);
+    if (local === 'bodyPr' || local === 'lstStyle') continue;
+    if (local !== 'p') return false;
+    // The reader stops at a paragraph that comes once the text is as long as it reads: the body is not all read.
+    if (length >= MAX_SHAPE_TEXT) return false;
+    if (++paragraphs > MAX_SHAPE_PARAGRAPHS) return false;
+    const key = elementKey(child(node, 'pPr'));
+    if (!same(props, key)) return false;
+    props = key;
+    const end = elementKey(child(node, 'endParaRPr'));
+    if (!same(mark, end)) return false;
+    mark = end;
+    for (const item of node.children) {
+      if (item.type === 'text') {
+        if (item.value.trim() !== '') return false;
+        continue;
+      }
+      if (item.type !== 'element') return false;
+      const kind = localName(item.name);
+      if (kind === 'pPr' || kind === 'endParaRPr') continue;
+      if (kind !== 'r') return false;
+      for (const part of item.children) {
+        if (part.type === 'text' && part.value.trim() === '') continue;
+        if (part.type !== 'element') return false;
+        const name = localName(part.name);
+        if (name !== 'rPr' && name !== 't') return false;
+        if (name === 't' && (length += textOf(part).length) > MAX_SHAPE_TEXT) return false;
+      }
+      const runLook = elementKey(child(item, 'rPr'));
+      if (!same(look, runLook)) return false;
+      look = runLook;
+    }
+  }
+  return paragraphs > 0;
+}
+
+const SHAPE_SPACES = 'xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"';
+
+/** The children of a shape, and of its properties, that the writer writes (see shape-write.ts). */
+const WRITTEN_SHAPE_PARTS: { [local: string]: true } = { nvSpPr: true, nvCxnSpPr: true, spPr: true, txBody: true };
+const WRITTEN_SHAPE_PROPS: { [local: string]: true } = { xfrm: true, prstGeom: true, solidFill: true, noFill: true, ln: true };
+
+/** Whether the element of a shape is what the writer makes of its model (DrawingShape.known). */
+function writtenAsModel(el: XmlElement, shape: DrawingShape): boolean {
+  // What the writer never writes says no at once, before anything is made to compare: a style, effects, a geometry of its own.
+  for (const node of el.children) if (node.type === 'element' && !Object.prototype.hasOwnProperty.call(WRITTEN_SHAPE_PARTS, localName(node.name))) return false;
+  const spPr = child(el, 'spPr');
+  for (const node of spPr ? spPr.children : []) if (node.type === 'element' && !Object.prototype.hasOwnProperty.call(WRITTEN_SHAPE_PROPS, localName(node.name))) return false;
+  const props = child(child(el, localName(el.name) === 'sp' ? 'nvSpPr' : 'nvCxnSpPr'), 'cNvPr');
+  const id = props ? int(props.attrs.get('id')) : undefined;
+  if (id === undefined || id < 1 || id > 4294967294) return false;
+  try {
+    const made = parseXml(`<w ${SHAPE_SPACES}>${shapeElementXml(shape, id, { x: 0, y: 0, width: 0, height: 0 })}</w>`).root;
+    const own = made.children.find((node): node is XmlElement => node.type === 'element');
+    return !!own && sameShapeElement(el, own);
+  } catch (error) {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------------ objects
 
 interface Transform {
@@ -461,6 +598,12 @@ function shapeStyle(state: ReadState, shape: XmlElement, props: XmlElement | und
       const dash = child(outline, 'prstDash');
       const dashKind = dash ? dash.attrs.get('val') : undefined;
       if ((dashKind !== undefined && dashKind !== 'solid') || child(outline, 'custDash')) out.line.dash = true;
+      // The ends of a line: an arrow head, say. One of a kind that is not known is drawn as a triangle.
+      for (const [name, key] of [['headEnd', 'head'], ['tailEnd', 'tail']] as const) {
+        const end = child(outline, name);
+        const type = end ? end.attrs.get('type') : undefined;
+        if (type !== undefined && type !== 'none') out.line[key] = LINE_ENDS.indexOf(type) >= 0 ? type : 'triangle';
+      }
     }
   }
 }
@@ -550,14 +693,26 @@ function readObject(state: ReadState, el: XmlElement, depth: number, transformOu
     if (kind === 'cxnSp' || shape.geometry === 'line' || /Connector\d*$/.test(shape.geometry)) shape.connector = true;
     shapeStyle(state, el, props, shape);
     if (kind === 'sp') {
+      const flags = child(child(el, 'nvSpPr'), 'cNvSpPr');
+      if (flags && isTrue(flags.attrs.get('txBox'))) shape.textBox = true;
       // The colour a shape style gives its text: usually white on a filled shape.
       const defaults: DrawingTextRun = { text: '' };
       const fontRef = child(child(el, 'style'), 'fontRef');
       const fontColor = firstColor(themeColors, fontRef);
       if (fontColor) defaults.color = fontColor;
-      const text = readText(state, child(el, 'txBody'), defaults);
+      const body = child(el, 'txBody');
+      const text = readText(state, body, defaults);
       if (text) shape.text = text;
+      // What text typed into it would look like, and whether its text can be replaced: not of a shape that shows the text of a cell.
+      if (body && depth === 0) {
+        const look = readTextLook(state, body, defaults);
+        if (look) shape.textLook = look;
+        const link = el.attrs.get('textlink');
+        if ((link === undefined || link === '') && plainBody(body)) shape.plainText = true;
+      }
     }
+    // A shape of the drawing itself (not of a group) that is just what the writer makes of its model can be changed in every way.
+    if (depth === 0 && writtenAsModel(el, shape)) shape.known = true;
     return shape;
   }
   if (kind === 'grpSp') {

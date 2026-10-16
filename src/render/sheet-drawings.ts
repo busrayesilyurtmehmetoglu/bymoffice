@@ -175,6 +175,70 @@ export function anchorRect(anchor: DrawingAnchor, metrics: SheetMetrics): Rect {
   return { x, y, width: Math.max(markerX(anchor.to) - x, 0), height: Math.max(markerY(anchor.to) - y, 0) };
 }
 
+/** How a drawing is turned that is drawn turned in its frame, in degrees: a picture or a shape; 0 for any other (a chart is not drawn turned by its frame). */
+export function turnOf(object: DrawingObject | undefined): number {
+  if (!object || (object.type !== 'picture' && object.type !== 'shape')) return 0;
+  return typeof object.rotation === 'number' && Number.isFinite(object.rotation) ? object.rotation : 0;
+}
+
+/** Whether a drawing is a line: drawn from one corner of its box to the other. */
+export const isLine = (object: DrawingObject | undefined): object is DrawingShape => !!object && object.type === 'shape' && object.connector === true;
+
+/** How far from a line a point still takes it, in pixels: a thin line is hard to hit. */
+export const LINE_REACH = 4;
+
+/** The two ends of a line in its box (before its turn): from the top left corner to the bottom right one, mirrored by its flips. */
+export function lineEnds(box: Rect, object: Pick<DrawingShape, 'flipH' | 'flipV'>): { x1: number; y1: number; x2: number; y2: number } {
+  const left = object.flipH === true;
+  const top = object.flipV === true;
+  return { x1: left ? box.x + box.width : box.x, y1: top ? box.y + box.height : box.y, x2: left ? box.x : box.x + box.width, y2: top ? box.y : box.y + box.height };
+}
+
+/** Whether a point (in the frame of the box of a line, before its turn) is near the line. */
+function nearLine(box: Rect, shape: DrawingShape, x: number, y: number): boolean {
+  const { x1, y1, x2, y2 } = lineEnds(box, shape);
+  const reach = Math.max(LINE_REACH, (shape.line && shape.line.width > 0 && shape.line.width < 64 ? shape.line.width : 1) / 2 + 2);
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const length = dx * dx + dy * dy;
+  const t = length > 0 ? Math.max(0, Math.min(1, ((x - x1) * dx + (y - y1) * dy) / length)) : 0;
+  const nx = x1 + t * dx - x;
+  const ny = y1 + t * dy - y;
+  return nx * nx + ny * ny <= reach * reach;
+}
+
+/**
+ * Whether a drawing is a shape without a fill (a frame drawn around cells, say): it is found near
+ * its outline and inside its text, not anywhere in its box, so that the cells inside stay the cells.
+ */
+export const isHollow = (object: DrawingObject | undefined): object is DrawingShape => !!object && object.type === 'shape' && object.connector !== true && !(typeof object.fill === 'string' && object.fill !== '');
+
+/** Whether a point (in the frame of the box of a shape, before its turn) is near the outline of the shape: of an ellipse, or of its box. */
+function nearOutline(box: Rect, shape: DrawingShape, x: number, y: number): boolean {
+  const reach = Math.max(LINE_REACH, (shape.line && shape.line.width > 0 && shape.line.width < 64 ? shape.line.width : 1) / 2 + 2);
+  if (shape.geometry === 'ellipse' || shape.geometry === 'flowChartConnector') {
+    const rx = box.width / 2;
+    const ry = box.height / 2;
+    if (!(rx > 0 && ry > 0)) return false;
+    const d = Math.sqrt(((x - box.x - rx) / rx) ** 2 + ((y - box.y - ry) / ry) ** 2);
+    return Math.abs(d - 1) * Math.min(rx, ry) <= reach;
+  }
+  const outside = x < box.x - reach || x > box.x + box.width + reach || y < box.y - reach || y > box.y + box.height + reach;
+  if (outside) return false;
+  const edge = Math.min(Math.abs(x - box.x), Math.abs(x - box.x - box.width), Math.abs(y - box.y), Math.abs(y - box.y - box.height));
+  const within = x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height;
+  return within ? edge <= reach : true;
+}
+
+/** Whether a point (in the frame of the box of a shape) is inside the room its text is laid out in: the box less its insets. A shape without text has none. */
+function inText(box: Rect, shape: DrawingShape, x: number, y: number): boolean {
+  const text = shape.text;
+  if (!text || !text.paragraphs.some((paragraph) => paragraph.runs.some((run) => run.text !== '' && run.text !== '\n'))) return false;
+  const insets = text.insets || [9.6, 4.8, 9.6, 4.8];
+  const inset = (i: number) => (typeof insets[i] === 'number' && insets[i] >= 0 && insets[i] < 1e6 ? insets[i] : 0);
+  return x >= box.x + inset(0) && x <= box.x + box.width - inset(2) && y >= box.y + inset(1) && y <= box.y + box.height - inset(3);
+}
+
 /** Rotations near a quarter turn: the file gives the box the object takes up turned, not the box that is turned. */
 export function quarterTurned(rotation: number | undefined): boolean {
   if (rotation === undefined) return false;
@@ -534,10 +598,10 @@ export class SheetDrawings {
     let found = -1;
     for (const item of this.placed) {
       if (item.order >= count || item.order < found) continue;
-      // A turned picture is found where it is drawn: the point is taken into the frame of its box.
+      // A turned picture or shape is found where it is drawn: the point is taken into the frame of its box.
       let px = x;
       let py = y;
-      const turn = item.object.type === 'picture' && typeof item.object.rotation === 'number' && Number.isFinite(item.object.rotation) ? item.object.rotation : 0;
+      const turn = turnOf(item.object);
       if (turn) {
         const cx = item.x + item.width / 2;
         const cy = item.y + item.height / 2;
@@ -545,7 +609,13 @@ export class SheetDrawings {
         px = cx + (x - cx) * Math.cos(angle) - (y - cy) * Math.sin(angle);
         py = cy + (x - cx) * Math.sin(angle) + (y - cy) * Math.cos(angle);
       }
-      if (px >= item.x && px <= item.x + item.width && py >= item.y && py <= item.y + item.height && wanted(item.object)) found = item.order;
+      // A line is found near it, whatever the box it runs across (one that is flat has none).
+      const inside = isLine(item.object)
+        ? nearLine(item, item.object, px, py)
+        : isHollow(item.object)
+          ? nearOutline(item, item.object, px, py) || inText(item, item.object, px, py)
+          : px >= item.x && px <= item.x + item.width && py >= item.y && py <= item.y + item.height;
+      if (inside && wanted(item.object)) found = item.order;
     }
     return found;
   }
@@ -691,9 +761,9 @@ export class SheetDrawings {
       }
     }
     if (marked) {
-      // The frame of a picture is turned with it; that of a chart is not (a chart is not drawn turned by its frame in Excel).
+      // The frame of a picture or a shape is turned with it; that of a chart is not (a chart is not drawn turned by its frame in Excel).
       const object = this.selected !== undefined ? ((this.sheet.drawings || [])[this.selected] || ({} as SheetDrawing)).object : undefined;
-      const turn = object && object.type === 'picture' && typeof object.rotation === 'number' && Number.isFinite(object.rotation) ? object.rotation : 0;
+      const turn = turnOf(object);
       paintSelection(ctx, marked, this.ghost, originX, originY, {
         rotation: turn,
         ghostRotation: this.ghostTurn !== undefined && Number.isFinite(this.ghostTurn) ? this.ghostTurn : turn,
@@ -987,6 +1057,53 @@ function shapePath(ctx: CanvasRenderingContext2D, geometry: string, x: number, y
   ctx.rect(x, y, width, height);
 }
 
+/**
+ * Draws an end of a line at (tipX, tipY), the line coming from (fromX, fromY), in the fill and
+ * stroke of the context: a triangle (filled, "stealth" with a notch), an open arrow, a diamond or
+ * an oval, of the size Office gives an end of medium length and width (three times the line).
+ */
+function paintLineEnd(ctx: CanvasRenderingContext2D, type: string, tipX: number, tipY: number, fromX: number, fromY: number, lineWidth: number): void {
+  const dx = tipX - fromX;
+  const dy = tipY - fromY;
+  const length = Math.sqrt(dx * dx + dy * dy);
+  if (!(length > 0)) return;
+  const ux = dx / length;
+  const uy = dy / length;
+  const size = Math.max(lineWidth * 3, 6);
+  const back = { x: tipX - ux * size, y: tipY - uy * size };
+  const side = { x: -uy * (size / 2), y: ux * (size / 2) };
+  ctx.beginPath();
+  if (type === 'oval') {
+    ctx.arc(tipX, tipY, size / 2, 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+  if (type === 'diamond') {
+    const half = { x: ux * (size / 2), y: uy * (size / 2) };
+    ctx.moveTo(tipX + half.x, tipY + half.y);
+    ctx.lineTo(tipX + side.x, tipY + side.y);
+    ctx.lineTo(tipX - half.x, tipY - half.y);
+    ctx.lineTo(tipX - side.x, tipY - side.y);
+    ctx.closePath();
+    ctx.fill();
+    return;
+  }
+  if (type === 'arrow') {
+    ctx.setLineDash([]);
+    ctx.moveTo(back.x + side.x, back.y + side.y);
+    ctx.lineTo(tipX, tipY);
+    ctx.lineTo(back.x - side.x, back.y - side.y);
+    ctx.stroke();
+    return;
+  }
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(back.x + side.x, back.y + side.y);
+  if (type === 'stealth') ctx.lineTo(tipX - ux * size * 0.6, tipY - uy * size * 0.6);
+  ctx.lineTo(back.x - side.x, back.y - side.y);
+  ctx.closePath();
+  ctx.fill();
+}
+
 function paintShapeBody(frame: PaintFrame, shape: DrawingShape, x: number, y: number, width: number, height: number): void {
   const { ctx } = frame;
   const line = shape.line;
@@ -1015,6 +1132,12 @@ function paintShapeBody(frame: PaintFrame, shape: DrawingShape, x: number, y: nu
     }
     ctx.stroke();
     ctx.setLineDash([]);
+    // The ends of the line: the head where it starts, the tail where it ends (a flip, applied by the caller, mirrors them with it).
+    if (line && (line.head || line.tail)) {
+      frame.painter.setFill(stroke);
+      if (line.head) paintLineEnd(ctx, line.head, x, y, x + width, y + height, lineWidth);
+      if (line.tail) paintLineEnd(ctx, line.tail, x + width, y + height, x, y, lineWidth);
+    }
     return;
   }
   const fill = safeColor(shape.fill);

@@ -226,6 +226,35 @@ export {
   type PictureInfo,
   type PictureOptions,
 } from './ops/pictures';
+export {
+  DEFAULT_SHAPE_HEIGHT,
+  DEFAULT_SHAPE_WIDTH,
+  MAX_SHAPE_TEXT,
+  SHAPE_COPY_OFFSET,
+  SHAPE_KINDS,
+  addShape,
+  copyShape,
+  cutShape,
+  defaultShapeSize,
+  formatShape,
+  moveShape,
+  moveShapeTo,
+  pasteShape,
+  removeShape,
+  rotateShape,
+  setShapeText,
+  shapeAnchorAt,
+  shapeCopyProblem,
+  shapeEditProblem,
+  shapeFormatProblem,
+  shapesProblem,
+  sheetShapes,
+  type ShapeCopy,
+  type ShapeFormat,
+  type ShapeInfo,
+  type ShapeKind,
+  type ShapeOptions,
+} from './ops/shapes';
 export type { PictureCrop } from './render/picture-frame';
 export { pictureSource } from './model/sheet/pictures';
 export {
