@@ -108,6 +108,15 @@ test('canPointAt: not behind the sign of an exponent', () => {
   for (const marked of ['=B2E+|', '=RATE+|', '=E+|', '=A1E+|', '=x1E-|', '=1E +|', '=1+|', '=1E3+|', '=_1E+|']) assert.equal(at(marked), true, marked);
 });
 
+test('canPointAt: behind a long run of digits in linear time', () => {
+  // The pattern for the exponent once shared the digits out between two loops in every way: 0.7 s for this.
+  const text = `=${'1'.repeat(MAX_POINT_TEXT - 3)}+`;
+  const start = Date.now();
+  assert.equal(canPointAt(text, text.length), true);
+  assert.equal(canPointAt(`=${'1'.repeat(MAX_POINT_TEXT - 4)}E+`, MAX_POINT_TEXT - 1), false);
+  assert.ok(Date.now() - start < 100, `${Date.now() - start} ms`);
+});
+
 test('canPointAt: not inside the square brackets of a reference to a table', () => {
   for (const marked of ['=T[[#This Row],|', '=T[[A]:|', '=T[|', '=SUM(T[[A]:|', '=T[[#All],[A]:|']) assert.equal(at(marked), false, marked);
   // Behind the closed brackets, after an operator, it can.

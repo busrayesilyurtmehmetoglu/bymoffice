@@ -3252,7 +3252,8 @@ function adjustVmlText(text: string, place: PlaceNote): string {
     const end = close + 10;
     i = end;
     const block = text.slice(start, end);
-    if (!/<x:ClientData[^>]*ObjectType\s*=\s*["']Note["']/.test(block)) continue;
+    // `[^<>]`, not `[^>]`: each attempt stays in one tag (see startTagOf()).
+    if (!/<x:ClientData[^<>]*ObjectType\s*=\s*["']Note["']/.test(block)) continue;
     const rowMatch = /<x:Row>\s*(\d{1,7})\s*<\/x:Row>/.exec(block);
     const colMatch = /<x:Column>\s*(\d{1,5})\s*<\/x:Column>/.exec(block);
     if (!rowMatch || !colMatch) continue;
@@ -4015,7 +4016,8 @@ function declaredPrefix(text: string, namespace: string): string | undefined {
 /** Blocks of shape ids a legacy drawing uses: those its <o:idmap> names and those its shapes are in. */
 function vmlBlocks(text: string): number[] {
   const out: number[] = [];
-  const map = /:idmap\b[^>]*?\bdata\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(text);
+  // Each attempt starts at a "<" and stays in that tag: with `[^>]`, many unclosed starts were each read to the end.
+  const map = /<[A-Za-z_][\w.-]*:idmap\b[^<>]*?\bdata\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(text);
   if (map) {
     for (const piece of (map[1] !== undefined ? map[1] : map[2]).split(',')) {
       const block = parseUint(piece.trim());
@@ -4052,7 +4054,7 @@ function editVml(source: Uint8Array, removed: Set<number>, added: AddedNote[], n
   if (removed.size > 0) {
     const open = `<${p.v}:shape`;
     const close = `</${p.v}:shape>`;
-    const isNote = new RegExp(`<${escapeRegExp(p.x)}:ClientData[^>]*ObjectType\\s*=\\s*["']Note["']`);
+    const isNote = new RegExp(`<${escapeRegExp(p.x)}:ClientData[^<>]*ObjectType\\s*=\\s*["']Note["']`);
     const rowOf = new RegExp(`<${escapeRegExp(p.x)}:Row>\\s*(\\d{1,7})\\s*</${escapeRegExp(p.x)}:Row>`);
     const colOf = new RegExp(`<${escapeRegExp(p.x)}:Column>\\s*(\\d{1,5})\\s*</${escapeRegExp(p.x)}:Column>`);
     const gone = new Set<number>();
@@ -4097,7 +4099,7 @@ function editVml(source: Uint8Array, removed: Set<number>, added: AddedNote[], n
     const closeAt = root.closeStart;
     // Shape ids come in blocks; each block a drawing uses is named in its <o:idmap>.
     // Block n stands for the ids n*1024 .. n*1024+1023, of which the first is not used.
-    const map = new RegExp(`<${escapeRegExp(p.o)}:idmap\\b[^>]*?\\bdata\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(text);
+    const map = new RegExp(`<${escapeRegExp(p.o)}:idmap\\b[^<>]*?\\bdata\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(text);
     const listed: number[] = [];
     if (map) {
       for (const piece of (map[1] !== undefined ? map[1] : map[2]).split(',')) {
@@ -4161,18 +4163,90 @@ function editVml(source: Uint8Array, removed: Set<number>, added: AddedNote[], n
   return { bytes: encoder.encode(text), changed: true, empty };
 }
 
-/** The id of the relationship <legacyDrawing> of a sheet names; undefined for a sheet without the element. */
-function legacyDrawingId(sheetXml: string): string | undefined {
-  const match = /<(?:[A-Za-z_][\w.-]*:)?legacyDrawing(?=[\s/>])[^>]*?\b[A-Za-z_][\w.-]*:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(sheetXml);
+/**
+ * A part name split for a free name of the same kind (see freshName()): what comes before
+ * the number at the end of its last segment, and the extension after it ("/xl/charts/colors12.xml"
+ * gives "/xl/charts/colors" and ".xml"). Plain string work: no pattern to read back over a
+ * long run of digits, and none that a line break in the name stops.
+ */
+export function numberedName(name: string): { stem: string; extension: string } {
+  const slash = name.lastIndexOf('/');
+  const dot = name.lastIndexOf('.');
+  const extension = dot > slash ? name.slice(dot) : '';
+  let end = name.length - extension.length;
+  while (end > 0) {
+    const c = name.charCodeAt(end - 1);
+    if (c < 48 || c > 57) break;
+    end--;
+  }
+  return { stem: name.slice(0, end), extension };
+}
+
+/**
+ * The first start tag of an element named `local` (with any prefix) in the text of a part,
+ * leaving out comments, CDATA sections and processing instructions; undefined when there is
+ * none, or when the part ends inside it. One pass over the text: candidates are found by a
+ * pattern whose every attempt starts at a "<" and stops at the end of a name, and the markup
+ * that hides text is looked for once, ahead of them.
+ */
+export function startTagOf(text: string, local: string): string | undefined {
+  const candidates = new RegExp(`<(?:[A-Za-z_][\\w.-]*:)?${escapeRegExp(local)}(?=[\\s/>])`, 'g');
+  const hiders = /<!--|<!\[CDATA\[|<\?/g;
+  // The next construct that hides text at or after the candidates: [hideStart, hideEnd).
+  let hideStart = 0;
+  let hideEnd = 0;
+  const nextHider = (from: number): void => {
+    hiders.lastIndex = from;
+    const found = hiders.exec(text);
+    if (!found) {
+      hideStart = hideEnd = text.length;
+      return;
+    }
+    hideStart = found.index;
+    const close = found[0] === '<!--' ? '-->' : found[0] === '<?' ? '?>' : ']]>';
+    const end = text.indexOf(close, hideStart + found[0].length);
+    hideEnd = end < 0 ? text.length : end + close.length;
+  };
+  nextHider(0);
+  for (;;) {
+    const match = candidates.exec(text);
+    if (!match) return undefined;
+    const at = match.index;
+    while (hideEnd <= at && hideStart < text.length) nextHider(hideEnd);
+    if (hideStart <= at && at < hideEnd) {
+      candidates.lastIndex = hideEnd;
+      continue;
+    }
+    // The end of the tag: the first ">" outside a quoted value.
+    for (let j = at + match[0].length; j < text.length; j++) {
+      const c = text.charCodeAt(j);
+      if (c === 62) return text.slice(at, j + 1);
+      if (c === 60) return undefined;
+      if (c === 34 || c === 39) {
+        j = text.indexOf(c === 34 ? '"' : "'", j + 1);
+        if (j < 0) return undefined;
+      }
+    }
+    return undefined;
+  }
+}
+
+/** The relationship id an attribute "id" of any namespace (r:id) of a start tag names. */
+function relIdOf(tag: string | undefined): string | undefined {
+  if (tag === undefined) return undefined;
+  const match = /\s[A-Za-z_][\w.-]*:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(tag);
   if (!match) return undefined;
   return plainOf(match[1] !== undefined ? match[1] : match[2]);
 }
 
+/** The id of the relationship <legacyDrawing> of a sheet names; undefined for a sheet without the element. */
+function legacyDrawingId(sheetXml: string): string | undefined {
+  return relIdOf(startTagOf(sheetXml, 'legacyDrawing'));
+}
+
 /** The id of the relationship <drawing> of a sheet names; undefined for a sheet without the element. */
 function drawingId(sheetXml: string): string | undefined {
-  const match = /<(?:[A-Za-z_][\w.-]*:)?drawing(?=[\s/>])[^>]*?\b[A-Za-z_][\w.-]*:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(sheetXml);
-  if (!match) return undefined;
-  return plainOf(match[1] !== undefined ? match[1] : match[2]);
+  return relIdOf(startTagOf(sheetXml, 'drawing'));
 }
 
 /** The target of a relationship from one part to another, relative the way applications write it. */
@@ -5627,8 +5701,8 @@ function produceXlsx(pkg: OpcPackage, workbook: Workbook, reads: PartReads): voi
         // The part of the chart first, then what it leads to, each under a free name of the kind its own name is of.
         const names = copied.map((item, i) => {
           if (i === 0) return part;
-          const match = /^(.*?)\d*(\.[^./]*)?$/.exec(item.from) as RegExpExecArray;
-          return freshName(match[1], match[2] || '', relsPartOf);
+          const split = numberedName(item.from);
+          return freshName(split.stem, split.extension, relsPartOf);
         });
         copied.forEach((item, i) => {
           out.fresh.push([names[i], item.bytes, item.contentType]);

@@ -2332,6 +2332,22 @@ test('run as a program it listens where it is told and stops when it is asked to
   assert.match(wrong.err, /--port/);
 });
 
+test('without a host, the program and listen() listen on 127.0.0.1 only', async () => {
+  const program = await run([SERVER_FILE, '--port', '0', '--origin', 'https://app.example'], {
+    killOn: /listening on ws:\/\/\S+:\d+/,
+  });
+  assert.match(program.out, /listening on ws:\/\/127\.0\.0\.1:\d+/);
+  assert.equal(program.code, 0);
+
+  const server = createCollabServer({ origins: ['https://app.example'] });
+  try {
+    const { host } = await server.listen(0);
+    assert.equal(host, '127.0.0.1');
+  } finally {
+    await server.close();
+  }
+});
+
 // --- The client of the platform ----------------------------------------------
 
 test('the WebSocket of the platform talks to the server', async (t) => {

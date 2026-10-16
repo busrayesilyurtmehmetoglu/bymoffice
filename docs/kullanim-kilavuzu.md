@@ -560,7 +560,7 @@ Aynı çalışma kitabını (xlsx) birden çok kişi **aynı anda** düzenler; h
 </script>
 ```
 
-`collab` bir **aktarıcının** (relay) adresidir. Aktarıcı dosyayı tutmaz ve işlemlerin içine bakmaz; yalnız sıra verir. Depoda bağımlılıksız bir örneği vardır (pakete de girer): `node server/collab-server.mjs --port 8787 --origin https://uygulamaniz.example` — **kalıcılığı yoktur** (bellek), süreç kapanınca odalar gider. Kendi arka ucunuzda yazmak için kurallar ve iletilerin tam şeması: [`docs/collab-sozlesmesi.md`](collab-sozlesmesi.md).
+`collab` bir **aktarıcının** (relay) adresidir. Aktarıcı dosyayı tutmaz ve işlemlerin içine bakmaz; yalnız sıra verir. Depoda bağımlılıksız bir örneği vardır (pakete de girer): `node server/collab-server.mjs --port 8787 --origin https://uygulamaniz.example` — **kalıcılığı yoktur** (bellek), süreç kapanınca odalar gider. Yalnız `127.0.0.1`'i dinler (önüne TLS sağlayan bir vekil konur); dışarıya açmak için `--host 0.0.0.0`. Belirteci adrese (`?token=`) değil `collab.token`'a koyun: adres vekil günlüklerine düşer. Kendi arka ucunuzda yazmak için kurallar ve iletilerin tam şeması: [`docs/collab-sozlesmesi.md`](collab-sozlesmesi.md).
 
 Nesne biçimi:
 
@@ -1496,6 +1496,7 @@ Hatalar:
 
 - `PasswordError` (`code`: `'required' | 'wrong' | 'cancelled' | 'unsupported' | 'damaged'`; `format`: `'ooxml' | 'doc' | 'xls'`): dosya parola korumalı ve parola verilmedi / yanlış / şifreleme okunamıyor / şifreli dosya bozuk.
 - `UnsupportedFileError`: girdi Word/Excel dosyası değil ya da henüz desteklenmeyen bir tür (Word 95 ve öncesi).
+- `PartTooLargeError` (`kind`: `'part' | 'archive'`, `size`, `limit`; `part`: girdinin adı — iletide yoktur): docx/xlsx paketinin bir parçası açılınca motorun okuyacağından büyük çıkıyor (bkz. "`ZipArchive`" → açılmış boyut sınırları). Hata `open()`'dan ya da parçayı ilk okuyan çağrıdan (`workbook()`, `document()`) gelir; hiçbir şey açılmadan, bildirilen boyuta bakılarak verilir. Köprüde `corrupt` koduyla bildirilir.
 - `Error`: dosya bozuk (iletisi `Corrupt ZIP archive: …`, `Corrupt ZIP entry …` vb. ile başlar).
 
 ### Sayfa ekleme, silme, yeniden adlandırma
@@ -2324,6 +2325,10 @@ Düşük düzey ZIP erişimi: `ZipArchive.read(bytes)`, `names()`, `has(name)`, 
 - Girdi yorumları, ek alanlar, öznitelikler, arşiv yorumu ve UTF-8 olmayan adlar aynen geri yazılır.
 - Aynı adı taşıyan iki girdi içeren arşiv, biri kaybolmasın diye reddedilir.
 - Bildirdiği boyuttan büyük açılan ("zip bombası") girdi reddedilir.
+- **Açılmış boyut sınırları** (dosyadan gelen girdiler için; `read(name)` hiçbir şey açmadan `PartTooLargeError` ile reddeder):
+  - bir parça en çok `MAX_UNPACKED_PART_BYTES` = **512 MB** (sayfa gövdeleri `…/worksheets/`, `macrosheets/`, `dialogsheets/`; `sharedStrings*`, `pivotCacheRecords*`; `word/` altında adında `document` geçen XML; XML olmayan her dosya: görsel, gömülü nesne, `.bin`) ya da `MAX_UNPACKED_XML_BYTES` = **64 MB** (öbür her `.xml` / `.rels` / `.vml` parçası: stiller, çalışma kitabı, ilişkiler, çizimler, grafikler, üstbilgiler…);
+  - bir arşivden okunan parçaların açılmış toplamı (her parça bir kez sayılır, sıkıştırılmadan saklanan girdiler sayılmaz) en çok arşiv boyutunun `MAX_UNPACK_RATIO` = **256** katı, ama en az `MIN_UNPACK_BUDGET_BYTES` = **64 MB**. Uygulamaların yazdığı XML 5–50 kat sıkışır (sınama havuzunda en çok 26 kat); tek bayt dizisi ise yaklaşık 1.000 kat: 512 KB'lik bir dosya bu sınırlar olmadan 1,7 GB bellek tutabiliyordu.
+  - Sınırlar sabittir (bu sürümde değiştirilemez). Uygulamanın kendi yazdığı (`set`) ve bir `write()`'ın sıkıştırdığı girdiler bu sınırlara tabi değildir.
 
 ## 5. Tarayıcı ve platform desteği
 

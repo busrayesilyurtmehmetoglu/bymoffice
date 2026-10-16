@@ -33,8 +33,11 @@ export interface PointContext {
 
 const isDigit = (code: number) => code >= 48 && code <= 57;
 
-/** Whether the text ends in the mantissa and "E" of a number in scientific notation ("=1E", "=A1+1.5e"). */
-const SCIENTIFIC = /(?:^|[^A-Za-z0-9_.$])(?:\d+\.?\d*|\.\d+)[Ee]$/;
+/**
+ * Whether the text ends in the mantissa and "E" of a number in scientific notation ("=1E", "=A1+1.5e").
+ * `\d+(?:\.\d*)?`, not `\d+\.?\d*`: the digits of a long run without a dot are not shared out between two loops in every way.
+ */
+const SCIENTIFIC = /(?:^|[^A-Za-z0-9_.$])(?:\d+(?:\.\d*)?|\.\d+)[Ee]$/;
 /** Whether the text ends in the beginning of an error constant that goes on with "/" ("#N", "#DIV", "#SAYI"). */
 const ERROR_HEAD = /#[^\s\/#!?()+\-*^&=<>,;:"']*$/;
 

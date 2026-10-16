@@ -138,7 +138,7 @@ export interface CollabRoomInfo {
 export interface CollabServer {
   /** Serves the WebSocket upgrades of a server that exists. */
   attach(server: Server): CollabServer;
-  /** Opens a server of its own; plain HTTP requests are answered with 426. */
+  /** Opens a server of its own, on 127.0.0.1 unless `host` says otherwise ('0.0.0.0'); plain HTTP requests are answered with 426. */
   listen(port?: number, host?: string): Promise<{ port: number; host: string }>;
   /** Cuts every connection, forgets every room and stops every timer. */
   close(): Promise<void>;

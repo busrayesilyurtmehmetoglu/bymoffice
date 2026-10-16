@@ -147,6 +147,71 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+// What reading an archive may unpack. A small file must not be able to fill memory: deflate
+// shrinks a run of one byte about a thousand times, and the parts of a package are read whole.
+// The limits are well above what applications write (the body of a sheet or document is the
+// largest part; past about 512 MB it does not fit in a string of a JavaScript engine anyway).
+
+/** Most one part of a package unpacks to: the body of a sheet or document, shared strings, pictures and other files. */
+export const MAX_UNPACKED_PART_BYTES = 512 * 1024 * 1024;
+/** Most any other XML part unpacks to (styles, workbook, relationships, drawings, ...); as other parts that are read whole (charts, drawings). */
+export const MAX_UNPACKED_XML_BYTES = 64 * 1024 * 1024;
+/**
+ * Most the parts read from one archive unpack to together, counting each part once, as a
+ * multiple of the size of the archive: what applications write packs XML 5 to 50 times, a
+ * decompression bomb about a thousand times.
+ */
+export const MAX_UNPACK_RATIO = 256;
+/** What may be unpacked from any archive, however small, before MAX_UNPACK_RATIO applies. */
+export const MIN_UNPACK_BUDGET_BYTES = 64 * 1024 * 1024;
+
+/** A part of an archive unpacks to more than this engine reads (see MAX_UNPACKED_PART_BYTES and the limits beside it). */
+export class PartTooLargeError extends Error {
+  override name = 'PartTooLargeError';
+  /** 'part': one part is larger than its limit; 'archive': the parts read together unpack to too much for the size of the file. */
+  readonly kind: 'part' | 'archive';
+  /** The entry that was being read; not in the message, which is shown to people. */
+  readonly part: string;
+  /** Its size when unpacked, as the archive declares it. */
+  readonly size: number;
+  readonly limit: number;
+
+  constructor(kind: 'part' | 'archive', part: string, size: number, limit: number) {
+    super(
+      kind === 'part'
+        ? `A part of the file is too large to open: it unpacks to ${size} bytes, more than the ${limit} this engine reads`
+        : `The file unpacks to far more than its size (more than ${limit} bytes): it is not opened, as it may be made to fill memory`,
+    );
+    this.kind = kind;
+    this.part = part;
+    this.size = size;
+    this.limit = limit;
+  }
+}
+
+/**
+ * The most an entry of a package unpacks to, by its name: MAX_UNPACKED_PART_BYTES for the
+ * bodies of sheets and documents, shared strings, records of pivot caches and every file that
+ * is not XML; MAX_UNPACKED_XML_BYTES for any other XML part. String work only: names come
+ * from the file.
+ */
+export function unpackedLimitOf(name: string): number {
+  const lower = name.toLowerCase();
+  const slash = lower.lastIndexOf('/');
+  const base = lower.slice(slash + 1);
+  const dir = lower.slice(0, slash + 1);
+  const xml = base.endsWith('.xml') || base.endsWith('.rels') || base.endsWith('.vml');
+  if (!xml) return MAX_UNPACKED_PART_BYTES;
+  const body =
+    dir.endsWith('worksheets/') ||
+    dir.endsWith('macrosheets/') ||
+    dir.endsWith('dialogsheets/') ||
+    base.startsWith('sharedstrings') ||
+    base.startsWith('pivotcacherecords') ||
+    (dir === 'word/' && base.indexOf('document') >= 0);
+  return body ? MAX_UNPACKED_PART_BYTES : MAX_UNPACKED_XML_BYTES;
+}
+
 export class ZipArchive {
   private entries = new Map<string, ZipEntry>();
   /**
@@ -158,6 +223,11 @@ export class ZipArchive {
   private originals = new Map<string, { entry: ZipEntry; index: number }>();
   /** Archive comment, written back as it was read. */
   private comment: Uint8Array = EMPTY;
+  /** Size of the archive that was read, for MAX_UNPACK_RATIO. */
+  private archiveBytes = 0;
+  /** What the entries inflated so far unpack to together, each counted once. */
+  private unpacked = 0;
+  private counted = new Set<string>();
 
   static read(bytes: Uint8Array): ZipArchive {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -192,6 +262,7 @@ export class ZipArchive {
     if (end > bytes.length || count * 46 > size) throw new Error('Corrupt ZIP archive: central directory out of bounds');
 
     const zip = new ZipArchive();
+    zip.archiveBytes = bytes.length;
     const commentLength = Math.min(view.getUint16(eocd + 20, true), bytes.length - eocd - 22);
     zip.comment = bytes.subarray(eocd + 22, eocd + 22 + commentLength);
     // Writers without ZIP64 store the count modulo 65536, so headers that follow
@@ -287,13 +358,30 @@ export class ZipArchive {
     return this.entries.get(name);
   }
 
-  /** Returns the uncompressed content of an entry. */
+  /**
+   * Returns the uncompressed content of an entry. Rejects with PartTooLargeError, before
+   * anything is inflated, for an entry larger than unpackedLimitOf() its name, and for one
+   * that would take what the entries read from the archive unpack to together past
+   * MAX_UNPACK_RATIO times its size (MIN_UNPACK_BUDGET_BYTES at least).
+   */
   async read(name: string): Promise<Uint8Array> {
     const entry = this.entries.get(name);
     if (!entry) throw new Error(`ZIP entry not found: ${name}`);
     if (entry.data) return entry.data;
+    // The limits are for what the file brings; what was written here since (and compressed by a write) is not held to them.
+    const original = this.originals.get(name);
+    const fromFile = original !== undefined && original.entry === entry;
+    const limit = unpackedLimitOf(name);
+    if (fromFile && entry.uncompressedSize > limit) throw new PartTooLargeError('part', name, entry.uncompressedSize, limit);
     let data = entry.raw;
     if (entry.method !== METHOD_STORE) {
+      // Stored entries are in the file already; only what inflating makes counts.
+      if (fromFile && !this.counted.has(name)) {
+        const budget = Math.max(MIN_UNPACK_BUDGET_BYTES, MAX_UNPACK_RATIO * this.archiveBytes);
+        if (this.unpacked + entry.uncompressedSize > budget) throw new PartTooLargeError('archive', name, entry.uncompressedSize, budget);
+        this.unpacked += entry.uncompressedSize;
+        this.counted.add(name);
+      }
       try {
         data = await inflate(entry.raw, entry.uncompressedSize);
       } catch (error) {

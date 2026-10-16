@@ -242,7 +242,8 @@ export function parseVmlNotes(bytes: Uint8Array): NoteBox[] {
     if (close < 0) break;
     i = close + 10;
     const block = text.slice(start, i);
-    if (!/<x:ClientData[^>]*ObjectType\s*=\s*["']Note["']/.test(block)) continue;
+    // `[^<>]`, not `[^>]`: each attempt stays in one tag, where `[^>]` read the rest of the box from each of many unclosed starts.
+    if (!/<x:ClientData[^<>]*ObjectType\s*=\s*["']Note["']/.test(block)) continue;
     const row = /<x:Row>\s*(\d{1,7})\s*<\/x:Row>/.exec(block);
     const col = /<x:Column>\s*(\d{1,5})\s*<\/x:Column>/.exec(block);
     if (!row || !col) continue;

@@ -108,9 +108,13 @@
 // Use as a library:
 //   import { createCollabServer } from './collab-server.mjs';
 //   const relay = createCollabServer({ origins: ['https://app.example'], authorize });
-//   relay.attach(httpServer);            // or: await relay.listen(8787, '127.0.0.1')
+//   relay.attach(httpServer);            // or: await relay.listen(8787)
 // or as a program:
-//   node collab-server.mjs --port 8787 --host 127.0.0.1 --origin https://app.example
+//   node collab-server.mjs --port 8787 --origin https://app.example
+// Both listen on 127.0.0.1 unless told otherwise (`listen(8787, '0.0.0.0')`,
+// `--host 0.0.0.0`): a relay is meant to stand behind a proxy that speaks TLS.
+// Clients send their token in `join`, not in the address (`?token=`), which a
+// proxy writes into its logs; the address is still read, for old clients.
 
 import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync } from 'node:fs';
@@ -1408,8 +1412,11 @@ export function createCollabServer(options = {}) {
       return api;
     },
 
-    /** Opens a server of its own. Plain HTTP requests are answered with 426. */
-    listen(port = 0, host) {
+    /**
+     * Opens a server of its own, on 127.0.0.1 unless `host` says otherwise ('0.0.0.0', '::'
+     * for every interface). Plain HTTP requests are answered with 426.
+     */
+    listen(port = 0, host = '127.0.0.1') {
       if (closed) return Promise.reject(new Error('collab server: it has been closed'));
       if (ownServer) return Promise.reject(new Error('collab server: it is listening already'));
       const server = http.createServer((request, response) => {

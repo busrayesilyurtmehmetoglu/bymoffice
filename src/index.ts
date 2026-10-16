@@ -64,7 +64,15 @@ export { MAX_PASSWORD_CHARS } from './crypto/agile';
 export { MAX_SPIN_COUNT } from './crypto/work';
 export type { PasswordRequest } from './ui/password-dialog';
 export { OpcPackage, type Relationship } from './opc';
-export { ZipArchive, type ZipEntry } from './zip';
+export {
+  ZipArchive,
+  type ZipEntry,
+  PartTooLargeError,
+  MAX_UNPACKED_PART_BYTES,
+  MAX_UNPACKED_XML_BYTES,
+  MAX_UNPACK_RATIO,
+  MIN_UNPACK_BUDGET_BYTES,
+} from './zip';
 export * from './xml';
 export * from './model/sheet/types';
 export * from './model/sheet/color';

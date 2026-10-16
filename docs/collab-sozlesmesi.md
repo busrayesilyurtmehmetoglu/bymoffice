@@ -94,6 +94,10 @@ Damga, **dosyanın durduğu yere yazabilen** biri tarafından sahtelenebilir; o 
 
 Örnek sunucuda oda = isteğin **yol adı** (sorgu hariç) + varsa `join.room`. Yani `wss://example.com/collab/42` adresini açan herkes aynı odadadır. Yetki sizdedir: örnek sunucunun `authorize({ room, token, origin, request })` kancası `true` / `false` / `{ readOnly: true }` döndürür; `origins` seçeneği izinli `Origin` listesidir. Kendi aktarıcınızda `token`'ı (ya da çerezinizi) doğrulayın: **odaya giren herkes dosyanın içeriğini öğrenir ve değiştirebilir.**
 
+Belirteci **adreste (`?token=…`) değil `join` iletisinde** gönderin (`collab: { url, token }` bunu yapar): adres, aradaki vekillerin (nginx, yük dengeleyici, CDN) erişim günlüklerine olduğu gibi düşer. Örnek sunucu eski istemciler için adresteki `token`'ı da okur (yalnız `join` belirteç taşımıyorsa) ve onu kendi günlüğüne yazmaz; vekilin günlüğünü ise koruyamaz.
+
+Örnek sunucu, `--host` (programda) ya da `listen(port, host)`'un ikinci bağımsız değişkeni verilmezse yalnız **`127.0.0.1`**'i dinler: TLS'i (`wss:`) önündeki vekil sağlar. Bütün arayüzleri dinlemesi için açıkça `--host 0.0.0.0` (ya da `listen(8787, '0.0.0.0')`) verin.
+
 ## `ops`: bir adımın içeriği
 
 `ops`, tel işlemlerinin dizisidir; hücre biçimi taşıyan adımda **ilk öğe** biçim tablosudur: `{ "t":"st", "f":[biçim…] }`. İşlemlerdeki biçim alanları (`s`) bu tablonun dizinleridir. Biçim: `{ "n": sayı biçimi (yerleşik biçimin numarası 0–163 ya da kod dizgesi), "f": font, "l": dolgu, "b": kenarlık, "x"?: adlandırılmış stil dizini, "a"?: hizalama, "p"?: koruma, "q"?: true }` (alanlar modeldeki `Font`, `Fill`, `Border`, `Alignment`, `Protection` ile aynıdır; geçişli dolgu `{ "type":"gradient", "xml":"…" }`).
