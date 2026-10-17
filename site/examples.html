@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Usage examples — BYM Office</title>
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script src="assets/i18n.js" defer></script>
+    <script src="assets/site.js" defer></script>
+    <script src="assets/examples.js" defer></script>
+  </head>
+  <body data-title="examples.title">
+    <a class="skip" href="#main" data-i18n="site.skip">Skip to content</a>
+    <header class="top">
+      <div class="wrap">
+        <a class="brand" href="./"><svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#1f5fbf" /><path d="M9 7h9l5 5v13H9z" fill="#fff" /><path d="M18 7v5h5" fill="#cfe0fa" /><path d="M12 16h8M12 19.5h8M12 23h5" stroke="#1f5fbf" stroke-width="1.8" stroke-linecap="round" /></svg><span data-i18n="site.name">BYM Office</span></a>
+        <nav class="nav" data-i18n-attr="aria-label:nav.label" aria-label="Site menu">
+          <ul>
+            <li><a href="./" data-i18n="nav.home">Home</a></li>
+            <li><a href="editor.html" data-i18n="nav.editor">Live editor</a></li>
+            <li><a href="examples.html" aria-current="page" data-i18n="nav.examples">Usage examples</a></li>
+            <li><a href="__BYM_REPOSITORY_URL__" data-i18n="nav.github">GitHub</a></li>
+          </ul>
+        </nav>
+        <label class="lang"><span data-i18n="lang.label">Language</span>
+          <select id="lang">
+            <option value="tr" lang="tr">Türkçe</option>
+            <option value="en" lang="en">English</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <main id="main" class="wrap">
+      <h1 data-i18n="examples.heading">Usage examples</h1>
+      <p class="lead" data-i18n="examples.lead">Every example runs live; the code beside it is the running page itself.</p>
+      <nav data-i18n-attr="aria-label:examples.list" aria-label="Examples">
+        <ul class="toc" id="toc"></ul>
+      </nav>
+      <!-- One section per example, made by assets/examples.js from the list there. -->
+      <div id="examples"></div>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p><span data-i18n="footer.license">Open source under the MIT licence.</span> <span data-i18n="footer.version">Version</span> __BYM_VERSION__.</p>
+        <p data-i18n="footer.fonts">Font shipped with the package: TeX Gyre Bonum (GUST Font License).</p>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: saving by itself</title>
+    <style>
+      html, body { height: 100%; margin: 0; font: 14px system-ui, sans-serif; }
+      body { display: flex; flex-direction: column; }
+      #bar { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 12px; border-bottom: 1px solid #d7dde5; }
+      #editor { flex: 1; min-height: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <span id="state" role="status"></span>
+      <span id="count"></span>
+    </div>
+    <div id="editor"></div>
+
+    <script src="../bymoffice.min.js"></script>
+    <script>
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+      const text = locale === 'tr'
+        ? { saving: 'Kaydediliyor…', dirty: 'Değişti: birazdan kendiliğinden kaydedilecek', saved: 'Kaydedildi', count: 'Kayıt sayısı' }
+        : { saving: 'Saving…', dirty: 'Changed: it is saved by itself in a moment', saved: 'Saved', count: 'Saves' };
+      const state = document.getElementById('state');
+      const count = document.getElementById('count');
+      const saves = [];
+
+      BymOffice.createBlank('xlsx', { locale })
+        .then((file) =>
+          BymOffice.mount(document.getElementById('editor'), {
+            file,
+            locale,
+            // A function here; with a URL, saving by itself needs the server's ETag (see the guide).
+            saveTo: (bytes, info) => {
+              saves.push({ bytes: bytes.length, auto: info.auto === true, at: new Date() });
+              count.textContent = `${text.count}: ${saves.length}`;
+            },
+            // One second after the last change, at the latest ten seconds after the first.
+            autoSave: { delayMs: 1000, maxWaitMs: 10000 },
+            onSaveState: ({ dirty, saving, lastSavedAt, error }) => {
+              state.textContent = error || (saving ? text.saving : dirty ? text.dirty : lastSavedAt ? `${text.saved} ${new Date(lastSavedAt).toLocaleTimeString(locale)}` : '');
+            },
+          }),
+        )
+        .then((mounted) => {
+          window.mounted = mounted;
+          window.saves = saves;
+        })
+        .catch((error) => {
+          state.textContent = error.message;
+        });
+    </script>
+  </body>
+</html>

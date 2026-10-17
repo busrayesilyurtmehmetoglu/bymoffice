@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: the language</title>
+    <style>
+      html, body { height: 100%; margin: 0; font: 14px system-ui, sans-serif; }
+      body { display: flex; flex-direction: column; }
+      #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #d7dde5; }
+      #bar button[aria-pressed='true'] { font-weight: 700; }
+      #editor { flex: 1; min-height: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <button type="button" data-locale="tr" lang="tr">Türkçe (tr)</button>
+      <button type="button" data-locale="en" lang="en">English (en)</button>
+    </div>
+    <div id="editor"></div>
+
+    <script src="../bymoffice.min.js"></script>
+    <script>
+      const start = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+      const buttons = document.querySelectorAll('[data-locale]');
+      const pressed = (locale) => buttons.forEach((button) => button.setAttribute('aria-pressed', String(button.dataset.locale === locale)));
+
+      BymOffice.mount(document.getElementById('editor'), {
+        // The same workbook in either language: 1,200.00 or 1.200,00, and the editor's texts in that language.
+        file: '../samples/sample-sheet-en.xlsx',
+        locale: start, // 'tr' or 'en'; without it, the language of the browser
+      })
+        .then((mounted) => {
+          window.mounted = mounted;
+          pressed(start);
+          buttons.forEach((button) =>
+            button.addEventListener('click', () => {
+              mounted.editor.setLocale(button.dataset.locale); // numbers, dates and the editor's own texts
+              pressed(button.dataset.locale);
+            }),
+          );
+        })
+        .catch((error) => {
+          document.getElementById('editor').textContent = error.message;
+        });
+    </script>
+  </body>
+</html>

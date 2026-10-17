@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: saving</title>
+    <style>
+      html, body { height: 100%; margin: 0; font: 14px system-ui, sans-serif; }
+      body { display: flex; flex-direction: column; }
+      #bar { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 12px; border-bottom: 1px solid #d7dde5; }
+      #editor { flex: 1; min-height: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <span id="state" role="status"></span>
+      <a id="link" hidden></a>
+    </div>
+    <div id="editor"></div>
+
+    <script src="../bymoffice.min.js"></script>
+    <script>
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+      const text = locale === 'tr'
+        ? { saving: 'Kaydediliyor…', dirty: 'Kaydedilmedi (Kaydet ya da Ctrl/Cmd+S)', saved: 'Kaydedildi', link: 'Kaydedilen dosyayı indir' }
+        : { saving: 'Saving…', dirty: 'Not saved (Save or Ctrl/Cmd+S)', saved: 'Saved', link: 'Download the saved file' };
+      const state = document.getElementById('state');
+      const link = document.getElementById('link');
+
+      BymOffice.mount(document.getElementById('editor'), {
+        file: `../samples/sample-sheet-${locale}.xlsx`,
+        locale,
+        // Where the file is saved to. A URL (saveTo: '/files/42') would be sent with PUT;
+        // a function gets the bytes. This page has no server: the bytes become a download link.
+        saveTo: (bytes, info) => {
+          if (link.href) URL.revokeObjectURL(link.href);
+          link.href = URL.createObjectURL(new Blob([bytes]));
+          link.download = `saved.${info.format}`;
+          link.textContent = `${text.link} (${bytes.length} B)`;
+          link.hidden = false;
+        },
+        onSaveState: ({ dirty, saving, error }) => {
+          state.textContent = error || (saving ? text.saving : dirty ? text.dirty : text.saved);
+        },
+      })
+        .then((mounted) => {
+          window.mounted = mounted;
+        })
+        .catch((error) => {
+          state.textContent = error.message;
+        });
+    </script>
+  </body>
+</html>

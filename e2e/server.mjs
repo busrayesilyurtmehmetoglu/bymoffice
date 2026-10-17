@@ -35,6 +35,9 @@ const send = (res, status, text) => {
   res.end(text);
 };
 
+/** Where the demo site is served, as on GitHub Pages. */
+const SITE = '/bymoffice/';
+
 /** Where saved files are sent to and fetched from again. */
 const SAVED = '/e2e/saved/';
 /** A name is letters, digits, dots, dashes and underscores, and does not start with a dot: it is never a path. */
@@ -157,6 +160,9 @@ const server = createServer(async (req, res) => {
   // The one place that takes what a page sends; its names are checked there, and never reach the disk.
   if (pathname.startsWith(SAVED)) return savedFile(req, res, pathname.slice(SAVED.length));
   if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed');
+  // The demo site (site-dist/, made by scripts/build-site.mjs) under the path it is published at,
+  // with a folder's index.html as GitHub Pages gives it. The checks below apply to it as to any path.
+  if (pathname.startsWith(SITE)) pathname = `/site-dist/${pathname.slice(SITE.length)}${pathname.endsWith('/') ? 'index.html' : ''}`;
   // Reject NUL bytes, backslashes and any dot-segment or hidden file (.git, .env, ..).
   if (pathname.includes('\0') || pathname.includes('\\') || pathname.split('/').some((part) => part.startsWith('.'))) {
     return send(res, 403, 'Forbidden');

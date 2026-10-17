@@ -100,7 +100,6 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 | Grafiklerde (xlsx), gösterim: `chartex` **bölge haritası** (`regionMap`; harita verisi gerekir — yedeği gösterilir) ve `chartex` grafiklerinin düzenlenmesi, taşınması, kopyalanması, silinmesi; `chartex`'te stil ve renk parçaları (`style`/`colors`: yalnız tema vurgu renkleri kullanılır), kutu-bıyıkta veri etiketleri, ağaç haritası / güneş patlamasında tek nokta etiketleri, eksen başlıkları ve görüntü birimleri, yalnız ilk düzenin (birden çok düzen içeren grafikte) ve aynı düzende yalnız ilk serinin çizilmesi (kutu-bıyık hariç); yüzey grafiğinin 3B perspektifi (yukarıdan çizilir); pasta-çubuk / pasta-pasta grafiğinin (`ofPieChart`) **ikinci çizimi** (yalnız pasta çizilir, ikinci çizimin noktaları tek dilimdir); 3B görünüm (düz çizilir); **veri etiketlerinde** kılavuz çizgisi (`showLeaderLines`), gösterge anahtarı (`showLegendKey`), etiketin elle yeri, etiket kutusunun dolgusu/kenarlığı ve döndürülmesi, zengin metnin biçimi (düz metni yazılır); **eğilim çizgisinin** denklemi ve R² etiketi, elle kesişim (`intercept`), göstergedeki girdisi; hata çubuklarının eksen ölçeğini genişletmesi; yığılmış çubuklar arasındaki seri çizgileri (`serLines`); **veri tablosu** (`c:dTable`); görüntü birimleri (`dispUnits`); eksende ara çentik birimi (`minorUnit`) ve çentik işaretleri; radar grafiğinde logaritmik eksen; yatık çubukta ve dağılımda döndürülmüş / iki düzeyli kategori etiketi, yatık çubukta tarih ekseni (kategori ekseni gibi çizilir), üçüncü ve sonraki kategori düzeyleri; ikiden çok değer ekseni (üçüncüsünün serileri ikinciye çizilir); elle yerleşimde `factor` kipi (çizim alanı ve göstergede; yalnız başlıkta uygulanır); gradyan, desen ve resim dolgu (gradyan ilk rengi, desen ön rengi olarak), saydamlık (beyaz üzerinde göründüğü renk; kabarcıklar opak), gölge ve efektler; grafik stil numarası (`c:style`), grafik içine çizilmiş şekiller (`userShapes`); xls dosyalarındaki grafikler (BIFF grafik kayıtları okunmaz) | Yok. Grafik parçası dosyada bayt bayt korunur; okunmayan türde grafik yer tutucu olarak görünür, çizilen grafikte çizilmeyenler `chart.notes` listesinde yazar |
 | Hücre notlarında: iş parçacıklı yorumu (Excel 365 "yorum"; yazışma) düzenleme, silme ve yanıtlama; yeni yazışma başlatma; not kutusunu taşıma/boyutlandırma ve "hep göster" ayarını değiştirme; notta zengin metin (kalın, renk); yorum zincirinin kopyalanması ve satırıyla sıralanması; editör araç çubuğunda not düğmesi; köprüde not komutu; xls'e yazma | Yok. İş parçacıklı yorumu olan hücrede not komutları nedeniyle birlikte devre dışıdır ve yorum dosyada bayt bayt kalır. Biçimli bir notun metni düzenlenirse not **tek biçimli düz metin** olur (düzenlenmeyen notların biçimi korunur). Yorum zinciri içeren aralık sıralanmaz; kopyalanan/kesilen hücrenin yorum zinciri yerinde kalır. Hücre içeriğini silmek (Delete) notu silmez |
 | Aynı yere kaydetmede (`saveTo`): köprüde kendiliğinden kaydetmeyi çalışırken açıp kapatma iletisi ve beklemede olduğunu söyleyen ileti alanı; ETag'siz sunucuda kendiliğinden kaydetme (`unconditional: true` verilmedikçe bekler); 412'den sonra sunucudaki dosyayı yeniden yükleme ya da birleştirme (çakışmada editör yalnız "Üzerine yaz / Vazgeç" diye sorar; sunucudaki sürümü göstermez, saklamaz); yanıtı gelmeyen kayıttan sonra ETag'i yenileme; `autoSave` kapalıyken başarısız kaydı kendiliğinden yeniden deneme; yükleme ilerlemesi; işlev kaydedicinin 10 dakikalık sınırını değiştirme; "farklı kaydet" / indirme düğmesi; `onSaveState.error` için makinece okunur kod (kod `onError`'daki `SaveError.code`'dadır) | Yok. Kendiliğinden kaydetme `autoSave` ile açılır (beklediği `onSaveState.autoPaused` ile anlaşılır); indirme için işlev kaydedici yazılır (`examples/html`) |
-| npm ve CDN'den kurulum | Paket henüz yayımlanmadı; depodan derlenir |
 | 4 GB ve üzeri arşiv yazma | Yok |
 
 ## 2. Kurulum
@@ -368,7 +367,7 @@ Bir adresten açılan dosya düzenlenir ve **aynı adrese** geri kaydedilir; kay
 </script>
 ```
 
-(Paket henüz yayımlanmadığı için CDN adresi yerine şimdilik kendi sunucunuzdaki `dist/bymoffice.min.js` kullanılır.) ES modülüyle aynıdır: `import { mount } from 'bymoffice'; await mount(el, { file: '/files/42', saveTo: true });`
+Betiği kendi sunucunuzdan sunuyorsanız CDN adresi yerine `dist/bymoffice.min.js`'in adresini yazın. ES modülüyle aynıdır: `import { mount } from 'bymoffice'; await mount(el, { file: '/files/42', saveTo: true });`
 
 `saveTo` verildiğinde:
 
@@ -2400,6 +2399,22 @@ Sayfada yapabilecekleriniz:
 
 Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez. Tek istisna `saveTo` denemesidir: orada **yalnız sayfanın kendi ürettiği boş dosya** ve ona yazdıklarınız, sayfayı sunan yerel sınama sunucusuna (`127.0.0.1`) gönderilir; sürükleyip bıraktığınız dosyalar o bölüme girmez.
 
+### Demo sitesi
+
+Test arayüzünden (`demo/index.html`, geliştirici içindir) ayrı, kullanıcıya dönük, herkese açık bir demo sitesi vardır. Kaynağı `site/`, çıktısı `site-dist/`'tir (depoya girmez):
+
+```sh
+pnpm site            # pnpm build + node scripts/build-site.mjs → site-dist/
+```
+
+- **Sayfalar:** ana sayfa (`index.html`: ne olduğu, kurulum), canlı düzenleyici (`editor.html`: dosya sürükle-bırak ya da seç, boş belge/tablo, örnek tablo/belge, İndir, PDF indir, Salt okunur) ve kullanım örnekleri (`examples.html`). Hepsi Türkçe ve İngilizcedir: dil üstteki seçiciyle değişir ve tarayıcıda hatırlanır (`localStorage`; yoksa tarayıcının dili Türkçeyse Türkçe, değilse İngilizce). Metinler tek bir sözlükte durur (`site/assets/i18n.js`); derleme iki dilin aynı anahtarları taşıdığını ve sayfaların andığı her anahtarın var olduğunu denetler.
+- **Dosya tarayıcıdan çıkmaz:** canlı düzenleyicide açılan dosya `mount()`'a verilir, hiçbir yere gönderilmez; doc, xls ve RTF `convert: true` ile docx/xlsx'e çevrilerek düzenlenir (Salt okunur işaretliyse çevrilmeden gösterilir).
+- **Örnek dosyalar** derlemede Node'da, motorun açık API'siyle (`createBlank`, `setCellInput`, `formatRange`, `addChart`, `CalcEngine`, `docOps`) sentetik içerikle üretilir ve yeniden açılıp denetlenir (`scripts/site-samples.mjs` → `site-dist/samples/`; tablo: değerler, formüller, sayı biçimleri, iki grafik; belge: başlıklar, listeler, tablo; her biri TR ve EN).
+- **Kullanım örnekleri** birer sayfadır (`site/examples/*.html`: tek `<script>`, ES modülü, salt okunur, `saveTo` işlevi, `autoSave`, `collab` + `BymOffice.collab.memoryServer()`, `exportPdf()`, köprü sayfası `bymoffice.webview.html` bir iframe'de, `locale`/`setLocale`). Her biri örnekler sayfasında iframe'de çalışır (ekrana yaklaşınca başlar); yanında gösterilen kod **aynı dosyadan** derlemede üretilir (`examples/code.json`), yalnız paketin site içi adresleri (`../bymoffice.min.js`, `../bymoffice.esm.js`, `'../fonts/'`) `https://cdn.jsdelivr.net/npm/bymoffice@<sürüm>/dist/…` olarak yazılır ve sitenin eklediği CSP satırı gösterilmez. Köprü örneği aynı kökendeki iframe ile `BymOfficeHost.postMessage` / `BymOfficeBridge.receive` kanalını kullanır (başka kökende `window.postMessage` ve izin listesi gerekir: [köprü belgesi](webview-koprusu.md), Bölüm 5).
+- **Güvenlik:** sitenin bütün adresleri görelidir (site `/bymoffice/` gibi bir alt yolda çalışır); başka bir sunucudan hiçbir şey (betik, font, analitik) istenmez — derleme, sayfalarda başka köken ya da kök göreli adres bulursa durur. Her sayfa bir CSP meta etiketi taşır (`default-src 'self'`; örnek sayfalarının satır içi betikleri özetleriyle izinlidir; motor kendi `<style>` öğesini eklediği için `style-src 'unsafe-inline'`). Dosyadan ya da motordan gelen metin yalnız `textContent` ile basılır.
+- **Yayımlama:** `.github/workflows/pages.yml`, `main`'e her gönderimde `pnpm install --frozen-lockfile && pnpm site` çalıştırır ve `site-dist/`'i GitHub Pages'e yükler (depo ayarlarında Pages kaynağı "GitHub Actions" olmalı). Depo kapalıyken çalışmaz; depo açılınca kullanılır. Sitedeki depo adresi tek bir sabittedir (`scripts/site-config.mjs` `REPOSITORY`).
+- **Sınama:** `pnpm e2e` (ve dolayısıyla `pnpm verify`) siteyi de derler; `e2e/site.spec.ts` onu sınama sunucusunun `/bymoffice/` yolundan sunar (Pages'teki gibi). Elle bakmak için: `pnpm site && E2E_PORT=4318 node e2e/server.mjs`, ardından `http://127.0.0.1:4318/bymoffice/`.
+
 ## 7. Geliştirme komutları
 
 | Komut | İş |
@@ -2409,7 +2424,8 @@ Dosyalar yalnız tarayıcıda işlenir; hiçbir yere gönderilmez. Tek istisna `
 | `pnpm test` | Birim testleri |
 | `pnpm build` | `dist/` çıktıları |
 | `pnpm pack:check` | Paketi arşivleyip boş bir projeye kurar ve oradan kullanır (ES modülü, tipler, `<script>`); önce `pnpm build` gerekir |
-| `pnpm e2e` | Derler ve Playwright testlerini 5 tarayıcı profilinde çalıştırır |
+| `pnpm e2e` | Derler (paket ve demo sitesi) ve Playwright testlerini 5 tarayıcı profilinde çalıştırır |
+| `pnpm site` | Demo sitesini `site-dist/`'e derler (önce `pnpm build`); bkz. "Demo sitesi" |
 | `pnpm corpus <klasör> …` | Gerçek dosyalarda aç → kaydet → yeniden aç denetimi (`BYM_NO_NATIVE=1` ile motorun kendi sıkıştırma koduyla); her xls ayrıca xlsx'e çevrilip yeniden okunur ve iki model karşılaştırılır ("converted to xlsx and read back") |
 | `pnpm demo` | Derler ve test arayüzünü sunar |
 

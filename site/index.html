@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="BYM Office: a viewer and editor for Word and Excel files (docx, xlsx, doc, xls, RTF) that runs in the browser." />
+    <title>BYM Office — Word and Excel in the browser</title>
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <script src="assets/i18n.js" defer></script>
+    <script src="assets/site.js" defer></script>
+  </head>
+  <body data-title="home.title">
+    <a class="skip" href="#main" data-i18n="site.skip">Skip to content</a>
+    <header class="top">
+      <div class="wrap">
+        <a class="brand" href="./"><svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#1f5fbf" /><path d="M9 7h9l5 5v13H9z" fill="#fff" /><path d="M18 7v5h5" fill="#cfe0fa" /><path d="M12 16h8M12 19.5h8M12 23h5" stroke="#1f5fbf" stroke-width="1.8" stroke-linecap="round" /></svg><span data-i18n="site.name">BYM Office</span></a>
+        <nav class="nav" data-i18n-attr="aria-label:nav.label" aria-label="Site menu">
+          <ul>
+            <li><a href="./" aria-current="page" data-i18n="nav.home">Home</a></li>
+            <li><a href="editor.html" data-i18n="nav.editor">Live editor</a></li>
+            <li><a href="examples.html" data-i18n="nav.examples">Usage examples</a></li>
+            <li><a href="__BYM_REPOSITORY_URL__" data-i18n="nav.github">GitHub</a></li>
+          </ul>
+        </nav>
+        <label class="lang"><span data-i18n="lang.label">Language</span>
+          <select id="lang">
+            <option value="tr" lang="tr">Türkçe</option>
+            <option value="en" lang="en">English</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <main id="main" class="wrap">
+      <h1 data-i18n="home.tagline">A viewer and editor for Word and Excel files that runs in the browser</h1>
+      <p class="lead" data-i18n="home.lead">Open, edit and save docx, xlsx, doc, xls and RTF files in your page.</p>
+      <div class="actions">
+        <a class="button primary" href="editor.html" data-i18n="home.ctaEditor">Open the live editor</a>
+        <a class="button" href="examples.html" data-i18n="home.ctaExamples">See the usage examples</a>
+      </div>
+
+      <h2 data-i18n="home.featuresTitle">What it does</h2>
+      <div class="grid">
+        <section class="card"><h3 data-i18n="feature.formats.title"></h3><p data-i18n="feature.formats.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.browser.title"></h3><p data-i18n="feature.browser.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.deps.title"></h3><p data-i18n="feature.deps.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.lossless.title"></h3><p data-i18n="feature.lossless.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.collab.title"></h3><p data-i18n="feature.collab.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.pdf.title"></h3><p data-i18n="feature.pdf.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.webview.title"></h3><p data-i18n="feature.webview.body"></p></section>
+        <section class="card"><h3 data-i18n="feature.more.title"></h3><p data-i18n="feature.more.body"></p></section>
+      </div>
+
+      <h2 data-i18n="home.installTitle">Installation</h2>
+      <p data-i18n="home.installCdn">From a CDN, one line:</p>
+      <div class="code">
+        <pre id="install-cdn"><code>&lt;script src="__BYM_CDN__bymoffice.min.js"&gt;&lt;/script&gt;</code></pre>
+        <button type="button" class="copy" data-copy-for="install-cdn" data-i18n="code.copy">Copy</button>
+      </div>
+      <p data-i18n="home.installNpm">With npm:</p>
+      <div class="code">
+        <pre id="install-npm"><code>npm i bymoffice</code></pre>
+        <button type="button" class="copy" data-copy-for="install-npm" data-i18n="code.copy">Copy</button>
+      </div>
+      <p data-i18n="home.installUse">Showing a file in a box:</p>
+      <div class="code">
+        <pre id="install-use"><code>&lt;div id="editor" style="height: 600px"&gt;&lt;/div&gt;
+&lt;script src="__BYM_CDN__bymoffice.min.js"&gt;&lt;/script&gt;
+&lt;script&gt;
+  BymOffice.mount(document.getElementById('editor'), {
+    file: '/files/report.xlsx', // a URL, a File/Blob, an ArrayBuffer or a Uint8Array
+    locale: 'tr',
+    onSave: (bytes) =&gt; console.log('Ctrl+S:', bytes.length, 'bytes'),
+  });
+&lt;/script&gt;
+
+// npm:
+import { mount } from 'bymoffice';
+await mount(document.getElementById('editor'), { file, fontsUrl: '/assets/bymoffice-fonts/' });</code></pre>
+        <button type="button" class="copy" data-copy-for="install-use" data-i18n="code.copy">Copy</button>
+      </div>
+      <p class="muted"><span data-i18n="home.installNote">The API in detail is in the developer guide.</span> <a href="__BYM_REPOSITORY_URL__/blob/main/docs/kullanim-kilavuzu.md" data-i18n="home.guide">Developer guide</a></p>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p><span data-i18n="footer.license">Open source under the MIT licence.</span> <span data-i18n="footer.version">Version</span> __BYM_VERSION__.</p>
+        <p data-i18n="footer.fonts">Font shipped with the package: TeX Gyre Bonum (GUST Font License).</p>
+      </div>
+    </footer>
+  </body>
+</html>

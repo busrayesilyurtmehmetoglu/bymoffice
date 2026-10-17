@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: one script tag</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #editor { height: 100%; }
+    </style>
+  </head>
+  <body>
+    <div id="editor"></div>
+
+    <script src="../bymoffice.min.js"></script>
+    <script>
+      // The language of the editor (the site passes its own: ?lang=tr or ?lang=en).
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+
+      BymOffice.mount(document.getElementById('editor'), {
+        file: `../samples/sample-sheet-${locale}.xlsx`, // a URL, a File/Blob, an ArrayBuffer or a Uint8Array
+        locale,
+      })
+        .then((mounted) => {
+          window.mounted = mounted; // to try the API from the browser console
+        })
+        .catch((error) => {
+          document.getElementById('editor').textContent = error.message;
+        });
+    </script>
+  </body>
+</html>

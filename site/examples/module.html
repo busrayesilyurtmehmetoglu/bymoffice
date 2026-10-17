@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: an ES module</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #editor { height: 100%; }
+    </style>
+  </head>
+  <body>
+    <div id="editor"></div>
+
+    <script type="module">
+      // With npm: import { mount } from 'bymoffice';
+      import { mount } from '../bymoffice.esm.js';
+
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+      const editor = document.getElementById('editor');
+      try {
+        window.mounted = await mount(editor, {
+          file: `../samples/sample-doc-${locale}.docx`,
+          locale,
+          // A module does not know its own address: say where the font folder of the package is
+          // (dist/fonts/ of the package, wherever it is served from).
+          fontsUrl: '../fonts/',
+        });
+      } catch (error) {
+        editor.textContent = error.message;
+      }
+    </script>
+  </body>
+</html>

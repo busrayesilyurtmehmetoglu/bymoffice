@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: the WebView bridge</title>
+    <style>
+      html, body { height: 100%; margin: 0; font: 14px system-ui, sans-serif; }
+      body { display: flex; flex-direction: column; }
+      #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 12px; border-bottom: 1px solid #d7dde5; }
+      #frame { flex: 1; min-height: 240px; width: 100%; border: 0; }
+      #log { height: 132px; overflow: auto; margin: 0; padding: 6px 12px; border-top: 1px solid #d7dde5; background: #f4f6f9; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; list-style: none; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <button id="sheet" type="button"></button>
+      <button id="doc" type="button"></button>
+      <button id="save" type="button" disabled></button>
+      <a id="link" hidden></a>
+    </div>
+    <!-- The bridge page that apps ship (dist/bymoffice.webview.html), served by this site. -->
+    <iframe id="frame" src="../bymoffice.webview.html" title="BYM Office"></iframe>
+    <ul id="log" aria-live="polite"></ul>
+
+    <script>
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+      const text = locale === 'tr'
+        ? { sheet: 'Tablo yükle', doc: 'Belge yükle', save: 'Kaydet (save)', link: 'Kaydedilen dosyayı indir' }
+        : { sheet: 'Load a workbook', doc: 'Load a document', save: 'Save (save)', link: 'Download the saved file' };
+      for (const id of ['sheet', 'doc', 'save']) document.getElementById(id).textContent = text[id];
+      const frame = document.getElementById('frame');
+      const log = document.getElementById('log');
+      const link = document.getElementById('link');
+      let serial = 0;
+      let name = '';
+
+      /** Shows a message in the list: as text, with the file's bytes left out. */
+      function note(direction, message) {
+        const shown = { ...message };
+        if (typeof shown.data === 'string') shown.data = `<${shown.data.length} base64 characters>`;
+        const item = document.createElement('li');
+        item.textContent = `${direction} ${JSON.stringify(shown)}`;
+        log.appendChild(item);
+        log.scrollTop = log.scrollHeight;
+      }
+
+      // App -> page. In a WebView this is the app's "run JavaScript" call; in an iframe of the
+      // same origin the page's function is called directly. (An iframe of another origin uses
+      // window.postMessage, once the bridge page lists the parent's origin: see the bridge guide.)
+      function send(message) {
+        note('→', message);
+        frame.contentWindow.BymOfficeBridge.receive(JSON.stringify(message));
+      }
+
+      // Page -> app: the first channel the bridge page looks for is window.BymOfficeHost.
+      function receive(json) {
+        const message = JSON.parse(json);
+        note('←', message);
+        if (message.type === 'ready' && serial === 0) loadBlank('xlsx');
+        if (message.type === 'loaded') document.getElementById('save').disabled = false;
+        if (message.type === 'saved' && message.data) {
+          const bytes = Uint8Array.from(atob(message.data), (c) => c.charCodeAt(0));
+          if (link.href) URL.revokeObjectURL(link.href);
+          link.href = URL.createObjectURL(new Blob([bytes]));
+          link.download = name;
+          link.textContent = `${text.link} (${bytes.length} B)`;
+          link.hidden = false;
+        }
+      }
+
+      function loadBlank(kind) {
+        name = kind === 'docx' ? 'document.docx' : 'workbook.xlsx';
+        send({ type: 'load', id: String(++serial), blank: kind, name, locale });
+      }
+
+      frame.addEventListener('load', () => {
+        frame.contentWindow.BymOfficeHost = { postMessage: receive };
+        // Asks for "ready" again, in case it was sent before the channel was there.
+        send({ type: 'hello' });
+      });
+      document.getElementById('sheet').addEventListener('click', () => loadBlank('xlsx'));
+      document.getElementById('doc').addEventListener('click', () => loadBlank('docx'));
+      document.getElementById('save').addEventListener('click', () => send({ type: 'save', id: String(++serial) }));
+    </script>
+  </body>
+</html>

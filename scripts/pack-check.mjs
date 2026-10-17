@@ -28,11 +28,11 @@ for (const file of ['dist/bymoffice.min.js', 'dist/bymoffice.esm.js', 'dist/type
 // 1. What goes into the archive.
 const packed = JSON.parse(run('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', work], root))[0];
 const names = packed.files.map((file) => file.path);
-for (const wanted of ['package.json', 'README.md', 'CHANGELOG.md', 'dist/bymoffice.min.js', 'dist/bymoffice.esm.js', 'dist/bymoffice.webview.html', 'dist/types/index.d.ts']) {
+for (const wanted of ['package.json', 'README.md', 'README.tr.md', 'CHANGELOG.md', 'dist/bymoffice.min.js', 'dist/bymoffice.esm.js', 'dist/bymoffice.webview.html', 'dist/types/index.d.ts']) {
   if (!names.includes(wanted)) fail(`the archive lacks ${wanted}`);
 }
 // server/: the example relay for collaborative editing (two files, no dependencies).
-const stray = names.filter((name) => !/^(package\.json|README\.md|CHANGELOG\.md|THIRD-PARTY-NOTICES\.md|LICENSE[^/]*|dist\/.+|server\/collab-server\.(mjs|d\.mts))$/.test(name));
+const stray = names.filter((name) => !/^(package\.json|README(\.tr)?\.md|CHANGELOG\.md|THIRD-PARTY-NOTICES\.md|LICENSE[^/]*|dist\/.+|server\/collab-server\.(mjs|d\.mts))$/.test(name));
 if (stray.length) fail(`the archive holds files that are not part of the package: ${stray.slice(0, 5).join(', ')}`);
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 // No source maps: neither as files nor named by the scripts (a CDN would answer that name with a 404).

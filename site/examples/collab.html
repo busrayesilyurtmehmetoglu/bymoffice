@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: editing together</title>
+    <style>
+      html, body { height: 100%; margin: 0; }
+      body { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px; box-sizing: border-box; }
+      .editor { flex: 1 1 320px; min-width: 0; height: calc(100% - 4px); min-height: 280px; border: 1px solid #d7dde5; }
+      @media (max-width: 680px) { .editor { height: calc(50% - 8px); } }
+    </style>
+  </head>
+  <body>
+    <div class="editor" id="first"></div>
+    <div class="editor" id="second"></div>
+
+    <script src="../bymoffice.min.js"></script>
+    <script>
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+
+      // A relay inside the page, for trying it out: both editors are in this page.
+      // In real use `collab` is the address of a relay ('wss://example.com/collab/42'),
+      // or a transport of your own: { send(text), onMessage(callback), close() }.
+      const relay = BymOffice.collab.memoryServer();
+      const people = [
+        { box: 'first', user: { name: 'Ayşe', color: '#D93025' } },
+        { box: 'second', user: { name: 'Deniz', color: '#1A73E8' } },
+      ];
+
+      (async () => {
+        // Everyone in a room starts from the same file.
+        const file = await BymOffice.createBlank('xlsx', { locale });
+        window.mounted = [];
+        for (const person of people) {
+          window.mounted.push(
+            await BymOffice.mount(document.getElementById(person.box), {
+              file: file.slice(),
+              locale,
+              collab: { transport: relay.connect(), user: person.user },
+            }),
+          );
+        }
+      })().catch((error) => {
+        document.body.textContent = error.message;
+      });
+    </script>
+  </body>
+</html>

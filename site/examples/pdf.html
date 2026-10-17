@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="__BYM_CSP__" />
+    <title>BYM Office: making a PDF</title>
+    <style>
+      html, body { height: 100%; margin: 0; font: 14px system-ui, sans-serif; }
+      body { display: flex; flex-direction: column; }
+      #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid #d7dde5; }
+      #editor { flex: 1; min-height: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <button id="pdf" type="button" disabled></button>
+      <span id="state" role="status"></span>
+    </div>
+    <div id="editor"></div>
+
+    <script src="../bymoffice.min.js"></script>
+    <script>
+      const locale = new URLSearchParams(location.search).get('lang') === 'tr' ? 'tr' : 'en';
+      const text = locale === 'tr' ? { button: 'PDF olarak indir', making: 'PDF hazırlanıyor…' } : { button: 'Download as PDF', making: 'Making the PDF…' };
+      const button = document.getElementById('pdf');
+      const state = document.getElementById('state');
+      button.textContent = text.button;
+
+      BymOffice.mount(document.getElementById('editor'), { file: `../samples/sample-doc-${locale}.docx`, locale })
+        .then((mounted) => {
+          window.mounted = mounted;
+          button.disabled = false;
+          button.addEventListener('click', async () => {
+            button.disabled = true;
+            state.textContent = text.making;
+            try {
+              const pdf = await mounted.exportPdf({ title: 'BYM Office' }); // Uint8Array, "%PDF-1.4…"
+              const link = document.createElement('a');
+              link.href = URL.createObjectURL(new Blob([pdf], { type: 'application/pdf' }));
+              link.download = 'document.pdf';
+              link.click();
+              setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+              state.textContent = `${pdf.length} B`;
+            } catch (error) {
+              state.textContent = error.message;
+            }
+            button.disabled = false;
+          });
+        })
+        .catch((error) => {
+          state.textContent = error.message;
+        });
+    </script>
+  </body>
+</html>
