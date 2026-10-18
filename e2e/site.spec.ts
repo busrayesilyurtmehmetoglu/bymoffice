@@ -147,19 +147,20 @@ test.describe('demo site: pages and languages', () => {
   });
 });
 
-test.describe('demo site: the default language is that of the browser (tr)', () => {
+test.describe('demo site: English first, even in a Turkish browser', () => {
   test.use({ locale: 'tr-TR' });
-  test('a Turkish browser gets the Turkish site', async ({ page }) => {
+  test('the first visit is in English; ?lang=tr opens Turkish and is remembered', async ({ page }) => {
     await page.goto(SITE);
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    await expect(page.locator('#lang')).toHaveValue('en');
+
+    await page.goto(`${SITE}?lang=tr`);
     await expect(page.locator('html')).toHaveAttribute('lang', 'tr');
     await expect(page.locator('#lang')).toHaveValue('tr');
-  });
-});
+    await page.goto(`${SITE}examples.html`);
+    await expect(page.locator('html')).toHaveAttribute('lang', 'tr');
 
-test.describe('demo site: the default language is that of the browser (en)', () => {
-  test.use({ locale: 'de-DE' });
-  test('a browser in another language gets the English site', async ({ page }) => {
-    await page.goto(SITE);
+    await page.goto(`${SITE}?lang=en`);
     await expect(page.locator('html')).toHaveAttribute('lang', 'en');
   });
 });

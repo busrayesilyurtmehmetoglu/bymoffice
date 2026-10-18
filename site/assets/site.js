@@ -21,11 +21,20 @@
       // A private window or blocked storage: the choice lasts as long as the page.
     }
   }
+  /** `?lang=tr` or `?lang=en` in the address: a link that opens the site in a given language. */
+  function asked() {
+    var match = /[?&]lang=(tr|en)(?:&|#|$)/.exec(window.location.search);
+    return match ? match[1] : null;
+  }
+  // English first, whatever the language of the browser; Turkish when the address asks for it
+  // or the visitor chose it before.
   function initial() {
-    var given = stored();
-    if (given) return given;
-    var nav = String((navigator.languages && navigator.languages[0]) || navigator.language || '').toLowerCase();
-    return nav === 'tr' || nav.indexOf('tr-') === 0 ? 'tr' : 'en';
+    var given = asked();
+    if (given) {
+      remember(given);
+      return given;
+    }
+    return stored() || 'en';
   }
 
   var lang = initial();

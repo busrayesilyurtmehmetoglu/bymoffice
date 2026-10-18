@@ -3,7 +3,7 @@
 **Word ve Excel dosyalarını tarayıcıda açın, düzenleyin, kaydedin — docx, xlsx, doc, xls ve RTF.**
 TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu yok, çalışma zamanı bağımlılığı yok.
 
-[Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
+[Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/?lang=tr) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>
