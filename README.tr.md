@@ -3,7 +3,7 @@
 **Word ve Excel dosyalarını tarayıcıda açın, düzenleyin, kaydedin — docx, xlsx, doc, xls ve RTF.**
 TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu yok, çalışma zamanı bağımlılığı yok.
 
-[Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/?lang=tr) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [Sunucuya kaydetme (İngilizce)](docs/server.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
+[Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/?lang=tr) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [Sunucuya kaydetme (İngilizce)](docs/server.md) · [API başvurusu (İngilizce)](docs/api.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
@@ -30,7 +30,7 @@ TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu y
 **Excel (xlsx; xls salt okunur açılır ya da xlsx'e çevrilir)**
 - Yalnız görünen alanı çizen Canvas ızgara; dondurulmuş bölmeler, gizli satır/sütun, sayfa sekmeleri.
 - Hücre düzenleme, biçim araç çubuğu, sayı biçimleri (Türkçe ve İngilizce yerel ayar), birleştirme, kenarlık, koşullu biçim, veri doğrulama, süzgeç ve sıralama.
-- Formüller: 265 fonksiyon, artımlı yeniden hesap, dinamik diziler (taşma, `A1#`), `LET` ve `LAMBDA`.
+- Formüller: 266 fonksiyon, artımlı yeniden hesap, dinamik diziler (taşma, `A1#`), `LET` ve `LAMBDA`.
 - Grafikler (çizme, ekleme, düzenleme, kopyalama), pivot tablolar (yenileme, oluşturma, alan değiştirme, silme), görseller ve şekiller, notlar, sayfa koruması.
 - Yazdırma, baskı önizleme, sayfa yapısı, PDF.
 
@@ -89,7 +89,7 @@ Yalnız ES modülü ve `<script>` çıktısı dağıtılır (CommonJS çıktıs�
 
 **Dosya sunabilen ve `PUT` alabilen her arka uçla çalışır.** Aynı yere kaydetme (`saveTo`) 2026-11-03'te Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby ve Dart ile sınandı: açma, düzenleme, kaydetme, ETag ve çakışma. Laravel, Django, ASP.NET Core ve Node örnekleri, CSRF başlıkları ve büyük kayıtları engelleyen istek boyutu sınırları (varsayılan: Django 2,5 MB, PHP 8 MB, ASP.NET Core yaklaşık 28,6 MB) [Sunucuya kaydetme](docs/server.md) belgesinde.
 
-Tablonun ön yüz satırları bir tariftir, test raporu değil: Next.js, React Native, Electron, Tauri ve gerçek mobil WebView'ler henüz denenmedi. Motorun kendisi her değişiklikte Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır. `DecompressionStream` olmayan eski WebView'lerde motor kendi inflate/deflate kodunu kullanır.
+Vite, React ve Vue örnekleri ([Vite](examples/vite), [React](examples/react-vite), [Vue](examples/vue-vite)) yayımlanan paketle derlenip her değişiklikte tarayıcıda sınanır. Tablonun öbür ön yüz satırları bir tariftir, test raporu değil: Svelte, Angular, webpack, Next.js, React Native, Electron, Tauri ve gerçek mobil WebView'ler henüz denenmedi. Motorun kendisi her değişiklikte Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır. `DecompressionStream` olmayan eski WebView'lerde motor kendi inflate/deflate kodunu kullanır.
 
 ## Geliştirme
 

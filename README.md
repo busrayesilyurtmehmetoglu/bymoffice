@@ -3,7 +3,7 @@
 **Open, edit and save Word and Excel files in the browser — docx, xlsx, doc, xls and RTF.**
 A document and spreadsheet engine written from scratch in TypeScript: one script, no server, no runtime dependencies.
 
-[Live demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/) · [Türkçe](README.tr.md) · [Saving to your server](docs/server.md) · [Developer guide (Turkish)](docs/kullanim-kilavuzu.md) · [WebView bridge](docs/webview-koprusu.md) · [Changelog](CHANGELOG.md)
+[Live demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/) · [Türkçe](README.tr.md) · [API reference](docs/api.md) · [Saving to your server](docs/server.md) · [Developer guide (Turkish)](docs/kullanim-kilavuzu.md) · [WebView bridge](docs/webview-koprusu.md) · [Changelog](CHANGELOG.md)
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
@@ -29,7 +29,7 @@ A document and spreadsheet engine written from scratch in TypeScript: one script
 **Excel (xlsx; xls opens read-only or is converted to xlsx)**
 - Canvas grid that draws only what is visible; frozen panes, hidden rows/columns, sheet tabs.
 - Cell editing, formatting toolbar, number formats (Turkish and English locales), merge, borders, conditional formats, data validation, filter and sort.
-- Formulas: 265 functions, incremental recalculation, dynamic arrays (spills, `A1#`), `LET` and `LAMBDA`.
+- Formulas: 266 functions, incremental recalculation, dynamic arrays (spills, `A1#`), `LET` and `LAMBDA`.
 - Charts (draw, insert, edit, copy), pivot tables (refresh, create, change fields, delete), pictures and shapes, notes, sheet protection.
 - Print, print preview, page setup, PDF export.
 
@@ -81,14 +81,15 @@ Only the ES module and the `<script>` build are shipped (no CommonJS build). Typ
 | Where | How |
 |---|---|
 | Plain HTML, Laravel/Blade, Django, Rails, PHP … | `<script>` from the CDN, then `BymOffice.mount(...)` |
-| React, Vue, Svelte, Angular | `import { mount } from 'bymoffice'` in an effect / `onMounted`; call `destroy()` on unmount |
+| React, Vue (with Vite) | `import { mount } from 'bymoffice'` in an effect / `onMounted`; call `destroy()` on unmount. Tested examples: [Vite](examples/vite), [React](examples/react-vite), [Vue](examples/vue-vite) |
+| Svelte, Angular | The same pattern as React and Vue |
 | Next.js, Nuxt | Client side only: a `'use client'` component, or a dynamic import with SSR off |
 | Flutter, React Native, native iOS/Android, Electron, Tauri | Load `bymoffice.webview.html` in a WebView and talk to it with messages (`load`, `save`, `changed`, `error` …) — see [the bridge contract](docs/webview-koprusu.md) |
 | Node, Bun | `open()`, the edit operations and `save()` work without a screen |
 
 **Works with any backend that can serve a file and accept a `PUT`.** Saving back (`saveTo`) was tested on 2026-11-03 with Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby and Dart: open, edit, save, ETag and conflict. Examples for Laravel, Django, ASP.NET Core and Node, CSRF headers and the request size limits that block large saves (Django 2.5 MB, PHP 8 MB, ASP.NET Core about 28.6 MB by default) are in [Saving to your server](docs/server.md).
 
-The front-end rows are a recipe, not a test report: Next.js, React Native, Electron, Tauri and real mobile WebViews have not been tried yet. The engine itself is tested on every change in Chromium, Firefox, WebKit and two mobile profiles (iPhone, Pixel). Old WebViews without `DecompressionStream` fall back to the engine's own inflate/deflate.
+The Vite, React and Vue examples are built from the published package and tested in the browser on every change. The other front-end rows are a recipe, not a test report: Svelte, Angular, webpack, Next.js, React Native, Electron, Tauri and real mobile WebViews have not been tried yet. The engine itself is tested on every change in Chromium, Firefox, WebKit and two mobile profiles (iPhone, Pixel). Old WebViews without `DecompressionStream` fall back to the engine's own inflate/deflate.
 
 ## Development
 

@@ -2,6 +2,22 @@
 
 Bu dosya [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) düzenini izler; sürümler [anlamsal sürümleme](https://semver.org/lang/tr/) ile numaralanır. 1.0'dan önce (0.x) küçük sürümler kırıcı değişiklik içerebilir; bunlar "Kırıcı" başlığı altında yazılır.
 
+## 0.1.2 — yayımlanmadı
+
+API değişikliği yok.
+
+### Belgeler
+
+- **İngilizce API başvurusu (`docs/api.md`):** `mount()` seçeneklerinin tamamı, dönen nesne, kaydetme, birlikte düzenleme, eski biçimler, parola, belge ve tablo özellikleri, alt düzey API, WebView köprüsü ve "henüz olmayanlar" tablosunun tamamı; kodla karşılaştırılarak yazıldı.
+- **Tiplerde açıklama ve örnek:** açık tiplerin yaklaşık 70 üyesine açıklama, 32 `@example`, varsayılanlar (`@defaultValue`) ve sunucu belgesine bağlantı. Yanlış olan yorumlar düzeltildi: `collab` docx'te de çalışır; `workbook()` xls'te de çalışır; `document()` doc ve RTF'te de model verir; PDF varsayılan olarak vektör metin yazar (her sayfa görüntü değildir); `mount()` ve `createBlank()` hata fırlatmaz, reddeder.
+- **Vite, React ve Vue örnekleri (`examples/vite`, `examples/react-vite`, `examples/vue-vite`; depo, pakete girmez):** paketle gelen fontun derleme çıktısına kopyalanması ve `fontsUrl`; React StrictMode'un çift bağlamasında ve hızlı kapat-aç'ta tek düzenleyici kalır. Testler (`e2e/framework-examples.spec.ts`) örnekleri npm'e giden paketle Vite'la derler ve beş profilde sınar.
+- Kılavuzda eskimiş bilgiler düzeltildi: fonksiyon sayısı 266; birlikte düzenleme protokol sürümü 7; xlsx grafikleri düzenlenebilir ve xls grafikleri gösterilir; CDN'den çapraz köken font yüklemesi ve motorun şifrelediği dosyaların Office'te açılması doğrulandı.
+- `keywords`'e `react`, `vue`, `vite`.
+
+### Demo sitesi
+
+- `llms-full.txt` (README, API başvurusu ve sunucu belgesi tek dosyada), paylaşım görseli (`og:image`, 1200 × 630), düzenleyici sayfasında ne yapılabileceğini anlatan bölüm. Sayfaların dile bağlı metinleri derlemede İngilizce olarak HTML'e de yazılır: sayfa betiği çalışmadan da okunur (arama motorları için).
+
 ## 0.1.1 — 2026-11-04
 
 API değişikliği yok.
