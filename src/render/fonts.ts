@@ -73,9 +73,17 @@ export interface FontRegistration {
   family: string;
   /** The font file: its address, or its bytes. */
   source: FontSource;
-  /** Default "normal". A number is a CSS weight from 1 to 1000. */
+  /**
+   * The weight of this face: register one face per weight and style. Default "normal". A number is a CSS weight from 1 to 1000.
+   *
+   * @defaultValue "normal"
+   */
   weight?: 'normal' | 'bold' | number;
-  /** Default "normal". */
+  /**
+   * The style of this face. Default "normal".
+   *
+   * @defaultValue "normal"
+   */
   style?: 'normal' | 'italic';
   /**
    * Font names of files this font stands in for when the device does not
@@ -84,7 +92,11 @@ export interface FontRegistration {
    * font wherever the device lacks Bookman Old Style.
    */
   as?: string | string[];
-  /** With `as`: this font is used even where the device has the font of that name. */
+  /**
+   * With `as`: this font is used even where the device has the font of that name.
+   *
+   * @defaultValue false
+   */
   prefer?: boolean;
 }
 

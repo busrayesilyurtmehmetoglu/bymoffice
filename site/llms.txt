@@ -35,7 +35,9 @@ The server answers `GET` with the file and a strong `ETag`, and `PUT` (raw body,
 - [README](__BYM_REPOSITORY_URL__#readme): what it does, install, frameworks
 - [Saving to your server](__BYM_REPOSITORY_URL__/blob/main/docs/server.md): the GET/PUT contract, Laravel, Django, ASP.NET Core and Node examples, CSRF, request size limits
 - [WebView bridge](__BYM_REPOSITORY_URL__/blob/main/docs/webview-koprusu.md): Flutter, React Native, iOS, Android, Electron (Turkish)
-- [Developer guide](__BYM_REPOSITORY_URL__/blob/main/docs/kullanim-kilavuzu.md): the full API and every rule and limit (Turkish)
+- [Developer guide](__BYM_REPOSITORY_URL__/blob/main/docs/kullanim-kilavuzu.md): the full guide with every rule and limit (Turkish)
+- [API reference](__BYM_REPOSITORY_URL__/blob/main/docs/api.md): every option, method, error code and limit, and what is not there yet
+- [llms-full.txt](__BYM_SITE_URL__llms-full.txt): the README, the API reference and the server guide in one file
 - [Changelog](__BYM_REPOSITORY_URL__/blob/main/CHANGELOG.md)
 
 ## Try it

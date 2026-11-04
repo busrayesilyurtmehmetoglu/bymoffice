@@ -6,7 +6,11 @@
 // document; the editors only see it as the SaveCommand of their Save button.
 import type { SaveCommand } from '../ui/save-command';
 
-/** What a saved file is, for whoever takes its bytes. */
+/**
+ * What a saved file is, for whoever takes its bytes: the second argument of a SaveToFunction.
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ */
 export interface SaveInfo {
   /** The format of the bytes: never one of the formats that cannot be written. */
   format: 'docx' | 'xlsx';
@@ -26,23 +30,80 @@ export interface SaveInfo {
   auto?: true;
 }
 
-/** An application's own way to save: resolves (or returns) when the bytes are safe, rejects or throws when they are not. */
+/**
+ * An application's own way to save: resolves (or returns) when the bytes are safe, rejects or throws when they are not
+ * (the save then fails with SaveError "refused"; a SaveError that is thrown is passed on as it is). A call that takes
+ * more than ten minutes fails with SaveError "timeout".
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ *
+ * @example
+ * ```js
+ * const saveTo = async (bytes, info) => {
+ *   const body = new FormData();
+ *   body.append('file', new Blob([bytes]), info.name || `file.${info.format}`);
+ *   const answer = await fetch('/api/upload', { method: 'POST', body });
+ *   if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
+ * };
+ * await BymOffice.mount(el, { file: blob, saveTo });
+ * ```
+ */
 export type SaveToFunction = (bytes: Uint8Array, info: SaveInfo) => void | Promise<void>;
 
-/** The request a file is saved with. */
+/**
+ * The request a file is saved with (MountOptions.saveTo as an object). The body is the file's bytes, with the
+ * media type of its format and the headers `X-Bym-Format`, `X-Bym-Converted-From` (converted files) and
+ * `If-Match` (the file's ETag, when it is saved to the address it was fetched from). Any 2xx answer means saved.
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ *
+ * @example
+ * ```js
+ * await BymOffice.mount(el, {
+ *   file: '/files/report.xlsx',
+ *   saveTo: {
+ *     url: '/files/report.xlsx',
+ *     headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name=csrf-token]').content },
+ *     credentials: 'same-origin',
+ *     timeoutMs: 300000,
+ *     onConflict: 'ask',
+ *   },
+ * });
+ * ```
+ */
 export interface SaveToRequest {
-  /** Where the bytes are sent. Default: the address the file was fetched from. */
+  /**
+   * Where the bytes are sent: http: or https:, or an address relative to the page. Default: the address the file
+   * was fetched from (MountOptions.file must then be an address).
+   *
+   * @defaultValue the address of MountOptions.file
+   */
   url?: string;
-  /** Default "PUT". */
+  /**
+   * The HTTP method; nothing else is accepted (mount() rejects with TypeError).
+   *
+   * @defaultValue "PUT"
+   */
   method?: 'PUT' | 'POST';
-  /** Headers added to the request (a token, say). One that has the name of a header of the engine takes its place. */
+  /**
+   * Headers added to the request (a CSRF token, an authorization, say). One that has the name of a header of the
+   * engine takes its place. Values are Latin-1 text without line breaks; mount() rejects with TypeError otherwise.
+   */
   headers?: { [name: string]: string };
-  /** Default "same-origin", as the file is fetched: nothing of the user is sent to another origin. */
+  /**
+   * The `credentials` of fetch(): whether cookies go with the request. Default "same-origin", as the file is
+   * fetched: nothing of the user is sent to another origin. "include" for a server of another origin (it must
+   * allow that with CORS).
+   *
+   * @defaultValue "same-origin"
+   */
   credentials?: 'omit' | 'same-origin' | 'include';
   /**
    * How long the request may take, in milliseconds, the upload of the file
    * included. Default 120 000 (two minutes): time enough for a file of some
-   * megabytes on a slow connection.
+   * megabytes on a slow connection. A save that takes longer fails with SaveError "timeout".
+   *
+   * @defaultValue 120000
    */
   timeoutMs?: number;
   /**
@@ -51,6 +112,9 @@ export interface SaveToRequest {
    * replaces the original with a file of another format, which a server that
    * does not read `X-Bym-Converted-From` cannot know. So it is not done
    * unless the page says here that its server expects it. Default false.
+   * A save that is refused for this fails with SaveError "converted".
+   *
+   * @defaultValue false
    */
   allowConverted?: boolean;
   /**
@@ -61,6 +125,8 @@ export interface SaveToRequest {
    * says that the file was not saved; the page asks by itself and calls
    * saveNow({ overwrite: true }). onError is given the SaveError "conflict"
    * either way, before anything is asked.
+   *
+   * @defaultValue "ask"
    */
   onConflict?: 'ask' | 'fail';
 }
@@ -71,6 +137,8 @@ export interface SaveNowOptions {
    * Saves over whatever the server holds: the request carries no `If-Match`.
    * For the user who was told that the file on the server is not the one
    * that was opened (SaveError "conflict") and chose to keep their own.
+   *
+   * @defaultValue false
    */
   overwrite?: boolean;
 }
@@ -85,6 +153,16 @@ export interface SaveNowOptions {
  * ETag the server last named): otherwise it could overwrite, without anyone being asked, what
  * someone else saved meanwhile. `unconditional: true` says that this is acceptable: auto-save
  * then also saves where no ETag is known, and can silently overwrite the changes of others.
+ * `false` (the default) turns auto-save off. It needs MountOptions.saveTo.
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ *
+ * @example
+ * ```js
+ * const mounted = await BymOffice.mount(el, { file: '/files/report.xlsx', saveTo: true, autoSave: true });
+ * mounted.setAutoSave({ delayMs: 5000 }); // other times while the view is shown
+ * mounted.setAutoSave(false);             // off again
+ * ```
  */
 export type AutoSave = boolean | { delayMs?: number; maxWaitMs?: number; unconditional?: boolean };
 
@@ -130,10 +208,34 @@ export function resolveAutoSave(value: unknown, name = 'autoSave'): AutoSaveSett
   return given.unconditional === true ? { delayMs, maxWaitMs, unconditional: true } : { delayMs, maxWaitMs };
 }
 
-/** MountOptions.saveTo: `true` for the address the file was fetched from, an address, a request, or a function. */
+/**
+ * MountOptions.saveTo: `true` for the address the file was fetched from, an address (http: or https:, or one
+ * relative to the page), a request (SaveToRequest), or a function (SaveToFunction). The file is sent as it is
+ * now; the server replaces what it holds (no versions are kept by the engine).
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ *
+ * @example
+ * ```js
+ * await BymOffice.mount(el, { file: '/files/report.docx', saveTo: true });              // PUT to the same address
+ * await BymOffice.mount(el, { file: blob, saveTo: '/api/files/42' });                   // PUT to another address
+ * await BymOffice.mount(el, { file: blob, saveTo: { url: '/api/files/42', method: 'POST' } });
+ * ```
+ */
 export type SaveTo = true | string | SaveToRequest | SaveToFunction;
 
-/** What MountOptions.onSaveState is told. */
+/**
+ * What MountOptions.onSaveState is told.
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ *
+ * @example
+ * ```js
+ * onSaveState: ({ dirty, saving, lastSavedAt, error }) => {
+ *   label.textContent = error ? `Not saved: ${error}` : saving ? 'Saving…' : dirty ? 'Unsaved changes' : 'Saved';
+ * },
+ * ```
+ */
 export interface SaveState {
   /** There are changes that no save holds. */
   dirty: boolean;
@@ -159,6 +261,7 @@ export interface SaveState {
   autoWaits?: 'room' | 'offline';
 }
 
+/** Why a save failed: SaveError.code. */
 export type SaveErrorCode =
   /** What is being typed (a note, the name of a sheet, a dialog with changes) could not be applied. */
   | 'pending'
@@ -183,8 +286,27 @@ export type SaveErrorCode =
   /** The function of the application (or the application behind the bridge) rejected or threw; or the request could not be made at all. */
   | 'refused';
 
-/** What MountOptions.onError is given when a save fails. The message is English and holds nothing of the file. */
+/**
+ * What MountOptions.onError is given when a save fails. The message is English and holds nothing of the file;
+ * the user is told in the language of the view (onNotice, SaveState.error).
+ *
+ * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+ *
+ * @example
+ * ```js
+ * const mounted = await BymOffice.mount(el, {
+ *   file: '/files/report.xlsx',
+ *   saveTo: { onConflict: 'fail' }, // the page asks about a conflict itself
+ *   onError: (error) => {
+ *     if (!(error instanceof BymOffice.SaveError)) return;
+ *     if (error.code === 'conflict' && confirm('Someone else saved this file. Overwrite it?')) void mounted.saveNow({ overwrite: true });
+ *     else if (error.code === 'denied' || error.code === 'redirected') location.reload(); // the session has run out
+ *   },
+ * });
+ * ```
+ */
 export class SaveError extends Error {
+  /** What went wrong; see SaveErrorCode. */
   readonly code: SaveErrorCode;
   /** The status of the answer, for the codes that come from one. */
   readonly status?: number;

@@ -216,7 +216,24 @@ export const MAX_UNPACK_RATIO = 256;
 /** What may be unpacked from any archive, however small, before MAX_UNPACK_RATIO applies. */
 export const MIN_UNPACK_BUDGET_BYTES = 64 * 1024 * 1024;
 
-/** A part of an archive unpacks to more than this engine reads (see MAX_UNPACKED_PART_BYTES and the limits beside it). */
+/**
+ * A part of an archive unpacks to more than this engine reads (see MAX_UNPACKED_PART_BYTES and the limits beside it):
+ * what open() (or the first call that reads the part: workbook(), document()) and mount() reject with for a docx or
+ * xlsx that is too large, or that would unpack to far more than its size (a decompression bomb). It is given from the
+ * sizes the archive declares, before anything is unpacked. The limits are fixed: 512 MiB for the body of a sheet or document, shared
+ * strings and files that are not XML, 64 MiB for any other XML part, and 256 times the size of the archive
+ * (at least 64 MiB) for all parts together.
+ *
+ * @example
+ * ```js
+ * try {
+ *   await BymOffice.open(bytes);
+ * } catch (error) {
+ *   if (error instanceof BymOffice.PartTooLargeError) console.log(error.kind, error.size, error.limit);
+ *   else throw error;
+ * }
+ * ```
+ */
 export class PartTooLargeError extends Error {
   override name = 'PartTooLargeError';
   /** 'part': one part is larger than its limit; 'archive': the parts read together unpack to too much for the size of the file. */
@@ -225,6 +242,7 @@ export class PartTooLargeError extends Error {
   readonly part: string;
   /** Its size when unpacked, as the archive declares it. */
   readonly size: number;
+  /** The limit in bytes that was passed: of the part ('part'), or of all parts together ('archive'). */
   readonly limit: number;
 
   constructor(kind: 'part' | 'archive', part: string, size: number, limit: number) {

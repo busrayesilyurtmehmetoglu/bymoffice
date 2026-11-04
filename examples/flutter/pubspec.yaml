@@ -15,6 +15,13 @@ dependencies:
   # Only the example application (lib/main.dart) needs this one.
   file_picker: ^8.0.0
 
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  # integration_test/bridge_test.dart runs the controller against the bridge page in a real WebView.
+  integration_test:
+    sdk: flutter
+
 flutter:
   uses-material-design: true
   assets:

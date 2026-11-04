@@ -45,8 +45,9 @@ function fresh(text: string): Uint8Array {
 }
 
 /**
- * The stamp a file carries; undefined when it has none, or one that is not as this module writes
- * it. What a CollabSession is given as `stamp` when it is made for the file (`file.package`).
+ * Resolves to the stamp a file carries; to undefined when it has none, or one that is not as this module writes
+ * it. What a CollabSession is given as `stamp` when it is made for the file (`file.package`):
+ * `stamp: await readCollabStamp(file.package)`.
  */
 export async function readCollabStamp(pkg: OpcPackage): Promise<CollabStamp | undefined> {
   try {
@@ -212,7 +213,8 @@ export interface SharedFile {
  *
  * `pkg` is the package of the file (`file.package`) and `take` writes it (`() => file.save()`);
  * mount() saves this way, and a program that runs a CollabSession without mount() does the same,
- * then tells the room with `session.announceSaved(versions, rev)`.
+ * then tells the room with `session.announceSaved(versions, rev)`. Resolves to the SharedFile
+ * (`{ bytes, rev, unstamped? }`) once the file is written: `await` it.
  */
 export async function writeSharedFile(
   session: StampingSession,

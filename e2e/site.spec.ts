@@ -176,6 +176,26 @@ test.describe('demo site: for search engines and AI tools', () => {
     // No product other than this one is named.
     for (const name of ['onlyoffice', 'sheetjs', 'google', 'microsoft', 'libreoffice', 'collabora', 'syncfusion', 'univer']) expect(text.toLowerCase()).not.toContain(name);
   });
+
+  test('llms-full.txt holds the English documents with links into the repository; the share picture is a 1200 x 630 PNG', async ({ page, request }) => {
+    const full = await request.get(`${SITE}llms-full.txt`);
+    expect(full.status()).toBe(200);
+    const text = await full.text();
+    for (const name of ['README.md', 'docs/api.md', 'docs/server.md']) expect(text).toContain(`<!-- ${name} -->`);
+    // Every Markdown link is absolute (a relative one would point into the site, where the documents are not).
+    const relativeLinks = [...text.matchAll(/\]\(([^)]+)\)/g)].map((match) => match[1]).filter((target) => !/^(https?:|mailto:|#)/.test(target));
+    expect(relativeLinks).toEqual([]);
+    expect(text).not.toMatch(/\/Users\//);
+
+    await page.goto(SITE);
+    const image = await page.locator('meta[property="og:image"]').getAttribute('content');
+    expect(image).toBe(`${SITE_URL}assets/og.png`);
+    const png = await request.get(`${SITE}assets/og.png`);
+    expect(png.status()).toBe(200);
+    const bytes = await png.body();
+    expect(bytes.subarray(1, 4).toString('latin1')).toBe('PNG');
+    expect([bytes.readUInt32BE(16), bytes.readUInt32BE(20)]).toEqual([1200, 630]);
+  });
 });
 
 test.describe('demo site: English first, even in a Turkish browser', () => {

@@ -22,12 +22,28 @@ import { StatusBar } from './status-bar';
 import type { CollabPeer, CollabState } from '../collab/session';
 import { Toolbar, type ShellHost } from './toolbar';
 
+/** What a SpreadsheetEditor takes: the options of its grid (WorkbookViewOptions) and of the bars around it. */
 export interface SpreadsheetEditorOptions extends WorkbookViewOptions {
-  /** Show the toolbar. Default true. */
+  /**
+   * Show the toolbar. Default true. For mount() it also stands for the documents: false hides the formatting
+   * toolbar and the bar with the zoom and the page number. With toolbar, formula bar and status bar all off,
+   * only the grid and the sheet tabs are left.
+   *
+   * @defaultValue true
+   */
   toolbar?: boolean;
-  /** Show the formula bar. Default true. */
+  /**
+   * Show the formula bar (the cell's name and its content). Default true. Spreadsheets only.
+   *
+   * @defaultValue true
+   */
   formulaBar?: boolean;
-  /** Show the status bar. Default true. */
+  /**
+   * Show the status bar (a read-only badge, messages, and the sum, average and count of the selected cells).
+   * Default true. Spreadsheets only.
+   *
+   * @defaultValue true
+   */
   statusBar?: boolean;
   /**
    * What saves the workbook: with it the toolbar has a Save button (not while

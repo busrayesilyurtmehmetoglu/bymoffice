@@ -334,7 +334,7 @@ Hepsinde akış aynıdır: kanalı kur → sayfayı yükle → `ready`'yi bekle 
 
 ### Flutter (`webview_flutter` 4.x)
 
-Tam örnek: `examples/flutter/` (yeniden kullanılabilir `BymOfficeController` + `BymOfficeView`).
+Tam örnek: `examples/flutter/` (yeniden kullanılabilir `BymOfficeController` + `BymOfficeView`; Android, iOS ve macOS için derlenir, `integration_test/bridge_test.dart` macOS'ta WKWebView'de geçer). **macOS:** korumalı alandaki (sandbox) uygulamada WKWebView, `file://` adresindeki sayfayı bile `com.apple.security.network.client` yetkisi olmadan açmaz (`ready` hiç gelmez); yetki iki `.entitlements` dosyasına eklenir.
 
 ```dart
 final controller = WebViewController()

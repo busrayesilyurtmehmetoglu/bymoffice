@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BYM Office with Vite</title>
+    <style>
+      body { margin: 0; font-family: system-ui, sans-serif; }
+      header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; }
+      /* The editor fills its container, which must have a size. */
+      #editor { height: calc(100vh - 56px); border-top: 1px solid #ddd; }
+      #error { color: #b00020; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <button id="toggle" type="button">Close editor</button>
+      <p id="error" role="alert"></p>
+    </header>
+    <div id="editor"></div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

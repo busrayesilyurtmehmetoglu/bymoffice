@@ -1,9 +1,10 @@
 // A reusable widget that shows the BYM Office editor in a WebView and talks to
 // it through the bridge contract (docs/webview-koprusu.md).
 //
-// NOTE: written against webview_flutter 4.x (WebViewController,
-// addJavaScriptChannel, loadFlutterAsset, runJavaScript) but never compiled or
-// run. Lines marked UNVERIFIED are the ones most likely to need a correction.
+// Written against webview_flutter 4.x (WebViewController, addJavaScriptChannel,
+// loadFlutterAsset, runJavaScript). Built for Android, iOS and macOS with
+// Flutter 3.41; integration_test/bridge_test.dart runs it in WKWebView on macOS.
+// Lines marked UNVERIFIED are paths that test does not reach.
 
 import 'dart:async';
 import 'dart:convert';

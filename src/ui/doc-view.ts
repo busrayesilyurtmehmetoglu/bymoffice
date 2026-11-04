@@ -1362,7 +1362,9 @@ export class DocumentView {
   /**
    * What is kept for the charts of the document and how often something was worked out for
    * them (charts kept, their weight in numbers, how often cached values were read and charts
-   * laid out): for tests, and for whoever wants to see what charts cost.
+   * laid out), and in `notes` what those charts have that is not drawn, or is drawn differently
+   * (Chart.notes, each once, at most 200): for tests, and for whoever wants to see what charts cost.
+   * Unlike the sheet view's, it has no `texts`.
    */
   getChartState(): ChartRendererState {
     return this.charts.state();

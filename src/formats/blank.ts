@@ -14,9 +14,11 @@ export interface BlankOptions {
    * "Sayfa1" and Turkish separators; "en", "en-US" and "en-CA" a document on
    * Letter paper, every other language one on A4. What is not a language tag
    * counts as the default, "en-GB".
+   *
+   * @defaultValue "en-GB"
    */
   locale?: string;
-  /** xlsx: the name of the sheet instead of the one the language gives. */
+  /** xlsx: the name of the sheet instead of the one the language gives ("Sayfa1" for Turkish, "Sheet1" otherwise). */
   sheetName?: string;
 }
 
@@ -99,8 +101,20 @@ function documentParts(language: string): [name: string, text: string][] {
 /**
  * A new, empty file as bytes: `docx`, a document with one empty paragraph,
  * or `xlsx`, a workbook with one empty sheet. The same options give the same
- * bytes. Throws RangeError for a kind that is neither, and for a sheet name
- * a workbook cannot have.
+ * bytes. Rejects with RangeError for a kind that is neither, and for a sheet name
+ * a workbook cannot have. Works in browsers and in Node.
+ *
+ * @example
+ * ```js
+ * // A "New document" button: an empty docx, shown in the editor and saved by the page.
+ * const bytes = await BymOffice.createBlank('docx', { locale: 'tr' });
+ * const mounted = await BymOffice.mount(el, { file: bytes, onSave: (saved) => upload(saved) });
+ * ```
+ *
+ * @example
+ * ```js
+ * const xlsx = await createBlank('xlsx', { locale: 'en-US', sheetName: 'Budget' });
+ * ```
  */
 export async function createBlank(kind: 'docx' | 'xlsx', options: BlankOptions = {}): Promise<Uint8Array> {
   const language = languageOf(options.locale);
