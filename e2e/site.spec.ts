@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import type { Download, Frame, Page } from '@playwright/test';
-import { REPOSITORY_URL } from '../scripts/site-config.mjs';
+import { REPOSITORY_URL, SITE_URL } from '../scripts/site-config.mjs';
 import { expect, test } from './helpers';
 
 // The public demo site (site/ -> site-dist/ by scripts/build-site.mjs; `pnpm e2e` builds it),
@@ -144,6 +144,34 @@ test.describe('demo site: pages and languages', () => {
     await page.click('#sample-doc');
     await editorReady(page);
     expect(others).toEqual([]);
+  });
+});
+
+test.describe('demo site: for search engines and AI tools', () => {
+  test('every page names its public address; the sitemap lists those addresses; llms.txt is filled in', async ({ page, request }) => {
+    for (const entry of PAGES) {
+      await page.goto(SITE + entry.path);
+      await expect(page.locator('link[rel="canonical"]')).toHaveAttribute('href', SITE_URL + entry.path);
+      await expect(page.locator('meta[property="og:url"]')).toHaveAttribute('content', SITE_URL + entry.path);
+      expect(await page.locator('meta[name="description"]').getAttribute('content')).toBeTruthy();
+    }
+
+    const sitemap = await request.get(`${SITE}sitemap.xml`);
+    expect(sitemap.status()).toBe(200);
+    const locs = [...(await sitemap.text()).matchAll(/<loc>([^<]*)<\/loc>/g)].map((match) => match[1]);
+    expect(locs.sort()).toEqual(PAGES.map((entry) => SITE_URL + entry.path).sort());
+
+    const llms = await request.get(`${SITE}llms.txt`);
+    expect(llms.status()).toBe(200);
+    const text = await llms.text();
+    const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+    expect(text).not.toMatch(/__BYM_[A-Z_]+__/);
+    expect(text).toContain(`Current version: ${version}.`);
+    expect(text).toContain(`https://cdn.jsdelivr.net/npm/bymoffice@${version}/dist/bymoffice.min.js`);
+    expect(text).toContain(`${REPOSITORY_URL}/blob/main/docs/server.md`);
+    expect(text).not.toMatch(/\/Users\//);
+    // No product other than this one is named.
+    for (const name of ['onlyoffice', 'sheetjs', 'google', 'microsoft', 'libreoffice', 'collabora', 'syncfusion', 'univer']) expect(text.toLowerCase()).not.toContain(name);
   });
 });
 

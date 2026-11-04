@@ -2,3 +2,5 @@
 // (scripts/build-site.mjs) and its tests (e2e/site.spec.ts).
 export const REPOSITORY = 'busrayesilyurtmehmetoglu/bymoffice';
 export const REPOSITORY_URL = `https://github.com/${REPOSITORY}`;
+/** Where GitHub Pages publishes the site (with the closing slash). */
+export const SITE_URL = 'https://busrayesilyurtmehmetoglu.github.io/bymoffice/';

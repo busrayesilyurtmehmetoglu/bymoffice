@@ -1,0 +1,45 @@
+# BYM Office
+
+> A Word and Excel engine for the browser: open, view, edit and save docx, xlsx, doc, xls and RTF files with one script tag or `npm i bymoffice`. Written from scratch in TypeScript, no runtime dependencies, no document server. MIT license. Current version: __BYM_VERSION__.
+
+Use it when a web page or a WebView app has to show or edit Office files without sending them to a conversion service. The file is read, edited and written on the device; the server only stores bytes (GET the file, PUT it back). Saving keeps what the engine does not understand byte for byte, and an untouched docx or xlsx is saved byte for byte (a password-protected one is encrypted again). doc, xls and RTF open read-only, or converted to docx/xlsx for editing; they are never written in their old formats.
+
+## Install
+
+- CDN, global `BymOffice`: `<script src="__BYM_CDN__bymoffice.min.js"></script>`
+- npm (ES module and TypeScript types; no CommonJS build): `npm i bymoffice`, then `import { mount, open } from 'bymoffice'`. When bundling, copy `node_modules/bymoffice/dist/fonts/` to your public files and pass `mount(el, { fontsUrl: '/assets/bymoffice-fonts/' })`.
+- Node and Bun, no screen: `open(bytes)`, `file.save()`, `createBlank('docx' | 'xlsx')`, `file.saveAsXlsx()` / `file.saveAsDocx()` for old formats, `file.workbook()` / `file.document()` for the content.
+
+## Smallest editor that saves back to the server
+
+```html
+<div id="editor" style="height: 600px"></div>
+<script src="__BYM_CDN__bymoffice.min.js"></script>
+<script>
+  BymOffice.mount(document.getElementById('editor'), {
+    file: '/files/report.xlsx',   // a URL, a File/Blob or bytes; the format is read from the content
+    saveTo: true,                 // Save button and Ctrl/Cmd+S: PUT the file back to the same URL
+    locale: 'en',                 // 'en' or 'tr'
+  });
+</script>
+```
+
+The server answers `GET` with the file and a strong `ETag`, and `PUT` (raw body, `If-Match`) with 2xx and the new `ETag`, or 412 when the file changed meanwhile. Pass CSRF tokens in `saveTo: { headers: { 'X-CSRF-TOKEN': token } }` (Laravel; Django: `X-CSRFToken`). Default body limits refuse large saves: Django 2.5 MB, PHP/Laravel 8 MB (`post_max_size`), ASP.NET Core Kestrel 30,000,000 bytes, nginx 1 MB. Tested on 2026-11-03 with Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby and Dart.
+
+## Main options of mount()
+
+`file`, `readOnly`, `locale`, `toolbar`, `saveTo`, `autoSave`, `onSave(bytes)`, `onSaveState`, `onChange` (spreadsheets) / `onDocumentChange` (documents), `onNotice`, `onError`, `convert` (edit doc/xls/RTF as docx/xlsx), `collab` (real-time editing through a relay, e.g. `collab: 'wss://example.com/room/42'`), `fontsUrl`, `fonts`. The returned object has `save()` (the bytes), `saveNow()`, `hasUnsavedChanges`, `exportPdf()`, `print()` and `destroy()`; its `editor` has `setReadOnly()` and `setLocale()`.
+
+## Docs
+
+- [README](__BYM_REPOSITORY_URL__#readme): what it does, install, frameworks
+- [Saving to your server](__BYM_REPOSITORY_URL__/blob/main/docs/server.md): the GET/PUT contract, Laravel, Django, ASP.NET Core and Node examples, CSRF, request size limits
+- [WebView bridge](__BYM_REPOSITORY_URL__/blob/main/docs/webview-koprusu.md): Flutter, React Native, iOS, Android, Electron (Turkish)
+- [Developer guide](__BYM_REPOSITORY_URL__/blob/main/docs/kullanim-kilavuzu.md): the full API and every rule and limit (Turkish)
+- [Changelog](__BYM_REPOSITORY_URL__/blob/main/CHANGELOG.md)
+
+## Try it
+
+- [Live editor](__BYM_SITE_URL__editor.html): open your own file; it stays in the browser
+- [Usage examples](__BYM_SITE_URL__examples.html): script tag, ES module, read-only viewer, saving, auto-save, editing together, PDF, WebView bridge
+- [npm package](https://www.npmjs.com/package/bymoffice)

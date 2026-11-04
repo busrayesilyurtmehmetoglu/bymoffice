@@ -2,6 +2,20 @@
 
 Bu dosya [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) düzenini izler; sürümler [anlamsal sürümleme](https://semver.org/lang/tr/) ile numaralanır. 1.0'dan önce (0.x) küçük sürümler kırıcı değişiklik içerebilir; bunlar "Kırıcı" başlığı altında yazılır.
 
+## 0.1.1 — yayımlanmadı
+
+API değişikliği yok.
+
+### Düzeltildi
+
+- **Dokunulmayan dosya artık bu iki arşiv türünde de bayt bayt aynı kaydedilir:** (1) `zip` aracıyla klasör girdileriyle paketlenmiş docx/xlsx: klasör girdilerinin "version needed to extract" alanı 1.0'dan 2.0'a dönüyordu (6 bayt); (2) akış halinde yazan araçların (Java `ZipOutputStream`, .NET, boruya yazan Python `zipfile`) ürettiği arşivler: verinin ardındaki data descriptor atılıyor, yerel başlık yeniden yazılıyordu. Artık içeriği değişmeyen girdinin yerel başlığı ve descriptor'ı baytı baytına, merkezi başlığın bayrakları ve "version needed" alanı dosyadaki haliyle yazılır. ZIP64 alanı taşıyan girdiler ile yerel ve merkezi başlığı descriptor konusunda çelişen girdiler eskisi gibi yeniden yazılır; içeriği değişen girdi descriptor'suz ve 2.0 ile yazılır. `ZipEntry`'ye `versionNeeded`, `localHeader`, `descriptor` eklendi.
+
+### Belgeler
+
+- **Sunucuya kaydetme (İngilizce, `docs/server.md`):** `GET` + ETag / `PUT` + `If-Match` → 412 sözleşmesi; Laravel, Django, ASP.NET Core ve Node örnekleri; CSRF başlıkları (Laravel `X-CSRF-TOKEN`, Django `X-CSRFToken`); ölçülmüş varsayılan gövde sınırları ve nasıl yükseltilecekleri (Django 2,5 MB → 400, Laravel/PHP 8 MB → 413, ASP.NET Core 30.000.000 bayt → 413). 2026-11-03'te 12 arka uçta (Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby, Dart) elle sınandı.
+- **Örnek Node dosya sunucusu (`examples/server/node.mjs`, depo; pakete girmez):** bağımlılıksız; ETag, 412, 50 MB sınırı (413), yalnız klasördeki `*.docx`/`*.xlsx` adları (her dilin harfleriyle), aynı dosyanın kayıtları sırayla (denetim ve yazma tek adım; aynı anda gelen iki kayıt karışmaz); her değişiklikte birim testiyle sınanır.
+- README'lerde "her arka uçla çalışır" satırı ve sunucu belgesine bağlantı; paket `keywords`'üne `word-editor`, `excel-editor`, `docx-viewer`, `xlsx-viewer`, `browser`, `laravel`, `django`, `php`, `aspnet`.
+
 ## 0.1.0 — 2026-10-16
 
 İlk sürüm. Paket `bymoffice` adıyla npm'de; `<script>` için jsDelivr/unpkg adresleri npm'den kendiliğinden gelir. Paket kaynak haritası (`.map`) taşımaz; betiklerde harita başvurusu yoktur (geliştirirken `BYM_SOURCEMAP=1 pnpm build` ile üretilir).

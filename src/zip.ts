@@ -10,6 +10,7 @@ const SIG_CENTRAL = 0x02014b50;
 const SIG_EOCD = 0x06054b50;
 const SIG_EOCD64 = 0x06064b50;
 const SIG_EOCD64_LOCATOR = 0x07064b50;
+const SIG_DESCRIPTOR = 0x08074b50;
 
 const EXTRA_ZIP64 = 0x0001;
 const MAX32 = 0xffffffff;
@@ -30,6 +31,19 @@ export interface ZipEntry {
   /** Name bytes as stored; kept so names that are not valid UTF-8 are written back unchanged. */
   rawName?: Uint8Array;
   versionMadeBy?: number;
+  /**
+   * "Version needed to extract" of the central header as the archive had it (some writers put 1.0
+   * on directory entries). Written with `localHeader`; headers written anew say 2.0.
+   */
+  versionNeeded?: number;
+  /**
+   * Of an entry of the archive: its local header and the data descriptor after its data (empty
+   * when there is none), exactly as stored. While the stored bytes are the archive's own, they are
+   * written as they are, and the central header keeps the entry's flags. Absent on entries with
+   * ZIP64 fields and on descriptors that cannot be told apart from the bytes that follow.
+   */
+  localHeader?: Uint8Array;
+  descriptor?: Uint8Array;
   internalAttrs?: number;
   /** Extra fields of the central and the local header, without the ZIP64 field. */
   extra?: Uint8Array;
@@ -139,6 +153,43 @@ function stripZip64(extra: Uint8Array): Uint8Array {
     p = next;
   }
   return extra;
+}
+
+/**
+ * The data descriptor at `at`, with or without its signature, when it says what the central header
+ * says; otherwise undefined (a ZIP64 descriptor, or bytes that are not one).
+ */
+function descriptorAt(view: DataView, at: number, crc: number, compressedSize: number, uncompressedSize: number): Uint8Array | undefined {
+  const says = (q: number) =>
+    q + 12 <= view.byteLength &&
+    view.getUint32(q, true) === crc &&
+    view.getUint32(q + 4, true) === compressedSize &&
+    view.getUint32(q + 8, true) === uncompressedSize;
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  if (at + 4 <= view.byteLength && view.getUint32(at, true) === SIG_DESCRIPTOR && says(at + 4)) return bytes.subarray(at, at + 16);
+  if (says(at)) return bytes.subarray(at, at + 12);
+  return undefined;
+}
+
+/** A local header written anew for an entry: sizes in the header, no data descriptor. */
+function localHeaderOf(entry: ZipEntry, name: Uint8Array, flags: number): Uint8Array {
+  const localExtra = entry.localExtra ?? EMPTY;
+  const local = new Uint8Array(30 + name.length + localExtra.length);
+  const lv = new DataView(local.buffer);
+  lv.setUint32(0, SIG_LOCAL, true);
+  lv.setUint16(4, 20, true);
+  lv.setUint16(6, flags, true);
+  lv.setUint16(8, entry.method, true);
+  lv.setUint16(10, entry.dosTime, true);
+  lv.setUint16(12, entry.dosDate, true);
+  lv.setUint32(14, entry.crc32, true);
+  lv.setUint32(18, entry.compressedSize, true);
+  lv.setUint32(22, entry.uncompressedSize, true);
+  lv.setUint16(26, name.length, true);
+  lv.setUint16(28, localExtra.length, true);
+  local.set(name, 30);
+  local.set(localExtra, 30 + name.length);
+  return local;
 }
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -321,12 +372,32 @@ export class ZipArchive {
       const localExtraStart = localOffset + 30 + view.getUint16(localOffset + 26, true);
       const dataStart = localExtraStart + view.getUint16(localOffset + 28, true);
       if (dataStart + compressedSize > bytes.length) throw new Error(`Corrupt ZIP archive: truncated data for ${name}`);
+      const crc = view.getUint32(p + 16, true);
+      const localExtra = bytes.subarray(localExtraStart, dataStart);
+      const keptLocalExtra = stripZip64(localExtra);
+      const centralExtra = bytes.subarray(p + 46 + nameLength, p + 46 + nameLength + extraLength);
+      const keptExtra = stripZip64(centralExtra);
+      // The headers of an entry with ZIP64 fields are written anew, without them.
+      let localHeader: Uint8Array | undefined;
+      let descriptor: Uint8Array | undefined;
+      if (
+        keptLocalExtra === localExtra &&
+        keptExtra === centralExtra &&
+        // Both headers must agree on whether a descriptor follows the data.
+        (view.getUint16(localOffset + 6, true) & 0x0008) === (flags & 0x0008) &&
+        view.getUint32(p + 20, true) !== MAX32 &&
+        view.getUint32(p + 24, true) !== MAX32 &&
+        view.getUint32(p + 42, true) !== MAX32
+      ) {
+        descriptor = flags & 0x0008 ? descriptorAt(view, dataStart + compressedSize, crc, compressedSize, uncompressedSize) : EMPTY;
+        if (descriptor) localHeader = bytes.subarray(localOffset, dataStart);
+      }
 
       zip.entries.set(name, {
         name,
         method,
         flags,
-        crc32: view.getUint32(p + 16, true),
+        crc32: crc,
         compressedSize,
         uncompressedSize,
         dosTime: view.getUint16(p + 12, true),
@@ -334,9 +405,12 @@ export class ZipArchive {
         externalAttrs: view.getUint32(p + 38, true),
         rawName,
         versionMadeBy: view.getUint16(p + 4, true),
+        versionNeeded: view.getUint16(p + 6, true),
+        localHeader,
+        descriptor: localHeader ? descriptor : undefined,
         internalAttrs: view.getUint16(p + 36, true),
-        extra: stripZip64(bytes.subarray(p + 46 + nameLength, p + 46 + nameLength + extraLength)),
-        localExtra: stripZip64(bytes.subarray(localExtraStart, dataStart)),
+        extra: keptExtra,
+        localExtra: keptLocalExtra,
         comment: bytes.subarray(next - entryCommentLength, next),
         raw: bytes.subarray(dataStart, dataStart + compressedSize),
       });
@@ -515,34 +589,21 @@ export class ZipArchive {
     let offset = 0;
     for (const entry of written) {
       const name = entry.rawName ?? encoder.encode(entry.name);
-      // Keep the deflate-level bits; drop the data-descriptor bit since sizes go in the header.
-      let flags = entry.flags & 0x0006;
-      if (entry.rawName ? entry.flags & 0x0800 : name.length !== entry.name.length) flags |= 0x0800;
       const extra = entry.extra ?? EMPTY;
-      const localExtra = entry.localExtra ?? EMPTY;
       const comment = entry.comment ?? EMPTY;
-
-      const local = new Uint8Array(30 + name.length + localExtra.length);
-      const lv = new DataView(local.buffer);
-      lv.setUint32(0, SIG_LOCAL, true);
-      lv.setUint16(4, 20, true);
-      lv.setUint16(6, flags, true);
-      lv.setUint16(8, entry.method, true);
-      lv.setUint16(10, entry.dosTime, true);
-      lv.setUint16(12, entry.dosDate, true);
-      lv.setUint32(14, entry.crc32, true);
-      lv.setUint32(18, entry.compressedSize, true);
-      lv.setUint32(22, entry.uncompressedSize, true);
-      lv.setUint16(26, name.length, true);
-      lv.setUint16(28, localExtra.length, true);
-      local.set(name, 30);
-      local.set(localExtra, 30 + name.length);
+      const kept = entry.localHeader;
+      const descriptor = (kept && entry.descriptor) || EMPTY;
+      // The headers of the archive say what its local header and descriptor say. Written anew, they
+      // keep the deflate-level bits and drop the data-descriptor bit since sizes go in the header.
+      let flags = kept ? entry.flags : entry.flags & 0x0006;
+      if (!kept && (entry.rawName ? entry.flags & 0x0800 : name.length !== entry.name.length)) flags |= 0x0800;
+      const local = kept ?? localHeaderOf(entry, name, flags);
 
       const header = new Uint8Array(46 + name.length + extra.length + comment.length);
       const cv = new DataView(header.buffer);
       cv.setUint32(0, SIG_CENTRAL, true);
       cv.setUint16(4, entry.versionMadeBy ?? 20, true);
-      cv.setUint16(6, 20, true);
+      cv.setUint16(6, kept ? entry.versionNeeded ?? 20 : 20, true);
       cv.setUint16(8, flags, true);
       cv.setUint16(10, entry.method, true);
       cv.setUint16(12, entry.dosTime, true);
@@ -560,9 +621,9 @@ export class ZipArchive {
       header.set(extra, 46 + name.length);
       header.set(comment, 46 + name.length + extra.length);
 
-      chunks.push(local, entry.raw);
+      chunks.push(local, entry.raw, descriptor);
       central.push(header);
-      offset += local.length + entry.raw.length;
+      offset += local.length + entry.raw.length + descriptor.length;
       if (offset > 0xfffffffe) throw new Error('Archive too large: writing archives of 4 GB or more is not supported yet');
     }
 
