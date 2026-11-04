@@ -10,9 +10,18 @@ import { test } from 'node:test';
 
 const SCRIPT = new URL('./tools/offcrypto_ref.py', import.meta.url).pathname;
 
+// Twice a whole test file timed out under the load of a full verification with nothing printed, inside a call to
+// an outside program: every call has a time of its own and is killed outright (spawnSync waits for the end of a
+// process it only sent SIGTERM to). A probe that does not answer counts as the tool missing, which is said; a
+// command that does not answer fails its test with the command named.
+const PROBE_MS = 30_000;
+const COMMAND_MS = 90_000;
+
 function found(command: string, args: string[]): boolean {
   try {
-    return spawnSync(command, args, { stdio: 'ignore' }).status === 0;
+    const done = spawnSync(command, args, { stdio: 'ignore', timeout: PROBE_MS, killSignal: 'SIGKILL' });
+    if (done.error && (done.error as { code?: string }).code === 'ETIMEDOUT') console.log(`# ${command} did not answer in ${PROBE_MS / 1000} s`);
+    return done.status === 0;
   } catch {
     return false;
   }
@@ -46,8 +55,11 @@ export function passwordArg(password: string): string {
 export function ref(command: string, options: Record<string, string | number>, input: Uint8Array = new Uint8Array(0)): RefResult {
   const args = [SCRIPT, command];
   for (const name of Object.keys(options)) args.push(`--${name}`, String(options[name]));
-  const done = spawnSync('python3', args, { input, maxBuffer: 1 << 28 });
-  return { status: done.status === null ? -1 : done.status, out: new Uint8Array(done.stdout), err: String(done.stderr) };
+  const done = spawnSync('python3', args, { input, maxBuffer: 1 << 28, timeout: COMMAND_MS, killSignal: 'SIGKILL' });
+  if (done.error && (done.error as { code?: string }).code === 'ETIMEDOUT') {
+    return { status: -1, out: new Uint8Array(0), err: `offcrypto_ref.py ${command} did not answer in ${COMMAND_MS / 1000} s and was killed` };
+  }
+  return { status: done.status === null ? -1 : done.status, out: new Uint8Array(done.stdout ?? []), err: String(done.stderr) };
 }
 
 /** As ref(), for a command that has to succeed. */
