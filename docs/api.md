@@ -66,7 +66,8 @@ Node versions that can `require` an ES module). There are no runtime dependencie
 **Bundlers and ES modules.** An ES module does not know its own address, so the bundled font cannot be found by
 itself. Copy `node_modules/bymoffice/dist/fonts/` to your public files and pass the address once:
 `mount(el, { file, fontsUrl: '/assets/bymoffice-fonts/' })` or
-`BymOffice.fonts.configure({ baseUrl: new URL('./dist/fonts/', import.meta.url).href })`.
+`fonts.configure({ baseUrl: '/assets/bymoffice-fonts/' })`. The Vite, React and Vue examples
+([`examples/`](../examples/)) do the copy in `vite.config.js` and are tested.
 
 **Your own server.** Serve `node_modules/bymoffice/dist/` as it is; `bymoffice.min.js` and `fonts/` must stay side by side.
 
@@ -118,7 +119,7 @@ size. A file that is not recognised rejects with `UnsupportedFileError` and noth
 | `file` | `Uint8Array \| ArrayBuffer \| Blob \| string` | — (required) | The file, or a URL to `fetch` it from. An HTTP error rejects (`Could not load the file: HTTP 404`) |
 | `locale` | `string \| FormatLocale` | browser language | Language of number/date formats and of the UI: `'tr'`, `'en'`… Every language other than Turkish is shown with en-US rules |
 | `readOnly` | `boolean` | `false` | No editing (no cell editor, paste, cut, delete, undo, structural commands); copy still works |
-| `toolbar` | `boolean` | `true` | S: show the toolbar |
+| `toolbar` | `boolean` | `true` | Show the toolbars: in a workbook the formatting toolbar; in a document the formatting toolbar and the bar with the zoom and the page number |
 | `formulaBar` | `boolean` | `true` | S: show the formula bar and name box |
 | `statusBar` | `boolean` | `true` | S: show the status bar (sum/average/count) |
 | `calculate` | `boolean` | `true` | S: recalculate formulas after changes |
@@ -413,7 +414,7 @@ const mounted = await BymOffice.mount(el, {
 mounted.collab.state;   // 'connecting' | 'online' | 'offline' | 'detached' | 'closed'
 ```
 
-`collab` is a `ws://`/`wss://` address or a `CollabOptions` object; anything else makes `mount()` throw `TypeError`.
+`collab` is a `ws://`/`wss://` address or a `CollabOptions` object; anything else makes `mount()` reject with `TypeError`.
 
 | `CollabOptions` field | Meaning |
 |---|---|
@@ -537,7 +538,7 @@ createBlank(kind: 'docx' | 'xlsx', options?: { locale?: string; sheetName?: stri
 ```
 
 A new, empty file (deterministic bytes). Turkish gives the sheet name `Sayfa1`; `en`, `en-US`, `en-CA` use Letter
-paper, others A4. Invalid `kind` or `sheetName` throws `RangeError`. Then `mount(el, { file: bytes, saveTo: … })`.
+paper, others A4. An invalid `kind` or `sheetName` makes the promise reject with `RangeError`. Then `mount(el, { file: bytes, saveTo: … })`.
 
 An embedding page that takes `file`, `save`, `mode` (`edit`/`view`), `lang`, `new` (`docx`/`xlsx`), `convert` and
 `name` from its address and talks to its parent with `postMessage` is in `examples/html/index.html`.
@@ -638,7 +639,7 @@ specifications (UNSURE: not compared with protected files).
 
 ### Print
 
-`mounted.print(options?)` / `view.print({ dpi? })` → `Promise<{ pages, dpi }>` (default 200 dpi, 72–600), Print button
+`mounted.print(options?)` / `view.print({ dpi? })` → `Promise<{ pages, dpi }>` (default 200 dpi; values outside 72–600 are clamped), Print button
 or Ctrl/Cmd+P; also read-only and for doc/RTF. Pages go to the browser's print dialog **as images** (no selectable text;
 use `exportPdf()` for that). `DocumentPrintError.code`: `'unavailable' | 'too-long' | 'empty' | 'cancelled' | 'failed'`;
 at most 2 000 pages. The page's CSP needs `img-src blob: data:`; a sandboxed iframe needs `allow-modals`. Not tried on
@@ -647,12 +648,12 @@ real printers, Safari, iOS or Android by hand.
 ### PDF export
 
 `mounted.exportPdf(options?)` / `view.exportPdf(options?)` → `Promise<Uint8Array>` (PDF 1.4), and
-`view.downloadPdf(options?)` → `{ fileName, size }` (the **PDF download** button). Works for documents and
+`await view.downloadPdf(options?)` → `{ fileName, size }` (the **PDF download** button). Works for documents and
 spreadsheets, also read-only and for unconverted doc/RTF/xls. No PDF library is used.
 
 | `PdfExportOptions` | Default | Meaning |
 |---|---|---|
-| `dpi` | 150 | 72–300, resolution of image pages |
+| `dpi` | 150 | Resolution of image pages; values outside 72–300 are clamped (not a number, ≤ 0 or infinite: `RangeError`) |
 | `image` | `'auto'` | `'auto' \| 'jpeg' \| 'lossless'` |
 | `quality` | 0.85 | JPEG quality, 0 < q ≤ 1 |
 | `text` | `'auto'` | `'auto'`: vector page where possible, else image; `'image'`; `'vector'` (fails with `unsupported` if a page cannot be vector) |
@@ -668,8 +669,8 @@ spreadsheets, also read-only and for unconverted doc/RTF/xls. No PDF library is 
 - A page is **vector** (real text with an embedded font, vector drawing) only if all its text uses fonts whose files
   the engine has: the bundled font and fonts given to `registerFont` / `mount({ fonts })`. Other pages are an image of
   the page with an **invisible text layer**; in both cases text can be searched, selected and copied (Turkish too).
-- `PdfExportError` `code`: `'unavailable' | 'empty' | 'too-long' | 'cancelled' | 'unsupported' | 'failed'`; invalid
-  option values throw `RangeError`/`TypeError`. Limits: 2 000 pages; file at most 768 MB (192 MB on touch devices).
+- `PdfExportError` `code`: `'unavailable' | 'empty' | 'too-long' | 'cancelled' | 'unsupported' | 'failed'`; an invalid
+  option (not a clamped number) rejects with `RangeError`/`TypeError`. Limits: 2 000 pages; file at most 768 MB (192 MB on touch devices).
 - Checked with independent PDF tools; not tried in Acrobat or browser PDF viewers (link clicks untested).
 
 ### Fonts
@@ -733,7 +734,7 @@ Cutting an array formula or pushing data off the sheet is refused. Undo keeps at
 steps). Pastes over 1 000 000 cells are refused. Cut = copy + clear (not a move). Sorting and the auto-filter: toolbar,
 `view.sort`, `view.toggleFilter`, `view.setColumnFilter`; ranges with merges, multi-cell array formulas or comment
 threads, and sheets with tables, are not sorted. The headless equivalents are `setCellInput`, `clearRange`,
-`copyRange`, `pasteAt`, `cutRange` (each returns `Op[]`) and `new History(workbook).apply(ops, before, after)`.
+`cutRange` (each returns `Op[]`), `copyRange` (returns a `CopiedRange`, no ops), `pasteAt(workbook, sheet, selection, text, copied?, options?)` (returns a `PasteResult` whose `ops` you apply) and `new History(workbook).apply(ops, before, after)`.
 
 ### Sheet operations
 
@@ -1002,7 +1003,7 @@ without the font.
 | Direction | Messages |
 |---|---|
 | App → page | `load` (`data` base64, `url` or `blank`; plus `name`, `locale`, `readOnly`, `sheet`, `convert`, `toolbar`, `save`, `author`, `trackChanges`, `commentsPanel`, `fonts`, `password`, `passwordPrompt`, `collab`), `save`, `setReadOnly`, `setLocale`, `undo`, `redo`, `print`, `exportPdf`, `printPreview`, `insertSheet`, `renameSheet`, `deleteSheet`, `moveSheet`, `setSheetState`, `copySheet`, `setTabColor`, `refreshPivots`, `insertPivot`, `setPivotFields`, `deletePivot`, `pivotFields`, `setTabStops`, `setPageSetup`, `insertPageBreak`, `removePageBreak`, `resetPageBreaks`, `insertSectionBreak`, `setDefaultTabStop`, `acceptAllRevisions`, `rejectAllRevisions`, `setTrackChanges`, `addComment`, `editComment`, `replyComment`, `resolveComment`, `removeComment`, `commentsPanel`, `close`, `saveResult`, `password`, `hello` |
-| Page → app | `ready` (`version`), `loaded`, `passwordRequired`, `changed`, `saveState`, `saved` (also `by: "user"` / `by: "auto"` with a `saveId` the app answers with `saveResult`), `pdf`, `selection`, `revisions`, `comments`, `sheet`, `sheets`, `done`, `link`, `error`, `collabState` |
+| Page → app | `ready` (`version`), `loaded`, `passwordRequired`, `changed`, `saveState`, `saved` (also `by: "user"` / `by: "auto"` with a `saveId` the app answers with `saveResult`), `pdf`, `selection`, `revisions`, `comments`, `sheet`, `sheets`, `done`, `link`, `error`, `collabState`, `collabSaved` |
 
 Error codes include `bad-message`, `not-loaded`, `read-only`, `no-document`, `no-sheet`, `unsupported`, `corrupt`,
 `load-failed`, `save-failed`, `password-cancelled`, `pdf-too-large` (above 64 MB), `pdf-failed`, `print-failed`,
@@ -1049,7 +1050,7 @@ This is a translation of the guide's "Henüz olmayanlar" table. Do not build on 
 | In a workbook with a pivot table, a form control or **a chart whose references cannot be followed** (row above): deleting and renaming sheets; deleting a sheet that holds a table; deleting and renaming a chart sheet; in a workbook with two sheets whose names differ only in case (`IL` / `İL`): every sheet operation (inserting too) | Refused (this content names sheets and is not rewritten yet); the menu item looks disabled. **Inserting** a sheet is otherwise always free |
 | Updating the model for "place in document" links of drawings (shapes, pictures) | Updated in the file, not in the model: `#Sheet!A1` targets in drawing relationships and the sheet's cell links written as `Target="#…"` get the new name/place **in the saved file** on rename, delete and row/column insert/delete (a target to a deleted sheet becomes `#REF!`, the relationship stays — UNSURE: what Excel writes there was not checked; undo returns the part to its original bytes). The open model's `hyperlink.target` keeps the old text until the file is opened again |
 | 3-D references (`Sheet2:Sheet4!A1`) in content kept "as in the file", such as conditional formats/validation | UNSURE: if an end sheet is deleted and then rows/columns are inserted next to it, the reference in this content can differ from the same reference in a cell (cells are adjusted operation by operation, this content in one pass from the file state). Excel does not allow 3-D references in these rules; seen only in hand-made files |
-| Filtering by colour and icon, filters inside tables, sorting on sheets with comments or tables, a confirmation dialog for warning-type validation, Turkish error names (`#YOK`) | Not available. Filter criteria that cannot be applied are kept in the file |
+| Filtering by colour and icon, filters inside tables, sorting on sheets with comments or tables, a confirmation dialog for warning-type validation | Not available. Filter criteria that cannot be applied are kept in the file |
 | Conditional formats: Excel's original icon pictures (simple vector icons are drawn), the font name/size of the rule and pattern/gradient fills | Not available. With `calculate: false` formula rules are not applied |
 | Word 95 and earlier | Not available; `UnsupportedFileError` |
 | RTF: math, frame positioning, line and fill of Word 95 drawing objects (`\do`; for text boxes only the text is read, others are skipped), old `\pn` lists, table styles, Far East code pages; writing RTF | Not available. RTF opens read-only, `save()` gives the original bytes |
@@ -1069,7 +1070,7 @@ This is a translation of the guide's "Henüz olmayanlar" table. Do not build on 
 | Documents: in-document links, search (see note), right-to-left text, hyphenation, drawing vector pictures (EMF/WMF/SVG) and diagrams (SmartArt), fonts embedded in the document | Not available. A placeholder appears where an object cannot be drawn. *Note: the guide lists "search" here, but Find and replace does exist in documents (see [Documents](#find-and-replace-in-documents)).* |
 | Charts in embedded objects of doc/RTF: Excel 2007+ objects (`Excel.Chart.12` / `Excel.Sheet.12`: an xlsx package inside), workbooks older than BIFF5, linked (not embedded) objects, **floating** OLE objects in doc, the cells of an Excel sheet object; writing the chart to docx **as a chart** (its picture from the file is written, with a warning) | Not available. The object shows as before (in RTF its result picture, in doc nothing); why a chart object could not be read is in `doc.warnings` |
 | xls charts (display): surface and pie-of-bar / pie-of-pie (placeholder); **trendlines and error bars** (not counted as series, not drawn; a note is added); series axis; data table; gradient, pattern and picture fills (patterns become solid colour); manually placed title / legend / plot area (legend stays on the right); axis label angles other than quarter turns; Excel 2007+ extra format records (`CrtLayout12`, `ShapePropsStream`, `TextPropsStream`…); drawing objects over a chart sheet; Excel 5/95 (BIFF5) charts (chart sheet empty, no embedded chart); **writing** the chart to xlsx with `saveAsXlsx()` and editing it with `convert: true` | Not available. A chart that cannot be read stays a placeholder and is listed in the sheet's `warnings`; saving to xlsx does not write the chart and counts it in `report.warnings` |
-| Charts in documents (docx): refreshing a series that **has** a cache from the embedded workbook (the cache is drawn; the workbook is opened only for references without a cache); binary embedded workbooks (`.xlsb`); password-protected embedded workbooks; linked workbooks (`TargetMode="External"`); reading multi-level categories from the workbook; embedded workbooks larger than 16 MB; **inserting, editing, resizing** charts; carrying a chart through the clipboard (a selection with a chart cannot be cut; a copy does not take the chart); rotation and effects (shadow etc.) of the chart frame; `c:clrMapOvr`; reading embedded charts in doc and RTF (OLE / `\object`: Microsoft Graph or an embedded Excel sheet) **as charts** (in RTF the object's `\result` picture is shown: PNG/JPEG are drawn, WMF/EMF become an empty frame; in doc the object character shows nothing); Excel 2016+ `chartex` and surface charts (placeholder); chart titles and labels do not count as document text (not searched, not copied) | Not available |
+| Charts in documents (docx): refreshing a series that **has** a cache from the embedded workbook (the cache is drawn; the workbook is opened only for references without a cache); binary embedded workbooks (`.xlsb`); password-protected embedded workbooks; linked workbooks (`TargetMode="External"`); reading multi-level categories from the workbook; embedded workbooks larger than 16 MB; **inserting, editing, resizing** charts; carrying a chart through the clipboard (a selection with a chart cannot be cut; a copy does not take the chart); rotation and effects (shadow etc.) of the chart frame; `c:clrMapOvr`. Chart titles and labels do not count as document text (not searched, not copied) | Not available |
 | Shapes in documents (docx, doc, RTF): geometries other than rectangle, rounded rectangle, ellipse and straight line (arrows, freeforms, flowchart shapes…); arrow heads; double/triple (compound) lines; custom dashes; gradient, pattern and picture fills; transparency; shadows and other effects; parts of shape groups and drawing canvases; rotating a text box together with its text | Not available. Drawn **in a single-shape drawing** (not a group): preset geometry `rect` (snipped/one-round-corner rectangle kinds and `flowChartProcess` as a plain rectangle too), `roundRect`, `ellipse`, `line`, `straightConnector1`; solid fill; line colour, width (0 = thinnest) and preset dash; rotation of shapes without text, flipping of lines. **Approximated:** arrow lines without heads, compound lines as single, custom dashes as solid; no shadow; partly transparent colours opaque (fully transparent not painted); a *line* with gradient/pattern not drawn at all; shapes with text not rotated. **Placeholders:** a shape without text in another geometry (or in docx with custom geometry or none), or with gradient/pattern/picture fill; groups without text, canvases, charts, diagrams. In those cases a **text box** shows its text: for an unknown geometry without a frame in docx, with a rectangle frame in doc/RTF; with an unshowable fill, without fill. In **groups** only the parts' texts (one below another) and pictures are shown, not their geometry. In doc/RTF also: palette/scheme/system-indexed colours are not resolved (fill not painted, line black), the drawing group's default property table is not read (a shape takes the spec default for what it does not state), arrow heads, compound lines and shadows are not read; a picture shape whose picture is missing is a placeholder. In docx all of this is kept in the file |
 | Grid view: rotated text, shrink to fit, justified alignment, right-to-left sheets, zoom, diagonal borders, pattern/gradient fills, hiding headings | Not available; content is drawn plainly or skipped |
 | Number formats: languages other than Turkish and English, `*` fill, the real width of `_` spacing, Hijri/Japanese calendars, `[DBNum]` | Not available; `*` writes nothing, `_x` is one space |

@@ -18,4 +18,4 @@ mount(element, { file, fontsUrl: import.meta.env.BASE_URL + 'bymoffice-fonts/' }
 
 Keep the licence file of the font (`GUST-FONT-LICENSE.txt`) in the copied folder. If you do not want the font, pass `fonts: false` instead and leave the copy out.
 
-`vite build` warns that a chunk is larger than 500 kB: the engine is one module of about 1.5 MB minified. The warning is harmless; raise `build.chunkSizeWarningLimit` in `vite.config.js` if you want it gone.
+`vite build` warns that a chunk is larger than 500 kB: the engine is one module of about 3 MB minified (about 1 MB gzipped). The warning is harmless; raise `build.chunkSizeWarningLimit` in `vite.config.js` if you want it gone.

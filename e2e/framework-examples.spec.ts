@@ -93,7 +93,7 @@ async function buildAll(work: string): Promise<void> {
       configFile: join(app, 'vite.config.js'),
       base: `/${relative(ROOT, app).split(sep).join('/')}/dist/`,
       logLevel: 'warn',
-      // The engine is one module of about 1.5 MB: more than Vite's warning limit, which says so in every run.
+      // The engine is one module of about 3 MB: more than Vite's warning limit, which says so in every run.
       build: { outDir: join(app, 'dist'), emptyOutDir: true, chunkSizeWarningLimit: 4096 },
     });
     const outputs = (Array.isArray(result) ? result : [result]).flatMap((one: any) => one.output ?? []);
