@@ -89,7 +89,7 @@ Yalnız ES modülü ve `<script>` çıktısı dağıtılır (CommonJS çıktıs�
 
 **Dosya sunabilen ve `PUT` alabilen her arka uçla çalışır.** Aynı yere kaydetme (`saveTo`) 2026-11-03'te Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby ve Dart ile sınandı: açma, düzenleme, kaydetme, ETag ve çakışma. Laravel, Django, ASP.NET Core ve Node örnekleri, CSRF başlıkları ve büyük kayıtları engelleyen istek boyutu sınırları (varsayılan: Django 2,5 MB, PHP 8 MB, ASP.NET Core yaklaşık 28,6 MB) [Sunucuya kaydetme](docs/server.md) belgesinde.
 
-Tablonun ön yüz satırları bir tariftir, test raporu değil: motor bugün bir Laravel sayfasında ve bir Flutter web uygulamasında kullanılıyor; Next.js, React Native, Electron, Tauri ve gerçek mobil WebView'ler henüz denenmedi. Motorun kendisi her değişiklikte Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır. `DecompressionStream` olmayan eski WebView'lerde motor kendi inflate/deflate kodunu kullanır.
+Tablonun ön yüz satırları bir tariftir, test raporu değil: Next.js, React Native, Electron, Tauri ve gerçek mobil WebView'ler henüz denenmedi. Motorun kendisi her değişiklikte Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır. `DecompressionStream` olmayan eski WebView'lerde motor kendi inflate/deflate kodunu kullanır.
 
 ## Geliştirme
 

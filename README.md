@@ -88,7 +88,7 @@ Only the ES module and the `<script>` build are shipped (no CommonJS build). Typ
 
 **Works with any backend that can serve a file and accept a `PUT`.** Saving back (`saveTo`) was tested on 2026-11-03 with Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby and Dart: open, edit, save, ETag and conflict. Examples for Laravel, Django, ASP.NET Core and Node, CSRF headers and the request size limits that block large saves (Django 2.5 MB, PHP 8 MB, ASP.NET Core about 28.6 MB by default) are in [Saving to your server](docs/server.md).
 
-The front-end rows are a recipe, not a test report: the engine is used in a Laravel page and in a Flutter web app; Next.js, React Native, Electron, Tauri and real mobile WebViews have not been tried yet. The engine itself is tested on every change in Chromium, Firefox, WebKit and two mobile profiles (iPhone, Pixel). Old WebViews without `DecompressionStream` fall back to the engine's own inflate/deflate.
+The front-end rows are a recipe, not a test report: Next.js, React Native, Electron, Tauri and real mobile WebViews have not been tried yet. The engine itself is tested on every change in Chromium, Firefox, WebKit and two mobile profiles (iPhone, Pixel). Old WebViews without `DecompressionStream` fall back to the engine's own inflate/deflate.
 
 ## Development
 
