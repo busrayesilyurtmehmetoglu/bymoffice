@@ -1860,7 +1860,7 @@ const FONT_WAIT_MS = 3000;
  * ```html
  * <!-- CDN: the script defines the global BymOffice. Pin the version. -->
  * <div id="editor" style="height: 600px"></div>
- * <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+ * <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
  * <script>
  *   BymOffice.mount(document.getElementById('editor'), {
  *     file: '/files/report.xlsx', // a URL, a Blob or File, an ArrayBuffer or a Uint8Array

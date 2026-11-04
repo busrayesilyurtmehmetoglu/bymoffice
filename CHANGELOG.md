@@ -2,7 +2,7 @@
 
 Bu dosya [Keep a Changelog](https://keepachangelog.com/tr/1.1.0/) düzenini izler; sürümler [anlamsal sürümleme](https://semver.org/lang/tr/) ile numaralanır. 1.0'dan önce (0.x) küçük sürümler kırıcı değişiklik içerebilir; bunlar "Kırıcı" başlığı altında yazılır.
 
-## 0.1.2 — yayımlanmadı
+## 0.1.2 — 2026-11-04
 
 API değişikliği yok.
 

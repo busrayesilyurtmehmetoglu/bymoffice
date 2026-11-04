@@ -1,6 +1,6 @@
 {
   "name": "bymoffice",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "description": "Open, edit and save Word and Excel files (docx, xlsx, doc, xls, RTF) in the browser: one script, no server, no dependencies",
   "homepage": "https://busrayesilyurtmehmetoglu.github.io/bymoffice/",

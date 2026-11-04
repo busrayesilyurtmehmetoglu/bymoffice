@@ -6,7 +6,7 @@ A document and spreadsheet engine written from scratch in TypeScript: one script
 [Live demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/) · [Türkçe](README.tr.md) · [API reference](docs/api.md) · [Saving to your server](docs/server.md) · [Developer guide (Turkish)](docs/kullanim-kilavuzu.md) · [WebView bridge](docs/webview-koprusu.md) · [Changelog](CHANGELOG.md)
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
 <div id="editor" style="height: 600px"></div>
 <script>
   BymOffice.mount(document.getElementById('editor'), {
@@ -52,7 +52,7 @@ What is **not** there yet is listed honestly in the guide's "Henüz olmayanlar" 
 **CDN** — no build step, defines a global `BymOffice`:
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
 ```
 
 **npm**
