@@ -3,7 +3,7 @@
 Bu kılavuz, BYM Office'i kendi uygulamasına ekleyecek geliştiriciler içindir. Her kod değişikliğinde güncellenir;
 burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılmamış olanlar "Henüz olmayanlar" başlığında açıkça listelenir.
 
-**Kılavuzun karşılık geldiği sürüm:** 0.1.0 (2026-10-16) — ilk sürüm. Neyin yapılıp neyin henüz yapılmadığı Bölüm 1'de ve "Henüz olmayanlar" tablosunda; değişiklikler [`CHANGELOG.md`](../CHANGELOG.md)'de.
+**Kılavuzun karşılık geldiği sürüm:** 0.1.1 (2026-11-04). Neyin yapılıp neyin henüz yapılmadığı Bölüm 1'de ve "Henüz olmayanlar" tablosunda; değişiklikler [`CHANGELOG.md`](../CHANGELOG.md)'de.
 
 ## 1. Bu sürüm ne yapar
 
@@ -107,11 +107,11 @@ burada yazan her şey depodaki sürümde çalışır durumdadır, henüz yapılm
 **CDN'den, tek satır** (derleme aracı gerekmez; global `BymOffice` nesnesi tanımlanır):
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>
-<!-- ya da: https://unpkg.com/bymoffice@0.1.0/dist/bymoffice.min.js -->
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<!-- ya da: https://unpkg.com/bymoffice@0.1.1/dist/bymoffice.min.js -->
 ```
 
-Adreste sürümü yazın (`@0.1.0`): sürümsüz adres her yeni sürümde kendiliğinden değişir, 0.x'te küçük sürümler kırıcı değişiklik içerebilir. Paketle gelen font betiğin yanındaki `fonts/` klasöründen kendiliğinden yüklenir (CDN'de de; bkz. "Fontlar").
+Adreste sürümü yazın (`@0.1.1`): sürümsüz adres her yeni sürümde kendiliğinden değişir, 0.x'te küçük sürümler kırıcı değişiklik içerebilir. Paketle gelen font betiğin yanındaki `fonts/` klasöründen kendiliğinden yüklenir (CDN'de de; bkz. "Fontlar").
 
 **npm ile** (paketleyici ya da Node):
 

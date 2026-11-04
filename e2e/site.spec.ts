@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import type { Download, Frame, Page } from '@playwright/test';
 import { REPOSITORY_URL, SITE_URL } from '../scripts/site-config.mjs';
@@ -9,6 +9,9 @@ import { expect, test } from './helpers';
 // editor, the samples, and each usage example as it runs.
 
 const SITE = '/bymoffice/';
+/** The CDN addresses of the version being built. */
+const VERSION: string = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const CDN = `https://cdn.jsdelivr.net/npm/bymoffice@${VERSION}/dist/`;
 const OUT = new URL('../site-dist/', import.meta.url);
 
 /** The texts of the site, as its pages read them. */
@@ -118,7 +121,7 @@ test.describe('demo site: pages and languages', () => {
 
   test('the home page gives the one-line installation and links to the demos and the repository', async ({ page }) => {
     await page.goto(SITE);
-    await expect(page.locator('#install-cdn')).toHaveText('<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>');
+    await expect(page.locator('#install-cdn')).toHaveText(`<script src="${CDN}bymoffice.min.js"></script>`);
     await expect(page.locator('#install-npm')).toHaveText('npm i bymoffice');
     await expect(page.locator('main a[href="editor.html"]')).toHaveCount(1);
     await expect(page.locator('main a[href="examples.html"]')).toHaveCount(1);
@@ -280,9 +283,9 @@ test.describe('demo site: the usage examples', () => {
       const running = await (await page.request.get(`${SITE}examples/${id}.html`)).text();
       const shown = running
         .replace(/^[ \t]*<meta http-equiv="Content-Security-Policy"[^\n]*\n/m, '')
-        .split('../bymoffice.min.js').join('https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js')
-        .split('../bymoffice.esm.js').join('https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.esm.js')
-        .split("'../fonts/'").join("'https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/fonts/'");
+        .split('../bymoffice.min.js').join(`${CDN}bymoffice.min.js`)
+        .split('../bymoffice.esm.js').join(`${CDN}bymoffice.esm.js`)
+        .split("'../fonts/'").join(`'${CDN}fonts/'`);
       expect(shown, id).toBe(code[id]);
       await expect(page.locator(`#ex-${id} iframe`)).toHaveAttribute('data-src', `examples/${id}.html?lang=en`);
     }
@@ -291,8 +294,8 @@ test.describe('demo site: the usage examples', () => {
     await page.locator('#ex-locale iframe').scrollIntoViewIfNeeded();
     await expect(page.locator('#ex-locale iframe')).toHaveAttribute('src', 'examples/locale.html?lang=en');
     await examplesSettled(page, 'en');
-    expect(code.script).toContain('<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>');
-    expect(code.module).toContain("from 'https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.esm.js'");
+    expect(code.script).toContain(`<script src="${CDN}bymoffice.min.js"></script>`);
+    expect(code.module).toContain(`from '${CDN}bymoffice.esm.js'`);
     // The examples follow the language of the site.
     await page.selectOption('#lang', 'tr');
     await expect(page.locator('#ex-script iframe')).toHaveAttribute('src', 'examples/script.html?lang=tr');
