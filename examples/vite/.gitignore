@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# Copied from node_modules/bymoffice/dist/fonts/ by vite.config.js
+public/bymoffice-fonts/

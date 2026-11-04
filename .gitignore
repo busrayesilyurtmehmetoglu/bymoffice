@@ -14,3 +14,6 @@ tmp-*/
 
 # macOS
 .DS_Store
+
+# Copied by the Vite examples from node_modules/bymoffice/dist/fonts/ when they run in place
+examples/*/public/bymoffice-fonts/

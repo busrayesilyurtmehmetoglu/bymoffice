@@ -45,7 +45,10 @@
     "laravel",
     "django",
     "php",
-    "aspnet"
+    "aspnet",
+    "react",
+    "vue",
+    "vite"
   ],
   "main": "dist/bymoffice.esm.js",
   "module": "dist/bymoffice.esm.js",
@@ -85,9 +88,15 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "@vitejs/plugin-vue": "^6.0.10",
     "esbuild": "^0.25.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "ssf": "0.11.2",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vite": "^8.3.5",
+    "vue": "^3.5.44"
   }
 }
