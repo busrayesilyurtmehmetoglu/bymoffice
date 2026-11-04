@@ -14,7 +14,7 @@ import { createHash } from 'node:crypto';
 import { cp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { REPOSITORY_URL } from './site-config.mjs';
+import { REPOSITORY_URL, SITE_URL } from './site-config.mjs';
 import { makeSamples } from './site-samples.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -74,8 +74,11 @@ function shownCode(page) {
 
 /** Fails when a page asks for anything of another host (the CDN appears only as text in code). */
 function checkOwnOrigin(source, where) {
-  // Code shown on a page is text (escaped), not markup.
-  const page = source.replace(/<pre\b[\s\S]*?<\/pre>/g, '');
+  // Code shown on a page is text (escaped), not markup. The canonical link names the page's own
+  // public address and loads nothing.
+  const page = source
+    .replace(/<pre\b[\s\S]*?<\/pre>/g, '')
+    .replace(/<link rel="canonical" href="([^"]*)" \/>/g, (tag, href) => (href.startsWith(SITE_URL) ? '' : tag));
   for (const match of page.matchAll(/\b(?:src|href|action|data|poster)\s*=\s*["']([^"']*)["']/gi)) {
     const value = match[1];
     if (value === REPOSITORY_URL || value.startsWith(`${REPOSITORY_URL}/`)) continue;
@@ -117,7 +120,7 @@ function checkKeys(page, where) {
 }
 
 const placeholders = (page, where) => {
-  let out = page.split('__BYM_VERSION__').join(version).split('__BYM_REPOSITORY_URL__').join(REPOSITORY_URL).split('__BYM_CDN__').join(CDN);
+  let out = page.split('__BYM_VERSION__').join(version).split('__BYM_REPOSITORY_URL__').join(REPOSITORY_URL).split('__BYM_CDN__').join(CDN).split('__BYM_SITE_URL__').join(SITE_URL);
   if (/__BYM_[A-Z_]+__/.test(out.replace('__BYM_CSP__', ''))) throw new Error(`${where}: an unknown placeholder ${/__BYM_[A-Z_]+__/.exec(out)[0]}`);
   return out;
 };
@@ -133,6 +136,10 @@ async function copyTree(from, to) {
       continue;
     }
     if (entry.name.startsWith('.')) continue;
+    if (entry.name.endsWith('.txt')) {
+      await writeFile(target, placeholders(await readFile(source, 'utf8'), where));
+      continue;
+    }
     if (!entry.name.endsWith('.html')) {
       await cp(source, target);
       continue;
@@ -161,6 +168,20 @@ await writeFile(join(OUT, 'examples', 'code.json'), JSON.stringify(examples, nul
 const engine = await import(pathToFileURL(join(DIST, 'bymoffice.esm.js')).href);
 await mkdir(join(OUT, 'samples'), { recursive: true });
 for (const [name, bytes] of Object.entries(await makeSamples(engine))) await writeFile(join(OUT, 'samples', name), bytes);
+
+// For search engines: a sitemap of the pages at their canonical addresses (site/llms.txt is for AI
+// tools). The Turkish view (?lang=tr) is the same page, so it is not listed apart.
+// (A robots.txt is read only at the root of a host, which a project site under /bymoffice/ is not.)
+const PAGES = ['', 'editor.html', 'examples.html'];
+const xml = (text) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+const sitemap = [
+  '<?xml version="1.0" encoding="UTF-8"?>',
+  '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+  ...PAGES.map((path) => `  <url><loc>${xml(SITE_URL + path)}</loc></url>`),
+  '</urlset>',
+  '',
+].join('\n');
+await writeFile(join(OUT, 'sitemap.xml'), sitemap);
 
 // Nothing private and no address of this machine goes out with the site.
 async function checkTree(dir) {
