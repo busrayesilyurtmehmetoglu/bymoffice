@@ -136,6 +136,11 @@ async function copyTree(from, to) {
       continue;
     }
     if (entry.name.startsWith('.')) continue;
+    // A search engine's ownership file is checked byte for byte: copied as it is.
+    if (/^google[0-9a-f]+\.html$/.test(entry.name)) {
+      await cp(source, target);
+      continue;
+    }
     if (entry.name.endsWith('.txt')) {
       await writeFile(target, placeholders(await readFile(source, 'utf8'), where));
       continue;
