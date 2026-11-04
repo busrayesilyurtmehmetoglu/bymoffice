@@ -453,16 +453,6 @@ export { sliceHtml, sliceOf, type DocSlice } from './ui/doc-clipboard';
 export type { LineMark } from './layout/doc/types';
 export type { EditProgress } from './layout/doc/layout';
 
-/**
- * The fonts of the application: registerFont() adds a font to the ones the
- * device has (also as a stand-in for font names of files), registeredFonts()
- * lists them and unregisterFont() takes one out again. The same functions
- * are exported on their own.
- *
- * configure() sets where the font the package brings (TeX Gyre Bonum, shown
- * for Bookman Old Style on devices that lack it) is fetched from, or turns
- * it off; embedded() tells its state. See EmbeddedFontsOptions.
- */
 export { collab } from './collab/index';
 export {
   CollabSession,
@@ -487,19 +477,42 @@ export {
 } from './collab/index';
 export { readCollabStamp, writeSharedFile, type CollabStamp, type SharedFile, type StampingSession } from './formats/xlsx/collab-stamp';
 
-/** Editing a workbook together with others: where the relay is, and who this participant is. See MountOptions.collab. */
+/**
+ * Editing a workbook or a document together with others: where the relay is, and who this participant is.
+ * See MountOptions.collab; a plain address string is the same as `{ url }`.
+ *
+ * @example
+ * ```js
+ * await BymOffice.mount(el, {
+ *   file: '/files/plan.xlsx',
+ *   saveTo: true,
+ *   collab: {
+ *     url: 'wss://example.com/collab',
+ *     room: 'plan-42',
+ *     user: { name: 'Ayla', color: '#1a7f45' },
+ *     token: sessionToken, // checked by the relay
+ *     onState: (state) => console.log(state), // 'connecting' | 'online' | 'offline' | 'detached' | 'closed'
+ *   },
+ * });
+ * ```
+ */
 export interface CollabOptions {
   /** The address of the relay ("ws://…" or "wss://…"); everybody who opens the same address (and room) edits together. */
   url?: string;
-  /** A channel of the application in place of `url`: see CollabTransport. */
+  /** A channel of the application in place of `url` (one over an existing message service, say): see CollabTransport. */
   transport?: CollabTransport;
   /** A room at the address, when one address serves several files. */
   room?: string;
-  /** The name and the colour ("#RRGGBB") the others see. */
+  /**
+   * The name and the colour ("#RRGGBB") the others see: what this participant says of itself, no proof of who it
+   * is. Without a name the one the relay gives is shown, or "Guest N" in the language of the view.
+   */
   user?: CollabUser;
   /** Sent to the relay in the first message, for it to decide who may join. Never shown, never logged here. */
   token?: string;
+  /** Called whenever the state of the session changes: "connecting", "online", "offline", "detached" or "closed". */
   onState?(state: CollabState): void;
+  /** Called whenever the others in the room change (someone came, left, or is somewhere else now): the others, without this participant. */
   onPeers?(peers: CollabPeer[]): void;
   /** Who is in the file changed (someone came, left, was renamed, went to another sheet, can only read now): the list, this participant first. */
   onPeople?(people: CollabPerson[]): void;
@@ -511,8 +524,12 @@ export interface CollabOptions {
   saveWatchMs?: number;
 }
 
-/** What mount() answers for a workbook that is edited together. */
+/** What mount() answers for a workbook that is edited together (MountedSpreadsheet.collab). */
 export interface MountedCollab {
+  /**
+   * "connecting", "online" (in the room), "offline" (the relay cannot be reached; changes wait here and are sent
+   * when it can), "detached" (the room is at another version of the file: see reload()) or "closed" (see `reason`).
+   */
   readonly state: CollabState;
   /**
    * Why a `closed` session ended by itself: `version` (the room is edited with another version of
@@ -523,10 +540,13 @@ export interface MountedCollab {
   readonly rev: number;
   /** How many changes made here wait for the relay. */
   readonly pending: number;
+  /** The others in the room, without this participant (see `people` for everybody). */
   readonly peers: CollabPeer[];
   /** This participant as the others see it. */
   readonly user: CollabPeer;
+  /** Set it to be told of every change of `state` (as CollabOptions.onState, which is called as well). */
   onState?: (state: CollabState) => void;
+  /** Set it to be told whenever `peers` changes (as CollabOptions.onPeers, which is called as well). */
   onPeers?: (peers: CollabPeer[]) => void;
   /**
    * Everybody in the file, this participant first (`self`), then the others in the order the relay named them:
@@ -535,6 +555,7 @@ export interface MountedCollab {
    * (offline, detached, closed) the list is this participant alone. At most 200 are listed.
    */
   readonly people: CollabPerson[];
+  /** Set it to be told whenever `people` changes (as CollabOptions.onPeople, which is called as well). */
   onPeople?: (people: CollabPerson[]) => void;
   /**
    * For an application that saves by itself (with save(), without `saveTo`): tells the others that
@@ -556,7 +577,9 @@ export interface MountedCollab {
 export interface MountedDocCollab extends Omit<MountedCollab, 'peers' | 'user' | 'onPeers'> {
   /** The others; `presence` is the story and the two ends of their selection (the same place for a caret). */
   readonly peers: DocPeer[];
+  /** This participant as the others see it. */
   readonly user: DocPeer;
+  /** Set it to be told whenever `peers` changes (as CollabOptions.onPeers, which is called as well). */
   onPeers?: (peers: DocPeer[]) => void;
 }
 
@@ -615,8 +638,35 @@ function fileVersions(etag: string | null | undefined, bytes: Uint8Array): strin
   return versions;
 }
 
+/**
+ * The fonts of the application: registerFont() adds a font to the ones the
+ * device has (also as a stand-in for font names of files), registeredFonts()
+ * lists them and unregisterFont() takes one out again. The same functions
+ * are exported on their own.
+ *
+ * configure() sets where the font the package brings (TeX Gyre Bonum, shown
+ * for Bookman Old Style on devices that lack it) is fetched from, or turns
+ * it off; embedded() tells its state. See EmbeddedFontsOptions. Both are
+ * settings of the page, not of one view: they stay when a view is destroyed.
+ *
+ * @example
+ * ```js
+ * // A font of the application, also shown for text a file sets in "Calibri" where the device lacks it.
+ * await BymOffice.fonts.registerFont({ family: 'Carlito', source: '/fonts/Carlito-Regular.ttf', as: 'Calibri' });
+ * await BymOffice.fonts.registerFont({ family: 'Carlito', source: '/fonts/Carlito-Bold.ttf', weight: 'bold', as: 'Calibri' });
+ * ```
+ *
+ * @example
+ * ```js
+ * // With a bundler: the folder of the package's dist/fonts/, copied to where the server serves it.
+ * import { fonts } from 'bymoffice';
+ * fonts.configure({ baseUrl: '/assets/bymoffice-fonts/' });
+ * fonts.configure({ baseUrl: null }); // or: no embedded font at all
+ * ```
+ */
 export const fonts = { registerFont, registeredFonts, unregisterFont, configure: configureEmbeddedFonts, embedded: embeddedFontsState };
 
+/** The formats open() reads: docx and xlsx are read and written; doc, xls and RTF are read only (see OfficeFile.saveAsDocx/saveAsXlsx and MountOptions.convert). */
 export type OfficeFormat = 'docx' | 'xlsx' | 'doc' | 'xls' | 'rtf';
 
 /** What open() takes besides the file. */
@@ -640,6 +690,8 @@ export interface OpenOptions {
    * Refuses an encrypted docx or xlsx that carries no integrity check (agile encryption without `dataIntegrity`)
    * with PasswordError "damaged". Without it such a file is opened, and says so in `warnings`: its content
    * could have been changed by someone who does not know the password, and nothing would show.
+   *
+   * @defaultValue false
    */
   requireIntegrity?: boolean;
 }
@@ -668,9 +720,25 @@ export interface SaveOptions {
   signal?: { readonly aborted: boolean };
 }
 
+/**
+ * A file that open() read: its format, the models read from it on demand, and
+ * the ways to get its bytes back. Nothing is shown; see mount() for that.
+ *
+ * @example
+ * ```js
+ * const file = await BymOffice.open(bytes);
+ * if (file.kind === 'spreadsheet') {
+ *   const workbook = await file.workbook();
+ *   console.log(workbook.sheets.map((sheet) => sheet.name));
+ * }
+ * ```
+ */
 export interface OfficeFile {
+  /** The format, detected from the content (never from a file name). */
   format: OfficeFormat;
+  /** "document" for docx, doc and RTF (use document()); "spreadsheet" for xlsx and xls (use workbook()). */
   kind: 'document' | 'spreadsheet';
+  /** How the file is packed: "ooxml" (a ZIP package: docx, xlsx), "cfb" (a compound file: doc, xls) or "rtf". */
   container: 'ooxml' | 'cfb' | 'rtf';
   /** Present for docx/xlsx. */
   package?: OpcPackage;
@@ -702,27 +770,41 @@ export interface OfficeFile {
   close(): void;
   /**
    * The spreadsheet model: sheets, cells, styles. Read on first use and then
-   * kept. Rejects with UnsupportedFileError for documents and, until the BIFF
-   * reader exists, for xls.
+   * kept. For xlsx and xls; rejects with UnsupportedFileError for documents.
+   * Changes made to the model of an xlsx are written by save().
    */
   workbook(): Promise<Workbook>;
   /**
    * The document model: paragraphs, tables, styles, numbering. Read on first use
-   * and then kept. Present for docx only, until the other readers exist.
+   * and then kept. Present for documents (docx, doc and RTF), missing for spreadsheets.
+   * Changes made to the model of a docx are written by save().
    */
   document?(): Promise<DocModel>;
   /**
-   * The document as a docx file. For a docx this is save(); for doc and RTF,
+   * The document as a docx file; present for documents (docx, doc, RTF). For a docx this is save(); for doc and RTF,
    * which cannot be written, the model is written out as a new docx (shapes
    * lose their geometry, theme colours become plain ones). A password-protected
    * file gives an encrypted docx (see SaveOptions).
+   *
+   * @example
+   * ```js
+   * const file = await BymOffice.open(rtfBytes); // or a doc
+   * const docx = await file.saveAsDocx();
+   * ```
    */
   saveAsDocx?(options?: SaveOptions): Promise<Uint8Array>;
   /**
-   * The spreadsheet as an xlsx file. For an xlsx this is save(); for xls, which
+   * The spreadsheet as an xlsx file; present for spreadsheets (xlsx, xls). For an xlsx this is save(); for xls, which
    * cannot be written, the model is written out as a new xlsx: what the model
    * holds, not what the xls reader leaves out (charts, macros, print settings).
    * A password-protected file gives an encrypted xlsx (see SaveOptions).
+   * To be told what was left out, call buildXlsx(await file.workbook(), { report }) instead.
+   *
+   * @example
+   * ```js
+   * const file = await BymOffice.open(xlsBytes); // file.format === 'xls'
+   * const xlsx = await file.saveAsXlsx();        // a new xlsx; file.save() still gives the original xls bytes
+   * ```
    */
   saveAsXlsx?(options?: SaveOptions): Promise<Uint8Array>;
   /**
@@ -857,6 +939,30 @@ export function encryptionOf(input: Uint8Array | ArrayBuffer): { format: Encrypt
  * is opened with `options.password`; without one, or with a wrong one, the
  * call rejects with PasswordError ("required", "wrong"), and with
  * "unsupported" or "damaged" for a file that cannot be decrypted at all.
+ * Anything else that is not a Word or Excel file rejects with
+ * UnsupportedFileError. Works in browsers and in Node (no DOM is needed).
+ *
+ * @example
+ * ```js
+ * // Node: open a file and save it again.
+ * import { readFile, writeFile } from 'node:fs/promises';
+ * import { open } from 'bymoffice';
+ *
+ * const file = await open(new Uint8Array(await readFile('report.xlsx')));
+ * console.log(file.format, file.kind); // 'xlsx' 'spreadsheet'
+ * await writeFile('copy.xlsx', await file.save()); // parts that were not changed keep their original bytes
+ * ```
+ *
+ * @example
+ * ```js
+ * // A password-protected file.
+ * try {
+ *   const file = await BymOffice.open(bytes, { password: 'secret' });
+ * } catch (error) {
+ *   if (error instanceof BymOffice.PasswordError && error.code === 'wrong') console.log('Wrong password');
+ *   else throw error;
+ * }
+ * ```
  */
 export async function open(input: Uint8Array | ArrayBuffer | Blob, options: OpenOptions = {}): Promise<OfficeFile> {
   return openWith(input, options, {});
@@ -1126,8 +1232,31 @@ async function openForView(
   );
 }
 
+/**
+ * What mount() takes. Only `file` is required. The options of the spreadsheet
+ * editor (toolbar, formulaBar, statusBar, locale, readOnly, onChange, …) come
+ * from SpreadsheetEditorOptions and WorkbookViewOptions; the ones marked
+ * "Documents" only act on docx, doc and RTF. Options of one kind are ignored
+ * for the other.
+ *
+ * @example
+ * ```js
+ * // Open, edit and save back to where the file came from.
+ * const mounted = await BymOffice.mount(document.getElementById('editor'), {
+ *   file: '/files/report.docx',
+ *   saveTo: true,
+ *   locale: 'en',
+ *   onSaveState: (state) => console.log(state.dirty ? 'unsaved changes' : 'saved'),
+ * });
+ * ```
+ */
 export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveCommand'> {
-  /** The file itself, or a URL to fetch it from. The format is detected from the content. */
+  /**
+   * The file itself (bytes, a Blob or a File), or a URL to fetch it from with `fetch()`. The format is detected
+   * from the content, never from the name. A URL whose answer is not 2xx rejects with
+   * `Error("Could not load the file: HTTP <status>")`. Only a file fetched from an http(s) URL can be saved
+   * back to it (`saveTo: true`).
+   */
   file: Uint8Array | ArrayBuffer | Blob | string;
   /**
    * The password of a password-protected file (see OpenOptions.password).
@@ -1147,12 +1276,29 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * Without it the editor asks by itself, in a dialog inside the container
    * (a field of type "password"; Escape gives up). The password is not kept
    * in the page: the field is emptied when its content is taken.
+   *
+   * @example
+   * ```js
+   * try {
+   *   await BymOffice.mount(el, {
+   *     file: '/files/secret.xlsx',
+   *     // askUser() is the page's own dialog: it resolves to the password, or to null when the user gives up.
+   *     onPassword: ({ attempts, wrong }) => askUser(wrong ? `Wrong password (${attempts} tried)` : 'Password'),
+   *   });
+   * } catch (error) {
+   *   if (error instanceof BymOffice.PasswordError && error.code === 'cancelled') {
+   *     // The user gave up: nothing is shown in the container.
+   *   } else throw error;
+   * }
+   * ```
    */
   onPassword?(request: PasswordRequest): string | null | undefined | Promise<string | null | undefined>;
   /**
    * Refuses an encrypted file that has no integrity check (see OpenOptions.requireIntegrity). Without it such a
    * file is shown, and the user is told through the notice of the view and onNotice that its content could have
    * been changed by someone who does not know the password.
+   *
+   * @defaultValue false
    */
   requireIntegrity?: boolean;
   /**
@@ -1196,6 +1342,42 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * read-only. `false` is the same as leaving the option out. mount() rejects
    * with TypeError for a value that cannot be saved to: `true` for a file
    * given as bytes, an address of another scheme, another method.
+   *
+   * @defaultValue undefined: no Save button; Ctrl+S / Cmd+S calls `onSave` when it is given
+   * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+   *
+   * @example
+   * ```js
+   * // PUT the file back to the address it was fetched from, with If-Match.
+   * await BymOffice.mount(el, { file: '/files/report.xlsx', saveTo: true });
+   * ```
+   *
+   * @example
+   * ```js
+   * // A request with a CSRF header (a server that puts its token in a meta tag).
+   * const file = '/files/report.xlsx';
+   * await BymOffice.mount(el, {
+   *   file,
+   *   saveTo: {
+   *     url: file,
+   *     method: 'PUT',
+   *     headers: { 'X-CSRF-TOKEN': document.querySelector('meta[name=csrf-token]').content },
+   *   },
+   *   onError: (error) => console.warn(error.code, error.status), // a SaveError
+   * });
+   * ```
+   *
+   * @example
+   * ```js
+   * // The application saves by itself: throw (or reject) when the bytes are not safe.
+   * await BymOffice.mount(el, {
+   *   file: blob,
+   *   saveTo: async (bytes, info) => {
+   *     const answer = await fetch(`/api/files/42?format=${info.format}`, { method: 'POST', body: bytes });
+   *     if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
+   *   },
+   * });
+   * ```
    */
   saveTo?: SaveTo | false;
   /**
@@ -1232,31 +1414,76 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    *   onSaveState; the first one after something went wrong is.
    *
    * A function given as `saveTo` is told `info.auto: true` for these saves.
+   *
+   * @defaultValue false
+   *
+   * @example
+   * ```js
+   * await BymOffice.mount(el, {
+   *   file: '/files/report.xlsx',
+   *   saveTo: true,
+   *   autoSave: { delayMs: 3000, maxWaitMs: 60000 }, // or `true`: 2 s after the last change, 30 s at the latest
+   *   onSaveState: ({ dirty, saving, autoPaused }) => console.log({ dirty, saving, autoPaused }),
+   * });
+   * ```
    */
   autoSave?: AutoSave;
   /**
-   * Edits the workbook together with everybody who opens the same address: the address of a
+   * Edits the file together with everybody who opens the same address: the address of a
    * relay ("wss://example.com/collab/42"), or an object (see CollabOptions) with `url` or a
-   * `transport` of the application, and `user`, `room`, `token`. An xlsx only: for a document, a
-   * file of another format or one that was converted, a notice says that it is not edited
-   * together, and the file is shown as without the option. Throws TypeError for anything that
-   * is neither an address nor such an object.
+   * `transport` of the application, and `user`, `room`, `token`. For xlsx and docx only: for a
+   * file of another format, one that was converted (`convert`) and a document that holds or
+   * tracks changes, a notice says that it is not edited together, and the file is shown as
+   * without the option. mount() rejects with TypeError for anything that is neither an address
+   * nor such an object. The result's `collab` tells the state of the room and who is in it.
+   * The package brings a relay for Node without dependencies: `server/collab-server.mjs`.
+   *
+   * @example
+   * ```js
+   * const mounted = await BymOffice.mount(el, {
+   *   file: '/files/plan.xlsx',
+   *   saveTo: true,
+   *   autoSave: true, // one participant saves for all
+   *   collab: 'wss://example.com/collab/plan-42',
+   * });
+   * if (mounted.collab) mounted.collab.onPeople = (people) => console.log(people.map((person) => person.name));
+   * ```
    */
   collab?: string | CollabOptions;
-  /** With `saveTo`: called whenever there is something else to say about saving. */
+  /**
+   * With `saveTo`: called whenever what there is to say about saving changes (unsaved changes, a save under
+   * way, the last save and its error, the state of auto-save): what a "Saved" / "Saving…" label of the page goes by.
+   *
+   * @see https://github.com/busrayesilyurtmehmetoglu/bymoffice/blob/main/docs/server.md
+   */
   onSaveState?(state: SaveState): void;
   /**
    * With `saveTo`: leaving the page with changes that were not saved asks the
    * user first (the browser's own question). Default true.
+   *
+   * @defaultValue true
    */
   warnOnLeave?: boolean;
   /**
    * Without `saveTo`: called with the file's bytes when the user saves with
    * Ctrl+S or Cmd+S in the view; without either the shortcut is left to the
    * browser. With `saveTo`: called with the bytes after every save that succeeded.
+   * Without `saveTo` the toolbar has no Save button: a button of the page calls
+   * `mounted.save()` for the bytes.
+   *
+   * @example
+   * ```js
+   * await BymOffice.mount(el, {
+   *   file: blob,
+   *   onSave: (bytes) => fetch('/api/files/42', { method: 'PUT', body: bytes }),
+   * });
+   * ```
    */
   onSave?(bytes: Uint8Array): void;
-  /** Called when saving fails: with a SaveError when `saveTo` is given, otherwise with what the writer threw. */
+  /**
+   * Called when saving fails: with a SaveError when `saveTo` is given, otherwise with what the writer threw
+   * (for Ctrl+S / Cmd+S with `onSave`; without onError that error is thrown, uncaught).
+   */
   onError?(error: unknown): void;
   /**
    * Opens the formats that cannot be written back (doc, RTF, xls) for
@@ -1266,6 +1493,24 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * `readOnly`, these files are shown as they are, read-only, and nothing
    * turns editing on. A file whose conversion fails is shown the same way,
    * and onNotice says so. Has no effect on docx and xlsx.
+   *
+   * Pass `onNotice` as well: that the file was converted, or could not be, is told
+   * only there (what was not carried over is listed in `conversion.warnings` of
+   * the result). With `saveTo` a converted file is not
+   * saved over the address of its original unless the request says `allowConverted: true`.
+   *
+   * @defaultValue false
+   *
+   * @example
+   * ```js
+   * const mounted = await BymOffice.mount(el, {
+   *   file: '/files/old-report.doc',
+   *   convert: true,
+   *   onNotice: ({ message, kind }) => console.log(kind, message),
+   * });
+   * if (mounted.conversion) console.log(mounted.conversion.from, '->', mounted.conversion.to, mounted.conversion.warnings);
+   * const docx = await mounted.save(); // a docx
+   * ```
    */
   convert?: boolean;
   /**
@@ -1277,6 +1522,14 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * arrives). The fonts stay registered when the view is destroyed.
    *
    * `false` turns the font the package brings off, as `fontsUrl: null` does.
+   *
+   * @example
+   * ```js
+   * await BymOffice.mount(el, {
+   *   file,
+   *   fonts: [{ family: 'Carlito', source: '/fonts/Carlito-Regular.ttf', as: 'Calibri' }],
+   * });
+   * ```
    */
   fonts?: FontRegistration[] | false;
   /**
@@ -1285,6 +1538,17 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * engine is inside a bundle (the folder is then not next to the script).
    * `null` turns the embedded font off. Like the fonts themselves the
    * setting is the page's, not this view's: it stays when the view is destroyed.
+   * Without it a `<script>` (CDN) finds the folder `fonts/` next to itself; an
+   * ES module has no such default and needs the address.
+   *
+   * @defaultValue the `fonts/` folder next to the `<script>`; none for an ES module
+   *
+   * @example
+   * ```js
+   * // Vite / webpack: copy node_modules/bymoffice/dist/fonts/ to the folder the server serves as /bymoffice-fonts/.
+   * import { mount } from 'bymoffice';
+   * await mount(el, { file, fontsUrl: '/bymoffice-fonts/' });
+   * ```
    */
   fontsUrl?: string | null;
   /** Documents: the zoom, 1 = 100%, or a mode that follows the container. Default: 100%, less when the page is wider than the container. */
@@ -1300,11 +1564,15 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * does not ask for it. A document that asks for it (its "track changes"
    * setting, or a protection that allows only tracked changes) is always
    * edited with tracked changes; false does not turn that off.
+   *
+   * @defaultValue false
    */
   trackChanges?: boolean;
   /**
    * Who is editing: the author that tracked changes of a document name, and the author of
    * the notes added to the cells of a spreadsheet. Default "Author".
+   *
+   * @defaultValue "Author"
    */
   author?: string;
   /**
@@ -1312,6 +1580,8 @@ export interface MountOptions extends Omit<SpreadsheetEditorOptions, 'saveComman
    * shows it from the start, "auto" when the document has comments and the
    * editor is wide enough (720 px), "closed" (the default) not until it is
    * asked for (the Comments button, Ctrl+Alt+Shift+M, view.setCommentsPanel()).
+   *
+   * @defaultValue "closed"
    */
   commentsPanel?: 'auto' | 'open' | 'closed';
   /** Documents: the clock tracked changes take their date from (tests). Default: the system's. */
@@ -1357,16 +1627,32 @@ export interface MountConversion {
 
 /** What MountedSpreadsheet.refreshPivots() did. */
 export interface PivotRefreshResult {
+  /** How many pivot tables were refreshed. */
   refreshed: number;
+  /** The tables that were not, each with its name and why (in the language of the view). */
   refused: { name: string; reason: string }[];
 }
 
+/**
+ * What mount() resolves to for a spreadsheet (xlsx; xls read-only unless converted).
+ *
+ * @example
+ * ```js
+ * const mounted = await BymOffice.mount(el, { file: '/files/report.xlsx', saveTo: true });
+ * if (mounted.kind === 'spreadsheet') {
+ *   const sheet = mounted.workbook.sheets[0];
+ *   console.log(sheet.name, mounted.view.selection);
+ * }
+ * ```
+ */
 export interface MountedSpreadsheet {
+  /** Always "spreadsheet": what tells this result from a MountedDocument. */
   kind: 'spreadsheet';
   /** The file that is shown: the converted one when `conversion` is set. */
   file: OfficeFile;
   /** Set when the file was converted to be opened for editing (see MountOptions.convert). */
   conversion?: MountConversion;
+  /** The model of the workbook that is shown: sheets, cells, styles. The commands of `view` change it as steps that can be undone. */
   workbook: Workbook;
   /** The grid: selection, editing, undo and redo, formatting. */
   view: WorkbookView;
@@ -1393,9 +1679,18 @@ export interface MountedSpreadsheet {
   print(options?: SheetPrintOptions): Promise<DocumentPrintResult>;
   /**
    * The sheet that is shown, or the sheets `sheets` names, as a PDF file:
-   * the pages print() makes, each one a picture with its text lying
-   * invisible over it (the file can be searched and its text copied). What
-   * is being typed is applied first. See WorkbookView.exportPdf().
+   * the pages print() makes. By default (`text: 'auto'`) a page is written as
+   * text in embedded fonts and drawings where it can be, otherwise as a picture
+   * with its text lying invisible over it; either way the file can be searched
+   * and its text copied. What is being typed is applied first. Rejects with a
+   * PdfExportError. See PdfExportOptions and WorkbookView.exportPdf().
+   *
+   * @example
+   * ```js
+   * const pdf = await mounted.exportPdf({ sheets: 'all', title: 'Report' });
+   * const url = URL.createObjectURL(new Blob([pdf], { type: 'application/pdf' }));
+   * window.open(url);
+   * ```
    */
   exportPdf(options?: SheetPdfExportOptions): Promise<Uint8Array>;
   /**
@@ -1414,6 +1709,15 @@ export interface MountedSpreadsheet {
    * `{ overwrite: true }` saves over whatever the server holds (no `If-Match`):
    * the user's answer to a SaveError "conflict". While the editor asks the user
    * about a conflict a call sends nothing, and resolves as the question ends.
+   *
+   * @example
+   * ```js
+   * // A Save button of the page, beside the one of the toolbar.
+   * saveButton.addEventListener('click', async () => {
+   *   const saved = await mounted.saveNow();
+   *   if (!saved) console.log('Not saved'); // onNotice and onSaveState say why
+   * });
+   * ```
    */
   saveNow(options?: SaveNowOptions): Promise<boolean>;
   /**
@@ -1431,11 +1735,28 @@ export interface MountedSpreadsheet {
    * cannot be, and for turning it on without `saveTo`.
    */
   setAutoSave(value: AutoSave): void;
-  /** Removes the view from the container; the same as `editor.destroy()`. */
+  /**
+   * Removes the view from the container, as `editor.destroy()` does, and leaves the room when the
+   * workbook is edited together. A save that is under way is given up, and the password of a
+   * protected file is forgotten (a later save() rejects).
+   */
   destroy(): void;
 }
 
+/**
+ * What mount() resolves to for a document (docx; doc and RTF read-only unless converted).
+ *
+ * @example
+ * ```js
+ * const mounted = await BymOffice.mount(el, { file: '/files/letter.docx' });
+ * if (mounted.kind === 'document') {
+ *   mounted.view.setZoom(1.25);
+ *   const bytes = await mounted.save(); // a docx with the changes made in the editor
+ * }
+ * ```
+ */
 export interface MountedDocument {
+  /** Always "document": what tells this result from a MountedSpreadsheet. */
   kind: 'document';
   /** The file that is shown: the converted one when `conversion` is set. */
   file: OfficeFile;
@@ -1451,6 +1772,7 @@ export interface MountedDocument {
    * `editor` are replaced by those of the new file.
    */
   collab?: MountedDocCollab;
+  /** The model of the document that is shown: paragraphs, tables, styles. The editor changes it as steps that can be undone. */
   document: DocModel;
   /** The pages: zoom, navigation, the caret and the selection, editing, undo and redo. */
   view: DocumentView;
@@ -1468,10 +1790,19 @@ export interface MountedDocument {
    */
   print(options?: DocumentPrintOptions): Promise<DocumentPrintResult>;
   /**
-   * The document as a PDF file: every page a picture of what is shown, with
-   * its text lying invisible over it (the file can be searched and its text
-   * copied). Also for doc and RTF files that are shown read-only. See
-   * DocumentView.exportPdf().
+   * The document as a PDF file, page by page as it is shown. By default
+   * (`text: 'auto'`) a page is written as text in embedded fonts and drawings
+   * where it can be, otherwise as a picture with its text lying invisible over
+   * it; either way the file can be searched and its text copied. Also for doc
+   * and RTF files that are shown read-only. Rejects with a PdfExportError. See
+   * PdfExportOptions and DocumentView.exportPdf().
+   *
+   * @example
+   * ```js
+   * const controller = new AbortController();
+   * const pdf = await mounted.exportPdf({ dpi: 200, signal: controller.signal, onProgress: (done, total) => console.log(done, '/', total) });
+   * await fetch('/api/files/42.pdf', { method: 'PUT', body: pdf });
+   * ```
    */
   exportPdf(options?: PdfExportOptions): Promise<Uint8Array>;
   /**
@@ -1493,11 +1824,24 @@ export interface MountedDocument {
    * cannot be, and for turning it on without `saveTo`.
    */
   setAutoSave(value: AutoSave): void;
-  /** Removes the view from the container; the same as `editor.destroy()`. */
+  /**
+   * Removes the view from the container, as `editor.destroy()` does, and leaves the room when the
+   * document is edited together. A save that is under way is given up, and the password of a
+   * protected file is forgotten (a later save() rejects).
+   */
   destroy(): void;
 }
 
-/** What mount() resolves to; `kind` tells which of the two it is. */
+/**
+ * What mount() resolves to; `kind` tells which of the two it is.
+ *
+ * @example
+ * ```ts
+ * const mounted: MountedView = await mount(el, { file });
+ * if (mounted.kind === 'spreadsheet') console.log(mounted.workbook.sheets.length, 'sheets');
+ * else console.log(mounted.view.pageCount, 'pages');
+ * ```
+ */
 export type MountedView = MountedSpreadsheet | MountedDocument;
 
 /** How long mount() waits for its fonts before it shows the file without them. */
@@ -1507,8 +1851,38 @@ const FONT_WAIT_MS = 3000;
  * Opens a file and shows it inside `container`, which must have a size: a
  * spreadsheet (xlsx) in the editor, with a toolbar, a formula bar and a status
  * bar unless the options turn them off; a document as pages, a docx in the
- * document editor (unless `readOnly` is set), doc and RTF read-only.
- * Other formats reject with UnsupportedFileError.
+ * document editor (read-only with `readOnly`). doc, RTF and xls are shown
+ * read-only unless `convert` is set. Other formats reject with
+ * UnsupportedFileError, and nothing is added to the container. The view fills
+ * the container and follows its size. Needs a browser (a DOM); in Node use open().
+ *
+ * @example
+ * ```html
+ * <!-- CDN: the script defines the global BymOffice. Pin the version. -->
+ * <div id="editor" style="height: 600px"></div>
+ * <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+ * <script>
+ *   BymOffice.mount(document.getElementById('editor'), {
+ *     file: '/files/report.xlsx', // a URL, a Blob or File, an ArrayBuffer or a Uint8Array
+ *     saveTo: true,
+ *   }).then((mounted) => console.log(mounted.kind));
+ * </script>
+ * ```
+ *
+ * @example
+ * ```js
+ * // ES module (npm i bymoffice). With a bundler give `fontsUrl` too (see MountOptions.fontsUrl).
+ * import { mount, UnsupportedFileError } from 'bymoffice';
+ *
+ * try {
+ *   const mounted = await mount(document.getElementById('editor'), { file: input.files[0], readOnly: true });
+ *   // ... later
+ *   mounted.destroy();
+ * } catch (error) {
+ *   if (error instanceof UnsupportedFileError) console.log('Not a Word or Excel file');
+ *   else throw error;
+ * }
+ * ```
  */
 export async function mount(container: HTMLElement, options: MountOptions): Promise<MountedView> {
   // A file that was opened and is not shown after all (its conversion or its view failed) lets go of its password.

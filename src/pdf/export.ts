@@ -34,13 +34,32 @@ const STRIP_ROWS = 256;
 
 /** What says that the caller does not want the file any more: an AbortSignal, or anything with its `aborted`. */
 export interface PdfAbortSignal {
+  /** True once the work is to end. */
   readonly aborted: boolean;
 }
 
+/**
+ * What exportPdf() (MountedSpreadsheet, MountedDocument, the views) and downloadPdf() take. Every field is optional.
+ * A value of the wrong type or range is refused with TypeError or RangeError.
+ *
+ * @example
+ * ```js
+ * const pdf = await mounted.exportPdf({
+ *   title: 'Quarterly report',
+ *   author: 'Finance',
+ *   image: 'jpeg',     // smaller files for pages with photographs
+ *   text: 'auto',      // text in embedded fonts where it can be
+ *   onLinks: (report) => console.log(report),
+ * });
+ * ```
+ */
 export interface PdfExportOptions {
   /**
    * Resolution the pages are painted at, in dots per inch. Default 150,
-   * between 72 and 300. A page larger than a canvas can be is painted at less.
+   * between 72 and 300 (a value outside is brought into that range; one that is not a positive number is refused
+   * with RangeError). A page larger than a canvas can be is painted at less.
+   *
+   * @defaultValue 150
    */
   dpi?: number;
   /**
@@ -48,9 +67,15 @@ export interface PdfExportOptions {
    * painted; small for text, large for photographs), 'jpeg' (small for
    * photographs; text gets larger, and blurred at its edges) or 'auto' (the
    * default): page by page whichever suits the page - see canvasPageImage().
+   *
+   * @defaultValue "auto"
    */
   image?: 'auto' | 'jpeg' | 'lossless';
-  /** Quality of the JPEG pictures, above 0 and at most 1. Default 0.85. */
+  /**
+   * Quality of the JPEG pictures, above 0 and at most 1. Default 0.85.
+   *
+   * @defaultValue 0.85
+   */
   quality?: number;
   /**
    * How a page is written. 'auto' (the default): as text in embedded fonts,
@@ -66,14 +91,23 @@ export interface PdfExportOptions {
    * with fonts.registerFont() (TrueType or OpenType, with a licence that
    * allows embedding) - and its fonts have a glyph for every character. Text
    * in a font of the device leaves its page a picture.
+   *
+   * @defaultValue "auto"
    */
   text?: 'auto' | 'image' | 'vector';
   /** Called for every page once it is in the file, with how it was written. */
   onPage?(info: PdfPageInfo): void;
-  /** Title and author in the information of the file; left out when missing. */
+  /** The title in the information of the file; left out when missing. */
   title?: string;
+  /** The author in the information of the file; left out when missing. */
   author?: string;
-  /** The date the file states as that of its making; now when missing. */
+  /**
+   * The date the file states as that of its making and of its last change (CreationDate and ModDate of its
+   * information, written in universal time, to the second). Now when missing; an invalid Date, or one outside
+   * the years 0 to 9999, leaves both out.
+   *
+   * @defaultValue `new Date()`
+   */
   date?: Date;
   /** Aborting it ends the work: the promise is rejected with a PdfExportError 'cancelled'. */
   signal?: PdfAbortSignal;
@@ -84,12 +118,16 @@ export interface PdfExportOptions {
    * address outside the file (only http, https and mailto) and a place in
    * it (a bookmark of a document, a cell of a workbook). False leaves them
    * out.
+   *
+   * @defaultValue true
    */
   links?: boolean;
   /**
    * The PDF gets an outline that readers show beside its pages (default
    * true): the headings of a document, the sheets of a workbook. False
    * leaves it out.
+   *
+   * @defaultValue true
    */
   outline?: boolean;
   /** Called once the file is made, with what became of its links and its outline. */
@@ -98,6 +136,7 @@ export interface PdfExportOptions {
 
 /** What downloadPdf() of a view says of the file it handed to the browser. */
 export interface PdfDownload {
+  /** The name the file was handed over with: that of the shown file with ".pdf" (see WorkbookViewOptions.fileName), or "document.pdf" / "workbook.pdf" when no name is known. */
   fileName: string;
   /** Bytes of the file. */
   size: number;

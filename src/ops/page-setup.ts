@@ -36,7 +36,11 @@ export const MAX_MANUAL_BREAKS = 1026;
 export interface PageSetupState {
   /** The paper code, or undefined for a paper the file gives as a measure (paperWidth/paperHeight) or by a code that is not known here. */
   paperSize: number | undefined;
-  /** The file states the paper (by code or by measure); otherwise the paper is the default one. */
+  /**
+   * Whether the file states the paper of the sheet (a paper code, or a width and height). When false, `paperSize`
+   * is the default paper: for WorkbookView.pageSetup() Letter where the language of the view is that of the United
+   * States or Canada, A4 everywhere else (pageSetupState(): A4 unless told otherwise).
+   */
   paperStated: boolean;
   orientation: 'portrait' | 'landscape';
   /** Inches. */

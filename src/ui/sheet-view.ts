@@ -269,28 +269,65 @@ import { CollabUnsupportedError } from '../collab/types';
 import { FilterMenu, ListMenu } from './filter-menu';
 import { allSheets, dropIndex, recalculateForSheets, sheetErrorText, sheetToShow, type SheetListChange, type SheetOpKind } from './sheet-tabs';
 
+/** What a WorkbookView takes; mount() passes them on for spreadsheets (see MountOptions). */
 export interface WorkbookViewOptions {
   /**
    * Language for number and date formats: a tag such as "tr" or "en-US", or a
-   * complete FormatLocale. Defaults to the browser's language.
+   * complete FormatLocale. Defaults to the browser's language. Turkish gets
+   * Turkish formats; every other language the English (en-US) ones. A tag is
+   * also the language of the editor's own texts (a FormatLocale object leaves
+   * those to the browser's language).
+   *
+   * @defaultValue `navigator.language`
    */
   locale?: string | FormatLocale;
-  /** Sheet shown first; defaults to workbook.activeSheet, or the first visible sheet when that one is hidden. */
+  /** Sheet shown first, by its index from 0; defaults to workbook.activeSheet, or the first visible sheet when that one is hidden. */
   sheet?: number;
+  /** Called when the selection changes: not when the view is first shown, nor when another sheet is shown. */
   onSelectionChange?(selection: GridSelection, sheetIndex: number): void;
+  /** Called when another sheet is shown, with its index from 0. */
   onSheetChange?(sheetIndex: number): void;
-  /** No editing: no cell editor, no paste, cut, delete, undo or structural commands. Copy still works. Default false. */
+  /**
+   * No editing: no cell editor, no paste, cut, delete, undo or structural commands. Copy still works. Default false.
+   * For mount() it stands for documents too (the document is shown read-only), and turns `convert` off.
+   *
+   * @defaultValue false
+   *
+   * @example
+   * ```js
+   * // A viewer: nothing can be changed, nothing is converted.
+   * const mounted = await BymOffice.mount(el, { file: '/files/report.xlsx', readOnly: true });
+   * mounted.editor.setReadOnly(false); // editing can be turned on later (not for doc, RTF and xls)
+   * ```
+   */
   readOnly?: boolean;
-  /** Recalculate formulas after every change. Default true. */
+  /**
+   * Recalculate formulas after every change. Default true. Opening a file does not recalculate it as a whole:
+   * the results the file holds are shown until something a formula depends on changes.
+   *
+   * @defaultValue true
+   */
   calculate?: boolean;
-  /** Who the notes added in this view are by. Default "Author". A note that is edited keeps its author. */
+  /**
+   * Who the notes added in this view are by. Default "Author". A note that is edited keeps its author.
+   *
+   * @defaultValue "Author"
+   */
   author?: string;
-  /** Called after every change to the workbook, including undo and redo. `remote`: the change came from someone else the workbook is edited together with. */
+  /**
+   * Called after every change to the workbook, including undo and redo. `sheets`: the indexes of the sheets the
+   * change may have touched. `remote`: the change came from someone else the workbook is edited together with.
+   * For mount(), spreadsheets only (see MountOptions.onDocumentChange for documents).
+   */
   onChange?(change: { sheets: number[]; remote?: boolean }): void;
   /**
    * Called with every message the view has for the user, in the language of
    * the view: what an action was refused for ('error'), or a hint ('info').
    * The same text goes to the view's live region for assistive technology.
+   * For mount() it serves documents as well, and also says what mount() itself
+   * has to tell: that the file was converted (`convert`) or could not be, and
+   * that a font of `fonts` could not be loaded. Those are told only here: pass
+   * onNotice, or the user never hears of them.
    */
   onNotice?(notice: { message: string; kind: 'error' | 'info' }): void;
   /** Called when cell editing starts, on every change of the text being edited, and when it ends. */
@@ -310,7 +347,10 @@ export interface WorkbookViewOptions {
   onPrintProgress?(progress: { done: number; total: number } | undefined): void;
   /** The same while exportPdf() paints the pages of a PDF, and with undefined once the file is there or was given up. */
   onPdfProgress?(progress: { done: number; total: number } | undefined): void;
-  /** The name of the file that is shown: what "&F" in a header of a PDF stands for, and what the PDF downloadPdf() makes is named after. */
+  /**
+   * The name of the file that is shown: what "&F" in a header of a PDF stands for, and what the PDF downloadPdf() makes is named after.
+   * mount() uses it for documents too; without it, it takes the last part of the address of `file`, or the name of a File.
+   */
   fileName?: string;
 }
 
@@ -5577,7 +5617,8 @@ export class WorkbookView {
   /**
    * What the charts of the shown sheet cost and show (for tests and embedding): how many charts something is
    * kept for and what it weighs (see CHART_KEEP_BUDGET), how often numbers were worked out and charts were laid
-   * out since the view was made, and the texts of the charts as they were last laid out (at most 500).
+   * out since the view was made, the texts of the charts as they were last laid out (`texts`, at most 500), and
+   * what the charts have that is not drawn, or is drawn differently (`notes`: Chart.notes, each once, at most 200).
    */
   getChartState(): { charts: number; weight: number; values: number; layouts: number; texts: string[]; notes: string[] } {
     const texts: string[] = [];

@@ -13,8 +13,25 @@ export type PasswordErrorCode = 'required' | 'wrong' | 'cancelled' | 'unsupporte
 export type EncryptedFormat = 'ooxml' | 'doc' | 'xls';
 
 /**
- * A password-protected file could not be opened. The message never holds the
- * password, a key or anything derived from them.
+ * A password-protected file could not be opened (open(), mount()), or could not be saved encrypted (save(),
+ * with code "cancelled" when its signal was aborted). The message never holds the
+ * password, a key or anything derived from them. Read `code` to tell the cases apart.
+ *
+ * @example
+ * ```js
+ * async function openAsking(bytes) {
+ *   for (let tries = 0; tries < 3; tries++) {
+ *     const password = tries === 0 ? undefined : prompt('Password') || undefined;
+ *     try {
+ *       return await BymOffice.open(bytes, { password });
+ *     } catch (error) {
+ *       if (!(error instanceof BymOffice.PasswordError)) throw error;
+ *       if (error.code !== 'required' && error.code !== 'wrong') throw error; // 'unsupported', 'damaged', 'cancelled'
+ *     }
+ *   }
+ *   throw new Error('No password');
+ * }
+ * ```
  */
 export class PasswordError extends Error {
   override name = 'PasswordError';
@@ -22,6 +39,7 @@ export class PasswordError extends Error {
   format?: EncryptedFormat;
 
   constructor(
+    /** What went wrong: see PasswordErrorCode. */
     readonly code: PasswordErrorCode,
     message: string,
   ) {
