@@ -3,7 +3,7 @@
 **Open, edit and save Word and Excel files in the browser — docx, xlsx, doc, xls and RTF.**
 A document and spreadsheet engine written from scratch in TypeScript: one script, no server, no runtime dependencies.
 
-[Live demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/) · [Türkçe](README.tr.md) · [Developer guide (Turkish)](docs/kullanim-kilavuzu.md) · [WebView bridge](docs/webview-koprusu.md) · [Changelog](CHANGELOG.md)
+[Live demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/) · [Türkçe](README.tr.md) · [Saving to your server](docs/server.md) · [Developer guide (Turkish)](docs/kullanim-kilavuzu.md) · [WebView bridge](docs/webview-koprusu.md) · [Changelog](CHANGELOG.md)
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>
@@ -20,7 +20,7 @@ A document and spreadsheet engine written from scratch in TypeScript: one script
 
 - **Runs entirely in the browser.** Files are read, edited and written on the device; nothing is uploaded unless you save it somewhere yourself (the engine only fetches its bundled font from beside the script, when a document needs it). The same code runs in Node for server-side work.
 - **One file, zero dependencies.** Add one `<script>` from a CDN or install from npm. The package (4.7 MB packed) includes a font for documents written in Bookman Old Style.
-- **Lossless.** Parts of a file the engine does not understand are kept byte for byte; only what you changed is rewritten. An unchanged docx or xlsx is saved byte for byte as it was opened.
+- **Lossless.** Parts of a file the engine does not understand are kept byte for byte; only what you changed is rewritten. An unchanged docx or xlsx is saved byte for byte as it was opened (entries with ZIP64 fields or headers that contradict each other get new, equivalent headers; a password-protected file is encrypted again with new keys).
 - **A ready editor, not only a parser.** Toolbars, keyboard and touch, undo/redo, clipboard, find and replace, print, PDF export — in Turkish or English.
 - **Web pages and apps.** Any web page or framework; mobile and desktop apps through a single-file WebView page.
 
@@ -84,9 +84,11 @@ Only the ES module and the `<script>` build are shipped (no CommonJS build). Typ
 | React, Vue, Svelte, Angular | `import { mount } from 'bymoffice'` in an effect / `onMounted`; call `destroy()` on unmount |
 | Next.js, Nuxt | Client side only: a `'use client'` component, or a dynamic import with SSR off |
 | Flutter, React Native, native iOS/Android, Electron, Tauri | Load `bymoffice.webview.html` in a WebView and talk to it with messages (`load`, `save`, `changed`, `error` …) — see [the bridge contract](docs/webview-koprusu.md) |
-| Node | `open()`, the edit operations and `save()` work without a screen |
+| Node, Bun | `open()`, the edit operations and `save()` work without a screen |
 
-The table is a recipe, not a test report: so far the engine is used in a Laravel page and in a Flutter web app; Next.js, React Native, Electron, Tauri and real mobile WebViews have not been tried yet. The engine itself is tested on every change in Chromium, Firefox, WebKit and two mobile profiles (iPhone, Pixel). Old WebViews without `DecompressionStream` fall back to the engine's own inflate/deflate.
+**Works with any backend that can serve a file and accept a `PUT`.** Saving back (`saveTo`) was tested on 2026-11-03 with Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby and Dart: open, edit, save, ETag and conflict. Examples for Laravel, Django, ASP.NET Core and Node, CSRF headers and the request size limits that block large saves (Django 2.5 MB, PHP 8 MB, ASP.NET Core about 28.6 MB by default) are in [Saving to your server](docs/server.md).
+
+The front-end rows are a recipe, not a test report: the engine is used in a Laravel page and in a Flutter web app; Next.js, React Native, Electron, Tauri and real mobile WebViews have not been tried yet. The engine itself is tested on every change in Chromium, Firefox, WebKit and two mobile profiles (iPhone, Pixel). Old WebViews without `DecompressionStream` fall back to the engine's own inflate/deflate.
 
 ## Development
 

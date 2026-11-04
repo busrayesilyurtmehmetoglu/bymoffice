@@ -3,7 +3,7 @@
 **Word ve Excel dosyalarını tarayıcıda açın, düzenleyin, kaydedin — docx, xlsx, doc, xls ve RTF.**
 TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu yok, çalışma zamanı bağımlılığı yok.
 
-[Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/?lang=tr) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
+[Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/?lang=tr) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [Sunucuya kaydetme (İngilizce)](docs/server.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.0/dist/bymoffice.min.js"></script>
@@ -21,7 +21,7 @@ TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu y
 
 - **Tamamen tarayıcıda çalışır.** Dosya cihazda okunur, düzenlenir ve yazılır; siz bir yere kaydetmedikçe hiçbir şey gönderilmez (motor yalnız, belge gerektirirse paketle gelen fontu betiğin yanından yükler). Aynı kod sunucu tarafı işler için Node'da da çalışır.
 - **Tek dosya, sıfır bağımlılık.** CDN'den tek `<script>` satırı ya da npm. Paket (sıkıştırılmış 4,7 MB) Bookman Old Style ile yazılmış belgeler için bir font da getirir.
-- **Kayıpsız.** Motorun anlamadığı parçalar bayt bayt korunur; yalnız değiştirdiğiniz yeniden yazılır. Değişmemiş bir docx ya da xlsx açıldığı haliyle, bayt bayt kaydedilir.
+- **Kayıpsız.** Motorun anlamadığı parçalar bayt bayt korunur; yalnız değiştirdiğiniz yeniden yazılır. Değişmemiş bir docx ya da xlsx açıldığı haliyle, bayt bayt kaydedilir (ZIP64 alanı taşıyan ya da başlıkları birbiriyle çelişen girdilerin başlıkları eşdeğerleriyle yeniden yazılır; parola korumalı dosya yeni anahtarlarla yeniden şifrelenir).
 - **Yalnız okuyucu değil, hazır editör.** Araç çubukları, klavye ve dokunmatik, geri al/yinele, pano, bul ve değiştir, yazdırma, PDF — Türkçe ya da İngilizce.
 - **Web sayfaları ve uygulamalar.** Her web sayfası ve çatı; mobil ve masaüstü uygulamalarda tek dosyalık WebView sayfasıyla.
 
@@ -85,9 +85,11 @@ Yalnız ES modülü ve `<script>` çıktısı dağıtılır (CommonJS çıktıs�
 | React, Vue, Svelte, Angular | Bir effect / `onMounted` içinde `import { mount } from 'bymoffice'`; bileşen kalkarken `destroy()` |
 | Next.js, Nuxt | Yalnız tarayıcı tarafında: `'use client'` bileşeni ya da SSR kapalı dinamik içe aktarma |
 | Flutter, React Native, yerel iOS/Android, Electron, Tauri | `bymoffice.webview.html` bir WebView'e yüklenir, iletilerle konuşulur (`load`, `save`, `changed`, `error` …) — bkz. [köprü sözleşmesi](docs/webview-koprusu.md) |
-| Node | `open()`, düzenleme işlemleri ve `save()` ekransız çalışır |
+| Node, Bun | `open()`, düzenleme işlemleri ve `save()` ekransız çalışır |
 
-Tablo bir tariftir, test raporu değil: motor bugün bir Laravel sayfasında ve bir Flutter web uygulamasında kullanılıyor; Next.js, React Native, Electron, Tauri ve gerçek mobil WebView'ler henüz denenmedi. Motorun kendisi her değişiklikte Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır. `DecompressionStream` olmayan eski WebView'lerde motor kendi inflate/deflate kodunu kullanır.
+**Dosya sunabilen ve `PUT` alabilen her arka uçla çalışır.** Aynı yere kaydetme (`saveTo`) 2026-11-03'te Node, Bun, PHP, Laravel, Python, Flask, Django, Go, Java, ASP.NET Core, Ruby ve Dart ile sınandı: açma, düzenleme, kaydetme, ETag ve çakışma. Laravel, Django, ASP.NET Core ve Node örnekleri, CSRF başlıkları ve büyük kayıtları engelleyen istek boyutu sınırları (varsayılan: Django 2,5 MB, PHP 8 MB, ASP.NET Core yaklaşık 28,6 MB) [Sunucuya kaydetme](docs/server.md) belgesinde.
+
+Tablonun ön yüz satırları bir tariftir, test raporu değil: motor bugün bir Laravel sayfasında ve bir Flutter web uygulamasında kullanılıyor; Next.js, React Native, Electron, Tauri ve gerçek mobil WebView'ler henüz denenmedi. Motorun kendisi her değişiklikte Chromium, Firefox, WebKit ve iki mobil profilde (iPhone, Pixel) sınanır. `DecompressionStream` olmayan eski WebView'lerde motor kendi inflate/deflate kodunu kullanır.
 
 ## Geliştirme
 

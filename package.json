@@ -36,7 +36,16 @@
     "collaborative-editing",
     "pdf",
     "typescript",
-    "zero-dependency"
+    "zero-dependency",
+    "word-editor",
+    "excel-editor",
+    "docx-viewer",
+    "xlsx-viewer",
+    "browser",
+    "laravel",
+    "django",
+    "php",
+    "aspnet"
   ],
   "main": "dist/bymoffice.esm.js",
   "module": "dist/bymoffice.esm.js",
