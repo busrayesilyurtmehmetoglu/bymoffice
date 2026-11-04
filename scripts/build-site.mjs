@@ -119,6 +119,13 @@ function checkKeys(page, where) {
   for (const key of named) if (!(key in dictionary.en)) throw new Error(`${where}: the text "${key}" is not in site/assets/i18n.js`);
 }
 
+/** The page with every empty element that names a dictionary text holding that text in English. */
+const escapeHtml = (text) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const prerender = (page) =>
+  page.replace(/(<([a-z][a-z0-9]*)\b[^<>]*\bdata-i18n="([^"]+)"[^<>]*>)(<\/\2>)/g, (match, open, tag, key, close) =>
+    key in dictionary.en ? `${open}${escapeHtml(dictionary.en[key])}${close}` : match,
+  );
+
 const placeholders = (page, where) => {
   let out = page.split('__BYM_VERSION__').join(version).split('__BYM_REPOSITORY_URL__').join(REPOSITORY_URL).split('__BYM_CDN__').join(CDN).split('__BYM_SITE_URL__').join(SITE_URL);
   if (/__BYM_[A-Z_]+__/.test(out.replace('__BYM_CSP__', ''))) throw new Error(`${where}: an unknown placeholder ${/__BYM_[A-Z_]+__/.exec(out)[0]}`);
@@ -153,10 +160,13 @@ async function copyTree(from, to) {
     const page = placeholders(await readFile(source, 'utf8'), where);
     checkOwnOrigin(page, where);
     if (!isExample) checkKeys(page, where);
+    // Texts the page fills in from the dictionary are written into it in English too, so the page
+    // reads whole without its scripts (search engines index that); the scripts then set the language.
+    const filled = isExample ? page : prerender(page);
     // Only the scripts of the page itself run: the examples' inline scripts by their hashes.
-    const scripts = inlineScripts(page);
+    const scripts = inlineScripts(filled);
     if (!isExample && scripts.length) throw new Error(`${where}: the pages of the site keep their scripts in files`);
-    await writeFile(target, fill(page, '__BYM_CSP__', policy(scripts.map(sha256)), where));
+    await writeFile(target, fill(filled, '__BYM_CSP__', policy(scripts.map(sha256)), where));
   }
 }
 await copyTree(SOURCE, OUT);
@@ -187,6 +197,21 @@ const sitemap = [
   '',
 ].join('\n');
 await writeFile(join(OUT, 'sitemap.xml'), sitemap);
+
+// llms-full.txt: the English documents in one plain file, for tools that read a whole package at once.
+const FULL = ['README.md', 'docs/api.md', 'docs/server.md'];
+const parts = [];
+for (const name of FULL) {
+  const text = await readFile(join(ROOT, name), 'utf8');
+  // Links between the documents point to the repository, where they are read.
+  const linked = text.replace(/\]\((?!https?:|#|mailto:)([^)]+)\)/g, (match, target) => {
+    const resolved = relative(ROOT, resolve(dirname(join(ROOT, name)), target.split('#')[0])).split('\\').join('/');
+    const hash = target.includes('#') ? target.slice(target.indexOf('#')) : '';
+    return `](${REPOSITORY_URL}/blob/main/${resolved}${hash})`;
+  });
+  parts.push(`<!-- ${name} -->\n\n${linked.trim()}\n`);
+}
+await writeFile(join(OUT, 'llms-full.txt'), parts.join('\n\n---\n\n'));
 
 // Nothing private and no address of this machine goes out with the site.
 async function checkTree(dir) {
