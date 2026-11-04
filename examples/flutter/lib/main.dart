@@ -1,7 +1,7 @@
 // Example application: pick a Word or Excel file, edit it, save it.
 //
-// NOTE: never compiled or run; see README.md. The file_picker calls are
-// UNVERIFIED against the package's current API.
+// Built for Android, iOS and macOS (see README.md); not run by hand. The
+// file_picker calls are UNVERIFIED: the integration test does not pick files.
 
 import 'dart:async';
 import 'dart:io';
