@@ -1,0 +1,22 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "BYM Office",
+  "description": "Open, edit and save Word and Excel files (docx, xlsx, doc, xls, RTF) in the browser. A document and spreadsheet engine in TypeScript with no server and no runtime dependencies; one script from a CDN or the bymoffice npm package. Also runs in WebViews (Flutter, Android, iOS) through a bridge page.",
+  "folders": ["docs", "examples"],
+  "excludeFolders": ["node_modules", "dist", "build"],
+  "excludeFiles": [
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "README.tr.md",
+    "kullanim-kilavuzu.md",
+    "collab-sozlesmesi.md",
+    "webview-koprusu.md"
+  ],
+  "rules": [
+    "BymOffice.mount(element, { file }) returns a Promise; it rejects (it does not throw) for an unsupported file, an invalid option or a cancelled password.",
+    "With a bundler or ES modules, copy the package's dist/fonts/ folder into the build output and pass its address as fontsUrl. The CDN script finds its fonts by itself.",
+    "doc, xls and RTF open read-only. Pass convert: true to edit them; they are then saved as docx or xlsx.",
+    "To save back to the address the file was fetched from, use saveTo (PUT with If-Match/ETag; see docs/server.md). Without saveTo, onSave receives the bytes on Ctrl/Cmd+S.",
+    "Call destroy() on the mounted editor when its element is removed, for example in a React effect cleanup or Vue onBeforeUnmount."
+  ]
+}
