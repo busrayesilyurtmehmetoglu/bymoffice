@@ -147,10 +147,13 @@ test('cfb writer: names a compound file cannot hold are refused', () => {
 
 test('cfb writer: file(1) calls what is written a compound document', (t) => {
   // Once, under the load of a full verification, file(1) never answered and the whole file timed out: it is given a
-  // time of its own, and a check that could not be made is skipped and says so, not taken as passed.
+  // time of its own, and a check that could not be made is skipped and says so, not taken as passed. It happened again
+  // with that time limit: spawnSync sends SIGTERM and then waits for the process to end, so a file(1) that does not
+  // end on SIGTERM still held the whole file. It is killed outright.
   const done = spawnSync('file', ['-'], {
     input: writeCfb([{ path: 'EncryptionInfo', data: fill(900) }, { path: 'EncryptedPackage', data: fill(9000) }]),
     timeout: 30_000,
+    killSignal: 'SIGKILL',
   });
   if (done.error && (done.error as { code?: string }).code === 'ENOENT') return t.skip('file(1) not found');
   if (done.error && (done.error as { code?: string }).code === 'ETIMEDOUT') return t.skip('file(1) did not answer in 30 s');

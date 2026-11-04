@@ -1,6 +1,6 @@
 # BYM Office — API reference
 
-This is the English reference for the public API of the `bymoffice` package, version 0.1.1. The full developer
+This is the English reference for the public API of the `bymoffice` package, version 0.1.2. The full developer
 guide is in Turkish: [kullanim-kilavuzu.md](kullanim-kilavuzu.md). Where this page is short, the guide has the
 details; where the two disagree, the code (`src/index.ts` and what it exports; types in `dist/types/`) wins.
 
@@ -34,8 +34,8 @@ touch. The same code runs in Node and Bun without a screen.
 **CDN** (defines a global `BymOffice`; no build step):
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
-<!-- or https://unpkg.com/bymoffice@0.1.1/dist/bymoffice.min.js -->
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
+<!-- or https://unpkg.com/bymoffice@0.1.2/dist/bymoffice.min.js -->
 ```
 
 Put the version in the address: 0.x minor versions may contain breaking changes. The bundled font is loaded from
@@ -94,7 +94,7 @@ size. A file that is not recognised rejects with `UnsupportedFileError` and noth
 
 ```html
 <div id="editor" style="height: 600px"></div>
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
 <script>
   (async () => {
     const mounted = await BymOffice.mount(document.getElementById('editor'), {
@@ -260,7 +260,7 @@ const bytes = await mounted.save();   // any time; Uint8Array
 ### `saveTo`: save back to where the file came from
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
 <script>
   BymOffice.mount(document.getElementById('editor'), { file: '/files/42', saveTo: true });
 </script>

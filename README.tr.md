@@ -6,7 +6,7 @@ TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu y
 [Canlı demo](https://busrayesilyurtmehmetoglu.github.io/bymoffice/?lang=tr) · [English](README.md) · [Geliştirici kılavuzu](docs/kullanim-kilavuzu.md) · [Sunucuya kaydetme (İngilizce)](docs/server.md) · [API başvurusu (İngilizce)](docs/api.md) · [WebView köprüsü](docs/webview-koprusu.md) · [Sürüm notları](CHANGELOG.md)
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
 <div id="editor" style="height: 600px"></div>
 <script>
   BymOffice.mount(document.getElementById('editor'), {
@@ -53,7 +53,7 @@ TypeScript ile sıfırdan yazılmış belge ve tablo motoru: tek betik, sunucu y
 **CDN** — derleme gerekmez, global `BymOffice` tanımlanır:
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.1/dist/bymoffice.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bymoffice@0.1.2/dist/bymoffice.min.js"></script>
 ```
 
 **npm**
