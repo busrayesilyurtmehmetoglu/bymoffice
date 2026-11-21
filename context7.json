@@ -1,5 +1,7 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
+  "url": "https://context7.com/busrayesilyurtmehmetoglu/bymoffice",
+  "public_key": "pk_XauKg06Q0IgySZjjdbfJm",
   "projectTitle": "BYM Office",
   "description": "Open, edit and save Word and Excel files (docx, xlsx, doc, xls, RTF) in the browser. A document and spreadsheet engine in TypeScript with no server and no runtime dependencies; one script from a CDN or the bymoffice npm package. Also runs in WebViews (Flutter, Android, iOS) through a bridge page.",
   "folders": ["docs", "examples"],
